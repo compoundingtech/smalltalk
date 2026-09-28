@@ -120,12 +120,33 @@ pub enum Effect {
     CancelRun {
         mission: String,
     },
+    OpenTerminal {
+        agent: String,
+    },
+    TerminalKey(KeyEvent),
+    CloseTerminal,
+    CreateLaunch {
+        title: String,
+        request: String,
+        mission: String,
+        workspace: String,
+    },
+    RevokeDevice {
+        id: String,
+    },
     /// "Chat about this": a new message to `to`, titled after the item, with its context.
     Discuss {
         to: String,
         title: String,
         text: String,
     },
+}
+
+/// An agent's live terminal screen, drawn in place of its conversation.
+pub(crate) struct TerminalView {
+    pub(crate) title: String,
+    pub(crate) lines: Vec<Line<'static>>,
+    pub(crate) ended: Option<String>,
 }
 
 /// An open "chat about this" on a Home item.
@@ -172,6 +193,14 @@ pub struct Ui {
     kdl: bool,
     /// Agents and Missions list as the graph's path tree instead of grouped by state.
     tree: bool,
+    /// An attached terminal shown in place of the conversation.
+    pub(crate) terminal: Option<TerminalView>,
+    /// A Ctrl-C or Ctrl-D pressed once in a terminal, waiting for its confirming second press.
+    terminal_confirm: Option<(KeyCode, Instant)>,
+    /// The New mission form: title, request, mission id, workspace; and the focused field.
+    new_mission: Option<([String; 4], usize)>,
+    /// A device awaiting a confirmed revoke.
+    revoke: Option<String>,
     /// Home items put off until later. Demo only: kept in memory on this machine.
     snoozed: HashSet<String>,
 }
@@ -207,6 +236,10 @@ impl Ui {
             details: true,
             kdl: false,
             tree: false,
+            terminal: None,
+            terminal_confirm: None,
+            new_mission: None,
+            revoke: None,
             snoozed: HashSet::new(),
         }
     }
@@ -480,7 +513,20 @@ impl Ui {
 
     fn footer(&self, buf: &mut Buffer, area: Rect) {
         buf.set_style(area, Style::default().bg(theme::CRUST));
-        let hints: Vec<(&str, &str)> = if self.editing {
+        let hints: Vec<(&str, &str)> = if self.terminal.is_some() && self.tab == 1 {
+            vec![
+                ("ctrl+\\", "return"),
+                ("keys", "go to the agent"),
+                ("ctrl-c twice", "interrupt"),
+            ]
+        } else if self.new_mission.is_some() && self.tab == 2 {
+            vec![
+                ("tab", "next field"),
+                ("alt+enter", "new line"),
+                ("enter", "next / create"),
+                ("esc", "cancel"),
+            ]
+        } else if self.editing {
             vec![("enter", "send"), ("esc", "stop editing"), ("⌫", "delete")]
         } else if self.confirm.is_some() {
             vec![("y", "confirm"), ("esc", "cancel")]
@@ -495,7 +541,7 @@ impl Ui {
                     ("end", "latest"),
                     ("drag", "select + copy"),
                 ]),
-                2 => hints.extend([("enter", "answer"), ("x", "system missions")]),
+                2 => hints.extend([("n", "new mission"), ("t", "tree"), ("x", "system")]),
                 _ => {}
             }
             hints.extend([("?", "help"), ("q", "quit")]);
@@ -529,7 +575,17 @@ impl Ui {
         if let Some((message, _)) = &self.flash {
             let message = format!(" {message} ");
             let width = text::width(&message) as u16;
-            let start = (area.x + area.width).saturating_sub(width + 1).max(x);
+            // A message wins over the key hints: on a narrow window it must still show.
+            let start = (area.x + area.width).saturating_sub(width + 1).max(area.x);
+            let trouble = [
+                "Failed",
+                "Could not",
+                "not sent",
+                "Detach failed",
+                "Key not sent",
+            ]
+            .iter()
+            .any(|word| message.contains(word));
             buf.set_stringn(
                 start,
                 area.y,
@@ -537,7 +593,7 @@ impl Ui {
                 (area.x + area.width - start) as usize,
                 Style::default()
                     .fg(theme::CRUST)
-                    .bg(theme::GREEN)
+                    .bg(if trouble { theme::RED } else { theme::GREEN })
                     .add_modifier(Modifier::BOLD),
             );
         } else if self.demo.is_some() {
@@ -823,7 +879,13 @@ impl Ui {
                 let doc = screens::home_detail(&self.world, id.as_deref(), width, &drafts);
                 self.pane(buf, &format!("home:{key}"), area, doc, false);
             }
+            1 if self.terminal.is_some() => self.draw_terminal(buf, area),
             1 => self.draw_agent(buf, area, id.as_deref()),
+            2 if self.new_mission.is_some() => {
+                let (fields, focus) = self.new_mission.as_ref().unwrap();
+                let doc = screens::new_mission_form(fields, *focus, width);
+                self.pane(buf, "new-mission", area, doc, false);
+            }
             2 if self.kdl => {
                 let doc = screens::mission_kdl(&self.world, id.as_deref(), width);
                 self.pane(
@@ -1209,6 +1271,36 @@ impl Ui {
         }
     }
 
+    fn draw_terminal(&self, buf: &mut Buffer, area: Rect) {
+        let Some(view) = &self.terminal else { return };
+        let header = format!(" ← Return · Ctrl+\\   {}", view.title);
+        buf.set_stringn(
+            area.x,
+            area.y,
+            &header,
+            area.width as usize,
+            theme::strong(theme::ACCENT),
+        );
+        self.hit(Rect { height: 1, ..area }, Hit::Detach);
+        let status = match &view.ended {
+            Some(reason) => format!("ended: {reason}"),
+            None => "Ctrl-C and Ctrl-D need a second press to reach the agent".into(),
+        };
+        buf.set_stringn(
+            area.x,
+            area.y + 1,
+            format!(" {status}"),
+            area.width as usize,
+            theme::dim(),
+        );
+        // A terminal taller than the pane shows its bottom, where the prompt and cursor are.
+        let rows = area.height.saturating_sub(2) as usize;
+        let skip = view.lines.len().saturating_sub(rows);
+        for (offset, line) in view.lines.iter().skip(skip).take(rows).enumerate() {
+            buf.set_line(area.x, area.y + 2 + offset as u16, line, area.width);
+        }
+    }
+
     /// The message box under a conversation, wrapped, newest lines last.
     fn composer_lines(&self, agent: &Agent, width: usize) -> Vec<Line<'static>> {
         let draft = self.drafts.get(&agent.id).cloned().unwrap_or_default();
@@ -1409,6 +1501,33 @@ impl Ui {
         if key.kind != KeyEventKind::Press {
             return;
         }
+        // An attached terminal gets every key first, Ctrl-C included.
+        if self.terminal.is_some() && self.tab == 1 {
+            let control = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                // Terminals send Ctrl+\\ as 0x1c, which crossterm reports as Ctrl+4.
+                KeyCode::Char('\\' | '4') if control => {
+                    self.effects.push(Effect::CloseTerminal);
+                }
+                KeyCode::Char(letter @ ('c' | 'd')) if control => {
+                    let code = KeyCode::Char(letter);
+                    if self.terminal_confirm.is_some_and(|(pending, at)| {
+                        pending == code && at.elapsed() < Duration::from_secs(2)
+                    }) {
+                        self.terminal_confirm = None;
+                        self.effects.push(Effect::TerminalKey(key));
+                    } else {
+                        self.terminal_confirm = Some((code, Instant::now()));
+                        self.flash(format!(
+                            "Press Ctrl-{} again within 2s to send it to the agent",
+                            letter.to_ascii_uppercase()
+                        ));
+                    }
+                }
+                _ => self.effects.push(Effect::TerminalKey(key)),
+            }
+            return;
+        }
         if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
             if self.editing {
                 self.editing = false;
@@ -1423,6 +1542,34 @@ impl Ui {
         }
         if self.help {
             self.help = false;
+            return;
+        }
+        if let Some((fields, focus)) = self.new_mission.as_mut() {
+            let focus_now = *focus;
+            match key.code {
+                KeyCode::Esc => self.new_mission = None,
+                KeyCode::Tab => *focus = (focus_now + 1) % 4,
+                KeyCode::BackTab => *focus = (focus_now + 3) % 4,
+                KeyCode::Enter
+                    if key
+                        .modifiers
+                        .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
+                {
+                    fields[focus_now].push('\n')
+                }
+                KeyCode::Enter if focus_now < 3 => *focus = focus_now + 1,
+                KeyCode::Enter => self.create_launch(),
+                KeyCode::Backspace => {
+                    fields[focus_now].pop();
+                }
+                KeyCode::Char(character) => {
+                    fields[focus_now].push(character);
+                    if focus_now == 0 && fields[2].is_empty() {
+                        // Suggest a mission id from the title as it is typed.
+                    }
+                }
+                _ => {}
+            }
             return;
         }
         if let Some(chat) = self.chat.clone().filter(|chat| chat.editing) {
@@ -1527,7 +1674,10 @@ impl Ui {
                     "Grouped view · t for the tree"
                 });
             }
-            KeyCode::Enter if self.tab == 1 => self.editing = true,
+            KeyCode::Enter if self.tab == 1 => self.open_terminal(),
+            KeyCode::Char('n') if self.tab == 2 => {
+                self.new_mission = Some((Default::default(), 0));
+            }
             KeyCode::Enter if self.tab == 2 => {
                 if let Some(decision) = self.selected_id().and_then(|id| {
                     self.world
@@ -1684,6 +1834,62 @@ impl Ui {
             ));
         } else {
             self.flash(format!("{what} · demo: nothing was sent"));
+        }
+    }
+
+    fn open_terminal(&mut self) {
+        let Some(agent) = self.selected_id().and_then(|id| {
+            self.world
+                .agents
+                .items()
+                .iter()
+                .find(|agent| agent.id == id)
+                .cloned()
+        }) else {
+            return;
+        };
+        if !agent.terminal {
+            self.flash(format!("{} has no terminal to open", agent.name));
+            return;
+        }
+        if self.live {
+            self.effects.push(Effect::OpenTerminal { agent: agent.id });
+            self.flash("Opening the terminal…");
+        } else {
+            self.terminal = Some(TerminalView {
+                title: format!("{} · demo terminal", agent.name),
+                lines: demo::terminal(&agent.name),
+                ended: None,
+            });
+        }
+    }
+
+    fn create_launch(&mut self) {
+        let Some((fields, _)) = self.new_mission.clone() else {
+            return;
+        };
+        if let Some(missing) = fields.iter().position(|field| field.trim().is_empty()) {
+            if let Some((_, focus)) = self.new_mission.as_mut() {
+                *focus = missing;
+            }
+            self.flash(format!(
+                "Fill in {}",
+                screens::NEW_MISSION_FIELDS[missing].0
+            ));
+            return;
+        }
+        let [title, request, mission, workspace] = fields;
+        self.new_mission = None;
+        if self.live {
+            self.effects.push(Effect::CreateLaunch {
+                title,
+                request,
+                mission,
+                workspace,
+            });
+            self.flash("Creating the launch…");
+        } else {
+            self.flash("Launch created · demo: nothing was sent");
         }
     }
 
@@ -1902,6 +2108,20 @@ impl Ui {
     }
 
     fn act(&mut self, action: char) {
+        if action == 'v' {
+            if let Some(id) = self.revoke.take() {
+                if self.live {
+                    self.effects.push(Effect::RevokeDevice { id });
+                    self.flash("Revoking…");
+                } else {
+                    if let Load::Ready(devices) = &mut self.world.devices {
+                        devices.retain(|device| device.id != id);
+                    }
+                    self.flash("Device revoked · demo: nothing was sent");
+                }
+            }
+            return;
+        }
         if action == 'X' {
             let Some(mission) = self.selected_id().filter(|_| self.tab == 2) else {
                 return;
@@ -2108,6 +2328,11 @@ impl Ui {
                     _ => {}
                 }
             }
+            Hit::Key('\t') => {
+                if let Some((_, focus)) = self.new_mission.as_mut() {
+                    *focus = (*focus + 1) % 4;
+                }
+            }
             Hit::Key(key) => {
                 if key == 'y' {
                     if let Some(action) = self.confirm.take() {
@@ -2118,6 +2343,7 @@ impl Ui {
                     self.action_key(key);
                 }
             }
+            Hit::Enter if self.new_mission.is_some() => self.create_launch(),
             Hit::Enter => {
                 if self.chat.is_some() {
                     self.submit_chat()
@@ -2125,6 +2351,7 @@ impl Ui {
                     self.submit()
                 }
             }
+            Hit::Escape if self.new_mission.is_some() => self.new_mission = None,
             Hit::Escape => {
                 if self.popover.take().is_none() {
                     self.editing = false;
@@ -2153,6 +2380,23 @@ impl Ui {
             }
             Hit::Help => self.help = !self.help,
             Hit::Open(id) => self.open(&id),
+            Hit::Field(index) => {
+                if let Some((_, focus)) = self.new_mission.as_mut() {
+                    *focus = index;
+                }
+            }
+            Hit::Revoke(id) => {
+                self.revoke = Some(id);
+                self.confirm = Some('v');
+                self.flash("Revoke this device? y to confirm");
+            }
+            Hit::Detach => {
+                if self.live {
+                    self.effects.push(Effect::CloseTerminal);
+                } else {
+                    self.terminal = None;
+                }
+            }
             Hit::Peek(id) => {
                 if self.popover.as_deref() != Some(id.as_str()) {
                     self.popover = Some(id);
@@ -2460,6 +2704,13 @@ pub fn run_demo(args: &[String]) -> Result<()> {
     {
         ui.tick = (started.elapsed().as_millis() / 100) as u64;
         ui.step_demo();
+        for effect in std::mem::take(&mut ui.effects) {
+            match effect {
+                Effect::CloseTerminal => ui.terminal = None,
+                Effect::TerminalKey(_) => ui.flash("demo: keys are not sent"),
+                _ => {}
+            }
+        }
         if ui
             .flash
             .as_ref()
@@ -2892,5 +3143,85 @@ mod tests {
         assert!(screen.contains("first line of a long message"), "{screen}");
         assert!(screen.contains("second paragraph"), "{screen}");
         assert!(ui.editing, "Alt+Enter adds a line instead of sending");
+    }
+    #[test]
+    fn enter_opens_an_agents_terminal_and_ctrl_backslash_returns() {
+        let mut ui = Ui::new(demo::world());
+        ui.tab = 1;
+        press(&mut ui, KeyCode::Enter);
+        assert!(ui.terminal.is_some());
+        let screen = frame(&ui, 120, 30).join("\n");
+        assert!(screen.contains("Return"), "{screen}");
+        ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(ui.effects.is_empty(), "the first Ctrl-C only arms");
+        ui.key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(matches!(ui.effects.last(), Some(Effect::TerminalKey(_))));
+        ui.key(KeyEvent::new(KeyCode::Char('4'), KeyModifiers::CONTROL));
+        assert!(
+            matches!(ui.effects.last(), Some(Effect::CloseTerminal)),
+            "0x1c arrives as Ctrl+4"
+        );
+    }
+
+    #[test]
+    fn a_new_mission_needs_every_field_before_it_creates_a_launch() {
+        let mut ui = Ui::new(demo::world());
+        ui.live = true;
+        ui.tab = 2;
+        press(&mut ui, KeyCode::Char('n'));
+        for character in "Audit".chars() {
+            press(&mut ui, KeyCode::Char(character));
+        }
+        for _ in 0..3 {
+            press(&mut ui, KeyCode::Enter);
+        }
+        press(&mut ui, KeyCode::Enter);
+        assert!(ui.effects.is_empty(), "missing fields keep the form open");
+        assert_eq!(
+            ui.new_mission.as_ref().unwrap().1,
+            1,
+            "focus moves to the first empty field"
+        );
+        let screen = frame(&ui, 140, 50).join("\n");
+        assert!(screen.contains("NEW MISSION"), "{screen}");
+        for (field, value) in [
+            (1, "Audit the dependencies"),
+            (2, "fleet/harbor/audit"),
+            (3, "~/src/harbor"),
+        ] {
+            ui.new_mission.as_mut().unwrap().1 = field;
+            for character in value.chars() {
+                press(&mut ui, KeyCode::Char(character));
+            }
+        }
+        press(&mut ui, KeyCode::Enter);
+        assert!(
+            matches!(ui.effects.last(), Some(Effect::CreateLaunch { mission, .. }) if mission == "fleet/harbor/audit")
+        );
+    }
+
+    #[test]
+    fn a_device_is_revoked_only_after_confirming() {
+        let mut ui = Ui::new(demo::world());
+        ui.tab = 3;
+        let screen = frame(&ui, 140, 60).join("\n");
+        assert!(screen.contains("YOUR DEVICES"), "{screen}");
+        let (rect, _) = ui
+            .frame
+            .borrow()
+            .hits
+            .iter()
+            .find(|(_, hit)| matches!(hit, Hit::Revoke(_)))
+            .cloned()
+            .unwrap();
+        ui.mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(ui.world.devices.items().len(), 2, "not before confirming");
+        press(&mut ui, KeyCode::Char('y'));
+        assert_eq!(ui.world.devices.items().len(), 1);
     }
 }

@@ -23,6 +23,12 @@ pub enum Hit {
     Open(String),
     /// Show a popover card for a graph subject.
     Peek(String),
+    /// Focus a field of a form.
+    Field(usize),
+    /// Revoke a paired device (after a confirmation).
+    Revoke(String),
+    /// Leave the terminal view.
+    Detach,
 }
 
 #[derive(Clone, Debug)]

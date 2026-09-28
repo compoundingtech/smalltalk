@@ -1587,6 +1587,9 @@ pub fn fleet_detail(world: &World, id: Option<&str>, width: usize, spinner: &'st
         agents.line(Line::from(span("No agents on this machine.", theme::dim())));
     }
     doc.card("agents here", theme::OVERLAY1, false, agents, width);
+    if machine.you_are_here {
+        doc.append(devices_card(world, width), 0);
+    }
     doc
 }
 
@@ -2170,4 +2173,127 @@ mod tree_tests {
             "{kinds:#?}"
         );
     }
+}
+
+// ------------------------------------------------------------- new mission
+
+pub const NEW_MISSION_FIELDS: [(&str, &str); 4] = [
+    ("title", "A short name, like 'Nightly dependency audit'"),
+    (
+        "what you want",
+        "Describe the outcome; the planner turns it into a mission",
+    ),
+    (
+        "mission id",
+        "Where it lives in the graph, like fleet/harbor/nightly-audit",
+    ),
+    ("workspace", "The directory the agents work in"),
+];
+
+/// The form behind Missions' New mission: it creates a launch, which a planner turns into a
+/// proposed mission on Home. Nothing runs until the person approves it there.
+pub fn new_mission_form(fields: &[String; 4], focus: usize, width: usize) -> Doc {
+    let mut inner = Doc::new();
+    let w = width.saturating_sub(4);
+    inner.blank();
+    inner.wrap(
+        &[run(
+            "Say what you want. A planner turns it into a proposed mission, which appears on Home for you to approve; nothing runs before that.",
+            theme::soft(),
+        )],
+        w,
+    );
+    inner.blank();
+    for (index, (label, hint)) in NEW_MISSION_FIELDS.iter().enumerate() {
+        let focused = index == focus;
+        let mut body = Doc::new();
+        let value = &fields[index];
+        if value.is_empty() && !focused {
+            body.line(Line::from(span(*hint, theme::dim())));
+        } else {
+            for (line_index, paragraph) in value.split('\n').enumerate() {
+                let mut runs = vec![run(paragraph.to_owned(), theme::text())];
+                if focused && line_index == value.split('\n').count() - 1 {
+                    runs.push(run("█", theme::fg(theme::ACCENT)));
+                }
+                body.lines(text::wrap(&runs, w.saturating_sub(4), &[], &[], None));
+            }
+        }
+        let start = inner.lines.len();
+        inner.card(
+            label,
+            if focused {
+                theme::ACCENT
+            } else {
+                theme::OVERLAY1
+            },
+            false,
+            body,
+            w,
+        );
+        for line in start..inner.lines.len() {
+            inner.targets.push(super::doc::Target {
+                line,
+                column: 0,
+                width: w as u16,
+                hit: Hit::Field(index),
+            });
+        }
+    }
+    inner.blank();
+    inner.buttons(&[
+        ("tab", "Next field", Hit::Key('\t'), theme::OVERLAY1),
+        ("enter", "Create the launch", Hit::Enter, theme::GREEN),
+        ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
+    ]);
+    inner.blank();
+    let mut doc = Doc::new();
+    doc.card("new mission", theme::ACCENT, false, inner, width);
+    doc
+}
+
+// ------------------------------------------------------------------ devices
+
+pub fn devices_card(world: &World, width: usize) -> Doc {
+    let mut inner = Doc::new();
+    match &world.devices {
+        Load::Loading => inner.line(Line::from(span("Loading your devices…", theme::dim()))),
+        Load::Failed(error) => inner.wrap(
+            &[run(
+                format!("Could not read devices: {error}"),
+                theme::fg(theme::RED),
+            )],
+            width.saturating_sub(4),
+        ),
+        Load::Ready(devices) if devices.is_empty() => {
+            inner.line(Line::from(span("No paired devices.", theme::dim())))
+        }
+        Load::Ready(devices) => {
+            for device in devices {
+                inner.line(Line::from(vec![
+                    span(
+                        if device.state == "active" {
+                            "● "
+                        } else {
+                            "○ "
+                        },
+                        theme::fg(if device.state == "active" {
+                            theme::GREEN
+                        } else {
+                            theme::QUIET
+                        }),
+                    ),
+                    span(format!("{:<22}", device.name), theme::text()),
+                    span(format!("{:<24}", device.scopes.join(", ")), theme::soft()),
+                    span(format!("expires {}", device.expires), theme::dim()),
+                ]));
+                if device.state == "active" {
+                    inner.buttons(&[("", "Revoke", Hit::Revoke(device.id.clone()), theme::RED)]);
+                }
+            }
+        }
+    }
+    let mut doc = Doc::new();
+    doc.card("your devices", theme::OVERLAY1, false, inner, width);
+    doc
 }
