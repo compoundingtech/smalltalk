@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
@@ -165,9 +165,7 @@ fn parse_github_ref_locator(locator: &str) -> Result<GithubRefLocator> {
 
 async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObservation> {
     let locator = parse_github_ref_locator(&request.locator)?;
-    let client = reqwest::Client::builder()
-        .user_agent("st3-resource-observer/0.1")
-        .build()?;
+    let client = github_client()?;
     let token = github_token().await?;
     let request_json = |url: String| {
         let request = client
@@ -304,9 +302,7 @@ async fn observe_github_repository_at(
         !owner.is_empty() && !repository.is_empty() && !repository.contains('/'),
         "a GitHub repository locator needs OWNER/REPO"
     );
-    let client = reqwest::Client::builder()
-        .user_agent("st3-resource-observer/0.1")
-        .build()?;
+    let client = github_client()?;
     let request_json = |url: String, etag: Option<&str>| {
         let mut request = client
             .get(url)
@@ -477,6 +473,22 @@ fn github_next_page(link: &str) -> Option<String> {
                     .to_owned()
             })
     })
+}
+
+/// A hung connection must end, or its observer would never be polled again.
+const GITHUB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const GITHUB_REQUEST_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(60)
+};
+
+fn github_client() -> Result<reqwest::Client> {
+    Ok(reqwest::Client::builder()
+        .user_agent("st3-resource-observer/0.1")
+        .connect_timeout(GITHUB_CONNECT_TIMEOUT)
+        .timeout(GITHUB_REQUEST_TIMEOUT)
+        .build()?)
 }
 
 pub(crate) const GITHUB_AUTH_REMEDY: &str = "GitHub observers have no token; run `gh auth login` as the daemon account or export GH_TOKEN/GITHUB_TOKEN in that account's login-shell startup files. Check the daemon PATH with `st doctor`. No anonymous request was sent; authentication is checked again on the next poll.";
@@ -651,9 +663,7 @@ async fn observe_github_pull_request(request: ObservationRequest) -> Result<Prov
     let number = number
         .parse::<u64>()
         .context("a GitHub pull request number must be an integer")?;
-    let client = reqwest::Client::builder()
-        .user_agent("st3-resource-observer/0.1")
-        .build()?;
+    let client = github_client()?;
     let token = github_token().await?;
     let request_json = |url: String| {
         let request = client
@@ -965,6 +975,33 @@ mod tests {
         assert_eq!(facts["pull_requests"].as_array().unwrap().len(), 2);
         let repeated = normalize_github_repository(Some(&facts), 7, &[], &[], &fields).unwrap();
         assert_eq!(repeated, facts);
+    }
+
+    /// A provider that accepts the connection and never answers must not hold its observer forever.
+    #[tokio::test]
+    async fn a_github_request_that_never_answers_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(stream);
+        });
+        let request = ObservationRequest {
+            provider: "github.repository".into(),
+            locator: "example/repo".into(),
+            fields: BTreeSet::from(["issues".into()]),
+            cursor: None,
+            previous_facts: None,
+        };
+        let observed = tokio::time::timeout(
+            Duration::from_secs(10),
+            observe_github_repository_at(request, &base, None),
+        )
+        .await
+        .expect("the request did not time out");
+        assert!(observed.is_err());
+        server.abort();
     }
 
     #[tokio::test]

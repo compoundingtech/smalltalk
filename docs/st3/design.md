@@ -141,6 +141,15 @@ declarations stay, so stopping continues after the run ends.
 A panic that escapes a pass restarts the reconciler with backoff and records `daemon.diagnostic`
 with the code `reconciler-panicked`.
 
+The daemon's other loops keep the same rule:
+
+- The local API keeps serving when one accept fails, for example when the daemon runs out of file
+  descriptors.
+- A native delivery forwards each message on its own. A message it cannot forward, such as one
+  whose document is not on this host, is recorded once as a `harness.diagnostic` with the code
+  `message-unforwarded`. The recipient's other messages keep arriving.
+- A driver skips renewing a step whose claim ended in the meantime, and keeps running.
+
 ## Messages and attention
 
 Small Talk messages are durable claims. Delivery is a separate lifecycle with sent, delivered,

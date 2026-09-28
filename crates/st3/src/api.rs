@@ -3137,7 +3137,16 @@ async fn serve_unix_inner(socket: &Path, app: Router, bind_harness: bool) -> any
     let listener = UnixListener::bind(socket)?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
     loop {
-        let (stream, _) = listener.accept().await?;
+        let stream = match listener.accept().await {
+            Ok((stream, _)) => stream,
+            // Running out of file descriptors, or a peer that hung up before it was accepted,
+            // fails one accept. It must not end the daemon: back off and keep serving.
+            Err(error) => {
+                eprintln!("st3: accept a local API connection: {error}");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let bound_agent = if bind_harness {
             stream
                 .peer_cred()
