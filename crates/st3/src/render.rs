@@ -578,6 +578,11 @@ fn ensure_tracked_file_is_unchanged(
     let Ok(relative) = destination.strip_prefix(workspace) else {
         return Ok(());
     };
+    // Most reconcile passes leave rendered files untouched. Their tracked status cannot
+    // affect the result when the existing bytes already equal the planned bytes.
+    if fs::read(destination).is_ok_and(|current| current == bytes) {
+        return Ok(());
+    }
     let tracked = git_tracks(workspace, relative)
         .with_context(|| format!("check whether {} is tracked", destination.display()))?;
     if tracked {
