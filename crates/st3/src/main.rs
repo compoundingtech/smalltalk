@@ -1833,7 +1833,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         notify.clone(),
         event_notify.clone(),
     )?);
-    tokio::spawn(reconciler.run());
+    tokio::spawn(reconciler.supervise());
     tokio::spawn(trim_local_observations(
         store.clone(),
         config.observations.clone(),
