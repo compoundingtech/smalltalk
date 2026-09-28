@@ -15,8 +15,8 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Layout, Rect},
-    style::{Color, Style},
-    text::Line,
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use st3_client::{
@@ -83,6 +83,21 @@ struct Attached {
     terminal_id: String,
     attachment_id: String,
     screen: TerminalScreen,
+    /// Newer screens from the open terminal stream; `None` in tests without a stream.
+    updates: Option<tokio::sync::watch::Receiver<Option<TerminalUpdate>>>,
+    follower: Option<tokio::task::JoinHandle<()>>,
+}
+impl Drop for Attached {
+    fn drop(&mut self) {
+        if let Some(follower) = &self.follower {
+            follower.abort();
+        }
+    }
+}
+#[derive(Clone)]
+enum TerminalUpdate {
+    Screen(Box<TerminalScreen>),
+    Ended(String),
 }
 struct PendingTerminalInput {
     key: KeyCode,
@@ -146,7 +161,6 @@ struct App {
     last_timeline: Instant,
     messages_requested: Option<String>,
     last_messages: Instant,
-    last_terminal: Instant,
 }
 impl App {
     fn new(model: Model) -> Self {
@@ -189,7 +203,6 @@ impl App {
             last_timeline: Instant::now(),
             messages_requested: None,
             last_messages: Instant::now(),
-            last_terminal: Instant::now(),
         }
     }
     fn cancel_terminal_input(&mut self) {
@@ -527,11 +540,18 @@ impl App {
                 .lines
                 .iter()
                 .map(|line| {
-                    Line::from(if line.redacted {
-                        "[redacted]"
+                    if line.redacted {
+                        Line::from("[redacted]")
+                    } else if line.runs.is_empty() {
+                        Line::from(line.text.as_str())
                     } else {
-                        &line.text
-                    })
+                        Line::from(
+                            line.runs
+                                .iter()
+                                .map(|run| Span::styled(run.text.as_str(), terminal_run_style(run)))
+                                .collect::<Vec<_>>(),
+                        )
+                    }
                 })
                 .collect();
             frame.render_widget(
@@ -711,7 +731,7 @@ impl App {
                     for action in &v.actions {
                         lines.push(format!("  {}", action_label(action)));
                     }
-                    lines.push("Choose a key, then confirm with y. CLI actions need st3.".into());
+                    lines.push("Choose a key, then confirm with y. CLI actions need st.".into());
                     lines.push("└────────────────────────".into());
                 } else {
                     lines.push("Nothing needs your attention.".into());
@@ -782,16 +802,16 @@ impl App {
                             .then_with(|| a.header.id.cmp(&b.header.id))
                     });
                     lines.push(if conversation.is_empty() && !recent.is_empty() {
-                        "ST3 MESSAGES · native transcript unavailable".into()
+                        "ST MESSAGES · native transcript unavailable".into()
                     } else {
-                        "ST3 MESSAGES".into()
+                        "ST MESSAGES".into()
                     });
                     if conversation.is_empty() && recent.is_empty() {
                         lines.push(
                             if self.messages_requested.as_deref() == Some(peer.header.id.as_str())
                                 && self.model.messages.snapshot.is_none()
                             {
-                                "Loading ST3 messages…".into()
+                                "Loading ST messages…".into()
                             } else if self
                                 .selected_session_id()
                                 .is_some_and(|id| self.timeline_cache.contains_key(&id))
@@ -864,7 +884,7 @@ impl App {
                         }
                     }
                     lines.push(if session_is_importable(session) {
-                        "m import session into st3 · confirmation stops the exact process and resumes it under st3".into()
+                        "m import session into st · confirmation stops the exact process and resumes it under st".into()
                     } else if exact {
                         format!(
                             "Import unavailable: {}",
@@ -1149,7 +1169,7 @@ impl App {
                         self.model.messages(None, &peer.header.id).next().is_some()
                     }) && self.model.timeline.iter().all(|entry| !matches!(entry.body, st3_client::TimelineBody::Content(_)));
                     if graph_only {
-                        format!("{selected}ST3 messages · transcript unavailable · Pg/wheel scroll · Enter terminal")
+                        format!("{selected}ST messages · transcript unavailable · Pg/wheel scroll · Enter terminal")
                     } else if self.runtime().is_some() {
                         format!("{selected}Enter terminal · Pg/wheel scroll · h history · c message · v select")
                     } else {
@@ -1168,7 +1188,7 @@ impl App {
                 .unwrap_or_else(|| "Esc cancel".into()),
             Mode::ActionReason => format!("Reason: {}█ · Enter continue · Esc cancel", self.input),
             Mode::ImportConfirm => format!(
-                "y confirm import {} · Esc cancel · stops exact process, resumes under st3",
+                "y confirm import {} · Esc cancel · stops exact process, resumes under st",
                 self.pending_import.as_deref().unwrap_or("session")
             ),
             Mode::Chat => format!("Message: {}█ · Enter send · Esc cancel", self.input),
@@ -1193,7 +1213,7 @@ fn mission_label(mission: &st3_client::Mission) -> String {
         .map(|word| match word.to_ascii_lowercase().as_str() {
             "tui" => "TUI".into(),
             "ios" => "iOS".into(),
-            "st3" => "ST3".into(),
+            "st3" => "ST".into(),
             "omp" => "OMP".into(),
             "api" => "API".into(),
             "pty" => "PTY".into(),
@@ -1571,7 +1591,7 @@ fn agent_label(agent: &st3_client::Agent) -> String {
     let label = |slug: &str| {
         slug.split('-')
             .map(|word| match word.to_ascii_lowercase().as_str() {
-                "st3" => "ST3".to_string(),
+                "st3" => "ST".to_string(),
                 "cos" => "COS".to_string(),
                 "ios" => "iOS".to_string(),
                 "tui" => "TUI".to_string(),
@@ -1642,6 +1662,35 @@ fn key_input(key: KeyEvent) -> Option<String> {
     }
 }
 
+fn terminal_run_style(run: &st3_client::TerminalRun) -> Style {
+    let color = |color: &st3_client::TerminalColor| match color {
+        st3_client::TerminalColor::Palette(index) => Some(Color::Indexed(*index)),
+        st3_client::TerminalColor::Rgb(hex) => {
+            let value = u32::from_str_radix(hex.strip_prefix('#')?, 16).ok()?;
+            Some(Color::Rgb((value >> 16) as u8, (value >> 8) as u8, value as u8))
+        }
+    };
+    let mut style = Style::default();
+    if let Some(fg) = run.fg.as_ref().and_then(color) {
+        style = style.fg(fg);
+    }
+    if let Some(bg) = run.bg.as_ref().and_then(color) {
+        style = style.bg(bg);
+    }
+    for (set, modifier) in [
+        (run.bold, Modifier::BOLD),
+        (run.dim, Modifier::DIM),
+        (run.italic, Modifier::ITALIC),
+        (run.underline, Modifier::UNDERLINED),
+        (run.inverse, Modifier::REVERSED),
+    ] {
+        if set {
+            style = style.add_modifier(modifier);
+        }
+    }
+    style
+}
+
 fn is_detach_key(key: KeyEvent) -> bool {
     key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('\\' | '4'))
 }
@@ -1695,25 +1744,42 @@ async fn attach(app: &mut App, client: &Client) -> Result<()> {
         }
     }
     let attachment = attached.context("attach returned no viewer")?;
-    let screen = if let Some(capability) = attachment.stream_capability.as_deref() {
-        client
-            .terminal_frames(
-                &terminal_id,
-                None,
-                Some(&attachment.runtime_incarnation),
-                capability,
-                Some(0),
-            )
-            .await?
-            .screen
-            .value
-    } else {
-        client.terminal_screen(&terminal_id).await?.value
-    };
+    let capability = attachment
+        .stream_capability
+        .as_deref()
+        .context("attach returned no stream capability")?;
+    let mut stream = client
+        .terminal_stream(
+            &terminal_id,
+            Some(&attachment.runtime_incarnation),
+            capability,
+        )
+        .await?;
+    let screen = stream
+        .next()
+        .await?
+        .context("the terminal stream closed before its first screen")?
+        .value;
+    let (updates, receiver) = tokio::sync::watch::channel(None);
+    let follower = tokio::spawn(async move {
+        loop {
+            let update = match stream.next().await {
+                Ok(Some(screen)) => TerminalUpdate::Screen(Box::new(screen.value)),
+                Ok(None) => TerminalUpdate::Ended("The terminal stream closed".into()),
+                Err(error) => TerminalUpdate::Ended(error.to_string()),
+            };
+            let ended = matches!(update, TerminalUpdate::Ended(_));
+            if updates.send(Some(update)).is_err() || ended {
+                break;
+            }
+        }
+    });
     app.attached = Some(Attached {
         terminal_id,
         attachment_id: attachment.attachment_id,
         screen,
+        updates: Some(receiver),
+        follower: Some(follower),
     });
     app.notice = None;
     app.dirty = true;
@@ -2416,7 +2482,7 @@ fn main() -> Result<()> {
         person
             .as_deref()
             .is_some_and(|person| person.starts_with("person/") && person.len() > 7),
-        "stui needs ST3_PERSON=person/NAME or person = \"person/NAME\" in the st3 config"
+        "stui needs ST3_PERSON=person/NAME or person = \"person/NAME\" in the st config"
     );
     let cache_path = person
         .as_deref()
@@ -2842,16 +2908,26 @@ fn main() -> Result<()> {
                 _ => {}
             }
         }
-        if let Some(attached) = app.attached.as_mut()
-            && app.last_terminal.elapsed() >= Duration::from_millis(400)
-        {
-            if let Ok(screen) = runtime.block_on(client.terminal_screen(&attached.terminal_id))
-                && attached.screen != screen.value
-            {
-                attached.screen = screen.value;
+        let update = app
+            .attached
+            .as_mut()
+            .and_then(|attached| attached.updates.as_mut())
+            .filter(|updates| updates.has_changed().unwrap_or(false))
+            .and_then(|updates| updates.borrow_and_update().clone());
+        match update {
+            Some(TerminalUpdate::Screen(screen)) => {
+                if let Some(attached) = app.attached.as_mut() {
+                    attached.screen = *screen;
+                }
                 app.dirty = true;
             }
-            app.last_terminal = Instant::now();
+            Some(TerminalUpdate::Ended(reason)) => {
+                let _ = runtime.block_on(detach(&mut app, &client));
+                app.attached = None;
+                app.model.status = format!("Terminal detached: {reason}");
+                app.dirty = true;
+            }
+            None => {}
         }
     }
     if app.attached.is_some() {
@@ -2894,7 +2970,7 @@ mod tests {
     #[test]
     fn regression_agent_header_shows_harness_state() {
         let mut model = Model::default();
-        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"ST3","state":"running","reachability":"reachable","driver":"claude","harness_state":"ready"}"#).unwrap());
+        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"ST","state":"running","reachability":"reachable","driver":"claude","harness_state":"ready"}"#).unwrap());
         let mut app = App::new(model);
         app.tab = 1;
         let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
@@ -2995,7 +3071,7 @@ mod tests {
             .iter()
             .map(|cell| cell.symbol())
             .collect::<String>();
-        assert!(loading.contains("Loading ST3 messages…"));
+        assert!(loading.contains("Loading ST messages…"));
     }
 
     #[test]
@@ -3024,7 +3100,7 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(
-            content.contains("ST3 messages · transcript unavailable"),
+            content.contains("ST messages · transcript unavailable"),
             "{content}"
         );
         assert!(content.contains("message 5:"), "{content}");
@@ -3032,7 +3108,7 @@ mod tests {
     #[test]
     fn recent_message_preserves_line_breaks_without_return_glyphs() {
         let mut model = Model::default();
-        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"one","updated_at":"2026-09-25T08:00:00Z","name":"ST3","state":"running","reachability":"reachable"}"#).unwrap());
+        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"one","updated_at":"2026-09-25T08:00:00Z","name":"ST","state":"running","reachability":"reachable"}"#).unwrap());
         model.messages.items.push(serde_json::from_str(r#"{"kind":"message","id":"message/two-lines","revision":"one","updated_at":"2026-09-25T08:00:00Z","from":"agent/cos","to":"agent/st3","title":null,"content":"first line\nsecond line","state":"closed","sent_at":"2026-09-25T08:00:00Z","in_reply_to":null,"session_id":null}"#).unwrap());
         let mut app = App::new(model);
         app.tab = 1;
@@ -3142,6 +3218,8 @@ mod tests {
                 terminal_id: screen.value.terminal_id.clone(),
                 attachment_id: "attachment/test".into(),
                 screen: screen.value,
+                updates: None,
+                follower: None,
             });
             let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
             let (client, server) = terminal_test_client();
@@ -3341,7 +3419,7 @@ mod tests {
     fn st3_descendants_nest_and_top_level_omp_shows_its_work() {
         let mut model = Model::default();
         for (id, name, driver, active) in [
-            ("agent/fleet/st3/standing/st3", "ST3", "codex", 0),
+            ("agent/fleet/st3/standing/st3", "ST", "codex", 0),
             (
                 "agent/st3/tui-ios-fixes/2026-09-25/st3-tui-fixer",
                 "TUI fixer",

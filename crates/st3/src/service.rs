@@ -1,4 +1,4 @@
-//! Install the st3 daemon as a native user service.
+//! Install the st daemon as a native user service.
 
 use std::env;
 use std::fs;
@@ -13,9 +13,12 @@ use anyhow::bail;
 
 use crate::config::Config;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod install;
+
+#[cfg(any(target_os = "linux", test))]
 const SERVICE_NAME: &str = "st3.service";
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", test))]
 const REPLICATION_SERVICE_NAME: &str = "st3-replication.service";
 const SERVICE_LABEL: &str = "com.compoundingtech.st3";
 const REPLICATION_SERVICE_LABEL: &str = "com.compoundingtech.st3.replication";
@@ -85,6 +88,17 @@ impl ServiceSpec {
         if let Some(pty_root) = &self.config.pty_root {
             arguments.extend(["--pty-root".into(), pty_root.display().to_string()]);
         }
+        self.push_fleet_arguments(&mut arguments);
+        arguments
+    }
+
+    /// A config-peer node bakes its peers into the unit, as before. A fleet member reads
+    /// `fleet.toml` and membership at run time, so its units carry no peer, fleet, or secret
+    /// arguments and never need reinstalling when membership changes.
+    fn push_fleet_arguments(&self, arguments: &mut Vec<String>) {
+        if self.config.fleet.is_some() {
+            return;
+        }
         if let Some(peer_listen) = &self.config.peer_listen {
             arguments.extend(["--peer-listen".into(), peer_listen.clone()]);
         }
@@ -97,7 +111,6 @@ impl ServiceSpec {
         if let Some(secret) = &self.config.shared_secret_file {
             arguments.extend(["--shared-secret-file".into(), secret.display().to_string()]);
         }
-        arguments
     }
 
     fn replication_program_arguments(&self) -> Vec<String> {
@@ -111,18 +124,7 @@ impl ServiceSpec {
             "--socket".into(),
             self.config.socket.display().to_string(),
         ];
-        if let Some(peer_listen) = &self.config.peer_listen {
-            arguments.extend(["--peer-listen".into(), peer_listen.clone()]);
-        }
-        for peer in &self.config.peers {
-            arguments.extend(["--peer".into(), format!("{}={}", peer.name, peer.url)]);
-        }
-        if let Some(fleet_id) = &self.config.fleet_id {
-            arguments.extend(["--fleet-id".into(), fleet_id.clone()]);
-        }
-        if let Some(secret) = &self.config.shared_secret_file {
-            arguments.extend(["--shared-secret-file".into(), secret.display().to_string()]);
-        }
+        self.push_fleet_arguments(&mut arguments);
         arguments
     }
 }
@@ -131,9 +133,9 @@ pub fn install(mut config: Config) -> Result<()> {
     #[cfg(target_os = "linux")]
     anyhow::ensure!(
         st_runtime::isolation_mode() != st_runtime::Isolation::DegradedDetached,
-        "st3 service install needs a working systemd user manager and transient user scopes"
+        "st service install needs a working systemd user manager and transient user scopes"
     );
-    let exe = env::current_exe().context("resolve the current st3 executable")?;
+    let exe = env::current_exe().context("resolve the current st executable")?;
     let current = env::current_dir().context("resolve the service install directory")?;
     config.state_dir = absolute_from(&current, &config.state_dir);
     config.socket = absolute_from(&current, &config.socket);
@@ -202,12 +204,12 @@ pub fn permissions(open: bool) -> Result<()> {
 pub fn permissions_guidance() -> Result<String> {
     #[cfg(target_os = "macos")]
     {
-        let executable = env::current_exe().context("resolve the current st3 executable")?;
+        let executable = env::current_exe().context("resolve the current st executable")?;
         Ok(macos_permission_guidance(&executable))
     }
     #[cfg(not(target_os = "macos"))]
     {
-        Ok("st3 does not need a macOS privacy approval on this host.\n".into())
+        Ok("st does not need a macOS privacy approval on this host.\n".into())
     }
 }
 
@@ -229,13 +231,13 @@ pub fn open_permissions_settings() -> Result<()> {
 #[cfg(any(target_os = "macos", test))]
 fn macos_permission_guidance(executable: &Path) -> String {
     format!(
-        "st3 executable\t{}\n\
+        "st executable\t{}\n\
 1. Open System Settings > Privacy & Security > Full Disk Access.\n\
-2. Add the st3 executable and enable it.\n\
+2. Add the st executable and enable it.\n\
 3. Open System Settings > Privacy & Security > Developer Tools.\n\
-4. Add the st3 executable and enable it.\n\
-5. Run `st3 service restart` after an approval changes.\n\
-macOS assigns service-owned file and developer access to st3, not to the terminal that installed it.\n\
+4. Add the st executable and enable it.\n\
+5. Run `st service restart` after an approval changes.\n\
+macOS assigns service-owned file and developer access to st, not to the terminal that installed it.\n\
 A launchd property list cannot grant these approvals.\n",
         executable.display()
     )
@@ -269,26 +271,31 @@ pub fn reset(mut config: Config) -> Result<()> {
     match fs::remove_dir_all(&config.state_dir) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error).context("erase the st3 state directory"),
+        Err(error) => return Err(error).context("erase the st state directory"),
     }
     if !config.socket.starts_with(&config.state_dir) {
         match fs::remove_file(&config.socket) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("erase the st3 socket"),
+            Err(error) => return Err(error).context("erase the st socket"),
         }
     }
     if !config.client_gateway_socket.starts_with(&config.state_dir) {
         match fs::remove_file(&config.client_gateway_socket) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("erase the st3 client gateway socket"),
+            Err(error) => return Err(error).context("erase the st client gateway socket"),
         }
     }
     start_native_service()?;
     wait_for_service_sockets(&config)?;
     println!("reset\t{}", config.state_dir.display());
     Ok(())
+}
+
+/// Stop the st3 services without removing them.
+pub fn stop() -> Result<()> {
+    stop_native_service()
 }
 
 pub fn uninstall() -> Result<()> {
@@ -300,7 +307,7 @@ pub fn uninstall() -> Result<()> {
 fn validate_reset_target(config: &Config) -> Result<()> {
     anyhow::ensure!(
         config.state_dir.is_absolute(),
-        "the st3 state directory must be absolute"
+        "the st state directory must be absolute"
     );
     anyhow::ensure!(
         config.state_dir != Path::new("/"),
@@ -314,7 +321,7 @@ fn validate_reset_target(config: &Config) -> Result<()> {
     }
     anyhow::ensure!(
         config.state_dir.components().count() >= 3,
-        "the st3 state directory is too broad to erase"
+        "the st state directory is too broad to erase"
     );
     Ok(())
 }
@@ -435,104 +442,13 @@ fn start_native_service() -> Result<()> {
 
 #[cfg(target_os = "macos")]
 fn install_native_service(spec: &ServiceSpec) -> Result<()> {
-    let plist = launch_agent_path()?;
-    let replication_plist = replication_launch_agent_path()?;
-    let logs = spec.config.state_dir.join("logs");
-    fs::create_dir_all(&logs)?;
-    if let Some(parent) = plist.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let previous = read_existing_file(&plist)?;
-    let previous_replication = read_existing_file(&replication_plist)?;
-    fs::write(&plist, render_launchd_plist(spec))?;
-    if spec.config.fleet_id.is_some() {
-        fs::write(&replication_plist, render_launchd_replication_plist(spec))?;
-    }
-    let domain = launch_domain();
-    let service = format!("{domain}/{SERVICE_LABEL}");
-    let replication_service = format!("{domain}/{REPLICATION_SERVICE_LABEL}");
-    let install = (|| -> Result<()> {
-        let _ = Command::new("launchctl")
-            .args(["bootout", &service])
-            .status();
-        let _ = Command::new("launchctl")
-            .args(["bootout", &replication_service])
-            .status();
-        run_command("launchctl", &["enable", &service])?;
-        run_command(
-            "launchctl",
-            &["bootstrap", &domain, &plist.display().to_string()],
-        )?;
-        run_command("launchctl", &["kickstart", &service])?;
-        if spec.config.fleet_id.is_some() {
-            run_command("launchctl", &["enable", &replication_service])?;
-            run_command(
-                "launchctl",
-                &[
-                    "bootstrap",
-                    &domain,
-                    &replication_plist.display().to_string(),
-                ],
-            )?;
-            run_command("launchctl", &["kickstart", &replication_service])?;
-        } else {
-            let _ = Command::new("launchctl")
-                .args(["disable", &replication_service])
-                .status();
-            if replication_plist.exists() {
-                fs::remove_file(&replication_plist)?;
-            }
-        }
-        wait_for_service_sockets(&spec.config)
-    })();
-    if let Err(error) = install {
-        let rollback = (|| -> Result<()> {
-            let _ = Command::new("launchctl")
-                .args(["bootout", &service])
-                .status();
-            let _ = Command::new("launchctl")
-                .args(["bootout", &replication_service])
-                .status();
-            restore_file(&plist, previous.as_deref())?;
-            restore_file(&replication_plist, previous_replication.as_deref())?;
-            if previous.is_some() {
-                run_command("launchctl", &["enable", &service])?;
-                run_command(
-                    "launchctl",
-                    &["bootstrap", &domain, &plist.display().to_string()],
-                )?;
-                run_command("launchctl", &["kickstart", &service])?;
-            } else {
-                let _ = Command::new("launchctl")
-                    .args(["disable", &service])
-                    .status();
-            }
-            if previous_replication.is_some() {
-                run_command("launchctl", &["enable", &replication_service])?;
-                run_command(
-                    "launchctl",
-                    &[
-                        "bootstrap",
-                        &domain,
-                        &replication_plist.display().to_string(),
-                    ],
-                )?;
-                run_command("launchctl", &["kickstart", &replication_service])?;
-            }
-            Ok(())
-        })();
-        if let Err(rollback) = rollback {
-            return Err(error).context(format!(
-                "the launchd install failed, and rollback also failed: {rollback:#}"
-            ));
-        }
-        return Err(error).context("the launchd install failed; st3 restored the prior service");
-    }
-    println!("plist\t{}", plist.display());
-    if spec.config.fleet_id.is_some() {
-        println!("replication-plist\t{}", replication_plist.display());
-    }
-    Ok(())
+    install::launchd(
+        spec,
+        &launch_agent_path()?,
+        &replication_launch_agent_path()?,
+        &launch_domain(),
+        &mut install::NativeCommands("launchctl"),
+    )
 }
 
 #[cfg(target_os = "macos")]
@@ -684,76 +600,12 @@ fn start_native_service() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 fn install_systemd_user(spec: &ServiceSpec) -> Result<()> {
-    let unit_path = systemd_user_unit_path()?;
-    let replication_path = replication_systemd_user_unit_path()?;
-    if let Some(parent) = unit_path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let previous = read_existing_file(&unit_path)?;
-    let previous_replication = read_existing_file(&replication_path)?;
-    fs::write(&unit_path, render_systemd_user_unit(spec))?;
-    if spec.config.fleet_id.is_some() {
-        fs::write(&replication_path, render_systemd_replication_unit(spec))?;
-    }
-    let install = (|| -> Result<()> {
-        run_command("systemctl", &["--user", "daemon-reload"])?;
-        run_command("systemctl", &["--user", "enable", SERVICE_NAME])?;
-        run_command("systemctl", &["--user", "restart", SERVICE_NAME])?;
-        if spec.config.fleet_id.is_some() {
-            run_command("systemctl", &["--user", "enable", REPLICATION_SERVICE_NAME])?;
-            run_command(
-                "systemctl",
-                &["--user", "restart", REPLICATION_SERVICE_NAME],
-            )?;
-        } else {
-            let _ = Command::new("systemctl")
-                .args(["--user", "disable", "--now", REPLICATION_SERVICE_NAME])
-                .status();
-            if replication_path.exists() {
-                fs::remove_file(&replication_path)?;
-                run_command("systemctl", &["--user", "daemon-reload"])?;
-            }
-        }
-        wait_for_service_sockets(&spec.config)
-    })();
-    if let Err(error) = install {
-        let rollback = (|| -> Result<()> {
-            if previous.is_some() {
-                restore_file(&unit_path, previous.as_deref())?;
-                restore_file(&replication_path, previous_replication.as_deref())?;
-                run_command("systemctl", &["--user", "daemon-reload"])?;
-                run_command("systemctl", &["--user", "restart", SERVICE_NAME])?;
-                if previous_replication.is_some() {
-                    run_command(
-                        "systemctl",
-                        &["--user", "restart", REPLICATION_SERVICE_NAME],
-                    )?;
-                }
-            } else {
-                let _ = Command::new("systemctl")
-                    .args(["--user", "disable", "--now", SERVICE_NAME])
-                    .status();
-                let _ = Command::new("systemctl")
-                    .args(["--user", "disable", "--now", REPLICATION_SERVICE_NAME])
-                    .status();
-                restore_file(&unit_path, None)?;
-                restore_file(&replication_path, previous_replication.as_deref())?;
-                run_command("systemctl", &["--user", "daemon-reload"])?;
-            }
-            Ok(())
-        })();
-        if let Err(rollback) = rollback {
-            return Err(error).context(format!(
-                "the systemd install failed, and rollback also failed: {rollback:#}"
-            ));
-        }
-        return Err(error).context("the systemd install failed; st3 restored the prior service");
-    }
-    println!("unit\t{}", unit_path.display());
-    if spec.config.fleet_id.is_some() {
-        println!("replication-unit\t{}", replication_path.display());
-    }
-    Ok(())
+    install::systemd(
+        spec,
+        &systemd_user_unit_path()?,
+        &replication_systemd_user_unit_path()?,
+        &mut install::NativeCommands("systemctl"),
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -830,7 +682,7 @@ fn uninstall_systemd_user() -> Result<()> {
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn unsupported() -> Result<()> {
-    bail!("st3 service is available only on Linux and macOS")
+    bail!("st service is available only on Linux and macOS")
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -865,12 +717,7 @@ fn start_native_service() -> Result<()> {
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn run_command(program: &str, arguments: &[&str]) -> Result<()> {
-    let status = Command::new(program)
-        .args(arguments)
-        .status()
-        .with_context(|| format!("run {program} {}", arguments.join(" ")))?;
-    anyhow::ensure!(status.success(), "{program} failed with {status}");
-    Ok(())
+    install::Commands::run(&mut install::NativeCommands(program), arguments)
 }
 
 #[cfg(target_os = "macos")]
@@ -936,7 +783,7 @@ fn wait_for_socket_for(socket: &Path, timeout: std::time::Duration) -> Result<()
         std::thread::sleep(std::time::Duration::from_millis(25));
     }
     anyhow::bail!(
-        "the st3 service did not accept connections at {}",
+        "the st service did not accept connections at {}",
         socket.display()
     )
 }
@@ -960,7 +807,7 @@ pub fn render_systemd_user_unit(spec: &ServiceSpec) -> String {
         .join(" ");
     format!(
         "[Unit]\n\
-Description=st3 claims graph daemon\n\
+Description=st claims graph daemon\n\
 After=network.target\n\
 \n\
 [Service]\n\
@@ -982,7 +829,7 @@ WantedBy=default.target\n",
 
 pub fn render_systemd_replication_unit(spec: &ServiceSpec) -> String {
     render_systemd_program_unit(
-        "st3 authenticated replication worker",
+        "st authenticated replication worker",
         &spec.replication_program_arguments(),
         spec,
     )
@@ -1114,6 +961,48 @@ mod tests {
     use crate::config::PeerConfig;
 
     #[test]
+    fn membership_units_carry_no_peer_fleet_or_secret_arguments() -> Result<()> {
+        let config = Config {
+            node: "node-a".into(),
+            fleet_id: Some("1f91ca65-7793-48cc-866e-ac15690130e1".into()),
+            shared_secret_file: Some("/var/lib/st3/fleet/secret".into()),
+            state_dir: "/var/lib/st3".into(),
+            socket: "/run/user/1000/st3.sock".into(),
+            client_gateway_socket: "/run/user/1000/st3-client.sock".into(),
+            peer_listen: Some("127.0.0.1:31313".into()),
+            peers: vec![PeerConfig {
+                name: "node-b".into(),
+                url: "http://127.0.0.1:31314".into(),
+            }],
+            fleet: Some(crate::config::FleetFile {
+                fleet_id: "1f91ca65-7793-48cc-866e-ac15690130e1".into(),
+                port: Some(31313),
+                ..Default::default()
+            }),
+            ..Config::default()
+        };
+        let spec = ServiceSpec::new("/usr/bin/st3", config, 1024)?;
+        for unit in [
+            render_systemd_user_unit(&spec),
+            render_systemd_replication_unit(&spec),
+            render_launchd_plist(&spec),
+            render_launchd_replication_plist(&spec),
+        ] {
+            for argument in [
+                "--peer",
+                "--peer-listen",
+                "--fleet-id",
+                "--shared-secret-file",
+                "fleet/secret",
+            ] {
+                assert!(!unit.contains(argument), "{argument} in {unit}");
+            }
+            assert!(unit.contains("--state-dir"));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn unit_bakes_the_effective_config_and_limit() -> Result<()> {
         let config = Config {
             node: "node-a".into(),
@@ -1131,6 +1020,7 @@ mod tests {
             }],
             planner: crate::model::PlannerSpec::default(),
             observations: crate::config::ObservationsConfig::default(),
+            fleet: None,
         };
         let spec = ServiceSpec::new("/usr/bin/st3", config, 1024)?;
         let unit = render_systemd_user_unit(&spec);
@@ -1197,7 +1087,7 @@ mod tests {
     #[test]
     fn macos_permission_guidance_names_the_exact_binary_and_manual_steps() {
         let guidance = macos_permission_guidance(Path::new("/Users/test/bin/st3"));
-        assert!(guidance.contains("st3 executable\t/Users/test/bin/st3"));
+        assert!(guidance.contains("st executable\t/Users/test/bin/st3"));
         assert!(guidance.contains("Full Disk Access"));
         assert!(guidance.contains("Developer Tools"));
         assert!(guidance.contains("cannot grant"));

@@ -15,6 +15,143 @@ pub struct PeerConfig {
     pub url: String,
 }
 
+/// How a fleet member takes part in replication.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum FleetMode {
+    /// Accepts connections and advertises endpoints.
+    #[default]
+    Listening,
+    /// Accepts no connections and dials listening members.
+    DialOut,
+}
+
+impl FleetMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Listening => "listening",
+            Self::DialOut => "dial-out",
+        }
+    }
+}
+
+/// Written when a member learns that it was removed from the fleet.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct FleetRemoval {
+    /// The member whose signed refusal reported it.
+    pub reported_by: String,
+    /// `member-removed` or `member-left`.
+    pub code: String,
+}
+
+/// `STATE/fleet/fleet.toml`: the fleet settings that `st fleet` commands write. Paths are
+/// relative to `STATE/fleet` unless absolute.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FleetFile {
+    pub fleet_id: String,
+    pub secret_file: PathBuf,
+    pub node_key_file: PathBuf,
+    pub anchor_key: Option<String>,
+    /// The name this machine joined under. It wins over `config.toml` and `--node`.
+    pub node: Option<String>,
+    /// The sponsor's name and member key from the join handshake. Until membership arrives,
+    /// the new member trusts only this key and the anchor's.
+    pub sponsor: Option<String>,
+    pub sponsor_key: Option<String>,
+    /// How this node reached its sponsor during the join: an `http://` URL, or
+    /// `fabric://NODE_ID/PROTOCOL`. The worker dials it until membership arrives.
+    pub sponsor_routes: Vec<String>,
+    pub mode: FleetMode,
+    pub port: Option<u16>,
+    pub transports: Vec<String>,
+    pub fabric_protocol: Option<String>,
+    /// Accept HMAC-only exchanges from config peers. True only during a migration.
+    pub legacy_peers: bool,
+    pub advertise_loopback: bool,
+    pub writer_floor: Option<u64>,
+    /// Executable overrides; tests point these at shims.
+    pub fabric: Option<PathBuf>,
+    pub tailscale: Option<PathBuf>,
+    pub removed: Option<FleetRemoval>,
+}
+
+impl FleetFile {
+    pub fn path(state_dir: &Path) -> PathBuf {
+        state_dir.join("fleet").join("fleet.toml")
+    }
+
+    pub fn load(state_dir: &Path) -> Result<Option<Self>> {
+        let path = Self::path(state_dir);
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => {
+                return Err(error).with_context(|| format!("read {}", path.display()));
+            }
+        };
+        let file: Self =
+            toml::from_str(&text).with_context(|| format!("parse {}", path.display()))?;
+        anyhow::ensure!(
+            uuid::Uuid::parse_str(&file.fleet_id).is_ok(),
+            "{} needs a fleet_id UUID",
+            path.display()
+        );
+        Ok(Some(file))
+    }
+
+    /// Write the file atomically with mode `0600` inside a `0700` directory.
+    pub fn save(&self, state_dir: &Path) -> Result<()> {
+        use std::io::Write as _;
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let path = Self::path(state_dir);
+        let directory = path.parent().expect("fleet.toml has a parent");
+        fs::create_dir_all(directory)?;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        let temporary = directory.join(format!(".fleet.toml.{}.tmp", std::process::id()));
+        {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&temporary)?;
+            file.write_all(b"# Written by st fleet. Change it with st fleet commands.\n")?;
+            file.write_all(toml::to_string(self)?.as_bytes())?;
+            file.sync_all()?;
+        }
+        fs::rename(&temporary, &path)?;
+        Ok(())
+    }
+
+    fn resolve(state_dir: &Path, path: &Path) -> PathBuf {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            state_dir.join("fleet").join(path)
+        }
+    }
+
+    pub fn secret_path(&self, state_dir: &Path) -> PathBuf {
+        let path = if self.secret_file.as_os_str().is_empty() {
+            Path::new("secret")
+        } else {
+            self.secret_file.as_path()
+        };
+        Self::resolve(state_dir, path)
+    }
+
+    pub fn node_key_path(&self, state_dir: &Path) -> PathBuf {
+        let path = if self.node_key_file.as_os_str().is_empty() {
+            Path::new("node.key")
+        } else {
+            self.node_key_file.as_path()
+        };
+        Self::resolve(state_dir, path)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
@@ -33,6 +170,9 @@ pub struct Config {
     pub planner: PlannerSpec,
     /// The local observation log of this node.
     pub observations: ObservationsConfig,
+    /// `STATE/fleet/fleet.toml`, merged by `apply_fleet_file` after command-line overrides.
+    #[serde(skip)]
+    pub fleet: Option<FleetFile>,
 }
 
 /// Observations of `local` retention stay on the node that made them. The daemon trims
@@ -44,6 +184,8 @@ pub struct ObservationsConfig {
     pub retention: String,
     /// The most observations to keep for one subject and kind.
     pub max_per_subject_kind: usize,
+    /// Export every local observation to an OpenTelemetry collector. Off when absent.
+    pub otlp: Option<crate::otlp::OtlpConfig>,
 }
 
 impl Default for ObservationsConfig {
@@ -51,6 +193,7 @@ impl Default for ObservationsConfig {
         Self {
             retention: "7d".into(),
             max_per_subject_kind: 20_000,
+            otlp: None,
         }
     }
 }
@@ -101,6 +244,7 @@ impl Default for Config {
             peers: Vec::new(),
             planner: PlannerSpec::default(),
             observations: ObservationsConfig::default(),
+            fleet: None,
         }
     }
 }
@@ -118,6 +262,14 @@ impl Config {
         Ok(config)
     }
 
+    /// Load the config, merge `STATE/fleet/fleet.toml`, and validate the result.
+    pub fn load_with_fleet(path: Option<&Path>) -> Result<Self> {
+        let mut config = Self::load_unvalidated(path)?;
+        config.apply_fleet_file()?;
+        config.validate()?;
+        Ok(config)
+    }
+
     pub fn load_unvalidated(path: Option<&Path>) -> Result<Self> {
         let selected = path
             .map(Path::to_path_buf)
@@ -129,11 +281,11 @@ impl Config {
             }
             Err(error) => {
                 return Err(error)
-                    .with_context(|| format!("read st3 config {}", selected.display()));
+                    .with_context(|| format!("read st config {}", selected.display()));
             }
         };
         let mut config: Self = toml::from_str(&bytes)
-            .with_context(|| format!("parse st3 config {}", selected.display()))?;
+            .with_context(|| format!("parse st config {}", selected.display()))?;
         let defaults = Self::default();
         if config.node.is_empty() {
             config.node = defaults.node;
@@ -148,6 +300,37 @@ impl Config {
             config.client_gateway_socket = defaults.client_gateway_socket;
         }
         Ok(config)
+    }
+
+    /// Merge `STATE/fleet/fleet.toml` from the effective state directory. Call it after
+    /// command-line overrides and before `validate`.
+    pub fn apply_fleet_file(&mut self) -> Result<()> {
+        let Some(file) = FleetFile::load(&self.state_dir)? else {
+            return Ok(());
+        };
+        if let Some(configured) = &self.fleet_id {
+            anyhow::ensure!(
+                *configured == file.fleet_id,
+                "config.toml names fleet `{configured}` but {} names fleet `{}`",
+                FleetFile::path(&self.state_dir).display(),
+                file.fleet_id
+            );
+        }
+        self.fleet_id = Some(file.fleet_id.clone());
+        if let Some(node) = &file.node {
+            self.node = node.clone();
+        }
+        if self.shared_secret_file.is_none() {
+            self.shared_secret_file = Some(file.secret_path(&self.state_dir));
+        }
+        if self.peer_listen.is_none()
+            && file.mode == FleetMode::Listening
+            && let Some(port) = file.port
+        {
+            self.peer_listen = Some(format!("127.0.0.1:{port}"));
+        }
+        self.fleet = Some(file);
+        Ok(())
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -174,7 +357,7 @@ impl Config {
             self.planner.provider != "opencode" || self.planner.effort.is_none(),
             "the OpenCode planner does not accept an effort override"
         );
-        anyhow::ensure!(!self.node.trim().is_empty(), "the st3 node label is empty");
+        anyhow::ensure!(!self.node.trim().is_empty(), "the st node label is empty");
         anyhow::ensure!(
             self.observations.retention_ms()? >= ObservationsConfig::MINIMUM_RETENTION_MS,
             "observations.retention must be at least 1h"
@@ -183,6 +366,9 @@ impl Config {
             self.observations.max_per_subject_kind > 0,
             "observations.max_per_subject_kind must be positive"
         );
+        if let Some(otlp) = &self.observations.otlp {
+            otlp.validate()?;
+        }
         anyhow::ensure!(
             self.person.as_deref().is_none_or(|person| {
                 person.starts_with("person/")
@@ -195,20 +381,32 @@ impl Config {
             self.socket != self.client_gateway_socket,
             "the privileged local socket and paired client gateway socket must be different"
         );
-        let fleet_configured = self.fleet_id.is_some() || self.shared_secret_file.is_some();
-        let peers_configured = self.peer_listen.is_some() || !self.peers.is_empty();
-        anyhow::ensure!(
-            fleet_configured == peers_configured,
-            "fleet_id and shared_secret_file are required exactly when fleet peers are configured"
-        );
         anyhow::ensure!(
             self.fleet_id.is_some() == self.shared_secret_file.is_some(),
             "fleet_id and shared_secret_file must be configured together"
         );
-        anyhow::ensure!(
-            self.peer_listen.is_some() == !self.peers.is_empty(),
-            "a fleet node needs both a peer listener and at least one peer"
-        );
+        match &self.fleet {
+            // A config-peer fleet, as before membership.
+            None => {
+                let fleet_configured = self.fleet_id.is_some() || self.shared_secret_file.is_some();
+                let peers_configured = self.peer_listen.is_some() || !self.peers.is_empty();
+                anyhow::ensure!(
+                    fleet_configured == peers_configured,
+                    "fleet_id and shared_secret_file are required exactly when fleet peers are configured"
+                );
+                anyhow::ensure!(
+                    self.peer_listen.is_some() == !self.peers.is_empty(),
+                    "a fleet node needs both a peer listener and at least one peer"
+                );
+            }
+            // A member: peers come from membership, so config peers are optional overrides.
+            Some(file) => {
+                anyhow::ensure!(
+                    file.mode == FleetMode::DialOut || self.peer_listen.is_some(),
+                    "a listening fleet member needs a peer listener or a port in fleet.toml"
+                );
+            }
+        }
         if let Some(fleet_id) = &self.fleet_id {
             anyhow::ensure!(
                 uuid::Uuid::parse_str(fleet_id).is_ok(),
@@ -242,7 +440,7 @@ impl Config {
                 .with_context(|| format!("parse peer URL for '{}'", peer.name))?;
             anyhow::ensure!(
                 url.scheme() == "http",
-                "peer '{}' must use plain http:// in st3 v1",
+                "peer '{}' must use plain http:// in st v1",
                 peer.name
             );
             let host = url.host_str().unwrap_or_default();
@@ -308,6 +506,13 @@ mod tests {
         }
         let mut config = Config::default();
         config.observations.max_per_subject_kind = 0;
+        assert!(config.validate().is_err());
+        assert_eq!(Config::default().observations.otlp, None);
+        let exported: Config =
+            toml::from_str("[observations.otlp]\nendpoint = \"http://127.0.0.1:4318\"\n").unwrap();
+        exported.validate().unwrap();
+        let mut config = exported.clone();
+        config.observations.otlp.as_mut().unwrap().endpoint = "ftp://collector".into();
         assert!(config.validate().is_err());
     }
 
@@ -412,5 +617,112 @@ url = "http://127.0.0.1:31314"
         config.fleet_id = Some("1f91ca65-7793-48cc-866e-ac15690130e1".into());
         config.shared_secret_file = Some(root.path().join("fleet.secret"));
         config.validate().unwrap();
+    }
+
+    #[test]
+    fn fleet_toml_merges_with_config_and_rejects_different_fleet_ids() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempdir().unwrap();
+        let state_dir = root.path().join("state");
+        FleetFile {
+            fleet_id: "5b0c1d8e-6a44-4f0e-9d51-2f7f3c9a0b12".into(),
+            port: Some(31999),
+            anchor_key: Some("anchor".into()),
+            ..FleetFile::default()
+        }
+        .save(&state_dir)
+        .unwrap();
+        let path = FleetFile::path(&state_dir);
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+
+        let mut config = Config {
+            state_dir: state_dir.clone(),
+            ..Config::default()
+        };
+        config.apply_fleet_file().unwrap();
+        assert_eq!(
+            config.fleet_id.as_deref(),
+            Some("5b0c1d8e-6a44-4f0e-9d51-2f7f3c9a0b12")
+        );
+        assert_eq!(
+            config.shared_secret_file.as_deref(),
+            Some(state_dir.join("fleet/secret").as_path())
+        );
+        assert_eq!(config.peer_listen.as_deref(), Some("127.0.0.1:31999"));
+        assert!(config.peers.is_empty());
+        config.validate().unwrap();
+
+        let mut conflicting = Config {
+            state_dir,
+            fleet_id: Some("1f91ca65-7793-48cc-866e-ac15690130e1".into()),
+            ..Config::default()
+        };
+        assert!(
+            conflicting
+                .apply_fleet_file()
+                .unwrap_err()
+                .to_string()
+                .contains("names fleet")
+        );
+    }
+
+    #[test]
+    fn a_dial_out_member_needs_no_listener_and_a_listening_member_does() {
+        let root = tempdir().unwrap();
+        let state_dir = root.path().join("state");
+        let mut file = FleetFile {
+            fleet_id: "5b0c1d8e-6a44-4f0e-9d51-2f7f3c9a0b12".into(),
+            mode: FleetMode::DialOut,
+            ..FleetFile::default()
+        };
+        file.save(&state_dir).unwrap();
+        let mut config = Config {
+            state_dir: state_dir.clone(),
+            ..Config::default()
+        };
+        config.apply_fleet_file().unwrap();
+        assert!(config.peer_listen.is_none());
+        config.validate().unwrap();
+
+        file.mode = FleetMode::Listening;
+        file.save(&state_dir).unwrap();
+        let mut config = Config {
+            state_dir,
+            ..Config::default()
+        };
+        config.apply_fleet_file().unwrap();
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("listening fleet member")
+        );
+    }
+
+    #[test]
+    fn a_node_without_fleet_toml_keeps_the_config_peer_rules() {
+        let root = tempdir().unwrap();
+        let mut config = Config {
+            state_dir: root.path().join("state"),
+            ..Config::default()
+        };
+        config.apply_fleet_file().unwrap();
+        assert!(config.fleet.is_none());
+        config.peer_listen = Some("127.0.0.1:31313".into());
+        config.fleet_id = Some("1f91ca65-7793-48cc-866e-ac15690130e1".into());
+        config.shared_secret_file = Some(root.path().join("secret"));
+        assert!(config.validate().unwrap_err().to_string().contains("both"));
     }
 }

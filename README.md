@@ -6,6 +6,9 @@ harness, daemon, and machine restarts. One daemon runs on each machine; machines
 
 ## Install
 
+Download prebuilt Linux x86_64 or macOS arm64 tools from [tagged releases](docs/st3/binary-releases.md),
+or build from source below.
+
 With Nix, from a checkout:
 
 ```sh
@@ -46,6 +49,9 @@ st service install
 st service status
 st doctor --strict
 ```
+
+Run `st service install` again after upgrading the binaries. It updates the installed definitions
+and restarts the services so they use the new executables.
 
 On Linux the service is a systemd user unit. It needs a working user manager; enable lingering
 (`loginctl enable-linger`) so seats keep running after you log out. On macOS it is a launchd
