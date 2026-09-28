@@ -1,5 +1,12 @@
 # Small Talk
 
+## Continuous integration
+
+Small Talk runs pull request and main branch CI on our own Linux and macOS machines through
+`st`. The `st/ci` commit status reports the Linux debug workspace tests and Clippy;
+`st/ci-macos` reports the same checks on macOS. GitHub Actions handles tags and forked
+pull requests. See [CI operations](docs/ci.md) to inspect a failing run.
+
 Small Talk (`st`) runs coding agents as durable seats and hands them work as missions. The graph
 records every seat, mission, step, message, and decision, so the state of your agents survives
 harness, daemon, and machine restarts. One daemon runs on each machine; machines can join a fleet.
@@ -49,6 +56,9 @@ st service install
 st service status
 st doctor --strict
 ```
+
+Run `st service install` again after upgrading the binaries. It updates the installed definitions
+and restarts the services so they use the new executables.
 
 On Linux the service is a systemd user unit. It needs a working user manager; enable lingering
 (`loginctl enable-linger`) so seats keep running after you log out. On macOS it is a launchd

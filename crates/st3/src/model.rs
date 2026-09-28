@@ -1503,6 +1503,8 @@ pub struct AttentionItemView {
     pub kind: String,
     pub subject: String,
     pub person: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requester_id: Option<String>,
     pub title: String,
     pub detail: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2252,6 +2254,22 @@ pub struct ReplicaEnvelope {
     pub accepted_at_unix_ms: u128,
     /// Base64-encoded CBOR. Receipt does not decode this field.
     pub payload: String,
+    /// The writer's member key and its signature over this envelope, when the writer is a
+    /// keyed fleet member. Older peers ignore and drop both fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+}
+
+/// A writer's signature for an envelope that the other side already holds.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ReplicaEnvelopeSignature {
+    pub writer: String,
+    pub sequence: u64,
+    pub hash: String,
+    pub member_key: String,
+    pub signature: String,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -2286,12 +2304,21 @@ pub struct ReplicationExchange {
     pub inventory: ReplicationInventory,
     #[serde(default)]
     pub envelopes: Vec<ReplicaEnvelope>,
+    /// Envelopes the sender holds but cannot admit until it has their writer's signature.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signature_requests: Vec<ReplicaEnvelopeId>,
+    /// Signatures answering the other side's `signature_requests`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signatures: Vec<ReplicaEnvelopeSignature>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReplicationReceipt {
     pub received: usize,
     pub duplicate: usize,
+    /// Envelope signatures stored for the first time.
+    #[serde(default)]
+    pub signatures: usize,
     pub inventory: ReplicationInventory,
 }
 
@@ -2301,6 +2328,9 @@ pub struct ReplicationExportRequest {
     pub inventory: ReplicationInventory,
     #[serde(default)]
     pub summary_only: bool,
+    /// The other side's signature requests, to answer in the exported exchange.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub signature_requests: Vec<ReplicaEnvelopeId>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2358,6 +2388,12 @@ pub struct ReplicationStatus {
     pub unknown_records: u64,
     pub invalid_records: u64,
     pub repaired_records: u64,
+    /// Envelopes of keyed writers held until their writer's signature arrives.
+    #[serde(default)]
+    pub unsigned_envelopes: u64,
+    /// Envelopes held because no incarnation of their writer holds their sequence.
+    #[serde(default)]
+    pub fenced_envelopes: u64,
     pub unhealthy_projections: u64,
     pub peers: Vec<ReplicationPeerStatus>,
 }

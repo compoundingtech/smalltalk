@@ -25,6 +25,28 @@ The secret contains 32 raw bytes or 64 hexadecimal characters. Its file mode mus
 
 The listener and every peer URL must use loopback. Fabric or a similar local port exposer carries traffic between hosts.
 
+On a node that only receives connections from a peer, list its name without a URL:
+
+```toml
+[[peers]]
+name = "node-b"
+```
+
+This accepts node-b's authenticated exchanges and never dials it. The equivalent command-line
+entry is `--peer node-b`. A peer is observed as up after a successful exchange in either
+direction; it becomes down only after 90 seconds without a success. The worker checks peers
+without URLs once a minute. Repeated checks do not write repeated transport claims.
+
+### Fleet members
+
+A node that joined or migrated keeps its fleet settings in `STATE/fleet/fleet.toml`, written by
+`st fleet` commands, and needs no `[[peers]]`. Its peers come from membership claims in the graph:
+it dials every current listening member and accepts exchanges from current members that sign with
+their member keys. A dial-out member accepts no connections, is never dialed, and neither records
+nor receives transport observations. A `[[peers]]` entry for a member is that member's first route
+from this machine. Service units for a member carry no peer, fleet, or secret arguments. See
+[Fleet join](../fleet-join.md) for invites, removal, and migration.
+
 ## Process boundary
 
 The main daemon owns the local API, projections, reconciliation, and runtime changes.

@@ -191,7 +191,8 @@ impl ApiError {
             | "missing-subject-token"
             | "stale-document-token"
             | "stale-incarnation"
-            | "stale-launch-preview" => StatusCode::CONFLICT,
+            | "stale-launch-preview"
+            | "fleet-leaving" => StatusCode::CONFLICT,
             "launch-review-not-authorized" | "wrong-message-recipient" => StatusCode::FORBIDDEN,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
@@ -397,6 +398,25 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/internal/replication/peer-failure",
             post(replication_peer_failure),
         )
+        .route("/v1/internal/fleet/membership", get(fleet_membership_view))
+        .route("/v1/internal/fleet/status", get(fleet_status))
+        .route(
+            "/v1/internal/fleet/invites",
+            get(fleet_invite_list).post(fleet_invite_create),
+        )
+        .route(
+            "/v1/internal/fleet/invites/revoke",
+            post(fleet_invite_revoke),
+        )
+        .route("/v1/internal/fleet/redeem", post(fleet_redeem))
+        .route("/v1/internal/fleet/remove", post(fleet_remove))
+        .route("/v1/internal/fleet/leave/begin", post(fleet_leave_begin))
+        .route("/v1/internal/fleet/leave/cancel", post(fleet_leave_cancel))
+        .route("/v1/internal/fleet/leave/claim", post(fleet_leave_claim))
+        .route(
+            "/v1/internal/fleet/endpoints",
+            post(fleet_publish_endpoints),
+        )
         .route("/v1/internal/replication-wake", post(replication_wake))
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*run}", get(get_eval))
@@ -441,11 +461,12 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/sessions/attach/{*subject}", post(attach_session))
         .route("/v1/sessions/{subject}/attach", post(attach_session))
         .route("/v1/sessions/terminal/{*subject}", get(terminal_session));
-    app.layer(from_fn_with_state(
-        (state.clone(), transport),
-        response_envelope,
-    ))
-    .with_state(state)
+    app.layer(from_fn_with_state(state.clone(), refuse_while_leaving))
+        .layer(from_fn_with_state(
+            (state.clone(), transport),
+            response_envelope,
+        ))
+        .with_state(state)
 }
 
 async fn schema() -> Json<Value> {
@@ -1630,12 +1651,12 @@ fn client_attention_actions(kind: &str) -> Vec<&'static str> {
             vec!["mission.approve-revision", "mission.cancel-revision"]
         }
         "unread-message" => vec!["message.read"],
-        "fault" => vec!["attention.resolve"],
+        "fault" | "agent-request" => vec!["attention.resolve"],
         _ => Vec::new(),
     }
 }
 
-/// Both the default and the history view rank a fault by the severity its requester gave.
+/// Both the default and the history view rank a request by the severity its requester gave.
 fn attention_priority(severity: &str) -> &'static str {
     match severity {
         "critical" => "critical",
@@ -1645,7 +1666,7 @@ fn attention_priority(severity: &str) -> &'static str {
     }
 }
 
-/// Beside each fault target, what that target is doing now, so a leftover request is
+/// Beside each request target, what that target is doing now, so a leftover request is
 /// recognizable without opening every target.
 fn insert_attention_target_states(
     store: &Store,
@@ -1683,7 +1704,7 @@ fn client_attention_resources(
     let mut resources = BTreeMap::new();
     for item in &current {
         let id = attention_resource_id(&item.subject);
-        let priority = if item.kind == "fault" {
+        let priority = if matches!(item.kind.as_str(), "fault" | "agent-request") {
             store
                 .attention_request(&item.subject)?
                 .map_or("high", |request| attention_priority(&request.severity))
@@ -1715,7 +1736,12 @@ fn client_attention_resources(
         let object = resource
             .as_object_mut()
             .expect("an attention resource is an object");
-        if item.kind == "fault" && attention_requester_retired(store, item, &mut retired_seats)? {
+        if let Some(requester) = &item.requester_id {
+            object.insert("requester_id".into(), Value::String(requester.clone()));
+        }
+        if matches!(item.kind.as_str(), "fault" | "agent-request")
+            && attention_requester_retired(store, item, &mut retired_seats)?
+        {
             object["operational"]["reasons"] = json!(["requester-retired"]);
         }
         if let Some(mission) = &item.mission {
@@ -1727,7 +1753,7 @@ fn client_attention_resources(
         if let Some(step) = &item.step {
             object.insert("step_run_id".into(), Value::String(step.clone()));
         }
-        if item.kind == "fault" {
+        if matches!(item.kind.as_str(), "fault" | "agent-request") {
             insert_attention_target_states(store, object, &item.targets)?;
         }
         resources.insert(id, resource);
@@ -1742,12 +1768,18 @@ fn client_attention_resources(
                 reasons.push("superseded");
             }
             let id = attention_resource_id(&request.subject);
+            let kind = if crate::store::agent_attention_requester(&request.actor) {
+                "agent-request"
+            } else {
+                "fault"
+            };
             let mut resource = json!({
                     "id": id,
                     "kind": "attention",
-                    "attention_kind": "fault",
+                    "attention_kind": kind,
                     "source_id": request.subject,
                     "person_id": request.reviewer,
+                    "requester_id": request.actor,
                     "revision": request.request,
                     "updated_at": client_timestamp(request.resolved_at_unix_ms.unwrap_or(request.requested_at_unix_ms)),
                     "title": request.title,
@@ -1756,7 +1788,7 @@ fn client_attention_resources(
                     "state": if request.status == "pending" { "open" } else { "resolved" },
                     "requested_at": client_timestamp(request.requested_at_unix_ms),
                     "targets": request.targets,
-                    "actions": if current { client_attention_actions("fault") } else { Vec::<&str>::new() },
+                    "actions": if current { client_attention_actions(kind) } else { Vec::<&str>::new() },
                     "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
             });
             insert_attention_target_states(
@@ -3294,7 +3326,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     match state.store.replication_status(
         state.fleet_id.is_some(),
         state.fleet_id.as_deref(),
-        &state.configured_peers,
+        &replication_peer_names(state),
     ) {
         Ok(replication) if !replication.configured => checks.push(DoctorCheck {
             name: "replication".into(),
@@ -3334,6 +3366,52 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         }
         Err(error) => checks.push(DoctorCheck {
             name: "replication".into(),
+            status: "fail".into(),
+            message: error.to_string(),
+        }),
+    }
+    // Once a node pins a fleet anchor, membership decides admission. Report what waits for a
+    // signature, what is fenced, and what was admitted before this node knew better.
+    match state.store.fleet_anchor() {
+        Ok(None) => {}
+        Ok(Some(_)) => match (
+            state
+                .store
+                .replication_status(true, state.fleet_id.as_deref(), &[]),
+            state.store.fleet_admission_residue(),
+        ) {
+            (Ok(holds), Ok(residue)) => {
+                let mut notes = vec![format!(
+                    "{} envelopes wait for their writer's signature; {} are fenced",
+                    holds.unsigned_envelopes, holds.fenced_envelopes
+                )];
+                notes.extend(residue.iter().map(|item| {
+                    format!(
+                        "{} envelopes from {} were {}",
+                        item.envelopes,
+                        item.writer,
+                        item.reason.replace('-', " ")
+                    )
+                }));
+                checks.push(DoctorCheck {
+                    name: "fleet-admission".into(),
+                    status: if residue.is_empty() && holds.unsigned_envelopes == 0 {
+                        "pass"
+                    } else {
+                        "warn"
+                    }
+                    .into(),
+                    message: notes.join("; "),
+                });
+            }
+            (Err(error), _) | (_, Err(error)) => checks.push(DoctorCheck {
+                name: "fleet-admission".into(),
+                status: "fail".into(),
+                message: error.to_string(),
+            }),
+        },
+        Err(error) => checks.push(DoctorCheck {
+            name: "fleet-admission".into(),
             status: "fail".into(),
             message: error.to_string(),
         }),
@@ -3378,7 +3456,7 @@ async fn replication_status(
     let store = state.store.clone();
     let configured = state.fleet_id.is_some();
     let fleet = state.fleet_id.clone();
-    let peers = state.configured_peers.clone();
+    let peers = replication_peer_names(&state);
     blocking_store(move || store.replication_status(configured, fleet.as_deref(), &peers))
         .await
         .map(Json)
@@ -3448,7 +3526,11 @@ async fn replication_export(
         let exchange = if request.summary_only {
             store.export_replication_summary(&request.fleet_id)?
         } else {
-            store.export_replication_exchange(&request.fleet_id, &request.inventory)?
+            store.export_replication_exchange_answering(
+                &request.fleet_id,
+                &request.inventory,
+                &request.signature_requests,
+            )?
         };
         Ok(Json(ReplicationExportResponse {
             exchange,
@@ -3475,24 +3557,29 @@ async fn replication_receive(
             &request.fleet_id,
             &request.exchange,
         )?;
-        store
-            .record_transport_observation(&request.peer, "up", None, None)
-            .map_err(|error| St3Error::new("internal", error.to_string()))?;
-        let (admission, repairs, projected) = if replication_receive_has_new_data(receipt.received)
+        if store
+            .observes_transport_to(&request.peer)
+            .map_err(|error| St3Error::new("internal", error.to_string()))?
         {
-            let admission = store
-                .validate_replication_backlog()
+            store
+                .record_transport_observation(&request.peer, "up", None, None)
                 .map_err(|error| St3Error::new("internal", error.to_string()))?;
-            let repairs = store
-                .apply_replication_repairs()
-                .map_err(|error| St3Error::new("internal", error.to_string()))?;
-            let projected = store
-                .project_replication_backlog()
-                .map_err(|error| St3Error::new("internal", error.to_string()))?;
-            (admission, repairs, projected)
-        } else {
-            (Default::default(), 0, true)
-        };
+        }
+        let (admission, repairs, projected) =
+            if replication_receive_has_new_data(receipt.received + receipt.signatures) {
+                let admission = store
+                    .validate_replication_backlog()
+                    .map_err(|error| St3Error::new("internal", error.to_string()))?;
+                let repairs = store
+                    .apply_replication_repairs()
+                    .map_err(|error| St3Error::new("internal", error.to_string()))?;
+                let projected = store
+                    .project_replication_backlog()
+                    .map_err(|error| St3Error::new("internal", error.to_string()))?;
+                (admission, repairs, projected)
+            } else {
+                (Default::default(), 0, true)
+            };
         let store_index = store
             .index()
             .map_err(|error| St3Error::new("internal", error.to_string()))?;
@@ -3538,13 +3625,15 @@ async fn replication_peer_failure(
     let store = state.store.clone();
     let changed = blocking_store(move || {
         let before_index = store.index()?;
-        store.record_peer_failure(&request.peer, &request.status, &request.error)?;
-        store.record_transport_observation(
-            &request.peer,
-            &request.status,
-            Some(&request.error),
-            None,
-        )?;
+        let stale = store.record_peer_failure(&request.peer, &request.status, &request.error)?;
+        if stale && store.observes_transport_to(&request.peer)? {
+            store.record_transport_observation(
+                &request.peer,
+                &request.status,
+                Some(&request.error),
+                None,
+            )?;
+        }
         Ok(store.index()? != before_index)
     })
     .await?;
@@ -3552,6 +3641,416 @@ async fn replication_peer_failure(
         signal_changed(&state);
     }
     Ok(Json(json!({ "recorded": true, "changed": changed })))
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FleetEndpointsRequest {
+    pub mode: String,
+    pub endpoints: Vec<Value>,
+}
+
+async fn fleet_publish_endpoints(
+    State(state): State<AppState>,
+    Json(request): Json<FleetEndpointsRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let store = state.store.clone();
+    let written = blocking_store(move || {
+        store.publish_fleet_endpoints(&request.mode, &request.endpoints, env!("CARGO_PKG_VERSION"))
+    })
+    .await?;
+    if written {
+        signal_changed(&state);
+    }
+    Ok(Json(json!({ "published": written })))
+}
+
+/// The peers a node reports on: its config peers and the current listening members it dials.
+/// A dial-out member is never dialed, and an ended name is history, so neither is reported.
+fn replication_peer_names(state: &AppState) -> Vec<String> {
+    let view = state.store.fleet_view().unwrap_or_default();
+    let mut names = state
+        .configured_peers
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    names.extend(
+        view.members
+            .iter()
+            .filter(|member| member.state == "current" && member.mode == "listening")
+            .map(|member| member.name.clone()),
+    );
+    names.retain(|name| {
+        let current = view.current(name);
+        let ended = view.members.iter().any(|member| member.name == *name) && current.is_empty();
+        *name != state.node
+            && !ended
+            && !view.legacy_removed.contains(name)
+            && current.iter().all(|member| member.mode != "dial-out")
+    });
+    names.into_iter().collect()
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FleetInviteRequest {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub expires_seconds: u64,
+    #[serde(default)]
+    pub via: Option<String>,
+    #[serde(default)]
+    pub migrate: bool,
+    pub person: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FleetInviteCreated {
+    pub invite: String,
+    pub code: String,
+    pub expires_at_unix_ms: u64,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FleetInviteRevokeRequest {
+    pub invite: String,
+    pub reason: String,
+    pub person: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FleetStatus {
+    pub node: String,
+    pub fleet_id: Option<String>,
+    pub member_key: Option<String>,
+    pub view: crate::fleet::FleetView,
+    pub peers: Vec<crate::model::ReplicationPeerStatus>,
+    pub invites: Vec<crate::store::FleetInviteView>,
+}
+
+fn concrete_person(person: &str) -> Result<(), ApiError> {
+    if person.starts_with("person/") && person.matches('/').count() == 1 && person.len() > 7 {
+        Ok(())
+    } else {
+        Err(ApiError::bad(St3Error::new(
+            "person-required",
+            "fleet operations need a concrete person/NAME",
+        )))
+    }
+}
+
+async fn fleet_status(State(state): State<AppState>) -> Result<Json<FleetStatus>, ApiError> {
+    let peers = replication_peer_names(&state);
+    let store = state.store.clone();
+    let node = state.node.clone();
+    let fleet_id = state.fleet_id.clone();
+    blocking_store(move || {
+        let replication =
+            store.replication_status(fleet_id.is_some(), fleet_id.as_deref(), &peers)?;
+        Ok(FleetStatus {
+            node,
+            fleet_id,
+            member_key: store.member_public_key(),
+            view: store.fleet_view()?,
+            peers: replication.peers,
+            invites: store.fleet_invites(false)?,
+        })
+    })
+    .await
+    .map(Json)
+}
+
+#[derive(Deserialize)]
+struct FleetInviteListQuery {
+    #[serde(default)]
+    all: bool,
+}
+
+async fn fleet_invite_list(
+    State(state): State<AppState>,
+    Query(query): Query<FleetInviteListQuery>,
+) -> Result<Json<Vec<crate::store::FleetInviteView>>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.fleet_invites(query.all))
+        .await
+        .map(Json)
+}
+
+fn internal_error(error: impl std::fmt::Display) -> St3Error {
+    St3Error::new("internal", error.to_string())
+}
+
+async fn fleet_invite_create(
+    State(state): State<AppState>,
+    Json(request): Json<FleetInviteRequest>,
+) -> Result<Json<FleetInviteCreated>, ApiError> {
+    use crate::fleet::code::{CodeEndpoint, JoinCode, fingerprint};
+    concrete_person(&request.person)?;
+    let fleet_id = state.fleet_id.clone().ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "not-in-a-fleet",
+            "this node is not in a fleet; run st fleet create first",
+        ))
+    })?;
+    let store = state.store.clone();
+    let node = state.node.clone();
+    let created = blocking_action(move || {
+        let via = request.via.clone().unwrap_or_else(|| "auto".into());
+        if !matches!(via.as_str(), "auto" | "tailscale" | "fabric" | "loopback") {
+            return Err(St3Error::new(
+                "invalid-via",
+                "--via is auto, tailscale, fabric, or loopback",
+            ));
+        }
+        let membership = store.fleet_membership().map_err(internal_error)?;
+        let crate::fleet::MemberState::Current(own) = membership.state(&node) else {
+            return Err(St3Error::new(
+                "not-a-member",
+                "this node is not a current fleet member",
+            ));
+        };
+        let wanted = |transport: &str| via == "auto" || via == transport;
+        let text = |value: &Value, field: &str| value[field].as_str().map(str::to_owned);
+        let endpoints = own
+            .endpoints
+            .iter()
+            .filter_map(|endpoint| {
+                let transport = endpoint["transport"].as_str()?;
+                if !wanted(transport) {
+                    return None;
+                }
+                match transport {
+                    "tailscale" => Some(CodeEndpoint::Tailscale(text(endpoint, "address")?)),
+                    "fabric" => Some(CodeEndpoint::Fabric {
+                        node: text(endpoint, "node")?,
+                        protocol: text(endpoint, "protocol")?,
+                    }),
+                    "loopback" => Some(CodeEndpoint::Loopback(text(endpoint, "address")?)),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<_>>();
+        if endpoints.is_empty() {
+            return Err(St3Error::new(
+                "no-endpoints",
+                format!(
+                    "this member advertises no {} endpoint yet; is its replication worker running?",
+                    if via == "auto" {
+                        "reachable"
+                    } else {
+                        via.as_str()
+                    }
+                ),
+            ));
+        }
+        let transports = endpoints
+            .iter()
+            .map(|endpoint| match endpoint {
+                CodeEndpoint::Tailscale(_) => "tailscale".to_owned(),
+                CodeEndpoint::Fabric { .. } => "fabric".to_owned(),
+                CodeEndpoint::Loopback(_) => "loopback".to_owned(),
+            })
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let member_key = store
+            .member_public_key()
+            .ok_or_else(|| St3Error::new("no-member-key", "this node has no member key"))?;
+        let invite = store.create_fleet_invite(
+            request.name.as_deref(),
+            std::time::Duration::from_secs(request.expires_seconds),
+            &transports,
+            &request.person,
+            request.migrate,
+        )?;
+        let code = JoinCode {
+            fleet_id: uuid::Uuid::parse_str(&fleet_id).map_err(internal_error)?,
+            invite: hex::decode(&invite.invite)
+                .ok()
+                .and_then(|bytes| bytes.try_into().ok())
+                .ok_or_else(|| St3Error::new("internal", "the invite ID is damaged"))?,
+            token: invite.token,
+            fingerprint: fingerprint(&member_key),
+            expires_at: invite.expires_at_unix_ms / 1000,
+            name: request.name.clone(),
+            migrate: request.migrate,
+            endpoints,
+        }
+        .encode()
+        .map_err(internal_error)?;
+        Ok(FleetInviteCreated {
+            invite: format!("fleet-invite/{}", invite.invite),
+            code,
+            expires_at_unix_ms: invite.expires_at_unix_ms,
+        })
+    })
+    .await?;
+    signal_changed(&state);
+    Ok(Json(created))
+}
+
+async fn fleet_invite_revoke(
+    State(state): State<AppState>,
+    Json(request): Json<FleetInviteRevokeRequest>,
+) -> Result<Json<Value>, ApiError> {
+    concrete_person(&request.person)?;
+    let store = state.store.clone();
+    let invite = request
+        .invite
+        .strip_prefix("fleet-invite/")
+        .unwrap_or(&request.invite)
+        .to_owned();
+    blocking_store(move || {
+        store.revoke_fleet_invite(&invite, &request.reason, Some(&request.person))
+    })
+    .await?;
+    signal_changed(&state);
+    Ok(Json(json!({ "revoked": true })))
+}
+
+async fn fleet_redeem(
+    State(state): State<AppState>,
+    Json(request): Json<crate::fleet::handshake::JoinRequest>,
+) -> Result<Json<Value>, ApiError> {
+    use crate::store::FleetRedemption;
+    let store = state.store.clone();
+    let state_dir = state.state_dir.clone();
+    let fleet_id = state.fleet_id.clone();
+    let (answer, changed) = blocking_store(move || {
+        Ok(match store.redeem_fleet_invite(&request)? {
+            FleetRedemption::Closed => (json!({ "status": "closed" }), false),
+            FleetRedemption::Refused(reason) => {
+                (json!({ "status": "refused", "reason": reason }), false)
+            }
+            FleetRedemption::Admitted {
+                token,
+                writer_floor,
+                admitted_claim,
+                first,
+            } => {
+                let fleet_id =
+                    fleet_id.ok_or_else(|| anyhow::anyhow!("this node is not in a fleet"))?;
+                let fabric_protocol = crate::config::FleetFile::load(&state_dir)?
+                    .and_then(|file| file.fabric_protocol)
+                    .unwrap_or_else(|| crate::fleet::transport::default_fabric_protocol(&fleet_id));
+                (
+                    json!({
+                        "status": "admitted",
+                        "token": hex::encode(token),
+                        "writer_floor": writer_floor,
+                        "admitted_claim": admitted_claim,
+                        "anchor_key": store.fleet_anchor()?,
+                        "fleet_id": fleet_id,
+                        "fabric_protocol": fabric_protocol,
+                    }),
+                    first,
+                )
+            }
+        })
+    })
+    .await?;
+    if changed {
+        signal_changed(&state);
+    }
+    Ok(Json(answer))
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FleetRemoveRequest {
+    pub name: String,
+    pub reason: String,
+    pub person: String,
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct FleetPersonRequest {
+    pub person: String,
+}
+
+async fn fleet_remove(
+    State(state): State<AppState>,
+    Json(request): Json<FleetRemoveRequest>,
+) -> Result<Json<crate::store::FleetRemoval>, ApiError> {
+    concrete_person(&request.person)?;
+    let store = state.store.clone();
+    let removal = blocking_action(move || {
+        store.remove_fleet_member(&request.name, &request.reason, &request.person)
+    })
+    .await?;
+    signal_changed(&state);
+    Ok(Json(removal))
+}
+
+async fn fleet_leave_begin(
+    State(state): State<AppState>,
+    Json(request): Json<FleetPersonRequest>,
+) -> Result<Json<Value>, ApiError> {
+    concrete_person(&request.person)?;
+    let store = state.store.clone();
+    blocking_store(move || store.set_fleet_leaving(true)).await?;
+    Ok(Json(json!({ "leaving": true })))
+}
+
+/// The body is read and ignored, so the answer never races a client still sending it.
+async fn fleet_leave_cancel(
+    State(state): State<AppState>,
+    _body: axum::body::Bytes,
+) -> Result<Json<Value>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.set_fleet_leaving(false)).await?;
+    Ok(Json(json!({ "leaving": false })))
+}
+
+async fn fleet_leave_claim(
+    State(state): State<AppState>,
+    Json(request): Json<FleetPersonRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    concrete_person(&request.person)?;
+    let store = state.store.clone();
+    let claim = blocking_action(move || store.leave_fleet(&request.person)).await?;
+    signal_changed(&state);
+    Ok(Json(claim))
+}
+
+/// While this node leaves its fleet, it refuses every new write except the leave itself and
+/// replication traffic, so the leave stays its writer's last batch.
+async fn refuse_while_leaving(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    let mutating =
+        request.method() != axum::http::Method::GET && request.method() != axum::http::Method::HEAD;
+    // Replication keeps running so the drain can finish; it writes no local claims while
+    // leaving, because transport observations stop. Everything else that writes waits,
+    // including invite redemption and endpoint announcements.
+    let allowed = path.starts_with("/v1/internal/fleet/leave/")
+        || matches!(
+            path,
+            "/v1/health"
+                | "/v1/internal/replication/export"
+                | "/v1/internal/replication/receive"
+                | "/v1/internal/replication/peer-failure"
+                | "/v1/internal/replication-wake"
+        );
+    if mutating && !allowed && state.store.fleet_leaving().unwrap_or(false) {
+        // Read the body before refusing: an answer sent while the client is still writing
+        // closes the connection under it, and the client then reports a broken pipe instead
+        // of this refusal.
+        let _ = axum::body::to_bytes(request.into_body(), 1 << 20).await;
+        return ApiError::bad(St3Error::new(
+            "fleet-leaving",
+            "this node is leaving its fleet and accepts no new writes; `st fleet leave --cancel` stops the leave",
+        ))
+        .into_response();
+    }
+    next.run(request).await
+}
+
+async fn fleet_membership_view(
+    State(state): State<AppState>,
+) -> Result<Json<crate::fleet::FleetView>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.fleet_view()).await.map(Json)
 }
 
 async fn replication_wake(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -5561,6 +6060,29 @@ async fn resolve_attention(
         .store
         .resolve_attention(&subject, &request)
         .map_err(ApiError::bad)?;
+    if crate::store::agent_attention_requester(&response.actor) {
+        let content = match response.resolution_reason.as_deref() {
+            Some(reason) if !reason.trim().is_empty() => format!(
+                "Your attention request `{}` was {}. Reason: {}",
+                response.subject, request.outcome, reason
+            ),
+            _ => format!(
+                "Your attention request `{}` was {}.",
+                response.subject, request.outcome
+            ),
+        };
+        send_planning_message(
+            &state,
+            &format!(
+                "attention-resolution:{}:{}",
+                response.request, request.idempotency_key
+            ),
+            &request.actor,
+            &response.actor,
+            &content,
+            "Attention request answered",
+        )?;
+    }
     signal_changed(&state);
     Ok(Json(response))
 }
@@ -5621,6 +6143,14 @@ async fn post_review(
         return Err(ApiError::bad(St3Error::new(
             "invalid-review-decision",
             "a review decision must be approved or rejected",
+        )));
+    }
+    if request.decision == "rejected"
+        && request.reason.as_deref().is_none_or(|reason| reason.trim().is_empty())
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "missing-review-reason",
+            "a rejected review needs a reason",
         )));
     }
     let subject = if subject.starts_with("resource/")
@@ -5705,6 +6235,56 @@ async fn post_review(
             idempotency_key: None,
         })
         .map_err(ApiError::bad)?;
+    if request.decision == "rejected" {
+        if let Some(owner) = review_request
+            .as_ref()
+            .and_then(|claim| claim.body.pointer("/fields/owner"))
+            .and_then(Value::as_str)
+        {
+            if owner.starts_with("step-run/") {
+                let step = state.store.step_run(owner).map_err(ApiError::internal)?;
+                let claimant = if let Some(step) = step {
+                    if step.claimant.is_some() || step.carried_claimant.is_some() {
+                        step.claimant.or(step.carried_claimant)
+                    } else {
+                        state
+                            .store
+                            .claims_for(owner, Some("work.claimed"))
+                            .map_err(ApiError::internal)?
+                            .into_iter()
+                            .rev()
+                            .find(|claim| {
+                                claim.body.pointer("/fields/attempt").and_then(Value::as_u64)
+                                    == Some(u64::from(step.attempt))
+                            })
+                            .and_then(|claim| {
+                                claim.body
+                                    .pointer("/fields/claimant")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                    }
+                } else {
+                    None
+                };
+                if let Some(claimant) = claimant {
+                    let reason = response
+                        .body
+                        .pointer("/fields/reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("No reason provided.");
+                    send_planning_message(
+                        &state,
+                        &format!("review-rejected:{}:{claimant}", response.id),
+                        response.actor.as_deref().unwrap_or("daemon/runtime"),
+                        &claimant,
+                        &format!("Your work on `{owner}` was rejected. Reason: {reason}"),
+                        "Human review rejected",
+                    )?;
+                }
+            }
+        }
+    }
     signal_changed(&state);
     Ok(Json(response))
 }
@@ -12807,9 +13387,14 @@ version 2
         let source = r#"
 version 2
 
+  agent "worker" { workspace "/tmp"; command "true" }
   mission "review-api" state="ready" {
     goal "Complete mission review-api."
-    step "approval" { gate "human-review" type="human" { reviewer "person/nathan" } }
+    step "approval" {
+      goal "Submit the candidate."
+      assigned-to "agent/worker"
+      gate "human-review" type="human" { reviewer "person/nathan" }
+    }
   }
 
 "#;
@@ -12841,6 +13426,42 @@ version 2
             })
             .unwrap();
         let step = &run.steps[0];
+        assert!(!step.agentless, "{step:?}");
+        let claimant = step.assigned_to.clone().expect("the step has an assignee");
+        state
+            .store
+            .set_step_state(&step.subject, "ready", None)
+            .unwrap();
+        state
+            .store
+            .work_action(
+                &step.subject,
+                "claim",
+                &crate::model::WorkRequest {
+                    actor: Some(claimant.clone()),
+                    incarnation: Some("test-incarnation".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "review-api-claim".into(),
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .work_action(
+                &step.subject,
+                "complete",
+                &crate::model::WorkRequest {
+                    actor: Some(claimant.clone()),
+                    incarnation: Some("test-incarnation".into()),
+                    summary: Some("Candidate submitted for review".into()),
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "review-api-submit".into(),
+                },
+            )
+            .unwrap();
         let request_fields = |owner: String, definition: String, operation: &str| {
             BTreeMap::from([
                 ("owner".into(), Value::String(owner)),
@@ -13007,6 +13628,22 @@ version 2
         );
         assert_eq!(accepted_mission["body"]["fields"]["verdict"], "pass");
 
+        let missing_reason = serde_json::to_value(ReviewRequest {
+            decision: "rejected".into(),
+            reason: None,
+            actor: Some("person/nathan".into()),
+            expected_subject: None,
+        })
+        .unwrap();
+        let (status, invalid) = json_request(
+            app.clone(),
+            &format!("/v1/reviews/{}", step.subject),
+            missing_reason,
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{invalid}");
+        assert_eq!(invalid["code"], "missing-review-reason");
+
         let reject = serde_json::to_value(ReviewRequest {
             decision: "rejected".into(),
             reason: Some("the evidence is incomplete".into()),
@@ -13024,15 +13661,20 @@ version 2
         assert_eq!(accepted_step["body"]["fields"]["request"], step_request.id);
         assert_eq!(accepted_step["body"]["fields"]["verdict"], "fail");
         assert_eq!(accepted_step["body"]["evidence"][0], step_request.id);
+        let messages = store.messages(Some(&claimant), false).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains("the evidence is incomplete"));
 
         let (_, empty) = get_request(app, "/v1/reviews?reviewer=person%2Fnathan").await;
         assert_eq!(empty, json!([]));
     }
 
     #[tokio::test]
-    async fn attention_routes_request_filter_and_resolve_one_fault() {
+    async fn attention_routes_show_agent_request_and_deliver_resolution_reason() {
         let root = tempfile::tempdir().unwrap();
-        let app = router(state(root.path()));
+        let state = state(root.path());
+        let store = state.store.clone();
+        let app = router(state);
         let request = serde_json::to_value(AttentionRequest {
             reviewer: "nathan".into(),
             title: "Fabric needs review".into(),
@@ -13051,7 +13693,12 @@ version 2
         let (status, selected) = get_request(app.clone(), "/v1/attention?person=nathan").await;
         assert_eq!(status, StatusCode::OK, "{selected}");
         assert_eq!(selected.as_array().unwrap().len(), 1);
-        assert_eq!(selected[0]["kind"], "fault");
+        assert_eq!(selected[0]["kind"], "agent-request");
+        assert_eq!(selected[0]["requester_id"], "agent/fabric/worker");
+        assert_eq!(selected[0]["actions"][0]["label"], "answer");
+        let client = client_attention_resources(&store, Some("person/nathan"), false).unwrap();
+        assert_eq!(client[0]["attention_kind"], "agent-request");
+        assert_eq!(client[0]["requester_id"], "agent/fabric/worker");
         let (_, filtered) =
             get_request(app.clone(), "/v1/attention?person=person%2Fsomeone-else").await;
         assert_eq!(filtered, json!([]));
@@ -13083,11 +13730,22 @@ version 2
         let (status, resolved) = json_request(
             app.clone(),
             &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
-            resolution,
+            resolution.clone(),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{resolved}");
         assert_eq!(resolved["status"], "resolved");
+        let (status, replayed) = json_request(
+            app.clone(),
+            &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
+            resolution,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{replayed}");
+        let messages = store.messages(Some("agent/fabric/worker"), false).unwrap();
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].content.contains("The queue recovered."));
+        assert!(messages[0].content.contains("resolved"));
         let (_, empty) = get_request(app, "/v1/attention?person=nathan").await;
         assert_eq!(empty, json!([]));
     }
