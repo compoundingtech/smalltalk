@@ -1,0 +1,741 @@
+//! One socket to st for everything stui shows live.
+//!
+//! The feed holds one collection socket with the attention, missions and agents windows and,
+//! while a terminal is open, that terminal. st joins each row, so stui never joins lists itself
+//! or reads item by item. When the socket drops, the feed opens a new one, subscribes again,
+//! and attaches the open terminal again. Nothing here runs on a timer while connected: frames
+//! arrive only when something changed.
+
+use st3_client::{
+    Client, ClientError, CollectionEvent, CollectionStream, ErrorCode, Fence, Resource, Snapshot,
+    TargetParameters, TerminalScreen,
+};
+use std::collections::BTreeMap;
+use std::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::mpsc as channel;
+use tokio::time::Instant;
+
+/// How many current items each window holds. st sends at most 200.
+pub const WINDOW: usize = 200;
+
+/// The waits between attempts to reach st again, reset once st answers.
+const RETRY_DELAYS: [Duration; 5] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(30),
+];
+
+/// The subscription ID of the open terminal.
+const TERMINAL: &str = "terminal";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Window {
+    Attention,
+    Missions,
+    Agents,
+}
+
+impl Window {
+    const ALL: [Self; 3] = [Self::Attention, Self::Missions, Self::Agents];
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Attention => "attention",
+            Self::Missions => "missions",
+            Self::Agents => "agents",
+        }
+    }
+
+    fn from_id(id: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|window| window.id() == id)
+    }
+}
+
+#[derive(Debug)]
+pub enum Update {
+    /// st cannot be reached; the feed keeps trying and every window keeps its last items.
+    Offline(String),
+    /// A window's current items, in st's display order.
+    Window {
+        window: Window,
+        snapshot: Snapshot,
+        items: Vec<Resource>,
+        has_more: bool,
+    },
+    /// st refused a window; its last items stay.
+    WindowFailed(Window, String),
+    Terminal(TerminalUpdate),
+}
+
+#[derive(Debug)]
+pub enum TerminalUpdate {
+    /// The viewer record input and detach are fenced to.
+    Attached {
+        terminal_id: String,
+        attachment_id: String,
+        incarnation: String,
+    },
+    Screen(Box<TerminalScreen>),
+    /// The stream dropped. The last screen stays, marked stale, while the feed attaches again.
+    Reconnecting(String),
+    /// Following stopped. `restarted` means the terminal restarted or its process exited, which
+    /// only reopening it resolves.
+    Ended {
+        restarted: bool,
+        reason: String,
+    },
+}
+
+#[derive(Debug)]
+pub enum Command {
+    /// Follow this agent's terminal, found among its runtimes, in place of any other.
+    Follow {
+        runtime_ids: Vec<String>,
+    },
+    Unfollow,
+}
+
+/// The terminal being followed.
+struct Following {
+    runtime_id: String,
+    terminal_id: String,
+    /// The incarnation first attached. A different one means the terminal restarted.
+    incarnation: Option<String>,
+    attachment_id: Option<String>,
+    /// When to attach again after a transient failure; `None` while subscribed.
+    retry_at: Option<Instant>,
+    failures: usize,
+}
+
+/// Keep stui's windows and terminal current until the receiving side goes away.
+pub async fn run(
+    client: Client,
+    updates: mpsc::Sender<Update>,
+    mut commands: channel::UnboundedReceiver<Command>,
+) {
+    let mut failures = 0_usize;
+    let mut following: Option<Following> = None;
+    loop {
+        let stream = match client.collection_stream().await {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                if updates.send(Update::Offline(error.to_string())).is_err() {
+                    return;
+                }
+                None
+            }
+        };
+        if let Some(mut stream) = stream {
+            match connected(
+                &client,
+                &mut stream,
+                &updates,
+                &mut commands,
+                &mut following,
+                &mut failures,
+            )
+            .await
+            {
+                Ended::Closed => return,
+                Ended::Dropped(reason) => {
+                    if updates.send(Update::Offline(reason.clone())).is_err() {
+                        return;
+                    }
+                    if let Some(current) = following.as_mut() {
+                        current.attachment_id = None;
+                        current.retry_at = None;
+                        let _ =
+                            updates.send(Update::Terminal(TerminalUpdate::Reconnecting(reason)));
+                    }
+                }
+            }
+        }
+        // Wait before trying again, still honouring an unfollow meanwhile.
+        let delay = RETRY_DELAYS[failures.min(RETRY_DELAYS.len() - 1)];
+        failures += 1;
+        let wake = tokio::time::sleep(delay);
+        tokio::pin!(wake);
+        loop {
+            tokio::select! {
+                () = &mut wake => break,
+                command = commands.recv() => match command {
+                    None => return,
+                    Some(Command::Unfollow) => following = None,
+                    Some(Command::Follow { runtime_ids }) => {
+                        following = None;
+                        match resolve(&client, &runtime_ids).await {
+                            Ok((runtime_id, terminal_id)) => following = Some(Following {
+                                runtime_id, terminal_id, incarnation: None, attachment_id: None, retry_at: None, failures: 0,
+                            }),
+                            Err(reason) => {
+                                let _ = updates.send(Update::Terminal(TerminalUpdate::Ended { restarted: false, reason }));
+                            }
+                        }
+                    }
+                },
+            }
+        }
+    }
+}
+
+enum Ended {
+    /// stui is closing.
+    Closed,
+    /// The socket dropped; open another.
+    Dropped(String),
+}
+
+/// Serve one open socket until it drops.
+async fn connected(
+    client: &Client,
+    stream: &mut CollectionStream,
+    updates: &mpsc::Sender<Update>,
+    commands: &mut channel::UnboundedReceiver<Command>,
+    following: &mut Option<Following>,
+    failures: &mut usize,
+) -> Ended {
+    for window in Window::ALL {
+        if let Err(error) = stream
+            .subscribe(window.id(), window.id(), WINDOW, None, None)
+            .await
+        {
+            return Ended::Dropped(error.to_string());
+        }
+    }
+    let mut windows = BTreeMap::<Window, BTreeMap<String, Resource>>::new();
+    if following.is_some() {
+        match follow(client, stream, updates, following).await {
+            Ok(()) => {}
+            Err(error) => return Ended::Dropped(error.to_string()),
+        }
+    }
+    loop {
+        let retry_at = following.as_ref().and_then(|current| current.retry_at);
+        tokio::select! {
+            event = stream.next_event() => {
+                let event = match event {
+                    Ok(Some(event)) => event,
+                    Ok(None) => return Ended::Dropped("st closed the connection".into()),
+                    Err(error) => return Ended::Dropped(error.to_string()),
+                };
+                match event {
+                    CollectionEvent::Snapshot { id, snapshot, items, order, has_more } => {
+                        let Some(window) = Window::from_id(&id) else { continue };
+                        *failures = 0;
+                        let rows = windows.entry(window).or_default();
+                        rows.clear();
+                        rows.extend(items.into_iter().map(|item| (item.header().id.clone(), item)));
+                        if !send_window(updates, window, snapshot, rows, &order, has_more) {
+                            return Ended::Closed;
+                        }
+                    }
+                    CollectionEvent::Changes { id, snapshot, upserts, removes, order, has_more } => {
+                        let Some(window) = Window::from_id(&id) else { continue };
+                        let rows = windows.entry(window).or_default();
+                        for id in removes {
+                            rows.remove(&id);
+                        }
+                        rows.extend(upserts.into_iter().map(|item| (item.header().id.clone(), item)));
+                        if !send_window(updates, window, snapshot, rows, &order, has_more) {
+                            return Ended::Closed;
+                        }
+                    }
+                    CollectionEvent::Resync { id } => {
+                        if let Some(window) = Window::from_id(&id)
+                            && let Err(error) = stream.subscribe(window.id(), window.id(), WINDOW, None, None).await
+                        {
+                            return Ended::Dropped(error.to_string());
+                        }
+                    }
+                    CollectionEvent::Error { id, code, message } => {
+                        if let Some(window) = Window::from_id(&id) {
+                            if updates.send(Update::WindowFailed(window, message)).is_err() {
+                                return Ended::Closed;
+                            }
+                        } else if id == TERMINAL {
+                            terminal_failed(updates, following, code, message);
+                        }
+                    }
+                    CollectionEvent::Screen { id, screen } => {
+                        if id != TERMINAL {
+                            continue;
+                        }
+                        if let Some(current) = following.as_mut() {
+                            current.failures = 0;
+                        }
+                        if updates.send(Update::Terminal(TerminalUpdate::Screen(Box::new(screen.value)))).is_err() {
+                            return Ended::Closed;
+                        }
+                    }
+                }
+            }
+            command = commands.recv() => match command {
+                None => {
+                    stop_following(client, stream, following).await;
+                    return Ended::Closed;
+                }
+                Some(Command::Unfollow) => stop_following(client, stream, following).await,
+                Some(Command::Follow { runtime_ids }) => {
+                    stop_following(client, stream, following).await;
+                    match resolve(client, &runtime_ids).await {
+                        Ok((runtime_id, terminal_id)) => {
+                            *following = Some(Following {
+                                runtime_id, terminal_id, incarnation: None, attachment_id: None, retry_at: None, failures: 0,
+                            });
+                            if let Err(error) = follow(client, stream, updates, following).await {
+                                return Ended::Dropped(error.to_string());
+                            }
+                        }
+                        Err(reason) => {
+                            let _ = updates.send(Update::Terminal(TerminalUpdate::Ended { restarted: false, reason }));
+                        }
+                    }
+                }
+            },
+            () = tokio::time::sleep_until(retry_at.unwrap_or_else(Instant::now)), if retry_at.is_some() => {
+                if let Err(error) = follow(client, stream, updates, following).await {
+                    return Ended::Dropped(error.to_string());
+                }
+            }
+        }
+    }
+}
+
+fn send_window(
+    updates: &mpsc::Sender<Update>,
+    window: Window,
+    snapshot: Snapshot,
+    rows: &BTreeMap<String, Resource>,
+    order: &[String],
+    has_more: bool,
+) -> bool {
+    let items = order
+        .iter()
+        .filter_map(|id| rows.get(id).cloned())
+        .collect();
+    updates
+        .send(Update::Window {
+            window,
+            snapshot,
+            items,
+            has_more,
+        })
+        .is_ok()
+}
+
+/// A terminal subscription ended with an error. Transient failures attach again after a
+/// backoff; `stale-fence` means the terminal restarted, and anything else stops following.
+fn terminal_failed(
+    updates: &mpsc::Sender<Update>,
+    following: &mut Option<Following>,
+    code: Option<ErrorCode>,
+    message: String,
+) {
+    let Some(current) = following.as_mut() else {
+        return;
+    };
+    current.attachment_id = None;
+    let update = match code {
+        Some(ErrorCode::StaleFence) => {
+            *following = None;
+            TerminalUpdate::Ended {
+                restarted: true,
+                reason: "Terminal restarted".into(),
+            }
+        }
+        Some(ErrorCode::Internal | ErrorCode::RemoteUnavailable | ErrorCode::RateLimited) => {
+            current.retry_at =
+                Some(Instant::now() + RETRY_DELAYS[current.failures.min(RETRY_DELAYS.len() - 1)]);
+            current.failures += 1;
+            TerminalUpdate::Reconnecting(message)
+        }
+        _ => {
+            *following = None;
+            TerminalUpdate::Ended {
+                restarted: false,
+                reason: message,
+            }
+        }
+    };
+    let _ = updates.send(Update::Terminal(update));
+}
+
+/// Attach to the followed terminal and subscribe to it on this socket. A refused attach ends
+/// following; only a failure to write to the socket is returned.
+async fn follow(
+    client: &Client,
+    stream: &mut CollectionStream,
+    updates: &mpsc::Sender<Update>,
+    following: &mut Option<Following>,
+) -> Result<(), ClientError> {
+    let Some(current) = following.as_mut() else {
+        return Ok(());
+    };
+    current.retry_at = None;
+    let attachment = match attach(
+        client,
+        &current.runtime_id,
+        &current.terminal_id,
+        current.incarnation.as_deref(),
+    )
+    .await
+    {
+        Ok(attachment) => attachment,
+        Err(Refusal::Restarted) => {
+            *following = None;
+            let _ = updates.send(Update::Terminal(TerminalUpdate::Ended {
+                restarted: true,
+                reason: "Terminal restarted".into(),
+            }));
+            return Ok(());
+        }
+        Err(Refusal::Failed(reason)) => {
+            *following = None;
+            let _ = updates.send(Update::Terminal(TerminalUpdate::Ended {
+                restarted: false,
+                reason,
+            }));
+            return Ok(());
+        }
+    };
+    let Some(capability) = attachment.stream_capability.clone() else {
+        *following = None;
+        let _ = updates.send(Update::Terminal(TerminalUpdate::Ended {
+            restarted: false,
+            reason: "st returned no stream capability for the terminal".into(),
+        }));
+        return Ok(());
+    };
+    current.incarnation = Some(attachment.runtime_incarnation.clone());
+    current.attachment_id = Some(attachment.attachment_id.clone());
+    let _ = updates.send(Update::Terminal(TerminalUpdate::Attached {
+        terminal_id: current.terminal_id.clone(),
+        attachment_id: attachment.attachment_id,
+        incarnation: attachment.runtime_incarnation.clone(),
+    }));
+    stream
+        .subscribe_terminal(
+            TERMINAL,
+            &current.terminal_id,
+            Some(&attachment.runtime_incarnation),
+            &capability,
+        )
+        .await
+}
+
+/// Stop following: leave the subscription and end the viewer record.
+async fn stop_following(
+    client: &Client,
+    stream: &mut CollectionStream,
+    following: &mut Option<Following>,
+) {
+    let Some(current) = following.take() else {
+        return;
+    };
+    let _ = stream.unsubscribe(TERMINAL).await;
+    if let (Some(attachment_id), Some(incarnation)) = (current.attachment_id, current.incarnation) {
+        let client = client.clone();
+        tokio::spawn(async move {
+            let _ = detach(&client, &current.terminal_id, &attachment_id, &incarnation).await;
+        });
+    }
+}
+
+enum Refusal {
+    /// The runtime now runs another incarnation, or none.
+    Restarted,
+    Failed(String),
+}
+
+/// The first of these runtimes that has a terminal.
+async fn resolve(client: &Client, runtime_ids: &[String]) -> Result<(String, String), String> {
+    for id in runtime_ids {
+        if let Ok(envelope) = client.runtimes_get(id).await
+            && let Resource::Runtime(runtime) = envelope.value
+            && let Some(terminal) = runtime.terminal_id
+        {
+            return Ok((runtime.header.id, terminal));
+        }
+    }
+    Err("that agent has no terminal right now".into())
+}
+
+/// `terminal.attach` with a fresh fence, retried on `stale-fence` three times. With `expected`,
+/// a runtime now on another incarnation is a restart rather than something to attach to.
+async fn attach(
+    client: &Client,
+    runtime_id: &str,
+    terminal_id: &str,
+    expected: Option<&str>,
+) -> Result<st3_client::TerminalAttachment, Refusal> {
+    for attempt in 0..3 {
+        let current = client
+            .runtimes_get(runtime_id)
+            .await
+            .map_err(|error| Refusal::Failed(error.to_string()))?;
+        let Resource::Runtime(runtime) = current.value else {
+            return Err(Refusal::Failed("the runtime is no longer available".into()));
+        };
+        if runtime.terminal_id.as_deref() != Some(terminal_id) {
+            return Err(Refusal::Restarted);
+        }
+        if let Some(expected) = expected
+            && runtime.incarnation_id.as_deref() != Some(expected)
+        {
+            return Err(Refusal::Restarted);
+        }
+        let fence = Fence {
+            snapshot_id: current.snapshot.id,
+            runtime_incarnation: runtime.incarnation_id,
+            terminal_sequence: runtime.terminal_sequence,
+            ..Fence::default()
+        };
+        let (id, key) = crate::action_pair();
+        match client
+            .terminal_attach(
+                id,
+                key,
+                fence,
+                TargetParameters {
+                    target_id: terminal_id.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(response) => {
+                return response
+                    .value
+                    .terminal_attachment
+                    .ok_or_else(|| Refusal::Failed("st attached no viewer".into()));
+            }
+            Err(ClientError::Api(ErrorCode::StaleFence, _, _)) if attempt < 2 => continue,
+            Err(error) => return Err(Refusal::Failed(error.to_string())),
+        }
+    }
+    Err(Refusal::Failed(
+        "the terminal kept changing while attaching".into(),
+    ))
+}
+
+/// End a viewer record with a fresh fence, retried on `stale-fence` three times.
+pub async fn detach(
+    client: &Client,
+    terminal_id: &str,
+    attachment_id: &str,
+    incarnation: &str,
+) -> anyhow::Result<()> {
+    for attempt in 0..3 {
+        let fence = crate::terminal_fence(client, terminal_id, incarnation).await?;
+        let (id, key) = crate::action_pair();
+        match client
+            .terminal_detach(
+                id,
+                key,
+                fence,
+                TargetParameters {
+                    target_id: attachment_id.to_owned(),
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => return Ok(()),
+            Err(ClientError::Api(ErrorCode::StaleFence, _, _)) if attempt < 2 => continue,
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+    use std::sync::Arc;
+    use tokio::sync::{Notify, watch};
+
+    fn following() -> Option<Following> {
+        Some(Following {
+            runtime_id: "runtime/demo".into(),
+            terminal_id: "terminal/demo".into(),
+            incarnation: Some("demo:i1".into()),
+            attachment_id: Some("terminal-attachment/demo".into()),
+            retry_at: None,
+            failures: 0,
+        })
+    }
+
+    fn terminal_update(updates: &mpsc::Receiver<Update>) -> TerminalUpdate {
+        match updates.try_recv().unwrap() {
+            Update::Terminal(update) => update,
+            other => panic!("expected a terminal update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stale_fence_ends_following_as_a_restart_and_never_reattaches() {
+        let (tx, rx) = mpsc::channel();
+        let mut current = following();
+        terminal_failed(
+            &tx,
+            &mut current,
+            Some(ErrorCode::StaleFence),
+            "stale".into(),
+        );
+        assert!(
+            current.is_none(),
+            "a restart is never followed again on its own"
+        );
+        assert!(matches!(
+            terminal_update(&rx),
+            TerminalUpdate::Ended {
+                restarted: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn a_transient_failure_reattaches_after_a_growing_wait_and_a_refusal_stops() {
+        let (tx, rx) = mpsc::channel();
+        let mut current = following();
+        for (attempt, delay) in RETRY_DELAYS.iter().take(3).enumerate() {
+            let before = Instant::now();
+            terminal_failed(
+                &tx,
+                &mut current,
+                Some(ErrorCode::RemoteUnavailable),
+                "owner away".into(),
+            );
+            let state = current
+                .as_ref()
+                .expect("a transient failure keeps following");
+            assert_eq!(state.failures, attempt + 1);
+            assert!(state.attachment_id.is_none(), "the old attachment is spent");
+            let wait = state.retry_at.unwrap() - before;
+            assert!(
+                wait >= *delay && wait < *delay + Duration::from_secs(1),
+                "{wait:?}"
+            );
+            assert!(matches!(
+                terminal_update(&rx),
+                TerminalUpdate::Reconnecting(_)
+            ));
+        }
+        terminal_failed(&tx, &mut current, Some(ErrorCode::Forbidden), "no".into());
+        assert!(current.is_none(), "a refusal is not retried");
+        assert!(matches!(
+            terminal_update(&rx),
+            TerminalUpdate::Ended { restarted: false, reason } if reason == "no"
+        ));
+    }
+
+    fn test_state(root: &Path) -> st3::api::AppState {
+        st3::api::AppState {
+            store: Arc::new(st3::store::Store::open_memory("stui-feed").unwrap()),
+            notify: Arc::new(Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: "stui-feed".into(),
+            state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"),
+            pty_binary: root.join("unused-pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: st3::model::PlannerSpec::default(),
+        }
+    }
+
+    async fn next_window(updates: &mpsc::Receiver<Update>, wanted: Window) -> Vec<Resource> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            match updates.try_recv() {
+                Ok(Update::Window { window, items, .. }) if window == wanted => return items,
+                Ok(_) => {}
+                Err(mpsc::TryRecvError::Empty) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "no {wanted:?} window arrived"
+                    );
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(mpsc::TryRecvError::Disconnected) => panic!("the feed stopped"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_feed_waits_for_st_then_keeps_every_window_current_on_one_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("st3.sock");
+        let state = test_state(root.path());
+        let (tx, rx) = mpsc::channel();
+        let (_commands, command_receiver) = channel::unbounded_channel();
+        let feed = tokio::spawn(run(
+            Client::unix_as(&socket, "person/avery"),
+            tx,
+            command_receiver,
+        ));
+
+        // No st yet: the feed says so and keeps trying.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match rx.try_recv() {
+                Ok(Update::Offline(_)) => break,
+                Ok(other) => panic!("expected offline first, got {other:?}"),
+                Err(_) => {
+                    assert!(std::time::Instant::now() < deadline, "no offline update");
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+        let server_socket = socket.clone();
+        let app = st3::api::router(state.clone());
+        let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
+
+        for window in Window::ALL {
+            assert!(next_window(&rx, window).await.is_empty());
+        }
+
+        let source =
+            "version 2\nmission \"feed-test\" state=\"ready\" { goal \"Push changes to stui\" }\n";
+        let intent = st3::graph::parse_intent(source, "stui-feed").unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                st3::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "feed-test-definition")
+            .unwrap();
+        state
+            .event_notify
+            .send(state.store.index().unwrap())
+            .unwrap();
+        let missions = next_window(&rx, Window::Missions).await;
+        assert_eq!(
+            missions
+                .iter()
+                .map(|item| item.header().id.as_str())
+                .collect::<Vec<_>>(),
+            ["mission/feed-test"]
+        );
+
+        // Nothing changes, so nothing arrives: no polling.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert!(rx.try_recv().is_err(), "an idle feed sends nothing");
+        feed.abort();
+        server.abort();
+    }
+}

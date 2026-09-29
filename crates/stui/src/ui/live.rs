@@ -1,15 +1,16 @@
-//! `stui --new`: the new screens on the live graph.
+//! `stui`: the screens on the live graph.
 //!
-//! The old stui's background sync keeps a `Model` current and sends it here. This loop turns
-//! it into a `World`, fetches what only the selected item needs (a conversation, a launch
-//! preview), and carries out the actions the screens queue. A refresh replaces data in
-//! place: it never empties a list or a conversation while the fresh copy is on its way.
+//! The feed keeps the attention, missions and agents windows current over one socket, joined
+//! by st, and follows the open terminal on the same socket. This loop turns those windows
+//! into a `World`, fetches what only the selected item or tab needs (a conversation, a launch
+//! preview, the fleet), and carries out the actions the screens queue. A refresh replaces
+//! data in place: it never empties a list or a conversation while the fresh copy is on its way.
 
 use super::adapt::{self, Extras};
 use super::view::{Load, MissionPreview};
 use super::{Effect, Guard, Ui};
-use crate::Update;
-use crate::model::{self, Model};
+use crate::feed::{self, Command, TerminalUpdate, Window};
+use crate::model::{self, Collection, Model};
 use anyhow::Result;
 use crossterm::{
     event::{self, Event},
@@ -40,9 +41,18 @@ struct Pending {
 pub struct Context {
     pub client: Client,
     pub runtime: tokio::runtime::Runtime,
-    pub incoming: mpsc::Receiver<Update>,
+    pub incoming: mpsc::Receiver<feed::Update>,
+    pub commands: tokio::sync::mpsc::UnboundedSender<Command>,
     pub person: String,
+    pub cache_path: Option<std::path::PathBuf>,
     pub cached: Option<Model>,
+}
+
+/// The terminal the feed follows for the open terminal view.
+struct Following {
+    terminal_id: String,
+    attachment_id: String,
+    incarnation: String,
 }
 
 enum Fetched {
@@ -52,8 +62,11 @@ enum Fetched {
     /// The message behind an unread-message item: sender, title and text.
     Body(String, String, Option<String>, String),
     Notice(String),
-    /// An attach finished: the agent's name and the attachment, or why it failed.
-    Attached(String, Result<Box<crate::Attached>, String>),
+    /// Harness sessions st did not start, found on this machine.
+    Sessions(Collection),
+    /// The Fleet tab's machines and paired devices.
+    Machines(Collection),
+    Devices(Collection),
     /// A send finished: the pending token and st's message id, or why it failed.
     Sent(String, Result<Option<String>, String>),
     Failed(String, String),
@@ -67,11 +80,15 @@ pub fn run(context: Context) -> Result<()> {
         client,
         runtime,
         incoming,
+        commands,
         person,
+        cache_path,
         cached,
     } = context;
     let (fetched_tx, fetched) = mpsc::channel::<Fetched>();
     let mut model = cached.unwrap_or_default();
+    // The attention window is already this person's; nothing else names the actor.
+    model.actor = person.clone();
     let mut extras = Extras::default();
     let mut timelines: BTreeMap<String, Vec<TimelineEntry>> = BTreeMap::new();
     let mut messages: BTreeMap<String, Vec<st3_client::Message>> = BTreeMap::new();
@@ -93,7 +110,14 @@ pub fn run(context: Context) -> Result<()> {
     let started = Instant::now();
     let mut changed = true;
     let stopping = super::stop_flag()?;
-    let mut attached: Option<crate::Attached> = None;
+    let mut attached: Option<Following> = None;
+    // The runtimes of the agent whose terminal view is open, to follow it again after a pause.
+    let mut terminal_runtimes: Option<Vec<String>> = None;
+    // The tab shown on the last pass: opening a tab loads what only it needs.
+    let mut shown_tab = usize::MAX;
+    // Each agent's last activity, so a change reloads its open conversation.
+    let mut activity: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut last_cache_save = Instant::now();
     // A closed terminal ends the loop: without this check a detached stui spins and keeps
     // polling the daemon forever.
     while !ui.quit
@@ -110,39 +134,94 @@ pub fn run(context: Context) -> Result<()> {
         }
         while let Ok(update) = incoming.try_recv() {
             match update {
-                Update::Partial(next) => {
-                    model = *next;
-                    changed = true;
-                }
-                Update::Model(next) => {
-                    model = *next;
+                feed::Update::Window {
+                    window,
+                    snapshot,
+                    items,
+                    has_more,
+                } => {
+                    let collection = Collection {
+                        items,
+                        snapshot: Some(snapshot),
+                        truncated: has_more,
+                        sync: None,
+                    };
+                    match window {
+                        Window::Attention => model.now = collection,
+                        Window::Missions => model.missions = collection,
+                        Window::Agents => {
+                            model.agents = collection;
+                            // A conversation whose agent moved is due for a reload.
+                            for agent in model.agents() {
+                                let last = activity.insert(
+                                    agent.header.id.clone(),
+                                    agent.last_activity_at.clone(),
+                                );
+                                if last.is_some_and(|last| last != agent.last_activity_at) {
+                                    requested.remove(&agent.header.id);
+                                }
+                            }
+                        }
+                    }
                     extras.live = true;
                     extras.offline = None;
                     changed = true;
-                    // Something changed in the graph; the open conversation may have new mail.
-                    if let (1, Some(agent)) = ui.focus()
-                        && requested
-                            .get(&agent)
-                            .is_some_and(|at| at.elapsed() > Duration::from_secs(3))
-                    {
-                        requested.remove(&agent);
+                }
+                feed::Update::WindowFailed(window, error) => {
+                    ui.flash(format!("Could not load {window:?}: {error}"));
+                }
+                feed::Update::Offline(error) => {
+                    extras.live = false;
+                    extras.offline = Some(error);
+                    changed = true;
+                }
+                feed::Update::Terminal(update) => match update {
+                    TerminalUpdate::Attached {
+                        terminal_id,
+                        attachment_id,
+                        incarnation,
+                    } => {
+                        attached = Some(Following {
+                            terminal_id,
+                            attachment_id,
+                            incarnation,
+                        });
                     }
-                }
-                Update::TimelineInvalidated(session) => {
-                    stale.insert(session);
-                }
-                Update::TimelineCursorGap => {
-                    stale.extend(timelines.keys().cloned());
-                }
-                Update::Error(error) => {
-                    if error.starts_with("Sync:") || error.starts_with("Initial load:") {
-                        extras.live = false;
-                        extras.offline = Some(error.clone());
-                        changed = true;
+                    TerminalUpdate::Screen(screen) => {
+                        if let Some(view) = ui.terminal.as_mut() {
+                            view.lines = screen_lines(&screen);
+                            view.cursor = screen
+                                .cursor
+                                .visible
+                                .then_some((screen.cursor.row, screen.cursor.column));
+                            view.stale = None;
+                            if !screen.title.is_empty() {
+                                view.title = format!("{} · {}", view.name, screen.title);
+                            }
+                        }
                     }
-                    ui.flash(error);
-                }
-                Update::Timeline(..) | Update::Messages(..) => {}
+                    TerminalUpdate::Reconnecting(reason) => {
+                        if let Some(view) = ui.terminal.as_mut() {
+                            view.stale = Some(reason);
+                        }
+                    }
+                    TerminalUpdate::Ended { restarted, reason } => {
+                        attached = None;
+                        match ui.terminal.as_mut() {
+                            Some(view) => {
+                                view.ended = Some(if restarted {
+                                    "Terminal restarted; open it again to follow the new one".into()
+                                } else {
+                                    reason
+                                })
+                            }
+                            None if !restarted => {
+                                ui.flash(format!("Could not open the terminal: {reason}"))
+                            }
+                            None => {}
+                        }
+                    }
+                },
             }
         }
         while let Ok(result) = fetched.try_recv() {
@@ -176,17 +255,11 @@ pub fn run(context: Context) -> Result<()> {
                     extras.bodies.insert(id, (from, title, content));
                 }
                 Fetched::Notice(notice) => ui.flash(notice),
-                Fetched::Attached(name, result) => match result {
-                    Ok(current) => {
-                        ui.terminal = Some(super::TerminalView {
-                            title: format!("{name} · {}", current.screen.title),
-                            lines: screen_lines(&current.screen),
-                            ended: None,
-                        });
-                        attached = Some(*current);
-                    }
-                    Err(error) => ui.flash(format!("Could not open the terminal: {error}")),
-                },
+                Fetched::Sessions(native) => {
+                    model.sessions = native;
+                }
+                Fetched::Machines(machines) => model.machines = machines,
+                Fetched::Devices(devices) => model.devices = devices,
                 Fetched::Failed(agent, error) => {
                     failed.insert(agent, error);
                 }
@@ -196,6 +269,60 @@ pub fn run(context: Context) -> Result<()> {
 
         // What the selection needs: a conversation, or a launch preview.
         let (tab, selected) = ui.focus();
+        // What a tab needs when it opens: harness sessions st did not start (Agents), and the
+        // machines and devices (Fleet). They are read then, never on a timer.
+        if tab != shown_tab {
+            // The terminal is followed only while it is on screen: leaving the Agents tab
+            // pauses it, and coming back shows the current screen first.
+            if let (Some(view), Some(runtime_ids)) = (ui.terminal.as_mut(), &terminal_runtimes)
+                && view.ended.is_none()
+            {
+                if shown_tab == 1 {
+                    let _ = commands.send(Command::Unfollow);
+                    attached = None;
+                    view.stale = Some("paused while hidden".into());
+                } else if tab == 1 {
+                    let _ = commands.send(Command::Follow {
+                        runtime_ids: runtime_ids.clone(),
+                    });
+                    view.stale = Some("reconnecting".into());
+                }
+            }
+            shown_tab = tab;
+            if tab == 1 || model.sessions.snapshot.is_none() {
+                let client = client.clone();
+                let tx = fetched_tx.clone();
+                runtime.spawn(async move {
+                    match model::read_native_sessions(&client).await {
+                        Ok(native) => {
+                            let _ = tx.send(Fetched::Sessions(native));
+                        }
+                        Err(error) => {
+                            let _ = tx.send(Fetched::Notice(format!(
+                                "Could not look for other harness sessions: {error}"
+                            )));
+                        }
+                    }
+                });
+            }
+            if tab == 3 {
+                let client = client.clone();
+                let tx = fetched_tx.clone();
+                runtime.spawn(async move {
+                    let (machines, devices) =
+                        tokio::join!(model::read_machines(&client), model::read_devices(&client));
+                    for (result, what) in [(machines, "machines"), (devices, "devices")] {
+                        let _ = tx.send(match result {
+                            Ok(collection) if what == "machines" => Fetched::Machines(collection),
+                            Ok(collection) => Fetched::Devices(collection),
+                            Err(error) => {
+                                Fetched::Notice(format!("Could not load {what}: {error}"))
+                            }
+                        });
+                    }
+                });
+            }
+        }
         if tab == 1
             && let Some(agent) = selected.clone()
         {
@@ -298,99 +425,36 @@ pub fn run(context: Context) -> Result<()> {
                 }
             });
         }
-        // A newer screen from the attached terminal, if any.
-        if let Some(current) = attached.as_mut()
-            && let Some(receiver) = current.updates.as_mut()
-            && receiver.has_changed().unwrap_or(false)
-        {
-            let update = receiver.borrow_and_update().clone();
-            match update {
-                Some(crate::TerminalUpdate::Screen(screen)) => {
-                    current.screen = *screen;
-                    if let Some(view) = ui.terminal.as_mut() {
-                        view.lines = screen_lines(&current.screen);
-                    }
-                }
-                Some(crate::TerminalUpdate::Ended(reason)) => {
-                    if let Some(view) = ui.terminal.as_mut() {
-                        view.ended = Some(reason);
-                    }
-                }
-                None => {}
-            }
-        }
         let mut effects = Vec::new();
         for effect in std::mem::take(&mut ui.effects) {
             match effect {
                 Effect::OpenTerminal { agent } => {
-                    // Never block the loop on the network: resolve and attach in the background.
-                    let known = model
-                        .runtimes()
-                        .find(|runtime| runtime.owner_id == agent && runtime.terminal_id.is_some())
-                        .map(|runtime| {
-                            (
-                                runtime.header.id.clone(),
-                                runtime.terminal_id.clone().unwrap_or_default(),
-                            )
-                        });
-                    let ids = model
+                    // The feed attaches and follows on its socket; screens arrive as updates.
+                    let found = model
                         .agents()
-                        .find(|candidate| candidate.header.id == agent)
+                        .find(|candidate| candidate.header.id == agent);
+                    let runtime_ids = found
                         .map(|candidate| candidate.runtime_ids.clone())
                         .unwrap_or_default();
-                    let name = model
-                        .agents()
-                        .find(|candidate| candidate.header.id == agent)
-                        .map(crate::agent_label)
-                        .unwrap_or(agent);
-                    let client = client.clone();
-                    let tx = fetched_tx.clone();
-                    runtime.spawn(async move {
-                        let mut found = known;
-                        if found.is_none() {
-                            // The bounded runtime list may not include it; ask for it by id.
-                            for id in ids {
-                                if let Ok(envelope) = client.runtimes_get(&id).await
-                                    && let Resource::Runtime(current) = envelope.value
-                                    && let Some(terminal) = current.terminal_id.clone()
-                                {
-                                    found = Some((current.header.id.clone(), terminal));
-                                    break;
-                                }
-                            }
-                        }
-                        let result = match found {
-                            None => Err("that agent has no terminal right now".to_owned()),
-                            Some((runtime_id, terminal_id)) => {
-                                // Never wait silently: a terminal that sends no first screen is reported.
-                                match tokio::time::timeout(
-                                    Duration::from_secs(15),
-                                    crate::attach_terminal(&client, &runtime_id, &terminal_id),
-                                )
-                                .await
-                                {
-                                    Ok(result) => {
-                                        result.map(Box::new).map_err(|error| error.to_string())
-                                    }
-                                    Err(_) => Err(format!(
-                                        "{terminal_id} sent no screen within 15 seconds"
-                                    )),
-                                }
-                            }
-                        };
-                        let _ = tx.send(Fetched::Attached(name, result));
-                    });
-                }
-                Effect::CloseTerminal => {
-                    if let Some(current) = attached.take() {
-                        let client = client.clone();
-                        let tx = fetched_tx.clone();
-                        runtime.spawn(async move {
-                            if let Err(error) = crate::detach_terminal(&client, &current).await {
-                                let _ = tx.send(Fetched::Notice(format!("Detach failed: {error}")));
-                            }
+                    let name = found.map(crate::agent_label).unwrap_or(agent);
+                    attached = None;
+                    terminal_runtimes = Some(runtime_ids.clone());
+                    if commands.send(Command::Follow { runtime_ids }).is_ok() {
+                        ui.terminal = Some(super::TerminalView {
+                            title: name.clone(),
+                            name,
+                            lines: Vec::new(),
+                            cursor: None,
+                            stale: Some("connecting".into()),
+                            ended: None,
                         });
                     }
+                }
+                Effect::CloseTerminal => {
+                    // Leaving the terminal view stops following it; the feed ends the viewer.
+                    let _ = commands.send(Command::Unfollow);
+                    attached = None;
+                    terminal_runtimes = None;
                     ui.terminal = None;
                 }
                 Effect::TerminalKey(key) => {
@@ -398,7 +462,7 @@ pub fn run(context: Context) -> Result<()> {
                         let client = client.clone();
                         let tx = fetched_tx.clone();
                         let terminal = current.terminal_id.clone();
-                        let incarnation = current.screen.runtime_incarnation.clone();
+                        let incarnation = current.incarnation.clone();
                         runtime.spawn(async move {
                             if let Err(error) =
                                 crate::send_terminal_key(&client, &terminal, &incarnation, key)
@@ -407,6 +471,8 @@ pub fn run(context: Context) -> Result<()> {
                                 let _ = tx.send(Fetched::Notice(format!("Key not sent: {error}")));
                             }
                         });
+                    } else {
+                        ui.flash("The terminal is not connected; that key was not sent");
                     }
                 }
                 other => effects.push(other),
@@ -473,6 +539,10 @@ pub fn run(context: Context) -> Result<()> {
             }
             ui.set_world(adapt::world(&model, &person, &extras));
             changed = false;
+            if last_cache_save.elapsed() >= Duration::from_secs(60) {
+                save_cache(cache_path.as_deref(), &person, &model);
+                last_cache_save = Instant::now();
+            }
         }
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
         terminal.draw(|frame| ui.render(frame))?;
@@ -492,9 +562,23 @@ pub fn run(context: Context) -> Result<()> {
     }
     // Leave no attachment behind.
     if let Some(current) = attached.take() {
-        let _ = runtime.block_on(crate::detach_terminal(&client, &current));
+        let _ = runtime.block_on(feed::detach(
+            &client,
+            &current.terminal_id,
+            &current.attachment_id,
+            &current.incarnation,
+        ));
     }
+    save_cache(cache_path.as_deref(), &person, &model);
     Ok(())
+}
+
+fn save_cache(path: Option<&std::path::Path>, person: &str, model: &Model) {
+    if let Some(path) = path
+        && model.missions.snapshot.is_some()
+    {
+        let _ = crate::cache::save(path, person, model);
+    }
 }
 
 /// A terminal screen as styled lines, the way the old screens drew it.
@@ -503,14 +587,15 @@ fn screen_lines(screen: &st3_client::TerminalScreen) -> Vec<ratatui::text::Line<
     screen
         .lines
         .iter()
-        .map(|line| {
-            if line.redacted {
+        .map(|screen_line| {
+            let mut line = if screen_line.redacted {
                 Line::from("[redacted]")
-            } else if line.runs.is_empty() {
-                Line::from(super::text::sanitize(&line.text))
+            } else if screen_line.runs.is_empty() {
+                Line::from(super::text::sanitize(&screen_line.text))
             } else {
                 Line::from(
-                    line.runs
+                    screen_line
+                        .runs
                         .iter()
                         .map(|run| {
                             Span::styled(
@@ -520,7 +605,12 @@ fn screen_lines(screen: &st3_client::TerminalScreen) -> Vec<ratatui::text::Line<
                         })
                         .collect::<Vec<_>>(),
                 )
+            };
+            // st cut a line longer than it sends; say so rather than let it look complete.
+            if screen_line.truncated {
+                line.spans.push(Span::styled("…", super::theme::dim()));
             }
+            line
         })
         .collect()
 }
@@ -869,4 +959,37 @@ async fn send_message(
     Err(last
         .map(Into::into)
         .unwrap_or_else(|| anyhow::anyhow!("the graph kept changing; try again")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture_screen() -> st3_client::TerminalScreen {
+        let text = include_str!("../../../../docs/st3/client-v0/fixtures/terminal-screen.json");
+        let envelope: serde_json::Value = serde_json::from_str(text).unwrap();
+        serde_json::from_value(envelope["value"].clone()).unwrap()
+    }
+
+    fn plain(line: &ratatui::text::Line) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect()
+    }
+
+    #[test]
+    fn screen_lines_mark_cut_lines_hide_redacted_ones_and_fall_back_to_text() {
+        let mut screen = fixture_screen();
+        let styled = screen_lines(&screen);
+        assert_eq!(plain(&styled[0]), "$ cargo build");
+        assert!(styled[0].spans.len() > 1, "runs keep their styles");
+        screen.lines[0].truncated = true;
+        screen.lines[1].runs.clear();
+        screen.lines[2].redacted = true;
+        let lines = screen_lines(&screen);
+        assert_eq!(plain(&lines[0]), "$ cargo build…");
+        assert_eq!(plain(&lines[1]), "Finished");
+        assert_eq!(plain(&lines[2]), "[redacted]");
+    }
 }

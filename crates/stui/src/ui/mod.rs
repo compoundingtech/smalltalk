@@ -144,8 +144,14 @@ pub enum Effect {
 
 /// An agent's live terminal screen, drawn in place of its conversation.
 pub(crate) struct TerminalView {
+    /// The agent's name; the title adds the program's own title once a screen names it.
+    pub(crate) name: String,
     pub(crate) title: String,
     pub(crate) lines: Vec<Line<'static>>,
+    /// The visible cursor's row and column on the screen.
+    pub(crate) cursor: Option<(usize, usize)>,
+    /// Why the screen shown is not current: still connecting, or reconnecting after a drop.
+    pub(crate) stale: Option<String>,
     pub(crate) ended: Option<String>,
 }
 
@@ -1282,9 +1288,11 @@ impl Ui {
             theme::strong(theme::ACCENT),
         );
         self.hit(Rect { height: 1, ..area }, Hit::Detach);
-        let status = match &view.ended {
-            Some(reason) => format!("ended: {reason}"),
-            None => "Ctrl-C and Ctrl-D need a second press to reach the agent".into(),
+        let status = match (&view.ended, &view.stale) {
+            (Some(reason), _) => format!("ended: {reason}"),
+            (None, Some(reason)) if view.lines.is_empty() => format!("{reason}…"),
+            (None, Some(reason)) => format!("not current, reconnecting: {reason}"),
+            (None, None) => "Ctrl-C and Ctrl-D need a second press to reach the agent".into(),
         };
         buf.set_stringn(
             area.x,
@@ -1293,11 +1301,22 @@ impl Ui {
             area.width as usize,
             theme::dim(),
         );
-        // A terminal taller than the pane shows its bottom, where the prompt and cursor are.
         let rows = area.height.saturating_sub(2) as usize;
-        let skip = view.lines.len().saturating_sub(rows);
+        let skip = terminal_rows_skipped(view.lines.len(), rows, view.cursor);
         for (offset, line) in view.lines.iter().skip(skip).take(rows).enumerate() {
             buf.set_line(area.x, area.y + 2 + offset as u16, line, area.width);
+        }
+        // The cursor is drawn as an inverted cell where the screen says it is.
+        if let Some((row, column)) = view.cursor
+            && view.ended.is_none()
+            && row >= skip
+            && row < skip + rows
+            && column < usize::from(area.width)
+        {
+            let position = (area.x + column as u16, area.y + 2 + (row - skip) as u16);
+            if let Some(cell) = buf.cell_mut(position) {
+                cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
+            }
         }
     }
 
@@ -1858,7 +1877,10 @@ impl Ui {
         } else {
             self.terminal = Some(TerminalView {
                 title: format!("{} · demo terminal", agent.name),
+                name: agent.name.clone(),
                 lines: demo::terminal(&agent.name),
+                cursor: None,
+                stale: None,
                 ended: None,
             });
         }
@@ -2643,6 +2665,17 @@ fn copy(text: &str) {
 
 struct Guard;
 
+/// How many of a terminal's rows to skip so it fits the pane. A terminal taller than the pane
+/// shows its bottom, where the prompt usually is, unless that would hide the cursor; then the
+/// cursor's row is the pane's last.
+fn terminal_rows_skipped(lines: usize, rows: usize, cursor: Option<(usize, usize)>) -> usize {
+    let bottom = lines.saturating_sub(rows);
+    match cursor {
+        Some((row, _)) if row < bottom => (row + 1).saturating_sub(rows),
+        _ => bottom,
+    }
+}
+
 /// A flag set by SIGINT, SIGTERM or SIGHUP, so the loop exits and `Guard` restores the terminal.
 fn stop_flag() -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
     let stopping = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -3144,6 +3177,56 @@ mod tests {
         assert!(screen.contains("second paragraph"), "{screen}");
         assert!(ui.editing, "Alt+Enter adds a line instead of sending");
     }
+    #[test]
+    fn a_terminal_keeps_its_cursor_row_in_view_and_says_when_its_screen_is_not_current() {
+        // Taller than the pane: the bottom shows, unless the cursor is above it.
+        assert_eq!(terminal_rows_skipped(40, 10, None), 30);
+        assert_eq!(terminal_rows_skipped(40, 10, Some((35, 0))), 30);
+        assert_eq!(terminal_rows_skipped(40, 10, Some((20, 0))), 11);
+        assert_eq!(terminal_rows_skipped(40, 10, Some((5, 0))), 0);
+        assert_eq!(terminal_rows_skipped(8, 10, Some((5, 0))), 0);
+
+        let mut ui = Ui::new(demo::world());
+        ui.tab = 1;
+        ui.terminal = Some(TerminalView {
+            name: "Keeper".into(),
+            title: "Keeper · vim".into(),
+            lines: (0..40)
+                .map(|row| Line::from(format!("row {row}")))
+                .collect(),
+            cursor: Some((5, 2)),
+            stale: Some("st closed the connection".into()),
+            ended: None,
+        });
+        let screen = frame(&ui, 120, 20).join("\n");
+        assert!(screen.contains("row 5"), "{screen}");
+        assert!(!screen.contains("row 39"), "{screen}");
+        assert!(
+            screen.contains("not current, reconnecting: st closed the connection"),
+            "{screen}"
+        );
+
+        let mut terminal = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        terminal.draw(|frame| ui.render(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        // Column 2 of "row 5" is its "w".
+        let (row, column) = (0..buffer.area.height)
+            .flat_map(|y| (0..buffer.area.width.saturating_sub(2)).map(move |x| (y, x)))
+            .find(|&(y, x)| {
+                buffer[(x, y)].symbol() == "w"
+                    && buffer[(x + 1, y)].symbol() == " "
+                    && buffer[(x + 2, y)].symbol() == "5"
+            })
+            .expect("row 5 is drawn");
+        assert!(
+            buffer[(column, row)]
+                .style()
+                .add_modifier
+                .contains(Modifier::REVERSED),
+            "the cursor cell at column 2 is inverted"
+        );
+    }
+
     #[test]
     fn enter_opens_an_agents_terminal_and_ctrl_backslash_returns() {
         let mut ui = Ui::new(demo::world());

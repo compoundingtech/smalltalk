@@ -23,3 +23,7 @@ unicode-width = "0.2.0"
 [[bin]]
 name = "stui"
 path = "src/main.rs"
+
+[dev-dependencies]
+st3 = { path = "../st3" }
+tempfile = "3"

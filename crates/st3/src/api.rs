@@ -13045,7 +13045,10 @@ mission "labelled" state="ready" {
         assert_eq!(
             steps
                 .iter()
-                .map(|step| (step["path"].as_str().unwrap(), step["state"].as_str().unwrap()))
+                .map(|step| (
+                    step["path"].as_str().unwrap(),
+                    step["state"].as_str().unwrap()
+                ))
                 .collect::<Vec<_>>(),
             [("first", "ready"), ("second", "pending")]
         );

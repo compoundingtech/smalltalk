@@ -14,11 +14,11 @@ use st3::api::AppState;
 use st3::model::{AttentionRequest, ClaimInput};
 use st3::store::Store;
 use st3_client::{
-    AttentionResolveParameters, Capabilities, Client, ClientError, CollectionEvent, Envelope, ErrorCode, Fence,
-    LaunchVariantParameters, PairingBegin, PairingComplete, Resource, TargetParameters,
-    TerminalAttachment, TerminalColor, TerminalInputMode, TerminalInputParameters,
-    TerminalResizeParameters, TerminalRun, TerminalScreen, TerminalStream, TimelineBody,
-    TimelineUsageSemantics,
+    AttentionResolveParameters, Capabilities, Client, ClientError, CollectionEvent, Envelope,
+    ErrorCode, Fence, LaunchVariantParameters, PairingBegin, PairingComplete, Resource,
+    TargetParameters, TerminalAttachment, TerminalColor, TerminalInputMode,
+    TerminalInputParameters, TerminalResizeParameters, TerminalRun, TerminalScreen, TerminalStream,
+    TimelineBody, TimelineUsageSemantics,
 };
 use tokio::sync::{Notify, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -405,13 +405,14 @@ async fn a_slow_terminal_client_gets_the_latest_screen_not_a_backlog() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let mut received = Vec::new();
-    while let Ok(screen) = tokio::time::timeout(Duration::from_millis(1_500), stream.next()).await
-    {
+    while let Ok(screen) = tokio::time::timeout(Duration::from_millis(1_500), stream.next()).await {
         received.push(screen.unwrap().unwrap());
     }
     let last = received.last().expect("the latest screen arrives");
     assert!(
-        last.value.lines[0].text.starts_with(&format!("{:04}", CHANGES - 1)),
+        last.value.lines[0]
+            .text
+            .starts_with(&format!("{:04}", CHANGES - 1)),
         "the last screen must be the latest one: {:?}",
         &last.value.lines[0].text[..10]
     );

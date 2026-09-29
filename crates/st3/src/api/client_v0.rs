@@ -4199,7 +4199,7 @@ pub(super) async fn terminal_stream(
     )?;
     Ok(websocket
         .protocols([TERMINAL_SUBPROTOCOL])
-        .on_upgrade(move |socket| follow.run(state, TerminalSink::Socket(socket))))
+        .on_upgrade(move |socket| follow.run(state, TerminalSink::Socket(Box::new(socket)))))
 }
 
 /// A terminal viewer, checked and holding its consumed attachment, ready to follow.
@@ -4297,7 +4297,7 @@ enum TerminalFrame {
 /// Where a followed terminal's screens go: its own WebSocket, or one subscription on a
 /// client's collection socket.
 enum TerminalSink {
-    Socket(WebSocket),
+    Socket(Box<WebSocket>),
     Subscription(watch::Sender<TerminalFrame>),
 }
 
@@ -4384,11 +4384,9 @@ async fn remote_terminal_stream_socket(
         };
         let read = relay.read(&owner, &request);
         tokio::pin!(read);
-        let read = loop {
-            tokio::select! {
-                read = &mut read => break read,
-                () = sink.gone() => return,
-            }
+        let read = tokio::select! {
+            read = &mut read => read,
+            () = sink.gone() => return,
         };
         let screen = match read {
             Ok(screen) => screen,

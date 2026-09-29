@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::Model;
 
-const VERSION: u32 = 1;
+// 2: mission runs carry their steps and agents name their queued steps.
+const VERSION: u32 = 2;
 const MAX_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
