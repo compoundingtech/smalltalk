@@ -599,7 +599,8 @@ PRAGMA user_version = 13;
 "#;
 
 /// The writer connection's clock offset. Only a simulation sets it; see `write_time`.
-const WRITE_CLOCK: &str = "CREATE TEMP TABLE IF NOT EXISTS write_clock(offset_ms INTEGER NOT NULL);";
+const WRITE_CLOCK: &str =
+    "CREATE TEMP TABLE IF NOT EXISTS write_clock(offset_ms INTEGER NOT NULL, at_ms INTEGER);";
 
 const READ_CONNECTIONS: usize = 4;
 

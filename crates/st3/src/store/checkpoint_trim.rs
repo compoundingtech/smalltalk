@@ -403,14 +403,17 @@ impl Store {
     }
 
     /// A deliberate bug for the convergence suite: forget every tombstone, as a trim that
-    /// deleted rows without keeping tombstones would. Nothing else calls it.
+    /// deleted rows without keeping tombstones would. Returns how many it forgot. Nothing else
+    /// calls it.
     #[doc(hidden)]
-    pub fn forget_tombstones_for_tests(&self) -> Result<()> {
-        self.connection
-            .write()
-            .execute_batch("DELETE FROM checkpoint_envelopes; DELETE FROM checkpoint_claims;")?;
+    pub fn forget_tombstones_for_tests(&self) -> Result<usize> {
+        let forgotten = {
+            let connection = self.connection.write();
+            connection.execute("DELETE FROM checkpoint_envelopes", [])?
+                + connection.execute("DELETE FROM checkpoint_claims", [])?
+        };
         self.replica_rows_changed();
-        Ok(())
+        Ok(forgotten)
     }
 
     fn set_checkpoint_state(&self, checkpoint: &str, cut_unix_ms: u128, state: &str) -> Result<()> {

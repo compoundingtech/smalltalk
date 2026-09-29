@@ -55,10 +55,13 @@ use st3_schema::{FieldSpec, Retention, ValueType};
 
 const FLEET: &str = "7d3f9a2e-5b6c-4e1d-8a0f-2c9b8e7d6f5a";
 const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
-/// Every run starts at this time of day, UTC. Cuts fall at midnight UTC, so a seed drops the
-/// same claims whenever it runs. Clock skews are whole hours, so no node starts within half
-/// an hour of a cut.
-const START_TIME_OF_DAY_MS: i64 = (12 * 60 + 30) * 60 * 1_000;
+/// Every run starts at 12:30 UTC on 1 January 2100, and its clock moves one second per step
+/// and by whole days, never with the host's. Claim IDs hash the time they were written, so a
+/// seed writes the same claims whenever and however slowly it runs. Cuts fall at midnight UTC
+/// and clock skews are whole hours, so no node starts within half an hour of a cut.
+const START_MS: i64 = 4_102_489_800_000;
+/// How far one step moves the clock.
+const STEP_MS: i64 = 1_000;
 const PERSON: &str = "person/operator";
 
 /// The seeds CI runs. Every failing seed found by hand is added here.
@@ -153,11 +156,10 @@ struct World {
     oracle: Store,
     /// The partition group of each node, by index. Nodes exchange only within a group.
     groups: Vec<usize>,
-    /// How far the simulation's clock runs ahead of this host's: the run starts at
-    /// `START_TIME_OF_DAY_MS` today.
-    start_offset_ms: i64,
     /// Simulated days since the run started.
     days: i64,
+    /// Time the steps have moved the clock, besides whole days.
+    elapsed_ms: i64,
     schedule: Vec<String>,
     failures: Vec<String>,
     serial: u64,
@@ -185,8 +187,8 @@ impl World {
             nodes: Vec::new(),
             oracle,
             groups: Vec::new(),
-            start_offset_ms: START_TIME_OF_DAY_MS - now_ms().rem_euclid(DAY_MS),
             days: 0,
+            elapsed_ms: 0,
             schedule: Vec::new(),
             failures: Vec::new(),
             serial: 0,
@@ -245,21 +247,27 @@ impl World {
         ));
     }
 
-    fn offset(&self, index: usize) -> i64 {
-        self.start_offset_ms + self.days * DAY_MS + self.nodes[index].skew_ms
+    /// The simulation's clock, without any node's skew.
+    fn now(&self) -> i64 {
+        START_MS + self.days * DAY_MS + self.elapsed_ms
+    }
+
+    /// What this node's clock reads.
+    fn clock(&self, index: usize) -> i64 {
+        self.now() + self.nodes[index].skew_ms
     }
 
     fn set_clock(&self, index: usize) {
         self.nodes[index]
             .store
-            .set_write_clock_offset(self.offset(index))
+            .set_write_clock_at(self.clock(index) as u128)
             .unwrap();
     }
 
     fn context(&self, index: usize) -> CheckpointContext {
         let node = &self.nodes[index];
         CheckpointContext {
-            now_unix_ms: (now_ms() + self.offset(index)) as u128,
+            now_unix_ms: self.clock(index) as u128,
             configured_peers: self
                 .nodes
                 .iter()
@@ -511,11 +519,18 @@ impl World {
                 .iter()
                 .any(|action| matches!(action, CheckpointAction::Trimmed { .. }))
         {
-            self.nodes[index]
+            let forgotten = self.nodes[index]
                 .store
                 .forget_tombstones_for_tests()
                 .unwrap();
-            self.sabotaged = true;
+            // A trim that dropped nothing leaves nothing to forget.
+            if forgotten != 0 {
+                self.sabotaged = true;
+                self.note(format!(
+                    "{} forgot {forgotten} tombstones",
+                    self.nodes[index].name
+                ));
+            }
         }
         self.check_actions(index, &actions);
         self.check_index(index);
@@ -658,7 +673,7 @@ impl World {
                         subject,
                         "subscription.mission-deferred",
                         None,
-                        json!({"request": request, "not_before_unix_ms": now_ms() + self.offset(index) + self.rng.below(100_000) as i64}),
+                        json!({"request": request, "not_before_unix_ms": self.clock(index) + self.rng.below(100_000) as i64}),
                     )
                 }
             }
@@ -832,6 +847,10 @@ impl World {
     fn run_schedule(&mut self, steps: usize) {
         for _ in 0..steps {
             let count = self.nodes.len();
+            self.elapsed_ms += STEP_MS;
+            for node in 0..count {
+                self.set_clock(node);
+            }
             let index = self.rng.below(count);
             match self.rng.below(100) {
                 0..=39 => {
@@ -1110,7 +1129,7 @@ impl World {
             .map(|claim| claim.subject.clone())
             .collect::<BTreeSet<_>>();
         // A fixed time, far enough ahead that every reader looks at every claim.
-        let now = (now_ms() + self.start_offset_ms + (self.days + 10) * DAY_MS) as u128;
+        let now = (self.now() + 10 * DAY_MS) as u128;
         let oracle_answers = self
             .oracle
             .checkpoint_reader_answers(&subjects, now)
@@ -1309,6 +1328,9 @@ struct Outcome {
     written: BTreeMap<String, usize>,
     trimmed: bool,
     sabotaged: bool,
+    /// The schedule and every store's authority digest, to show that a seed runs the same
+    /// every time.
+    fingerprint: Vec<String>,
 }
 
 fn run(seed: u64, sabotage: Sabotage) -> Outcome {
@@ -1323,11 +1345,22 @@ fn run(seed: u64, sabotage: Sabotage) -> Outcome {
         .nodes
         .iter()
         .any(|node| node.store.trimmed_checkpoint().unwrap().is_some());
+    let mut fingerprint = world.schedule.clone();
+    for store in std::iter::once(&world.oracle).chain(world.nodes.iter().map(|node| &node.store)) {
+        let status = store.replication_status(true, Some(FLEET), &[]).unwrap();
+        fingerprint.push(format!(
+            "{}: {:?} {:?}",
+            store.origin(),
+            status.authority_digest,
+            status.graph_digest
+        ));
+    }
     Outcome {
         failure: (!world.failures.is_empty()).then(|| world.report()),
         written: world.written,
         trimmed,
         sabotaged: world.sabotaged,
+        fingerprint,
     }
 }
 
@@ -1383,20 +1416,31 @@ fn every_seed_converges_3() {
     every_fourth_seed(3);
 }
 
-/// The deliberate bug must fail the first runs it happens in, not just some run.
+/// The deliberate bug must fail the first runs it happens in, not just some run. Seeds run four
+/// at a time, in order, until two ran into the bug.
 fn the_checks_catch(sabotage: Sabotage) {
     let mut happened = 0;
-    for seed in SEEDS {
-        let outcome = run(*seed, sabotage);
-        if outcome.sabotaged {
-            assert!(
-                outcome.failure.is_some(),
-                "seed {seed} ran into {sabotage:?} and passed"
-            );
-            happened += 1;
-            if happened == 2 {
-                break;
+    for seeds in SEEDS.chunks(4) {
+        let outcomes = std::thread::scope(|scope| {
+            let runs = seeds
+                .iter()
+                .map(|seed| scope.spawn(move || (*seed, run(*seed, sabotage))))
+                .collect::<Vec<_>>();
+            runs.into_iter()
+                .map(|run| run.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for (seed, outcome) in outcomes {
+            if outcome.sabotaged {
+                assert!(
+                    outcome.failure.is_some(),
+                    "seed {seed} ran into {sabotage:?} and passed"
+                );
+                happened += 1;
             }
+        }
+        if happened >= 2 {
+            break;
         }
     }
     assert!(happened > 0, "no seed ran into {sabotage:?}");
@@ -1410,6 +1454,29 @@ fn the_checks_catch_a_trim_that_forgets_its_tombstones() {
 #[test]
 fn the_checks_catch_a_partial_adoption() {
     the_checks_catch(Sabotage::PartialAdoption);
+}
+
+/// A seed runs the same however fast it runs, so the seed a failure prints reproduces it.
+#[test]
+fn a_seed_runs_the_same_every_time() {
+    let [first, second] = std::thread::scope(|scope| {
+        [0, 1]
+            .map(|_| scope.spawn(|| run(SEEDS[0], Sabotage::None)))
+            .map(|run| run.join().unwrap())
+    });
+    assert_eq!(first.failure, None);
+    let differs = first
+        .fingerprint
+        .iter()
+        .zip(&second.fingerprint)
+        .position(|(first, second)| first != second);
+    assert!(
+        differs.is_none() && first.fingerprint.len() == second.fingerprint.len(),
+        "seed {} ran differently from line {differs:?}:\n{}\n---\n{}",
+        SEEDS[0],
+        first.fingerprint.join("\n"),
+        second.fingerprint.join("\n")
+    );
 }
 
 #[test]

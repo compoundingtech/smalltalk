@@ -1007,7 +1007,11 @@ impl Store {
             ));
         }
         self.append_claim(&ClaimInput {
-            subject: format!("checkpoint-excusal/{}", Uuid::now_v7().simple()),
+            // One subject per excused writer, from its name, which a person typed.
+            subject: format!(
+                "checkpoint-excusal/{}",
+                &hex::encode(Sha256::digest(request.writer.as_bytes()))[..16]
+            ),
             kind: CHECKPOINT_EXCUSED.into(),
             actor: Some(actor),
             fields: BTreeMap::from([
@@ -1031,6 +1035,19 @@ impl Store {
         )?;
         Ok(())
     }
+
+    /// Date this store's writes at `at_unix_ms` until its clock is set again. Claim IDs hash
+    /// the time they were written, so a simulation that sets this before each step writes the
+    /// same claims however fast it runs. Nothing else sets it.
+    pub fn set_write_clock_at(&self, at_unix_ms: u128) -> Result<()> {
+        let connection = self.connection.write();
+        connection.execute("DELETE FROM temp.write_clock", [])?;
+        connection.execute(
+            "INSERT INTO temp.write_clock(offset_ms, at_ms) VALUES (0, ?1)",
+            [i64::try_from(at_unix_ms)?],
+        )?;
+        Ok(())
+    }
 }
 
 fn terms_key(terms: &SealTerms) -> String {
@@ -1044,7 +1061,8 @@ fn terms_key(terms: &SealTerms) -> String {
 /// promises the other participants that nothing this node writes afterwards is dated before its
 /// cut. Folds read claims in canonical order, which starts with the accepted time, so a writer
 /// whose clock stepped back would otherwise date its new claims before its older ones.
-/// `temp.write_clock` shifts the clock for a simulation; see `Store::set_write_clock_offset`.
+/// `temp.write_clock` shifts or fixes the clock for a simulation; see
+/// `Store::set_write_clock_offset` and `Store::set_write_clock_at`.
 pub(super) fn write_time(connection: &Connection, origin: &str) -> Result<u128> {
     let floor: Option<i64> = connection
         .prepare_cached("SELECT MAX(cut_unix_ms) FROM checkpoints")?
@@ -1056,11 +1074,14 @@ pub(super) fn write_time(connection: &Connection, origin: &str) -> Result<u128> 
         )?
         .query_row([origin], |row| row.get(0))
         .optional()?;
-    let offset: i64 = connection
-        .prepare_cached("SELECT offset_ms FROM temp.write_clock")
-        .and_then(|mut statement| statement.query_row([], |row| row.get(0)))
-        .unwrap_or(0);
-    let now = i128::try_from(now_ms()).unwrap_or(i128::MAX) + i128::from(offset);
+    let (offset, at): (i64, Option<i64>) = connection
+        .prepare_cached("SELECT offset_ms, at_ms FROM temp.write_clock")
+        .and_then(|mut statement| statement.query_row([], |row| Ok((row.get(0)?, row.get(1)?))))
+        .unwrap_or((0, None));
+    let now = match at {
+        Some(at) => i128::from(at),
+        None => i128::try_from(now_ms()).unwrap_or(i128::MAX) + i128::from(offset),
+    };
     let now = u128::try_from(now.max(0)).unwrap_or(0);
     let floor = floor
         .and_then(|floor| u128::try_from(floor).ok())
