@@ -3082,7 +3082,7 @@ fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
                 unique_child(delivery_body, name)?;
             }
             let reference = required_child_string(delivery_body, "mission", "mission delivery")?;
-            validate_exact_mission_reference(&reference)?;
+            validate_subscription_mission_reference(&reference)?;
             let input = required_child_string(delivery_body, "resource", "mission delivery")?;
             validate_name(&input, false)?;
             let workspace = required_child_string(delivery_body, "workspace", "mission delivery")?;
@@ -3436,6 +3436,14 @@ fn validate_exact_mission_reference(reference: &str) -> Result<(), St3Error> {
     Ok(())
 }
 
+fn validate_subscription_mission_reference(reference: &str) -> Result<(), St3Error> {
+    if reference.contains('@') {
+        validate_exact_mission_reference(reference)
+    } else {
+        crate::mission::validate_mission_id(reference.strip_prefix("mission/").unwrap_or(reference))
+    }
+}
+
 fn reject_unknown_children(
     document: &KdlDocument,
     allowed: &[&str],
@@ -3684,16 +3692,13 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
         .as_str()?
         .to_owned();
     let mission_reference = canonical_child_value(delivery_node, "mission").and_then(Value::as_str);
-    let (mission, revision) = mission_reference
-        .and_then(|value| {
-            value
-                .strip_prefix("mission/")
-                .unwrap_or(value)
-                .rsplit_once('@')
-        })
-        .map_or((None, None), |(mission, revision)| {
-            (Some(mission.to_owned()), Some(revision.to_owned()))
-        });
+    let (mission, revision) = mission_reference.map_or((None, None), |value| {
+        let value = value.strip_prefix("mission/").unwrap_or(value);
+        value.rsplit_once('@').map_or_else(
+            || (Some(value.to_owned()), None),
+            |(mission, revision)| (Some(mission.to_owned()), Some(revision.to_owned())),
+        )
+    });
     Some(SubscriptionSpec {
         observer: canonical_child_value(value, "observer")?
             .as_str()?
@@ -5383,6 +5388,27 @@ subscription "reviews" {{
             spec.requester.as_deref(),
             Some("agent/fleet/repository/standing/owner")
         );
+    }
+
+    #[test]
+    fn a_subscription_can_follow_the_current_ready_mission_revision() {
+        let source = r#"version 2
+resource "repo" { kind "vcs.repository" }
+observer "github" { resource "resource/repo"; provider "github.repository"; locator "example/repo"; field "pull_requests" }
+subscription "reviews" {
+  observer "observer/github"
+  on "pull_requests"
+  delivery "mission" { mission "example/review"; resource "source"; workspace "/srv/reviews" }
+}"#;
+        let intent = parse_test_intent(source, "node").unwrap();
+        let subscription = intent
+            .subjects
+            .values()
+            .find(|item| item.kind == "subscription")
+            .unwrap();
+        let spec = subscription_spec(&subscription.desired).unwrap();
+        assert_eq!(spec.mission.as_deref(), Some("example/review"));
+        assert_eq!(spec.revision, None);
     }
 
     #[test]

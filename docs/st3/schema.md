@@ -3,7 +3,7 @@
 This file is generated from `st3-schema`.
 
 Schema: `st3.v1`
-Digest: `07a9baac57d3b1c04906cf7b5388dc4f2794887d8acc78dcef195095ede14560`
+Digest: `fb0edf3cec4d254b643df7776459fbe1e1e010fcef75d7b3226b0be313d43525`
 
 ## Subject families
 
@@ -141,7 +141,7 @@ Custom subjects use `custom/NAMESPACE/NAME`. Custom claims use `custom.NAMESPACE
 | `subscription.mission-failed` | `subscription` | `system-only` | `append` | `durable` | `code!:string`, `reason!:string`, `request!:string` | `subscription` |
 | `subscription.mission-request-cancelled` | `subscription` | `authorized-participant` | `append` | `durable` | `reason:string`, `request!:string` | `subscription` |
 | `subscription.mission-request-released` | `subscription` | `authorized-participant` | `append` | `durable` | `reason:string`, `request!:string` | `subscription` |
-| `subscription.mission-requested` | `subscription` | `system-only` | `append` | `durable` | `discovery!:string`, `held:boolean`, `mission!:subject-reference(mission)`, `mission_revision!:string`, `requester:subject-reference(agent|person)`, `resource!:subject-reference(resource)`, `resource_input!:string`, `workspace!:string` | `subscription` |
+| `subscription.mission-requested` | `subscription` | `system-only` | `append` | `durable` | `delivery_key:string`, `discovery!:string`, `held:boolean`, `mission!:subject-reference(mission)`, `mission_revision:string`, `requester:subject-reference(agent|person)`, `resource!:subject-reference(resource)`, `resource_input!:string`, `workspace!:string` | `subscription` |
 | `subscription.mission-started` | `subscription` | `system-only` | `append` | `durable` | `mission_run!:subject-reference(mission-run)`, `request!:string` | `subscription` |
 | `subscription.state` | `subscription` | `system-only` | `state-transition` | `durable` | `fields:array`, `observer:subject-reference`, `reason:string`, `state!:string`, `to:subject-reference` | `subscription` |
 | `terminal.input.requested` | `agent`, `pty` | `authorized-requester` | `append` | `durable` | `byte_count:integer`, `incarnation_id:string`, `intent:string`, `mode:string`, `runtime_id:string`, `sequence:integer`, `sha256:string` |  |

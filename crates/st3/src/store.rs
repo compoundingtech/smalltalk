@@ -112,6 +112,12 @@ WHERE kind IN (
     'subscription.mission-failed',
     'subscription.mission-request-cancelled'
 );
+CREATE INDEX IF NOT EXISTS claims_subscription_delivery_key_index
+ON claims(json_extract(body, '$.fields.delivery_key'))
+WHERE kind='subscription.mission-requested';
+CREATE INDEX IF NOT EXISTS claims_subscription_mission_resource_index
+ON claims(json_extract(body, '$.fields.mission'), json_extract(body, '$.fields.resource'))
+WHERE kind='subscription.mission-requested';
 CREATE INDEX IF NOT EXISTS claims_subscription_deferred_request_index
 ON claims(subject, json_extract(body, '$.fields.request'), store_index)
 WHERE kind='subscription.mission-deferred';
@@ -1351,6 +1357,65 @@ fn discovered_collection_items(
             ))
         })
         .collect()
+}
+
+/// Subscription subjects change when a watch mission is restarted. Look up the item and exact
+/// head in the graph's existing request claims, including claims written before delivery keys
+/// were added, so a replacement watch cannot review an old head again.
+fn collection_delivery_was_requested_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    mission: &str,
+    delivery_scope: &str,
+    resource: &str,
+    head: Option<&str>,
+    delivery_key: &str,
+) -> rusqlite::Result<bool> {
+    let keyed = transaction
+        .query_row(
+            "SELECT 1 FROM claims WHERE kind='subscription.mission-requested'
+         AND json_extract(body, '$.fields.delivery_key')=?1 LIMIT 1",
+            [delivery_key],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if keyed {
+        return Ok(true);
+    }
+    let mut statement = transaction.prepare(
+        "SELECT subject, body FROM claims WHERE kind='subscription.mission-requested'
+         AND json_extract(body, '$.fields.mission')=?1
+         AND json_extract(body, '$.fields.resource')=?2
+         AND json_extract(body, '$.fields.delivery_key') IS NULL",
+    )?;
+    let requests = statement
+        .query_map(params![format!("mission/{mission}"), resource], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (subscription, body) in requests {
+        if subscription.rsplit('/').next() != Some(delivery_scope) {
+            continue;
+        }
+        let body: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let Some(discovery) = body.pointer("/fields/discovery").and_then(Value::as_str) else {
+            continue;
+        };
+        let observed = transaction
+            .query_row("SELECT body FROM claims WHERE id=?1", [discovery], |row| {
+                row.get::<_, String>(0)
+            })
+            .optional()?;
+        let observed = observed.and_then(|body| serde_json::from_str::<Value>(&body).ok());
+        let old_head = observed
+            .as_ref()
+            .and_then(|value| value.pointer("/fields/facts/head_sha"))
+            .and_then(Value::as_str);
+        if old_head == head {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn open_read_connections(path: &Path, shared_memory: bool) -> Result<Vec<Connection>> {
@@ -9491,9 +9556,6 @@ impl Store {
                     let Some(mission) = subscription.mission.as_deref() else {
                         continue;
                     };
-                    let Some(revision) = subscription.revision.as_deref() else {
-                        continue;
-                    };
                     let Some(resource_input) = subscription.resource_input.as_deref() else {
                         continue;
                     };
@@ -9520,20 +9582,72 @@ impl Store {
                             .map(|claim| vec![(resource.to_owned(), claim.id.clone())])
                             .unwrap_or_default()
                     };
-                    for (index, (delivery_resource, discovery)) in
-                        discoveries.into_iter().enumerate()
-                    {
+                    let mut requested_count = 0;
+                    for (delivery_resource, discovery) in discoveries {
+                        let discovery_body = transaction
+                            .query_row("SELECT body FROM claims WHERE id=?1", [&discovery], |row| {
+                                row.get::<_, String>(0)
+                            })
+                            .map_err(internal)?;
+                        let discovery_body: Value =
+                            serde_json::from_str(&discovery_body).map_err(internal)?;
+                        let head = discovery_body
+                            .pointer("/fields/facts/head_sha")
+                            .and_then(Value::as_str);
+                        let number = discovery_body
+                            .pointer("/fields/facts/number")
+                            .and_then(Value::as_u64);
+                        let kind = discovery_body
+                            .pointer("/fields/kind")
+                            .and_then(Value::as_str);
+                        let repository_identity = current_object
+                            .get("repository_id")
+                            .filter(|value| !value.is_null())
+                            .cloned()
+                            .unwrap_or_else(|| Value::String(resource.into()));
+                        let delivery_scope = subscription_subject
+                            .rsplit('/')
+                            .next()
+                            .expect("a subscription subject has a local name");
+                        let delivery_key = canonical_hash(&(
+                            mission,
+                            delivery_scope,
+                            repository_identity,
+                            kind,
+                            number,
+                            head,
+                        ))
+                        .map_err(internal)?;
+                        if uses_collection
+                            && collection_delivery_was_requested_tx(
+                                &transaction,
+                                mission,
+                                delivery_scope,
+                                &delivery_resource,
+                                head,
+                                &delivery_key,
+                            )
+                            .map_err(internal)?
+                        {
+                            continue;
+                        }
                         let mut request_fields = json!({
                             "mission": format!("mission/{mission}"),
-                            "mission_revision": revision,
                             "resource": delivery_resource,
                             "resource_input": resource_input,
                             "workspace": workspace,
                             "discovery": discovery,
+                            "delivery_key": delivery_key,
                         });
+                        if let Some(revision) = subscription.revision.as_deref() {
+                            request_fields
+                                .as_object_mut()
+                                .expect("subscription request fields are an object")
+                                .insert("mission_revision".into(), Value::String(revision.into()));
+                        }
                         // One observation starts a bounded number of runs. A person releases or
                         // cancels the rest.
-                        if index >= MAX_OBSERVATION_DELIVERIES {
+                        if requested_count >= MAX_OBSERVATION_DELIVERIES {
                             request_fields
                                 .as_object_mut()
                                 .expect("subscription request fields are an object")
@@ -9556,6 +9670,7 @@ impl Store {
                             Some(&batch_id),
                         )
                         .map_err(claim_append_error)?;
+                        requested_count += 1;
                     }
                     continue;
                 }
@@ -9745,6 +9860,82 @@ impl Store {
             .query_map([subject], claim_from_row)?
             .collect::<Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Find a mission-run PR resource for this discovered PR when that run already has a human
+    /// review gate for its own PR. Intake uses this graph provenance to avoid a second reviewer.
+    pub fn authoring_review_owner(&self, discovery: &str) -> Result<Option<String>> {
+        let Some(claim) = self.claim_by_id(discovery)? else {
+            return Ok(None);
+        };
+        let url = claim
+            .body
+            .pointer("/fields/facts/url")
+            .and_then(Value::as_str);
+        let repository = claim
+            .body
+            .pointer("/fields/facts/repository")
+            .and_then(Value::as_str);
+        let number = claim
+            .body
+            .pointer("/fields/facts/number")
+            .and_then(Value::as_u64);
+        if url.is_none() && (repository.is_none() || number.is_none()) {
+            return Ok(None);
+        }
+        let head = claim
+            .body
+            .pointer("/fields/facts/head_sha")
+            .and_then(Value::as_str);
+        let candidates = {
+            let connection = self.readers.get();
+            let mut statement = connection.prepare(
+                "SELECT subject, body FROM claims WHERE kind='resource.observed'
+                 AND subject LIKE 'resource/mission-run/%/pull-request'
+                 AND (json_extract(body, '$.fields.facts.url')=?1
+                   OR (json_extract(body, '$.fields.facts.repository')=?2
+                       AND json_extract(body, '$.fields.facts.number')=?3))",
+            )?;
+            statement
+                .query_map(params![url, repository, number], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for (resource, body) in candidates {
+            let value: Value = serde_json::from_str(&body)?;
+            let authored_head = value
+                .pointer("/fields/facts/head_sha")
+                .and_then(Value::as_str);
+            if head.is_some() && authored_head.is_some() && head != authored_head {
+                continue;
+            }
+            let Some(run_id) = resource
+                .strip_prefix("resource/mission-run/")
+                .and_then(|name| name.strip_suffix("/pull-request"))
+            else {
+                continue;
+            };
+            let Some(run) = self.mission_run(run_id)? else {
+                continue;
+            };
+            let mission_id = run.mission.strip_prefix("mission/").unwrap_or(&run.mission);
+            let Some(mission) = self.mission_spec(mission_id, Some(&run.revision))? else {
+                continue;
+            };
+            let has_own_review = mission.steps.values().any(|step| {
+                step.gates.iter().any(|gate| match gate {
+                    crate::model::GateSpec::Human { review_targets, .. } => review_targets
+                        .iter()
+                        .any(|target| target == &resource || target.ends_with("/pull-request")),
+                    _ => false,
+                })
+            });
+            if has_own_review {
+                return Ok(Some(format!("mission-run/{run_id}")));
+            }
+        }
+        Ok(None)
     }
 
     /// Read only one pending request's retry history. The request index covers the count and
@@ -11251,8 +11442,7 @@ impl Store {
                              WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
                             params![envelope.writer, envelope.sequence, envelope.hash],
                         )?;
-                        membership_changed |=
-                            envelope_carries_fleet_claims(&savepoint, &envelope)?;
+                        membership_changed |= envelope_carries_fleet_claims(&savepoint, &envelope)?;
                         savepoint.commit()?;
                     }
                     Err(error) => {
@@ -11289,8 +11479,10 @@ impl Store {
     /// replay the whole graph after every exchange. It projects at most once per interval
     /// instead, and again as soon as it has caught up. `None` means it deferred.
     pub fn project_replication_backlog_unless_catching_up(&self) -> Result<Option<bool>> {
-        let since = (now_ms() as u64)
-            .saturating_sub(self.last_replication_projection_unix_ms.load(Ordering::Acquire));
+        let since = (now_ms() as u64).saturating_sub(
+            self.last_replication_projection_unix_ms
+                .load(Ordering::Acquire),
+        );
         if since < CATCH_UP_PROJECTION_INTERVAL_MS && self.replication_catching_up() {
             self.replication_projection_deferred
                 .store(true, Ordering::Release);
@@ -21122,7 +21314,9 @@ fn a_catching_up_node_projects_once_per_interval_and_again_when_caught_up() {
             .receive_replication_exchange("source", FLEET, &response)
             .unwrap();
         target.validate_replication_backlog().unwrap();
-        target.project_replication_backlog_unless_catching_up().unwrap()
+        target
+            .project_replication_backlog_unless_catching_up()
+            .unwrap()
     };
 
     // The first exchange projects, so the node shows something at once.
@@ -21142,7 +21336,9 @@ fn a_catching_up_node_projects_once_per_interval_and_again_when_caught_up() {
         .last_replication_projection_unix_ms
         .store(0, Ordering::Release);
     assert_eq!(
-        target.project_replication_backlog_unless_catching_up().unwrap(),
+        target
+            .project_replication_backlog_unless_catching_up()
+            .unwrap(),
         Some(true)
     );
     assert!(!target.replication_projection_deferred());
