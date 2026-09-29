@@ -2901,6 +2901,21 @@ fn main() -> ExitCode {
     if let Some(program) = st3::recorder::invoked_program() {
         st3::recorder::run(program);
     }
+    // A seat process asks a replacement binary which resume formats it reads before executing it.
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(st2::reexec::PROBE_SUBCOMMAND))
+    {
+        println!("{}", st2::reexec::probe_answer());
+        return ExitCode::SUCCESS;
+    }
+    // SAFETY: no other thread exists yet; the async runtime starts after this returns.
+    unsafe { st2::reexec::take_resume_environment() };
+    if st2::reexec::resume_path(st2::reexec::DRIVER_RESUME_ENV).is_some() {
+        // The predecessor blocked the stop signals across its exec. Install the handlers before
+        // unblocking them, so a stop that arrived in between ends the session the ordinary way.
+        st2::provider_session::install_stop_handlers();
+        st2::reexec::unblock_stop_signals();
+    }
     let cli = Cli::parse();
     if let Command::Up(args) = &cli.command {
         record_daemon_commands(args);
@@ -8426,6 +8441,16 @@ fn render_client_agent(
     if let Some(fault) = &agent.fault {
         let _ = writeln!(output, "FAULT        {fault}");
     }
+    if let Some(delivery) = &agent.delivery {
+        match delivery.reason.as_deref() {
+            Some(reason) => {
+                let _ = writeln!(output, "DELIVERY     {} · {reason}", delivery.state);
+            }
+            None => {
+                let _ = writeln!(output, "DELIVERY     {}", delivery.state);
+            }
+        }
+    }
     if let Some(incarnation) = &agent.incarnation_id {
         let _ = writeln!(output, "INCARNATION  {incarnation}");
     }
@@ -9536,12 +9561,27 @@ async fn message_page(
     include_closed: bool,
     cursor: Option<&str>,
 ) -> Result<MessagePage> {
+    message_page_reporting(client, recipient, include_closed, cursor, None).await
+}
+
+/// One mailbox page. A seat's delivery process passes its delivery report, which the daemon
+/// keeps in memory to tell a live, current delivery path from a stale one.
+async fn message_page_reporting(
+    client: &Client,
+    recipient: Option<&str>,
+    include_closed: bool,
+    cursor: Option<&str>,
+    report: Option<&str>,
+) -> Result<MessagePage> {
     let mut path = format!("/v1/messages/page?include_closed={include_closed}&limit=100");
     if let Some(recipient) = recipient {
         path.push_str(&format!("&to={}", urlencoding::encode(recipient)));
     }
     if let Some(cursor) = cursor {
         path.push_str(&format!("&cursor={}", urlencoding::encode(cursor)));
+    }
+    if let Some(report) = report {
+        path.push_str(&format!("&delivery={}", urlencoding::encode(report)));
     }
     client.get(&path).await
 }
@@ -10289,7 +10329,6 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
             .identity
             .as_deref()
             .context("the pi-family channel has no identity")?;
-        let _ = catalog.context("the pi-family channel has no native driver catalog")?;
         anyhow::ensure!(
             args.argv.is_empty(),
             "the pi-family channel takes no provider argv"
@@ -10299,12 +10338,20 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
         } else {
             "pi"
         };
-        return run_pi_channel(client, &normalize_agent_subject(identity), driver).await;
+        let catalog = catalog.context("the pi-family channel has no native driver catalog")?;
+        return run_pi_channel(client, &normalize_agent_subject(identity), driver, catalog).await;
     }
     let subject = args
         .subject
         .as_deref()
         .context("the driver has no subject")?;
+    if matches!(
+        args.driver.as_str(),
+        "claude" | "codex" | "pi" | "omp" | "opencode"
+    ) && let Some(state) = st2::reexec::resume_path(st2::reexec::DRIVER_RESUME_ENV)
+    {
+        return resume_native_driver(client, subject, &args.driver, args.argv, &state).await;
+    }
     if args.driver == "codex" {
         return run_codex_native(client, subject, args.argv).await;
     }
@@ -10371,7 +10418,7 @@ async fn run_st2_native_driver(
     if driver == "claude" {
         reject_noninteractive_claude_argv(&argv)?;
     }
-    let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
+    let paths = NativePaths::prepare(subject)?;
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
     // A driver launched while the daemon restarts waits for it; exiting here would end the seat.
     retry_while_daemon_unreachable(subject, || {
@@ -10385,27 +10432,335 @@ async fn run_st2_native_driver(
         )
     })
     .await?;
-    let harness_state_path = st2::harness_state::harness_state_path(&agent_dir);
-    let predecessor_harness_record = fs::read(&harness_state_path).ok();
-    let mut current_harness_record_started = false;
-    let task_catalog = catalog.clone();
-    let task_agent = agent_dir.clone();
-    let task_identity = identity.clone();
-    let task_runtime = runtime_id.clone();
-    let task_driver = driver.to_owned();
-    let mut task = tokio::task::spawn_blocking(move || match task_driver.as_str() {
-        "claude" => st2::claude_session::run_controlled_paths(
-            &task_catalog,
-            &task_agent,
-            task_identity,
-            task_runtime,
-            argv,
+    let harness_state_path = st2::harness_state::harness_state_path(&paths.agent_dir);
+    let loop_state = NativeLoopState {
+        predecessor_harness_record: fs::read(&harness_state_path).ok(),
+        ..NativeLoopState::default()
+    };
+    let task = spawn_st2_provider(driver, &paths, ProviderStart::Launch(argv));
+    drive_st2_native(
+        client,
+        subject,
+        driver,
+        paths,
+        incarnation,
+        loop_state,
+        task,
+    )
+    .await
+}
+
+/// The private catalog paths a native driver derives from its subject.
+#[derive(Clone)]
+struct NativePaths {
+    catalog: PathBuf,
+    agent_dir: PathBuf,
+    identity: String,
+    runtime_id: String,
+}
+
+impl NativePaths {
+    fn prepare(subject: &str) -> Result<Self> {
+        let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
+        Ok(Self {
+            catalog,
+            agent_dir,
+            identity,
+            runtime_id,
+        })
+    }
+
+    /// The driver's own state root, where it leaves its resume state for its next image.
+    fn state_root(&self) -> PathBuf {
+        self.catalog
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| self.catalog.clone())
+    }
+}
+
+enum ProviderStart {
+    Launch(Vec<String>),
+    Adopt(st2::provider_session::DetachedSession),
+}
+
+fn spawn_st2_provider(
+    driver: &str,
+    paths: &NativePaths,
+    start: ProviderStart,
+) -> tokio::task::JoinHandle<Result<()>> {
+    use st2::provider_session::DetachedSession;
+    let paths = paths.clone();
+    let driver = driver.to_owned();
+    tokio::task::spawn_blocking(move || match start {
+        ProviderStart::Launch(argv) => match driver.as_str() {
+            "claude" => st2::claude_session::run_controlled_paths(
+                &paths.catalog,
+                &paths.agent_dir,
+                paths.identity,
+                paths.runtime_id,
+                argv,
+            ),
+            "pi" => st2::pi_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv),
+            "omp" => st2::omp_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv),
+            "opencode" => {
+                st2::opencode_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv)
+            }
+            _ => unreachable!("the native driver was checked"),
+        },
+        ProviderStart::Adopt(session) => match (driver.as_str(), session) {
+            ("claude", DetachedSession::Provider { pid, session, seq }) => {
+                st2::claude_session::adopt_controlled_paths(
+                    &paths.agent_dir,
+                    &paths.identity,
+                    &paths.runtime_id,
+                    pid,
+                    &session,
+                    seq,
+                )
+            }
+            ("pi", DetachedSession::Provider { pid, session, seq }) => st2::pi_session::adopt(
+                &paths.catalog,
+                paths.identity,
+                paths.runtime_id,
+                pid,
+                session,
+                seq,
+            ),
+            ("omp", DetachedSession::Provider { pid, session, seq }) => st2::omp_session::adopt(
+                &paths.catalog,
+                paths.identity,
+                paths.runtime_id,
+                pid,
+                session,
+                seq,
+            ),
+            (
+                "opencode",
+                DetachedSession::OpenCode {
+                    pid,
+                    session,
+                    seq,
+                    port,
+                    password,
+                    version_ok,
+                    producer_version,
+                },
+            ) => st2::opencode_session::adopt(
+                &paths.catalog,
+                paths.identity,
+                paths.runtime_id,
+                pid,
+                session,
+                seq,
+                port,
+                password,
+                version_ok,
+                producer_version,
+            ),
+            (driver, session) => {
+                anyhow::bail!("a {driver} driver cannot adopt this provider session: {session:?}")
+            }
+        },
+    })
+}
+
+/// Driver loop state a replacement image carries forward, so it neither republishes what this
+/// image already published nor forgets that the harness already reported ready.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct NativeLoopState {
+    ready: bool,
+    /// Whether the harness-state file already belongs to this session. A resumed driver adopts a
+    /// running session, so its record is always current.
+    harness_record_started: bool,
+    #[serde(skip)]
+    predecessor_harness_record: Option<Vec<u8>>,
+    published_timeline: BTreeSet<String>,
+    delivery_episode: u64,
+}
+
+/// What a native driver hands its next image across `execve`.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct DriverResume {
+    driver: String,
+    subject: String,
+    incarnation: String,
+    session: st2::provider_session::DetachedSession,
+    loop_state: NativeLoopState,
+}
+
+/// Resume a native driver a predecessor image re-executed into this binary.
+async fn resume_native_driver(
+    client: &Client,
+    subject: &str,
+    driver: &str,
+    argv: Vec<String>,
+    state_path: &Path,
+) -> Result<()> {
+    let mut resume: DriverResume = st2::reexec::read_state(state_path)?;
+    anyhow::ensure!(
+        resume.subject == subject && resume.driver == driver,
+        "the resume state belongs to the {} driver of `{}`, not the {driver} driver of `{subject}`",
+        resume.driver,
+        resume.subject
+    );
+    resume.loop_state.harness_record_started = true;
+    let _ = write_driver_log(
+        subject,
+        &format!(
+            "the {driver} driver resumed in {} after its st binary was replaced; the provider kept running",
+            st2::reexec::installed_binary()
+                .map(|path| path.display().to_string())
+                .unwrap_or_else(|| "a replacement binary".into())
         ),
-        "pi" => st2::pi_session::run(&task_catalog, task_identity, task_runtime, argv),
-        "omp" => st2::omp_session::run(&task_catalog, task_identity, task_runtime, argv),
-        "opencode" => st2::opencode_session::run(&task_catalog, task_identity, task_runtime, argv),
-        _ => unreachable!("the native driver was checked"),
+    );
+    if driver == "codex" {
+        return drive_codex_native(
+            client,
+            subject,
+            argv,
+            resume.incarnation,
+            ProviderStart::Adopt(resume.session),
+            resume.loop_state,
+        )
+        .await;
+    }
+    let paths = NativePaths::prepare(subject)?;
+    let task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(resume.session));
+    drive_st2_native(
+        client,
+        subject,
+        driver,
+        paths,
+        resume.incarnation,
+        resume.loop_state,
+        task,
+    )
+    .await
+}
+
+/// Follows the installed st binary for a native driver. Once a replacement is ready, the driver
+/// asks its provider task to detach and re-executes with the session it released.
+struct DriverReplacement {
+    watch: Option<st2::reexec::ReplacementWatch>,
+    pending: Option<PathBuf>,
+}
+
+impl DriverReplacement {
+    fn new() -> Self {
+        Self {
+            watch: st2::reexec::ReplacementWatch::for_current_process(),
+            pending: None,
+        }
+    }
+
+    /// Check the installed binary. Returns true when the provider task was asked to detach.
+    fn check(&mut self) -> bool {
+        if self.pending.is_some() {
+            return false;
+        }
+        let Some(watch) = self.watch.as_mut() else {
+            return false;
+        };
+        let ready = tokio::task::block_in_place(|| watch.ready());
+        let Some(binary) = ready else {
+            return false;
+        };
+        self.pending = Some(binary);
+        st2::provider_session::DETACH.store(true, std::sync::atomic::Ordering::SeqCst);
+        true
+    }
+
+    /// Re-execute with a released session. Returns only when that failed; the caller then adopts
+    /// the session again in this image and retries the replacement later.
+    fn exec(&mut self, subject: &str, state_root: &Path, resume: &DriverResume) -> anyhow::Error {
+        st2::provider_session::DETACH.store(false, std::sync::atomic::Ordering::SeqCst);
+        let Some(binary) = self.pending.take() else {
+            return anyhow::anyhow!("no replacement binary was pending");
+        };
+        let _ = write_driver_log(
+            subject,
+            &format!(
+                "the st binary at {} was replaced; the {} driver re-executes into it and keeps its provider",
+                binary.display(),
+                resume.driver
+            ),
+        );
+        let error = match st2::reexec::write_state(state_root, "driver-resume", resume) {
+            Ok(path) => {
+                let error = st2::reexec::exec_unless_stopped(
+                    &binary,
+                    st2::reexec::DRIVER_RESUME_ENV,
+                    &path,
+                    &resume.session.inherited_descriptors(),
+                    &st2::provider_session::stop_requested,
+                );
+                let _ = fs::remove_file(&path);
+                anyhow::Error::new(error).context(format!("executing {}", binary.display()))
+            }
+            Err(error) => error.context("saving the driver resume state"),
+        };
+        if let Some(watch) = self.watch.as_mut() {
+            watch.refuse_current();
+        }
+        let _ = write_driver_log(
+            subject,
+            &format!(
+                "the driver keeps its current binary and adopts its provider again: {error:#}"
+            ),
+        );
+        error
+    }
+}
+
+/// The detached session a provider task returned, if it returned one.
+fn detached_session(outcome: &Result<()>) -> Option<st2::provider_session::DetachedSession> {
+    outcome
+        .as_ref()
+        .err()?
+        .downcast_ref::<st2::provider_session::Detached>()
+        .map(|detached| detached.session.clone())
+}
+
+/// The delivery report a native driver attaches to its mailbox poll, so the daemon can tell a
+/// current, live delivery path from a stale one.
+fn native_delivery_report(transport: &str, agent_dir: Option<&Path>) -> String {
+    let mut report = json!({
+        "transport": transport,
+        "pid": std::process::id(),
+        "image": st2::reexec::running_identity().map(|identity| identity.token()),
     });
+    if let Some(agent_dir) = agent_dir {
+        let channel = st2::claude_mcp::read_presence(agent_dir);
+        let now = current_unix_ms().unwrap_or_default() as u64;
+        report["channel"] = match channel {
+            Some(presence) => json!({
+                "pid": presence.pid,
+                "image": presence.image,
+                "age_ms": now.saturating_sub(presence.at_unix_ms),
+            }),
+            None => Value::Null,
+        };
+    }
+    report.to_string()
+}
+
+async fn drive_st2_native(
+    client: &Client,
+    subject: &str,
+    driver: &str,
+    paths: NativePaths,
+    incarnation: String,
+    mut loop_state: NativeLoopState,
+    mut task: tokio::task::JoinHandle<Result<()>>,
+) -> Result<()> {
+    let NativePaths {
+        catalog,
+        agent_dir,
+        identity,
+        runtime_id,
+    } = paths.clone();
+    let harness_state_path = st2::harness_state::harness_state_path(&agent_dir);
     let inbox = st2::message::inbox_dir(&agent_dir);
     let archive = st2::message::archive_dir(&agent_dir);
     // Mailbox projection reads the durable message history. A one-second poll
@@ -10418,15 +10773,28 @@ async fn run_st2_native_driver(
     let mut renewed_minute = None;
     let mut last_activity_fingerprint = None;
     let mut last_usage_fingerprint = None;
-    let mut published_timeline = BTreeSet::new();
-    let mut ready = false;
     let mut last_control_warning = None;
     let mut last_capacity_fingerprint = None;
-    let mut delivery = NativeDeliverySupervisor::default();
+    let mut delivery = NativeDeliverySupervisor::resumed(loop_state.delivery_episode);
+    let mut replacement = DriverReplacement::new();
     loop {
         tokio::select! {
             result = &mut task => {
                 let outcome = result?;
+                if let Some(session) = detached_session(&outcome) {
+                    loop_state.delivery_episode = delivery.episode;
+                    let resume = DriverResume {
+                        driver: driver.to_owned(),
+                        subject: subject.to_owned(),
+                        incarnation: incarnation.clone(),
+                        session: session.clone(),
+                        loop_state,
+                    };
+                    let _ = replacement.exec(subject, &paths.state_root(), &resume);
+                    loop_state = resume.loop_state;
+                    task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(session));
+                    continue;
+                }
                 loop {
                     let result: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
                         subject: subject.into(),
@@ -10456,15 +10824,57 @@ async fn run_st2_native_driver(
                 return outcome;
             }
             _ = interval.tick() => {
+                let current_record = fs::read(&harness_state_path).ok();
+                loop_state.harness_record_started = harness_record_belongs_to_current_session(
+                    loop_state.harness_record_started,
+                    loop_state.predecessor_harness_record.as_deref(),
+                    current_record.as_deref(),
+                );
+                let provider_incarnation = if loop_state.harness_record_started {
+                    st2::harness_state::read(&harness_state_path, None)
+                        .and_then(|observed| observed.evidence_incarnation)
+                } else {
+                    None
+                };
+                // Delivery runs first and on its own: a failing observation publish must never
+                // hold back a message.
+                if driver == "claude" {
+                    delivery.report = Some(native_delivery_report("claude-channel", Some(&agent_dir)));
+                    supervise_native_delivery(
+                        client,
+                        subject,
+                        &inbox,
+                        &archive,
+                        "claude-channel",
+                        NativeDeliveryReceipts::ClaudeChannel {
+                            agent_dir: &agent_dir,
+                            incarnation: claude_receipt_incarnation(&incarnation, provider_incarnation.as_deref()),
+                        },
+                        &incarnation,
+                        &mut delivery,
+                    )
+                    .await;
+                } else if driver == "opencode" {
+                    delivery.report = Some(native_delivery_report("opencode-server", None));
+                    supervise_native_delivery(
+                        client,
+                        subject,
+                        &inbox,
+                        &archive,
+                        "opencode-server",
+                        NativeDeliveryReceipts::OpenCode {
+                            catalog_root: &catalog,
+                            identity: &identity,
+                            runtime_id: &runtime_id,
+                        },
+                        &incarnation,
+                        &mut delivery,
+                    )
+                    .await;
+                }
                 let tick: Result<()> = async {
-                    let current_record = fs::read(&harness_state_path).ok();
-                    current_harness_record_started = harness_record_belongs_to_current_session(
-                        current_harness_record_started,
-                        predecessor_harness_record.as_deref(),
-                        current_record.as_deref(),
-                    );
                     if native_file_may_override_channel(driver)
-                        && current_harness_record_started
+                        && loop_state.harness_record_started
                         && let Some(observed) = st2::harness_state::read(&harness_state_path, None)
                     {
                         // A session claim is a startup fence, not an observation. Preserve the
@@ -10475,7 +10885,7 @@ async fn run_st2_native_driver(
                             observed.state == st2::harness_state::Activity::Unknown
                                 && observed.reason.as_deref() == Some("claimed");
                         if !claim_placeholder {
-                            if !ready
+                            if !loop_state.ready
                                 && !matches!(
                                     observed.state,
                                     st2::harness_state::Activity::Unknown
@@ -10503,7 +10913,7 @@ async fn run_st2_native_driver(
                                     expected_subject: None,
                                     idempotency_key: Some(format!("native-ready:{subject}:{driver}:{incarnation}")),
                                 }).await?;
-                                ready = true;
+                                loop_state.ready = true;
                             }
                             publish_harness_activity(
                                 client,
@@ -10550,12 +10960,6 @@ async fn run_st2_native_driver(
                             .await?;
                         }
                     }
-                    let provider_incarnation = if current_harness_record_started {
-                        st2::harness_state::read(&harness_state_path, None)
-                            .and_then(|observed| observed.evidence_incarnation)
-                    } else {
-                        None
-                    };
                     publish_harness_timeline(
                         client,
                         subject,
@@ -10563,46 +10967,15 @@ async fn run_st2_native_driver(
                         &incarnation,
                         provider_incarnation.as_deref(),
                         &agent_dir,
-                        &mut published_timeline,
+                        &mut loop_state.published_timeline,
                     )
                     .await?;
-                    if driver == "claude" {
-                        supervise_native_delivery(
-                            client,
-                            subject,
-                            &inbox,
-                            &archive,
-                            "claude-channel",
-                            NativeDeliveryReceipts::ClaudeChannel {
-                                agent_dir: &agent_dir,
-                                incarnation: claude_receipt_incarnation(&incarnation, provider_incarnation.as_deref()),
-                            },
-                            &incarnation,
-                            &mut delivery,
-                        )
-                        .await;
-                    } else if driver == "opencode" {
-                        supervise_native_delivery(
-                            client,
-                            subject,
-                            &inbox,
-                            &archive,
-                            "opencode-server",
-                            NativeDeliveryReceipts::OpenCode {
-                                catalog_root: &catalog,
-                                identity: &identity,
-                                runtime_id: &runtime_id,
-                            },
-                            &incarnation,
-                            &mut delivery,
-                        )
-                        .await;
-                    }
                     Ok(())
                 }.await;
                 if let Err(error) = tick {
-                    tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
+                replacement.check();
             }
             _ = work_interval.tick() => {
                 let tick: Result<()> = async {
@@ -10614,7 +10987,7 @@ async fn run_st2_native_driver(
                     Ok(())
                 }.await;
                 if let Err(error) = tick {
-                    tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
             }
         }
@@ -11131,106 +11504,133 @@ fn pi_family_session_ritual(subject: &str) -> String {
     )
 }
 
-async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<()> {
-    use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+async fn run_pi_channel(
+    client: &Client,
+    subject: &str,
+    driver: &str,
+    catalog: &Path,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt as _;
 
-    let incarnation = wait_for_agent_incarnation(client, subject).await?;
     let identity = subject.strip_prefix("agent/").unwrap_or(subject);
-    let context_name = format!("doc/context/{identity}/now");
-    let context =
-        retry_while_daemon_unreachable(subject, || latest_document_text(client, &context_name))
-            .await?
-            .unwrap_or_default();
-    let ritual = pi_family_session_ritual(subject);
-    let session_context = if context.trim().is_empty() {
-        ritual
-    } else {
-        format!(
-            "<context source=\"st3/context/now.md\" agent=\"{identity}\">\n{}\n</context>\n\n{ritual}",
-            context.trim_end()
-        )
+    let resumed = match st2::reexec::resume_path(st2::reexec::CHANNEL_RESUME_ENV) {
+        Some(path) => {
+            let state = st2::reexec::read_state::<PiChannelResume>(&path);
+            st2::reexec::unblock_stop_signals();
+            Some(state.context("resuming the pi-family channel after a binary replacement")?)
+        }
+        None => None,
     };
     let mut stdout = tokio::io::stdout();
-    stdout
-        .write_all(
-            format!(
-                "{}\n",
-                serde_json::to_string(&json!({
-                    "type": "hello",
-                    "protocol": 1,
-                    "identity": identity,
-                    "sessionContext": session_context,
-                }))?
-            )
-            .as_bytes(),
-        )
-        .await?;
-    stdout.flush().await?;
-
-    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+    let mut state = match resumed {
+        // The extension already has its hello; a second one would restate the session context.
+        Some(state) => {
+            let _ = write_driver_log(
+                subject,
+                &format!("the {driver} channel resumed after its st binary was replaced"),
+            );
+            state
+        }
+        None => {
+            let incarnation = wait_for_agent_incarnation(client, subject).await?;
+            let context_name = format!("doc/context/{identity}/now");
+            let context = retry_while_daemon_unreachable(subject, || {
+                latest_document_text(client, &context_name)
+            })
+            .await?
+            .unwrap_or_default();
+            let ritual = pi_family_session_ritual(subject);
+            let session_context = if context.trim().is_empty() {
+                ritual
+            } else {
+                format!(
+                    "<context source=\"st3/context/now.md\" agent=\"{identity}\">\n{}\n</context>\n\n{ritual}",
+                    context.trim_end()
+                )
+            };
+            stdout
+                .write_all(
+                    format!(
+                        "{}\n",
+                        serde_json::to_string(&json!({
+                            "type": "hello",
+                            "protocol": 1,
+                            "identity": identity,
+                            "sessionContext": session_context,
+                        }))?
+                    )
+                    .as_bytes(),
+                )
+                .await?;
+            stdout.flush().await?;
+            PiChannelResume {
+                incarnation,
+                session: std::env::var("ST2_PI_CHANNEL_SESSION")
+                    .unwrap_or_else(|_| "unknown".into()),
+                ..PiChannelResume::default()
+            }
+        }
+    };
+    let incarnation = state.incarnation.clone();
+    let session = state.session.clone();
+    let transport = format!("{driver}-channel");
+    let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
+    let spawn_reader = |sender: tokio::sync::mpsc::UnboundedSender<st2::reexec::StdinChunk>| {
+        st2::reexec::StdinReader::spawn(move |chunk| sender.send(chunk).is_ok())
+    };
+    let mut reader = Some(spawn_reader(input_tx.clone()));
+    let mut watch = st2::reexec::ReplacementWatch::for_current_process();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut delivered = BTreeSet::new();
-    let mut failed_handoffs = BTreeMap::<String, u32>::new();
-    let mut failed_diagnostics = BTreeSet::new();
-    let mut first_idle_seen = false;
     let mut last_warning = None;
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
-    let mut frame_sequence = 0_u64;
-    let session = std::env::var("ST2_PI_CHANNEL_SESSION").unwrap_or_else(|_| "unknown".into());
-    // Reports the daemon has not accepted yet. A restart must not end the channel or lose the
-    // harness's latest state, so each waits here and is sent again on the next tick.
-    let mut pending = PiFamilyReports::default();
     loop {
         tokio::select! {
-            line = lines.next_line() => {
-                let Some(line) = line? else { return Ok(()); };
-                let Ok(frame) = serde_json::from_str::<Value>(&line) else { continue; };
-                match frame.get("type").and_then(Value::as_str) {
-                    Some("state") => {
-                        let Some(state) = frame.get("state").and_then(Value::as_str) else { continue; };
-                        let status = match state {
-                            "active" => "working",
-                            "idle" => { first_idle_seen = true; "idle" },
-                            _ => continue,
-                        };
-                        frame_sequence = frame_sequence.saturating_add(1);
-                        pending.state = Some((status, frame_sequence));
-                    }
-                    Some("delivered") => {
-                        let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else { continue; };
-                        pending.acknowledgements.insert(message.to_owned());
-                    }
-                    Some("failed") => {
-                        let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else { continue; };
-                        let failures = failed_handoffs.entry(message.to_owned()).or_default();
-                        *failures += 1;
-                        if *failures < 3 {
-                            delivered.remove(message);
-                        } else {
-                            failed_diagnostics.insert(message.to_owned());
+            chunk = input_rx.recv() => {
+                let mut publish = false;
+                match chunk {
+                    Some(st2::reexec::StdinChunk::Bytes(bytes)) => {
+                        state.lines.push(&bytes);
+                        while let Some(line) = state.lines.next_line() {
+                            publish |= state.accept_frame(&line);
                         }
-                        continue;
                     }
-                    _ => continue,
+                    // The extension ends the pipe when its session ends.
+                    Some(st2::reexec::StdinChunk::Eof) | None => {
+                        if let Some(line) = state.lines.finish()
+                            && state.accept_frame(&line)
+                        {
+                            let _ = state
+                                .pending
+                                .publish(client, subject, driver, &incarnation, &session)
+                                .await;
+                        }
+                        return Ok(());
+                    }
+                    Some(st2::reexec::StdinChunk::Failed(error)) => {
+                        return Err(error).context("reading the pi-family channel input");
+                    }
                 }
-                if let Err(error) = pending
-                    .publish(client, subject, driver, &incarnation, &session)
-                    .await
+                if publish
+                    && let Err(error) = state
+                        .pending
+                        .publish(client, subject, driver, &incarnation, &session)
+                        .await
                 {
                     warn_pi_channel(subject, &error, &mut last_warning);
                 }
             }
             _ = interval.tick() => {
-                if let Err(error) = pending
+                if let Err(error) = state
+                    .pending
                     .publish(client, subject, driver, &incarnation, &session)
                     .await
                 {
                     warn_pi_channel(subject, &error, &mut last_warning);
                 }
-                for message in failed_diagnostics.clone() {
+                for message in state.failed_diagnostics.clone() {
                     let result: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
                         subject: subject.into(),
                         kind: "harness.diagnostic".into(),
@@ -11247,25 +11647,39 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                         idempotency_key: Some(format!("pi-handoff-failed:{subject}:{incarnation}:{message}")),
                     }).await;
                     match result {
-                        Ok(_) => { failed_diagnostics.remove(&message); },
+                        Ok(_) => { state.failed_diagnostics.remove(&message); },
                         Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
                     }
                 }
-                if !first_idle_seen { continue; }
+                // The first page is polled on every tick, before the first idle too: the poll
+                // carries this channel's delivery report, which is how the daemon knows the
+                // seat's delivery path is live and current.
+                let report = native_delivery_report(&transport, None);
                 let mut cursor = None;
                 loop {
-                    let page = match message_page(client, Some(subject), false, cursor.as_deref()).await {
+                    let page = match message_page_reporting(
+                        client,
+                        Some(subject),
+                        false,
+                        cursor.as_deref(),
+                        cursor.is_none().then_some(report.as_str()),
+                    )
+                    .await
+                    {
                         Ok(page) => page,
                         Err(error) => { warn_pi_channel(subject, &error, &mut last_warning); break; }
                     };
+                    if !state.first_idle_seen {
+                        break;
+                    }
                     for message in page.items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged")) {
-                    if !delivered.insert(message.subject.clone()) {
+                    if !state.delivered.insert(message.subject.clone()) {
                         continue;
                     }
                     let body = match message_content(client, &message).await {
                         Ok(body) => body,
                         Err(error) => {
-                            delivered.remove(&message.subject);
+                            state.delivered.remove(&message.subject);
                             warn_pi_channel(subject, &error, &mut last_warning);
                             continue;
                         }
@@ -11273,9 +11687,9 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                     if message.status == "sent" {
                         match stage_pi_family_message(client, &message.subject, subject, driver).await {
                             Ok(true) => {},
-                            Ok(false) => { delivered.remove(&message.subject); continue; },
+                            Ok(false) => { state.delivered.remove(&message.subject); continue; },
                             Err(error) => {
-                                delivered.remove(&message.subject);
+                                state.delivered.remove(&message.subject);
                                 warn_pi_channel(subject, &error, &mut last_warning);
                                 continue;
                             }
@@ -11291,6 +11705,66 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                         None => break,
                     }
                 }
+                let ready = match watch.as_mut() {
+                    Some(watch) => tokio::task::block_in_place(|| watch.ready()),
+                    None => None,
+                };
+                if let Some(binary) = ready {
+                    // Take every byte the reader already consumed and act on every complete
+                    // frame; only a partial frame crosses the exec.
+                    if let Some(reader) = reader.take() {
+                        tokio::task::block_in_place(|| reader.stop());
+                    }
+                    let mut publish = false;
+                    while let Ok(chunk) = input_rx.try_recv() {
+                        match chunk {
+                            st2::reexec::StdinChunk::Bytes(bytes) => state.lines.push(&bytes),
+                            st2::reexec::StdinChunk::Eof => return Ok(()),
+                            st2::reexec::StdinChunk::Failed(error) => {
+                                return Err(error).context("reading the pi-family channel input");
+                            }
+                        }
+                    }
+                    while let Some(line) = state.lines.next_line() {
+                        publish |= state.accept_frame(&line);
+                    }
+                    if publish {
+                        let _ = state
+                            .pending
+                            .publish(client, subject, driver, &incarnation, &session)
+                            .await;
+                    }
+                    stdout.flush().await?;
+                    let state_root = catalog.parent().unwrap_or(catalog);
+                    let _ = write_driver_log(
+                        subject,
+                        &format!(
+                            "the st binary at {} was replaced; the {driver} channel re-executes into it",
+                            binary.display()
+                        ),
+                    );
+                    let failure = match st2::reexec::write_state(state_root, "channel-resume", &state) {
+                        Ok(path) => {
+                            let error = st2::reexec::exec(
+                                &binary,
+                                st2::reexec::CHANNEL_RESUME_ENV,
+                                &path,
+                                &[],
+                            );
+                            let _ = fs::remove_file(&path);
+                            format!("executing {} failed: {error}", binary.display())
+                        }
+                        Err(error) => format!("saving the channel resume state failed: {error:#}"),
+                    };
+                    let _ = write_driver_log(
+                        subject,
+                        &format!("the {driver} channel keeps its current binary: {failure}"),
+                    );
+                    if let Some(watch) = watch.as_mut() {
+                        watch.refuse_current();
+                    }
+                    reader = Some(spawn_reader(input_tx.clone()));
+                }
             }
             _ = work_interval.tick() => {
                 let minute = unix_minute()?;
@@ -11301,6 +11775,71 @@ async fn run_pi_channel(client: &Client, subject: &str, driver: &str) -> Result<
                     }
                 }
             }
+        }
+    }
+}
+
+/// Everything a pi-family channel keeps between frames, which is also what it hands its next
+/// image when the st binary is replaced.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+struct PiChannelResume {
+    incarnation: String,
+    session: String,
+    delivered: BTreeSet<String>,
+    failed_handoffs: BTreeMap<String, u32>,
+    failed_diagnostics: BTreeSet<String>,
+    first_idle_seen: bool,
+    frame_sequence: u64,
+    // Reports the daemon has not accepted yet. A restart must not end the channel or lose the
+    // harness's latest state, so each waits here and is sent again on the next tick.
+    pending: PiFamilyReports,
+    lines: st2::reexec::LineBuffer,
+}
+
+impl PiChannelResume {
+    /// Apply one frame from the extension. Returns whether it left a report to publish.
+    fn accept_frame(&mut self, line: &str) -> bool {
+        let Ok(frame) = serde_json::from_str::<Value>(line) else {
+            return false;
+        };
+        match frame.get("type").and_then(Value::as_str) {
+            Some("state") => {
+                let Some(state) = frame.get("state").and_then(Value::as_str) else {
+                    return false;
+                };
+                let status = match state {
+                    "active" => "working",
+                    "idle" => {
+                        self.first_idle_seen = true;
+                        "idle"
+                    }
+                    _ => return false,
+                };
+                self.frame_sequence = self.frame_sequence.saturating_add(1);
+                self.pending.state = Some((status.to_owned(), self.frame_sequence));
+                true
+            }
+            Some("delivered") => {
+                let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else {
+                    return false;
+                };
+                self.pending.acknowledgements.insert(message.to_owned());
+                true
+            }
+            Some("failed") => {
+                let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else {
+                    return false;
+                };
+                let failures = self.failed_handoffs.entry(message.to_owned()).or_default();
+                *failures += 1;
+                if *failures < 3 {
+                    self.delivered.remove(message);
+                } else {
+                    self.failed_diagnostics.insert(message.to_owned());
+                }
+                false
+            }
+            _ => false,
         }
     }
 }
@@ -11327,10 +11866,10 @@ fn warn_pi_channel(
 }
 
 /// Harness reports a pi-family channel owes the daemon.
-#[derive(Default)]
+#[derive(Default, serde::Serialize, serde::Deserialize)]
 struct PiFamilyReports {
     /// Only the latest state matters; a newer frame replaces an unsent older one.
-    state: Option<(&'static str, u64)>,
+    state: Option<(String, u64)>,
     acknowledgements: BTreeSet<String>,
 }
 
@@ -11343,7 +11882,7 @@ impl PiFamilyReports {
         incarnation: &str,
         session: &str,
     ) -> Result<()> {
-        if let Some((status, sequence)) = self.state {
+        if let Some((status, sequence)) = self.state.clone() {
             let _: ClaimRecord = client
                 .post(
                     "/v1/claims",
@@ -11352,7 +11891,7 @@ impl PiFamilyReports {
                         kind: "harness.observed".into(),
                         actor: Some(subject.into()),
                         fields: BTreeMap::from([
-                            ("state".into(), Value::String(status.into())),
+                            ("state".into(), Value::String(status)),
                             ("driver".into(), Value::String(driver.into())),
                             (
                                 "transport".into(),
@@ -11468,46 +12007,112 @@ async fn message_content(client: &Client, message: &MessageView) -> Result<Strin
 async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> Result<()> {
     anyhow::ensure!(!argv.is_empty(), "the Codex driver argv is empty");
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
-    let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
-    let root = catalog
-        .parent()
-        .context("the Codex driver catalog has no state root")?
-        .to_path_buf();
+    drive_codex_native(
+        client,
+        subject,
+        argv,
+        incarnation,
+        ProviderStart::Launch(Vec::new()),
+        NativeLoopState::default(),
+    )
+    .await
+}
+
+fn spawn_codex_provider(
+    paths: &NativePaths,
+    state_dir: &Path,
+    argv: &[String],
+    start: ProviderStart,
+) -> tokio::task::JoinHandle<Result<()>> {
+    let paths = paths.clone();
+    let state_dir = state_dir.to_path_buf();
+    let argv = argv.to_vec();
+    tokio::task::spawn_blocking(move || match start {
+        ProviderStart::Launch(_) => st2::codex_app_server::run_controlled_paths(
+            &paths.catalog,
+            &state_dir,
+            &paths.agent_dir,
+            paths.identity,
+            paths.runtime_id,
+            argv,
+        ),
+        ProviderStart::Adopt(st2::provider_session::DetachedSession::Codex {
+            tui_pid,
+            server_pid,
+            watchdog_pid,
+            owner_write_fd,
+            socket_path,
+            safe_fallback,
+        }) => st2::codex_app_server::adopt_controlled_paths(
+            &paths.catalog,
+            &state_dir,
+            &paths.agent_dir,
+            paths.identity,
+            paths.runtime_id,
+            argv,
+            tui_pid,
+            server_pid,
+            watchdog_pid,
+            owner_write_fd,
+            socket_path,
+            safe_fallback,
+        ),
+        ProviderStart::Adopt(session) => {
+            anyhow::bail!("a Codex driver cannot adopt this provider session: {session:?}")
+        }
+    })
+}
+
+async fn drive_codex_native(
+    client: &Client,
+    subject: &str,
+    argv: Vec<String>,
+    incarnation: String,
+    start: ProviderStart,
+    mut loop_state: NativeLoopState,
+) -> Result<()> {
+    let paths = NativePaths::prepare(subject)?;
+    let NativePaths {
+        agent_dir,
+        identity,
+        runtime_id,
+        ..
+    } = paths.clone();
+    let root = paths.state_root();
     let state_dir = root.join("state");
     let prior_binding = std::fs::read(state_dir.join("binding.json")).ok();
     let inbox = st2::message::inbox_dir(&agent_dir);
     let archive = st2::message::archive_dir(&agent_dir);
-    let driver_root = catalog.clone();
-    let driver_state = state_dir.clone();
-    let driver_agent = agent_dir.clone();
-    let driver_identity = identity.clone();
-    let driver_runtime_id = runtime_id.clone();
-    let mut task = tokio::task::spawn_blocking(move || {
-        st2::codex_app_server::run_controlled_paths(
-            &driver_root,
-            &driver_state,
-            &driver_agent,
-            driver_identity,
-            driver_runtime_id,
-            argv,
-        )
-    });
+    let mut task = spawn_codex_provider(&paths, &state_dir, &argv, start);
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
     work_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut renewed_minute = None;
-    let mut ready = false;
     let mut last_activity_fingerprint = None;
     let mut last_usage_fingerprint = None;
-    let mut published_timeline = BTreeSet::new();
     let mut last_control_warning = None;
     let mut last_capacity_fingerprint = None;
-    let mut delivery = NativeDeliverySupervisor::default();
+    let mut delivery = NativeDeliverySupervisor::resumed(loop_state.delivery_episode);
+    let mut replacement = DriverReplacement::new();
     loop {
         tokio::select! {
             result = &mut task => {
                 let outcome = result.context("joining the Codex driver")?;
+                if let Some(session) = detached_session(&outcome) {
+                    loop_state.delivery_episode = delivery.episode;
+                    let resume = DriverResume {
+                        driver: "codex".into(),
+                        subject: subject.to_owned(),
+                        incarnation: incarnation.clone(),
+                        session: session.clone(),
+                        loop_state,
+                    };
+                    let _ = replacement.exec(subject, &root, &resume);
+                    loop_state = resume.loop_state;
+                    task = spawn_codex_provider(&paths, &state_dir, &argv, ProviderStart::Adopt(session));
+                    continue;
+                }
                 if let Err(error) = &outcome {
                     let reason = format!("{error:#}").chars().take(2_000).collect::<String>();
                     let _: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
@@ -11529,8 +12134,26 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                 return outcome;
             },
             _ = interval.tick() => {
+                // Delivery runs first and on its own: a failing observation publish must never
+                // hold back a message.
+                delivery.report = Some(native_delivery_report("app-server", None));
+                supervise_native_delivery(
+                    client,
+                    subject,
+                    &inbox,
+                    &archive,
+                    "app-server",
+                    NativeDeliveryReceipts::Codex {
+                        state_dir: &state_dir,
+                        identity: &identity,
+                        runtime_id: &runtime_id,
+                    },
+                    &incarnation,
+                    &mut delivery,
+                )
+                .await;
                 let tick: Result<()> = async {
-                    if !ready && std::fs::read(state_dir.join("binding.json"))
+                    if !loop_state.ready && std::fs::read(state_dir.join("binding.json"))
                         .ok()
                         .is_some_and(|binding| Some(&binding) != prior_binding.as_ref())
                     {
@@ -11548,23 +12171,8 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                             expected_subject: None,
                             idempotency_key: Some(format!("codex-ready:{subject}:{incarnation}")),
                         }).await?;
-                        ready = true;
+                        loop_state.ready = true;
                     }
-                    supervise_native_delivery(
-                        client,
-                        subject,
-                        &inbox,
-                        &archive,
-                        "app-server",
-                        NativeDeliveryReceipts::Codex {
-                            state_dir: &state_dir,
-                            identity: &identity,
-                            runtime_id: &runtime_id,
-                        },
-                        &incarnation,
-                        &mut delivery,
-                    )
-                    .await;
                     if let Some(observed) = st2::harness_state::read(
                         &st2::harness_state::harness_state_path(&agent_dir),
                         None,
@@ -11618,13 +12226,18 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                         &incarnation,
                         Some(&incarnation),
                         &agent_dir,
-                        &mut published_timeline,
+                        &mut loop_state.published_timeline,
                     )
                     .await?;
                     Ok(())
                 }.await;
                 if let Err(error) = tick {
-                    tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
+                // Only a bound session can be adopted, so wait for the binding before following
+                // a replacement.
+                if loop_state.ready {
+                    replacement.check();
                 }
             }
             _ = work_interval.tick() => {
@@ -11637,7 +12250,7 @@ async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> 
                     Ok(())
                 }.await;
                 if let Err(error) = tick {
-                    tolerate_driver_api_outage(subject, error, &mut last_control_warning)?;
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
                 }
             }
         }
@@ -11804,6 +12417,26 @@ fn tolerate_driver_api_outage(
     Ok(())
 }
 
+/// Record a failed driver tick and keep going. A driver's control loop lives exactly as long as its
+/// provider: an error it does not understand, such as a response shape a newer daemon changed, must
+/// never end the loop while the provider keeps running, because nothing would deliver messages.
+fn note_driver_tick_failure(
+    subject: &str,
+    error: anyhow::Error,
+    last_warning: &mut Option<Instant>,
+) {
+    if let Err(error) = tolerate_driver_api_outage(subject, error, last_warning) {
+        let now = Instant::now();
+        if last_warning.is_none_or(|prior| now.duration_since(prior) >= Duration::from_secs(10)) {
+            let _ = write_driver_log(
+                subject,
+                &format!("a driver tick failed; the driver keeps running and retries: {error:#}"),
+            );
+            *last_warning = Some(now);
+        }
+    }
+}
+
 /// Repeat one driver call until the daemon answers. A driver outlives daemon restarts, so an
 /// outage while it starts delays the seat instead of ending it.
 async fn retry_while_daemon_unreachable<T, F, Fut>(subject: &str, mut call: F) -> Result<T>
@@ -11935,6 +12568,8 @@ fn current_unix_ms() -> Result<u128> {
 /// Each attempt rereads graph message state, so a failed page or receipt is replayed safely.
 struct NativeDeliverySupervisor {
     episode: u64,
+    /// The delivery report attached to each mailbox poll; see [`native_delivery_report`].
+    report: Option<String>,
     /// Whether the current failure episode began with the daemon unreachable.
     daemon_outage: bool,
     failures: u32,
@@ -11947,6 +12582,7 @@ impl Default for NativeDeliverySupervisor {
     fn default() -> Self {
         Self {
             episode: 0,
+            report: None,
             daemon_outage: false,
             failures: 0,
             retry_after: None,
@@ -11957,6 +12593,15 @@ impl Default for NativeDeliverySupervisor {
 }
 
 impl NativeDeliverySupervisor {
+    /// A supervisor that continues a predecessor image's episode numbering, so a new failure
+    /// episode never reuses the idempotency key of one already recorded.
+    fn resumed(episode: u64) -> Self {
+        Self {
+            episode,
+            ..Self::default()
+        }
+    }
+
     fn ready(&self) -> bool {
         self.retry_after
             .is_none_or(|retry_after| Instant::now() >= retry_after)
@@ -12099,7 +12744,17 @@ async fn supervise_native_delivery(
     if !supervisor.ready() {
         return;
     }
-    match forward_projected_messages(client, subject, inbox, archive, transport, receipts).await {
+    match forward_projected_messages_reporting(
+        client,
+        subject,
+        inbox,
+        archive,
+        transport,
+        receipts,
+        supervisor.report.as_deref(),
+    )
+    .await
+    {
         Ok(unforwarded) => {
             // A message that cannot be forwarded is recorded once on its own and retried with the
             // next poll. It never pauses delivery of the recipient's other messages.
@@ -12189,6 +12844,7 @@ async fn supervise_native_delivery(
 
 /// Forward the recipient's queued messages into its native inbox. Each message is forwarded on
 /// its own; the ones that could not be forwarded are returned with their reasons.
+#[cfg(test)]
 async fn forward_projected_messages(
     client: &Client,
     subject: &str,
@@ -12196,6 +12852,20 @@ async fn forward_projected_messages(
     archive: &Path,
     transport: &str,
     receipts: NativeDeliveryReceipts<'_>,
+) -> Result<Vec<(String, String)>> {
+    forward_projected_messages_reporting(client, subject, inbox, archive, transport, receipts, None)
+        .await
+}
+
+/// [`forward_projected_messages`], attaching the driver's delivery report to its mailbox poll.
+async fn forward_projected_messages_reporting(
+    client: &Client,
+    subject: &str,
+    inbox: &Path,
+    archive: &Path,
+    transport: &str,
+    receipts: NativeDeliveryReceipts<'_>,
+    report: Option<&str>,
 ) -> Result<Vec<(String, String)>> {
     const TAG_PREFIX: &str = "st3-message:";
     let mut present = projected_message_files(inbox, archive)?;
@@ -12225,7 +12895,14 @@ async fn forward_projected_messages(
     let mut cursor = None;
     let mut failures = Vec::new();
     loop {
-        let page = message_page(client, Some(subject), false, cursor.as_deref()).await?;
+        let page = message_page_reporting(
+            client,
+            Some(subject),
+            false,
+            cursor.as_deref(),
+            if cursor.is_none() { report } else { None },
+        )
+        .await?;
         for message in page.items {
             active_subjects.insert(message.subject.clone());
             if matches!(message.status.as_str(), "read" | "closed") {
@@ -12891,6 +13568,86 @@ mod tests {
             .unwrap();
         assert!(guard_mutating_cli_actor(&own.command, Some("agent/own"), None).is_ok());
         assert!(guard_mutating_cli_actor(&own.command, None, None).is_ok());
+    }
+
+    #[test]
+    fn a_pi_family_channel_carries_its_frames_across_a_replacement() {
+        let mut state = PiChannelResume {
+            incarnation: "1:one".into(),
+            session: "session".into(),
+            ..PiChannelResume::default()
+        };
+        state
+            .lines
+            .push(b"{\"type\":\"state\",\"state\":\"idle\"}\n{\"type\":\"deliv");
+        while let Some(line) = state.lines.next_line() {
+            assert!(state.accept_frame(&line));
+        }
+        assert!(state.first_idle_seen);
+        assert_eq!(state.pending.state, Some(("idle".to_owned(), 1)));
+        state.delivered.insert("message/one".into());
+
+        // The next image reads everything back, including the partial frame.
+        let mut resumed: PiChannelResume =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        resumed
+            .lines
+            .push(b"ered\",\"meta\":{\"messageId\":\"message/one\"}}\n");
+        let line = resumed.lines.next_line().unwrap();
+        assert!(resumed.accept_frame(&line));
+        assert!(resumed.pending.acknowledgements.contains("message/one"));
+        assert!(resumed.delivered.contains("message/one"));
+        assert_eq!(resumed.frame_sequence, 1);
+        // A handoff failure below the retry limit makes the message deliverable again.
+        assert!(!resumed.accept_frame(r#"{"type":"failed","meta":{"messageId":"message/one"}}"#));
+        assert!(!resumed.delivered.contains("message/one"));
+    }
+
+    #[test]
+    fn a_driver_resume_state_names_its_driver_session_and_loop() {
+        let resume = DriverResume {
+            driver: "claude".into(),
+            subject: "agent/example/worker".into(),
+            incarnation: "1:one".into(),
+            session: st2::provider_session::DetachedSession::Provider {
+                pid: 42,
+                session: "token".into(),
+                seq: 3,
+            },
+            loop_state: NativeLoopState {
+                ready: true,
+                harness_record_started: true,
+                predecessor_harness_record: Some(b"ignored".to_vec()),
+                published_timeline: BTreeSet::from(["one:1:1:upsert".to_owned()]),
+                delivery_episode: 2,
+            },
+        };
+        let back: DriverResume =
+            serde_json::from_slice(&serde_json::to_vec(&resume).unwrap()).unwrap();
+        assert_eq!(back.session, resume.session);
+        assert!(back.loop_state.ready);
+        assert_eq!(back.loop_state.delivery_episode, 2);
+        assert_eq!(
+            back.loop_state.published_timeline,
+            resume.loop_state.published_timeline
+        );
+        // A predecessor's harness record is only a startup fence; it never crosses an exec.
+        assert!(back.loop_state.predecessor_harness_record.is_none());
+    }
+
+    #[test]
+    fn a_delivery_report_names_the_process_and_its_channel() {
+        let root = tempfile::tempdir().unwrap();
+        let report: Value =
+            serde_json::from_str(&native_delivery_report("claude-channel", Some(root.path())))
+                .unwrap();
+        assert_eq!(report["transport"], "claude-channel");
+        assert_eq!(report["pid"], std::process::id());
+        assert!(report["image"].is_string());
+        assert!(report["channel"].is_null(), "no channel has reported yet");
+        let codex: Value =
+            serde_json::from_str(&native_delivery_report("app-server", None)).unwrap();
+        assert!(codex.get("channel").is_none());
     }
 
     #[test]

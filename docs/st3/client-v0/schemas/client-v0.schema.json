@@ -599,10 +599,22 @@
             "next_work": { "oneOf": [{ "$ref": "#/$defs/WorkLabel" }, { "type": "null" }] },
             "upcoming_work": { "type": "array", "items": { "$ref": "#/$defs/WorkLabel" } },
             "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] },
-            "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } }
+            "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } },
+            "delivery": { "oneOf": [{ "$ref": "#/$defs/AgentDelivery" }, { "type": "null" }], "description": "Whether the process that carries this local seat's messages is live and runs this daemon's st binary. Present only for a local native seat whose harness can take work; a stale path makes the agent `waiting`." }
           }
         }
       ]
+    },
+    "AgentDelivery": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": { "enum": ["current", "stale", "unknown"] },
+        "reason": { "type": ["string", "null"] },
+        "polled_seconds_ago": { "type": ["integer", "null"], "minimum": 0 },
+        "transport": { "type": ["string", "null"] }
+      }
     },
     "AgentRelationship": {
       "type": "object",

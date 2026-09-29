@@ -490,6 +490,15 @@ fn agents(model: &Model) -> Vec<Agent> {
         .map(|agent| {
             let state = match (agent.state.as_str(), agent.harness_state.as_deref()) {
                 _ if agent.fault.is_some() => AgentState::Fault,
+                // A seat whose message path runs a replaced binary or stopped polling takes no
+                // messages, however ready its harness looks.
+                _ if agent
+                    .delivery
+                    .as_ref()
+                    .is_some_and(|delivery| delivery.state == "stale") =>
+                {
+                    AgentState::Fault
+                }
                 ("failed", _) => AgentState::Fault,
                 ("running", Some("working")) => AgentState::Working,
                 ("running", _) => AgentState::Idle,
