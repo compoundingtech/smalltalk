@@ -192,7 +192,9 @@ st usage --hours 24 --by host
 The seat starts its harness in the workspace with no prompt. It stays idle, taking no turn, until
 a person types in its terminal or a message is posted to it. `st terminals attach
 agent/example/worker` opens its terminal from any fleet machine; Ctrl+\\ detaches without stopping
-it.
+it. On the seat's own host it connects straight to the PTY session, so a busy daemon cannot stall
+it. If the daemon does not answer within a second, st attaches to the seat's newest PTY session on
+that host without it and says so.
 
 A running seat keeps its current process when you apply a changed declaration; the change takes
 effect the next time it starts. To use it now, stop the seat and apply again. `st agents stop
