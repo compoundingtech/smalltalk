@@ -7952,13 +7952,33 @@ impl<R: RuntimeControl> Reconciler<R> {
                 continue;
             };
             let suffix = &hex::encode(sha2::Sha256::digest(request.id.as_bytes()))[..16];
-            let workspace = Path::new(root).join(suffix).to_string_lossy().into_owned();
+            let workspace = Path::new(root).join(suffix);
+            if let Err(error) = fs::create_dir_all(&workspace) {
+                self.record_once(
+                    &format!("daemon/{}", self.host),
+                    "daemon.diagnostic",
+                    BTreeMap::from([
+                        ("severity".into(), Value::String("error".into())),
+                        ("status".into(), Value::String("unavailable".into())),
+                        ("code".into(), Value::String("workspace-unavailable".into())),
+                        (
+                            "reason".into(),
+                            Value::String(format!(
+                                "schedule {} workspace {}: {error}",
+                                schedule.subject,
+                                workspace.display()
+                            )),
+                        ),
+                    ]),
+                )?;
+                continue;
+            }
             let inputs = serde_json::from_value(fields.get("inputs").cloned().unwrap_or_default())
                 .unwrap_or_default();
             let request_value = MissionRunRequest {
                 mission: mission.into(),
                 revision: Some(revision.into()),
-                workspace,
+                workspace: workspace.to_string_lossy().into_owned(),
                 requester: Some(format!("daemon/{}", self.host)),
                 mode: None,
                 inputs,
@@ -15306,6 +15326,8 @@ mission "scheduled-cycle" state="ready" {
     async fn one_time_schedule_starts_exactly_one_mission() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let revision = scheduled_mission_revision(&store);
+        let root = tempfile::tempdir().unwrap();
+        let workspace_root = root.path().join("cycles");
         let at = (Utc::now() + chrono::Duration::milliseconds(50))
             .to_rfc3339_opts(SecondsFormat::Millis, true);
         let source = format!(
@@ -15316,11 +15338,12 @@ mission "scheduled-cycle" state="ready" {
                     at "{at}"
                     work {{
                       mission "scheduled-cycle@{revision}"
-                      workspace "/tmp/st3-schedule-test"
+                      workspace "{workspace_root}"
                     }}
                   }}
 
-            "#
+            "#,
+            workspace_root = workspace_root.display()
         );
         apply_source(&store, &source, "schedule-one");
         let reconciler = Reconciler::new(
@@ -15351,6 +15374,80 @@ mission "scheduled-cycle" state="ready" {
                 .count(),
             1
         );
+        let started = schedule_claims
+            .iter()
+            .find(|claim| claim.kind == "schedule.work-started")
+            .unwrap();
+        let run = started
+            .body
+            .pointer("/fields/mission_run")
+            .and_then(Value::as_str)
+            .unwrap();
+        let workspace = store.mission_run(run).unwrap().unwrap().workspace;
+        assert!(Path::new(&workspace).is_dir());
+        assert!(Path::new(&workspace).starts_with(&workspace_root));
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            store
+                .claims_for("schedule/reminder", Some("schedule.work-started"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_work_waits_for_an_available_workspace() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let revision = scheduled_mission_revision(&store);
+        let root = tempfile::tempdir().unwrap();
+        let workspace_root = root.path().join("cycles");
+        fs::write(&workspace_root, "not a directory").unwrap();
+        let at = (Utc::now() + chrono::Duration::milliseconds(50))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        apply_source(
+            &store,
+            &format!(
+                "version 2\nschedule \"cycle\" {{ at \"{at}\"; work {{ mission \"scheduled-cycle@{revision}\"; workspace {:?} }} }}",
+                workspace_root.display().to_string()
+            ),
+            "schedule-unavailable-workspace",
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        reconciler.reconcile_once().unwrap();
+        assert!(
+            store
+                .claims_for("schedule/cycle", Some("schedule.work-started"))
+                .unwrap()
+                .is_empty()
+        );
+        let diagnostics = store
+            .claims_for("daemon/node", Some("daemon.diagnostic"))
+            .unwrap();
+        assert!(diagnostics.iter().any(|claim| {
+            claim.body.pointer("/fields/code").and_then(Value::as_str)
+                == Some("workspace-unavailable")
+        }));
+
+        fs::remove_file(&workspace_root).unwrap();
+        reconciler.reconcile_once().unwrap();
+        let started = store
+            .claims_for("schedule/cycle", Some("schedule.work-started"))
+            .unwrap();
+        assert_eq!(started.len(), 1);
+        let run = started[0]
+            .body
+            .pointer("/fields/mission_run")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(Path::new(&store.mission_run(run).unwrap().unwrap().workspace).is_dir());
     }
 
     #[tokio::test]
