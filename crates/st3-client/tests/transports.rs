@@ -387,6 +387,102 @@ async fn a_terminal_rides_the_collection_socket_and_its_end_leaves_the_rest() {
 }
 
 #[tokio::test]
+async fn an_agents_conversation_rides_the_collection_socket_with_its_small_talk() {
+    let (_root, state, _pty, client, server) =
+        serve_terminal_state("client-collection-conversation", 24, 80).await;
+    let mut stream = client.collection_stream().await.unwrap();
+    stream
+        .subscribe_conversation("chat", "agent/terminal-demo")
+        .await
+        .unwrap();
+    let session_id = match next_collection_event(&mut stream, "the conversation page").await {
+        CollectionEvent::Conversation {
+            id,
+            session_id,
+            replace: true,
+            ..
+        } if id == "chat" => session_id,
+        other => panic!("expected the conversation page, got {other:?}"),
+    };
+    assert!(session_id.starts_with("session/"), "{session_id}");
+
+    // Small Talk to the agent that names no session is part of its conversation: st joins it.
+    state
+        .store
+        .append_claim(&ClaimInput {
+            subject: "message/conversation-socket".into(),
+            kind: "message.sent".into(),
+            actor: Some("agent/terminal-peer".into()),
+            fields: BTreeMap::from([
+                ("from".into(), Value::String("agent/terminal-peer".into())),
+                ("to".into(), Value::String("agent/terminal-demo".into())),
+                ("content".into(), Value::String("hello from a peer".into())),
+                ("title".into(), Value::String("A question".into())),
+                ("status".into(), Value::String("sent".into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    let items = match next_collection_event(&mut stream, "the new message").await {
+        CollectionEvent::Conversation {
+            id,
+            replace: false,
+            items,
+            ..
+        } if id == "chat" => items,
+        other => panic!("expected the new message, got {other:?}"),
+    };
+    let header = items
+        .iter()
+        .find_map(|item| match &item.body {
+            st3_client::TimelineBody::Message(message) => Some(message),
+            _ => None,
+        })
+        .expect("the message header");
+    assert_eq!(header.from.as_deref(), Some("agent/terminal-peer"));
+    assert_eq!(header.to.as_deref(), Some("agent/terminal-demo"));
+    assert_eq!(header.title.as_deref(), Some("A question"));
+    assert!(items.iter().any(|item| matches!(
+        &item.body,
+        st3_client::TimelineBody::Content(content) if content.text.as_deref() == Some("hello from a peer")
+    )));
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1_500), stream.next_event())
+            .await
+            .is_err(),
+        "an idle conversation must send nothing"
+    );
+    stream.unsubscribe("chat").await.unwrap();
+    state
+        .store
+        .append_claim(&ClaimInput {
+            subject: "message/conversation-socket-later".into(),
+            kind: "message.sent".into(),
+            actor: Some("agent/terminal-peer".into()),
+            fields: BTreeMap::from([
+                ("from".into(), Value::String("agent/terminal-peer".into())),
+                ("to".into(), Value::String("agent/terminal-demo".into())),
+                ("content".into(), Value::String("after unsubscribe".into())),
+                ("status".into(), Value::String("sent".into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1_000), stream.next_event())
+            .await
+            .is_err(),
+        "an unsubscribed conversation must send nothing more"
+    );
+    server.abort();
+}
+
+#[tokio::test]
 async fn a_slow_terminal_client_gets_the_latest_screen_not_a_backlog() {
     const ROWS: usize = 100;
     const CHANGES: usize = 200;

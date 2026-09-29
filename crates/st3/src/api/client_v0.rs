@@ -27,6 +27,8 @@ struct CollectionSubscribe {
     terminal: Option<String>,
     incarnation: Option<String>,
     capability: Option<String>,
+    /// A conversation subscription names an agent or a session.
+    conversation: Option<String>,
 }
 
 struct CollectionSubscription {
@@ -270,12 +272,234 @@ async fn open_terminal_subscription(
     Ok(receiver)
 }
 
+/// Where a conversation is read: here, or on the host that owns its session.
+fn conversation_owner_host(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+) -> Result<Option<String>, ApiError> {
+    let remote = super::managed_session_owner_at(
+        &state.store,
+        new_client_snapshot(state).store_index,
+        session_id,
+    )
+    .map_err(ApiError::internal)?
+    .and_then(|(_, _, origin)| origin)
+    .filter(|origin| origin != state.store.origin())
+    .map(|origin| client_host_id(&origin));
+    if let Some(owner) = &remote {
+        if !session.authority_actor.starts_with("person/") {
+            return Err(forbidden("a remote conversation requires a concrete person"));
+        }
+        if state
+            .client_relay
+            .as_ref()
+            .is_none_or(|relay| !relay.has_peer(owner))
+        {
+            return Err(remote_unavailable(owner));
+        }
+    }
+    Ok(remote)
+}
+
+/// A conversation's newest page, read here or relayed from its owner.
+async fn conversation_page(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    remote: Option<&str>,
+) -> Result<Value, ApiError> {
+    const PAGE: usize = 200;
+    if let Some(owner) = remote {
+        let relay = state
+            .client_relay
+            .as_ref()
+            .ok_or_else(|| remote_unavailable(owner))?;
+        return relay
+            .read(
+                owner,
+                &crate::peer::ClientReadRequest {
+                    authority_actor: session.authority_actor.clone(),
+                    request: crate::peer::ClientReadOperation::Timeline {
+                        session_id: session_id.to_owned(),
+                        limit: PAGE,
+                        cursor: None,
+                    },
+                },
+            )
+            .await
+            .map_err(|error| remote_read_error(owner, error));
+    }
+    let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
+    tokio::task::spawn_blocking(move || {
+        timeline_value(
+            &state,
+            &new_client_snapshot(&state),
+            &session,
+            &session_id,
+            &ClientListQuery {
+                limit: Some(PAGE),
+                ..Default::default()
+            },
+        )
+        .map(|page| page.0)
+    })
+    .await
+    .map_err(ApiError::internal)?
+}
+
+/// What changed in a conversation after `after`, waiting up to `wait_ms` for something to.
+async fn conversation_changes_value(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    remote: Option<&str>,
+    after: Option<&str>,
+    wait_ms: u64,
+) -> Result<Value, ApiError> {
+    if let Some(owner) = remote {
+        let relay = state
+            .client_relay
+            .as_ref()
+            .ok_or_else(|| remote_unavailable(owner))?;
+        return relay
+            .read(
+                owner,
+                &crate::peer::ClientReadRequest {
+                    authority_actor: session.authority_actor.clone(),
+                    request: crate::peer::ClientReadOperation::ConversationChanges {
+                        session_id: session_id.to_owned(),
+                        after: after.map(str::to_owned),
+                        wait_ms,
+                    },
+                },
+            )
+            .await
+            .map_err(|error| remote_read_error(owner, error));
+    }
+    conversation_changes_local(state, session, session_id, after, wait_ms).await
+}
+
+/// Follow one conversation for a collection socket: its newest page, then each change, until
+/// the socket stops listening. A change the server can no longer replay sends the page again.
+async fn follow_conversation(
+    state: AppState,
+    session: ClientSession,
+    id: String,
+    session_id: String,
+    remote: Option<String>,
+    outbox: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
+) {
+    let remote = remote.as_deref();
+    let failed = |error: ApiError| {
+        json!({"kind":"error", "id":id, "collection":"conversation", "code":error.code, "message":error.message})
+    };
+    loop {
+        // The cursor first, so nothing that lands while the page is read is lost.
+        let start =
+            match conversation_changes_value(&state, &session, &session_id, remote, None, 0).await
+            {
+                Ok(start) => start,
+                Err(error) => {
+                    let _ = outbox.send((id.clone(), failed(error)));
+                    return;
+                }
+            };
+        let page = match conversation_page(&state, &session, &session_id, remote).await {
+            Ok(page) => page,
+            Err(error) => {
+                let _ = outbox.send((id.clone(), failed(error)));
+                return;
+            }
+        };
+        let mut frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":true, "items":page["items"], "has_more":page["page"]["has_more"]});
+        // A page of long tool output can outgrow one frame: keep its newest entries.
+        while frame_bytes(&frame) > CLIENT_MAX_RESPONSE_BYTES {
+            let Some(items) = frame["items"].as_array_mut().filter(|items| items.len() > 1)
+            else {
+                break;
+            };
+            let drop = items.len().div_ceil(4);
+            items.drain(..drop);
+            frame["has_more"] = Value::Bool(true);
+        }
+        if outbox.send((id.clone(), frame)).is_err() {
+            return;
+        }
+        let mut after = start["next_cursor"].as_str().map(str::to_owned);
+        loop {
+            match conversation_changes_value(
+                &state,
+                &session,
+                &session_id,
+                remote,
+                after.as_deref(),
+                10_000,
+            )
+            .await
+            {
+                Ok(changes) => {
+                    if changes["items"]
+                        .as_array()
+                        .is_some_and(|items| !items.is_empty())
+                    {
+                        let frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":false, "items":changes["items"]});
+                        // Too much changed for one frame: send the newest page instead.
+                        if frame_bytes(&frame) > CLIENT_MAX_RESPONSE_BYTES {
+                            break;
+                        }
+                        if outbox.send((id.clone(), frame)).is_err() {
+                            return;
+                        }
+                    }
+                    after = changes["next_cursor"].as_str().map(str::to_owned);
+                }
+                Err(error) if error.code == "cursor-gap" => break,
+                Err(error) => {
+                    let _ = outbox.send((id.clone(), failed(error)));
+                    return;
+                }
+            }
+            if outbox.is_closed() {
+                return;
+            }
+        }
+    }
+}
+
+fn frame_bytes(frame: &Value) -> usize {
+    serde_json::to_vec(frame).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// The conversation followers a socket holds; they stop when it closes.
+#[derive(Default)]
+struct ConversationFollowers(BTreeMap<String, tokio::task::AbortHandle>);
+
+impl ConversationFollowers {
+    fn stop(&mut self, id: &str) {
+        if let Some(follower) = self.0.remove(id) {
+            follower.abort();
+        }
+    }
+}
+
+impl Drop for ConversationFollowers {
+    fn drop(&mut self) {
+        for follower in self.0.values() {
+            follower.abort();
+        }
+    }
+}
+
 async fn collection_stream_socket(mut socket: WebSocket, state: AppState, session: ClientSession) {
     // Subscribe before the first snapshot, so a commit while building it wakes
     // the next loop and is reflected in a following change frame.
     let mut changed = state.event_notify.subscribe();
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
     let mut terminals = BTreeMap::<String, watch::Receiver<TerminalFrame>>::new();
+    let mut conversations = ConversationFollowers::default();
+    let (conversation_outbox, mut conversation_frames) =
+        tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
     loop {
         // The subscriptions to read after this wake-up.
         let mut refresh = Vec::<String>::new();
@@ -303,16 +527,35 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
                         if request.kind == "unsubscribe" {
                             subscriptions.remove(&request.id);
                             terminals.remove(&request.id);
+                            conversations.stop(&request.id);
                             break 'command;
                         }
-                        let held = subscriptions.contains_key(&request.id) || terminals.contains_key(&request.id);
-                        if request.kind != "subscribe" || request.id.is_empty() || request.id.len() > 128 || subscriptions.len() + terminals.len() >= COLLECTION_MAX_SUBSCRIPTIONS && !held {
+                        let held = subscriptions.contains_key(&request.id) || terminals.contains_key(&request.id) || conversations.0.contains_key(&request.id);
+                        if request.kind != "subscribe" || request.id.is_empty() || request.id.len() > 128 || subscriptions.len() + terminals.len() + conversations.0.len() >= COLLECTION_MAX_SUBSCRIPTIONS && !held {
                             if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "message":"invalid subscription or subscription limit exceeded"})).await { return; }
                             break 'command;
                         }
                         // A subscription with a held ID replaces it.
                         subscriptions.remove(&request.id);
                         terminals.remove(&request.id);
+                        conversations.stop(&request.id);
+                        if request.collection == "conversation" {
+                            let target = request.conversation.as_deref().unwrap_or_default();
+                            let opened = conversation_session_id(&state, target).and_then(|session_id| {
+                                let remote = conversation_owner_host(&state, &session, &session_id)?;
+                                Ok((session_id, remote))
+                            });
+                            match opened {
+                                Ok((session_id, remote)) => {
+                                    let follower = tokio::spawn(follow_conversation(state.clone(), session.clone(), request.id.clone(), session_id, remote, conversation_outbox.clone()));
+                                    conversations.0.insert(request.id.clone(), follower.abort_handle());
+                                }
+                                Err(error) => {
+                                    if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "collection":"conversation", "code":error.code, "message":error.message})).await { return; }
+                                }
+                            }
+                            break 'command;
+                        }
                         if request.collection == "terminal" {
                             match open_terminal_subscription(&state, &session, &request).await {
                                 Ok(receiver) => {
@@ -334,6 +577,13 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
             result = changed.changed(), if !command_waiting => {
                 if result.is_err() { return; }
                 refresh.extend(subscriptions.keys().cloned());
+            }
+            Some((id, frame)) = conversation_frames.recv(), if !command_waiting => {
+                // A follower stopped by unsubscribe may still have had a frame on the way.
+                if !conversations.0.contains_key(&id) { continue; }
+                if frame["kind"] == "error" { conversations.0.remove(&id); }
+                if !send_collection(&mut socket, frame).await { return; }
+                continue;
             }
             (id, frame) = next_terminal_frame(&mut terminals), if !command_waiting && !terminals.is_empty() => {
                 let message = match frame {
