@@ -32,3 +32,23 @@ The agent list now builds its status and cards once for each graph index and his
 On a fresh isolated backup with 201,147 claims, a cold agent listing took 1.62 seconds before dividing the status scan and 0.74 seconds after. A cold batch of 24 agent listings plus one each of missions, work, and messages completed in 0.91 seconds. Agent calls took 0.887–0.894 seconds; the other calls took 0.238–0.543 seconds. A warm batch of the same shape completed in 0.46 seconds, with agent calls taking 8–22 ms. A profiling run before the parallel scan attributed 1.26 seconds of a cold 1.27 second agent projection to the status reduction, with work queues and card assembly taking about 11 ms together. The tests exercise cache reuse with all read connections occupied, graph-index invalidation, ordered reduction of more than 64 subjects, asynchronous handler responsiveness, and durable slow-request fault recording.
 
 The cold batch has less headroom than the warm batch; a larger graph or higher CPU pressure may still exceed one second, and those requests will raise durable faults. Reconciliation duration and writer-lock wait were not measured by the read-only reproduction.
+
+## Read connections since 2026-09-30
+
+A fixed pool made reads wait for one another. On 2026-09-29, a fleet host's store had four
+connections in each of four classes. Four work-item reads held every interactive connection for
+36 seconds. Every seat's mailbox poll waited 5 to 6 seconds behind them, and a client request's
+admission waited 35 seconds.
+
+Now a read takes an idle connection, or opens another when every one is busy. A read never
+waits for another read, and in WAL mode never for the writer. The pool keeps up to 32 connections
+between reads, each caching up to 8 MiB of pages, and closes the others. A read waits for a
+connection only when the operating system refuses to open one, so the daemon raises its soft
+open file limit toward the hard one, up to 8,192, when it starts. A large status projection still
+splits its subjects across four threads, each on its own connection at the same store index.
+
+`GET /v1/replication/status`, `GET /v1/internal/fleet/status` and
+`GET /v1/internal/fleet/membership` read the replication snapshot of envelopes already sealed,
+built on a read connection. Sealing this node's newest batches into envelopes needs the writer,
+so the exchange paths do it, and a batch written since the last exchange shows in these reads
+after the next one.
