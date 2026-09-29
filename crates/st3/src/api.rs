@@ -1611,9 +1611,9 @@ fn client_agent_resources_uncached(
     history: bool,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
-    // The default store status scan omits unhealthy current agents along with
-    // history. Scan both, then keep current-layer agents below.
-    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), true)?;
+    // Without history the store reduces only agents that can be current, including unhealthy
+    // ones; the filters below keep the current layer either way.
+    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
     let work_queues = store.agent_work_queues()?;
     let desired_hosts = store
         .desired_subjects()?
