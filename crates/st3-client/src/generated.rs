@@ -707,6 +707,19 @@ pub struct Agent {
     pub usage: Option<UsageSummary>,
     #[serde(default)]
     pub under: Vec<AgentRelationship>,
+    #[serde(default)]
+    pub delivery: Option<AgentDelivery>,
+}
+/// Whether the process that carries a local seat's messages is live and current.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentDelivery {
+    pub state: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub polled_seconds_ago: Option<u64>,
+    #[serde(default)]
+    pub transport: Option<String>,
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
