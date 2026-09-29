@@ -578,7 +578,7 @@ async fn response_envelope(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("application/json"))
     {
-        report_slow_request(&state, &request_path, started);
+        report_slow_request(&request_path, started);
         return response;
     }
     let status = response.status();
@@ -651,37 +651,19 @@ async fn response_envelope(
     };
     let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-    report_slow_request(&state, &request_path, started);
+    report_slow_request(&request_path, started);
     Response::from_parts(parts, Body::from(body))
 }
 
-fn report_slow_request(state: &AppState, path: &str, started: Instant) {
+fn report_slow_request(path: &str, started: Instant) {
     let elapsed = started.elapsed();
     if elapsed < Duration::from_secs(1) {
         return;
     }
-    let store = state.store.clone();
-    let subject = format!("daemon/{}", state.node);
-    let reason = format!("request {path} took {} ms", elapsed.as_millis());
-    tokio::task::spawn_blocking(move || {
-        let result = store.append_claim(&ClaimInput {
-            subject,
-            kind: "daemon.diagnostic".into(),
-            actor: None,
-            fields: BTreeMap::from([
-                ("severity".into(), Value::String("error".into())),
-                ("code".into(), Value::String("slow-request".into())),
-                ("status".into(), Value::String("faulted".into())),
-                ("reason".into(), Value::String(reason.clone())),
-            ]),
-            evidence: Vec::new(),
-            expected_subject: None,
-            idempotency_key: None,
-        });
-        if let Err(error) = result {
-            eprintln!("slow request fault could not be recorded: {reason}: {error}");
-        }
-    });
+    // Request latency is an operational sample, not a graph change. Publishing a
+    // claim here causes replication and reconciliation on every node, including
+    // during the contention that made the request slow in the first place.
+    eprintln!("st3: slow request {path} took {} ms", elapsed.as_millis());
 }
 
 fn new_request_id() -> String {
@@ -3551,11 +3533,20 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
     let environment = tokio::task::spawn_blocking(crate::environment::snapshot)
         .await
         .map_err(ApiError::internal)?;
+    // Linking a crate takes seconds, so it runs while the other checks do.
+    let build_tools = environment.as_ref().ok().cloned().map(|environment| {
+        tokio::task::spawn_blocking(move || crate::environment::check_build_tools(&environment))
+    });
     let token = crate::resource::github_token().await;
     let mut report = tokio::task::spawn_blocking(move || doctor_report(&state))
         .await
         .map_err(ApiError::internal)??
         .0;
+    if let Some(build_tools) = build_tools {
+        report.checks.push(build_tools_check(
+            &build_tools.await.map_err(ApiError::internal)?,
+        ));
+    }
     report.checks.push(match environment {
         Ok(environment) => DoctorCheck {
             name: "daemon-environment".into(),
@@ -3589,6 +3580,42 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
     }
     .into();
     Ok(Json(report))
+}
+
+fn build_tools_check(tools: &crate::environment::BuildTools) -> DoctorCheck {
+    use crate::environment::LinkResult;
+    let mut problems = Vec::new();
+    if !tools.missing.is_empty() {
+        problems.push(format!(
+            "missing from the login PATH: {}",
+            tools.missing.join(", ")
+        ));
+    }
+    match &tools.link {
+        LinkResult::Linked => {}
+        LinkResult::NotAttempted => {
+            problems.push("no small crate was linked because cargo or rustc is missing".into());
+        }
+        LinkResult::Failed(error) => problems.push(format!("a small crate did not link: {error}")),
+    }
+    if problems.is_empty() {
+        return DoctorCheck {
+            name: "build-tools".into(),
+            status: "pass".into(),
+            message: format!(
+                "{} are on the login PATH, and a small crate links",
+                tools.found.join(", ")
+            ),
+        };
+    }
+    DoctorCheck {
+        name: "build-tools".into(),
+        status: "warn".into(),
+        message: format!(
+            "{}; install what is missing, or export its directory from the account's shell startup files",
+            problems.join("; ")
+        ),
+    }
 }
 
 fn daemon_pty(state: &AppState) -> anyhow::Result<st_runtime::PtyRuntime> {
@@ -9814,35 +9841,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_request_records_a_durable_fault() {
+    async fn slow_request_does_not_change_the_graph() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
-        report_slow_request(
-            &state,
-            "/v1/client/agents",
-            Instant::now() - Duration::from_secs(2),
+        let before = state.store.index().unwrap();
+        report_slow_request("/v1/client/agents", Instant::now() - Duration::from_secs(2));
+        // The old implementation spawned a blocking write, so give that write
+        // time to finish before proving the request caused no graph change.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(state.store.index().unwrap(), before);
+        assert!(
+            state
+                .store
+                .latest_claim("daemon/node", Some("daemon.diagnostic"))
+                .unwrap()
+                .is_none()
         );
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Some(claim) = state
-                    .store
-                    .latest_claim("daemon/node", Some("daemon.diagnostic"))
-                    .unwrap()
-                {
-                    assert_eq!(claim.body["fields"]["code"], "slow-request");
-                    assert!(
-                        claim.body["fields"]["reason"]
-                            .as_str()
-                            .unwrap()
-                            .contains("/v1/client/agents")
-                    );
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -14914,21 +14928,21 @@ version 2
         assert_eq!(filtered, json!([]));
 
         let subject = created["subject"].as_str().unwrap();
-        let wrong = serde_json::to_value(AttentionResolveRequest {
+        let agent = serde_json::to_value(AttentionResolveRequest {
             outcome: "resolved".into(),
             reason: None,
-            actor: "person/someone-else".into(),
-            idempotency_key: "api-attention-wrong".into(),
+            actor: "agent/fabric/other".into(),
+            idempotency_key: "api-attention-agent".into(),
         })
         .unwrap();
         let (status, rejected) = json_request(
             app.clone(),
             &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
-            wrong,
+            agent,
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
-        assert_eq!(rejected["code"], "wrong-attention-reviewer");
+        assert_eq!(rejected["code"], "attention-resolver-not-person");
 
         let resolution = serde_json::to_value(AttentionResolveRequest {
             outcome: "resolved".into(),
