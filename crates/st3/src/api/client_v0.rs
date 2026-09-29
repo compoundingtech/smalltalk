@@ -41,6 +41,17 @@ struct CollectionSubscription {
 }
 
 const COLLECTION_MAX_SUBSCRIPTIONS: usize = 8;
+/// The least time between two rereads of a socket's held windows. A window read can take a
+/// few hundred milliseconds and the fleet commits about once a second, so rereading on every
+/// commit kept a daemon busy for as long as a client stayed connected. Commits in between are
+/// read together; a new subscription is still read at once.
+const COLLECTION_REREAD_INTERVAL: Duration = Duration::from_millis(1_500);
+
+/// Claims that no collection window shows: rereading for them only costs.
+fn collection_ignores(collection: &str, kind: &str) -> bool {
+    matches!(kind, "daemon.diagnostic" | "transport.observed")
+        || (kind == "harness.usage" && collection != "agents")
+}
 
 pub(super) async fn collection_stream(
     websocket: WebSocketUpgrade,
@@ -500,6 +511,10 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
     let mut conversations = ConversationFollowers::default();
     let (conversation_outbox, mut conversation_frames) =
         tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
+    // The commits already weighed for a reread, whether one is due, and when the last ran.
+    let mut weighed = state.store.index().unwrap_or_default();
+    let mut reread_due = false;
+    let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
     loop {
         // The subscriptions to read after this wake-up.
         let mut refresh = Vec::<String>::new();
@@ -576,6 +591,20 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
             }
             result = changed.changed(), if !command_waiting => {
                 if result.is_err() { return; }
+                // Weigh only the commits since the last look: a reread is due when one of them
+                // can change a held window.
+                let index = state.store.index().unwrap_or(weighed);
+                if index > weighed {
+                    let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims).unwrap_or_default();
+                    reread_due |= claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
+                        claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
+                    });
+                    weighed = index;
+                }
+                if !reread_due || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
+                refresh.extend(subscriptions.keys().cloned());
+            }
+            () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && reread_due => {
                 refresh.extend(subscriptions.keys().cloned());
             }
             Some((id, frame)) = conversation_frames.recv(), if !command_waiting => {
@@ -604,6 +633,10 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
         }
         if refresh.is_empty() {
             continue;
+        }
+        if refresh.len() >= subscriptions.len() && !subscriptions.is_empty() {
+            reread_due = false;
+            last_reread = tokio::time::Instant::now();
         }
         // Read every due window at once, each in its own snapshot, then send them in order:
         // one slow window never holds back the others' reads.
@@ -3485,6 +3518,103 @@ fn conversation_read_now(
     )
 }
 
+/// What a conversation read last saw, so a wake-up can tell cheaply whether anything that
+/// concerns the conversation changed: a claim about its agent, Small Talk to or from it, a local
+/// timeline entry, or its native transcript file.
+struct ConversationMark {
+    owner: Option<String>,
+    transcript: Option<std::path::PathBuf>,
+    store_index: u64,
+    local_position: u64,
+    transcript_seen: Option<(u64, std::time::SystemTime)>,
+}
+
+fn transcript_seen(path: Option<&std::path::Path>) -> Option<(u64, std::time::SystemTime)> {
+    let metadata = std::fs::metadata(path?).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
+}
+
+impl ConversationMark {
+    fn new(state: &AppState, session_id: &str) -> Result<Self, ApiError> {
+        let index = state.store.index().map_err(ApiError::internal)?;
+        let managed = super::managed_session_owner_at(&state.store, index, session_id)
+            .map_err(ApiError::internal)?;
+        let (owner, incarnation) = managed
+            .map(|(owner, incarnation, _)| (Some(owner), incarnation))
+            .unwrap_or_default();
+        // Resolve the transcript once: finding it walks the harness's session directories.
+        let transcript = match (&owner, &incarnation) {
+            (Some(owner), Some(incarnation)) => match managed_codex_transcript(state, owner, incarnation)? {
+                Some(external) => Some(external),
+                None => match managed_claude_transcript(state, owner, incarnation)? {
+                    Some(external) => Some(external),
+                    None => managed_omp_transcript(state, owner, incarnation)?,
+                },
+            },
+            _ => crate::external_sessions::find(state.native_session_home.as_deref(), session_id)
+                .map_err(ApiError::internal)?,
+        }
+        .map(|external| external.transcript);
+        Ok(Self {
+            transcript_seen: transcript_seen(transcript.as_deref()),
+            transcript,
+            owner,
+            store_index: index,
+            local_position: local_latest_position(state)?,
+        })
+    }
+
+    /// Whether anything that concerns the conversation changed since the last look.
+    fn changed(&mut self, state: &AppState) -> Result<bool, ApiError> {
+        let mut changed = false;
+        let index = state.store.index().map_err(ApiError::internal)?;
+        if index > self.store_index {
+            let claims = state
+                .store
+                .claims_page(None, None, self.store_index, index.checked_add(1), false, 10_000)
+                .map_err(ApiError::internal)?
+                .claims;
+            // A burst too large to scan is treated as a change.
+            changed |= claims.len() >= 10_000
+                || claims.iter().any(|claim| {
+                    let fields = claim.body.get("fields").unwrap_or(&claim.body);
+                    Some(claim.subject.as_str()) == self.owner.as_deref()
+                        || (claim.kind == "message.sent"
+                            && ["from", "to"].iter().any(|side| {
+                                fields.get(*side).and_then(Value::as_str) == self.owner.as_deref()
+                            }))
+                });
+            self.store_index = index;
+        }
+        let local = local_latest_position(state)?;
+        if local > self.local_position {
+            changed |= state
+                .store
+                .local_observations_after(self.local_position, 10_000)
+                .map_err(ApiError::internal)?
+                .iter()
+                .any(|claim| Some(claim.subject.as_str()) == self.owner.as_deref());
+            self.local_position = local;
+        }
+        let seen = transcript_seen(self.transcript.as_deref());
+        if seen != self.transcript_seen {
+            changed = true;
+            self.transcript_seen = seen;
+        }
+        Ok(changed)
+    }
+}
+
+fn local_latest_position(state: &AppState) -> Result<u64, ApiError> {
+    Ok(state
+        .store
+        .local_observations_tail(1)
+        .map_err(ApiError::internal)?
+        .first()
+        .and_then(crate::store::local_observation_position)
+        .unwrap_or(0))
+}
+
 async fn conversation_changes_local(
     state: &AppState,
     session: &ClientSession,
@@ -3494,6 +3624,7 @@ async fn conversation_changes_local(
 ) -> Result<Value, ApiError> {
     let mut changed = state.event_notify.subscribe();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms.min(30_000));
+    let mut mark = ConversationMark::new(state, session_id)?;
     loop {
         let value = conversation_read_now(state, session, session_id, after)?;
         if !value["items"]
@@ -3504,9 +3635,31 @@ async fn conversation_changes_local(
         {
             return Ok(value);
         }
-        let pause = Duration::from_millis(250)
-            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
-        tokio::select! { _ = changed.changed() => {}, _ = tokio::time::sleep(pause) => {} }
+        // Read again only when something that concerns this conversation changed: a full read
+        // parses the whole transcript, and the fleet commits many times a second.
+        loop {
+            let pause = Duration::from_millis(250)
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            tokio::select! { _ = changed.changed() => {}, _ = tokio::time::sleep(pause) => {} }
+            if mark.changed(state)? {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // Nothing concerned it: move the cursor past what was checked without a read.
+                let mut value = value;
+                if let Some(cursor) = value["next_cursor"].as_str() {
+                    let (_, _, native) = conversation_position(state, session_id, cursor)?;
+                    value["next_cursor"] = Value::String(conversation_cursor(
+                        state,
+                        session_id,
+                        mark.store_index,
+                        mark.local_position,
+                        native,
+                    ));
+                }
+                return Ok(value);
+            }
+        }
     }
 }
 

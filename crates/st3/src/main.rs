@@ -5591,7 +5591,12 @@ fn unseen_timeline_entries(
             seen.remove(&id);
         }
     }
-    changed.sort_by_key(|entry| entry.sequence);
+    // Small Talk and transcript entries number their sequences apart; time orders them.
+    changed.sort_by(|a, b| {
+        a.timestamp
+            .cmp(&b.timestamp)
+            .then(a.sequence.cmp(&b.sequence))
+    });
     changed
 }
 
