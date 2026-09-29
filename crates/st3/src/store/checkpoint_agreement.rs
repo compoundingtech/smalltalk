@@ -288,6 +288,21 @@ pub enum CheckpointAction {
     AttentionWithdrawn {
         attention: String,
     },
+    Trimmed {
+        checkpoint: String,
+        envelopes: usize,
+        claims: usize,
+    },
+    /// The newest stable checkpoint needs a manifest from a peer before this node goes on.
+    ManifestNeeded {
+        checkpoint: String,
+        cut_unix_ms: u128,
+    },
+    /// A trim stopped because deleting would change the graph. Nothing is sealed until a person
+    /// looks.
+    TrimGraphChanged {
+        checkpoint: String,
+    },
 }
 
 /// `st replication checkpoint status`: the newest stable checkpoint and the one being agreed.
@@ -295,6 +310,10 @@ pub enum CheckpointAction {
 pub struct CheckpointStatusView {
     pub node: String,
     pub newest_stable: Option<Certificate>,
+    /// The newest checkpoint this node trimmed or adopted.
+    pub trimmed: Option<String>,
+    /// A trim stopped because the graph would change, and waits for a person.
+    pub halted: bool,
     pub pending: Option<PendingCheckpointView>,
     pub participants: BTreeSet<String>,
     pub excused: BTreeSet<String>,
@@ -560,6 +579,18 @@ impl Store {
             return Ok(actions);
         }
         let claims = self.checkpoint_claims()?;
+        // Every node trims the same checkpoints in the same order, so the newest stable one is
+        // applied here before this node seals or verifies a newer one.
+        if let Some(need) = self.apply_stable_checkpoints(&claims, &mut actions)? {
+            actions.push(CheckpointAction::ManifestNeeded {
+                checkpoint: need.checkpoint,
+                cut_unix_ms: need.cut_unix_ms,
+            });
+            return Ok(actions);
+        }
+        if self.checkpoint_halted()? {
+            return Ok(actions);
+        }
         let stable = stable_checkpoints(&claims);
         let newest_stable = stable.keys().next_back().copied();
         self.withdraw_checkpoint_attention(&claims, newest_stable, &mut actions)?;
@@ -770,7 +801,8 @@ impl Store {
             let Some(request) = self.attention_request(&subject)? else {
                 continue;
             };
-            if request.status != "pending" {
+            // Requests replicate; each node withdraws only its own.
+            if request.status != "pending" || request.actor != checkpoint_actor(&self.origin) {
                 continue;
             }
             self.withdraw_attention(
@@ -787,6 +819,45 @@ impl Store {
             .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
             actions.push(CheckpointAction::AttentionWithdrawn { attention: subject });
         }
+        Ok(())
+    }
+
+    /// Whether a trim stopped because the graph would change. Checkpoints then wait for a
+    /// person; see `resume_checkpoints`.
+    pub fn checkpoint_halted(&self) -> Result<bool> {
+        Ok(self
+            .readers
+            .get()
+            .query_row(
+                "SELECT 1 FROM checkpoints WHERE state='graph-changed' LIMIT 1",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some())
+    }
+
+    /// A person looked at a trim that stopped because the graph would change. The rows stay
+    /// as they are, and checkpoints go on from the next one.
+    pub fn resume_checkpoints(&self, actor: &str, reason: &str) -> Result<(), St3Error> {
+        let actor = normalize_actor(actor, "person");
+        if !actor.starts_with("person/") || reason.trim().is_empty() {
+            return Err(St3Error::new(
+                "invalid-checkpoint-resume",
+                "a person resumes checkpoints, with a reason",
+            ));
+        }
+        let connection = self.connection.write();
+        connection
+            .execute(
+                "UPDATE checkpoints SET state='set-aside', detail=?1, updated_at_unix_ms=?2
+                 WHERE state='graph-changed'",
+                params![
+                    json!({"resumed_by": actor, "reason": reason}).to_string(),
+                    i64::try_from(now_ms()).unwrap_or(i64::MAX)
+                ],
+            )
+            .map_err(internal)?;
         Ok(())
     }
 
@@ -859,9 +930,20 @@ impl Store {
             })
         })
         .transpose()?;
+        let trimmed = self
+            .readers
+            .get()
+            .query_row(
+                "SELECT id FROM checkpoints WHERE state='trimmed' ORDER BY cut_unix_ms DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
         Ok(CheckpointStatusView {
             node: self.origin.clone(),
             newest_stable,
+            trimmed,
+            halted: self.checkpoint_halted()?,
             pending,
             excused: excused_writers(&claims),
             participants,
@@ -1135,12 +1217,7 @@ mod tests {
     }
 
     fn observe(store: &Store, n: usize) {
-        let first = store
-            .claims_page(None, None, 0, None, false, 10_000)
-            .unwrap()
-            .claims
-            .len();
-        for index in first..first + n {
+        for index in 0..n {
             store
                 .append_claim(&ClaimInput {
                     subject: format!("daemon/{}", store.origin),
@@ -1153,7 +1230,11 @@ mod tests {
                     ]),
                     evidence: Vec::new(),
                     expected_subject: None,
-                    idempotency_key: Some(format!("{}-slow-{index}", store.origin)),
+                    idempotency_key: Some(format!(
+                        "{}-slow-{index}-{}",
+                        store.origin,
+                        Uuid::now_v7().simple()
+                    )),
                 })
                 .unwrap();
         }
@@ -1182,6 +1263,9 @@ mod tests {
                 CheckpointAction::ProofFailed { .. } => "proof-failed",
                 CheckpointAction::AttentionRequested { .. } => "attention",
                 CheckpointAction::AttentionWithdrawn { .. } => "withdrawn",
+                CheckpointAction::Trimmed { .. } => "trimmed",
+                CheckpointAction::ManifestNeeded { .. } => "manifest-needed",
+                CheckpointAction::TrimGraphChanged { .. } => "graph-changed",
             })
             .collect()
     }
@@ -1213,6 +1297,7 @@ mod tests {
         sync(&[&alder, &birch]);
         for node in [&alder, &birch] {
             assert_eq!(stable_cuts(node), [cut]);
+            assert_eq!(kinds(&step(node, &context)), ["trimmed"]);
             assert!(step(node, &context).is_empty());
         }
         let status = alder.checkpoint_status(context.now_unix_ms, &[]).unwrap();
@@ -1337,16 +1422,24 @@ mod tests {
         sync(&[&alder, &birch]);
         let cut = newest_due_cut(late.now_unix_ms);
         assert_eq!(stable_cuts(&alder), [cut]);
-        assert_eq!(kinds(&step(&alder, &late)), ["withdrawn"]);
+        assert_eq!(kinds(&step(&alder, &late)), ["trimmed", "withdrawn"]);
+        assert_eq!(kinds(&step(&birch, &late)), ["trimmed"]);
 
-        // Cedar comes back. What it wrote while away replicates, and its next seal ends its
-        // excusal, so the next checkpoint waits for it again.
+        // Cedar comes back. What it wrote while away replicates. It adopts the checkpoint it
+        // missed, and its next seal ends its excusal, so the next checkpoint waits for it.
         observe(&cedar, 1);
         sync(&[&alder, &birch, &cedar]);
         let next = CheckpointContext {
             now_unix_ms: late.now_unix_ms + DAY_MS,
             ..late.clone()
         };
+        assert_eq!(kinds(&step(&cedar, &next)), ["manifest-needed"]);
+        let need = cedar.checkpoint_manifest_need().unwrap().unwrap();
+        let manifest = alder
+            .checkpoint_manifest(&need.checkpoint, need.cut_unix_ms)
+            .unwrap();
+        assert_eq!(kinds(&cedar.adopt_checkpoint(&manifest).unwrap()), ["trimmed"]);
+        assert_eq!(claim_ids(&cedar), claim_ids(&alder));
         assert_eq!(kinds(&step(&cedar, &next)), ["sealed"]);
         sync(&[&alder, &birch, &cedar]);
         assert!(
@@ -1397,6 +1490,149 @@ mod tests {
             .unwrap()
             .claims;
         assert!(newest.last().unwrap().accepted_at_unix_ms > cut + 5 * DAY_MS);
+    }
+
+    fn authority(store: &Store) -> (String, String) {
+        let status = store.replication_status(true, Some(FLEET), &[]).unwrap();
+        (status.authority_digest, status.graph_digest)
+    }
+
+    fn claim_ids(store: &Store) -> BTreeSet<String> {
+        store
+            .claims_page(None, None, 0, None, false, 100_000)
+            .unwrap()
+            .claims
+            .into_iter()
+            .map(|claim| claim.id)
+            .collect()
+    }
+
+    /// Two nodes agree on a checkpoint until it is stable, without trimming it.
+    fn stable_pair(alder: &Store, birch: &Store, context: &CheckpointContext) -> String {
+        observe(alder, 8);
+        observe(birch, 5);
+        sync(&[alder, birch]);
+        for round in ["sealed", "verified"] {
+            for node in [alder, birch] {
+                assert_eq!(kinds(&step(node, context)), [round]);
+            }
+            sync(&[alder, birch]);
+        }
+        checkpoint_name(newest_due_cut(context.now_unix_ms))
+    }
+
+    #[test]
+    fn participants_trim_the_stable_checkpoint_and_keep_every_identity() {
+        let scratch = tempfile::tempdir().unwrap();
+        let context = context(scratch.path(), 0);
+        let cut = newest_due_cut(context.now_unix_ms);
+        let [alder, birch] = ["alder", "birch"].map(|name| Store::open_memory(name).unwrap());
+        let checkpoint = stable_pair(&alder, &birch, &context);
+        let before = [&alder, &birch].map(authority);
+        let held = claim_ids(&alder);
+        let index = alder.index().unwrap();
+        for node in [&alder, &birch] {
+            assert_eq!(kinds(&step(node, &context)), ["trimmed"]);
+            assert!(step(node, &context).is_empty());
+        }
+        // Every identity stays in the inventory, so the authority digest does not move, and
+        // the graph is the same.
+        assert_eq!([&alder, &birch].map(authority), before);
+        assert_eq!(authority(&alder), authority(&birch));
+        let kept = claim_ids(&alder);
+        assert!(kept.len() < held.len());
+        assert_eq!(kept, claim_ids(&birch));
+        let manifests = [&alder, &birch].map(|node| node.checkpoint_manifest(&checkpoint, cut).unwrap());
+        assert!(!manifests[0].claims.is_empty());
+        assert_eq!(manifests[0], manifests[1]);
+        for claim in &manifests[0].claims {
+            assert!(held.contains(&claim.id) && !kept.contains(&claim.id));
+        }
+        // Snapshots taken before the trim expire.
+        assert!(alder.index().unwrap() > index);
+        let status = alder.checkpoint_status(context.now_unix_ms, &[]).unwrap();
+        assert_eq!(status.trimmed.as_deref(), Some(checkpoint.as_str()));
+
+        // Both keep replicating new writes.
+        observe(&alder, 2);
+        observe(&birch, 2);
+        sync(&[&alder, &birch]);
+        assert_eq!(authority(&alder), authority(&birch));
+        assert_eq!(claim_ids(&alder), claim_ids(&birch));
+    }
+
+    #[test]
+    fn a_trim_that_stops_anywhere_finishes_the_same_after_a_restart() {
+        for fault in [
+            TrimFault::AfterTombstones,
+            TrimFault::AfterChunk(1),
+            TrimFault::AfterChunk(2),
+            TrimFault::BeforeFinish,
+        ] {
+            let scratch = tempfile::tempdir().unwrap();
+            let context = context(scratch.path(), 0);
+            let path = scratch.path().join("alder.sqlite3");
+            let alder = Store::open(&path, "alder").unwrap();
+            let birch = Store::open_memory("birch").unwrap();
+            stable_pair(&alder, &birch, &context);
+            assert_eq!(kinds(&step(&birch, &context)), ["trimmed"]);
+            alder.set_trim_chunk_envelopes(2);
+            alder.set_trim_fault(Some(fault));
+            assert!(alder.checkpoint_step(&context).is_err(), "{fault:?}");
+            drop(alder);
+
+            let alder = Store::open(&path, "alder").unwrap();
+            let actions = step(&alder, &context);
+            assert_eq!(kinds(&actions), ["trimmed"], "{fault:?}");
+            assert!(step(&alder, &context).is_empty());
+            assert_eq!(claim_ids(&alder), claim_ids(&birch), "{fault:?}");
+            assert_eq!(authority(&alder), authority(&birch), "{fault:?}");
+            let cut = newest_due_cut(context.now_unix_ms);
+            let checkpoint = checkpoint_name(cut);
+            assert_eq!(
+                alder.checkpoint_manifest(&checkpoint, cut).unwrap(),
+                birch.checkpoint_manifest(&checkpoint, cut).unwrap(),
+                "{fault:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_node_that_did_not_take_part_adopts_the_manifest_and_nothing_else() {
+        let scratch = tempfile::tempdir().unwrap();
+        let context = context(scratch.path(), 0);
+        let cut = newest_due_cut(context.now_unix_ms);
+        let [alder, birch] = ["alder", "birch"].map(|name| Store::open_memory(name).unwrap());
+        let checkpoint = stable_pair(&alder, &birch, &context);
+        for node in [&alder, &birch] {
+            step(node, &context);
+        }
+        // A new node gets the kept envelopes, never the dropped ones, and the checkpoint claims.
+        let cedar = Store::open_memory("cedar").unwrap();
+        sync(&[&alder, &cedar]);
+        assert_ne!(authority(&cedar).0, authority(&alder).0);
+        assert_eq!(kinds(&step(&cedar, &context)), ["manifest-needed"]);
+        assert_eq!(
+            cedar.checkpoint_manifest_need().unwrap().map(|need| need.checkpoint),
+            Some(checkpoint.clone())
+        );
+        let manifest = alder.checkpoint_manifest(&checkpoint, cut).unwrap();
+
+        // A changed tombstone is refused before anything is stored.
+        let mut changed = manifest.clone();
+        changed.claims[0].predecessors.push("an-invented-claim".into());
+        assert_eq!(
+            cedar.adopt_checkpoint(&changed).unwrap_err().code,
+            "checkpoint-manifest-mismatch"
+        );
+        assert_eq!(cedar.checkpointed_envelopes().unwrap(), 0);
+
+        assert_eq!(kinds(&cedar.adopt_checkpoint(&manifest).unwrap()), ["trimmed"]);
+        assert_eq!(cedar.checkpoint_manifest_need().unwrap(), None);
+        assert_eq!(authority(&cedar), authority(&alder));
+        assert_eq!(claim_ids(&cedar), claim_ids(&alder));
+        assert_eq!(cedar.checkpoint_manifest(&checkpoint, cut).unwrap(), manifest);
+        assert!(step(&cedar, &context).is_empty());
     }
 
     #[test]

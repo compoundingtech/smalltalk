@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,6 +40,7 @@ use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
 mod checkpoint;
 mod checkpoint_agreement;
+mod checkpoint_trim;
 
 pub use checkpoint_agreement::{
     CHECKPOINT_ATTENTION_AFTER_MS, CHECKPOINT_EXCUSED, CHECKPOINT_PROTOCOL, CHECKPOINT_SEALED,
@@ -49,6 +50,7 @@ pub use checkpoint_agreement::{
     newest_seals, participants as checkpoint_participants, stable_checkpoints,
 };
 use checkpoint_agreement::write_time;
+pub use checkpoint_trim::{CheckpointManifestNeed, TRIM_CHUNK_ENVELOPES, TrimFault};
 pub use checkpoint::{
     CHECKPOINT_MANIFEST_PAGE_LIMIT, CheckpointManifest, CheckpointManifestCursor,
     CheckpointManifestPage, CheckpointManifestRequest, CheckpointPlanRequest, CheckpointPlanView,
@@ -747,6 +749,10 @@ pub struct Store {
     /// opens its own connection here to copy the store.
     path: PathBuf,
     shared_memory: bool,
+    /// Where the next trim stops, as a crash would, and how many envelopes it deletes per
+    /// transaction. Only tests change them.
+    trim_fault: Mutex<Option<checkpoint_trim::TrimFault>>,
+    trim_chunk_envelopes: AtomicUsize,
 }
 
 const MESSAGE_CACHE_LIMIT: usize = 4096;
@@ -1741,6 +1747,8 @@ impl Store {
             origin,
             path: path.to_path_buf(),
             shared_memory: false,
+            trim_fault: Mutex::new(None),
+            trim_chunk_envelopes: AtomicUsize::new(checkpoint_trim::TRIM_CHUNK_ENVELOPES),
         })
     }
 
@@ -1791,6 +1799,8 @@ impl Store {
             origin,
             path: uri,
             shared_memory: true,
+            trim_fault: Mutex::new(None),
+            trim_chunk_envelopes: AtomicUsize::new(checkpoint_trim::TRIM_CHUNK_ENVELOPES),
         })
     }
 
