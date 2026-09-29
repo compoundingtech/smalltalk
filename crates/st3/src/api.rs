@@ -3441,6 +3441,15 @@ pub async fn serve_unix_bound(socket: &Path, app: Router) -> anyhow::Result<()> 
 }
 
 async fn serve_unix_inner(socket: &Path, app: Router, bind_harness: bool) -> anyhow::Result<()> {
+    serve_unix_with_ancestor(socket, app, bind_harness, harness_ancestor).await
+}
+
+async fn serve_unix_with_ancestor(
+    socket: &Path,
+    app: Router,
+    bind_harness: bool,
+    ancestor: fn(u32) -> Option<String>,
+) -> anyhow::Result<()> {
     crate::config::validate_unix_socket_path(socket, "--socket or --client-gateway-socket")?;
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent)?;
@@ -3463,18 +3472,26 @@ async fn serve_unix_inner(socket: &Path, app: Router, bind_harness: bool) -> any
                 continue;
             }
         };
-        let bound_agent = if bind_harness {
+        let peer_pid = if bind_harness {
             stream
                 .peer_cred()
                 .ok()
                 .and_then(|cred| cred.pid())
                 .and_then(|pid| u32::try_from(pid).ok())
-                .and_then(harness_ancestor)
         } else {
             None
         };
         let app = app.clone();
         tokio::spawn(async move {
+            // /proc ancestry may fault in pages on a loaded host. Keep that work
+            // out of the accept loop so a slow lookup delays only this peer.
+            let bound_agent = match peer_pid {
+                Some(pid) => tokio::task::spawn_blocking(move || ancestor(pid))
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
             let service = hyper::service::service_fn(move |request: Request<Incoming>| {
                 let app = app.clone();
                 let bound_agent = bound_agent.clone();
@@ -10337,6 +10354,63 @@ mod tests {
         assert!(latency["routes"].as_array().unwrap().iter().any(|route| {
             route["route"] == "/v1/health" && route["count"].as_u64().unwrap_or_default() >= 30
         }));
+        server.abort();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_peer_identity_lookup_does_not_stop_existing_api_connections() {
+        use http_body_util::{BodyExt as _, Empty};
+        use hyper::client::conn::http1::SendRequest;
+
+        fn slow_ancestor(_pid: u32) -> Option<String> {
+            std::thread::sleep(Duration::from_millis(500));
+            None
+        }
+
+        async fn health(sender: &mut SendRequest<Empty<axum::body::Bytes>>) {
+            let response = sender
+                .send_request(
+                    Request::builder()
+                        .uri("/v1/health")
+                        .header("host", "local")
+                        .body(Empty::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.into_body().collect().await.unwrap();
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("st3.sock");
+        let server_socket = socket.clone();
+        let app = router(state(root.path()));
+        let server = tokio::spawn(async move {
+            serve_unix_with_ancestor(&server_socket, app, true, slow_ancestor).await
+        });
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        health(&mut sender).await;
+
+        let _slow_peer = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        health(&mut sender).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "an unrelated identity lookup stalled the API for {:?}",
+            started.elapsed()
+        );
         server.abort();
     }
 
