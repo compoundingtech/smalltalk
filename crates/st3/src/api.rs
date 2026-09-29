@@ -414,6 +414,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/replication/records/{*record}", get(replication_record))
         .route("/v1/replication/repair", post(repair_replication_record))
         .route("/v1/checkpoint/plan", post(checkpoint_plan))
+        .route("/v1/checkpoint/status", get(checkpoint_status))
+        .route("/v1/checkpoint/excuse", post(checkpoint_excuse))
         .route(
             "/v1/internal/replication/export",
             post(replication_export).layer(DefaultBodyLimit::max(crate::peer::MAX_EXCHANGE_BYTES)),
@@ -4192,6 +4194,28 @@ async fn checkpoint_plan(
     blocking_store(move || store.checkpoint_plan_view(cut, &scratch))
         .await
         .map(Json)
+}
+
+async fn checkpoint_status(
+    State(state): State<AppState>,
+) -> Result<Json<crate::store::CheckpointStatusView>, ApiError> {
+    let store = state.store.clone();
+    let peers = state.configured_peers.clone();
+    blocking_store(move || store.checkpoint_status(client_now_ms(), &peers))
+        .await
+        .map(Json)
+}
+
+async fn checkpoint_excuse(
+    State(state): State<AppState>,
+    Json(request): Json<crate::store::CheckpointExcuseRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    let claim = state
+        .store
+        .excuse_checkpoint_writer(&request)
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(claim))
 }
 
 async fn repair_replication_record(
