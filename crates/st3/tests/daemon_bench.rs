@@ -23,6 +23,7 @@
 //! - `ST_BENCH_SEATS` sets how many seats poll and write. The default is 30.
 //! - `ST_BENCH_PEOPLE` sets how many people read at once. The default is 3.
 //! - `ST_BENCH_P99_MS` sets the read budget. The default is 200.
+//! - `ST3_PROFILE_DIR` profiles the daemon during the runs, as `docs/st3/profiling.md` describes.
 //! - `ST_BENCH_RECONCILER=0` leaves out the reconciler, which otherwise runs as a host that owns
 //!   none of the store's members, so it starts, renders and signals nothing.
 //!
@@ -102,6 +103,8 @@ async fn person_facing_reads_answer_within_their_budget() {
         println!("skipped: a debug build is too slow to measure; run with cargo test --release");
         return;
     }
+    // `ST3_PROFILE_DIR` profiles the daemon here as it does under `st up`.
+    st3::profile::init_from_env();
     let scales = std::env::var("ST_BENCH_SCALES")
         .unwrap_or_else(|_| "0.1,1".into())
         .split(',')
