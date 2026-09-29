@@ -799,6 +799,8 @@ fn service_socket_accepts(socket: &Path) -> bool {
     socket.exists()
 }
 
+/// The daemon answers every command and attach, so it outranks the builds and tests its
+/// harnesses run at systemd's default weight of 100.
 pub fn render_systemd_user_unit(spec: &ServiceSpec) -> String {
     let exec_start = spec
         .program_arguments()
@@ -806,6 +808,7 @@ pub fn render_systemd_user_unit(spec: &ServiceSpec) -> String {
         .map(|argument| systemd_quote_arg(argument))
         .collect::<Vec<_>>()
         .join(" ");
+    let weight = st_runtime::LIVE_WEIGHT;
     format!(
         "[Unit]\n\
 Description=st claims graph daemon\n\
@@ -818,7 +821,8 @@ Environment=MALLOC_ARENA_MAX=2\n\
 Restart=on-failure\n\
 RestartSec=5s\n\
 Nice=0\n\
-CPUWeight=100\n\
+CPUWeight={weight}\n\
+IOWeight={weight}\n\
 KillMode=control-group\n\
 MemoryMax={}M\n\
 \n\
@@ -1035,12 +1039,13 @@ mod tests {
         assert!(unit.contains("Environment=MALLOC_ARENA_MAX=2"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("Nice=0"));
-        assert!(unit.contains("CPUWeight=100"));
+        assert!(unit.contains("CPUWeight=1000\nIOWeight=1000\n"));
         assert!(unit.contains("KillMode=control-group"));
         let replication = render_systemd_replication_unit(&spec);
         assert!(replication.contains("replication-worker"));
         assert!(replication.contains("Nice=0"));
-        assert!(replication.contains("CPUWeight=100"));
+        assert!(replication.contains("CPUWeight=100\n"));
+        assert!(!replication.contains("IOWeight"));
         assert!(replication.contains("KillMode=control-group"));
         assert!(replication.contains("Environment=MALLOC_ARENA_MAX=2"));
         assert!(replication.contains("--fleet-id 1f91ca65-7793-48cc-866e-ac15690130e1"));
