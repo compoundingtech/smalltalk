@@ -1127,8 +1127,12 @@ fn mission_resources_filtered(
         .filter_map(|item| item.mission_run.as_deref())
         .collect::<BTreeSet<_>>();
     let mut missions = BTreeMap::<String, Vec<MissionRunView>>::new();
-    let runs = if selected_id.is_some() {
-        store.mission_run_headers()?
+    // A detail or a page reads only its own missions' runs, definitions, seats and states.
+    let scope = selected_id
+        .map(|selected| vec![selected.to_owned()])
+        .or_else(|| page_ids.map(|ids| ids.to_vec()));
+    let runs = if let Some(selected) = selected_id {
+        store.mission_run_headers_for_missions(&[selected.to_owned()])?
     } else if let Some(ids) = page_ids {
         store.mission_run_summaries_for_missions(ids)?
     } else {
@@ -1137,7 +1141,7 @@ fn mission_resources_filtered(
     for run in runs {
         missions.entry(run.mission.clone()).or_default().push(run);
     }
-    let definitions = if let Some(ids) = page_ids {
+    let definitions = if let Some(ids) = &scope {
         store.mission_definitions_for_ids(ids)?
     } else {
         store.mission_definitions()?
@@ -1153,12 +1157,20 @@ fn mission_resources_filtered(
     for mission in definitions.keys() {
         missions.entry(mission.clone()).or_default();
     }
-    let desired = store.desired_subjects()?;
     let page_runs = missions
         .values()
         .flatten()
         .map(|run| run.subject.as_str())
         .collect::<BTreeSet<_>>();
+    let desired = if scope.is_some() {
+        let mut desired = Vec::new();
+        for run in &page_runs {
+            desired.extend(store.desired_subjects_for_owner_run(run)?);
+        }
+        desired
+    } else {
+        store.desired_subjects()?
+    };
     let usage_subjects = desired
         .iter()
         .filter(|seat| {
@@ -1178,7 +1190,16 @@ fn mission_resources_filtered(
             usage_by_run.entry(run).or_default().push(usage);
         }
     }
-    let run_states = store.mission_run_states()?;
+    let run_states = if scope.is_some() {
+        store.mission_run_states_for_runs(
+            &page_runs
+                .iter()
+                .map(|run| (*run).to_owned())
+                .collect::<Vec<_>>(),
+        )?
+    } else {
+        store.mission_run_states()?
+    };
     let mut values = missions
         .into_iter()
         .filter(|(mission, _)| selected_id.is_none_or(|selected| mission == selected))
@@ -2056,11 +2077,82 @@ fn machine_resources(
     Ok(machines)
 }
 
+/// How long page reads serve the daemon's last diagnostic report before one of them asks for a
+/// new report.
+const OPERATION_REPORT_REFRESH: Duration = Duration::from_secs(30);
+
+struct OperationReport {
+    store: std::sync::Weak<crate::store::Store>,
+    checks: Arc<Vec<crate::model::DoctorCheck>>,
+    at: Instant,
+    refreshing: bool,
+}
+
+/// The daemon's last diagnostic report for each store, which the operations collection lists.
+/// Some checks compare the whole projection with the claim log, seconds of work on a busy host's
+/// store, so page reads serve the last report and a new one is made off the request path.
+static OPERATION_REPORTS: OnceLock<Mutex<BTreeMap<usize, OperationReport>>> = OnceLock::new();
+
+fn operation_checks(state: &AppState) -> Result<Arc<Vec<crate::model::DoctorCheck>>, ApiError> {
+    let key = Arc::as_ptr(&state.store) as usize;
+    let reports = OPERATION_REPORTS.get_or_init(Default::default);
+    {
+        let mut reports = reports
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(report) = reports.get_mut(&key).filter(|report| {
+            report
+                .store
+                .upgrade()
+                .is_some_and(|store| Arc::ptr_eq(&store, &state.store))
+        }) {
+            if report.at.elapsed() >= OPERATION_REPORT_REFRESH && !report.refreshing {
+                report.refreshing = true;
+                let state = state.clone();
+                std::thread::spawn(move || refresh_operation_report(&state, key));
+            }
+            return Ok(report.checks.clone());
+        }
+    }
+    // The first read after a start has no report yet and makes one.
+    let checks = Arc::new(doctor_report(state)?.0.checks);
+    reports
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(
+            key,
+            OperationReport {
+                store: Arc::downgrade(&state.store),
+                checks: checks.clone(),
+                at: Instant::now(),
+                refreshing: false,
+            },
+        );
+    Ok(checks)
+}
+
+fn refresh_operation_report(state: &AppState, key: usize) {
+    let checks = doctor_report(state)
+        .ok()
+        .map(|report| Arc::new(report.0.checks));
+    let reports = OPERATION_REPORTS.get_or_init(Default::default);
+    let mut reports = reports
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(report) = reports.get_mut(&key) {
+        report.refreshing = false;
+        if let Some(checks) = checks {
+            report.checks = checks;
+            report.at = Instant::now();
+        }
+    }
+}
+
 fn operation_resources(state: &AppState, at: &str) -> Result<Vec<Value>, ApiError> {
-    let report = doctor_report(state)?.0;
-    let mut values = report
-        .checks
-        .into_iter()
+    let checks = operation_checks(state)?;
+    let mut values = checks
+        .iter()
+        .cloned()
         .map(|check| {
             let digest = hex::encode(Sha256::digest(check.name.as_bytes()));
             json!({
@@ -2219,7 +2311,34 @@ fn desired_child_arg(value: &Value, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The most items of each part the missions tree lists. A fleet with more shows the first ones
+/// and says how many there are, instead of failing the whole tree.
+const MISSIONS_TREE_ITEMS: usize = 200;
+const MISSIONS_TREE_QUEUED_RUNS: usize = 1000;
+
 fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Value> {
+    missions_tree_value_within(
+        store,
+        at,
+        index,
+        MISSIONS_TREE_ITEMS,
+        MISSIONS_TREE_QUEUED_RUNS,
+    )
+}
+
+fn missions_tree_value_within(
+    store: &Store,
+    at: &str,
+    index: u64,
+    items: usize,
+    queued_limit: usize,
+) -> anyhow::Result<Value> {
+    let mut truncated = serde_json::Map::new();
+    let mut note = |part: &str, shown: usize, total: usize| {
+        if total > shown {
+            truncated.insert(part.into(), json!({ "shown": shown, "total": total }));
+        }
+    };
     let mut runs = store
         .mission_run_headers()?
         .into_iter()
@@ -2230,20 +2349,19 @@ fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Va
             .cmp(&b.mission)
             .then_with(|| a.subject.cmp(&b.subject))
     });
-    anyhow::ensure!(runs.len() <= 200, "missions tree exceeds 200 active runs");
+    note("runs", items, runs.len());
+    runs.truncate(items);
     let mut run_values = Vec::with_capacity(runs.len());
+    let (mut steps_shown, mut steps_total) = (0, 0);
     for run in runs {
         let full = store
             .mission_run(&run.subject)?
             .ok_or_else(|| anyhow::anyhow!("run disappeared: {}", run.subject))?;
-        anyhow::ensure!(
-            full.steps.len() <= 200,
-            "missions tree run exceeds 200 steps: {}",
-            full.subject
-        );
+        steps_total += full.steps.len();
+        steps_shown += full.steps.len().min(items);
         run_values.push(json!({
             "id": full.subject, "mission": full.mission, "state": full.status,
-            "steps": full.steps.iter().map(|step| json!({
+            "steps": full.steps.iter().take(items).map(|step| json!({
                 "id": step.subject, "name": step.title.as_deref().unwrap_or(&step.step),
                 "path": step.step, "state": step.status
             })).collect::<Vec<_>>()
@@ -2257,11 +2375,10 @@ fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Va
         })
         .map(|mission| json!({ "id": mission["id"], "title": mission["title"], "state": mission["state"] }))
         .collect::<Vec<_>>();
+    note("steps", steps_shown, steps_total);
     unstarted.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-    anyhow::ensure!(
-        unstarted.len() <= 200,
-        "missions tree exceeds 200 unstarted missions"
-    );
+    note("unstarted_missions", items, unstarted.len());
+    unstarted.truncate(items);
 
     let desired = store
         .desired_subjects()?
@@ -2269,7 +2386,8 @@ fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Va
         .map(|seat| (seat.subject.clone(), seat))
         .collect::<BTreeMap<_, _>>();
     let mut agents = client_agent_resources(store, false, at, index)?;
-    anyhow::ensure!(agents.len() <= 200, "missions tree exceeds 200 agents");
+    note("agents", items, agents.len());
+    agents.truncate(items);
     for agent in &mut agents {
         let Some(id) = agent["id"].as_str() else {
             continue;
@@ -2297,7 +2415,7 @@ fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Va
         });
     }
     let mut queues = Vec::new();
-    let mut queued_runs = 0;
+    let (mut queued_runs, mut queues_total) = (0, 0);
     for agent in &agents {
         if agent["seat_kind"] != "standing" {
             continue;
@@ -2305,21 +2423,23 @@ fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Va
         let Some(id) = agent["id"].as_str() else {
             continue;
         };
+        queues_total += 1;
+        if queued_runs >= queued_limit {
+            continue;
+        }
         let queue = store.seat_queue(id)?;
         queued_runs += queue.runs.len();
-        anyhow::ensure!(
-            queued_runs <= 1000,
-            "missions tree exceeds 1000 queued runs"
-        );
         queues.push(agent_queue_value(&queue));
     }
+    note("standing_queues", queues.len(), queues_total);
     let lanes = store
         .lanes(false)?
         .iter()
         .map(lane_resource)
         .collect::<Vec<_>>();
     Ok(json!({ "runs": run_values, "standing_queues": queues,
-        "unstarted_missions": unstarted, "agents": agents, "lanes": lanes }))
+        "unstarted_missions": unstarted, "agents": agents, "lanes": lanes,
+        "truncated": truncated }))
 }
 
 pub(super) async fn mission_detail(
@@ -7830,6 +7950,165 @@ mission "example/looped" state="ready" {
             .find(|value| value["id"] == "mission/example/looped")
             .unwrap();
         assert_eq!(retired["state"], "retired");
+    }
+
+    /// A mission's detail reads only its own runs, seats and states, and says what the whole
+    /// history says about them.
+    #[test]
+    fn a_mission_detail_matches_the_mission_history() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "detail-node");
+        for mission in ["example/detail", "example/neighbor"] {
+            let source = format!(
+                "version 2\nmission \"{mission}\" state=\"ready\" {{\n  goal \"Finish.\"\n  concurrent-runs max=10\n  step \"do\" {{ assigned-to \"agent/doer\" }}\n}}\n"
+            );
+            let intent = crate::graph::parse_intent(&source, "detail-node").unwrap();
+            let preview = state
+                .store
+                .mission(
+                    &intent,
+                    crate::model::IntentInput {
+                        kdl: source.clone(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            state
+                .store
+                .apply_as(
+                    &intent,
+                    &preview.subject_tokens,
+                    &format!("publish-{mission}"),
+                    Some("person/operator"),
+                )
+                .unwrap();
+            for run in 0..2 {
+                let view = state
+                    .store
+                    .create_mission_run(&crate::model::MissionRunRequest {
+                        mission: mission.into(),
+                        revision: None,
+                        workspace: root.path().display().to_string(),
+                        requester: Some("person/operator".into()),
+                        mode: None,
+                        inputs: BTreeMap::new(),
+                        idempotency_key: format!("{mission}-{run}"),
+                    })
+                    .unwrap();
+                if run == 0 {
+                    for phase in ["cleanup-completed", "terminal"] {
+                        state
+                            .store
+                            .set_mission_run_state(&view.id, "completed", phase, Some("done"))
+                            .unwrap();
+                    }
+                }
+            }
+        }
+        let index = state.store.index().unwrap();
+        let history = mission_resources(&state.store, index, true, None).unwrap();
+        for mission in ["mission/example/detail", "mission/example/neighbor"] {
+            let listed = history.iter().find(|item| item["id"] == mission).unwrap();
+            let detail = mission_resources(&state.store, index, true, Some(mission)).unwrap();
+            assert_eq!(detail.len(), 1);
+            let detail = &detail[0];
+            for field in [
+                "runs",
+                "state",
+                "must_act",
+                "active_runs",
+                "usage",
+                "revision",
+            ] {
+                assert_eq!(detail[field], listed[field], "{mission} {field}");
+            }
+            let runs = |item: &Value| {
+                item["run_details"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|run| {
+                        json!([
+                            run["id"],
+                            run["status"],
+                            run["state_since"],
+                            run["outcome"],
+                            run["must_act"]
+                        ])
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(runs(detail), runs(listed), "{mission}");
+        }
+    }
+
+    /// Page reads of the operations collection serve the daemon's last diagnostic report, whose
+    /// checks read the whole store, instead of running every check on every read.
+    #[test]
+    fn operations_serve_the_last_diagnostic_report() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "operations-node");
+        let first = operation_checks(&state).unwrap();
+        let second = operation_checks(&state).unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(
+            first
+                .iter()
+                .any(|check| check.name == "operation-projection")
+        );
+        let other = test_state_named(&root.path().join("other"), "operations-other");
+        assert!(!Arc::ptr_eq(&first, &operation_checks(&other).unwrap()));
+    }
+
+    /// A fleet larger than the tree lists shows the first items and says what it left out, rather
+    /// than failing the whole tree.
+    #[test]
+    fn the_missions_tree_lists_a_bounded_part_of_a_large_fleet() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "tree-node");
+        for mission in ["example/first", "example/second", "example/third"] {
+            let source = format!(
+                "version 2\nmission \"{mission}\" state=\"ready\" {{\n  goal \"Wait to start.\"\n}}\n"
+            );
+            let intent = crate::graph::parse_intent(&source, "tree-node").unwrap();
+            let preview = state
+                .store
+                .mission(
+                    &intent,
+                    crate::model::IntentInput {
+                        kdl: source.clone(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            state
+                .store
+                .apply_as(
+                    &intent,
+                    &preview.subject_tokens,
+                    &format!("publish-{mission}"),
+                    Some("person/operator"),
+                )
+                .unwrap();
+        }
+        let index = state.store.index().unwrap();
+        let whole = missions_tree_value(&state.store, "now", index).unwrap();
+        assert_eq!(whole["unstarted_missions"].as_array().unwrap().len(), 3);
+        assert_eq!(whole["truncated"], json!({}));
+        let bounded = missions_tree_value_within(&state.store, "now", index, 2, 1000).unwrap();
+        assert_eq!(
+            bounded["unstarted_missions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|mission| mission["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["mission/example/first", "mission/example/second"]
+        );
+        assert_eq!(
+            bounded["truncated"],
+            json!({"unstarted_missions": {"shown": 2, "total": 3}})
+        );
     }
 
     #[test]

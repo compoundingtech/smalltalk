@@ -1335,7 +1335,39 @@ fn client_work_resources(
                 .then_with(|| left.subject.cmp(&right.subject))
         });
     }
-    let desired = store.desired_subjects()?;
+    // Only the seats these steps own, not every subject the fleet has ever declared.
+    let desired = store.desired_subjects_for_owner_steps(
+        &work
+            .iter()
+            .map(|step| step.subject.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    client_work_values(store, work, &desired, snapshot_index)
+}
+
+/// One work item, read and rendered alone. Rendering the whole history to pick one item
+/// enriched every step the store had ever run: seconds on a busy host's store.
+fn client_work_item(
+    store: &Store,
+    id: &str,
+    actor: Option<&str>,
+    snapshot_unix_ms: u128,
+    snapshot_index: u64,
+) -> anyhow::Result<Option<Value>> {
+    let Some(work) = store.client_work_item_at_snapshot(id, actor, snapshot_unix_ms)? else {
+        return Ok(None);
+    };
+    let desired = store.desired_subjects_for_owner_step(&work.subject)?;
+    Ok(client_work_values(store, vec![work], &desired, snapshot_index)?.pop())
+}
+
+/// Client resources for `work`, with the usage of the seats in `desired` that its steps own.
+fn client_work_values(
+    store: &Store,
+    work: Vec<crate::model::StepRunView>,
+    desired: &[crate::model::DesiredSubject],
+    snapshot_index: u64,
+) -> anyhow::Result<Vec<Value>> {
     let work_subjects = work
         .iter()
         .map(|step| step.subject.as_str())
@@ -1351,7 +1383,7 @@ fn client_work_resources(
         .collect::<Vec<_>>();
     let usage_summaries = store.usage_summaries_at(&usage_subjects, Some(snapshot_index))?;
     let mut usage_by_step = BTreeMap::<&str, Vec<&crate::model::UsageSummary>>::new();
-    for seat in &desired {
+    for seat in desired {
         if let (Some(step), Some(usage)) = (
             seat.owner_step.as_deref(),
             usage_summaries.get(&seat.subject),
@@ -2445,12 +2477,16 @@ fn client_message_resources(
     history: bool,
     peer: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
-    let current_ids = store
-        .operational_messages(person, false)?
-        .into_iter()
-        .map(|message| message.subject)
+    let current = store.operational_messages(person, false)?;
+    let current_ids = current
+        .iter()
+        .map(|message| message.subject.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    let messages = store.operational_messages(person, history)?;
+    let messages = if history {
+        store.operational_messages(person, true)?
+    } else {
+        current
+    };
     let mut resources = Vec::new();
     for message in messages {
         if peer.is_some_and(|peer| message.from != peer && message.to != peer) {
@@ -3109,18 +3145,26 @@ async fn client_work_detail(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    client_detail(
-        client_work_resources(
-            &state.store,
-            query.actor.as_deref(),
-            true,
-            client_snapshot_time(&snapshot),
+    let store = state.store.clone();
+    let actor = query.actor.clone();
+    let snapshot_unix_ms = client_snapshot_time(&snapshot);
+    let requested = id.clone();
+    let item = blocking_store(move || {
+        client_work_item(
+            &store,
+            &requested,
+            actor.as_deref(),
+            snapshot_unix_ms,
             snapshot.store_index,
         )
-        .map_err(ApiError::internal)?,
-        "work",
-        &id,
-    )
+    })
+    .await?;
+    item.map(Json).ok_or_else(|| {
+        ApiError::not_found(format!(
+            "work `{}` does not exist",
+            client_detail_id("work", &id)
+        ))
+    })
 }
 
 async fn client_agents(
@@ -8123,12 +8167,12 @@ async fn post_message_claim(
             )));
         }
     };
+    // One message, not every message the store has ever held: a lifecycle post read and folded
+    // the whole mailbox, a quarter second on a busy host's store, while holding up the next write.
     let message = state
         .store
-        .messages(None, true)
+        .message(&subject)
         .map_err(ApiError::internal)?
-        .into_iter()
-        .find(|message| message.subject == subject)
         .ok_or_else(|| ApiError::not_found(format!("message `{subject}` does not exist")))?;
     let actor = request.actor.ok_or_else(|| {
         ApiError::bad(St3Error::new(
@@ -8942,10 +8986,22 @@ async fn list_work(
 ) -> Result<Json<Vec<StepRunView>>, ApiError> {
     let store = state.store.clone();
     let (mut work, desired) = blocking_store(move || {
-        Ok((
-            store.work(query.actor.as_deref(), query.include_terminal)?,
-            store.desired_subjects()?,
-        ))
+        let work = store.work(query.actor.as_deref(), query.include_terminal)?;
+        // Only the agents these steps name, not every subject the fleet has ever declared.
+        let actors = work
+            .iter()
+            .flat_map(|step| {
+                step.claimant
+                    .iter()
+                    .chain(step.assigned_to.iter())
+                    .chain(step.available_to.iter())
+                    .cloned()
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let desired = store.desired_subjects_named(&actors)?;
+        Ok((work, desired))
     })
     .await?;
     let agents = desired
@@ -9030,10 +9086,8 @@ async fn wake_work(
     {
         let message = state
             .store
-            .messages(None, true)
+            .message(&existing.subject)
             .map_err(ApiError::internal)?
-            .into_iter()
-            .find(|message| message.subject == existing.subject)
             .ok_or_else(|| ApiError::internal("the wake operation message is unavailable"))?;
         return Ok(Json(message));
     }
@@ -13625,6 +13679,85 @@ mission "visible-agentless" state="ready" {
             )
             .unwrap()
             .is_empty()
+        );
+    }
+
+    /// A work item is the resource the work history lists for it, read without enriching every
+    /// other step the store has run.
+    #[test]
+    fn a_work_item_reads_only_its_own_step() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let state = state(root.path());
+        let kdl = r#"version 2
+mission "many-runs" state="ready" {
+  goal "Run often."
+  concurrent-runs max=100
+  step "build" { assigned-to "agent/builder" }
+  step "watch" { agentless }
+}"#;
+        let intent = parse_intent(kdl, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "many-runs")
+            .unwrap();
+        for run in 0..8 {
+            state
+                .store
+                .create_mission_run(&MissionRunRequest {
+                    mission: "many-runs".into(),
+                    revision: None,
+                    workspace: workspace.display().to_string(),
+                    requester: Some("person/operator".into()),
+                    mode: None,
+                    inputs: BTreeMap::new(),
+                    idempotency_key: format!("many-runs-{run}"),
+                })
+                .unwrap();
+        }
+        let (now, index) = (client_now_ms(), state.store.index().unwrap());
+        let history = client_work_resources(&state.store, None, true, now, index).unwrap();
+        assert_eq!(history.len(), 16);
+        for item in &history {
+            let id = item["id"].as_str().unwrap();
+            let detail = client_work_item(&state.store, id, None, now, index)
+                .unwrap()
+                .unwrap();
+            assert_eq!(&detail, item, "{id}");
+        }
+        let id = history[0]["id"].as_str().unwrap();
+        crate::store::STEPS_ENRICHED.with(|enriched| enriched.set(0));
+        client_work_item(&state.store, id, None, now, index).unwrap();
+        assert_eq!(crate::store::STEPS_ENRICHED.with(std::cell::Cell::get), 1);
+        let (assigned, assignee) = history
+            .iter()
+            .find_map(|item| Some((item["id"].as_str()?, item["assigned_to"].as_str()?)))
+            .unwrap();
+        assert!(
+            client_work_item(&state.store, assigned, Some("agent/other"), now, index)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            client_work_item(&state.store, assigned, Some(assignee), now, index)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            client_work_item(&state.store, "step-run/none/build", None, now, index)
+                .unwrap()
+                .is_none()
         );
     }
 
