@@ -5684,7 +5684,12 @@ async fn wait_for_condition(
     condition: &str,
     actor: Option<&str>,
 ) -> Result<Value> {
-    let mut cursor = 0;
+    // Capture the current index before checking the condition. A change made during the
+    // check is then still visible to the event wait, without reading all prior events.
+    let health: Value = client.get("/v1/health").await?;
+    let mut cursor = health["store_index"]
+        .as_u64()
+        .context("the daemon health response has no store index")?;
     loop {
         if let Some(value) = condition_value(client, subject, condition).await? {
             return Ok(value);
@@ -11945,6 +11950,81 @@ mod tests {
                 .collect::<Vec<_>>(),
             indexes[3..5]
         );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn trace_wait_starts_after_existing_events() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("st3.sock");
+        let store = Arc::new(Store::open_memory("wait-cursor-test").unwrap());
+        let mut last_index = 0;
+        for number in 0..3 {
+            last_index = store
+                .append_claim(&ClaimInput {
+                    subject: "host/wait-cursor-test".into(),
+                    kind: "transport.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("wait-cursor-test-{number}")),
+                })
+                .unwrap()
+                .store_index;
+        }
+        let state = AppState {
+            store,
+            notify: Arc::new(Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: "wait-cursor-test".into(),
+            state_dir: root.path().to_path_buf(),
+            pty_root: root.path().join("pty"),
+            pty_binary: PathBuf::from("pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: PlannerSpec::default(),
+        };
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let app = router(state).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let sent = sent.clone();
+                async move {
+                    if request.uri().path() == "/v1/events" {
+                        let _ = sent.send(request.uri().query().unwrap_or_default().to_owned());
+                    }
+                    next.run(request).await
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            serve_unix(&socket, app).await.unwrap();
+        });
+        let path = root.path().join("st3.sock");
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let client = Client::unix(&path);
+        let waiter = tokio::spawn(async move {
+            wait_for_condition(&client, "host/wait-cursor-test", "completed", None).await
+        });
+        let query = tokio::time::timeout(Duration::from_secs(2), received.recv())
+            .await
+            .expect("the wait did not request events")
+            .expect("the server stopped before the event request");
+        let after = query
+            .split('&')
+            .find_map(|part| part.strip_prefix("after="))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(after >= last_index, "the wait replayed existing events: {query}");
+        waiter.abort();
         server.abort();
     }
 
