@@ -38,7 +38,7 @@ use st3::reconcile::Reconciler;
 use st3::store::Store;
 use st3_client::{
     API_VERSION as CLIENT_V0_API_VERSION, Client as GeneratedClient,
-    ClientError as GeneratedClientError, Envelope as ClientEnvelope,
+    ClientError as GeneratedClientError, Envelope as ClientEnvelope, ErrorCode as ClientErrorCode,
     EventPage as ClientEventPage, EventType as ClientEventType, Fence as ClientFence,
     Page as ClientPage, PairingBegin, Resource as ClientResource,
     TargetParameters as ClientTargetParameters, TerminalInputMode as ClientTerminalInputMode,
