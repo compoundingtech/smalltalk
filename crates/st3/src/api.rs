@@ -195,7 +195,10 @@ impl ApiError {
             | "stale-incarnation"
             | "stale-launch-preview"
             | "fleet-leaving" => StatusCode::CONFLICT,
-            "launch-review-not-authorized" | "wrong-message-recipient" => StatusCode::FORBIDDEN,
+            "launch-review-not-authorized" | "wrong-message-recipient" | "lane-approval-denied" => {
+                StatusCode::FORBIDDEN
+            }
+            "lane-not-found" => StatusCode::NOT_FOUND,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
@@ -289,6 +292,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/agents", get(client_agents))
         .route("/v1/client/agents/{*id}", get(client_agents_detail))
         .route("/v1/client/agent-queues/{*id}", get(client_v0::agent_queue))
+        .route("/v1/client/lanes", get(client_v0::lanes))
+        .route("/v1/client/lanes/{*id}", get(client_v0::lane_detail))
         .route("/v1/client/history", get(client_history))
         .route("/v1/client/history/{*id}", get(client_history_detail))
         .route("/v1/client/sessions", get(client_sessions))
@@ -482,6 +487,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/work/{action}/{*subject}", post(post_work_action))
         .route("/v1/gate-results", post(post_gate_result))
         .route("/v1/agent-queue-moves", post(move_agent_queue))
+        .route("/v1/lanes", get(list_lanes))
+        .route("/v1/lanes/{*lane}", get(get_lane))
+        .route("/v1/lane-changes", post(change_lane))
         .route("/v1/sessions", get(list_sessions))
         .route("/v1/sessions/{subject}/context/clear", post(clear_context))
         .route("/v1/sessions/{subject}/signal", post(signal_session))
@@ -776,12 +784,27 @@ fn client_error_code(code: Option<&str>) -> String {
         | "runtime-authority-indeterminate"
         | "remote-unavailable"
         | "internal" => code.unwrap_or("internal").to_owned(),
-        "launch-review-not-authorized" | "wrong-message-recipient" => "forbidden".into(),
+        "launch-review-not-authorized" | "wrong-message-recipient" | "lane-approval-denied" => {
+            "forbidden".into()
+        }
+        "lane-not-found" => "not-found".into(),
         "run-not-queued"
         | "missing-queue-anchor"
         | "unexpected-queue-anchor"
         | "invalid-queue-anchor"
-        | "invalid-queue-placement" => "validation-failed".into(),
+        | "invalid-queue-placement"
+        | "ambiguous-lane"
+        | "lane-closed"
+        | "entry-not-in-lane"
+        | "invalid-lane-actor"
+        | "invalid-lane-entry"
+        | "invalid-lane-outcome"
+        | "invalid-lane-placement"
+        | "missing-lane-anchor"
+        | "unexpected-lane-anchor"
+        | "invalid-lane-anchor"
+        | "invalid-lane-state"
+        | "invalid-lane-change" => "validation-failed".into(),
         _ => "internal".into(),
     }
 }
@@ -3480,6 +3503,7 @@ async fn guard_bound_request(
     if ![
         "/v1/intent/apply",
         "/v1/agent-queue-moves",
+        "/v1/lane-changes",
         "/v1/work/",
         "/v1/attention",
         "/v1/launches",
@@ -8768,6 +8792,68 @@ async fn move_agent_queue(
     let claim = blocking_action(move || store.move_seat_queue_run(&request)).await?;
     signal_changed(&state);
     Ok(Json(claim))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct LaneListQuery {
+    #[serde(default)]
+    all: bool,
+    #[serde(default)]
+    run: Option<String>,
+}
+
+/// Every open lane, every declared lane with `?all=true`, or the lanes of one `?run=`.
+async fn list_lanes(
+    State(state): State<AppState>,
+    Query(query): Query<LaneListQuery>,
+) -> Result<Json<Vec<crate::model::LaneView>>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || match query.run.as_deref() {
+        Some(run) => store.lanes_for_run(run),
+        None => store.lanes(query.all),
+    })
+    .await
+    .map(Json)
+}
+
+/// One lane by subject, `RUN/NAME`, run, mission, or unique name.
+async fn get_lane(
+    State(state): State<AppState>,
+    AxumPath(lane): AxumPath<String>,
+) -> Result<Json<crate::model::LaneView>, ApiError> {
+    let store = state.store.clone();
+    blocking_action(move || {
+        let subject = store.resolve_lane(&lane)?;
+        store
+            .lane(&subject)
+            .map_err(|error| St3Error::new("internal", error.to_string()))?
+            .ok_or_else(|| St3Error::new("lane-not-found", format!("no lane `{subject}`")))
+    })
+    .await
+    .map(Json)
+}
+
+/// Join, leave, move, mark, or approve one lane entry as a person or an agent. A harness can
+/// only act as its own seat; `guard_bound_request` checks that before this runs.
+async fn change_lane(
+    State(state): State<AppState>,
+    Json(mut request): Json<crate::model::LaneChangeRequest>,
+) -> Result<Json<crate::model::LaneChangeResponse>, ApiError> {
+    request.actor = match request.actor.trim() {
+        actor if actor.starts_with("person/") => actor.to_owned(),
+        actor => normalized_agent_actor(actor).ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "invalid-lane-actor",
+                "a lane change needs a person or agent actor",
+            ))
+        })?,
+    };
+    let store = state.store.clone();
+    let response = blocking_action(move || store.change_lane(&request)).await?;
+    if response.claim.is_some() {
+        signal_changed(&state);
+    }
+    Ok(Json(response))
 }
 
 fn normalized_agent_actor(actor: &str) -> Option<String> {
