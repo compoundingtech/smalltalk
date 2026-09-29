@@ -1,4 +1,4 @@
-mod support;
+use crate::support;
 
 use std::ffi::CString;
 use std::fs;
