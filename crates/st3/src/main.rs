@@ -2193,6 +2193,16 @@ enum CheckpointCommand {
         #[arg(long = "as")]
         actor: Option<String>,
     },
+    /// Go on with checkpoints after a trim stopped because deleting would change the graph.
+    /// The rows stay as they are; the next checkpoint proceeds.
+    Resume {
+        /// What the person found.
+        #[arg(long)]
+        reason: String,
+        /// The person resuming.
+        #[arg(long = "as")]
+        actor: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -7160,6 +7170,19 @@ async fn run_replication(
                 client.post("/v1/checkpoint/excuse", &request).await?;
             print_value(&claim, json_output)
         }
+        ReplicationCommand::Checkpoint {
+            command: CheckpointCommand::Resume { reason, actor },
+        } => {
+            let actor = fleet_person(actor, config)?;
+            let request = st3::store::CheckpointResumeRequest { reason, actor };
+            let status: st3::store::CheckpointStatusView =
+                client.post("/v1/checkpoint/resume", &request).await?;
+            if json_output {
+                return print_value(&status, true);
+            }
+            print!("{}", render_checkpoint_status(&status));
+            Ok(())
+        }
     }
 }
 
@@ -7179,6 +7202,16 @@ fn render_checkpoint_status(status: &st3::store::CheckpointStatusView) -> String
             stable.terms.participants.len()
         )),
         None => output.push_str("stable        none\n"),
+    }
+    output.push_str(&format!(
+        "trimmed       {}\n",
+        status.trimmed.as_deref().unwrap_or("none")
+    ));
+    if status.halted {
+        output.push_str(
+            "halted        a trim found the graph would change; see daemon diagnostics, then \
+             `st replication checkpoint resume`\n",
+        );
     }
     output.push_str(&format!("participants  {}\n", names(&status.participants)));
     if !status.excused.is_empty() {

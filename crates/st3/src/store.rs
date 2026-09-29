@@ -5,7 +5,7 @@ use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -44,6 +44,7 @@ use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
 mod checkpoint;
 mod checkpoint_agreement;
+mod checkpoint_trim;
 #[cfg(test)]
 mod convergence;
 mod heal;
@@ -60,10 +61,11 @@ use checkpoint_agreement::write_time;
 pub use checkpoint_agreement::{
     CHECKPOINT_ATTENTION_AFTER_MS, CHECKPOINT_EXCUSED, CHECKPOINT_PROTOCOL, CHECKPOINT_SEALED,
     CHECKPOINT_VERIFIED, Certificate, CheckpointAction, CheckpointClaim, CheckpointContext,
-    CheckpointExcuseRequest, CheckpointStatusView, PendingCheckpointView, SealTerms, VerifiedTerms,
-    certificates, checkpoint_build, excused_writers, first_verifications, newest_seals,
-    participants as checkpoint_participants, stable_checkpoints,
+    CheckpointExcuseRequest, CheckpointResumeRequest, CheckpointStatusView, PendingCheckpointView,
+    SealTerms, VerifiedTerms, certificates, checkpoint_build, chosen_certificate, excused_writers,
+    first_verifications, newest_seals, participants as checkpoint_participants, stable_checkpoints,
 };
+pub use checkpoint_trim::{CheckpointManifestNeed, TRIM_CHUNK_ENVELOPES, TrimFault};
 
 type StepStateRow = (String, bool, u32, String, String, String, String, String);
 type StepRetryRow = (String, u32, bool, String, String, String, String, String);
@@ -597,7 +599,7 @@ PRAGMA user_version = 13;
 
 /// The writer connection's clock offset. Only a simulation sets it; see `write_time`.
 const WRITE_CLOCK: &str =
-    "CREATE TEMP TABLE IF NOT EXISTS write_clock(offset_ms INTEGER NOT NULL);";
+    "CREATE TEMP TABLE IF NOT EXISTS write_clock(offset_ms INTEGER NOT NULL, at_ms INTEGER);";
 
 const READ_CONNECTIONS: usize = 4;
 
@@ -925,6 +927,10 @@ pub struct Store {
     /// opens its own connection here to copy the store.
     path: PathBuf,
     shared_memory: bool,
+    /// Where the next trim stops, as a crash would, and how many envelopes it deletes per
+    /// transaction. Only tests change them.
+    trim_fault: Mutex<Option<checkpoint_trim::TrimFault>>,
+    trim_chunk_envelopes: AtomicUsize,
 }
 
 const MESSAGE_CACHE_LIMIT: usize = 4096;
@@ -1328,7 +1334,9 @@ impl CompactReplicationInventory {
         }
     }
 
-    /// Insert one identity in order. The digest is left for the caller to recompute.
+    /// Insert one identity in order. An identity already held as a tombstone gets its payload
+    /// back instead, as `full_compact_replication_inventory` reads a held and tombstoned one.
+    /// The digest is left for the caller to recompute.
     fn insert(&mut self, identity: ReplicaEnvelopeId) {
         let writer = match self.writers.binary_search(&identity.writer) {
             Ok(writer) => writer,
@@ -1343,11 +1351,20 @@ impl CompactReplicationInventory {
             }
         };
         let envelope = self.compact(writer as u32, identity);
-        let position = self
+        match self
             .envelopes
             .binary_search_by(|probe| self.order(probe, &envelope))
-            .unwrap_or_else(|at| at);
-        self.envelopes.insert(position, envelope);
+        {
+            Ok(_) if envelope.irregular == 0 => {
+                self.payloadless.remove(&envelope.hash);
+            }
+            Ok(_) => {
+                let identity = self.identity(&envelope);
+                self.payloadless_irregular.remove(&identity);
+                self.irregular_hashes.pop();
+            }
+            Err(position) => self.envelopes.insert(position, envelope),
+        }
     }
 
     fn order(&self, left: &CompactEnvelopeId, right: &CompactEnvelopeId) -> std::cmp::Ordering {
@@ -1397,6 +1414,7 @@ impl CompactReplicationInventory {
             envelopes: self.identities(&self.envelopes),
             buckets: Vec::new(),
             accepts: None,
+            checkpoint: None,
         }
     }
 
@@ -1997,6 +2015,8 @@ impl Store {
             origin,
             path: path.to_path_buf(),
             shared_memory: false,
+            trim_fault: Mutex::new(None),
+            trim_chunk_envelopes: AtomicUsize::new(checkpoint_trim::TRIM_CHUNK_ENVELOPES),
         })
     }
 
@@ -2053,6 +2073,8 @@ impl Store {
             origin,
             path: uri,
             shared_memory: true,
+            trim_fault: Mutex::new(None),
+            trim_chunk_envelopes: AtomicUsize::new(checkpoint_trim::TRIM_CHUNK_ENVELOPES),
         })
     }
 
@@ -7279,7 +7301,7 @@ impl Store {
             transaction.commit().map_err(internal)?;
             return Ok(response);
         }
-        let now = write_time(&transaction).map_err(internal)?;
+        let now = write_time(&transaction, &self.origin).map_err(internal)?;
         let sequence = next_replica_sequence(&transaction, &self.origin).map_err(internal)?;
         let previous_hash = previous_batch_hash(&transaction, &self.origin).map_err(internal)?;
         let batch_hash = batch_header_hash(&self.origin, sequence, previous_hash.as_deref(), now)
@@ -10668,7 +10690,7 @@ impl Store {
                 message_subjects: Vec::new(),
             });
         }
-        let now = write_time(&transaction).map_err(internal)?;
+        let now = write_time(&transaction, &self.origin).map_err(internal)?;
         let sequence = next_replica_sequence(&transaction, &self.origin).map_err(internal)?;
         let previous_hash = previous_batch_hash(&transaction, &self.origin).map_err(internal)?;
         let batch_hash = batch_header_hash(&self.origin, sequence, previous_hash.as_deref(), now)
@@ -12559,6 +12581,7 @@ impl Store {
                 envelopes: Vec::new(),
                 buckets: snapshot.buckets.clone(),
                 accepts: Some(REPLICATION_PAGE_LIMIT),
+                checkpoint: self.trimmed_checkpoint()?,
             },
             envelopes: Vec::new(),
             signature_requests,
@@ -12616,6 +12639,7 @@ impl Store {
                     envelopes: listed,
                     buckets: snapshot.buckets.clone(),
                     accepts: Some(REPLICATION_PAGE_LIMIT),
+                    checkpoint: self.trimmed_checkpoint()?,
                 },
                 envelopes: self.replica_envelopes(missing)?,
                 signature_requests: Vec::new(),
@@ -12653,6 +12677,7 @@ impl Store {
             graph_digest: snapshot.graph_digest.clone(),
             inventory: ReplicationInventory {
                 accepts: Some(REPLICATION_PAGE_LIMIT),
+                checkpoint: self.trimmed_checkpoint()?,
                 ..if same {
                     ReplicationInventory {
                         digest: snapshot.inventory.digest.clone(),
@@ -12901,6 +12926,7 @@ impl Store {
                 envelopes: Vec::new(),
                 buckets: Vec::new(),
                 accepts: None,
+                checkpoint: None,
             },
             heal,
         })
@@ -17425,7 +17451,7 @@ fn append_claim_tx(
         &claim_spec.cardinality,
     )
     .map_err(anyhow::Error::new)?;
-    let now = write_time(transaction)?;
+    let now = write_time(transaction, origin)?;
     let batch_id = if let Some(batch) = forced_batch {
         batch.to_owned()
     } else {
@@ -17686,12 +17712,15 @@ fn selected_actual_source_at(
     desired_host: Option<&str>,
 ) -> Result<(Option<String>, Option<String>, bool)> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
-    let mut statement = connection.prepare(
-        "SELECT id, kind, origin, predecessors,
-                CASE WHEN kind='runtime.observed' THEN body END FROM claims
-         WHERE subject=?1 AND store_index<=?2
-         ORDER BY store_index",
-    )?;
+    // Canonical order, not arrival order, so every node holding these claims selects the same
+    // source.
+    let mut statement = connection.prepare(&format!(
+        "SELECT claims.id, claims.kind, claims.origin, claims.predecessors,
+                CASE WHEN claims.kind='runtime.observed' THEN claims.body END
+         FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.store_index<=?2
+         ORDER BY {CANONICAL_ORDER}"
+    ))?;
     let rows = statement
         .query_map(params![subject, at_index], |row| {
             Ok((
@@ -22828,9 +22857,10 @@ fn replication_inventory_difference(
                     })
             })
             .count();
+        // A peer may list an identity twice, so neither count may go below zero.
         return Some((
-            (remote.envelopes.len() - shared) as u64,
-            (inventory.envelopes.len() - shared) as u64,
+            remote.envelopes.len().saturating_sub(shared) as u64,
+            inventory.envelopes.len().saturating_sub(shared) as u64,
         ));
     }
     None
@@ -23286,6 +23316,38 @@ fn compact_replication_inventory_matches_its_public_identities() {
     }
 }
 
+/// An envelope a node holds again after a checkpoint dropped it is listed once, with its
+/// payload, whether the inventory was read whole or extended by the new envelope.
+#[cfg(test)]
+#[test]
+fn a_tombstoned_identity_held_again_is_listed_once() {
+    let mut identities = test_envelope_ids("hetz-like", [1, 2], "a");
+    identities.push(ReplicaEnvelopeId {
+        writer: "hetz-like".into(),
+        sequence: 3,
+        hash: "not-a-hash".into(),
+    });
+    let mut inventory = CompactReplicationInventory::default();
+    for identity in &identities {
+        inventory.push_sorted(identity.clone());
+        inventory.mark_last_payloadless();
+    }
+    for identity in &identities {
+        inventory.insert(identity.clone());
+    }
+    inventory.refresh_digest();
+
+    assert_eq!(inventory.public().envelopes, identities);
+    assert_eq!(inventory.digest, replication_inventory_digest(&identities));
+    assert!(
+        inventory
+            .envelopes
+            .iter()
+            .all(|envelope| inventory.has_payload(envelope))
+    );
+    assert_eq!(inventory.irregular_hashes.len(), 1);
+}
+
 #[cfg(test)]
 #[test]
 fn a_malformed_peer_hash_does_not_stop_replication() {
@@ -23372,6 +23434,7 @@ impl TestReplica {
             envelopes: Vec::new(),
             buckets,
             accepts: None,
+            checkpoint: None,
         }
     }
 
@@ -23399,6 +23462,7 @@ impl TestReplica {
             envelopes: listed,
             buckets,
             accepts: None,
+            checkpoint: None,
         };
         (missing, inventory)
     }
@@ -23460,6 +23524,7 @@ fn compact_replication_exchange_lists_only_ranges_that_differ() {
         envelopes: left.0.iter().cloned().collect(),
         buckets: Vec::new(),
         accepts: None,
+        checkpoint: None,
     })
     .unwrap()
     .len();
@@ -23563,6 +23628,7 @@ fn compact_replication_exchange_waits_for_a_complete_listing() {
         envelopes: test_envelope_ids("origin", 1..=8, "a"),
         buckets: peer.summary().buckets,
         accepts: None,
+        checkpoint: None,
     };
     let (missing, _) = compact_replication_difference(&inventory, &buckets, &listing, limit);
     assert_eq!(missing, test_envelope_ids("origin", 9..=10, "a"));
@@ -29775,6 +29841,82 @@ mod tests {
         assert!(operation_tx(&connection, "op/existing").unwrap().is_some());
     }
 
+    /// A full replay projects each claim in its own savepoint and quarantines one it cannot
+    /// project. Once the transaction has changed the schema, as a checkpoint proof's does with
+    /// its temporary tables, SQLite aborts every open read when a savepoint rolls back. The
+    /// replay must not be reading then, or one malformed claim fails every proof on that node.
+    #[test]
+    fn a_replay_quarantines_claims_it_cannot_project_and_projects_the_rest() {
+        const FLEET: &str = "5e3c1a9b-2d4f-4b6e-8a7c-0f1e2d3c4b5a";
+        let source = Store::open_memory("source").unwrap();
+        for n in 0..3 {
+            source
+                .append_claim(&ClaimInput {
+                    subject: format!("mission-run/broken-{n}"),
+                    kind: "mission-run.created".into(),
+                    actor: None,
+                    fields: BTreeMap::new(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("broken-{n}")),
+                })
+                .unwrap();
+        }
+        let later = source
+            .append_claim(&ClaimInput {
+                subject: "daemon/source".into(),
+                kind: "daemon.started".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), json!("running"))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("started".into()),
+            })
+            .unwrap();
+        source.bind_fleet(FLEET).unwrap();
+        let target = Store::open_memory("target").unwrap();
+        target.bind_fleet(FLEET).unwrap();
+        let exchange = source
+            .export_replication_exchange(FLEET, &target.replication_inventory().unwrap())
+            .unwrap();
+        target
+            .receive_replication_exchange("source", FLEET, &exchange)
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        target.project_replication_backlog().unwrap();
+        let connection = target.readers.get();
+        let quarantined: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM projection_health
+                 WHERE aggregate LIKE 'projection:runs:%' AND status='stale'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined, 3);
+        let healthy: String = connection
+            .query_row(
+                "SELECT status FROM projection_health WHERE aggregate='graph'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(healthy, "healthy");
+        assert!(
+            target
+                .latest_claim("daemon/source", Some("daemon.started"))
+                .unwrap()
+                .is_some_and(|claim| claim.id == later.id)
+        );
+        drop(connection);
+        // The proof replays the same claims after creating its temporary tables.
+        let scratch = tempfile::tempdir().unwrap();
+        let (_, _, proof) = target
+            .plan_checkpoint_through(now_ms() + 1_000, None, scratch.path())
+            .unwrap();
+        assert!(proof.passed, "{proof:?}");
+    }
+
     /// A panic while the writer is held leaves no half-written transaction behind, so it must not
     /// turn every later write into a panic while the daemon keeps running.
     #[test]
@@ -33675,6 +33817,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                 }],
                 buckets: Vec::new(),
                 accepts: None,
+                checkpoint: None,
             },
             envelopes: vec![candidate],
             signature_requests: Vec::new(),
@@ -33747,6 +33890,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                     .collect(),
                 buckets: Vec::new(),
                 accepts: None,
+                checkpoint: None,
             },
             envelopes,
             signature_requests: Vec::new(),
@@ -33793,6 +33937,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                     .collect(),
                 buckets: Vec::new(),
                 accepts: None,
+                checkpoint: None,
             },
             envelopes,
             signature_requests: Vec::new(),

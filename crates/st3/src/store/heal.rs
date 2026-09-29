@@ -280,13 +280,23 @@ impl Store {
                         hash: hash.clone(),
                     })
                 };
-                let wanted = peer_claims
-                    .iter()
-                    .filter(|claim| {
-                        !local_keys.contains(&key(claim)) && claim.envelope_hash.is_some()
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>();
+                // A claim a checkpoint dropped here is not missing: its tombstone stands for it,
+                // and fetching it back would undo the trim.
+                let mut dropped_here = 0;
+                let mut wanted = Vec::new();
+                {
+                    let connection = self.readers.get();
+                    for claim in &peer_claims {
+                        if local_keys.contains(&key(claim)) || claim.envelope_hash.is_none() {
+                            continue;
+                        }
+                        if checkpoint::claim_tombstoned(&connection, &claim.claim_id)? {
+                            dropped_here += 1;
+                        } else {
+                            wanted.push(claim.clone());
+                        }
+                    }
+                }
                 let want = wanted
                     .iter()
                     .filter_map(envelope)
@@ -300,13 +310,15 @@ impl Store {
                     .filter_map(envelope)
                     .collect::<BTreeSet<_>>();
                 if want.is_empty() && push.is_empty() {
-                    return self.finish_heal(
-                        peer,
-                        false,
-                        Some(format!(
-                            "the claims {peer} projects changed while this node compared them"
-                        )),
-                    );
+                    let reason = if dropped_here == 0 {
+                        format!("the claims {peer} projects changed while this node compared them")
+                    } else {
+                        format!(
+                            "the only claims {peer} projects that this node lacks are ones a \
+                             checkpoint dropped here"
+                        )
+                    };
+                    return self.finish_heal(peer, false, Some(reason));
                 }
                 let push = self.held_envelopes(push.iter().take(HEAL_ENVELOPE_LIMIT))?;
                 self.heal_session(peer, |session| session.wanted = wanted);
@@ -564,6 +576,16 @@ impl Store {
                     &bytes,
                 );
                 if hash != envelope.hash {
+                    continue;
+                }
+                // A checkpoint dropped this envelope here. Its tombstone already stands for it,
+                // as in an exchange.
+                if checkpoint::envelope_tombstoned(
+                    &transaction,
+                    &envelope.writer,
+                    envelope.sequence,
+                    &envelope.hash,
+                )? {
                     continue;
                 }
                 if let (Some(fleet_id), Some(member_key), Some(signature)) =
