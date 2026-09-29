@@ -17,7 +17,7 @@ def main(binary: str, label: str) -> None:
     subprocess.run(
         [PTY, "run", "-d", "-e", "--id", session,
          "--env", f"ST3_PERSON={actor}", "--env", "TERM=xterm-256color",
-         "--", os.path.abspath(binary)],
+         "--", os.path.abspath(binary), "--old"],
         check=True, capture_output=True, text=True,
     )
     try:

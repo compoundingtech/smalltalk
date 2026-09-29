@@ -1,0 +1,1599 @@
+{
+  "agents": {
+    "state": "ready",
+    "value": [
+      {
+        "activity": "33m",
+        "details": {
+          "claimed": "33m ago",
+          "fault": null,
+          "goal": "Cut over to the new store once a person approves.",
+          "harness_state": "idle, waiting for review",
+          "next": "Move the atlas store › cleanup",
+          "queue": [
+            "Atlas nightly build › build (tonight)"
+          ],
+          "queued": 1,
+          "runtime": "running · incarnation 3",
+          "under": null
+        },
+        "harness": "claude",
+        "host": "harbor",
+        "id": "agent/fleet/atlas/builder",
+        "mission": "mission/fleet/atlas/store-move",
+        "name": "Atlas Builder",
+        "parent": null,
+        "state": "needs_you",
+        "step": "cut-over",
+        "terminal": true,
+        "unmanaged": false,
+        "worktree": "~/src/atlas--store-move"
+      },
+      {
+        "activity": "12m",
+        "details": {
+          "claimed": "12m ago",
+          "fault": null,
+          "goal": "Draft the pricing page and get feedback.",
+          "harness_state": "idle, waiting for feedback",
+          "next": "A new pricing page › publish",
+          "queue": [],
+          "queued": 0,
+          "runtime": "running · incarnation 3",
+          "under": null
+        },
+        "harness": "claude",
+        "host": "harbor",
+        "id": "agent/fleet/docs/writer",
+        "mission": "mission/fleet/site/pricing-page",
+        "name": "Docs Writer",
+        "parent": null,
+        "state": "needs_you",
+        "step": "draft",
+        "terminal": true,
+        "unmanaged": false,
+        "worktree": "~/src/site--pricing"
+      },
+      {
+        "activity": "8m",
+        "details": {
+          "claimed": "1h ago",
+          "fault": "401 Unauthorized: the API key expired at 08:40.",
+          "goal": "Tag this week's release.",
+          "harness_state": "exited 4 times in 10 minutes",
+          "next": "Weekly release › publish",
+          "queue": [],
+          "queued": 0,
+          "runtime": "restarts paused",
+          "under": null
+        },
+        "harness": "codex",
+        "host": "harbor",
+        "id": "agent/fleet/release/captain",
+        "mission": "mission/fleet/release/weekly",
+        "name": "Release Captain",
+        "parent": null,
+        "state": "fault",
+        "step": "tag",
+        "terminal": true,
+        "unmanaged": false,
+        "worktree": "~/src/atlas"
+      },
+      {
+        "activity": "now",
+        "details": {
+          "claimed": "standing",
+          "fault": null,
+          "goal": "Keep Robin's fleet moving; answer questions.",
+          "harness_state": "working",
+          "next": null,
+          "queue": [
+            "Rotate harbor's signing keys › report"
+          ],
+          "queued": 1,
+          "runtime": "running · incarnation 3",
+          "under": null
+        },
+        "harness": "claude",
+        "host": "lark",
+        "id": "agent/fleet/cos",
+        "mission": null,
+        "name": "Chief of Staff",
+        "parent": null,
+        "state": "working",
+        "step": null,
+        "terminal": true,
+        "unmanaged": false,
+        "worktree": null
+      },
+      {
+        "activity": "1m",
+        "details": {
+          "claimed": "4m ago",
+          "fault": null,
+          "goal": "Review pull request #218.",
+          "harness_state": "working",
+          "next": "Review harbor #218 › route",
+          "queue": [],
+          "queued": 0,
+          "runtime": "running · incarnation 3",
+          "under": "Chief of Staff"
+        },
+        "harness": "claude",
+        "host": "harbor",
+        "id": "agent/fleet/harbor/reviewer",
+        "mission": "mission/fleet/harbor/pull-request-review",
+        "name": "Harbor Reviewer",
+        "parent": "agent/fleet/cos",
+        "state": "working",
+        "step": "review",
+        "terminal": true,
+        "unmanaged": false,
+        "worktree": "~/src/harbor--review-218"
+      },
+      {
+        "activity": "19m",
+        "details": {
+          "claimed": null,
+          "fault": null,
+          "goal": null,
+          "harness_state": null,
+          "next": null,
+          "queue": [],
+          "queued": 0,
+          "runtime": null,
+          "under": null
+        },
+        "harness": "omp",
+        "host": "harbor",
+        "id": "agent/fleet/rekey/worker",
+        "mission": "mission/fleet/rekey",
+        "name": "Rekey Worker",
+        "parent": null,
+        "state": "idle",
+        "step": "rotate",
+        "terminal": true,
+        "unmanaged": false,
+        "worktree": "~/src/harbor"
+      },
+      {
+        "activity": "3h",
+        "details": {
+          "claimed": null,
+          "fault": null,
+          "goal": null,
+          "harness_state": null,
+          "next": null,
+          "queue": [],
+          "queued": 0,
+          "runtime": null,
+          "under": null
+        },
+        "harness": "pi",
+        "host": "lark",
+        "id": "agent/fleet/pi/sketcher",
+        "mission": null,
+        "name": "Sketcher",
+        "parent": null,
+        "state": "idle",
+        "step": null,
+        "terminal": true,
+        "unmanaged": false,
+        "worktree": "~/src/sketches"
+      },
+      {
+        "activity": "2d",
+        "details": {
+          "claimed": null,
+          "fault": null,
+          "goal": null,
+          "harness_state": null,
+          "next": null,
+          "queue": [],
+          "queued": 0,
+          "runtime": null,
+          "under": null
+        },
+        "harness": "codex",
+        "host": "harbor",
+        "id": "agent/fleet/atlas/indexer",
+        "mission": null,
+        "name": "Atlas Indexer",
+        "parent": null,
+        "state": "stopped",
+        "step": null,
+        "terminal": false,
+        "unmanaged": false,
+        "worktree": null
+      },
+      {
+        "activity": "1h",
+        "details": {
+          "claimed": null,
+          "fault": null,
+          "goal": null,
+          "harness_state": null,
+          "next": null,
+          "queue": [],
+          "queued": 0,
+          "runtime": null,
+          "under": null
+        },
+        "harness": "claude",
+        "host": "lark",
+        "id": "agent/fleet/planner",
+        "mission": null,
+        "name": "Planner",
+        "parent": null,
+        "state": "needs_you",
+        "step": null,
+        "terminal": true,
+        "unmanaged": false,
+        "worktree": null
+      },
+      {
+        "activity": "5m",
+        "details": {
+          "claimed": null,
+          "fault": null,
+          "goal": null,
+          "harness_state": null,
+          "next": null,
+          "queue": [],
+          "queued": 0,
+          "runtime": null,
+          "under": null
+        },
+        "harness": "codex",
+        "host": "lark",
+        "id": "session/unmanaged-1",
+        "mission": null,
+        "name": "codex in ~/src/scratch",
+        "parent": null,
+        "state": "unknown",
+        "step": null,
+        "terminal": false,
+        "unmanaged": true,
+        "worktree": "~/src/scratch"
+      }
+    ]
+  },
+  "attention": {
+    "state": "ready",
+    "value": [
+      {
+        "actions": [],
+        "age": "33m",
+        "agent": "agent/fleet/atlas/builder",
+        "id": "attention/1",
+        "kind": {
+          "because": "cut-over cannot start until you answer; the old store stays read-only meanwhile",
+          "kind": "review",
+          "look_at": [
+            [
+              "report",
+              "1,204,881 rows on both sides, 0 mismatches"
+            ],
+            [
+              "contract",
+              "42 of 42 public queries return identical results"
+            ],
+            [
+              "rollback",
+              "the old store is frozen and kept for 7 days"
+            ]
+          ],
+          "question": "The row counts agree and the contract check passed. Cut over to the new store?",
+          "step": "cut-over"
+        },
+        "mission": "mission/fleet/atlas/store-move",
+        "raised_by": null,
+        "related": [],
+        "tier": "stopped",
+        "title": "Approve the atlas store cut-over",
+        "waiting": "Atlas Builder on harbor"
+      },
+      {
+        "actions": [],
+        "age": "12m",
+        "agent": "agent/fleet/docs/writer",
+        "id": "attention/2",
+        "kind": {
+          "excerpt": [
+            "# Simple pricing",
+            "",
+            "Start free. Pay when your team grows.",
+            "",
+            "- **Solo** — free forever, one workspace",
+            "- **Team** — $12 per person per month",
+            "- **Company** — talk to us"
+          ],
+          "kind": "feedback",
+          "link": "https://preview.example.com/pricing",
+          "question": "Here is the draft of the pricing page. What should change before it goes live?",
+          "subject": "site/pricing · draft 2"
+        },
+        "mission": "mission/fleet/site/pricing-page",
+        "raised_by": null,
+        "related": [],
+        "tier": "stopped",
+        "title": "Feedback on the new pricing page",
+        "waiting": "Docs Writer on harbor"
+      },
+      {
+        "actions": [],
+        "age": "1h",
+        "agent": "agent/fleet/planner",
+        "id": "attention/3",
+        "kind": {
+          "kind": "launch",
+          "name": "harbor/nightly-audit",
+          "planner": "Planner",
+          "preview": {
+            "state": "ready",
+            "value": {
+              "agents": [
+                {
+                  "harness": "codex",
+                  "host": "harbor",
+                  "name": "Auditor"
+                },
+                {
+                  "harness": "claude",
+                  "host": "harbor",
+                  "name": "Harbor Reviewer"
+                }
+              ],
+              "goals": [
+                "Every night, audit harbor's dependencies for known advisories.",
+                "Open one pull request per fix; never merge without review."
+              ],
+              "name": "harbor/nightly-audit",
+              "steps": [
+                {
+                  "after": [],
+                  "asks_you": false,
+                  "assignee": "Auditor",
+                  "name": "scan"
+                },
+                {
+                  "after": [
+                    "scan"
+                  ],
+                  "asks_you": false,
+                  "assignee": "Auditor",
+                  "name": "fix"
+                },
+                {
+                  "after": [
+                    "fix"
+                  ],
+                  "asks_you": false,
+                  "assignee": "Harbor Reviewer",
+                  "name": "review"
+                },
+                {
+                  "after": [
+                    "review"
+                  ],
+                  "asks_you": true,
+                  "assignee": "you",
+                  "name": "merge"
+                }
+              ],
+              "workspace": "~/src/harbor"
+            }
+          }
+        },
+        "mission": null,
+        "raised_by": null,
+        "related": [],
+        "tier": "today",
+        "title": "Launch harbor/nightly-audit",
+        "waiting": "Planner on lark"
+      },
+      {
+        "actions": [],
+        "age": "8m",
+        "agent": "agent/fleet/release/captain",
+        "id": "attention/4",
+        "kind": {
+          "because": "the weekly release cannot tag until this seat is back",
+          "fix": "Its API key expired at 08:40. Renew the key, then restart the seat.",
+          "kind": "fault",
+          "source": "seat release-captain on harbor",
+          "what": "Release Captain exited 4 times in 10 minutes and st stopped restarting it."
+        },
+        "mission": "mission/fleet/release/weekly",
+        "raised_by": null,
+        "related": [],
+        "tier": "alert",
+        "title": "Release Captain keeps restarting",
+        "waiting": null
+      },
+      {
+        "actions": [],
+        "age": "19m",
+        "agent": "agent/fleet/rekey/worker",
+        "id": "attention/5",
+        "kind": {
+          "changes": [
+            [
+              "+",
+              "step \"audit\" { assigned-to \"Rekey Worker\"; after \"rotate\" }"
+            ],
+            [
+              "~",
+              "step \"report\" { after \"audit\" }   (was: after \"rotate\")"
+            ]
+          ],
+          "kind": "revision",
+          "reason": "A key rotated mid-run last week and nobody noticed. An audit step would catch it."
+        },
+        "mission": "mission/fleet/rekey",
+        "raised_by": null,
+        "related": [],
+        "tier": "today",
+        "title": "Add an audit step to the rekey mission",
+        "waiting": "Rekey Worker on harbor"
+      },
+      {
+        "actions": [],
+        "age": "2h",
+        "agent": "agent/fleet/cos",
+        "id": "attention/6",
+        "kind": {
+          "body": "Usage this week is **up 18%**, almost all from the atlas store move (reruns of the compare step).\n\nNo action needed; it should fall back once the cut-over is done.",
+          "from": "Chief of Staff",
+          "kind": "message"
+        },
+        "mission": null,
+        "raised_by": null,
+        "related": [],
+        "tier": "later",
+        "title": "Weekly usage is up 18%",
+        "waiting": null
+      }
+    ]
+  },
+  "conversations": {
+    "agent/fleet/atlas/builder": {
+      "state": "ready",
+      "value": [
+        {
+          "at": "07:10",
+          "body": {
+            "kind": "event",
+            "value": "step compare ready · atlas/store-move"
+          },
+          "id": "a1"
+        },
+        {
+          "at": "07:10",
+          "body": {
+            "kind": "assistant",
+            "value": "Starting the compare step. I'll count rows on both sides, then run the contract queries against each store."
+          },
+          "id": "a2"
+        },
+        {
+          "at": "07:11",
+          "body": {
+            "kind": "tool",
+            "value": {
+              "output": [
+                "old  1,204,881",
+                "new  1,204,881"
+              ],
+              "state": "ok",
+              "title": "$ atlas-cli count --store old --store new"
+            }
+          },
+          "id": "a3"
+        },
+        {
+          "at": "07:14",
+          "body": {
+            "kind": "tool",
+            "value": {
+              "output": [
+                "accounts: 0 mismatches"
+              ],
+              "state": "ok",
+              "title": "$ atlas-cli diff --table accounts"
+            }
+          },
+          "id": "a4-0"
+        },
+        {
+          "at": "07:14",
+          "body": {
+            "kind": "tool",
+            "value": {
+              "output": [
+                "invoices: 0 mismatches"
+              ],
+              "state": "ok",
+              "title": "$ atlas-cli diff --table invoices"
+            }
+          },
+          "id": "a4-1"
+        },
+        {
+          "at": "07:14",
+          "body": {
+            "kind": "tool",
+            "value": {
+              "output": [
+                "events: 0 mismatches"
+              ],
+              "state": "ok",
+              "title": "$ atlas-cli diff --table events"
+            }
+          },
+          "id": "a4-2"
+        },
+        {
+          "at": "07:14",
+          "body": {
+            "kind": "tool",
+            "value": {
+              "output": [
+                "sessions: 0 mismatches"
+              ],
+              "state": "ok",
+              "title": "$ atlas-cli diff --table sessions"
+            }
+          },
+          "id": "a4-3"
+        },
+        {
+          "at": "07:14",
+          "body": {
+            "kind": "tool",
+            "value": {
+              "output": [
+                "keys: 0 mismatches"
+              ],
+              "state": "ok",
+              "title": "$ atlas-cli diff --table keys"
+            }
+          },
+          "id": "a4-4"
+        },
+        {
+          "at": "07:14",
+          "body": {
+            "kind": "tool",
+            "value": {
+              "output": [
+                "audit: 0 mismatches"
+              ],
+              "state": "ok",
+              "title": "$ atlas-cli diff --table audit"
+            }
+          },
+          "id": "a4-5"
+        },
+        {
+          "at": "07:39",
+          "body": {
+            "kind": "tool",
+            "value": {
+              "output": [
+                "test contract::query_01 ... ok",
+                "test contract::query_02 ... ok",
+                "test contract::query_03 ... ok",
+                "test contract::query_04 ... ok",
+                "test contract::query_05 ... ok",
+                "test contract::query_06 ... ok",
+                "test contract::query_07 ... ok",
+                "test contract::query_08 ... ok",
+                "test contract::query_09 ... ok",
+                "test contract::query_10 ... ok",
+                "test contract::query_11 ... ok",
+                "test contract::query_12 ... ok",
+                "test contract::query_13 ... ok",
+                "test contract::query_14 ... ok",
+                "test contract::query_15 ... ok",
+                "test contract::query_16 ... ok",
+                "test contract::query_17 ... ok",
+                "test contract::query_18 ... ok",
+                "test contract::query_19 ... ok",
+                "test contract::query_20 ... ok",
+                "test contract::query_21 ... ok",
+                "test contract::query_22 ... ok",
+                "test contract::query_23 ... ok",
+                "test contract::query_24 ... ok",
+                "test contract::query_25 ... ok",
+                "test contract::query_26 ... ok",
+                "test contract::query_27 ... ok",
+                "test contract::query_28 ... ok",
+                "test contract::query_29 ... ok",
+                "test contract::query_30 ... ok",
+                "test contract::query_31 ... ok",
+                "test contract::query_32 ... ok",
+                "test contract::query_33 ... ok",
+                "test contract::query_34 ... ok",
+                "test contract::query_35 ... ok",
+                "test contract::query_36 ... ok",
+                "test contract::query_37 ... ok",
+                "test contract::query_38 ... ok",
+                "test contract::query_39 ... ok",
+                "test contract::query_40 ... ok",
+                "test contract::query_41 ... ok",
+                "test contract::query_42 ... ok",
+                "",
+                "test result: ok. 42 passed; 0 failed"
+              ],
+              "state": "ok",
+              "title": "$ cargo test -p atlas-contract"
+            }
+          },
+          "id": "a5"
+        },
+        {
+          "at": "07:40",
+          "body": {
+            "kind": "assistant",
+            "value": "Both stores agree.\n\n| check | result |\n|---|---|\n| rows | 1,204,881 on both sides |\n| per-table diff | 0 mismatches in 6 tables |\n| contract | 42 of 42 queries identical |\n\nThe next step is the cut-over, which needs a person. I asked Robin for a review and will wait."
+          },
+          "id": "a6"
+        },
+        {
+          "at": "07:40",
+          "body": {
+            "kind": "event",
+            "value": "waiting for review · cut-over"
+          },
+          "id": "a7"
+        }
+      ]
+    },
+    "agent/fleet/atlas/indexer": {
+      "state": "ready",
+      "value": []
+    },
+    "agent/fleet/cos": {
+      "state": "ready",
+      "value": [
+        {
+          "at": "08:02",
+          "body": {
+            "kind": "user",
+            "value": "Morning. What happened overnight?"
+          },
+          "id": "c1"
+        },
+        {
+          "at": "08:02",
+          "body": {
+            "kind": "thinking",
+            "value": "Check missions that changed since 22:00, then faults, then anything waiting on Robin."
+          },
+          "id": "c2"
+        },
+        {
+          "at": "08:02",
+          "body": {
+            "kind": "tool",
+            "value": {
+              "output": [
+                "mission/fleet/atlas/store-move   running  3/5",
+                "mission/fleet/atlas/nightly      done     2/2",
+                "mission/fleet/rekey              running  1/3",
+                "mission/fleet/release/weekly     running  1/3",
+                "mission/fleet/docs/handbook      standing",
+                "mission/fleet/site/pricing-page  running  0/2",
+                "mission/fleet/harbor/nightly     done     4/4"
+              ],
+              "state": "ok",
+              "title": "$ st missions ls --since 22:00"
+            }
+          },
+          "id": "c3"
+        },
+        {
+          "at": "08:03",
+          "body": {
+            "kind": "assistant",
+            "value": "A quiet night, with one thing waiting on you.\n\n## Waiting on you\n\n- **Atlas store move** finished its compare step: 0 mismatches across 1.2M rows. The cut-over needs your review.\n\n## Finished\n\n- The atlas nightly build passed.\n- Harbor's nightly audit found nothing new.\n\n## Moving\n\n- The rekey mission rotated 3 of 5 keys; the rest are ready but unclaimed.\n\nWant me to start the rekey worker on the remaining keys?"
+          },
+          "id": "c4"
+        },
+        {
+          "at": "08:05",
+          "body": {
+            "kind": "user",
+            "value": "Yes, and make sure the release goes out today."
+          },
+          "id": "c5"
+        },
+        {
+          "at": "08:05",
+          "body": {
+            "kind": "mail",
+            "value": {
+              "body": "Robin asked for the remaining two keys today. Claim `rotate` when you are free.",
+              "from": "Chief of Staff",
+              "subject": "Finish the rotation",
+              "to": "Rekey Worker"
+            }
+          },
+          "id": "c6"
+        },
+        {
+          "at": "08:06",
+          "body": {
+            "kind": "assistant",
+            "value": "Done. I asked the rekey worker to pick up `rotate`, and I'll watch the weekly release."
+          },
+          "id": "c7"
+        },
+        {
+          "at": "08:41",
+          "body": {
+            "kind": "event",
+            "value": "Release Captain exited · restart 1 of 4"
+          },
+          "id": "c8"
+        },
+        {
+          "at": "08:44",
+          "body": {
+            "kind": "mail",
+            "value": {
+              "body": "release-captain on harbor exited 4 times in 10 minutes. Restarts are paused until a person acts.",
+              "from": "st",
+              "subject": "Seat release-captain stopped restarting",
+              "to": "Chief of Staff"
+            }
+          },
+          "id": "c9"
+        },
+        {
+          "at": "08:45",
+          "body": {
+            "kind": "tool",
+            "value": {
+              "output": [
+                "08:40:12 starting codex",
+                "08:40:13 error: 401 Unauthorized (api key expired)",
+                "08:40:13 exit 1",
+                "08:42:30 starting codex",
+                "08:42:31 error: 401 Unauthorized (api key expired)",
+                "08:42:31 exit 1"
+              ],
+              "state": "ok",
+              "title": "read ~/.local/state/st/logs/release-captain.log"
+            }
+          },
+          "id": "c10"
+        },
+        {
+          "at": "08:46",
+          "body": {
+            "kind": "assistant",
+            "value": "The release seat is down: **its API key expired at 08:40**, so every restart fails the same way. I raised a fault for you on Home.\n\nOnce the key is renewed, run:\n\n```sh\nst agents restart release-captain\n```\n\nand the `tag` step will retry by itself."
+          },
+          "id": "c11"
+        }
+      ]
+    },
+    "agent/fleet/docs/writer": {
+      "state": "ready",
+      "value": [
+        {
+          "at": "09:30",
+          "body": {
+            "kind": "event",
+            "value": "step draft ready · site/pricing-page"
+          },
+          "id": "d1"
+        },
+        {
+          "at": "09:31",
+          "body": {
+            "kind": "tool",
+            "value": {
+              "output": [
+                "# Pricing",
+                "",
+                "Contact sales."
+              ],
+              "state": "ok",
+              "title": "read ~/src/site--pricing/pages/pricing.md"
+            }
+          },
+          "id": "d2"
+        },
+        {
+          "at": "09:36",
+          "body": {
+            "kind": "tool",
+            "value": {
+              "output": [
+                "-# Pricing",
+                "+# Simple pricing",
+                "-Contact sales.",
+                "+Start free. Pay when your team grows."
+              ],
+              "state": "ok",
+              "title": "edit pages/pricing.md"
+            }
+          },
+          "id": "d3"
+        },
+        {
+          "at": "09:40",
+          "body": {
+            "kind": "tool",
+            "value": {
+              "output": [
+                "error: unknown shortcode {{plan-table}} in pages/pricing.md:9",
+                "build failed"
+              ],
+              "state": "failed",
+              "title": "$ npm run build"
+            }
+          },
+          "id": "d4"
+        },
+        {
+          "at": "09:41",
+          "body": {
+            "kind": "assistant",
+            "value": "The build doesn't know `{{plan-table}}` yet, so I wrote the plans as a plain list for this draft."
+          },
+          "id": "d5"
+        },
+        {
+          "at": "09:44",
+          "body": {
+            "kind": "tool",
+            "value": {
+              "output": [
+                "built 48 pages in 3.1s"
+              ],
+              "state": "ok",
+              "title": "$ npm run build"
+            }
+          },
+          "id": "d6"
+        },
+        {
+          "at": "09:45",
+          "body": {
+            "kind": "assistant",
+            "value": "Draft 2 is up at the preview link. I asked Robin for feedback before publishing."
+          },
+          "id": "d7"
+        }
+      ]
+    },
+    "agent/fleet/harbor/reviewer": {
+      "state": "ready",
+      "value": [
+        {
+          "at": "09:12",
+          "body": {
+            "kind": "event",
+            "value": "step review ready · harbor/pull-request-review"
+          },
+          "id": "h1"
+        },
+        {
+          "at": "09:13",
+          "body": {
+            "kind": "assistant",
+            "value": "Reviewed **#218**. Two findings, both small:\n\n1. `retry_after` is read as seconds but the server sends milliseconds.\n2. The new test sleeps for a real second; use the paused clock instead.\n\nI asked for changes on the pull request."
+          },
+          "id": "h2"
+        }
+      ]
+    },
+    "agent/fleet/pi/sketcher": {
+      "state": "ready",
+      "value": [
+        {
+          "at": "08:00",
+          "body": {
+            "kind": "assistant",
+            "value": "Sketched three layouts for the settings screen; they are in ~/src/sketches."
+          },
+          "id": "only"
+        }
+      ]
+    },
+    "agent/fleet/rekey/worker": {
+      "state": "ready",
+      "value": [
+        {
+          "at": "08:00",
+          "body": {
+            "kind": "assistant",
+            "value": "Inventory done: 5 signing keys, 3 services read them."
+          },
+          "id": "only"
+        }
+      ]
+    },
+    "agent/fleet/release/captain": {
+      "state": "ready",
+      "value": [
+        {
+          "at": "08:00",
+          "body": {
+            "kind": "assistant",
+            "value": "Tagging the weekly release."
+          },
+          "id": "only"
+        }
+      ]
+    },
+    "session/unmanaged-1": {
+      "state": "failed",
+      "value": "This codex process was found running on lark, but st cannot tell which session file it writes, so there is no conversation to show. Start it through st to see it here."
+    }
+  },
+  "devices": {
+    "state": "ready",
+    "value": [
+      {
+        "expires": "in 83 days",
+        "id": "device/phone",
+        "name": "Robin's phone",
+        "scopes": [
+          "full control"
+        ],
+        "state": "active"
+      },
+      {
+        "expires": "in 4 days",
+        "id": "device/tablet",
+        "name": "Old tablet",
+        "scopes": [
+          "read",
+          "attention"
+        ],
+        "state": "active"
+      }
+    ]
+  },
+  "host": "lark",
+  "link": "live",
+  "machines": {
+    "state": "ready",
+    "value": [
+      {
+        "links": [
+          [
+            "harbor",
+            true,
+            "direct · 18ms"
+          ],
+          [
+            "wren",
+            false,
+            "last seen 2d ago"
+          ]
+        ],
+        "load": "2 agents",
+        "name": "lark",
+        "online": true,
+        "platform": "macOS · arm64",
+        "seen": "now",
+        "you_are_here": true
+      },
+      {
+        "links": [
+          [
+            "lark",
+            true,
+            "direct · 18ms"
+          ],
+          [
+            "wren",
+            false,
+            "last seen 2d ago"
+          ]
+        ],
+        "load": "6 agents · 41% cpu",
+        "name": "harbor",
+        "online": true,
+        "platform": "linux · x86_64",
+        "seen": "4s ago",
+        "you_are_here": false
+      },
+      {
+        "links": [],
+        "load": null,
+        "name": "wren",
+        "online": false,
+        "platform": "linux · arm64",
+        "seen": "2d ago",
+        "you_are_here": false
+      }
+    ]
+  },
+  "missions": {
+    "state": "ready",
+    "value": [
+      {
+        "age": "33m",
+        "agents": [
+          "agent/fleet/atlas/builder"
+        ],
+        "decision": "attention/1",
+        "goals": [
+          "Move every row to the new store without losing a value.",
+          "Prove the two stores agree before anything cuts over.",
+          "Leave the old store readable until a person says otherwise."
+        ],
+        "host": "harbor",
+        "id": "mission/fleet/atlas/store-move",
+        "kdl": "version 2\n\nmission \"fleet/atlas/store-move\" state=\"ready\" {\n  goal \"Move every row to the new store without losing a value.\"\n  goal \"Prove the two stores agree before anything cuts over.\"\n  goal \"Leave the old store readable until a person says otherwise.\"\n  constraint \"Never write to the old store.\"\n\n  step \"snapshot\" { assigned-to \"agent/fleet/atlas/builder\" }\n  step \"convert\" {\n    assigned-to \"agent/fleet/atlas/builder\"\n    depends-on { step \"snapshot\" completed }\n    gate \"conversion-check\" { exec \"atlas-cli check --converted\" }\n  }\n  step \"compare\" {\n    assigned-to \"agent/fleet/atlas/builder\"\n    depends-on { step \"convert\" completed }\n  }\n  step \"cut-over\" {\n    agentless\n    depends-on { step \"compare\" completed }\n    gate \"cut-over-review\" type=\"human\" {\n      reviewer \"person/robin\"\n      question \"The row counts agree and the contract check passed. Cut over?\"\n      review \"doc/atlas/compare-report\"\n    }\n  }\n  step \"cleanup\" {\n    assigned-to \"agent/fleet/atlas/builder\"\n    depends-on { step \"cut-over\" completed }\n  }\n}\n",
+        "parent": null,
+        "steps": [
+          {
+            "after": [],
+            "age": "3h",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [],
+            "goals": [
+              "Finish the snapshot step and record what it produced."
+            ],
+            "name": "snapshot",
+            "note": null,
+            "owner": "Atlas Builder",
+            "state": "done"
+          },
+          {
+            "after": [
+              "snapshot"
+            ],
+            "age": "2h",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [
+              "conversion-check: atlas-cli check --converted (passed)"
+            ],
+            "goals": [
+              "Finish the convert step and record what it produced."
+            ],
+            "name": "convert",
+            "note": "conversion check passed",
+            "owner": "Atlas Builder",
+            "state": "done"
+          },
+          {
+            "after": [
+              "convert"
+            ],
+            "age": "41m",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [],
+            "goals": [
+              "Finish the compare step and record what it produced."
+            ],
+            "name": "compare",
+            "note": "0 mismatches in 1,204,881 rows",
+            "owner": "Atlas Builder",
+            "state": "done"
+          },
+          {
+            "after": [
+              "compare"
+            ],
+            "age": "33m",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [
+              "human review by robin: \"The row counts agree and the contract check passed. Cut over?\""
+            ],
+            "goals": [
+              "Switch reads and writes to the new store once a person approves."
+            ],
+            "name": "cut-over",
+            "note": "waiting for your review",
+            "owner": null,
+            "state": "needs_you"
+          },
+          {
+            "after": [
+              "cut-over"
+            ],
+            "age": "",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [],
+            "goals": [
+              "Finish the cleanup step and record what it produced."
+            ],
+            "name": "cleanup",
+            "note": null,
+            "owner": "Atlas Builder",
+            "state": "pending"
+          }
+        ],
+        "system": false,
+        "title": "Move the atlas store",
+        "word": "decision",
+        "worktree": "~/src/atlas--store-move"
+      },
+      {
+        "age": "12m",
+        "agents": [
+          "agent/fleet/docs/writer"
+        ],
+        "decision": "attention/2",
+        "goals": [
+          "Publish a pricing page the team agrees on."
+        ],
+        "host": "harbor",
+        "id": "mission/fleet/site/pricing-page",
+        "kdl": null,
+        "parent": null,
+        "steps": [
+          {
+            "after": [],
+            "age": "12m",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [],
+            "goals": [
+              "Finish the draft step and record what it produced."
+            ],
+            "name": "draft",
+            "note": "asked for your feedback",
+            "owner": "Docs Writer",
+            "state": "needs_you"
+          },
+          {
+            "after": [
+              "draft"
+            ],
+            "age": "",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [],
+            "goals": [
+              "Finish the publish step and record what it produced."
+            ],
+            "name": "publish",
+            "note": null,
+            "owner": "Docs Writer",
+            "state": "pending"
+          }
+        ],
+        "system": false,
+        "title": "A new pricing page",
+        "word": "decision",
+        "worktree": "~/src/site--pricing"
+      },
+      {
+        "age": "8m",
+        "agents": [
+          "agent/fleet/release/captain"
+        ],
+        "decision": null,
+        "goals": [
+          "Tag, build and publish this week's release."
+        ],
+        "host": "harbor",
+        "id": "mission/fleet/release/weekly",
+        "kdl": null,
+        "parent": null,
+        "steps": [
+          {
+            "after": [],
+            "age": "1h",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [],
+            "goals": [
+              "Finish the changelog step and record what it produced."
+            ],
+            "name": "changelog",
+            "note": null,
+            "owner": "Release Captain",
+            "state": "done"
+          },
+          {
+            "after": [
+              "changelog"
+            ],
+            "age": "8m",
+            "attempt": 4,
+            "blockers": [
+              "seat release-captain on harbor is not running"
+            ],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [],
+            "goals": [
+              "Finish the tag step and record what it produced."
+            ],
+            "name": "tag",
+            "note": "seat keeps restarting",
+            "owner": "Release Captain",
+            "state": "failed"
+          },
+          {
+            "after": [
+              "tag"
+            ],
+            "age": "",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [],
+            "goals": [
+              "Finish the publish step and record what it produced."
+            ],
+            "name": "publish",
+            "note": null,
+            "owner": "Release Captain",
+            "state": "pending"
+          }
+        ],
+        "system": false,
+        "title": "Weekly release",
+        "word": "stalled",
+        "worktree": "~/src/atlas"
+      },
+      {
+        "age": "1m",
+        "agents": [
+          "agent/fleet/harbor/reviewer"
+        ],
+        "decision": null,
+        "goals": [
+          "Review pull request #218 and route the result."
+        ],
+        "host": "harbor",
+        "id": "mission/fleet/harbor/pull-request-review",
+        "kdl": null,
+        "parent": null,
+        "steps": [
+          {
+            "after": [],
+            "age": "4m",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [],
+            "goals": [
+              "Finish the review step and record what it produced."
+            ],
+            "name": "review",
+            "note": null,
+            "owner": "Harbor Reviewer",
+            "state": "working"
+          },
+          {
+            "after": [
+              "review"
+            ],
+            "age": "",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [],
+            "goals": [
+              "Finish the route step and record what it produced."
+            ],
+            "name": "route",
+            "note": null,
+            "owner": "Harbor Reviewer",
+            "state": "pending"
+          }
+        ],
+        "system": false,
+        "title": "Review harbor #218",
+        "word": "working",
+        "worktree": "~/src/harbor--review-218"
+      },
+      {
+        "age": "19m",
+        "agents": [
+          "agent/fleet/rekey/worker"
+        ],
+        "decision": null,
+        "goals": [
+          "Rotate every signing key and prove nothing still uses the old ones."
+        ],
+        "host": "harbor",
+        "id": "mission/fleet/rekey",
+        "kdl": null,
+        "parent": null,
+        "steps": [
+          {
+            "after": [],
+            "age": "1h",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [],
+            "goals": [
+              "Finish the inventory step and record what it produced."
+            ],
+            "name": "inventory",
+            "note": null,
+            "owner": "Rekey Worker",
+            "state": "done"
+          },
+          {
+            "after": [
+              "inventory"
+            ],
+            "age": "19m",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [],
+            "goals": [
+              "Finish the rotate step and record what it produced."
+            ],
+            "name": "rotate",
+            "note": "queued for Rekey Worker, which finishes harbor/nightly first",
+            "owner": null,
+            "state": "ready"
+          },
+          {
+            "after": [
+              "rotate"
+            ],
+            "age": "",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [],
+            "goals": [
+              "Finish the report step and record what it produced."
+            ],
+            "name": "report",
+            "note": null,
+            "owner": "Rekey Worker",
+            "state": "pending"
+          }
+        ],
+        "system": false,
+        "title": "Rotate harbor's signing keys",
+        "word": "queued",
+        "worktree": "~/src/harbor"
+      },
+      {
+        "age": "2h",
+        "agents": [
+          "agent/fleet/docs/writer"
+        ],
+        "decision": null,
+        "goals": [
+          "Update the handbook when a mission changes how the fleet works."
+        ],
+        "host": "harbor",
+        "id": "mission/fleet/docs/handbook",
+        "kdl": null,
+        "parent": null,
+        "steps": [
+          {
+            "after": [],
+            "age": "2h",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [],
+            "goals": [
+              "Finish the watch step and record what it produced."
+            ],
+            "name": "watch",
+            "note": "standing; wakes on merged changes",
+            "owner": "Docs Writer",
+            "state": "waiting"
+          }
+        ],
+        "system": false,
+        "title": "Keep the handbook current",
+        "word": "idle",
+        "worktree": null
+      },
+      {
+        "age": "6h",
+        "agents": [],
+        "decision": null,
+        "goals": [
+          "Build and test atlas every night."
+        ],
+        "host": "harbor",
+        "id": "mission/fleet/atlas/nightly",
+        "kdl": null,
+        "parent": null,
+        "steps": [
+          {
+            "after": [],
+            "age": "6h",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [],
+            "goals": [
+              "Finish the build step and record what it produced."
+            ],
+            "name": "build",
+            "note": null,
+            "owner": "Atlas Indexer",
+            "state": "done"
+          },
+          {
+            "after": [
+              "build"
+            ],
+            "age": "6h",
+            "attempt": 1,
+            "blockers": [],
+            "constraints": [
+              "Never write to the old store."
+            ],
+            "gates": [],
+            "goals": [
+              "Finish the test step and record what it produced."
+            ],
+            "name": "test",
+            "note": null,
+            "owner": "Atlas Indexer",
+            "state": "done"
+          }
+        ],
+        "system": false,
+        "title": "Atlas nightly build",
+        "word": "done",
+        "worktree": null
+      }
+    ]
+  },
+  "person": "person/robin",
+  "quiet_missions": 6,
+  "worktrees": {
+    "state": "ready",
+    "value": [
+      {
+        "agents": [
+          "agent/fleet/atlas/builder"
+        ],
+        "ahead": 7,
+        "behind": 0,
+        "branch": "agent/store-move",
+        "dirty": 0,
+        "host": "harbor",
+        "missions": [
+          "mission/fleet/atlas/store-move"
+        ],
+        "path": "~/src/atlas--store-move"
+      },
+      {
+        "agents": [
+          "agent/fleet/docs/writer"
+        ],
+        "ahead": 2,
+        "behind": 1,
+        "branch": "agent/pricing-page",
+        "dirty": 3,
+        "host": "harbor",
+        "missions": [
+          "mission/fleet/site/pricing-page"
+        ],
+        "path": "~/src/site--pricing"
+      },
+      {
+        "agents": [
+          "agent/fleet/harbor/reviewer"
+        ],
+        "ahead": 0,
+        "behind": 0,
+        "branch": "pr/218",
+        "dirty": 0,
+        "host": "harbor",
+        "missions": [
+          "mission/fleet/harbor/pull-request-review"
+        ],
+        "path": "~/src/harbor--review-218"
+      },
+      {
+        "agents": [
+          "agent/fleet/rekey/worker"
+        ],
+        "ahead": 0,
+        "behind": 3,
+        "branch": "main",
+        "dirty": 0,
+        "host": "harbor",
+        "missions": [
+          "mission/fleet/rekey"
+        ],
+        "path": "~/src/harbor"
+      },
+      {
+        "agents": [
+          "agent/fleet/release/captain"
+        ],
+        "ahead": 0,
+        "behind": 0,
+        "branch": "main",
+        "dirty": 1,
+        "host": "harbor",
+        "missions": [
+          "mission/fleet/release/weekly"
+        ],
+        "path": "~/src/atlas"
+      },
+      {
+        "agents": [
+          "agent/fleet/pi/sketcher"
+        ],
+        "ahead": 0,
+        "behind": 0,
+        "branch": "main",
+        "dirty": 5,
+        "host": "lark",
+        "missions": [],
+        "path": "~/src/sketches"
+      },
+      {
+        "agents": [
+          "session/unmanaged-1"
+        ],
+        "ahead": 0,
+        "behind": 0,
+        "branch": "(unknown)",
+        "dirty": 0,
+        "host": "lark",
+        "missions": [],
+        "path": "~/src/scratch"
+      }
+    ]
+  }
+}
