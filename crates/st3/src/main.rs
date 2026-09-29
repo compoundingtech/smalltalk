@@ -5143,12 +5143,20 @@ async fn run_collection_watch(
     }
 }
 
-/// A host catching up with a peer shows early history as current, so say so before the items.
+/// A host catching up with a peer shows early history as current, and a host whose graph
+/// diverged from a peer's can show it wrong, so say so before the items.
 fn render_sync_notice(sync: &st3_client::SyncNotice, now: u128) -> String {
     use std::fmt::Write as _;
 
     let mut output = String::new();
     for peer in &sync.peers {
+        if let Some(since) = &peer.diverged_since {
+            let since = chrono::DateTime::parse_from_rfc3339(since)
+                .map(|at| relative_time(at.timestamp_millis().max(0) as u128, now))
+                .unwrap_or_else(|_| since.clone());
+            let _ = writeln!(output, "DIVERGED  {} · since {since}", peer.summary());
+            continue;
+        }
         let last_exchange = peer
             .last_exchange_at
             .as_deref()
@@ -5164,7 +5172,12 @@ fn render_sync_notice(sync: &st3_client::SyncNotice, now: u128) -> String {
     }
     let _ = writeln!(
         output,
-        "  Until then, items below can be out of date. Progress: st3 replication status\n"
+        "{}",
+        if sync.diverged() {
+            "  Exchanges cannot fix this, so items below can be wrong. Details: st3 replication status\n"
+        } else {
+            "  Until then, items below can be out of date. Progress: st3 replication status\n"
+        }
     );
     output
 }
@@ -6039,11 +6052,30 @@ async fn run_repair(client: &Client, command: RepairCommand, json_output: bool) 
 }
 
 /// Each peer's line, then how far apart the two envelope sets are and how long catching up
-/// should take, in words.
-fn render_replication_peers(peers: &[ReplicationPeerStatus], now: u128) -> String {
+/// should take, in words. Two nodes are in sync only when they hold the same envelopes and
+/// project the same graph from them.
+fn render_replication_peers(
+    peers: &[ReplicationPeerStatus],
+    local_graph_digest: &str,
+    now: u128,
+) -> String {
     use std::fmt::Write as _;
 
     let mut output = String::new();
+    for peer in peers
+        .iter()
+        .filter(|peer| peer.sync.as_ref().is_some_and(|sync| sync.diverged))
+    {
+        let sync = peer.sync.as_ref().expect("filtered on sync");
+        let _ = writeln!(
+            output,
+            "sync\tdiverged: {} holds the same envelopes but projects a different graph, since {}",
+            peer.peer,
+            sync.graph_differs_since_unix_ms
+                .map(|since| relative_time(since, now))
+                .unwrap_or_else(|| "an unknown time".into())
+        );
+    }
     for peer in peers
         .iter()
         .filter(|peer| peer.sync.as_ref().is_some_and(|sync| sync.catching_up))
@@ -6074,12 +6106,56 @@ fn render_replication_peers(peers: &[ReplicationPeerStatus], now: u128) -> Strin
             let _ = writeln!(output, "  difference not measured yet");
             continue;
         };
-        if sync.peer_only_envelopes == 0 && sync.local_only_envelopes == 0 {
+        let compared = sync
+            .graph_compared_at_unix_ms
+            .map(|at| relative_time(at, now))
+            .unwrap_or_else(|| "never".into());
+        let digests = format!(
+            "this node {}, {} {}",
+            short_digest(local_graph_digest),
+            peer.peer,
+            short_digest(peer.graph_digest.as_deref().unwrap_or("unknown"))
+        );
+        if let Some(since) = sync.graph_differs_since_unix_ms {
             let _ = writeln!(
                 output,
-                "  in sync: neither side has an envelope the other lacks (measured {})",
-                relative_time(sync.measured_at_unix_ms, now)
+                "  {}: the same envelopes project different graphs since {} (compared {compared}; {digests})",
+                if sync.diverged {
+                    "diverged"
+                } else {
+                    "graphs differ"
+                },
+                relative_time(since, now)
             );
+            if sync.diverged {
+                let _ = writeln!(
+                    output,
+                    "  exchanges cannot fix this; views on one node are wrong until it is repaired"
+                );
+            } else {
+                let _ = writeln!(
+                    output,
+                    "  diverged if this lasts a minute; a peer still projecting settles by itself"
+                );
+            }
+        }
+        if sync.peer_only_envelopes == 0 && sync.local_only_envelopes == 0 {
+            if sync.graph_differs_since_unix_ms.is_some() {
+                continue;
+            }
+            if peer.graph_digest.as_deref() == Some(local_graph_digest) {
+                let _ = writeln!(
+                    output,
+                    "  in sync: the same envelopes and the same graph (measured {})",
+                    relative_time(sync.measured_at_unix_ms, now)
+                );
+            } else {
+                let _ = writeln!(
+                    output,
+                    "  same envelopes (measured {}), but the graphs differ ({digests}); the next exchange compares them",
+                    relative_time(sync.measured_at_unix_ms, now)
+                );
+            }
             continue;
         }
         let _ = writeln!(
@@ -6108,6 +6184,11 @@ fn render_replication_peers(peers: &[ReplicationPeerStatus], now: u128) -> Strin
         }
     }
     output
+}
+
+/// The first 12 characters of a digest, enough to tell two apart in a status line.
+fn short_digest(digest: &str) -> &str {
+    digest.get(..12).unwrap_or(digest)
 }
 
 async fn run_replication(
@@ -6164,7 +6245,10 @@ async fn run_replication(
                 timings.commits,
                 timings.commit_ms
             );
-            print!("{}", render_replication_peers(&status.peers, now_ms()));
+            print!(
+                "{}",
+                render_replication_peers(&status.peers, &status.graph_digest, now_ms())
+            );
             Ok(())
         }
         ReplicationCommand::Invalid { all } => {
@@ -12911,21 +12995,34 @@ mod tests {
     #[test]
     fn replication_status_says_which_side_holds_what_and_how_long_catching_up_takes() {
         let now = 1_000_000;
+        let local = "1111111111111111aaaa";
         let peer =
-            |name: &str, sync: Option<st3::model::ReplicationPeerSync>| ReplicationPeerStatus {
-                peer: name.into(),
-                status: "up".into(),
-                last_success_at_unix_ms: Some(now - 2_000),
-                last_error: None,
-                schema_digest: None,
-                authority_digest: None,
-                graph_digest: None,
-                sync,
+            |name: &str, graph: Option<&str>, sync: Option<st3::model::ReplicationPeerSync>| {
+                ReplicationPeerStatus {
+                    peer: name.into(),
+                    status: "up".into(),
+                    last_success_at_unix_ms: Some(now - 2_000),
+                    last_error: None,
+                    schema_digest: None,
+                    authority_digest: None,
+                    graph_digest: graph.map(str::to_owned),
+                    sync,
+                }
             };
+        let same_envelopes = |compared: Option<u128>, differs: Option<u128>, diverged| {
+            Some(st3::model::ReplicationPeerSync {
+                measured_at_unix_ms: now,
+                graph_compared_at_unix_ms: compared,
+                graph_differs_since_unix_ms: differs,
+                diverged,
+                ..Default::default()
+            })
+        };
         let output = render_replication_peers(
             &[
                 peer(
                     "Silber",
+                    Some("3333333333333333"),
                     Some(st3::model::ReplicationPeerSync {
                         peer_only_envelopes: 124_384,
                         local_only_envelopes: 3,
@@ -12934,22 +13031,35 @@ mod tests {
                         catch_up_rate_per_second: Some(140.0),
                         estimated_catch_up_seconds: Some(889),
                         catching_up: true,
-                    }),
-                ),
-                peer(
-                    "Quiet",
-                    Some(st3::model::ReplicationPeerSync {
-                        measured_at_unix_ms: now,
                         ..Default::default()
                     }),
                 ),
-                peer("Fresh", None),
+                peer("Quiet", Some(local), same_envelopes(Some(now), None, false)),
+                peer(
+                    "Moved",
+                    Some("4444444444444444"),
+                    same_envelopes(Some(now), None, false),
+                ),
+                peer(
+                    "Settling",
+                    Some("5555555555555555"),
+                    same_envelopes(Some(now), Some(now - 10_000), false),
+                ),
+                peer(
+                    "Laptop",
+                    Some("2222222222222222bbbb"),
+                    same_envelopes(Some(now - 1_000), Some(now - 180_000), true),
+                ),
+                peer("Fresh", None, None),
             ],
+            local,
             now,
         );
         assert_eq!(
             output,
-            "sync\tcatching up: Silber has 124,384 envelopes this node lacks, \
+            "sync\tdiverged: Laptop holds the same envelopes but projects a different graph, \
+             since 3m ago\n\
+             sync\tcatching up: Silber has 124,384 envelopes this node lacks, \
              caught up in about 15m\n\
              peer\tSilber\tup\t\n\
              \x20 last exchange 2s ago\n\
@@ -12958,7 +13068,21 @@ mod tests {
              \x20 receiving 142.5 envelopes/s, caught up in about 15m (measured 2s ago)\n\
              peer\tQuiet\tup\t\n\
              \x20 last exchange 2s ago\n\
-             \x20 in sync: neither side has an envelope the other lacks (measured now)\n\
+             \x20 in sync: the same envelopes and the same graph (measured now)\n\
+             peer\tMoved\tup\t\n\
+             \x20 last exchange 2s ago\n\
+             \x20 same envelopes (measured now), but the graphs differ (this node \
+             111111111111, Moved 444444444444); the next exchange compares them\n\
+             peer\tSettling\tup\t\n\
+             \x20 last exchange 2s ago\n\
+             \x20 graphs differ: the same envelopes project different graphs since 10s ago \
+             (compared now; this node 111111111111, Settling 555555555555)\n\
+             \x20 diverged if this lasts a minute; a peer still projecting settles by itself\n\
+             peer\tLaptop\tup\t\n\
+             \x20 last exchange 2s ago\n\
+             \x20 diverged: the same envelopes project different graphs since 3m ago \
+             (compared 1s ago; this node 111111111111, Laptop 222222222222)\n\
+             \x20 exchanges cannot fix this; views on one node are wrong until it is repaired\n\
              peer\tFresh\tup\t\n\
              \x20 last exchange 2s ago\n\
              \x20 difference not measured yet\n"
@@ -12976,6 +13100,7 @@ mod tests {
                 local_only_envelopes: 0,
                 last_exchange_at: Some("1970-01-01T00:16:38Z".into()),
                 estimated_catch_up_seconds: None,
+                diverged_since: None,
             }],
         });
         let output = render_now_page(&page, "st3 now --as person/nathan");
@@ -13001,6 +13126,17 @@ mod tests {
         assert_eq!(catch_up_estimate(Some(3_601)), "caught up in about 1h 1m");
         assert_eq!(catch_up_estimate(Some(90_000)), "caught up in about 1d 1h");
         assert_eq!(envelope_count(1_234_567), "1,234,567 envelopes");
+
+        // A diverged peer outranks catching up: exchanges cannot fix what the page shows.
+        let sync = page.sync.as_mut().unwrap();
+        sync.state = "diverged".into();
+        sync.peers[0].diverged_since = Some("1970-01-01T00:13:40Z".into());
+        assert_eq!(
+            render_sync_notice(page.sync.as_ref().unwrap(), 1_000_000),
+            "DIVERGED  Silber projects a different graph from the same envelopes · since 3m ago\n\
+             \x20 Exchanges cannot fix this, so items below can be wrong. \
+             Details: st3 replication status\n\n"
+        );
 
         page.sync = None;
         assert!(!render_now_page(&page, "st3 now").contains("SYNCING"));

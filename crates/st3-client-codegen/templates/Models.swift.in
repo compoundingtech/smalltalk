@@ -194,7 +194,7 @@ public enum Resource: Codable, Sendable, Identifiable {
 }
 public struct ResourcePage: Codable, Sendable { public let kind: String; public let collection: String; public let filters: [String: String]; public let items: [Resource]; public let page: PageInfo; public let sync: SyncNotice? }
 public struct SyncNotice: Codable, Sendable { public let state: String; public let peers: [SyncPeer] }
-public struct SyncPeer: Codable, Sendable { public let hostID: String; public let peerOnlyEnvelopes, localOnlyEnvelopes: UInt64; public let lastExchangeAt: String?; public let estimatedCatchUpSeconds: UInt64?; enum CodingKeys: String, CodingKey { case hostID = "host_id", peerOnlyEnvelopes = "peer_only_envelopes", localOnlyEnvelopes = "local_only_envelopes", lastExchangeAt = "last_exchange_at", estimatedCatchUpSeconds = "estimated_catch_up_seconds" } }
+public struct SyncPeer: Codable, Sendable { public let hostID: String; public let peerOnlyEnvelopes, localOnlyEnvelopes: UInt64; public let lastExchangeAt: String?; public let estimatedCatchUpSeconds: UInt64?; public let divergedSince: String?; enum CodingKeys: String, CodingKey { case hostID = "host_id", peerOnlyEnvelopes = "peer_only_envelopes", localOnlyEnvelopes = "local_only_envelopes", lastExchangeAt = "last_exchange_at", estimatedCatchUpSeconds = "estimated_catch_up_seconds", divergedSince = "diverged_since" } }
 
 public enum TimelineRole: String, Codable, Sendable { case system, user, assistant, tool }
 public enum TimelineType: String, Codable, Sendable { case message, content, toolCall = "tool_call", toolResult = "tool_result", status, error, usage, redaction, truncation }

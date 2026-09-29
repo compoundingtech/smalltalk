@@ -1398,9 +1398,11 @@ pub struct ClientResourcePage {
 }
 
 /// Present on every page while this host is catching up with a peer, because its projections
-/// can then show early history as current.
+/// can then show early history as current, and while its graph has diverged from a peer's,
+/// because they can then be wrong.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ClientSyncNotice {
+    /// `diverged` when any peer has diverged, else `catching-up`.
     pub state: String,
     pub peers: Vec<ClientSyncPeer>,
 }
@@ -1412,6 +1414,9 @@ pub struct ClientSyncPeer {
     pub local_only_envelopes: u64,
     pub last_exchange_at: Option<String>,
     pub estimated_catch_up_seconds: Option<u64>,
+    /// Since when this host and the peer hold the same envelopes but project different graphs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diverged_since: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -2612,6 +2617,19 @@ pub struct ReplicationPeerSync {
     /// can show early history as current.
     #[serde(default)]
     pub catching_up: bool,
+    /// When this node last compared its graph digest with the peer's. Each graph projects the
+    /// envelopes its node holds, so only an exchange at which both nodes hold the same
+    /// envelopes compares them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_compared_at_unix_ms: Option<u128>,
+    /// When the comparisons began finding the two graphs different; `None` while the latest
+    /// comparison found them equal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub graph_differs_since_unix_ms: Option<u128>,
+    /// Consecutive comparisons found the same envelopes projecting different graphs. More
+    /// exchanges cannot fix that, so this node's views can be wrong until it is repaired.
+    #[serde(default)]
+    pub diverged: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
