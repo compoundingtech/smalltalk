@@ -19228,6 +19228,133 @@ subscription "reviews" {{
     }
 
     #[test]
+    fn a_person_closes_an_agent_requested_subscription_failure_and_a_stop_ends_the_rest() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+mission "review" state="ready" {
+  input "source" kind="resource"
+  completion { when "all-steps-exhausted" }
+  goal "Review a discovered item."
+  step "review" { agentless }
+}"#,
+            "agent-failure-mission",
+        );
+        let revision = store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        apply_source(
+            &store,
+            &format!(
+                r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+observer "repo" {{
+  resource "resource/repo"
+  provider "github.repository"
+  locator "example/repo"
+  field "issues"
+}}
+subscription "reviews" {{
+  observer "observer/repo"
+  on "issues"
+  delivery "mission" {{
+    mission "review@{revision}"
+    resource "source"
+    workspace "/tmp/st3-review"
+    requester "agent/example/steward"
+  }}
+}}"#
+            ),
+            "agent-failure-subscription",
+        );
+        let discovery = store
+            .append_claim(&ClaimInput {
+                subject: "resource/repo".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("kind".into(), Value::String("vcs.repository".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        for input in ["first", "second"] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "subscription/reviews".into(),
+                    kind: "subscription.mission-requested".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("mission".into(), Value::String("mission/review".into())),
+                        ("mission_revision".into(), Value::String(revision.clone())),
+                        ("resource".into(), Value::String("resource/repo".into())),
+                        ("resource_input".into(), Value::String(input.into())),
+                        ("workspace".into(), Value::String("/tmp/st3-review".into())),
+                        ("discovery".into(), Value::String(discovery.id.clone())),
+                        (
+                            "requester".into(),
+                            Value::String("agent/example/steward".into()),
+                        ),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler
+            .reconcile_subscription_missions(&store.desired_subjects().unwrap())
+            .unwrap();
+        let failures = || {
+            store
+                .attention_items(None)
+                .unwrap()
+                .into_iter()
+                .filter(|item| item.subject.starts_with("attention/subscription-failure-"))
+                .collect::<Vec<_>>()
+        };
+        let open = failures();
+        assert_eq!(open.len(), 2);
+        assert!(
+            open.iter().all(|item| item.person.is_empty()),
+            "a failure requested by an agent is routed to no person"
+        );
+
+        // The requester is an agent, which cannot close an item. Any person can.
+        let closed = store
+            .resolve_attention(
+                &open[0].subject,
+                &crate::model::AttentionResolveRequest {
+                    outcome: "dismissed".into(),
+                    reason: Some("The intake run was cancelled days ago".into()),
+                    actor: "person/nathan".into(),
+                    idempotency_key: "dismiss-agent-subscription-failure".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(closed.status, "dismissed");
+        assert_eq!(closed.reviewer, "person/nathan");
+        assert_eq!(failures().len(), 1);
+
+        // A stopped subscription starts nothing more, so its failures end on their own.
+        apply_source(
+            &store,
+            "version 2\nsubscription \"reviews\" { stop }\n",
+            "agent-failure-subscription-stop",
+        );
+        assert!(failures().is_empty());
+    }
+
+    #[test]
     fn subscription_publish_rejects_an_undeclared_mission_resource_input() {
         let store = Store::open_memory("node").unwrap();
         apply_source(

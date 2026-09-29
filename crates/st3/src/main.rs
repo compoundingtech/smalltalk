@@ -2318,19 +2318,22 @@ enum AttentionCommand {
     },
     /// Request attention after an explicit fault.
     ///
-    /// The item stays in `st now` until its reviewer resolves it or you withdraw it with
+    /// The item stays in `st now` until a person resolves it or you withdraw it with
     /// `st attention withdraw` once the condition clears. It also leaves `now` on its own:
     ///
-    /// - at once, when a `step-run/` or `run-generation/` target is no longer current;
+    /// - at once, when a `step-run/` or `run-generation/` target is no longer current, or a
+    ///   pull request target is merged or closed;
     /// - otherwise, once every other target has ended after the request: a `mission/` retired or
     ///   cancelled, a `mission-run/` terminal, an `attention/` item resolved or its gate no
-    ///   longer pending, or an `agent/` stopped or ready on a later incarnation.
+    ///   longer pending, an `agent/` stopped or ready on a later incarnation, an `observer/`
+    ///   stopped or observing again, a `subscription/` stopped, a `loop-run/` running again or
+    ///   its run revised or cancelled, or a `message/` closed.
     ///
-    /// `resource/` and `doc/` targets are context and never end an item. A target of any other
-    /// kind, or one that had already ended when you made the request, keeps it open.
+    /// Other `resource/` targets and `doc/` targets are context and never end an item. A target
+    /// of any other kind, or one that had already ended when you made the request, keeps it open.
     #[command(verbatim_doc_comment)]
     Request(AttentionRequestArgs),
-    /// Resolve or dismiss an explicit attention request.
+    /// Resolve or dismiss any attention request, as any person.
     Resolve(AttentionResolveArgs),
     /// Withdraw an obsolete attention request as its original requester.
     Withdraw(AttentionWithdrawArgs),
