@@ -206,6 +206,25 @@ pub struct SealedSet {
     pub claim_tombstones: Vec<ClaimTombstone>,
 }
 
+/// What a seal records of a sealed set: its digest, how many envelopes it holds, and the row it
+/// was read up to. Reading it needs no claims.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedIdentities {
+    pub digest: String,
+    pub count: usize,
+    pub seal_rowid: i64,
+}
+
+impl SealedIdentities {
+    pub fn of(sealed: &SealedSet) -> Self {
+        Self {
+            digest: sealed_digest(sealed),
+            count: sealed.envelopes.len(),
+            seal_rowid: sealed.seal_rowid,
+        }
+    }
+}
+
 /// What a checkpoint drops from a sealed set.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DropPlan {
@@ -1387,6 +1406,67 @@ impl Store {
             seal_rowid,
             envelope_tombstones,
             claim_tombstones,
+        })
+    }
+
+    /// The identities `checkpoint_sealed_set_through` would read, without the claims: what a
+    /// seal and the status need, every few minutes, on a store of any size.
+    pub fn checkpoint_sealed_identities(
+        &self,
+        cut_unix_ms: u128,
+        through_rowid: Option<i64>,
+    ) -> Result<SealedIdentities> {
+        {
+            let mut connection = self.connection.write();
+            let transaction = connection.transaction()?;
+            seed_replica_envelopes_tx(&transaction, &self.origin, None)?;
+            transaction.commit()?;
+        }
+        let connection = self.readers.get();
+        let connection = connection.unchecked_transaction()?;
+        let seal_rowid: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM replica_envelopes",
+            [],
+            |row| row.get(0),
+        )?;
+        let seal_rowid = through_rowid.map_or(seal_rowid, |through| through.min(seal_rowid));
+        let cut = i64::try_from(cut_unix_ms)?;
+        // As in `checkpoint_sealed_set_through`: an envelope is before the cut when it and every
+        // claim admitted from it are dated before the cut.
+        let identities = connection
+            .prepare(
+                "SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash
+                 FROM replica_envelopes AS envelopes
+                 WHERE envelopes.rowid <= ?2
+                   AND CAST(envelopes.accepted_at_unix_ms AS INTEGER) < ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM replica_records AS records
+                       JOIN claims ON claims.id=records.claim_id
+                       WHERE records.writer=envelopes.writer
+                         AND records.sequence=envelopes.sequence
+                         AND records.envelope_hash=envelopes.envelope_hash
+                         AND CAST(claims.accepted_at_unix_ms AS INTEGER) >= ?1)
+                 UNION
+                 SELECT writer, sequence, envelope_hash FROM checkpoint_envelopes
+                 WHERE accepted_at_unix_ms < ?1",
+            )?
+            .query_map(params![cut, seal_rowid], |row| {
+                Ok(EnvelopeKey {
+                    writer: row.get(0)?,
+                    sequence: row.get(1)?,
+                    envelope_hash: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        let mut digest = Sha256::new();
+        digest.update(b"st3-checkpoint-sealed-v1\0");
+        for key in &identities {
+            update_identity_digest(&mut digest, &key.writer, key.sequence, &key.envelope_hash);
+        }
+        Ok(SealedIdentities {
+            digest: hex::encode(digest.finalize()),
+            count: identities.len(),
+            seal_rowid,
         })
     }
 
@@ -2580,6 +2660,13 @@ mod tests {
         let [after_trim, without_trim] =
             [&trimmed, &untrimmed].map(|store| store.checkpoint_sealed_set(second).unwrap());
         assert_eq!(sealed_digest(&after_trim), sealed_digest(&without_trim));
+        // A seal reads only the identities, and they give the same digest as the whole set.
+        for (store, set) in [(&trimmed, &after_trim), (&untrimmed, &without_trim)] {
+            assert_eq!(
+                store.checkpoint_sealed_identities(second, None).unwrap(),
+                SealedIdentities::of(set)
+            );
+        }
         assert_eq!(after_trim.envelope_tombstones.len(), plan.envelopes.len());
         assert!(after_trim.claims.len() < without_trim.claims.len());
         let [after_trim, without_trim] = [after_trim, without_trim].map(|set| plan_drops(&set));
