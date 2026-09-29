@@ -12,6 +12,8 @@
 //!   does not finish within it yet.
 //! - `FIRST_SYNC_MEMORY_STATE` keeps both stores in `/dev/shm`, to show the cost without disk
 //!   flushes.
+//! - `FIRST_SYNC_LINK_MBPS` sends each node's peer traffic through a link of that many
+//!   megabits per second each way, such as a home Wi-Fi network, instead of bare loopback.
 //! - `FIRST_SYNC_KEEP` keeps the stores for inspection.
 //!
 //! The two stores take about 1.5 GB under `TMPDIR`. Point it at a disk with room and a short
@@ -32,6 +34,9 @@ const FLEET: &str = "5d0c6f8e-2b1a-4c3d-9e8f-7a6b5c4d3e2f";
 // Below the Linux and macOS ephemeral port ranges, so no outgoing connection can hold them.
 const SOURCE_PORT: u16 = 27_311;
 const TARGET_PORT: u16 = 27_312;
+/// With `FIRST_SYNC_LINK_MBPS`, each node dials the other through a slower link on these ports.
+const LINK_TO_SOURCE_PORT: u16 = 27_313;
+const LINK_TO_TARGET_PORT: u16 = 27_314;
 
 /// Two steps on one standing agent. The agent is not declared, so the source daemon starts no
 /// runtimes while the target syncs.
@@ -80,13 +85,26 @@ async fn an_empty_node_syncs_its_peer_within_two_minutes() {
     let memory = std::env::var_os("FIRST_SYNC_MEMORY_STATE")
         .map(|_| tempfile::tempdir_in("/dev/shm").unwrap());
     let memory_root = memory.as_ref().map(|memory| memory.path());
+    let link = std::env::var("FIRST_SYNC_LINK_MBPS")
+        .ok()
+        .and_then(|mbps| mbps.parse::<f64>().ok());
+    let (to_source, to_target) = match link {
+        Some(mbps) => {
+            let bytes_per_second = mbps * 1_000_000.0 / 8.0;
+            start_link(LINK_TO_SOURCE_PORT, SOURCE_PORT, bytes_per_second).await;
+            start_link(LINK_TO_TARGET_PORT, TARGET_PORT, bytes_per_second).await;
+            println!("peers talk over a {mbps} Mbit/s link each way");
+            (LINK_TO_SOURCE_PORT, LINK_TO_TARGET_PORT)
+        }
+        None => (SOURCE_PORT, TARGET_PORT),
+    };
     let source_dir = node_dir(
         &root,
         memory_root,
         "source",
         SOURCE_PORT,
         "target",
-        TARGET_PORT,
+        to_target,
         secret,
     );
     let target_dir = node_dir(
@@ -95,7 +113,7 @@ async fn an_empty_node_syncs_its_peer_within_two_minutes() {
         "target",
         TARGET_PORT,
         "source",
-        SOURCE_PORT,
+        to_source,
         secret,
     );
 
@@ -453,6 +471,46 @@ fn append_event(store: &Store, index: usize, harness_writes: &mut BTreeMap<Strin
             idempotency_key: Some(format!("bench-event-{index}")),
         })
         .unwrap();
+}
+
+/// Forward connections on `listen` to `upstream`, sending at most `bytes_per_second` each way on
+/// each connection.
+async fn start_link(listen: u16, upstream: u16, bytes_per_second: f64) {
+    let listener = tokio::net::TcpListener::bind(("127.0.0.1", listen))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        while let Ok((inbound, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let Ok(outbound) = tokio::net::TcpStream::connect(("127.0.0.1", upstream)).await
+                else {
+                    return;
+                };
+                let (inbound_read, inbound_write) = inbound.into_split();
+                let (outbound_read, outbound_write) = outbound.into_split();
+                tokio::join!(
+                    pump(inbound_read, outbound_write, bytes_per_second),
+                    pump(outbound_read, inbound_write, bytes_per_second),
+                );
+            });
+        }
+    });
+}
+
+async fn pump(
+    mut from: tokio::net::tcp::OwnedReadHalf,
+    mut to: tokio::net::tcp::OwnedWriteHalf,
+    bytes_per_second: f64,
+) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut buffer = vec![0_u8; 64 * 1024];
+    while let Ok(read) = from.read(&mut buffer).await {
+        if read == 0 || to.write_all(&buffer[..read]).await.is_err() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs_f64(read as f64 / bytes_per_second)).await;
+    }
+    let _ = to.shutdown().await;
 }
 
 fn node_dir(
