@@ -14,12 +14,26 @@ local file.
 The GitHub provider supports `head`, `state`, `review`, and `checks`.
 
 The repository provider supports `pull_requests` and `issues`. It retains discoveries and filters draft pull requests.
+Each listed pull request records its `number`, `url`, `title`, `head` SHA, `branch`, `author` login,
+`state`, and `draft`. A retained pull request that leaves the open listing becomes `closed`; an open
+listing cannot tell a merge from a closure.
 
 The `github.ref` provider supports `head` and `ancestors`. `head` is the selected branch's commit SHA.
 `ancestors` contains the full `refs/heads/NAME` name of every other repository branch whose head is
 reachable from the selected branch.
 
 Each newly ready pull request becomes one `vcs.pull-request` resource. Each new issue becomes one `vcs.issue` resource.
+A pull request resource follows its item: a new head, a closure, and a return to draft each record
+one more observation of it, with `head_sha`, `branch`, `author`, and `state`.
+
+Agents open pull requests with a shared GitHub identity, so the author login cannot say which agent
+opened one. When a pull request appears or moves to a new head, the observing host looks for the
+agent on that host whose workspace has the pull request's branch checked out. When exactly one
+agent has it, the listing records that agent as `opened_by` and its mission run as `opened_by_run`.
+A pull request keeps an opener once named, so a reviewer or fixer that later checks out the branch
+does not take it over. When no agent is named, a mission run that published
+`resource/mission-run/RUN/pull-request` for the pull request becomes its `opened_by_run`. A review
+mission routes its findings to that agent or run.
 
 The local file provider supports `status`, `path`, `content_hash`, `size`, `mode`, and `reason`. It never returns file content.
 
@@ -185,7 +199,10 @@ subscription "new-ready-pull-requests" {
 ```
 
 The repository provider creates one mission request for each newly discovered issue and each new
-ready pull request head. The run input pins that item's exact discovery claim. Requests for the
+ready pull request head. A pull request is reviewed at a head only when it first appears open and
+ready, when a draft becomes ready, or when a new head replaces a known one. A closure, a merge, a
+reopening at the same head, a title edit, and a field that an older build did not record never
+request a review. A known item whose head was never recorded gets a baseline head, not a review. The run input pins that item's exact discovery claim. Requests for the
 same mission, stable local subscription name, item, and PR head are remembered across replacement
 intake runs; a title or state change at the same head cannot start another review. Distinct local
 subscription names can still start separate workflows. An issue number is triaged once per
@@ -213,6 +230,15 @@ A released request starts like any pending request. A cancelled request never st
 An optional `requester` assigns run revision authority to one exact agent or person. The requester still needs its matching `mission-authority` rule.
 
 A draft pull request does not create a resource. Its first ready observation creates one resource and one mission request.
+
+A pull request review request that has not started, including one waiting for capacity or held for
+a person, starts only while its head is the open pull request's current head. When the pull request
+resource shows it closed, back in draft, or at a newer head, the reconciler records
+`subscription.mission-request-cancelled` with the reason instead of starting it. The newer head has
+its own request.
+
+A request recorded before item claims carried `head_sha` is matched by the head that its item
+claim's cited repository listing named.
 
 The GitHub issues endpoint also returns pull requests. The provider removes those records from the issue collection.
 
@@ -293,6 +319,11 @@ mission cancellation to stop it.
 - The first observation creates a baseline and no message.
 - An unchanged provider result creates no claim and no message.
 - A selected scalar field change creates one observation claim and one message.
+- A replacement intake over older discovery history requests no review for a closed or merged pull
+  request, or for an item whose only change is a field the older build did not record.
+- A pending or held review of a pull request that closed or moved to a newer head is cancelled with
+  its reason, and only the current head is reviewed.
+- A new pull request names the one agent on the observing host whose workspace has its branch.
 - Each new repository collection item creates one resource and one mission request; a new ready PR
   head creates one more, and an unchanged head or issue does not replay across intake restarts.
 - A renamed locator and a first complete listing create no mission request.
