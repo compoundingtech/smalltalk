@@ -1330,7 +1330,9 @@ impl CompactReplicationInventory {
         }
     }
 
-    /// Insert one identity in order. The digest is left for the caller to recompute.
+    /// Insert one identity in order. An identity already held as a tombstone gets its payload
+    /// back instead, as `full_compact_replication_inventory` reads a held and tombstoned one.
+    /// The digest is left for the caller to recompute.
     fn insert(&mut self, identity: ReplicaEnvelopeId) {
         let writer = match self.writers.binary_search(&identity.writer) {
             Ok(writer) => writer,
@@ -1345,11 +1347,20 @@ impl CompactReplicationInventory {
             }
         };
         let envelope = self.compact(writer as u32, identity);
-        let position = self
+        match self
             .envelopes
             .binary_search_by(|probe| self.order(probe, &envelope))
-            .unwrap_or_else(|at| at);
-        self.envelopes.insert(position, envelope);
+        {
+            Ok(_) if envelope.irregular == 0 => {
+                self.payloadless.remove(&envelope.hash);
+            }
+            Ok(_) => {
+                let identity = self.identity(&envelope);
+                self.payloadless_irregular.remove(&identity);
+                self.irregular_hashes.pop();
+            }
+            Err(position) => self.envelopes.insert(position, envelope),
+        }
     }
 
     fn order(&self, left: &CompactEnvelopeId, right: &CompactEnvelopeId) -> std::cmp::Ordering {
@@ -22445,9 +22456,10 @@ fn replication_inventory_difference(
                     })
             })
             .count();
+        // A peer may list an identity twice, so neither count may go below zero.
         return Some((
-            (remote.envelopes.len() - shared) as u64,
-            (inventory.envelopes.len() - shared) as u64,
+            remote.envelopes.len().saturating_sub(shared) as u64,
+            inventory.envelopes.len().saturating_sub(shared) as u64,
         ));
     }
     None
@@ -22901,6 +22913,38 @@ fn compact_replication_inventory_matches_its_public_identities() {
             .iter()
             .any(|id| id.hash == hash)
     }
+}
+
+/// An envelope a node holds again after a checkpoint dropped it is listed once, with its
+/// payload, whether the inventory was read whole or extended by the new envelope.
+#[cfg(test)]
+#[test]
+fn a_tombstoned_identity_held_again_is_listed_once() {
+    let mut identities = test_envelope_ids("hetz-like", [1, 2], "a");
+    identities.push(ReplicaEnvelopeId {
+        writer: "hetz-like".into(),
+        sequence: 3,
+        hash: "not-a-hash".into(),
+    });
+    let mut inventory = CompactReplicationInventory::default();
+    for identity in &identities {
+        inventory.push_sorted(identity.clone());
+        inventory.mark_last_payloadless();
+    }
+    for identity in &identities {
+        inventory.insert(identity.clone());
+    }
+    inventory.refresh_digest();
+
+    assert_eq!(inventory.public().envelopes, identities);
+    assert_eq!(inventory.digest, replication_inventory_digest(&identities));
+    assert!(
+        inventory
+            .envelopes
+            .iter()
+            .all(|envelope| inventory.has_payload(envelope))
+    );
+    assert_eq!(inventory.irregular_hashes.len(), 1);
 }
 
 #[cfg(test)]

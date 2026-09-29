@@ -5,7 +5,8 @@
 //! between random pairs that deliver a random part of each exchange in a random order, partitions
 //! and heals, nodes offline for days, clock skew of up to three days, checkpoint work (seal,
 //! verify, trim) at random points, crashes at every trim boundary, restarts, excusals by a
-//! person, new empty nodes, and an old-build node that never takes part in checkpoints.
+//! person, nodes away for days while the others checkpoint without them, new empty nodes, and
+//! an old-build node that never takes part in checkpoints.
 //!
 //! An oracle node receives every envelope the moment it is written and never trims. After the
 //! schedule, the run heals every partition, brings every node back, and exchanges and runs
@@ -18,10 +19,12 @@
 //! 5. the same trimmed checkpoint and the same tombstones, field by field, and tombstones
 //!    that match the drop digest of the certificate it trimmed;
 //! 6. no invalid record, and no record still pending;
-//! 7. for every claim it lacks, a tombstone, and only for claims a rule may drop. When people
-//!    excused each side of a partition, one side's certificate may have dropped a claim the
-//!    chosen one keeps, so a node may lack a claim without a tombstone, but only a claim some
-//!    node tombstoned.
+//! 7. for every claim it lacks, a tombstone, and only for claims a rule may drop. When a cut
+//!    ended with two certificates, one per side of an excused partition, the side whose
+//!    certificate lost may have dropped a claim the chosen one keeps, so a node may lack a claim
+//!    without a tombstone, but only a claim some node tombstoned. An old build keeps no
+//!    tombstones, so it may lack a claim the others dropped while it was excused, but only
+//!    such a claim.
 //!
 //! Also, no cut has two certificates unless people excused each side of a partition, no proof
 //! fails, no trim finds the graph changed, and no node's committed index ever moves back.
@@ -836,7 +839,7 @@ impl World {
                         self.write(index);
                     }
                 }
-                40..=64 => {
+                40..=59 => {
                     let to = self.rng.below(count);
                     if self.can_exchange(index, to) {
                         let received = self.exchange(index, to, false);
@@ -847,11 +850,13 @@ impl World {
                         }
                     }
                 }
-                65..=76 => {
+                60..=64 => self.settle(index),
+                65..=74 => {
                     if self.nodes[index].online && !self.nodes[index].old_build {
                         self.checkpoint_work(index, true);
                     }
                 }
+                75..=76 => self.away(index),
                 77..=81 => {
                     self.days += 1;
                     for node in 0..count {
@@ -890,8 +895,12 @@ impl World {
                     }
                 }
                 _ => {
-                    self.nodes[index].skew_ms =
-                        (self.rng.below(6 * 24) as i64 - 3 * 24) * DAY_MS / 24;
+                    // Half the time the machine corrects its clock.
+                    self.nodes[index].skew_ms = if self.rng.chance(50) {
+                        0
+                    } else {
+                        (self.rng.below(6 * 24) as i64 - 3 * 24) * DAY_MS / 24
+                    };
                     self.set_clock(index);
                     self.note(format!(
                         "{} skew {}h",
@@ -899,6 +908,48 @@ impl World {
                         self.nodes[index].skew_ms / (DAY_MS / 24)
                     ));
                 }
+            }
+        }
+    }
+
+    /// The replication worker catching up: the online nodes that `index` can reach exchange
+    /// everything and run checkpoint work, crashes included, until nothing moves. Checkpoints
+    /// seal, verify and trim here while other nodes are offline, partitioned or skewed.
+    fn settle(&mut self, index: usize) {
+        if !self.nodes[index].online {
+            return;
+        }
+        let members = (0..self.nodes.len())
+            .filter(|other| *other == index || self.can_exchange(index, *other))
+            .collect::<Vec<_>>();
+        let names = members
+            .iter()
+            .map(|member| self.nodes[*member].name.as_str())
+            .collect::<Vec<_>>()
+            .join(",");
+        self.note(format!("settle {names}"));
+        for _ in 0..6 {
+            let mut moved = false;
+            for &from in &members {
+                for &to in &members {
+                    if from != to {
+                        moved |= self.exchange(from, to, true) != 0;
+                    }
+                }
+            }
+            for &member in &members {
+                if !self.nodes[member].old_build {
+                    moved |= self.checkpoint_work(member, true).iter().any(|action| {
+                        !matches!(
+                            action,
+                            CheckpointAction::ManifestNeeded { .. }
+                                | CheckpointAction::AttentionRequested { .. }
+                        )
+                    });
+                }
+            }
+            if !moved {
+                return;
             }
         }
     }
@@ -920,11 +971,16 @@ impl World {
             return;
         }
         let writer = self.nodes[*self.rng.pick(&candidates)].name.clone();
+        self.excuse_writer(index, writer, "unreachable in the simulation");
+    }
+
+    /// A person on the node at `index` excuses `writer` from checkpoints.
+    fn excuse_writer(&mut self, index: usize, writer: String, reason: &str) {
         let result = self.nodes[index]
             .store
             .excuse_checkpoint_writer(&CheckpointExcuseRequest {
                 writer: writer.clone(),
-                reason: "unreachable in the simulation".into(),
+                reason: reason.into(),
                 actor: PERSON.into(),
             });
         match result {
@@ -944,6 +1000,50 @@ impl World {
                 );
                 self.fail(message);
             }
+        }
+    }
+
+    /// A node goes away for a few days while the others carry on: they write, exchange and
+    /// run checkpoint work each day, and a person usually excuses the absent node so
+    /// checkpoints go on without it. Half the time it comes back at the end and catches up,
+    /// which adopts any checkpoint it missed.
+    fn away(&mut self, index: usize) {
+        if !self.nodes[index].online {
+            return;
+        }
+        self.nodes[index].online = false;
+        let name = self.nodes[index].name.clone();
+        self.note(format!("{name} away"));
+        let people = (0..self.nodes.len())
+            .filter(|other| self.nodes[*other].online && !self.nodes[*other].old_build)
+            .collect::<Vec<_>>();
+        if !people.is_empty() && !self.nodes[index].old_build && self.rng.chance(70) {
+            let person = *self.rng.pick(&people);
+            self.excuse_writer(person, name.clone(), "away for a few days");
+        }
+        for _ in 0..2 + self.rng.below(2) {
+            self.days += 1;
+            for node in 0..self.nodes.len() {
+                self.set_clock(node);
+            }
+            self.note(format!("day {}", self.days));
+            let online = (0..self.nodes.len())
+                .filter(|other| self.nodes[*other].online)
+                .collect::<Vec<_>>();
+            if online.is_empty() {
+                continue;
+            }
+            for _ in 0..3 + self.rng.below(6) {
+                let writer = *self.rng.pick(&online);
+                self.write(writer);
+            }
+            let anchor = *self.rng.pick(&online);
+            self.settle(anchor);
+        }
+        if self.rng.chance(50) {
+            self.nodes[index].online = true;
+            self.note(format!("{name} back"));
+            self.settle(index);
         }
     }
 
@@ -968,17 +1068,7 @@ impl World {
         {
             self.groups = vec![0; count];
             let writer = self.nodes[old].name.clone();
-            let claim = self.nodes[person]
-                .store
-                .excuse_checkpoint_writer(&CheckpointExcuseRequest {
-                    writer: writer.clone(),
-                    reason: "an old build".into(),
-                    actor: PERSON.into(),
-                })
-                .unwrap();
-            self.person_claims.insert(claim.id);
-            self.tap(person);
-            self.note(format!("{} excuses {writer}", self.nodes[person].name));
+            self.excuse_writer(person, writer, "an old build");
         }
         for _ in 0..80 {
             let mut moved = false;
@@ -1040,6 +1130,14 @@ impl World {
                     .checkpoint_manifest(&trimmed.id, trimmed.cut_unix_ms)
                     .unwrap()
             })
+        });
+        // Only a cut with two certificates, one per side of an excused partition, lets a node
+        // lack a claim without its own tombstone.
+        let split = first_new.is_some_and(|index| {
+            let claims = self.nodes[index].store.checkpoint_claims().unwrap();
+            stable_checkpoints(&claims)
+                .values()
+                .any(|certified| certified.len() > 1)
         });
         let mut failures = Vec::new();
         if oracle.invalid_records != 0 {
@@ -1109,7 +1207,7 @@ impl World {
                         ));
                     }
                     None if !tombstones.contains(id)
-                        && !(self.excused_while_partitioned && self.tombstoned.contains(id)) =>
+                        && !((split || node.old_build) && self.tombstoned.contains(id)) =>
                     {
                         failures.push(format!(
                             "{name}: lacks {id} ({} on {}) without a tombstone",
@@ -1259,31 +1357,59 @@ fn run_seeds(seeds: impl IntoIterator<Item = u64>) {
     assert!(trimmed * 2 >= runs, "only {trimmed} of {runs} runs trimmed");
 }
 
-#[test]
-fn every_seed_converges() {
-    run_seeds(SEEDS.iter().copied());
+/// Every fourth fixed seed from `first`. The seeds run as four tests so the test runner
+/// spreads them over its threads.
+fn every_fourth_seed(first: usize) {
+    run_seeds(SEEDS.iter().skip(first).step_by(4).copied());
 }
 
-/// Each deliberate bug must fail the first runs it happens in, not just some run.
 #[test]
-fn the_checks_catch_each_deliberate_bug() {
-    for sabotage in [Sabotage::ForgetTombstones, Sabotage::PartialAdoption] {
-        let mut happened = 0;
-        for seed in SEEDS {
-            let outcome = run(*seed, sabotage);
-            if outcome.sabotaged {
-                assert!(
-                    outcome.failure.is_some(),
-                    "seed {seed} ran into {sabotage:?} and passed"
-                );
-                happened += 1;
-                if happened == 2 {
-                    break;
-                }
+fn every_seed_converges_0() {
+    every_fourth_seed(0);
+}
+
+#[test]
+fn every_seed_converges_1() {
+    every_fourth_seed(1);
+}
+
+#[test]
+fn every_seed_converges_2() {
+    every_fourth_seed(2);
+}
+
+#[test]
+fn every_seed_converges_3() {
+    every_fourth_seed(3);
+}
+
+/// The deliberate bug must fail the first runs it happens in, not just some run.
+fn the_checks_catch(sabotage: Sabotage) {
+    let mut happened = 0;
+    for seed in SEEDS {
+        let outcome = run(*seed, sabotage);
+        if outcome.sabotaged {
+            assert!(
+                outcome.failure.is_some(),
+                "seed {seed} ran into {sabotage:?} and passed"
+            );
+            happened += 1;
+            if happened == 2 {
+                break;
             }
         }
-        assert!(happened > 0, "no seed ran into {sabotage:?}");
     }
+    assert!(happened > 0, "no seed ran into {sabotage:?}");
+}
+
+#[test]
+fn the_checks_catch_a_trim_that_forgets_its_tombstones() {
+    the_checks_catch(Sabotage::ForgetTombstones);
+}
+
+#[test]
+fn the_checks_catch_a_partial_adoption() {
+    the_checks_catch(Sabotage::PartialAdoption);
 }
 
 #[test]
@@ -1305,43 +1431,4 @@ fn explore() {
         .unwrap_or(100);
     let start = now_ms() as u64;
     run_seeds((0..runs).map(|offset| start.wrapping_add(offset)));
-}
-
-#[test]
-#[ignore = "temporary timing probe"]
-fn probe_sabotage_timing() {
-    let from: u64 = std::env::var("PROBE_FROM").map_or(0, |v| v.parse().unwrap());
-    let count: u64 = std::env::var("PROBE_COUNT").map_or(0, |v| v.parse().unwrap());
-    let seeds: Vec<u64> = if count == 0 { SEEDS.to_vec() } else { (from..from + count).collect() };
-    let sabotages = match std::env::var("PROBE_SABOTAGE").as_deref() {
-        Ok("all") => vec![Sabotage::None, Sabotage::ForgetTombstones, Sabotage::PartialAdoption],
-        _ => vec![Sabotage::None],
-    };
-    for sabotage in sabotages {
-        for seed in &seeds {
-            let started = std::time::Instant::now();
-            let mut world = World::new(*seed, sabotage);
-            let steps = 300 + world.rng.below(300);
-            world.run_schedule(steps);
-            if !world.quiesce() {
-                world.fail("the nodes did not stop moving".into());
-            }
-            world.check();
-            let adopts = world.schedule.iter().filter(|line| line.contains(" adopts ")).count();
-            let trimmed = world
-                .nodes
-                .iter()
-                .any(|node| node.store.trimmed_checkpoint().unwrap().is_some());
-            eprintln!(
-                "PROBE {sabotage:?} seed={seed} failed={} sabotaged={} trimmed={trimmed} adopts={adopts} excused={} ms={}",
-                !world.failures.is_empty(),
-                world.sabotaged,
-                world.excused_while_partitioned,
-                started.elapsed().as_millis()
-            );
-            if !world.failures.is_empty() && sabotage == Sabotage::None {
-                eprintln!("{}", world.report());
-            }
-        }
-    }
 }
