@@ -709,6 +709,11 @@ impl Store {
         let _guards: Vec<_> = (0..READ_CONNECTIONS).map(|_| self.readers.get()).collect();
         hold();
     }
+
+    pub(crate) fn hold_writer_for_test(&self, hold: impl FnOnce()) {
+        let _writer = self.connection.write();
+        hold();
+    }
 }
 
 #[derive(Clone)]
