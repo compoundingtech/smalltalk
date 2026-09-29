@@ -2280,6 +2280,85 @@ fn normalized_timeline_usage_body(
     Value::Object(body)
 }
 
+/// The Small Talk in one session's conversation: messages sent for this session, and messages
+/// to or from its agent that name no session, accepted while this incarnation was the agent's
+/// current one. st joins them into the timeline so every client shows the same conversation.
+fn session_messages(
+    state: &AppState,
+    owner: &str,
+    session_id: &str,
+    incarnation: Option<&str>,
+    before: Option<u64>,
+) -> Result<Vec<ClaimRecord>, ApiError> {
+    // The incarnation's life: from its first runtime observation to the next incarnation's.
+    let (mut started, mut ended) = (None::<u128>, None::<u128>);
+    if let Some(incarnation) = incarnation {
+        let observed = state
+            .store
+            .claims_for(owner, Some("runtime.observed"))
+            .map_err(ApiError::internal)?;
+        let of = |claim: &ClaimRecord| {
+            claim
+                .body
+                .pointer("/fields/incarnation_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        started = observed
+            .iter()
+            .filter(|claim| of(claim).as_deref() == Some(incarnation))
+            .map(|claim| claim.accepted_at_unix_ms)
+            .min();
+        if let Some(started) = started {
+            ended = observed
+                .iter()
+                .filter(|claim| {
+                    claim.accepted_at_unix_ms > started
+                        && of(claim).is_some_and(|other| other != incarnation)
+                })
+                .map(|claim| claim.accepted_at_unix_ms)
+                .min();
+        }
+    }
+    let mut messages = state
+        .store
+        .claims_for_kind_at("message.sent", before, true, 10_000)
+        .map_err(ApiError::internal)?
+        .claims;
+    messages.retain(|claim| {
+        let fields = claim.body.get("fields").unwrap_or(&claim.body);
+        let from = fields.get("from").and_then(Value::as_str);
+        let to = fields.get("to").and_then(Value::as_str);
+        if from != Some(owner) && to != Some(owner) {
+            return false;
+        }
+        match fields.get("session_id").and_then(Value::as_str) {
+            Some(message_session) => message_session == session_id,
+            None => {
+                started.is_none_or(|started| claim.accepted_at_unix_ms >= started)
+                    && ended.is_none_or(|ended| claim.accepted_at_unix_ms < ended)
+            }
+        }
+    });
+    Ok(messages)
+}
+
+/// A message's timeline body: who wrote to whom, about what, so a client can draw Small Talk
+/// apart from the harness's own turns.
+fn session_message_body(claim: &ClaimRecord) -> Value {
+    let fields = claim.body.get("fields").unwrap_or(&claim.body);
+    let mut body = json!({
+        "message_id": claim.subject,
+        "reply_to": fields.get("in_reply_to"),
+        "from": fields.get("from"),
+        "to": fields.get("to"),
+    });
+    if let Some(title) = fields.get("title").and_then(Value::as_str) {
+        body["title"] = Value::String(title.to_owned());
+    }
+    body
+}
+
 fn native_timeline_page(
     state: &AppState,
     snapshot: &ClientSnapshot,
@@ -2289,30 +2368,19 @@ fn native_timeline_page(
 ) -> Result<Json<Value>, ApiError> {
     let mut items =
         crate::external_sessions::normalized_timeline(external).map_err(ApiError::internal)?;
-    if let Some((owner, _, _)) =
+    if let Some((owner, incarnation, _)) =
         super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
             .map_err(ApiError::internal)?
     {
-        for claim in state
-            .store
-            .claims_for_kind_at(
-                "message.sent",
-                snapshot.store_index.checked_add(1),
-                true,
-                10_000,
-            )
-            .map_err(ApiError::internal)?
-            .claims
-        {
+        for claim in session_messages(
+            state,
+            &owner,
+            session_id,
+            incarnation.as_deref(),
+            snapshot.store_index.checked_add(1),
+        )? {
             let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            if fields.get("session_id").and_then(Value::as_str) != Some(session_id) {
-                continue;
-            }
             let from = fields.get("from").and_then(Value::as_str);
-            let to = fields.get("to").and_then(Value::as_str);
-            if from != Some(owner.as_str()) && to != Some(owner.as_str()) {
-                continue;
-            }
             let role = if from == Some(owner.as_str()) {
                 "assistant"
             } else {
@@ -2321,7 +2389,7 @@ fn native_timeline_page(
             let stamp = client_timestamp(claim.accepted_at_unix_ms);
             let digest = hex::encode(Sha256::digest(claim.id.as_bytes()));
             let base = claim.store_index.saturating_mul(4);
-            items.push(json!({"id":format!("timeline-entry/{}/{}-message", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base, "revision":1, "timestamp":stamp, "role":role, "type":"message", "final":true, "body":{"message_id":claim.subject,"reply_to":fields.get("in_reply_to")}}));
+            items.push(json!({"id":format!("timeline-entry/{}/{}-message", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base, "revision":1, "timestamp":stamp, "role":role, "type":"message", "final":true, "body":session_message_body(&claim)}));
             items.push(json!({"id":format!("timeline-entry/{}/{}-content", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base+1, "revision":1, "timestamp":stamp, "role":role, "type":"content", "final":true, "body":{"media_type":"text/plain","text":fields.get("content").and_then(Value::as_str).unwrap_or_default()}}));
         }
         items.sort_by(|a, b| {
@@ -2616,11 +2684,7 @@ pub(super) fn timeline_value(
         .claims;
     owner_claims.reverse();
     owner_claims.retain(|claim| claim.kind != "harness.timeline");
-    let mut message_claims = state
-        .store
-        .claims_for_kind_at("message.sent", before, true, 10_000)
-        .map_err(ApiError::internal)?
-        .claims;
+    let mut message_claims = session_messages(state, owner, &session_id, incarnation, before)?;
     message_claims.reverse();
     let mut claims = timeline_claims;
     claims.extend(owner_claims);
@@ -2838,14 +2902,8 @@ pub(super) fn timeline_value(
             continue;
         }
         if claim.kind == "message.sent" {
-            if fields.get("session_id").and_then(Value::as_str) != Some(session_id.as_str()) {
-                continue;
-            }
+            // Only session_messages put a message here.
             let from = fields.get("from").and_then(Value::as_str);
-            let to = fields.get("to").and_then(Value::as_str);
-            if from != Some(owner) && to != Some(owner) {
-                continue;
-            }
             let role = if from == Some(owner) {
                 "assistant"
             } else {
@@ -2854,10 +2912,7 @@ pub(super) fn timeline_value(
             items.push(json!({
                 "id": entry_id(&claim, "message"), "sequence": base_sequence,
                 "revision": 1, "timestamp": timestamp, "role": role, "type": "message",
-                "final": true, "body": {
-                    "message_id": claim.subject,
-                    "reply_to": fields.get("in_reply_to")
-                }
+                "final": true, "body": session_message_body(&claim)
             }));
             items.push(json!({
                 "id": entry_id(&claim, "content"), "sequence": base_sequence + 1,
@@ -2912,7 +2967,7 @@ fn conversation_cursor(
     )
 }
 
-fn conversation_session_id(state: &AppState, id: &str) -> Result<String, ApiError> {
+pub(super) fn conversation_session_id(state: &AppState, id: &str) -> Result<String, ApiError> {
     if id.starts_with("agent/") {
         let status = state
             .store
@@ -3083,7 +3138,10 @@ fn conversation_read_now(
         {
             let fields = claim.body.get("fields").unwrap_or(&claim.body);
             if claim.store_index > store_index
-                && fields.get("session_id").and_then(Value::as_str) == Some(session_id)
+                && fields
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|message_session| message_session == session_id)
                 && owner.as_deref().is_some_and(|owner| {
                     fields.get("from").and_then(Value::as_str) == Some(owner)
                         || fields.get("to").and_then(Value::as_str) == Some(owner)
@@ -8137,7 +8195,92 @@ mission "example/zero-run" state="ready" {
             .iter()
             .filter_map(|item| item["body"]["text"].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(text, vec!["current composer message"]);
+        // A message that names no session belongs to the session current when it arrived; one
+        // that names an older session does not.
+        assert_eq!(
+            text,
+            vec!["generic legacy message", "current composer message"]
+        );
+
+        // The agent's own Small Talk joins its conversation, saying who wrote to whom.
+        let _ = accept_message(
+            &state,
+            MessageSendRequest {
+                idempotency_key: "session-message-outgoing".into(),
+                from: subject.into(),
+                to: "agent/session-message-peer".into(),
+                content: "outgoing small talk".into(),
+                title: Some("A question".into()),
+                in_reply_to: None,
+                tags: Vec::new(),
+            },
+            None,
+        )
+        .unwrap();
+        let timeline = timeline_value(
+            &state,
+            &new_client_snapshot(&state),
+            &client_session,
+            &session_id,
+            &ClientListQuery::default(),
+        )
+        .unwrap()
+        .0;
+        let items = timeline["items"].as_array().unwrap();
+        let outgoing = items
+            .iter()
+            .position(|item| item["body"]["text"] == "outgoing small talk")
+            .expect("the agent's own message is in its conversation");
+        let header = &items[outgoing - 1];
+        assert_eq!(header["type"], "message");
+        assert_eq!(header["role"], "assistant");
+        assert_eq!(header["body"]["from"], subject);
+        assert_eq!(header["body"]["to"], "agent/session-message-peer");
+        assert_eq!(header["body"]["title"], "A question");
+
+        // A new incarnation starts a new conversation: earlier Small Talk stays with the old one.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    (
+                        "runtime_id".into(),
+                        Value::String("session-message-runtime".into()),
+                    ),
+                    (
+                        "incarnation_id".into(),
+                        Value::String("session-message-runtime:i3".into()),
+                    ),
+                    ("terminal".into(), Value::Bool(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("session-message-runtime-i3".into()),
+            })
+            .unwrap();
+        let next_session = super::managed_session_id(subject, "session-message-runtime:i3");
+        let next = timeline_value(
+            &state,
+            &new_client_snapshot(&state),
+            &client_session,
+            &next_session,
+            &ClientListQuery::default(),
+        )
+        .unwrap()
+        .0;
+        assert!(
+            next["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["body"]["text"].is_null()),
+            "{next:#}"
+        );
     }
 
     #[test]

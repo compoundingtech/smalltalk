@@ -1138,6 +1138,12 @@ pub struct TimelineMessageBody {
     pub message_id: String,
     #[serde(default)]
     pub reply_to: Option<String>,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

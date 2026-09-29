@@ -2956,7 +2956,9 @@ async fn client_sessions_detail(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     if let Some(id) = id.strip_suffix("/timeline") {
-        let session_id = client_detail_id("session", id);
+        // An agent's timeline is its current session's: st resolves it, not the client.
+        let session_id = client_v0::conversation_session_id(&state, id)?;
+        let id = session_id.as_str();
         let managed = managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
             .map_err(ApiError::internal)?;
         if let Some((_, _, origin)) = managed {
