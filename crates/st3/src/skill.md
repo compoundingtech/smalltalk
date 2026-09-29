@@ -35,8 +35,9 @@ it.
 ## Attention
 
 `"$ST3_BIN" attention request --for PERSON --title TEXT --reason TEXT --as "$ST_AGENT"` puts an
-item in that person's `st now`. `attention withdraw ATTENTION --reason TEXT --as "$ST_AGENT"`
-removes it once it no longer applies.
+item in that person's `st now`. It closes on its own when the step this seat has claimed ends,
+unless it names a `--target` that can end or another way `attention request --help` lists.
+`attention withdraw ATTENTION --reason TEXT --as "$ST_AGENT"` removes it once it no longer applies.
 
 ## Other agents' terminals
 

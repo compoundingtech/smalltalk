@@ -1928,6 +1928,9 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("severity", required_enum(&["warning", "error"])),
             ("targets", array()),
             ("until", string()),
+            ("step", reference_to(&["step-run"])),
+            ("step_attempt", integer()),
+            ("closed_by", enumeration(&["person", "st"])),
         ],
         "attention.resolved" => &[
             ("request", required_string()),
