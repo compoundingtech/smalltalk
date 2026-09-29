@@ -15731,6 +15731,34 @@ version 2
         let (_, still_pending) = get_request(app.clone(), "/v1/reviews").await;
         assert_eq!(still_pending.as_array().unwrap().len(), 2);
 
+        // A newer build asks the mission gate again as a new operation. The reviewer sees one
+        // review, aged from the first request, and the decision answers the request the gate
+        // now waits on.
+        let mut again_fields = request_fields(
+            run.subject.clone(),
+            run.revision.clone(),
+            "gate-operation/review-api/mission-again",
+        );
+        again_fields.insert("mode".into(), Value::String("approve".into()));
+        let mission_again = store
+            .append_claim(&ClaimInput {
+                subject: "gate-operation/review-api/mission-again".into(),
+                kind: "gate.requested".into(),
+                actor: None,
+                fields: again_fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("mission-review-again".into()),
+            })
+            .unwrap();
+        let (_, asked_again) = get_request(app.clone(), "/v1/reviews").await;
+        assert_eq!(asked_again.as_array().unwrap().len(), 2, "{asked_again}");
+        assert_eq!(asked_again[1]["request"], mission_again.id);
+        assert_eq!(
+            asked_again[1]["requested_at_unix_ms"],
+            json!(mission_request.accepted_at_unix_ms)
+        );
+
         let body = |actor: &str| {
             serde_json::to_value(ReviewRequest {
                 decision: "approved".into(),
@@ -15758,8 +15786,9 @@ version 2
         assert_eq!(status, StatusCode::OK, "{accepted_mission}");
         assert_eq!(
             accepted_mission["body"]["fields"]["request"],
-            mission_request.id
+            mission_again.id
         );
+        assert_eq!(accepted_mission["subject"], mission_again.subject);
         assert_eq!(accepted_mission["body"]["fields"]["verdict"], "pass");
 
         let missing_reason = serde_json::to_value(ReviewRequest {
