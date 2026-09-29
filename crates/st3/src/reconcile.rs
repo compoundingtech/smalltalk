@@ -123,7 +123,6 @@ pub trait RuntimeControl: Send + Sync + 'static {
         expected_incarnation: Option<&str>,
     ) -> Result<()>;
     fn remove(&self, runtime_id: &str, terminal: bool) -> Result<()>;
-    fn attach(&self, runtime_id: &str) -> Result<()>;
     fn screen(&self, runtime_id: &str) -> Result<String>;
     fn send_key(&self, runtime_id: &str, key: &str) -> Result<()>;
     fn read_exec_log(&self, runtime_id: &str) -> Result<Option<String>>;
@@ -354,10 +353,6 @@ impl RuntimeControl for NativeRuntime {
         } else {
             self.exec.remove(runtime_id)
         }
-    }
-
-    fn attach(&self, runtime_id: &str) -> Result<()> {
-        self.pty()?.attach(runtime_id)
     }
 
     fn screen(&self, runtime_id: &str) -> Result<String> {
@@ -2428,10 +2423,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .and_then(Value::as_str)
                     == Some(desired_token.as_str())
             }))
-    }
-
-    pub fn attach(&self, runtime_id: &str) -> Result<()> {
-        self.runtime.attach(runtime_id)
     }
 
     fn reconcile_stop(
@@ -10737,9 +10728,6 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
             } else {
                 self.execs.lock().unwrap().remove(runtime_id);
             }
-            Ok(())
-        }
-        fn attach(&self, _runtime_id: &str) -> Result<()> {
             Ok(())
         }
         fn screen(&self, runtime_id: &str) -> Result<String> {

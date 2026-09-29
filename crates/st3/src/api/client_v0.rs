@@ -5273,7 +5273,7 @@ async fn dispatch_action(
             let runtime_id = live.runtime_id.clone();
             tokio::task::spawn_blocking(move || {
                 let stream = std::os::unix::net::UnixStream::connect(&socket)?;
-                let mut connection = pty_core::client::SessionConnection::attach_over(
+                let mut connection = pty_client::SessionConnection::attach_over(
                     stream,
                     &runtime_id,
                     rows,

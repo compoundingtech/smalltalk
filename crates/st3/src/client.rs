@@ -5,8 +5,8 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use futures_util::{SinkExt as _, StreamExt as _};
-use pty_core::client::tty::{FdWriter, is_tty};
-use pty_core::client::{
+use pty_client::tty::{FdWriter, is_tty};
+use pty_client::{
     AttachParams, CURSOR_TO_BOTTOM, ClientIo, Reconnect, RouteRefusedError, TERMINAL_SANITIZE,
     attach,
 };

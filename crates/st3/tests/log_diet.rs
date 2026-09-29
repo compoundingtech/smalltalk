@@ -69,9 +69,6 @@ impl RuntimeControl for NoRuntime {
     fn remove(&self, _: &str, _: bool) -> Result<()> {
         Ok(())
     }
-    fn attach(&self, _: &str) -> Result<()> {
-        Ok(())
-    }
     fn screen(&self, _: &str) -> Result<String> {
         Ok(String::new())
     }
