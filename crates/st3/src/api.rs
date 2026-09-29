@@ -3340,6 +3340,7 @@ pub async fn serve_unix_bound(socket: &Path, app: Router) -> anyhow::Result<()> 
 }
 
 async fn serve_unix_inner(socket: &Path, app: Router, bind_harness: bool) -> anyhow::Result<()> {
+    crate::config::validate_unix_socket_path(socket, "--socket or --client-gateway-socket")?;
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent)?;
     }
