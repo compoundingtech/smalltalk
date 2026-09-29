@@ -159,6 +159,8 @@ pub struct UsageSummary {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
