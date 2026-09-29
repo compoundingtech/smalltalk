@@ -1205,14 +1205,21 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
         },
         "parameters": { "attention_id": "attention/alex-paired", "outcome": "resolved" }
     });
-    let (status, denied) = client_post_json_auth(
+    // The credential cannot read another person's queue, but any person can close any
+    // item. The close is recorded as the credential's own person.
+    let (status, closed) = client_post_json_auth(
         fabric.clone(),
         "/v1/client/actions",
         credential,
         cross_attention,
     )
     .await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+    assert_eq!(status, StatusCode::OK, "{closed}");
+    let resolution = store
+        .latest_claim("attention/alex-paired", Some("attention.resolved"))
+        .unwrap()
+        .expect("the item was closed");
+    assert_eq!(resolution.actor.as_deref(), Some("person/nathan"));
 
     let (_, current) =
         client_json_auth(fabric.clone(), "/v1/client/capabilities", credential).await;
