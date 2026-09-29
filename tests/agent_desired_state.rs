@@ -2,7 +2,7 @@ use std::fs;
 use std::path::Path;
 use std::process::{Command, Output};
 
-mod support;
+use crate::support;
 
 use support::RETIRED_RESOURCES;
 

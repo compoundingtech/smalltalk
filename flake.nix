@@ -124,6 +124,70 @@
               --target ${rustHostTarget} --offline ${pkgs.lib.escapeShellArgs flags}
           '';
 
+        # Each integration test file of a package is a module of the package's one `integration`
+        # test binary, so a gate selects files by test-name prefix (`hooks::`). A name filter that
+        # matched nothing would pass vacuously, so every prefix must run at least one test. The
+        # derivation's own check features apply, as they do to `cargoCheckHook`.
+        integrationTest =
+          {
+            label,
+            prefixes,
+            flags ? [ ],
+            testFlags ? [ ],
+          }:
+          ''
+            echo "--- cargo test: ${label}"
+            integration_features=()
+            if [ -n "''${cargoCheckFeatures-}" ]; then
+              integration_features=(--features "$(echo $cargoCheckFeatures | tr ' ' ,)")
+            fi
+            if ! cargo test -j "$NIX_BUILD_CORES" --release \
+              --target ${rustHostTarget} --offline "''${integration_features[@]}" \
+              ${pkgs.lib.escapeShellArgs flags} --test integration -- \
+              ${pkgs.lib.escapeShellArgs (testFlags ++ prefixes)} > integration-test.log 2>&1; then
+              cat integration-test.log
+              exit 1
+            fi
+            cat integration-test.log
+            for prefix in ${pkgs.lib.escapeShellArgs prefixes}; do
+              grep -q "^test $prefix.* \.\.\. ok$" integration-test.log || {
+                echo "no test named $prefix... ran" >&2
+                exit 1
+              }
+            done
+          '';
+
+        # st2's own crates, for every invocation of its hermetic suite: the same selection keeps
+        # the same feature resolution, so each invocation reuses the artifacts of the first.
+        st2WorkspaceTestFlags = [
+          "--workspace"
+          "--exclude"
+          "st2-resource-providers"
+          "--exclude"
+          "st2-github-issue-component"
+          "--exclude"
+          "st2-github-pr-component"
+          "--exclude"
+          "st2-pty-stats-component"
+          "--exclude"
+          "st2-vista-component"
+          # `checks.st3` gates these crates with the runtime inputs their tests need.
+          "--exclude"
+          "st-runtime"
+          "--exclude"
+          "st3"
+          "--exclude"
+          "st3-client"
+          "--exclude"
+          "st3-client-codegen"
+          "--exclude"
+          "st3-migrate"
+          "--exclude"
+          "st3-schema"
+          "--exclude"
+          "stui"
+        ];
+
         st2 = pkgs.rustPlatform.buildRustPackage {
           pname = "st2";
           inherit version;
@@ -182,7 +246,8 @@
           # parser/CLI/doc-ledger targets that need nothing but `tempfile` and the binary this
           # build just produced. A target belongs in this list iff it is hermetic — an ungated
           # hermetic target is a test that cannot fail CI, which is how `tests/agent_publish.rs`
-          # stayed red on `main` unnoticed.
+          # stayed red on `main` unnoticed. Most root integration test files are modules of st2's
+          # one `integration` binary, so `postCheck` runs the hermetic ones by name prefix.
           # The remaining root integration tests assume facilities the Nix build sandbox
           # deliberately lacks: `/usr/bin/git` on a hardcoded `PATH`, live PTY backends, or a
           # systemd `--user` manager. They remain native gates, while the flake proves that its
@@ -204,70 +269,39 @@
           # swap, ownership markers — gate here.
           # `--workspace` because the root is a real package: without it cargo
           # selects only `st2` and silently skips the `agent-spec` crate.
-          cargoTestFlags = [
-            "--workspace"
-            "--exclude"
-            "st2-resource-providers"
-            "--exclude"
-            "st2-github-issue-component"
-            "--exclude"
-            "st2-github-pr-component"
-            "--exclude"
-            "st2-pty-stats-component"
-            "--exclude"
-            "st2-vista-component"
-            # `checks.st3` gates these crates with the runtime inputs their tests need.
-            "--exclude"
-            "st-runtime"
-            "--exclude"
-            "st3"
-            "--exclude"
-            "st3-client"
-            "--exclude"
-            "st3-client-codegen"
-            "--exclude"
-            "st3-migrate"
-            "--exclude"
-            "st3-schema"
-            "--exclude"
-            "stui"
+          cargoTestFlags = st2WorkspaceTestFlags ++ [
             "--lib"
             "--bins"
             "--test"
             "discovery"
             "--test"
-            "codex_hooks"
-            "--test"
-            "hooks"
-            "--test"
-            "run"
-            "--test"
             "driver_expansion"
-            "--test"
-            "agent_address"
-            "--test"
-            "agent_desired_state"
-            "--test"
-            "claude_hooks"
-            "--test"
-            "agent_publish"
-            "--test"
-            "catalog_graph"
-            "--test"
-            "invariants"
-            "--test"
-            "message"
-            "--test"
-            "status_agents"
-            "--test"
-            "validate"
-            "--test"
-            "vrs_ledger"
             # Lifecycle tests fork while holding temporary sockets and executables.
             # Serial execution prevents sibling tests from inheriting those live handles.
             "--"
             "--test-threads=1"
           ];
+          # The hermetic root integration test files, as modules of st2's `integration` binary.
+          postCheck = integrationTest {
+            label = "hermetic integration tests";
+            prefixes = [
+              "codex_hooks::"
+              "hooks::"
+              "run::"
+              "agent_address::"
+              "agent_desired_state::"
+              "claude_hooks::"
+              "agent_publish::"
+              "catalog_graph::"
+              "invariants::"
+              "message::"
+              "status_agents::"
+              "validate::"
+              "vrs_ledger::"
+            ];
+            flags = st2WorkspaceTestFlags;
+            testFlags = [ "--test-threads=1" ];
+          };
 
           # A few unit tests write under $HOME; the sandbox HOME is not writable.
           preCheck = "export HOME=$(mktemp -d)";
@@ -425,30 +459,27 @@
           nativeBuildInputs = (old.nativeBuildInputs or [ ]) ++ [ pkgs.lld ];
           # Non-vacuous feature gate: both the runner's live resync integration and agent-spec's
           # wasm ABI/containment suite execute with the same features as the production variant.
-          postCheck = extraCargoTest {
-            label = "wasm-resolver feature suite";
-            flags = [
-              "--features"
-              "wasm-resolver"
-              "--workspace"
-              "--exclude"
-              "st2-resource-providers"
-              "--exclude"
-              "st2-github-issue-component"
-              "--exclude"
-              "st2-github-pr-component"
-              "--exclude"
-              "st2-pty-stats-component"
-              "--exclude"
-              "st2-vista-component"
-              "--test"
-              "resync"
-              "--test"
-              "resync_notify_chain"
-              "--test"
-              "profile_wasm"
-            ];
-          };
+          postCheck =
+            old.postCheck
+            + integrationTest {
+              label = "wasm-resolver feature suite";
+              prefixes = [
+                "resync::"
+                "resync_notify_chain::"
+              ];
+              flags = st2WorkspaceTestFlags;
+            }
+            + extraCargoTest {
+              label = "wasm-resolver feature suite: agent-spec";
+              flags = [
+                "--features"
+                "wasm-resolver"
+                "-p"
+                "agent-spec"
+                "--test"
+                "profile_wasm"
+              ];
+            };
         });
 
         providerComponentPackages = {
@@ -523,9 +554,7 @@
             "st2-resource-providers"
             "--lib"
             "--test"
-            "github_issue_component"
-            "--test"
-            "github_pr_component"
+            "integration"
           ];
           postCheck =
             extraCargoTest {
@@ -537,8 +566,16 @@
                 "wasip2-provider-runtime"
                 "--test"
                 "resource_profile_supervisor_e2e"
-                "--test"
-                "resource_provider_e2e"
+              ];
+            }
+            + integrationTest {
+              label = "wasip2 provider integration";
+              prefixes = [ "resource_provider_e2e::" ];
+              flags = [
+                "-p"
+                "st2"
+                "--features"
+                "wasip2-provider-runtime"
               ];
             }
             + extraCargoTest {
@@ -558,9 +595,9 @@
         # Sandbox-safe integration episodes the package's own release-mode boundary cannot reach,
         # sharing one default-feature build because they differ only by test selection:
         #   * `atomic_pty_snapshot` — the atomic snapshot boundary, split out of the broad doctor
-        #     suite (some doctor cases need facilities the sandbox lacks). A target holding exactly
-        #     one test makes the gate structurally non-vacuous: a missing target is a cargo error,
-        #     never a zero-match pass.
+        #     suite (some doctor cases need facilities the sandbox lacks). `integrationTest`
+        #     fails when a name prefix runs no test, so a missing module is never a zero-match
+        #     pass.
         #   * `parked_recovery` — the parked-task recovery episode against real processes. Both
         #     single-pass entry points build a fresh `FlappingCap`, so `up --once` can never park
         #     anything and the package's boundary would never reach this path.
@@ -577,35 +614,40 @@
             effect-utils.packages.${system}.otelite
           ];
           ST2_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
-          cargoTestFlags = [
-            "--test"
-            "atomic_pty_snapshot"
-            "--test"
-            "parked_recovery"
-            "--test"
-            "otel_export"
-          ];
+          checkPhase = ''
+            runHook preCheck
+            ${integrationTest {
+              label = "release integration episodes";
+              prefixes = [
+                "atomic_pty_snapshot::"
+                "parked_recovery::"
+                "otel_export::"
+              ];
+            }}
+            runHook postCheck
+          '';
+          postCheck = "";
         });
 
         # Bootstrap's crash/race tests and the message CLI's crash/recovery controls are both
         # compiled only with debug assertions, so they share one derivation. Keep the package's
-        # release-mode test boundary unchanged. `bootstrap_` is a positional name filter, so it
-        # needs its own invocation — in a shared one it would also filter `message_cli` to nothing.
+        # release-mode test boundary unchanged. Both are modules of st2's `integration` binary, so
+        # one invocation selects them by name prefix.
         st2DebugAssertions = st2.overrideAttrs (_: {
           pname = "st2-debug-assertions-check";
           CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS = "true";
-          cargoTestFlags = [
-            "--test"
-            "message_cli"
-          ];
-          postCheck = extraCargoTest {
-            label = "catalog bootstrap transactions";
-            flags = [
-              "--test"
-              "catalog_apply"
-              "bootstrap_"
-            ];
-          };
+          checkPhase = ''
+            runHook preCheck
+            ${integrationTest {
+              label = "message CLI and catalog bootstrap transactions";
+              prefixes = [
+                "message_cli::"
+                "catalog_apply::bootstrap_"
+              ];
+            }}
+            runHook postCheck
+          '';
+          postCheck = "";
         });
 
         hookSuccessorSource = pkgs.runCommand "st2-hook-successor-source" { } ''
@@ -944,12 +986,12 @@
             pkgs.lld
             ptyPackage
             # Local runs of the OTLP export integration gate
-            # (`cargo test --test otel_export`) need the same collector the
+            # (`cargo test --test integration otel_export::`) need the same collector the
             # Nix check pins; `ST2_OTELITE_BIN` points at it.
             effect-utils.packages.${system}.otelite
           ];
           # Same collector the Nix gate pins, so a bare
-          # `cargo test --test otel_export` in this shell runs against it.
+          # `cargo test --test integration otel_export::` in this shell runs against it.
           ST2_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
           RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
         };
