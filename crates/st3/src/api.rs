@@ -3583,6 +3583,10 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
             crate::resource::GITHUB_AUTH_REMEDY.into()
         },
     });
+    report.checks.extend(github_usage_checks(
+        &crate::resource::github_usage_report(),
+        client_now_ms(),
+    ));
     report.status = if report.checks.iter().any(|check| check.status == "fail") {
         "fail"
     } else if report.checks.iter().any(|check| check.status == "warn") {
@@ -3592,6 +3596,78 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
     }
     .into();
     Ok(Json(report))
+}
+
+/// Show what spends the GitHub budget that every observer on every host shares: the budget
+/// GitHub last reported, how much of its window this host's observers spent, and each observer's
+/// requests.
+fn github_usage_checks(usage: &crate::resource::GithubUsageReport, now: u128) -> Vec<DoctorCheck> {
+    let time = |unix_ms: u128| {
+        chrono::DateTime::from_timestamp_millis(i64::try_from(unix_ms).unwrap_or(i64::MAX))
+            .unwrap_or(chrono::DateTime::UNIX_EPOCH)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    if usage.budgets.is_empty() && usage.spenders.is_empty() {
+        return vec![DoctorCheck {
+            name: "github-budget".into(),
+            status: "pass".into(),
+            message: "this daemon has sent no GitHub request since it started".into(),
+        }];
+    }
+    let mut checks = Vec::new();
+    for report in &usage.budgets {
+        let budget = &report.budget;
+        let message = if budget.reset_at_unix_ms <= now {
+            format!(
+                "GitHub last reported {} of {} requests left at {}, in a window that reset at {}",
+                budget.remaining,
+                budget.limit,
+                time(budget.reported_at_unix_ms),
+                time(budget.reset_at_unix_ms)
+            )
+        } else if budget.resource == "core" {
+            format!(
+                "{} of {} requests left until {}; observers on this host sent {} of the {} counted in this window, other hosts and clients of the token (gh, CI) the rest; reported {}",
+                budget.remaining,
+                budget.limit,
+                time(budget.reset_at_unix_ms),
+                report.counted_here.min(budget.used),
+                budget.used,
+                time(budget.reported_at_unix_ms)
+            )
+        } else {
+            format!(
+                "{} of {} requests left until {}; reported {}",
+                budget.remaining,
+                budget.limit,
+                time(budget.reset_at_unix_ms),
+                time(budget.reported_at_unix_ms)
+            )
+        };
+        // Under a tenth left, the observers are close to backing off until the reset.
+        let low = budget.reset_at_unix_ms > now
+            && u128::from(budget.remaining) * 10 < u128::from(budget.limit);
+        checks.push(DoctorCheck {
+            name: format!("github-budget/{}", budget.resource),
+            status: if low { "warn" } else { "pass" }.into(),
+            message,
+        });
+    }
+    for spender in &usage.spenders {
+        checks.push(DoctorCheck {
+            name: format!("github-requests/{}", spender.spender),
+            status: "pass".into(),
+            message: format!(
+                "{} counted requests in the last hour; since the daemon started {} sent, {} not modified (free), {} refused; last sent {}",
+                spender.counted_last_hour,
+                spender.sent,
+                spender.not_modified,
+                spender.refused,
+                time(spender.last_sent_at_unix_ms)
+            ),
+        });
+    }
+    checks
 }
 
 fn build_tools_check(tools: &crate::environment::BuildTools) -> DoctorCheck {
@@ -3703,6 +3779,25 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: format!("cannot write {}: {error}", state.state_dir.display()),
         }),
     }
+    checks.push(match crate::disk::disk_space(&state.state_dir) {
+        Ok(space) => DoctorCheck {
+            name: "disk-space".into(),
+            status: if space.is_low() { "warn" } else { "pass" }.into(),
+            message: format!(
+                "{} on the filesystem of {}",
+                space.describe(),
+                state.state_dir.display()
+            ),
+        },
+        Err(error) => DoctorCheck {
+            name: "disk-space".into(),
+            status: "warn".into(),
+            message: format!(
+                "cannot read free space for {}: {error}",
+                state.state_dir.display()
+            ),
+        },
+    });
     let desired = state.store.desired_subjects().map_err(ApiError::internal)?;
     for subject in &desired {
         if subject.kind != "stop"
@@ -10778,6 +10873,89 @@ agent "good" {{ workspace {:?}; command "true" }}
                 .unwrap()
                 .iter()
                 .any(|check| check["name"] == "runtime-ownership")
+        );
+        let disk = doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "disk-space")
+            .expect("doctor reports disk space");
+        assert!(
+            disk["message"].as_str().unwrap().contains("GiB free"),
+            "{disk}"
+        );
+    }
+
+    #[test]
+    fn doctor_shows_what_spends_the_shared_github_budget() {
+        use crate::resource::{
+            GithubBudget, GithubBudgetReport, GithubSpenderReport, GithubUsageReport,
+        };
+        let now = 1_790_000_000_000_u128;
+        let quiet = github_usage_checks(&GithubUsageReport::default(), now);
+        assert_eq!(quiet.len(), 1);
+        assert_eq!(
+            (quiet[0].name.as_str(), quiet[0].status.as_str()),
+            ("github-budget", "pass")
+        );
+
+        let spender = |name: &str, counted| GithubSpenderReport {
+            spender: name.into(),
+            sent: counted + 10,
+            not_modified: 10,
+            refused: 0,
+            counted_last_hour: counted,
+            last_sent_at_unix_ms: now - 5_000,
+        };
+        let usage = |remaining| GithubUsageReport {
+            spenders: vec![
+                spender("observer/orchid-listing", 40),
+                spender("observer/lichen-ref", 2),
+            ],
+            budgets: vec![GithubBudgetReport {
+                budget: GithubBudget {
+                    resource: "core".into(),
+                    limit: 5000,
+                    remaining,
+                    used: 5000 - remaining,
+                    reset_at_unix_ms: now + 600_000,
+                    reported_at_unix_ms: now - 5_000,
+                },
+                counted_here: 42,
+            }],
+        };
+        let checks = github_usage_checks(&usage(4000), now);
+        let names = checks
+            .iter()
+            .map(|check| (check.name.as_str(), check.status.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec![
+                ("github-budget/core", "pass"),
+                ("github-requests/observer/orchid-listing", "pass"),
+                ("github-requests/observer/lichen-ref", "pass"),
+            ]
+        );
+        assert!(
+            checks[0]
+                .message
+                .contains("observers on this host sent 42 of the 1000 counted in this window"),
+            "{}",
+            checks[0].message
+        );
+        assert!(
+            checks[1]
+                .message
+                .starts_with("40 counted requests in the last hour; since the daemon started 50 sent, 10 not modified"),
+            "{}",
+            checks[1].message
+        );
+        // Under a tenth of the budget left warns until the window resets.
+        assert_eq!(github_usage_checks(&usage(400), now)[0].status, "warn");
+        assert_eq!(
+            github_usage_checks(&usage(400), now + 600_000)[0].status,
+            "pass"
         );
     }
 
