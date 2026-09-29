@@ -3739,6 +3739,25 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: format!("cannot write {}: {error}", state.state_dir.display()),
         }),
     }
+    checks.push(match crate::disk::disk_space(&state.state_dir) {
+        Ok(space) => DoctorCheck {
+            name: "disk-space".into(),
+            status: if space.is_low() { "warn" } else { "pass" }.into(),
+            message: format!(
+                "{} on the filesystem of {}",
+                space.describe(),
+                state.state_dir.display()
+            ),
+        },
+        Err(error) => DoctorCheck {
+            name: "disk-space".into(),
+            status: "warn".into(),
+            message: format!(
+                "cannot read free space for {}: {error}",
+                state.state_dir.display()
+            ),
+        },
+    });
     let desired = state.store.desired_subjects().map_err(ApiError::internal)?;
     for subject in &desired {
         if subject.kind != "stop"
@@ -10775,6 +10794,16 @@ agent "good" {{ workspace {:?}; command "true" }}
                 .unwrap()
                 .iter()
                 .any(|check| check["name"] == "runtime-ownership")
+        );
+        let disk = doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "disk-space")
+            .expect("doctor reports disk space");
+        assert!(
+            disk["message"].as_str().unwrap().contains("GiB free"),
+            "{disk}"
         );
     }
 

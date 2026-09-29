@@ -412,6 +412,13 @@ pub struct Reconciler<R = NativeRuntime> {
     /// Faults that could not be recorded in the graph during the current pass.
     unrecorded_faults: Mutex<Vec<String>>,
     fault_injection: Option<Arc<dyn FaultInjection>>,
+    /// Reads free space for the disk stage. Without one the stage does nothing.
+    disk_probe: Option<DiskProbe>,
+    /// Paths whose filesystems the disk stage always watches, beside this host's workspaces.
+    disk_paths: Vec<PathBuf>,
+    /// When the disk stage last read free space, and whether its episode raised an item.
+    disk_check: Mutex<(Option<u128>, bool)>,
+    disk_check_every_ms: u128,
     /// How long run cleanup waits for its runtimes to stop before the run ends without them.
     cleanup_deadline: Duration,
     /// Unit tests fail a pass that raises a fault unless they opt in, so an isolated error
@@ -497,6 +504,10 @@ impl Reconciler<NativeRuntime> {
             faults: Mutex::new(None),
             unrecorded_faults: Mutex::new(Vec::new()),
             fault_injection: None,
+            disk_probe: Some(Arc::new(crate::disk::disk_space)),
+            disk_paths: vec![state_dir.to_path_buf()],
+            disk_check: Mutex::new((None, false)),
+            disk_check_every_ms: DISK_CHECK_EVERY_MS,
             cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
             raised_faults: Mutex::new(Some(Vec::new())),
@@ -534,6 +545,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             faults: Mutex::new(None),
             unrecorded_faults: Mutex::new(Vec::new()),
             fault_injection: None,
+            disk_probe: None,
+            disk_paths: Vec::new(),
+            disk_check: Mutex::new((None, false)),
+            disk_check_every_ms: 0,
             cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
             raised_faults: Mutex::new(Some(Vec::new())),
@@ -549,6 +564,14 @@ impl<R: RuntimeControl> Reconciler<R> {
     #[doc(hidden)]
     pub fn with_cleanup_deadline(mut self, deadline: Duration) -> Self {
         self.cleanup_deadline = deadline;
+        self
+    }
+
+    /// Read free space for `paths` and this host's workspaces with `probe` on every pass.
+    #[cfg(test)]
+    fn with_disk_probe(mut self, paths: Vec<PathBuf>, probe: DiskProbe) -> Self {
+        self.disk_probe = Some(probe);
+        self.disk_paths = paths;
         self
     }
 
@@ -688,6 +711,104 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn signal_changed(&self) {
         signal_changed(&self.notify, &self.event_notify);
+    }
+
+    /// Raise one host item while a filesystem that this daemon or one of its workspaces writes to
+    /// is low on space, and close it once every one of them has recovered. A person who closes
+    /// the item early is not asked again until the space recovers.
+    fn reconcile_disk_space(&self, desired: &[DesiredSubject]) -> Result<()> {
+        let Some(probe) = &self.disk_probe else {
+            return Ok(());
+        };
+        let now = now_ms();
+        {
+            let mut check = self
+                .disk_check
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if check
+                .0
+                .is_some_and(|at| now.saturating_sub(at) < self.disk_check_every_ms)
+            {
+                return Ok(());
+            }
+            check.0 = Some(now);
+        }
+        let workspaces = desired
+            .iter()
+            .filter(|subject| subject.kind != "stop")
+            .filter_map(|subject| subject.member.as_ref())
+            .filter(|member| member.host == self.host)
+            .map(|member| PathBuf::from(&member.workspace));
+        // One reading per filesystem, named by the first path on it. A workspace that does not
+        // exist yet has no filesystem to read.
+        let mut filesystems = BTreeMap::<u64, (PathBuf, crate::disk::DiskSpace)>::new();
+        for path in self.disk_paths.iter().cloned().chain(workspaces) {
+            if let Ok(space) = probe(&path) {
+                filesystems.entry(space.filesystem).or_insert((path, space));
+            }
+        }
+        if filesystems.is_empty() {
+            return Ok(());
+        }
+        let daemon = format!("daemon/{}", self.host);
+        let title = format!("Disk space is low on {}", self.host);
+        let pending = self
+            .store
+            .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
+            .into_iter()
+            .filter(|request| request.title == title && request.targets == [daemon.as_str()])
+            .collect::<Vec<_>>();
+        let low = filesystems
+            .values()
+            .filter(|(_, space)| space.is_low())
+            .map(|(path, space)| format!("`{}` has {}", path.display(), space.describe()))
+            .collect::<Vec<_>>();
+        if !low.is_empty() {
+            let mut check = self
+                .disk_check
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if pending.is_empty() && !check.1 {
+                let key = format!("disk-low:{}:{}", self.host, self.store.index()?);
+                let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+                self.store.request_attention(
+                    &format!("attention/{}", &digest[..32]),
+                    &AttentionRequest {
+                        reviewer: "person/operator".into(),
+                        title,
+                        reason: format!(
+                            "On {}, {}. Builds and the claim store fail once a filesystem fills. Free space there, for example by removing the `target/` directories of finished worktrees with `cargo clean`; `df -h PATH` and `st doctor` show what is left. This item closes once each filesystem has 4 GiB and 4% free.",
+                            self.host,
+                            low.join("; ")
+                        ),
+                        severity: "error".into(),
+                        targets: vec![daemon],
+                        actor: RECONCILER_ACTOR.into(),
+                        idempotency_key: key,
+                    },
+                )?;
+                self.signal_changed();
+            }
+            check.1 = true;
+            return Ok(());
+        }
+        if !filesystems.values().all(|(_, space)| space.has_recovered()) {
+            return Ok(());
+        }
+        for request in pending {
+            self.store.resolve_attention_automatically(
+                &request.subject,
+                "every filesystem this daemon writes to has 4 GiB and 4% free again",
+                &format!("disk-recovered:{}", request.request),
+            )?;
+            self.signal_changed();
+        }
+        self.disk_check
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .1 = false;
+        Ok(())
     }
 
     /// Raise one host item while whole reconcile passes fail or the reconciler panics. Nothing on
@@ -1466,6 +1587,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         });
         self.isolate("stage/retired-agent-attention", &daemon, || {
             self.resolve_attention_for_retired_agents(&desired)
+        });
+        self.isolate("stage/disk-space", &daemon, || {
+            self.reconcile_disk_space(&desired)
         });
         self.file_watchers_used
             .lock()
@@ -9914,6 +10038,10 @@ fn permanent_observation_error(code: &str) -> bool {
 }
 
 const HELD_SUBSCRIPTION_TITLE: &str = "A subscription is holding mission requests";
+/// How often the disk stage reads free space.
+const DISK_CHECK_EVERY_MS: u128 = 30_000;
+
+type DiskProbe = Arc<dyn Fn(&Path) -> std::io::Result<crate::disk::DiskSpace> + Send + Sync>;
 const RECONCILER_FAILING_TITLE: &str = "The reconciler is failing";
 
 /// How long a fault must last before it asks a person. st retries a faulted item on every pass,
@@ -19763,6 +19891,91 @@ observer "repo" {
                 .status,
             "resolved"
         );
+    }
+
+    #[test]
+    fn low_disk_space_raises_one_host_item_until_the_space_recovers() {
+        const GIB: u64 = 1 << 30;
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let available = Arc::new(Mutex::new(GIB));
+        let reading = available.clone();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_disk_probe(
+            vec![PathBuf::from("/state"), PathBuf::from("/missing")],
+            Arc::new(move |path: &Path| {
+                if path != Path::new("/state") {
+                    return Err(std::io::ErrorKind::NotFound.into());
+                }
+                Ok(crate::disk::DiskSpace {
+                    filesystem: 7,
+                    available: *reading.lock().unwrap(),
+                    total: 100 * GIB,
+                })
+            }),
+        );
+        let set = |bytes: u64| *available.lock().unwrap() = bytes;
+        let items = || {
+            store
+                .attention_items(Some("person/operator"))
+                .unwrap()
+                .into_iter()
+                .filter(|item| item.title == "Disk space is low on node")
+                .collect::<Vec<_>>()
+        };
+
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let first = items();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].targets, vec!["daemon/node".to_owned()]);
+        for expected in [
+            "On node, `/state` has 1.0 GiB of 100.0 GiB free (1.0%).",
+            "`cargo clean`",
+            "`st doctor`",
+            "closes once each filesystem has 4 GiB and 4% free",
+        ] {
+            assert!(first[0].detail.contains(expected), "{}", first[0].detail);
+        }
+
+        // Between low and recovered the item stays open.
+        set(3 * GIB);
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(items().len(), 1);
+
+        set(10 * GIB);
+        reconciler.reconcile_once().unwrap();
+        assert!(items().is_empty());
+        let closed = store.attention_request(&first[0].subject).unwrap().unwrap();
+        assert_eq!(closed.status, "resolved");
+
+        // A new episode raises a new item. A person who closes it early is not asked again
+        // while the space stays low.
+        set(GIB);
+        reconciler.reconcile_once().unwrap();
+        let second = items();
+        assert_eq!(second.len(), 1);
+        assert_ne!(second[0].subject, first[0].subject);
+        store
+            .resolve_attention(
+                &second[0].subject,
+                &crate::model::AttentionResolveRequest {
+                    outcome: "dismissed".into(),
+                    reason: Some("cleaning up".into()),
+                    actor: "person/operator".into(),
+                    idempotency_key: "dismiss-disk".into(),
+                },
+            )
+            .unwrap();
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert!(items().is_empty());
     }
 
     #[test]
