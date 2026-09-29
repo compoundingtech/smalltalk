@@ -5,6 +5,8 @@ edition = "2024"
 description = "Typed host capabilities for the st2 GitHub and PTY stats resource components."
 license = "MIT"
 publish = false
+# Every file in tests/ is a module of one test binary; see tests/integration.rs.
+autotests = false
 
 [dependencies]
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
@@ -21,3 +23,7 @@ tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 [dev-dependencies]
 st2-resource-protocol = { path = "../st2-resource-protocol" }
 tempfile = "3"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

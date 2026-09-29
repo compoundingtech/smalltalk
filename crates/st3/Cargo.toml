@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Claims-graph agent reconciler"
 license = "MIT"
+# Every file in tests/ is a module of one test binary; see tests/integration.rs.
+autotests = false
 
 [dependencies]
 anyhow = "1"
@@ -58,3 +60,7 @@ proptest = "1"
 [[bin]]
 name = "st3"
 path = "src/main.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"

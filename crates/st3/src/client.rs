@@ -556,6 +556,11 @@ where
     Ok(client_stream)
 }
 
+/// Run the interactive attach client over a socket that already speaks the PTY session protocol.
+pub async fn attach_socket_with_io(name: &str, stream: StdUnixStream, io: ClientIo) -> Result<i32> {
+    proxy_stream_with_io(name, stream, None, io).await
+}
+
 async fn proxy_stream_with_io(
     name: &str,
     stream: StdUnixStream,
