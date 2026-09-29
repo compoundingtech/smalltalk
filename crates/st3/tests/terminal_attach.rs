@@ -2,8 +2,10 @@
 //! `st terminals attach` reaches a terminal on this host through its PTY session, and a terminal
 //! behind an HTTP endpoint through the daemon's WebSocket. When the configured daemon is down or
 //! does not answer within a second, it attaches to the subject's newest PTY session on this host
-//! without st. Each test owns a daemon, in process or stand-in, and a stand-in PTY session that
-//! reports which process attached to it.
+//! without st. A terminal another host owns is attached PTY to PTY over Fabric, through
+//! `st terminals serve-fabric` on the owner, and through the client gateway only when Fabric
+//! cannot reach it. Each test owns a daemon, in process or stand-in, and a stand-in PTY session
+//! that reports which process attached to it.
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
@@ -504,6 +506,225 @@ async fn a_terminal_another_host_owns_is_not_attached_through_a_local_pty() {
     assert!(
         session.join().unwrap().is_none(),
         "a terminal on another host must not be attached through a local PTY"
+    );
+    server.abort();
+}
+
+/// The fleet the owner and this daemon share; the owner serves its PTY sessions as
+/// `st3/pty/FLEET`.
+const FLEET_ID: &str = "0f1e2d3c-4b5a-4968-8778-695a4b3c2d1e";
+const OWNER_NODE: &str = "fabric-owner-node";
+
+/// A host that owns the terminal, as this daemon sees it through replication, with this
+/// daemon's config naming the fleet.
+fn remote_terminal(root: &Path, incarnation: &str) -> AppState {
+    let mut state = state(root);
+    state.fleet_id = Some(FLEET_ID.into());
+    let owner = Store::open_memory("owner-node").unwrap();
+    observe_terminal(&owner, incarnation);
+    replicate(&owner, &state.store);
+    let config = root.join("config/st3");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("config.toml"),
+        format!("fleet_id = \"{FLEET_ID}\"\n"),
+    )
+    .unwrap();
+    state
+}
+
+/// A `fabric` on the CLI's PATH that records each call and knows the owner by name. `dial`
+/// prints `tunnel`, or fails as an unreachable peer does when `tunnel` is `None`.
+fn fabric_shim(root: &Path, tunnel: Option<&Path>) {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let dial = match tunnel {
+        Some(tunnel) => format!("echo '{}'", tunnel.display()),
+        None => "echo 'peer unreachable' >&2; exit 2".into(),
+    };
+    let fabric = bin.join("fabric");
+    std::fs::write(
+        &fabric,
+        format!(
+            "#!/bin/sh\necho \"$@\" >> '{calls}'\ncase \"$1\" in\n  \
+             peers) printf '{OWNER_NODE}\\towner-node\\tst3/pty/{FLEET_ID}\\n';;\n  \
+             dial) {dial};;\n  *) exit 1;;\nesac\n",
+            calls = root.join("fabric-calls").display(),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&fabric, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// The owner's end of a Fabric tunnel at `socket`: for the first tunnel, run
+/// `st terminals serve-fabric` over the owner's PTY root with the tunnel on its stdin and stdout,
+/// as Fabric's exec exposure does. Returns that process's pid.
+fn fabric_tunnel(socket: &Path, owner_pty_root: &Path) -> std::thread::JoinHandle<Option<u32>> {
+    let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
+    let pty_root = owner_pty_root.to_path_buf();
+    std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let tunnel = loop {
+            match listener.accept() {
+                Ok((tunnel, _)) => break tunnel,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    if Instant::now() > deadline {
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("accept a Fabric tunnel: {error}"),
+            }
+        };
+        tunnel.set_nonblocking(false).unwrap();
+        let mut serve = std::process::Command::new(binary)
+            .env_remove("ST_AGENT")
+            .env_remove("PTY_SESSION")
+            .args(["terminals", "serve-fabric", "--stdio", "--pty-root"])
+            .arg(&pty_root)
+            .stdin(std::os::fd::OwnedFd::from(tunnel.try_clone().unwrap()))
+            .stdout(std::os::fd::OwnedFd::from(tunnel))
+            .stderr(Stdio::inherit())
+            .spawn()
+            .unwrap();
+        let pid = serve.id();
+        serve.wait().unwrap();
+        Some(pid)
+    })
+}
+
+/// Run `st terminals attach` as a person against `endpoint`, with this test's config and state.
+async fn remote_attach(root: &Path, endpoint: &str) -> Output {
+    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
+    let mut command = std::process::Command::new(binary);
+    command
+        .env_remove("ST_AGENT")
+        .env_remove("ST_MISSION_RUN")
+        .env_remove("PTY_SESSION")
+        .env_remove("ST3_ENDPOINT")
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("PATH", recording_pty(root))
+        .args(["--endpoint", endpoint, "terminals", "attach", SUBJECT])
+        .args(["--as", "person/example"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let child = command.spawn().unwrap();
+    tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
+        .await
+        .unwrap()
+}
+
+/// The owner's stand-in session of `SUBJECT`, started at `created_at`, under `ROOT/owner-pty`.
+fn owner_session(root: &Path, created_at: &str) -> std::thread::JoinHandle<Option<Attached>> {
+    serve_pty_session(
+        &root.join("owner-pty"),
+        RUNTIME_ID,
+        json!({ "createdAt": created_at, "tags": { "st3.subject": SUBJECT } }),
+    )
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminal_another_host_owns_attaches_pty_to_pty_over_fabric() {
+    let root = tempfile::tempdir().unwrap();
+    let state = remote_terminal(root.path(), &incarnation(CREATED_AT));
+    let socket = root.path().join("st3.sock");
+    let server = serve_unix(state, &socket).await;
+    let tunnel = root.path().join("tunnel.sock");
+    fabric_shim(root.path(), Some(&tunnel));
+    let owner = fabric_tunnel(&tunnel, &root.path().join("owner-pty"));
+    let session = owner_session(root.path(), CREATED_AT);
+
+    let output = remote_attach(root.path(), socket.to_str().unwrap()).await;
+
+    assert_attached(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("client gateway"), "{stderr}");
+    let served = owner.join().unwrap().expect("the CLI dialed the owner");
+    let attached = session.join().unwrap().expect("the owner attached");
+    assert_eq!(
+        attached.pid,
+        Some(served as i32),
+        "the owner's `st terminals serve-fabric` must hold the PTY connection"
+    );
+    let calls = std::fs::read_to_string(root.path().join("fabric-calls")).unwrap();
+    assert!(
+        calls.contains(&format!("dial {OWNER_NODE} st3/pty/{FLEET_ID}")),
+        "{calls}"
+    );
+    assert!(
+        !root.path().join("pty-runs").exists(),
+        "attaching ran `pty`, which can start the session again"
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_replaced_pty_session_on_another_host_receives_nothing_over_fabric() {
+    let root = tempfile::tempdir().unwrap();
+    // st selected an earlier session; a replacement now serves the same name on the owner.
+    let state = remote_terminal(root.path(), &incarnation("2026-09-29T07:00:00.000Z"));
+    let socket = root.path().join("st3.sock");
+    let server = serve_unix(state, &socket).await;
+    let tunnel = root.path().join("tunnel.sock");
+    fabric_shim(root.path(), Some(&tunnel));
+    let owner = fabric_tunnel(&tunnel, &root.path().join("owner-pty"));
+    let session = owner_session(root.path(), CREATED_AT);
+
+    let output = remote_attach(root.path(), socket.to_str().unwrap()).await;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    assert!(
+        stderr.contains("changed incarnation")
+            && stderr.contains("Attaching through the client gateway instead"),
+        "the owner refuses the route, and st falls back: {stderr}"
+    );
+    assert!(owner.join().unwrap().is_some(), "the CLI dialed the owner");
+    let attached = session
+        .join()
+        .unwrap()
+        .expect("the owner connected to check");
+    assert!(
+        attached.received.is_empty(),
+        "a fenced-out session must receive nothing: {:?}",
+        attached.received
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminal_another_host_owns_falls_back_to_the_client_gateway_without_fabric() {
+    let root = tempfile::tempdir().unwrap();
+    let state = remote_terminal(root.path(), &incarnation(CREATED_AT));
+    let socket = root.path().join("st3.sock");
+    let server = serve_unix(state, &socket).await;
+    fabric_shim(root.path(), None);
+    let session = owner_session(root.path(), CREATED_AT);
+
+    let output = remote_attach(root.path(), socket.to_str().unwrap()).await;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("peer unreachable")
+            && stderr.contains("Attaching through the client gateway instead"),
+        "{stderr}"
+    );
+    // This daemon has no relay to the owner, so the gateway cannot reach it either.
+    assert!(!output.status.success(), "{stderr}");
+    assert!(stderr.contains("owner-node"), "{stderr}");
+    let calls = std::fs::read_to_string(root.path().join("fabric-calls")).unwrap();
+    assert!(
+        calls.contains(&format!("dial {OWNER_NODE} st3/pty/{FLEET_ID}")),
+        "{calls}"
+    );
+    assert!(
+        session.join().unwrap().is_none(),
+        "nothing reached the owner's session"
     );
     server.abort();
 }

@@ -1711,10 +1711,20 @@ enum PtyCommand {
     /// Attach this terminal interactively to one running terminal member.
     ///
     /// A terminal on this host is attached through its PTY session, fenced to the incarnation st
-    /// selected, so a busy daemon cannot block it. A terminal on another fleet host is reached
-    /// through the client gateway, the path paired clients use, as the person from `--as` or the
-    /// st config. Attaching never starts or restarts a session. Detach with Ctrl+\.
+    /// selected, so a busy daemon cannot block it. A terminal on another fleet host is attached
+    /// PTY to PTY over Fabric when Fabric reaches that host (see `st terminals expose-fabric`),
+    /// and otherwise through the client gateway, the path paired clients use, as the person from
+    /// `--as` or the st config. Attaching never starts or restarts a session. Detach with Ctrl+\.
     Attach(PtyAttachArgs),
+    /// Let fleet peers attach this host's terminals PTY to PTY over Fabric.
+    ///
+    /// Fabric keeps the exposure in its own configuration and runs `st terminals serve-fabric`
+    /// for each tunnel, so an attach works while st's daemon is busy or down. Each peer also needs
+    /// a grant for the printed protocol in this machine's Fabric `peers.toml`.
+    ExposeFabric(PtyExposeFabricArgs),
+    /// Serve one Fabric tunnel to a PTY session on stdin and stdout. Fabric runs this.
+    #[command(hide = true)]
+    ServeFabric(PtyServeFabricArgs),
     /// Read one terminal's current screen without taking control.
     Peek(PtySubjectArgs),
     /// Read a terminal screen through the client gateway, including a remote fleet host.
@@ -1793,6 +1803,24 @@ struct PtyAttachArgs {
     /// config. A terminal on this host needs no person.
     #[arg(long = "as", value_parser = parse_person_subject)]
     person: Option<String>,
+}
+
+#[derive(Args)]
+struct PtyExposeFabricArgs {
+    /// The st executable Fabric runs for each tunnel; defaults to this one. Name a stable path,
+    /// since Fabric keeps it after this build is replaced.
+    #[arg(long)]
+    st: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct PtyServeFabricArgs {
+    /// Serve the tunnel on stdin and stdout, as Fabric's exec exposure runs it.
+    #[arg(long, required = true)]
+    stdio: bool,
+    /// The PTY root whose sessions this serves.
+    #[arg(long)]
+    pty_root: PathBuf,
 }
 
 #[derive(Args)]
@@ -2952,6 +2980,13 @@ async fn run(cli: Cli) -> Result<()> {
     if let Command::Up(args) = cli.command {
         return run_up(args).await;
     }
+    // Fabric runs this for each tunnel. It needs no config and no daemon.
+    if let Command::Terminals {
+        command: PtyCommand::ServeFabric(args),
+    } = &cli.command
+    {
+        return st3::terminal_fabric::serve_stdio(&args.pty_root).await;
+    }
     if let Command::ReplicationWorker(args) = cli.command {
         let mut config = Config::load_unvalidated(args.config.as_deref())?;
         if let Some(value) = args.node {
@@ -3032,6 +3067,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Lanes { command } => {
             run_lanes(&client, config.person.as_deref(), command, cli.json).await
         }
+        Command::Terminals {
+            command: PtyCommand::ExposeFabric(args),
+        } => expose_fabric(&config, args).await,
         Command::Terminals { command } => {
             // The configured daemon's PTY root, to attach its sessions when it cannot answer.
             let pty_root = matches!(&endpoint, Endpoint::Unix(socket) if *socket == config.socket)
@@ -4427,6 +4465,9 @@ async fn run_pty(
             let person = args.person.as_deref().or(configured_person);
             attach_terminal(client, endpoint, pty_root, person, &subject, args.force).await
         }
+        PtyCommand::ExposeFabric(_) | PtyCommand::ServeFabric(_) => {
+            unreachable!("handled before any daemon client")
+        }
         PtyCommand::Peek(args) => {
             let subject = normalize_member_subject(&args.subject, "pty");
             let screen: SessionScreen = client
@@ -4695,13 +4736,13 @@ async fn attach_terminal(
                         .await?
                 }
                 Err(error) if st3::client::api_error_code(&error) == Some("runtime-not-local") => {
-                    attach_remote_terminal(endpoint, person, subject, error).await?
+                    attach_remote_terminal(client, endpoint, person, subject, error).await?
                 }
                 Err(error) => return Err(error),
             }
         }
         Err(error) if st3::client::api_error_code(&error) == Some("runtime-not-local") => {
-            attach_remote_terminal(endpoint, person, subject, error).await?
+            attach_remote_terminal(client, endpoint, person, subject, error).await?
         }
         Err(error) => match &local {
             Some((root, sessions)) if st3::client::daemon_did_not_answer(&error) => {
@@ -4722,9 +4763,11 @@ fn terminal_exit(code: i32) -> Result<()> {
     }
 }
 
-/// Attach to a terminal that another fleet host owns through the client gateway, as `person`.
-/// `not_local` is the local daemon's refusal, which names the owner.
+/// Attach to a terminal that another fleet host owns, as `person`: PTY to PTY over Fabric when
+/// Fabric reaches the owner, and otherwise through the client gateway. `not_local` is the local
+/// daemon's refusal, which names the owner.
 async fn attach_remote_terminal(
+    client: &Client,
     endpoint: &Endpoint,
     person: Option<&str>,
     subject: &str,
@@ -4737,7 +4780,127 @@ async fn attach_remote_terminal(
     })?;
     let person = parse_person_subject(person).map_err(anyhow::Error::msg)?;
     let gateway = generated_client(endpoint, Some(&person))?;
+    let unreached = match fabric_route(client, &gateway, subject).await {
+        Ok((target, request)) => match st3::terminal_fabric::attach(&target, &request).await? {
+            Ok(code) => return Ok(code),
+            Err(error) => format!("Fabric did not reach its PTY session: {error}"),
+        },
+        Err(error) => format!("{error:#}"),
+    };
+    eprintln!("st terminals attach: {unreached}. Attaching through the client gateway instead.");
     st3::remote_terminal::attach(&gateway, subject, subject).await
+}
+
+/// The Fabric route to the PTY session of `subject`, a terminal another fleet host owns. st
+/// first checks that the gateway grants its person terminal reading and control, then reads the
+/// runtime and incarnation this daemon holds for it. The owner proves that incarnation before
+/// it passes a byte.
+async fn fabric_route(
+    client: &Client,
+    gateway: &GeneratedClient,
+    subject: &str,
+) -> Result<(
+    st3::terminal_fabric::FabricTarget,
+    st3::terminal_fabric::RouteRequest,
+)> {
+    let capabilities = gateway.capabilities().await?.value;
+    for scope in ["terminal.read", "terminal.control"] {
+        anyhow::ensure!(
+            capabilities.capabilities.iter().any(|capability| {
+                capability.id == scope && capability.state == st3_client::CapabilityState::Granted
+            }),
+            "the client gateway does not grant `{scope}` for a direct attachment"
+        );
+    }
+    let status = status_for(client, subject).await?;
+    let selected = status
+        .subjects
+        .first()
+        .with_context(|| format!("st has no runtime for `{subject}`"))?;
+    let owner = selected
+        .actual_origin
+        .as_deref()
+        .with_context(|| format!("st does not know which host runs `{subject}`"))?;
+    let fields = selected
+        .actual
+        .as_ref()
+        .map(|actual| actual.get("fields").unwrap_or(actual))
+        .with_context(|| format!("st has no runtime for `{subject}`"))?;
+    let field = |name: &str| fields.get(name).and_then(Value::as_str);
+    anyhow::ensure!(
+        field("status") == Some("running") && fields.get("terminal") != Some(&Value::Bool(false)),
+        "`{subject}` has no running terminal on `{owner}`"
+    );
+    let (Some(runtime_id), Some(incarnation)) = (field("runtime_id"), field("incarnation_id"))
+    else {
+        anyhow::bail!("st has no runtime incarnation for `{subject}` on `{owner}`");
+    };
+    let (fabric, fleet_id) = configured_fabric()?;
+    let fleet_id = fleet_id
+        .with_context(|| format!("this machine is in no fleet to reach `{owner}` through"))?;
+    let fabric =
+        fabric.with_context(|| format!("this machine has no `fabric` to reach `{owner}` with"))?;
+    let view: st3::fleet::FleetView = client.get("/v1/internal/fleet/membership").await?;
+    let peer = st3::terminal_fabric::owner_peer(&fabric, &view.members, owner)
+        .await
+        .with_context(|| {
+            format!("`{owner}` advertises no Fabric node, and no Fabric peer of this machine has its name")
+        })?;
+    Ok((
+        st3::terminal_fabric::FabricTarget {
+            fabric,
+            peer,
+            protocol: st3::terminal_fabric::protocol(&fleet_id),
+        },
+        st3::terminal_fabric::RouteRequest::new(runtime_id, subject, incarnation),
+    ))
+}
+
+/// This machine's `fabric`, the fleet file's override or the one on `PATH`, and its fleet.
+fn configured_fabric() -> Result<(Option<st3::fleet::transport::Fabric>, Option<String>)> {
+    let mut config = Config::load_unvalidated(None)?;
+    config.apply_fleet_file()?;
+    let override_path = config
+        .fleet
+        .as_ref()
+        .and_then(|file| file.fabric.as_deref());
+    let fabric = st3::fleet::transport::resolve_tool(override_path, "fabric")
+        .map(st3::fleet::transport::Fabric::new);
+    Ok((fabric, config.fleet_id))
+}
+
+/// `st terminals expose-fabric`: have this machine's Fabric serve the fleet's PTY sessions.
+async fn expose_fabric(config: &Config, args: PtyExposeFabricArgs) -> Result<()> {
+    let (fabric, fleet_id) = configured_fabric()?;
+    let fleet_id =
+        fleet_id.context("this machine is in no fleet, so no peer can attach its terminals")?;
+    let fabric = fabric.context("`fabric` is not on PATH")?;
+    let st = match args.st {
+        Some(st) => std::path::absolute(st)?,
+        None => std::env::current_exe().context("find this st executable")?,
+    };
+    let pty_root = std::path::absolute(
+        config
+            .pty_root
+            .clone()
+            .unwrap_or_else(|| config.state_dir.join("pty")),
+    )?;
+    let protocol = st3::terminal_fabric::protocol(&fleet_id);
+    let (st, pty_root) = (st.display().to_string(), pty_root.display().to_string());
+    let argv = [
+        st.as_str(),
+        "terminals",
+        "serve-fabric",
+        "--stdio",
+        "--pty-root",
+        pty_root.as_str(),
+    ];
+    fabric.expose_exec(&protocol, &argv).await?;
+    println!("Fabric serves the PTY sessions under {pty_root} as `{protocol}`, with `{st}`.");
+    println!(
+        "Add `{protocol}` to the `allow` list of each peer in this machine's Fabric peers.toml, then run `fabric reload-peers`."
+    );
+    Ok(())
 }
 
 /// Attach to the newest of `subject`'s running PTY sessions on this host without the st daemon,
