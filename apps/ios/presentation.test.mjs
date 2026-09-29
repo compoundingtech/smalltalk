@@ -36,6 +36,8 @@ assert.equal(missionGroup({ ...release, run_details: [{ id: 'mission-run/9f', st
 assert.equal(missionGroup({ ...release, state: 'completed', run_details: [{ id: 'mission-run/9f', steps: null }] }), 'Archive');
 assert.equal(missionGroup({ state: 'draft' }), 'Drafts');
 assert.equal(missionDetail({ runs: [], run_details: [] }), '0 runs');
+const shipped = { runs: ['mission-run/9f'], run_details: [{ id: 'mission-run/9f', steps: [step('gate', 'failed')], outcome: { status: 'completed', previous_status: 'failed', actor: 'person/avery', reason: 'it merged after the gate was fixed', at: '2026-09-25T08:20:00Z' } }] };
+assert.equal(missionDetail(shipped), '1 runs · gate (failed) · set completed (was failed) by person/avery: it merged after the gate was fixed');
 
 // Small Talk st joined into a conversation shows who wrote to whom and its title.
 assert.deepEqual(smallTalkPresentation({ message_id: 'message/1', from: 'agent/fleet/cos/standing/cos', to: 'person/nathan', title: 'Release is ready' }), { from: 'COS → nathan', text: 'Release is ready' });
