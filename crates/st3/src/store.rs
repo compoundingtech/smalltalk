@@ -13419,6 +13419,32 @@ impl Store {
         Ok(true)
     }
 
+    /// The transport links the fleet currently observes as up, as `(observer, observed)` node
+    /// names: each observer's latest observation of each peer, from every replicated node.
+    pub fn transport_links(&self) -> Result<Vec<(String, String)>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT origin, subject, json_extract(body, '$.fields.status'), MAX(store_index)
+             FROM claims WHERE kind='transport.observed' GROUP BY origin, subject",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        let mut links = Vec::new();
+        for row in rows {
+            let (observer, subject, status) = row?;
+            if let (Some(observed), Some("up")) = (subject.strip_prefix("host/"), status.as_deref())
+            {
+                links.push((observer, observed.to_owned()));
+            }
+        }
+        Ok(links)
+    }
+
     pub(crate) fn record_transport_observation(
         &self,
         peer: &str,

@@ -633,6 +633,13 @@ pub fn api_error_code(error: &anyhow::Error) -> Option<&str> {
         .map(|error| error.code.as_str())
 }
 
+/// The status, code, and message of the API error that an API call failed with, if it did.
+pub fn api_error_parts(error: &anyhow::Error) -> Option<(u16, &str, &str)> {
+    error
+        .downcast_ref::<ApiResponseError>()
+        .map(|error| (error.status, error.code.as_str(), error.message.as_str()))
+}
+
 fn terminal_reconnect_is_refused(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<ApiResponseError>()
@@ -910,7 +917,9 @@ fn request_deadline(path: &str, deadlines: ClientDeadlines) -> Duration {
     if path.starts_with("/v1/internal/replication/export")
         || path.starts_with("/v1/internal/replication/receive")
         || path.starts_with("/v1/internal/replication/checkpoint")
+        || path.starts_with(crate::peer::CLIENT_READ_FORWARD_PATH)
     {
+        // A forwarded client read is bounded by the relay's own per-hop timeouts.
         deadlines.bulk
     } else if path.starts_with("/v1/internal/replication/heal/") {
         // A heal can replay the graph from nothing, 41 seconds on a 2 GB store.

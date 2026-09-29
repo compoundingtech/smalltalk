@@ -476,6 +476,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             post(fleet_publish_endpoints),
         )
         .route("/v1/internal/replication-wake", post(replication_wake))
+        .route(
+            crate::peer::CLIENT_READ_FORWARD_PATH,
+            post(forward_client_read).layer(DefaultBodyLimit::max(16_384)),
+        )
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*run}", get(get_eval))
         .route("/v1/mission-runs", get(list_mission_runs))
@@ -3188,6 +3192,7 @@ async fn client_sessions_detail(
                         &remote_host,
                         &crate::peer::ClientReadRequest {
                             authority_actor: session.authority_actor.clone(),
+                            relay: None,
                             request: crate::peer::ClientReadOperation::Timeline {
                                 session_id,
                                 limit: query.limit.unwrap_or(50).clamp(1, 200),
@@ -3215,6 +3220,33 @@ async fn client_sessions_detail(
         "session",
         &id,
     )
+}
+
+/// Carry on a client read a peer relayed to this node because it is on the way to the owner.
+/// The owner's refusal travels back as it was given; a missing route is `remote-unavailable`.
+async fn forward_client_read(
+    State(state): State<AppState>,
+    Json(request): Json<crate::peer::ClientReadRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let target = request
+        .relay
+        .as_ref()
+        .map_or_else(String::new, |relay| relay.target.clone());
+    let relay = state
+        .client_relay
+        .as_ref()
+        .ok_or_else(|| remote_unavailable(&target))?;
+    relay.forward(&request).await.map(Json).map_err(|error| {
+        match error.downcast_ref::<crate::peer::ClientReadRejected>() {
+            Some(rejected) => ApiError {
+                status: StatusCode::from_u16(rejected.status).unwrap_or(StatusCode::CONFLICT),
+                code: rejected.code.clone(),
+                message: rejected.message.clone(),
+                details: Box::default(),
+            },
+            None => remote_unavailable(&target),
+        }
+    })
 }
 
 fn remote_unavailable(host: &str) -> ApiError {
@@ -3739,6 +3771,14 @@ async fn guard_bound_request(
         return Ok(request);
     }
     let path = request.uri().path();
+    // A forwarded client read carries a person's authority between fleet members. Only the
+    // replication worker, which runs in no harness, hands one over.
+    if path.starts_with(crate::peer::CLIENT_READ_FORWARD_PATH) {
+        return Err(ApiError::bad(St3Error::new(
+            "foreign-agent-actor",
+            format!("this harness is `{bound_agent}` and cannot forward a person's client read"),
+        )));
+    }
     if ![
         "/v1/intent/apply",
         "/v1/agent-queue-moves",
@@ -10172,13 +10212,14 @@ async fn host_agent_workspace(
     let relay = state
         .client_relay
         .as_ref()
-        .filter(|relay| relay.has_peer(&host_id))
+        .filter(|relay| relay.reaches(&host_id))
         .ok_or_else(|| remote_unavailable(&host_id))?;
     let value = relay
         .read(
             &host_id,
             &crate::peer::ClientReadRequest {
                 authority_actor: person.into(),
+                relay: None,
                 request: crate::peer::ClientReadOperation::AgentWorkspace {
                     identity: query.identity,
                 },

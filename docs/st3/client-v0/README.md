@@ -456,6 +456,17 @@ revision differs from `after`, or the current screen after `wait_ms` (at most 30
 follows its PTY and answers the moment the screen changes; an idle remote terminal costs one relay
 request per 10-second wait and still sends the client nothing.
 
+The owner does not have to be the gateway's peer. Every read of another host's conversation or
+terminal, and every terminal control, goes to the owner directly when the gateway can dial it, and
+otherwise to the peer nearest the owner by the fleet's replicated transport observations. When no
+node has observed the owner, each peer is tried in turn. Each node on the way forwards the read the
+same way, at most four times and never through a node it already passed, and relays the owner's
+answer or refusal back unchanged. Every hop checks that its sender is a fleet member, and the owner
+applies its own grants to the person the read carries. A laptop peered only with a desktop
+therefore reads a conversation on a server that only the desktop dials. Each hop waits longer than
+the next one, so a long poll's answer is never cut short on its way back. A read that no peer can
+carry fails with `remote-unavailable`.
+
 Read-only terminal scope permits screens but rejects input and resize. Screen payloads obey
 negotiated byte limits: at most 200 lines and 4096 bytes of text per line, with explicit
 `redacted` and `truncated` markers.
