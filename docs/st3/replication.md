@@ -121,6 +121,23 @@ Reducers use causal ancestry where it exists. They use stable claim data as the 
 
 Terminal revision proposal states do not regress during replay. Local rules still allow only one pending proposal for a mission run.
 
+A full replay starts from nothing, as a node that joins late does. It clears the graph tables,
+replays every claim in canonical order (accepted time, writer, batch sequence, position in the
+batch), and then applies local lease renewals again. Replaying over the rows an earlier projection
+left behind made the graph depend on how that projection ran: it could apply a run's old terminal
+state over the revision that reopened the run, so two nodes holding the same claims showed
+different graphs. A rule that reads other claims finds them by subject, never by the batch it
+arrived in, since a writer may put related claims in separate batches. The replay reads every
+claim before it projects any, so a claim that fails to project is quarantined without ending the
+replay.
+
+The first start of a build with this rule replays from nothing once. A run that this node created
+could show as over in its old graph while its claims say it runs. Starting that work again long
+after anyone expected it would surprise people, so the node writes the claims that end the run as
+its graph showed it, and says so at startup. It does this only while no peer claim on the run
+waits to be projected, since such a claim may have reopened the run for real. Runs that other
+nodes created are theirs to settle.
+
 ## Inspection and repair
 
 Use these commands:
@@ -176,9 +193,9 @@ Two nodes are in sync only when they hold the same envelopes and project the sam
 them. Each exchange at which both nodes hold the same envelopes compares their graph digests; an
 exchange that stores new envelopes, or meets a deferred projection, compares nothing. The same
 envelopes must project the same graph, so a difference that outlasts a minute, longer than a peer
-takes to project what it stored, means the graphs diverged: for example, one node lost claims it
-had admitted while keeping their envelopes. Exchanges cannot fix that, so the status view leads
-with it:
+takes to project what it stored, means the graphs diverged: for example, one node's projection
+followed a rule that a replay from nothing does not, or lost claims it had admitted while keeping
+their envelopes. Exchanges cannot fix that, so the status view leads with it:
 
 ```text
 sync	diverged: node-b holds the same envelopes but projects a different graph, since 3m ago

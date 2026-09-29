@@ -37033,7 +37033,11 @@ mission "takeover" state="ready" {
         // nothing but its time does not replicate.
         let agent = "agent/writer.worker";
         for (kind, actor, fields) in [
-            ("runtime.action.requested", None, json!({"action": "terminate"})),
+            (
+                "runtime.action.requested",
+                None,
+                json!({"action": "terminate"}),
+            ),
             (
                 "harness.observed",
                 Some(agent),
@@ -37095,7 +37099,11 @@ mission "takeover" state="ready" {
                 ("report", "pending", 1),
                 ("smoke-check", "pending", 1),
             ]
-            .map(|(step, status, attempt)| (step.to_owned(), status.to_owned(), attempt))
+            .map(|(step, status, attempt)| (
+                step.to_owned(),
+                status.to_owned(),
+                attempt
+            ))
         );
         assert_eq!(graph(&joined), (status, phase, steps, authority, digest));
     }
@@ -37157,7 +37165,7 @@ mission "takeover" state="ready" {
         assert_eq!(run_state(&replica), ("running".into(), "normal".into()));
         assert_eq!(
             source.settle_runs_for_canonical_replay().unwrap(),
-            [failed.id.clone()]
+            std::slice::from_ref(&failed.id)
         );
         assert_eq!(run_state(&source), ("failed".into(), "terminal".into()));
         assert!(
