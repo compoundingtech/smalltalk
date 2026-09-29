@@ -1033,6 +1033,7 @@ impl CompactReplicationInventory {
             digest: self.digest.clone(),
             envelopes: self.identities(&self.envelopes),
             buckets: Vec::new(),
+            accepts: None,
         }
     }
 
@@ -10906,6 +10907,7 @@ impl Store {
                 digest: snapshot.inventory.digest.clone(),
                 envelopes: Vec::new(),
                 buckets: snapshot.buckets.clone(),
+                accepts: Some(REPLICATION_PAGE_LIMIT),
             },
             envelopes: Vec::new(),
             signature_requests,
@@ -10962,6 +10964,7 @@ impl Store {
                     digest: snapshot.inventory.digest.clone(),
                     envelopes: listed,
                     buckets: snapshot.buckets.clone(),
+                    accepts: Some(REPLICATION_PAGE_LIMIT),
                 },
                 envelopes: self.replica_envelopes(missing)?,
                 signature_requests: Vec::new(),
@@ -10987,7 +10990,7 @@ impl Store {
                 .iter()
                 .map(|envelope| inventory.identity(envelope))
                 .filter(|identity| !known.contains(identity))
-                .take(REPLICATION_EXCHANGE_ENVELOPE_LIMIT)
+                .take(replication_page_limit(remote))
                 .collect::<Vec<_>>()
         };
         Ok(ReplicationExchange {
@@ -10996,14 +10999,16 @@ impl Store {
             schema_digest: st3_schema::registry().digest(),
             authority_digest: snapshot.authority_digest.clone(),
             graph_digest: snapshot.graph_digest.clone(),
-            inventory: if same {
-                ReplicationInventory {
-                    digest: snapshot.inventory.digest.clone(),
-                    envelopes: Vec::new(),
-                    buckets: Vec::new(),
+            inventory: ReplicationInventory {
+                accepts: Some(REPLICATION_PAGE_LIMIT),
+                ..if same {
+                    ReplicationInventory {
+                        digest: snapshot.inventory.digest.clone(),
+                        ..Default::default()
+                    }
+                } else {
+                    snapshot.inventory.public()
                 }
-            } else {
-                snapshot.inventory.public()
             },
             envelopes: self.replica_envelopes(missing)?,
             signature_requests: Vec::new(),
@@ -11170,6 +11175,7 @@ impl Store {
                 digest: snapshot.inventory.digest.clone(),
                 envelopes: Vec::new(),
                 buckets: Vec::new(),
+                accepts: None,
             },
         })
     }
@@ -19954,9 +19960,24 @@ fn full_compact_replication_inventory(
     Ok((inventory, max_rowid))
 }
 
-/// The most envelopes one exchange response or request carries, and the most identities one
-/// divergent exchange lists beyond its first differing range.
+/// The most envelopes one exchange carries to a peer that does not say how many it takes, and
+/// the most identities one divergent exchange lists beyond its first differing range.
 const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
+
+/// The most envelopes this build takes in one exchange, which it says in each inventory it
+/// sends. Admission commits once per pass, so a page this size admits well within the peer
+/// request timeout, and a first sync needs a few dozen exchanges instead of hundreds.
+const REPLICATION_PAGE_LIMIT: u32 = 4_096;
+
+/// How many envelopes one exchange carries to a peer, from the inventory it sent. An older
+/// peer says nothing and takes the classic 512.
+fn replication_page_limit(remote: &ReplicationInventory) -> usize {
+    remote
+        .accepts
+        .map_or(REPLICATION_EXCHANGE_ENVELOPE_LIMIT, |accepts| {
+            (accepts as usize).clamp(1, REPLICATION_PAGE_LIMIT as usize)
+        })
+}
 
 /// How often a node catching up with a peer projects the claims it has admitted.
 const CATCH_UP_PROJECTION_INTERVAL_MS: u64 = 30_000;
@@ -20015,13 +20036,14 @@ fn compact_replication_difference(
             .or_default()
             .push(identity);
     }
+    let page_limit = replication_page_limit(remote);
     let mut missing = Vec::new();
     let mut listed = Vec::new();
     let mut listing_full = false;
     for bucket in buckets {
         let key = (bucket.writer.as_str(), bucket.start);
         let local = inventory.range(&bucket.writer, bucket.start);
-        let room = REPLICATION_EXCHANGE_ENVELOPE_LIMIT.saturating_sub(missing.len());
+        let room = page_limit.saturating_sub(missing.len());
         let Some(theirs) = remote_buckets.get(&key) else {
             // The peer holds nothing in this range.
             missing.extend(
@@ -20696,6 +20718,7 @@ impl TestReplica {
             digest: inventory.digest,
             envelopes: Vec::new(),
             buckets,
+            accepts: None,
         }
     }
 
@@ -20722,6 +20745,7 @@ impl TestReplica {
             digest: inventory.digest,
             envelopes: listed,
             buckets,
+            accepts: None,
         };
         (missing, inventory)
     }
@@ -20782,6 +20806,7 @@ fn compact_replication_exchange_lists_only_ranges_that_differ() {
         digest: String::new(),
         envelopes: left.0.iter().cloned().collect(),
         buckets: Vec::new(),
+        accepts: None,
     })
     .unwrap()
     .len();
@@ -20884,6 +20909,7 @@ fn compact_replication_exchange_waits_for_a_complete_listing() {
         digest: String::new(),
         envelopes: test_envelope_ids("origin", 1..=8, "a"),
         buckets: peer.summary().buckets,
+        accepts: None,
     };
     let (missing, _) = compact_replication_difference(&inventory, &buckets, &listing, limit);
     assert_eq!(missing, test_envelope_ids("origin", 9..=10, "a"));
@@ -21041,8 +21067,13 @@ fn a_receipt_measures_how_far_behind_this_node_is() {
     let local = target.replication_inventory().unwrap().envelopes.len() as u64;
     let pull = || {
         let summary = target.export_replication_summary(FLEET).unwrap();
+        // Classic 512-envelope pages, so the backlog takes more than one exchange.
+        let inventory = ReplicationInventory {
+            accepts: None,
+            ..summary.inventory
+        };
         let response = source
-            .export_replication_exchange(FLEET, &summary.inventory)
+            .export_replication_exchange(FLEET, &inventory)
             .unwrap();
         target
             .receive_replication_exchange("source", FLEET, &response)
@@ -21091,6 +21122,58 @@ impl Store {
 
 #[cfg(test)]
 #[test]
+fn a_peer_that_says_how_many_envelopes_it_takes_gets_pages_that_size() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    for index in 0..5_000 {
+        source
+            .append_client_claim(&ClaimInput {
+                subject: format!("resource/page-{index}"),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([(
+                    "kind".into(),
+                    Value::String("custom.test.replication".into()),
+                )]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    source.bind_fleet(FLEET).unwrap();
+    let target = Store::open_memory("target").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+
+    // This build says what it takes in every inventory it sends.
+    let summary = target.export_replication_summary(FLEET).unwrap();
+    assert_eq!(summary.inventory.accepts, Some(REPLICATION_PAGE_LIMIT));
+    let page = source
+        .export_replication_exchange(FLEET, &summary.inventory)
+        .unwrap();
+    assert_eq!(page.envelopes.len(), REPLICATION_PAGE_LIMIT as usize);
+    assert_eq!(page.inventory.accepts, Some(REPLICATION_PAGE_LIMIT));
+
+    // An older peer's inventory has no such field and gets the classic page.
+    let older = serde_json::to_value(&summary.inventory).unwrap();
+    let mut older = older.as_object().unwrap().clone();
+    older.remove("accepts");
+    let older: ReplicationInventory = serde_json::from_value(Value::Object(older)).unwrap();
+    assert_eq!(older.accepts, None);
+    let page = source.export_replication_exchange(FLEET, &older).unwrap();
+    assert_eq!(page.envelopes.len(), REPLICATION_EXCHANGE_ENVELOPE_LIMIT);
+
+    // A peer that asks for more than this build sends gets this build's page.
+    let greedy = ReplicationInventory {
+        accepts: Some(u32::MAX),
+        ..summary.inventory.clone()
+    };
+    let page = source.export_replication_exchange(FLEET, &greedy).unwrap();
+    assert_eq!(page.envelopes.len(), REPLICATION_PAGE_LIMIT as usize);
+}
+
+#[cfg(test)]
+#[test]
 fn a_catching_up_node_projects_once_per_interval_and_again_when_caught_up() {
     const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
     let source = Store::open_memory("source").unwrap();
@@ -21115,8 +21198,13 @@ fn a_catching_up_node_projects_once_per_interval_and_again_when_caught_up() {
     target.bind_fleet(FLEET).unwrap();
     let pull = || {
         let summary = target.export_replication_summary(FLEET).unwrap();
+        // Classic 512-envelope pages, so the backlog takes more than one exchange.
+        let inventory = ReplicationInventory {
+            accepts: None,
+            ..summary.inventory
+        };
         let response = source
-            .export_replication_exchange(FLEET, &summary.inventory)
+            .export_replication_exchange(FLEET, &inventory)
             .unwrap();
         target
             .receive_replication_exchange("source", FLEET, &response)
@@ -30429,6 +30517,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                     hash: candidate.hash.clone(),
                 }],
                 buckets: Vec::new(),
+                accepts: None,
             },
             envelopes: vec![candidate],
             signature_requests: Vec::new(),
@@ -30500,6 +30589,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                     })
                     .collect(),
                 buckets: Vec::new(),
+                accepts: None,
             },
             envelopes,
             signature_requests: Vec::new(),
