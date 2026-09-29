@@ -133,6 +133,11 @@ enum Command {
         #[command(subcommand)]
         command: WorkCommand,
     },
+    /// Show and change the ordered lanes that mission runs work through, such as a merge train.
+    Lanes {
+        #[command(subcommand)]
+        command: LaneCommand,
+    },
     /// Inspect and control terminal members.
     Terminals {
         #[command(subcommand)]
@@ -1704,6 +1709,9 @@ enum PtyCommand {
         limit: usize,
     },
     /// Attach this terminal interactively to one running terminal member.
+    ///
+    /// A terminal on another fleet host is reached through the client gateway, the path paired
+    /// clients use, as the person from `--as` or the st config. Detach with Ctrl+\.
     Attach(PtyAttachArgs),
     /// Read one terminal's current screen without taking control.
     Peek(PtySubjectArgs),
@@ -1779,6 +1787,10 @@ struct PtyAttachArgs {
     /// Allow an attachment from inside another PTY session.
     #[arg(long)]
     force: bool,
+    /// The person attaching to a terminal another fleet host owns; defaults to `person` in the st
+    /// config. A terminal on this host needs no person.
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    person: Option<String>,
 }
 
 #[derive(Args)]
@@ -2159,6 +2171,12 @@ enum AgentsCommand {
         #[arg(long)]
         all: bool,
     },
+    /// Declare one new agent seat, start its harness, and wait until it is ready.
+    ///
+    /// The declaration is the one a person writes by hand, with the harness defaults of the
+    /// fleet's Claude and Codex seats; `--print-kdl` shows it without applying it. With
+    /// `--attach`, this terminal attaches once the harness is ready, from any fleet host.
+    New(AgentNewArgs),
     /// Preview and apply one KDL file containing durable agent seats.
     Apply(AgentApplyArgs),
     /// Start or update one durable typed-harness seat.
@@ -2218,6 +2236,97 @@ struct AgentQueueMoveArgs {
     actor: Option<String>,
 }
 
+#[derive(Subcommand)]
+enum LaneCommand {
+    /// List open lanes; `--all` also lists lanes whose run ended.
+    Ls {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show one lane's entries in order and its recent changes.
+    Show {
+        /// A `lane/RUN/NAME` subject, a run or mission with one lane, or a unique lane name.
+        lane: String,
+    },
+    /// Add an entry at the back of a lane. An entry already in the lane stays where it is.
+    Join(LaneEntryArgs),
+    /// Take an entry out of a lane.
+    Leave(LaneLeaveArgs),
+    /// Move an entry to the top, to the bottom, or next to another entry.
+    Move(LaneMoveArgs),
+    /// Record the status the lane's run found for an entry.
+    Mark(LaneMarkArgs),
+    /// Approve an entry as the lane's approver.
+    Approve(LaneEntryArgs),
+}
+
+#[derive(Args)]
+struct LaneEntryArgs {
+    /// A `lane/RUN/NAME` subject, a run or mission with one lane, or a unique lane name.
+    lane: String,
+    /// The entry subject, or the part after the lane's entry prefix, such as a pull request number.
+    entry: String,
+    /// Why; recorded with the change.
+    #[arg(long)]
+    reason: Option<String>,
+    /// Person or agent making the change. A harness acts as its own seat (`ST_AGENT`); otherwise
+    /// this defaults to `person` in the st config.
+    #[arg(long = "as", value_parser = parse_queue_move_actor)]
+    actor: Option<String>,
+}
+
+#[derive(Args)]
+struct LaneLeaveArgs {
+    #[command(flatten)]
+    entry: LaneEntryArgs,
+    /// `completed` when the lane's work for the entry is done, or `removed` when it was dropped.
+    #[arg(long, default_value = "removed", value_parser = ["completed", "removed"])]
+    outcome: String,
+}
+
+#[derive(Args)]
+#[command(group(
+    clap::ArgGroup::new("placement")
+        .required(true)
+        .args(["top", "bottom", "before", "after"])
+))]
+struct LaneMoveArgs {
+    #[command(flatten)]
+    entry: LaneEntryArgs,
+    /// Put the entry first.
+    #[arg(long)]
+    top: bool,
+    /// Put the entry last.
+    #[arg(long)]
+    bottom: bool,
+    /// Put the entry directly before another entry.
+    #[arg(long, value_name = "ENTRY")]
+    before: Option<String>,
+    /// Put the entry directly after another entry.
+    #[arg(long, value_name = "ENTRY")]
+    after: Option<String>,
+}
+
+#[derive(Args)]
+struct LaneMarkArgs {
+    /// A `lane/RUN/NAME` subject, a run or mission with one lane, or a unique lane name.
+    lane: String,
+    /// The entry subject, or the part after the lane's entry prefix.
+    entry: String,
+    /// What the run found: waiting, held, ready, or running.
+    #[arg(long, value_parser = ["waiting", "held", "ready", "running"])]
+    state: String,
+    /// A short explanation shown next to the status.
+    #[arg(long)]
+    detail: Option<String>,
+    /// The exact head or version the status applies to.
+    #[arg(long)]
+    head: Option<String>,
+    /// Person or agent recording the status. A harness acts as its own seat (`ST_AGENT`).
+    #[arg(long = "as", value_parser = parse_queue_move_actor)]
+    actor: Option<String>,
+}
+
 #[derive(Args)]
 struct AgentApplyArgs {
     /// KDL file to publish; use `-` to read standard input.
@@ -2250,6 +2359,43 @@ struct AgentStartArgs {
     /// Print the exact seat KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
+}
+
+#[derive(Args)]
+struct AgentNewArgs {
+    /// Stable seat identity. A slash-qualified identity is kept exactly after `agent/`; a simple
+    /// name is prefixed with its host, as in `agent/HOST.NAME`.
+    name: String,
+    /// Fleet host that runs the agent; defaults to this host.
+    #[arg(long)]
+    host: Option<String>,
+    #[arg(long, default_value = "claude", value_parser = ["claude", "codex", "pi", "omp", "opencode"])]
+    harness: String,
+    /// Model the harness runs, such as `claude-opus-5-5`; defaults to the harness's own.
+    #[arg(long)]
+    model: Option<String>,
+    /// Reasoning effort the harness runs with, such as `high`.
+    #[arg(long)]
+    effort: Option<String>,
+    /// Directory the agent works in on its host; the host creates it when it is missing. Defaults
+    /// to a new directory for the agent below that host's home, `~/st/agents/NAME`.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    /// What the agent is for.
+    #[arg(long)]
+    description: Option<String>,
+    /// Attach this terminal to the agent once its harness is ready. Detach with Ctrl+\.
+    #[arg(long, conflicts_with = "print_kdl")]
+    attach: bool,
+    /// Print the declaration without applying it.
+    #[arg(long)]
+    print_kdl: bool,
+    /// How long to wait for the harness to become ready.
+    #[arg(long, default_value = "10m")]
+    timeout: String,
+    /// Person or agent publishing the declaration; defaults to `person` in the st config.
+    #[arg(long = "as", value_parser = parse_publication_actor)]
+    actor: Option<String>,
 }
 
 #[derive(Args)]
@@ -2881,6 +3027,9 @@ async fn run(cli: Cli) -> Result<()> {
             run_devices(endpoint.clone(), config.person.as_deref(), args, cli.json).await
         }
         Command::Work { command } => run_work(&client, &endpoint, command, cli.json).await,
+        Command::Lanes { command } => {
+            run_lanes(&client, config.person.as_deref(), command, cli.json).await
+        }
         Command::Terminals { command } => {
             run_pty(
                 &client,
@@ -2939,6 +3088,9 @@ fn guard_mutating_cli_actor(
             _ => None,
         },
         Command::Agents { command } => match command {
+            AgentsCommand::New(args) => Some(args.actor.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("a harness `st agents new` needs explicit --as {own}; it cannot use the configured person")
+            })?),
             AgentsCommand::Apply(args) => Some(args.actor.as_str()),
             AgentsCommand::Start(args) => Some(args.actor.as_str()),
             AgentsCommand::Stop(args) => Some(args.actor.as_str()),
@@ -2961,6 +3113,13 @@ fn guard_mutating_cli_actor(
                 _ => None,
             },
             _ => None,
+        },
+        Command::Lanes { command } => match command {
+            LaneCommand::Join(args) | LaneCommand::Approve(args) => args.actor.as_deref(),
+            LaneCommand::Leave(args) => args.entry.actor.as_deref(),
+            LaneCommand::Move(args) => args.entry.actor.as_deref(),
+            LaneCommand::Mark(args) => args.actor.as_deref(),
+            LaneCommand::Ls { .. } | LaneCommand::Show { .. } => None,
         },
         Command::Attention { command } => match command {
             AttentionCommand::Request(args) => args.actor.as_deref(),
@@ -3714,10 +3873,21 @@ async fn run_mission_view(
                 return print_value(&run, true);
             }
             let runs = load_mission_run_tree(client, &run).await?;
+            let now = current_unix_ms()?;
             print!(
                 "{}",
-                render_mission_run(&run, &runs, OutputStyle::stdout(), current_unix_ms()?)
+                render_mission_run(&run, &runs, OutputStyle::stdout(), now)
             );
+            // A daemon without lanes answers 404; the run itself is still shown.
+            if let Ok(lanes) = client
+                .get::<Vec<st3::model::LaneView>>(&format!(
+                    "/v1/lanes?run={}",
+                    urlencoding::encode(&run.subject)
+                ))
+                .await
+            {
+                print!("{}", render_run_lanes(&lanes, now));
+            }
             Ok(())
         }
         MissionViewCommand::Publish(args) => publish_mission_file(client, args, json_output).await,
@@ -4239,7 +4409,8 @@ async fn run_pty(
         }
         PtyCommand::Attach(args) => {
             let subject = normalize_member_subject(&args.subject, "pty");
-            attach_terminal(client, &subject, args.force).await
+            let person = args.person.as_deref().or(configured_person);
+            attach_terminal(client, endpoint, person, &subject, args.force).await
         }
         PtyCommand::Peek(args) => {
             let subject = normalize_member_subject(&args.subject, "pty");
@@ -4448,7 +4619,16 @@ fn render_terminal_screen(screen: &ClientTerminalScreen) -> String {
     output
 }
 
-async fn attach_terminal(client: &Client, subject: &str, force: bool) -> Result<()> {
+/// Attach this terminal to one terminal member. A terminal on this host is proxied byte for byte;
+/// one that another fleet host owns goes through the client gateway, the path paired clients use,
+/// as `person`.
+async fn attach_terminal(
+    client: &Client,
+    endpoint: &Endpoint,
+    person: Option<&str>,
+    subject: &str,
+    force: bool,
+) -> Result<()> {
     if !force
         && let Ok(outer) = std::env::var("PTY_SESSION")
         && !outer.is_empty()
@@ -4457,15 +4637,30 @@ async fn attach_terminal(client: &Client, subject: &str, force: bool) -> Result<
             "st terminals attach: already inside PTY session `{outer}`. Detach first with Ctrl+\\, or pass --force."
         );
     }
-    let attachment: Attachment = client
+    let attached: Result<Attachment> = client
         .post(
             &format!("/v1/sessions/attach/{}", urlencoding::encode(subject)),
             &AttachRequest::default(),
         )
-        .await?;
-    let code = client
-        .proxy_terminal_resilient(subject, &attachment)
-        .await?;
+        .await;
+    let code = match attached {
+        Ok(attachment) => {
+            client
+                .proxy_terminal_resilient(subject, &attachment)
+                .await?
+        }
+        Err(error) if st3::client::api_error_code(&error) == Some("runtime-not-local") => {
+            let person = person.with_context(|| {
+                format!(
+                    "{error:#}. Attaching to it from this host needs `--as person/NAME` or `person = \"person/NAME\"` in the st config"
+                )
+            })?;
+            let person = parse_person_subject(person).map_err(anyhow::Error::msg)?;
+            let gateway = generated_client(endpoint, Some(&person))?;
+            st3::remote_terminal::attach(&gateway, subject, subject).await?
+        }
+        Err(error) => return Err(error),
+    };
     if code == 0 {
         Ok(())
     } else {
@@ -5519,17 +5714,34 @@ fn print_timeline_page(
         return print_value(response, true);
     }
     use std::fmt::Write as _;
+    let mut output = timeline_entries_text(&response.value.session_id, &response.value.items);
+    if response.value.page.has_more
+        && let Some(cursor) = &response.value.page.next_cursor
+    {
+        let _ = writeln!(
+            output,
+            "\nOlder entries: st conversations timeline {} --cursor {}",
+            response.value.session_id,
+            shell_argument(cursor)
+        );
+    }
+    print!("{output}");
+    Ok(())
+}
+
+fn timeline_entries_text(session_id: &str, items: &[ClientTimelineEntry]) -> String {
+    use std::fmt::Write as _;
     let mut output = String::new();
     let _ = writeln!(
         output,
         "CONVERSATION  {} · {} entries",
-        response.value.session_id,
-        response.value.items.len()
+        session_id,
+        items.len()
     );
-    if response.value.items.is_empty() {
+    if items.is_empty() {
         let _ = writeln!(output, "No normalized timeline entries.");
     }
-    for entry in &response.value.items {
+    for entry in items {
         let kind = format!("{:?}", entry.body.entry_type()).to_lowercase();
         let role = format!("{:?}", entry.role).to_lowercase();
         let _ = writeln!(
@@ -5540,6 +5752,12 @@ fn print_timeline_page(
         match &entry.body {
             ClientTimelineBody::Message(body) => {
                 let _ = write!(output, "message {}", body.message_id);
+                if let (Some(from), Some(to)) = (&body.from, &body.to) {
+                    let _ = write!(output, " · {from} → {to}");
+                }
+                if let Some(title) = &body.title {
+                    let _ = write!(output, " · {title}");
+                }
                 if let Some(reply_to) = &body.reply_to {
                     let _ = write!(output, " · reply to {reply_to}");
                 }
@@ -5598,18 +5816,7 @@ fn print_timeline_page(
             }
         }
     }
-    if response.value.page.has_more
-        && let Some(cursor) = &response.value.page.next_cursor
-    {
-        let _ = writeln!(
-            output,
-            "\nOlder entries: st conversations timeline {} --cursor {}",
-            response.value.session_id,
-            shell_argument(cursor)
-        );
-    }
-    print!("{output}");
-    Ok(())
+    output
 }
 
 fn unseen_timeline_entries(
@@ -5636,12 +5843,17 @@ fn unseen_timeline_entries(
             seen.remove(&id);
         }
     }
-    changed.sort_by_key(|entry| entry.sequence);
+    // Small Talk and transcript entries number their sequences apart; time orders them.
+    changed.sort_by(|a, b| {
+        a.timestamp
+            .cmp(&b.timestamp)
+            .then(a.sequence.cmp(&b.sequence))
+    });
     changed
 }
 
 fn print_follow_entries(
-    response: &ClientEnvelope<ClientTimelinePage>,
+    session_id: &str,
     changed: Vec<ClientTimelineEntry>,
     json_output: bool,
 ) -> Result<()> {
@@ -5654,65 +5866,46 @@ fn print_follow_entries(
         }
         return Ok(());
     }
-    let mut delta = response.clone();
-    delta.value.items = changed;
-    delta.value.page.has_more = false;
-    delta.value.page.next_cursor = None;
-    print_timeline_page(&delta, false)
+    print!("{}", timeline_entries_text(session_id, &changed));
+    Ok(())
 }
 
+/// Follow a conversation the way every client sees it: st joins the transcript and the Small
+/// Talk and pushes each change on the collection socket.
 async fn follow_conversation(
     client: &GeneratedClient,
-    session: &str,
+    target: &str,
     limit: usize,
     json_output: bool,
 ) -> Result<()> {
-    // Subscribe before reading the first page so a change during that read cannot be lost.
-    let mut event_cursor = client.capabilities().await?.value.event_cursor;
+    let mut stream = client.collection_stream().await?;
+    stream.subscribe_conversation("conversation", target).await?;
     let mut seen = BTreeMap::new();
-    let initial = client.timeline(session, None, Some(limit)).await?;
-    print_follow_entries(
-        &initial,
-        unseen_timeline_entries(&initial.value.items, &mut seen),
-        json_output,
-    )?;
-    let mut last_read = Instant::now();
     loop {
-        let events = match client
-            .events(Some(&event_cursor), Some(200), Some(3_000))
-            .await
-        {
-            Ok(events) => events,
-            Err(GeneratedClientError::Api(ClientErrorCode::CursorGap, _, _)) => {
-                // Keep the visible window; re-establish the subscription and compare revisions.
-                event_cursor = client.capabilities().await?.value.event_cursor;
-                let page = client.timeline(session, None, Some(limit)).await?;
+        match stream.next_event().await? {
+            None => anyhow::bail!("st closed the conversation stream"),
+            Some(st3_client::CollectionEvent::Conversation {
+                session_id,
+                replace,
+                items,
+                ..
+            }) => {
+                // The first page shows its newest `limit` entries; later pages only what changed.
+                let items = if replace && seen.is_empty() {
+                    items[items.len().saturating_sub(limit)..].to_vec()
+                } else {
+                    items
+                };
                 print_follow_entries(
-                    &page,
-                    unseen_timeline_entries(&page.value.items, &mut seen),
+                    &session_id,
+                    unseen_timeline_entries(&items, &mut seen),
                     json_output,
                 )?;
-                last_read = Instant::now();
-                continue;
             }
-            Err(error) => return Err(error.into()),
-        };
-        event_cursor = events.value.resume_cursor;
-        let relevant = events
-            .value
-            .items
-            .iter()
-            .any(|event| event.resource_ids.iter().any(|id| id == session));
-        // Native host-local transcripts may advance without a graph event. This bounded
-        // fallback runs only while this explicit follow command is active.
-        if relevant || last_read.elapsed() >= Duration::from_secs(3) {
-            let page = client.timeline(session, None, Some(limit)).await?;
-            print_follow_entries(
-                &page,
-                unseen_timeline_entries(&page.value.items, &mut seen),
-                json_output,
-            )?;
-            last_read = Instant::now();
+            Some(st3_client::CollectionEvent::Error { message, .. }) => {
+                anyhow::bail!("st could not show this conversation: {message}")
+            }
+            Some(_) => {}
         }
     }
 }
@@ -6837,6 +7030,9 @@ async fn run_agents(
         AgentsCommand::Queue(args) => {
             run_agent_queue(endpoint, configured_person, args, json_output).await
         }
+        AgentsCommand::New(args) => {
+            run_agent_new(endpoint, configured_person, args, json_output).await
+        }
         AgentsCommand::Apply(args) => {
             let client = cli_client(endpoint);
             let (kdl, source_name) = read_intent(Some(&args.file))?;
@@ -6934,6 +7130,313 @@ fn agent_start_document(args: &AgentStartArgs) -> Result<String> {
     Ok(publication_document(agent))
 }
 
+/// The Claude settings the fleet's Claude seats run with: st's channel plugin on and the older
+/// st2 channel plugin off.
+const CLAUDE_SEAT_SETTINGS: &str =
+    r#"{"enabledPlugins":{"st2-channel@st2":false,"st3-channel@st2":true}}"#;
+
+/// The declaration `st agents new` publishes: what a person writes by hand for a fleet seat.
+/// Claude and Codex seats get the harness defaults the fleet's existing seats run with.
+fn agent_new_document(args: &AgentNewArgs, workspace: &str, create_workspace: bool) -> String {
+    let mut body = KdlDocument::new();
+    if let Some(description) = &args.description {
+        body.nodes_mut()
+            .push(kdl_node("description", [description.as_str()]));
+    }
+    if let Some(host) = &args.host {
+        body.nodes_mut().push(kdl_node("host", [host.as_str()]));
+    }
+    let mut workspace = kdl_node("workspace", [workspace]);
+    if create_workspace {
+        workspace
+            .entries_mut()
+            .push(KdlEntry::new_prop("create", true));
+    }
+    body.nodes_mut().push(workspace);
+    let arguments: &[&str] = match args.harness.as_str() {
+        "claude" => {
+            let mut environment = KdlNode::new("env");
+            let mut variables = KdlDocument::new();
+            variables
+                .nodes_mut()
+                .push(kdl_node("CLAUDE_CODE_CHILD_SESSION", ["0"]));
+            environment.set_children(variables);
+            body.nodes_mut().push(environment);
+            body.nodes_mut().push(render_node(&[
+                kdl_node("git-exclude", [".st3/", ".claude/"]),
+                kdl_node(
+                    "json-upsert",
+                    [".claude/settings.local.json", CLAUDE_SEAT_SETTINGS],
+                ),
+            ]));
+            &[
+                "--dangerously-skip-permissions",
+                "--settings",
+                CLAUDE_SEAT_SETTINGS,
+            ]
+        }
+        "codex" => {
+            body.nodes_mut()
+                .push(render_node(&[kdl_node("git-exclude", [".st3/"])]));
+            &[
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--dangerously-bypass-hook-trust",
+            ]
+        }
+        _ => &[],
+    };
+    let mut harness = kdl_node("harness", [args.harness.as_str()]);
+    let mut harness_body = KdlDocument::new();
+    if let Some(model) = &args.model {
+        harness_body
+            .nodes_mut()
+            .push(kdl_node("model", [model.as_str()]));
+    }
+    if let Some(effort) = &args.effort {
+        harness_body
+            .nodes_mut()
+            .push(kdl_node("effort", [effort.as_str()]));
+    }
+    if !arguments.is_empty() {
+        harness_body
+            .nodes_mut()
+            .push(kdl_node("args", arguments.iter().copied()));
+    }
+    if !harness_body.nodes().is_empty() {
+        harness.set_children(harness_body);
+    }
+    body.nodes_mut().push(harness);
+    body.nodes_mut().push(kdl_node("restart", ["always"]));
+    let mut agent = kdl_node("agent", [args.name.as_str()]);
+    agent.set_children(body);
+    publication_document(agent)
+}
+
+fn render_node(operations: &[KdlNode]) -> KdlNode {
+    let mut render = KdlNode::new("render");
+    let mut body = KdlDocument::new();
+    body.nodes_mut().extend(operations.iter().cloned());
+    render.set_children(body);
+    render
+}
+
+async fn run_agent_new(
+    endpoint: &Endpoint,
+    configured_person: Option<&str>,
+    args: AgentNewArgs,
+    json_output: bool,
+) -> Result<()> {
+    let client = cli_client(endpoint);
+    let actor = match &args.actor {
+        Some(actor) => actor.clone(),
+        None => configured_human(None, configured_person, "agents new")?,
+    };
+    // Another host's workspace and terminal are reached as a person, like any client.
+    let person = Some(actor.as_str())
+        .filter(|actor| actor.starts_with("person/"))
+        .or(configured_person);
+    let timeout = parse_timeout(&args.timeout)?;
+    let (workspace, create_workspace) =
+        agent_new_workspace(&client, endpoint, &args, person).await?;
+    let kdl = agent_new_document(&args, &workspace, create_workspace);
+    if args.print_kdl {
+        print!("{kdl}");
+        return Ok(());
+    }
+    let source_name = format!("st agents new {}", args.name);
+    let preview: MissionResponse = client
+        .post(
+            "/v1/intent/mission",
+            &MissionRequest {
+                intent: IntentInput {
+                    kdl: kdl.clone(),
+                    source_name: Some(source_name.clone()),
+                },
+                at_index: None,
+            },
+        )
+        .await?;
+    anyhow::ensure!(
+        preview.blockers.is_empty(),
+        "{}",
+        preview.blockers.join("; ")
+    );
+    let subject = preview
+        .subject_tokens
+        .keys()
+        .find(|subject| subject.starts_with("agent/"))
+        .cloned()
+        .context("the declaration names no agent")?;
+    let gateway = generated_client(endpoint, None)?;
+    match gateway.agents_get(&subject).await {
+        Ok(existing) => {
+            if let ClientResource::Agent(agent) = existing.value
+                && agent.state != "stopped"
+            {
+                anyhow::bail!(
+                    "`{subject}` already exists and is {}; change it with `st agents apply`, or stop it with `st agents stop` first",
+                    agent.state
+                );
+            }
+        }
+        Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => {}
+        Err(error) => return Err(error.into()),
+    }
+    publish_text(&client, kdl, source_name, actor.clone()).await?;
+    if !json_output {
+        eprintln!("Declared {subject} in {workspace}; waiting for its harness.");
+    }
+    let agent = match tokio::time::timeout(
+        timeout,
+        wait_for_agent_harness(&client, &gateway, &subject, args.attach),
+    )
+    .await
+    {
+        Ok(agent) => agent?,
+        Err(_) => anyhow::bail!(
+            "`{subject}` was declared, but its harness was not ready after {}; see `st agents show {subject}`",
+            args.timeout
+        ),
+    };
+    if json_output {
+        print_value(
+            &json!({
+                "subject": subject,
+                "host_id": agent.host_id,
+                "workspace": workspace,
+                "state": agent.state,
+                "harness_state": agent.harness_state,
+            }),
+            true,
+        )?;
+    } else {
+        println!("{subject}");
+    }
+    if args.attach {
+        attach_terminal(&client, endpoint, person, &subject, false).await?;
+    }
+    Ok(())
+}
+
+/// The workspace for a new agent and whether its host creates it when it is missing. A named
+/// workspace on another host is taken as written. With none named, the agent's host names a new
+/// directory for it below its own home.
+async fn agent_new_workspace(
+    client: &Client,
+    endpoint: &Endpoint,
+    args: &AgentNewArgs,
+    person: Option<&str>,
+) -> Result<(String, bool)> {
+    let health: Value = client.get("/v1/health").await?;
+    let local = health["node"]
+        .as_str()
+        .context("the daemon health response has no node")?
+        .to_owned();
+    let host = args.host.clone().unwrap_or_else(|| local.clone());
+    if let Some(workspace) = &args.workspace {
+        if host == local {
+            if let Ok(existing) = fs::canonicalize(workspace) {
+                return Ok((existing.display().to_string(), false));
+            }
+            let workspace = std::path::absolute(workspace)
+                .with_context(|| format!("resolve workspace {}", workspace.display()))?;
+            return Ok((workspace.display().to_string(), true));
+        }
+        anyhow::ensure!(
+            workspace.is_absolute(),
+            "a workspace on {host} must be an absolute path on that host"
+        );
+        return Ok((workspace.display().to_string(), true));
+    }
+    let path = format!(
+        "/v1/hosts/{}/agent-workspace?identity={}",
+        urlencoding::encode(&host),
+        urlencoding::encode(&args.name)
+    );
+    let answer: Result<Value> = if host == local {
+        client.get(&path).await
+    } else {
+        let Endpoint::Unix(socket) = endpoint else {
+            anyhow::bail!(
+                "asking {host} for a workspace needs the local Unix endpoint; pass --workspace"
+            );
+        };
+        let person = person.with_context(|| {
+            format!(
+                "asking {host} for a new workspace needs `--as person/NAME` or `person = \"person/NAME\"` in the st config; or pass --workspace"
+            )
+        })?;
+        Client::unix_as(socket.clone(), person)?
+            .with_outage_wait(DAEMON_WAIT.get().copied().unwrap_or_default(), true)
+            .get(&path)
+            .await
+    };
+    let answer = answer.with_context(|| {
+        format!(
+            "{host} did not name a workspace for `{}`; pass --workspace",
+            args.name
+        )
+    })?;
+    let workspace = answer["workspace"]
+        .as_str()
+        .with_context(|| format!("{host} returned no workspace"))?;
+    Ok((workspace.to_owned(), true))
+}
+
+/// Wait until the agent's current harness is ready. A harness that waits on a person, such as at
+/// a login prompt, is ready enough to attach to, so `attach` accepts it.
+async fn wait_for_agent_harness(
+    client: &Client,
+    gateway: &GeneratedClient,
+    subject: &str,
+    attach: bool,
+) -> Result<st3_client::Agent> {
+    let health: Value = client.get("/v1/health").await?;
+    let mut cursor = health["store_index"]
+        .as_u64()
+        .context("the daemon health response has no store index")?;
+    let mut reported = String::new();
+    loop {
+        let agent = match gateway.agents_get(subject).await {
+            Ok(response) => match response.value {
+                ClientResource::Agent(agent) => Some(agent),
+                _ => None,
+            },
+            Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => None,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(agent) = agent {
+            let harness = agent.harness_state.as_deref().unwrap_or("unobserved");
+            match agent.state.as_str() {
+                "running" => return Ok(agent),
+                "waiting" if attach && agent.reachability == "reachable" => return Ok(agent),
+                "waiting" if agent.reachability == "reachable" => anyhow::bail!(
+                    "`{subject}` started, but its harness is {harness} and waits on a person; attach with `st terminals attach {subject}`"
+                ),
+                "failed" => anyhow::bail!(
+                    "`{subject}` failed to start: {}",
+                    agent.fault.as_deref().unwrap_or(harness)
+                ),
+                _ => {}
+            }
+            let progress = format!("{} · harness {harness}", agent.state);
+            if progress != reported {
+                eprintln!("{subject}: {progress}");
+                reported = progress;
+            }
+        }
+        let events: Vec<EventRecord> = client
+            .get(&format!(
+                "/v1/events?after={cursor}&subject={}&wait=true&timeout_ms=30000",
+                urlencoding::encode(subject)
+            ))
+            .await?;
+        for event in events {
+            cursor = cursor.max(event.store_index);
+        }
+    }
+}
+
 async fn run_agent_inspection(
     endpoint: &Endpoint,
     command: AgentsCommand,
@@ -6983,7 +7486,8 @@ async fn run_agent_inspection(
             );
             return Ok(());
         }
-        AgentsCommand::Apply(_)
+        AgentsCommand::New(_)
+        | AgentsCommand::Apply(_)
         | AgentsCommand::Start(_)
         | AgentsCommand::Stop(_)
         | AgentsCommand::Queue(_) => {
@@ -7163,6 +7667,297 @@ async fn run_agent_queue(
     Ok(())
 }
 
+/// A lane change is made by `--as`, else by the harness's own seat, else by the configured person.
+fn lane_actor(explicit: Option<&str>, configured_person: Option<&str>) -> Result<String> {
+    if let Some(actor) = explicit {
+        return Ok(actor.to_owned());
+    }
+    if let Some(own) = std::env::var("ST_AGENT")
+        .ok()
+        .map(|own| own.trim().to_owned())
+        .filter(|own| !own.is_empty())
+    {
+        return Ok(seat_subject(&own));
+    }
+    configured_person.map(str::to_owned).context(
+        "st lanes needs `--as person/NAME`, `--as agent/PATH`, or `person = \"person/NAME\"` in the st config",
+    )
+}
+
+async fn run_lanes(
+    client: &Client,
+    configured_person: Option<&str>,
+    command: LaneCommand,
+    json_output: bool,
+) -> Result<()> {
+    let change =
+        |lane: String, change: &str, entry: String, actor: String| st3::model::LaneChangeRequest {
+            lane,
+            change: change.into(),
+            entry,
+            reason: None,
+            outcome: None,
+            placement: None,
+            anchor: None,
+            state: None,
+            detail: None,
+            head: None,
+            actor,
+            idempotency_key: format!("lane-change:{}", uuid::Uuid::now_v7().simple()),
+        };
+    let request = match command {
+        LaneCommand::Ls { all } => {
+            let lanes: Vec<st3::model::LaneView> =
+                client.get(&format!("/v1/lanes?all={all}")).await?;
+            if json_output {
+                return print_value(&lanes, true);
+            }
+            print!("{}", render_lanes(&lanes));
+            return Ok(());
+        }
+        LaneCommand::Show { lane } => {
+            let lane: st3::model::LaneView = client
+                .get(&format!("/v1/lanes/{}", urlencoding::encode(&lane)))
+                .await?;
+            if json_output {
+                return print_value(&lane, true);
+            }
+            print!("{}", render_lane(&lane, current_unix_ms()?));
+            return Ok(());
+        }
+        LaneCommand::Join(args) => {
+            let actor = lane_actor(args.actor.as_deref(), configured_person)?;
+            let mut request = change(args.lane, "join", args.entry, actor);
+            request.reason = args.reason;
+            request
+        }
+        LaneCommand::Approve(args) => {
+            let actor = lane_actor(args.actor.as_deref(), configured_person)?;
+            let mut request = change(args.lane, "approve", args.entry, actor);
+            request.reason = args.reason;
+            request
+        }
+        LaneCommand::Leave(args) => {
+            let actor = lane_actor(args.entry.actor.as_deref(), configured_person)?;
+            let mut request = change(args.entry.lane, "leave", args.entry.entry, actor);
+            request.reason = args.entry.reason;
+            request.outcome = Some(args.outcome);
+            request
+        }
+        LaneCommand::Move(args) => {
+            let actor = lane_actor(args.entry.actor.as_deref(), configured_person)?;
+            let mut request = change(args.entry.lane, "move", args.entry.entry, actor);
+            request.reason = args.entry.reason;
+            let (placement, anchor) = if args.top {
+                ("top", None)
+            } else if args.bottom {
+                ("bottom", None)
+            } else if let Some(before) = args.before {
+                ("before", Some(before))
+            } else if let Some(after) = args.after {
+                ("after", Some(after))
+            } else {
+                anyhow::bail!("choose one of --top, --bottom, --before ENTRY, or --after ENTRY");
+            };
+            request.placement = Some(placement.into());
+            request.anchor = anchor;
+            request
+        }
+        LaneCommand::Mark(args) => {
+            let actor = lane_actor(args.actor.as_deref(), configured_person)?;
+            let mut request = change(args.lane, "mark", args.entry, actor);
+            request.state = Some(args.state);
+            request.detail = args.detail;
+            request.head = args.head;
+            request
+        }
+    };
+    let response: st3::model::LaneChangeResponse =
+        client.post("/v1/lane-changes", &request).await?;
+    if json_output {
+        return print_value(&response, true);
+    }
+    let lane = &response.lane;
+    let entry = st3::lane::entry_subject(lane.entries_prefix.as_deref(), &request.entry);
+    let short = st3::lane::short_entry(lane.entries_prefix.as_deref(), &entry);
+    let summary = match (request.change.as_str(), response.claim.is_some()) {
+        ("join", false) => format!("{short} is already in {}", lane.subject),
+        ("join", true) => format!("{short} joined {}", lane.subject),
+        ("leave", _) => format!("{short} left {}", lane.subject),
+        ("move", _) => format!("moved {short} in {}", lane.subject),
+        ("mark", _) => format!("marked {short} {}", request.state.as_deref().unwrap_or("")),
+        ("approve", _) => format!("approved {short} in {}", lane.subject),
+        (other, _) => format!("{other} {short}"),
+    };
+    println!("{summary}");
+    print!("{}", render_lane(lane, current_unix_ms()?));
+    Ok(())
+}
+
+fn render_lanes(lanes: &[st3::model::LaneView]) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let _ = writeln!(output, "LANES  {}", lanes.len());
+    if lanes.is_empty() {
+        let _ = writeln!(output, "  No mission run declares an open lane.");
+    }
+    for lane in lanes {
+        let prefix = lane.entries_prefix.as_deref();
+        let front = lane.entries.first().map(|entry| {
+            format!(
+                " · front {} {}",
+                st3::lane::short_entry(prefix, &entry.entry),
+                entry.state
+            )
+        });
+        let _ = writeln!(
+            output,
+            "  {}  {} {}{}{}",
+            lane.subject,
+            lane.entries.len(),
+            if lane.entries.len() == 1 {
+                "entry"
+            } else {
+                "entries"
+            },
+            front.unwrap_or_default(),
+            if lane.open { "" } else { " · closed" }
+        );
+    }
+    output
+}
+
+/// One lane entry on one line: position, short entry, status, detail, and who joined it.
+fn render_lane_entry(
+    output: &mut String,
+    indent: &str,
+    prefix: Option<&str>,
+    entry: &st3::lane::Entry,
+    now: u128,
+) {
+    use std::fmt::Write as _;
+
+    let _ = write!(
+        output,
+        "{indent}{}. {}  {}",
+        entry.position,
+        st3::lane::short_entry(prefix, &entry.entry),
+        entry.state
+    );
+    if let Some(detail) = entry.detail.as_deref() {
+        let _ = write!(output, "  {detail}");
+    }
+    let _ = write!(
+        output,
+        "  joined by {} {}",
+        entry.joined_by,
+        presentation::relative_time(entry.joined_at_unix_ms, now)
+    );
+    if let Some(approver) = entry.approved_by.as_deref() {
+        let _ = write!(output, ", approved by {approver}");
+    }
+    let _ = writeln!(output);
+}
+
+fn render_lane(lane: &st3::model::LaneView, now: u128) -> String {
+    use std::fmt::Write as _;
+
+    let prefix = lane.entries_prefix.as_deref();
+    let mut output = String::new();
+    let _ = writeln!(output, "LANE      {}", lane.subject);
+    if let Some(run) = lane.run.as_deref() {
+        let _ = writeln!(output, "RUN       {run}");
+    }
+    if !lane.open {
+        let _ = writeln!(
+            output,
+            "STATE     closed: its run ended or a revision dropped it"
+        );
+    }
+    if let Some(prefix) = prefix {
+        let _ = writeln!(output, "ENTRIES   {prefix}");
+    }
+    if let Some(approver) = lane.approver.as_deref() {
+        let _ = writeln!(output, "APPROVER  {approver}");
+    }
+    let _ = writeln!(output, "QUEUE     {}", lane.entries.len());
+    if lane.entries.is_empty() {
+        let _ = writeln!(output, "  The lane is empty.");
+    }
+    for entry in &lane.entries {
+        render_lane_entry(&mut output, "  ", prefix, entry, now);
+    }
+    if !lane.recent.is_empty() {
+        let _ = writeln!(output, "RECENT");
+    }
+    for recent in &lane.recent {
+        let short = st3::lane::short_entry(prefix, &recent.entry);
+        let change = match recent.kind.as_str() {
+            "left" => format!(
+                "{short} left ({})",
+                recent.outcome.as_deref().unwrap_or("removed")
+            ),
+            "moved" => match (recent.placement.as_deref(), recent.anchor.as_deref()) {
+                (Some("top"), _) => format!("moved {short} to the top"),
+                (Some("bottom"), _) => format!("moved {short} to the bottom"),
+                (Some(placement), Some(anchor)) => format!(
+                    "moved {short} {placement} {}",
+                    st3::lane::short_entry(prefix, anchor)
+                ),
+                _ => format!("moved {short}"),
+            },
+            kind => format!("{kind} {short}"),
+        };
+        let _ = write!(
+            output,
+            "  {change} by {} {}",
+            recent.actor,
+            presentation::relative_time(recent.at_unix_ms, now)
+        );
+        if let Some(reason) = recent.reason.as_deref() {
+            let _ = write!(output, ": {reason}");
+        }
+        let _ = writeln!(output);
+    }
+    output
+}
+
+/// The lanes a mission run owns, for `st missions show`.
+fn render_run_lanes(lanes: &[st3::model::LaneView], now: u128) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    if lanes.is_empty() {
+        return output;
+    }
+    let _ = writeln!(output, "\nLANES");
+    for lane in lanes {
+        let _ = writeln!(
+            output,
+            "  {}  {} {}{}",
+            lane.subject,
+            lane.entries.len(),
+            if lane.entries.len() == 1 {
+                "entry"
+            } else {
+                "entries"
+            },
+            if lane.open { "" } else { " · closed" }
+        );
+        for entry in &lane.entries {
+            render_lane_entry(
+                &mut output,
+                "    ",
+                lane.entries_prefix.as_deref(),
+                entry,
+                now,
+            );
+        }
+    }
+    output
+}
+
 fn render_missions_tree(response: &Value) -> String {
     use std::fmt::Write as _;
     let value = &response["value"];
@@ -7247,6 +8042,31 @@ fn render_missions_tree(response: &Value) -> String {
                 waiting.join(", ")
             }
         );
+    }
+    // A daemon without lanes sends no `lanes` field; show the section only when it does.
+    if let Some(lanes) = value["lanes"].as_array() {
+        output.push_str("LANES\n");
+        if lanes.is_empty() {
+            output.push_str("  none\n");
+        }
+        for lane in lanes {
+            let entries = lane["entries"].as_array().map_or(0, Vec::len);
+            let _ = write!(
+                output,
+                "  {}  {entries} {}",
+                lane["id"].as_str().unwrap_or("unknown"),
+                if entries == 1 { "entry" } else { "entries" }
+            );
+            if let Some(front) = lane["entries"].get(0) {
+                let _ = write!(
+                    output,
+                    " · front {} {}",
+                    front["label"].as_str().unwrap_or("unknown"),
+                    front["state"].as_str().unwrap_or("unknown")
+                );
+            }
+            output.push('\n');
+        }
     }
     output.push_str("UNSTARTED MISSIONS\n");
     let unstarted = value["unstarted_missions"].as_array();
@@ -14022,6 +14842,147 @@ mod tests {
                 command: AgentsCommand::Stop(_)
             }
         ));
+    }
+
+    fn agent_new_args(arguments: &[&str]) -> AgentNewArgs {
+        let cli = Cli::try_parse_from(
+            ["st3", "agents", "new"]
+                .into_iter()
+                .chain(arguments.iter().copied()),
+        )
+        .unwrap();
+        let Command::Agents {
+            command: AgentsCommand::New(args),
+        } = cli.command
+        else {
+            panic!("agents new did not parse");
+        };
+        args
+    }
+
+    #[test]
+    fn a_new_claude_agent_is_the_fleet_claude_seat() {
+        let args = agent_new_args(&[
+            "site",
+            "--host",
+            "builder",
+            "--model",
+            "claude-opus-5-5",
+            "--effort",
+            "high",
+            "--description",
+            "Builds the example site.",
+            "--attach",
+        ]);
+        assert!(args.attach && args.actor.is_none() && args.workspace.is_none());
+        let kdl = agent_new_document(&args, "/home/avery/st/agents/site", true);
+        assert!(kdl.contains(r#"workspace "/home/avery/st/agents/site" create=#true"#));
+        let intent = st3::parse_intent(&kdl, "laptop").unwrap();
+        let seat = &intent.subjects["agent/builder.site"];
+        assert!(seat.owner_run.is_none());
+        let member = seat.member.as_ref().unwrap();
+        assert_eq!(member.host, "builder");
+        assert_eq!(member.workspace, "/home/avery/st/agents/site");
+        assert!(member.workspace_create);
+        assert_eq!(member.driver.as_deref(), Some("claude"));
+        assert_eq!(member.restart, st3::model::RestartType::Always);
+        assert_eq!(member.environment["CLAUDE_CODE_CHILD_SESSION"], "0");
+        let st3::model::LaunchSpec::Argv(argv) = &member.launch else {
+            panic!("a harness seat launches an argv");
+        };
+        let joined = argv.join(" ");
+        for expected in [
+            "--channels plugin:st3-channel@st3",
+            "--model claude-opus-5-5",
+            "--effort high",
+            "--dangerously-skip-permissions",
+            CLAUDE_SEAT_SETTINGS,
+        ] {
+            assert!(
+                joined.contains(expected),
+                "{expected} is missing from {joined}"
+            );
+        }
+        let render = seat.desired["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|child| child["name"] == "render")
+            .unwrap();
+        assert_eq!(
+            render["children"][0]["arguments"],
+            json!([".st3/", ".claude/"])
+        );
+        assert_eq!(
+            render["children"][1]["arguments"],
+            json!([".claude/settings.local.json", CLAUDE_SEAT_SETTINGS])
+        );
+    }
+
+    #[test]
+    fn a_new_codex_agent_is_the_fleet_codex_seat() {
+        let args = agent_new_args(&[
+            "fleet/example/codex",
+            "--harness",
+            "codex",
+            "--model",
+            "gpt-example",
+            "--effort",
+            "medium",
+            "--workspace",
+            "/srv/example",
+            "--print-kdl",
+            "--as",
+            "person/avery",
+        ]);
+        assert_eq!(args.actor.as_deref(), Some("person/avery"));
+        let kdl = agent_new_document(&args, "/srv/example", false);
+        assert!(!kdl.contains("create="));
+        assert!(!kdl.contains("host "));
+        let intent = st3::parse_intent(&kdl, "laptop").unwrap();
+        let member = intent.subjects["agent/fleet/example/codex"]
+            .member
+            .as_ref()
+            .unwrap();
+        assert_eq!(member.host, "laptop");
+        assert!(!member.workspace_create);
+        assert!(member.environment.is_empty());
+        let st3::model::LaunchSpec::Argv(argv) = &member.launch else {
+            panic!("a harness seat launches an argv");
+        };
+        let joined = argv.join(" ");
+        for expected in [
+            "--model gpt-example",
+            "-c model_reasoning_effort=medium",
+            "--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "{expected} is missing from {joined}"
+            );
+        }
+        assert!(kdl.contains(r#"git-exclude ".st3/""#) && !kdl.contains(".claude/"));
+    }
+
+    #[test]
+    fn a_new_agent_needs_its_own_identity_inside_a_harness() {
+        let command = Cli::try_parse_from(["st3", "agents", "new", "site"])
+            .unwrap()
+            .command;
+        let refused = guard_mutating_cli_actor(&command, Some("agent/seat"), None).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("needs explicit --as agent/seat")
+        );
+        let command = Cli::try_parse_from(["st3", "agents", "new", "site", "--as", "agent/seat"])
+            .unwrap()
+            .command;
+        guard_mutating_cli_actor(&command, Some("agent/seat"), None).unwrap();
+        assert!(
+            Cli::try_parse_from(["st3", "agents", "new", "site", "--attach", "--print-kdl"])
+                .is_err()
+        );
     }
 
     #[test]
