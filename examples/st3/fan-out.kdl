@@ -11,8 +11,7 @@ version 2
 // that already exists is checked out as it is. When the run ends, whether it completes, fails, or
 // is cancelled, st stops the workers and removes each clean worktree. A worktree with
 // uncommitted or untracked changes stays, with a warning, and the branches stay in the clone.
-// `git-exclude ".st3/"` keeps the files st writes for each harness out of Git, so a finished
-// worktree is clean.
+// st writes nothing into a harness workspace, so a finished worktree is clean.
 //
 // The run workspace holds a clone of the invented project at `repo/`.
 //
@@ -41,7 +40,6 @@ mission "example/fan-out" state="ready" timeout="4h" {
     agent "parser" {
       workspace "${ST_WORKSPACE}/parser"
       checkout "${ST_WORKSPACE}/repo" base="origin/main" branch="fan-out/parser" remove-at-run-end=#true
-      render { git-exclude ".st3/" }
       harness "omp" {
         model "openai-codex/gpt-6-astra"
         effort "medium"
@@ -50,7 +48,6 @@ mission "example/fan-out" state="ready" timeout="4h" {
     agent "cli" {
       workspace "${ST_WORKSPACE}/cli"
       checkout "${ST_WORKSPACE}/repo" base="origin/main" branch="fan-out/cli" remove-at-run-end=#true
-      render { git-exclude ".st3/" }
       harness "omp" {
         model "openai-codex/gpt-6-astra"
         effort "medium"
@@ -59,7 +56,6 @@ mission "example/fan-out" state="ready" timeout="4h" {
     agent "docs" {
       workspace "${ST_WORKSPACE}/docs"
       checkout "${ST_WORKSPACE}/repo" base="origin/main" branch="fan-out/docs" remove-at-run-end=#true
-      render { git-exclude ".st3/" }
       harness "omp" {
         model "openai-codex/gpt-6-astra"
         effort "medium"

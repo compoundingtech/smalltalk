@@ -32,7 +32,7 @@ impl OutputStyle {
     }
 
     #[cfg(test)]
-    fn plain() -> Self {
+    pub(crate) fn plain() -> Self {
         Self { color: false }
     }
 
@@ -731,6 +731,31 @@ pub(crate) fn render_step_run(step: &StepRunView, style: OutputStyle, now_unix_m
         let _ = writeln!(output, "{}", style.heading("CONSTRAINTS"));
         for constraint in &step.constraints {
             let _ = writeln!(output, "  • {constraint}");
+        }
+    }
+    output
+}
+
+/// The host documents of the machine a claim runs on, each under its exact reference.
+pub(crate) fn render_host_facts(
+    node: &str,
+    documents: &[(String, String)],
+    style: OutputStyle,
+) -> String {
+    let mut output = String::new();
+    if documents.is_empty() {
+        return output;
+    }
+    let _ = writeln!(output);
+    let _ = writeln!(output, "{}  {node}", style.heading("HOST"));
+    for (reference, text) in documents {
+        let _ = writeln!(output, "  {reference}");
+        for line in text.trim_end().lines() {
+            if line.is_empty() {
+                let _ = writeln!(output);
+            } else {
+                let _ = writeln!(output, "    {line}");
+            }
         }
     }
     output

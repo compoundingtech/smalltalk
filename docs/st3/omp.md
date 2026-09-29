@@ -37,11 +37,12 @@ needs. [Holding mail during a running turn](#holding-mail-during-a-running-turn)
 
 - The pi-family session context no longer tells omp to "set your status to available" and "set busy
   before work". st has no such commands, and omp searched for them before it claimed work. The
-  context now restates the st boot contract and names the seat.
+  branch replaced them with the st boot contract. st no longer adds instructions to that context;
+  it carries only the seat's saved context.
 - A CLI process whose `ST_AGENT` names a seat can no longer act as a different agent. omp's Python
   tool cannot see `ST_AGENT`. One omp seat probed its identity there, decided that it was the Codex
   seat, and sent protocol messages as that seat.
-- A wake delivered into omp's already-running boot turn now counts as acknowledged. Before, st
+- A wake delivered into omp's already-running turn now counts as acknowledged. Before, st
   sent two more wakes 15 seconds apart, and each one interrupted omp's tool calls.
 - A seat that submits a parent step before its nested steps now receives a wake for the ready nested
   step once its turn ends. Before, the run stalled.
@@ -269,8 +270,9 @@ Each run has a report in `evals/st3/cross-harness-message-wake/reports/`, named 
   }
   ```
 
-  `effort` becomes omp's `--thinking` level. st adds the channel extension, the session directory,
-  and the boot prompt itself; do not pass them in `args`.
+  `effort` becomes omp's `--thinking` level. st adds the channel extension and the session
+  directory itself; do not pass them in `args`. omp starts with no prompt and stays idle until a
+  person types or a message is posted.
 - **Transcripts.** st points omp's `--session-dir` into the daemon's driver state for that seat.
   Look for the session JSONL there, not in omp's default session directory.
 
@@ -283,11 +285,11 @@ Each run has a report in `evals/st3/cross-harness-message-wake/reports/`, named 
   omp as that batch returns, and no command is backgrounded unless it runs longer than 10 seconds.
   Queueing the message until the turn ended was measured and was worse.
 - omp's Python `eval` tool runs with a filtered environment without `ST_AGENT`, `ST3_BIN`, or
-  `ST3_ENDPOINT`. Run st commands from the shell tool. The session context says so, and the CLI
-  refuses another agent's identity.
-- The cross-harness message wake eval hands out work only by message. The boot contract asks for
-  claimable graph work, so omp and Codex seats sometimes stop and request person action there. That
-  is an eval and boot-contract mismatch, not an omp delivery fault.
+  `ST3_ENDPOINT`. Run st commands from the shell tool. The CLI refuses another agent's identity.
+- The cross-harness message wake eval hands out work only by message. In the runs recorded here,
+  the boot contract asked for claimable graph work, so omp and Codex seats sometimes stopped and
+  requested person action there. That was an eval and boot-contract mismatch, not an omp delivery
+  fault. st no longer starts a seat with that contract.
 - Each run's report records its model from the provider transcript and its token counts.
 
 ## Still open
