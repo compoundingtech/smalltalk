@@ -190,6 +190,12 @@ Each move names its run, placement, optional anchor run, actor, optional reason,
 joins the queue when it first has a step assigned to the seat and leaves when it is terminal. An
 unknown agent returns `not-found`.
 
+Observer and subscription lists and details are available at `/v1/client/observers` and
+`/v1/client/subscriptions`. Each resource includes its normalized specification, current state,
+and owning run, generation, and step. Agentless work includes `gate_kind`: `watch` for a standing
+step with no gate, `predicate`, `command`, `llm`, or `human` for a single gate family, `mixed`
+for combined families, and `run` for an `after-run` step.
+
 ## Harness-neutral session timeline
 
 The timeline schema deliberately contains no Claude, Codex, Pi, OMP, or transcript-file types. A
@@ -264,16 +270,23 @@ The v0 action discriminators are:
 
 | Family | Actions | Required fences |
 |---|---|---|
-| Attention | `attention.resolve`, `review.approve`, `review.reject` | attention or review revision |
+| Attention | `attention.resolve`, `review.approve`, `review.reject`, `review.request-changes` | attention or review revision |
 | Messages | `message.send`, `message.read`, `message.close` | reply/message revision when present |
 | Launches | `launch.create`, `launch.revise`, `launch.preview`, `launch.approve`, `launch.cancel` | launch revision; target generation and preview token where applicable |
 | Missions | `mission.start`, `mission.revise`, `mission.approve-revision`, `mission.cancel-revision`, `mission.cancel` | mission revision and current generation where applicable |
 | Sessions | `session.import` | exact native-session revision; an exact running-process fingerprint is revalidated server-side |
-| Work | `work.claim`, `work.renew`, `work.progress`, `work.complete`, `work.fail`, `work.release`, `work.publish-mission` | generation, definition, attempt, readiness epoch, and claimant incarnation after claim |
+| Work | `work.claim`, `work.renew`, `work.progress`, `work.complete`, `work.fail`, `work.release`, `work.retry`, `work.publish-mission` | generation, definition, attempt, readiness epoch, and claimant incarnation after claim |
 | Seat queues | `agent.queue-move` | snapshot; the run and any anchor run must be queued for the seat |
-| Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation and desired revision |
+| Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation; stop, restart, and reset also require `runtime_desired_revision` from the runtime resource |
 | Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation and terminal sequence |
 | Pairing | `pairing.begin`, `pairing.complete`, `pairing.revoke` | pairing/device revision where applicable |
+
+`runtime.stop` publishes a stop for the selected member. `runtime.restart` terminates the current
+incarnation of a member with an `always` restart policy; its desired state then starts the next
+incarnation. `runtime.reset` publishes a restart-window reset for a run-owned member. A client
+submits the runtime resource ID as `target_id` and copies its `incarnation_id` and
+`desired_revision` into the action fence. Runtimes with no selected desired state have a null
+`desired_revision` and cannot use these controls.
 
 `agent.queue-move` takes `agent_id`, `mission_run_id`, `placement` (`top`, `bottom`, `before`, or
 `after`), `anchor_run_id` for `before` and `after`, and an optional `reason`. It records one
@@ -319,6 +332,25 @@ effect for every subsequent request, including a new bounded terminal WebSocket 
 Read-only scope permits snapshots, details, timelines, and event feeds. `terminal.control` adds
 terminal input and resize; other control scopes are action-family-specific. A capabilities response
 must distinguish unavailable, ungranted, and unsupported features.
+
+## Conversation stream
+
+`GET /v1/client/conversations/{id}/stream` opens one authenticated WebSocket
+with subprotocol `st3.client.conversation.v0`. A client may pass `after=CURSOR` to
+resume. `{id}` may be a session ID, an agent peer ID (resolved to its current
+session), or a st message ID with a session peer. A cursor remains tied to the
+resolved session, so a new agent incarnation needs a fresh stream.
+The first envelope has a `ConversationChanges` value with an empty `items`
+array and a `next_cursor` when opening at the live edge. Later envelopes contain
+new chronological `TimelineEntry` values, including st messages, and a cursor to
+save after applying the batch. The owner sends no WebSocket data while idle.
+
+The gateway routes managed sessions to their owning host using the authenticated
+daemon relay. The owner holds a bounded change read for up to ten seconds. A
+reconnect replays at most 200 entries; an older cursor returns `cursor-gap`, so
+the client must reload the timeline before reopening. Cursors belong to one
+session and one owner. `GET /v1/client/conversations/{id}/changes?after=CURSOR&wait_ms=N`
+offers the same bounded change read for clients that cannot open WebSockets.
 
 ## Terminal protocol
 

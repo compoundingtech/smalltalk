@@ -22,6 +22,14 @@ With Nix, from a checkout:
 nix profile install .#st3
 ```
 
+For local development, enter `nix develop`. The shell provides Rust, sccache,
+cargo-nextest, and mold on Linux. Cargo uses mold for Linux links and the system
+linker on macOS; dev and test builds keep line tables for workspace crates and
+omit dependency debug info. On both platforms the shell sets `RUSTC_WRAPPER` to
+sccache. Run tests with `cargo nextest run --workspace --locked`.
+Outside the Nix shell, install mold on Linux and cargo-nextest separately; the
+repository's `.cargo/config.toml` still selects mold for Linux builds.
+
 This installs `st3`, the `st` symlink, the `stui` terminal app, `st3-migrate`, and the pinned
 `pty` terminal runtime.
 
@@ -98,6 +106,11 @@ Seat drivers wait as long as the restart takes, keep their notes out of the seat
 `~/.local/state/st3/driver-api-warnings.log`, and resume from the graph. To run the daemon in the
 foreground instead, use `st up`.
 
+st records every `git` and `gh` call it starts, including its own, in
+`~/.local/state/st3/recorder/commands.jsonl`, then runs the real program unchanged. A call by
+absolute path is not recorded. The [command recorder](docs/st3/command-recorder.md) describes the
+log.
+
 ## First commands
 
 ```sh
@@ -142,6 +155,15 @@ Apply it and look at it:
 st agents apply worker.kdl --as person/ada
 st agents show agent/example/worker
 st terminals peek agent/example/worker
+```
+
+Token spend across the fleet is available by agent, mission, model, or host. The period ends now:
+
+```sh
+st usage --hours 24 --by agent
+st usage --hours 24 --by mission
+st usage --hours 24 --by model
+st usage --hours 24 --by host
 ```
 
 The seat starts its harness in the workspace. Its first turn reads the generated
@@ -254,6 +276,8 @@ wake an imported Claude seat for new mission work or messages. Give mission work
 declare yourself.
 
 ## Where to go next
+
+Repository intake observes complete GitHub pull request and issue listings without using an agent turn. A subscription can name a review or triage mission without a revision suffix; each request starts that mission's current ready revision. The graph remembers each delivered pull request head and issue across intake and seat restarts, so the same item is not reviewed again. See [the intake example](examples/st3/github-intake.kdl) and [resource subscriptions](docs/st3/resource-subscriptions.md). Review workspaces belong on disk and are cleaned when the run finishes.
 
 - [Examples](examples/st3/README.md), indexed by task: a seat for each harness, seat queues,
   one mission across several seats, parallel fan-out, GitHub intake, and waiting for checks, a

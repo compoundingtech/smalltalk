@@ -1230,6 +1230,10 @@ fn parse_agent(
         )
     })?;
     validate_agent_body(children, &node_name)?;
+    let fresh_context = unique_child(children, "fresh-context")?
+        .map(|child| ensure_bare(child))
+        .transpose()?
+        .is_some();
     let identity = child_string(children, "identity")?.unwrap_or(node_name);
     let host = child_string(children, "host")?
         .or_else(|| enclosing_host.map(str::to_owned))
@@ -1329,6 +1333,11 @@ fn parse_agent(
 
     if let Some(member) = primary.as_mut() {
         member.tags.insert("st3.subject".into(), subject.clone());
+        if fresh_context {
+            member
+                .tags
+                .insert("st3.fresh_context".into(), "true".into());
+        }
     }
 
     let mut desired = canonical_node(node)?;
@@ -1674,7 +1683,7 @@ fn rewrite_owned_references(subjects: &mut BTreeMap<String, DesiredSubject>, run
 
 pub(crate) fn parse_gate(node: &KdlNode, default_host: &str) -> Result<GateSpec, St3Error> {
     reject_type(node)?;
-    ensure_only_properties(node, &["type"])?;
+    ensure_only_properties(node, &["type", "mode"])?;
     let name = one_string_with_children(node)?;
     if name.is_empty() || name.len() > 160 {
         return Err(St3Error::new(
@@ -1686,6 +1695,13 @@ pub(crate) fn parse_gate(node: &KdlNode, default_host: &str) -> Result<GateSpec,
         .children()
         .ok_or_else(|| St3Error::new("missing-gate-body", format!("gate `{name}` has no body")))?;
     let gate_type = property_string(node, "type")?;
+    let mode = property_string(node, "mode")?;
+    if mode.is_some() && gate_type.as_deref() != Some("human") {
+        return Err(St3Error::new(
+            "invalid-gate-mode",
+            "only a human gate accepts a mode",
+        ));
+    }
     if gate_type
         .as_deref()
         .is_some_and(|kind| matches!(kind, "llm" | "human"))
@@ -1937,11 +1953,12 @@ fn parse_running_gate(
     name: String,
     default_host: &str,
 ) -> Result<GateSpec, St3Error> {
-    ensure_only_properties(node, &["type"])?;
+    ensure_only_properties(node, &["type", "mode"])?;
     let body = node
         .children()
         .ok_or_else(|| St3Error::new("missing-gate-body", format!("gate `{name}` has no body")))?;
     let gate_type = property_string(node, "type")?;
+    let mode = property_string(node, "mode")?;
     let allowed: &[&str] = match gate_type.as_deref() {
         None => &["exec", "host", "workspace", "env", "time-limit"],
         Some("llm") => &[
@@ -1967,6 +1984,13 @@ fn parse_running_gate(
         unique_child(body, child)?;
     }
     if gate_type.as_deref() == Some("human") {
+        let mode = mode.unwrap_or_else(|| "approve".into());
+        if !matches!(mode.as_str(), "approve" | "feedback") {
+            return Err(St3Error::new(
+                "invalid-human-gate-mode",
+                format!("human gate `{name}` has invalid mode `{mode}`"),
+            ));
+        }
         let reviewer = required_child_string(body, "reviewer", &name)?;
         if !reviewer.starts_with("person/") {
             return Err(St3Error::new(
@@ -1994,6 +2018,7 @@ fn parse_running_gate(
         return Ok(GateSpec::Human {
             name,
             reviewer,
+            mode: Some(mode),
             question,
             review_targets,
         });
@@ -2363,6 +2388,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "env",
         "render",
         "harness",
+        "fresh-context",
         "mission-authority",
         "queue-authority",
         "seat-authority",
@@ -2397,6 +2423,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "env",
         "render",
         "harness",
+        "fresh-context",
         "mission-authority",
         "queue-authority",
         "seat-authority",
@@ -2944,7 +2971,7 @@ fn validate_observer(node: &KdlNode) -> Result<(), St3Error> {
     }
     reject_unknown_children(
         body,
-        &["resource", "provider", "locator", "field"],
+        &["resource", "provider", "locator", "field", "every"],
         "observer",
         "observer",
     )?;
@@ -2971,6 +2998,9 @@ fn validate_observer(node: &KdlNode) -> Result<(), St3Error> {
             "duplicate-observer-field",
             "an observer field repeats",
         ));
+    }
+    if let Some(every) = child_string(body, "every")? {
+        parse_duration(&every, true)?;
     }
     Ok(())
 }
@@ -3052,7 +3082,7 @@ fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
                 unique_child(delivery_body, name)?;
             }
             let reference = required_child_string(delivery_body, "mission", "mission delivery")?;
-            validate_exact_mission_reference(&reference)?;
+            validate_subscription_mission_reference(&reference)?;
             let input = required_child_string(delivery_body, "resource", "mission delivery")?;
             validate_name(&input, false)?;
             let workspace = required_child_string(delivery_body, "workspace", "mission delivery")?;
@@ -3406,6 +3436,14 @@ fn validate_exact_mission_reference(reference: &str) -> Result<(), St3Error> {
     Ok(())
 }
 
+fn validate_subscription_mission_reference(reference: &str) -> Result<(), St3Error> {
+    if reference.contains('@') {
+        validate_exact_mission_reference(reference)
+    } else {
+        crate::mission::validate_mission_id(reference.strip_prefix("mission/").unwrap_or(reference))
+    }
+}
+
 fn reject_unknown_children(
     document: &KdlDocument,
     allowed: &[&str],
@@ -3605,6 +3643,7 @@ pub fn observer_spec(value: &Value) -> Option<ObserverSpec> {
             provider: String::new(),
             locator: String::new(),
             fields: Vec::new(),
+            every_ms: None,
             stopped: true,
         });
     }
@@ -3619,6 +3658,9 @@ pub fn observer_spec(value: &Value) -> Option<ObserverSpec> {
             .as_str()?
             .to_owned(),
         fields: canonical_child_values(value, "field"),
+        every_ms: canonical_child_value(value, "every")
+            .and_then(Value::as_str)
+            .and_then(|value| parse_duration(value, true).ok()),
         stopped: false,
     })
 }
@@ -3650,16 +3692,13 @@ pub fn subscription_spec(value: &Value) -> Option<SubscriptionSpec> {
         .as_str()?
         .to_owned();
     let mission_reference = canonical_child_value(delivery_node, "mission").and_then(Value::as_str);
-    let (mission, revision) = mission_reference
-        .and_then(|value| {
-            value
-                .strip_prefix("mission/")
-                .unwrap_or(value)
-                .rsplit_once('@')
-        })
-        .map_or((None, None), |(mission, revision)| {
-            (Some(mission.to_owned()), Some(revision.to_owned()))
-        });
+    let (mission, revision) = mission_reference.map_or((None, None), |value| {
+        let value = value.strip_prefix("mission/").unwrap_or(value);
+        value.rsplit_once('@').map_or_else(
+            || (Some(value.to_owned()), None),
+            |(mission, revision)| (Some(mission.to_owned()), Some(revision.to_owned())),
+        )
+    });
     Some(SubscriptionSpec {
         observer: canonical_child_value(value, "observer")?
             .as_str()?
@@ -5190,6 +5229,24 @@ version 2
     }
 
     #[test]
+    fn observer_every_sets_a_positive_poll_interval() {
+        let source = r#"version 2
+resource "repo" { kind "vcs.repository" }
+observer "github" {
+    resource "resource/repo"
+    provider "github.repository"
+    locator "example/repo"
+    field "pull_requests"
+    every "5m"
+}"#;
+        let intent = parse_test_intent(source, "node").unwrap();
+        let observer = observer_spec(&intent.subjects["observer/github"].desired).unwrap();
+        assert_eq!(observer.every_ms, Some(300_000));
+        let error = parse_test_intent(&source.replace("5m", "0s"), "node").unwrap_err();
+        assert_eq!(error.code, "invalid-duration");
+    }
+
+    #[test]
     fn strict_grammar_rejects_unknown_children_and_properties() {
         let child = parse_test_intent(
             r#"version 2
@@ -5331,6 +5388,27 @@ subscription "reviews" {{
             spec.requester.as_deref(),
             Some("agent/fleet/repository/standing/owner")
         );
+    }
+
+    #[test]
+    fn a_subscription_can_follow_the_current_ready_mission_revision() {
+        let source = r#"version 2
+resource "repo" { kind "vcs.repository" }
+observer "github" { resource "resource/repo"; provider "github.repository"; locator "example/repo"; field "pull_requests" }
+subscription "reviews" {
+  observer "observer/github"
+  on "pull_requests"
+  delivery "mission" { mission "example/review"; resource "source"; workspace "/srv/reviews" }
+}"#;
+        let intent = parse_test_intent(source, "node").unwrap();
+        let subscription = intent
+            .subjects
+            .values()
+            .find(|item| item.kind == "subscription")
+            .unwrap();
+        let spec = subscription_spec(&subscription.desired).unwrap();
+        assert_eq!(spec.mission.as_deref(), Some("example/review"));
+        assert_eq!(spec.revision, None);
     }
 
     #[test]

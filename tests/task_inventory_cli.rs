@@ -344,7 +344,7 @@ fn completed_catalog_aba_during_runtime_observation_is_incomplete() {
     write_executable(
         &bin.join("pty"),
         &format!(
-            "#!/bin/sh\n: > {:?}\nwhile [ ! -e {:?} ]; do :; done\nprintf '[]\\n'\n",
+            "#!/bin/sh\n: > {:?}\nwhile [ ! -e {:?} ]; do /bin/sleep 0.01; done\nprintf '[]\\n'\n",
             observer_ready, observer_release
         ),
     );
@@ -357,13 +357,13 @@ fn completed_catalog_aba_during_runtime_observation_is_incomplete() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
     while !observer_ready.exists() {
         assert!(
             std::time::Instant::now() < deadline,
             "runtime observer did not start"
         );
-        std::thread::yield_now();
+        std::thread::sleep(Duration::from_millis(10));
     }
 
     let apply = |prepared: &Path, expected: &str| {
@@ -409,11 +409,14 @@ fn completed_catalog_aba_during_runtime_observation_is_incomplete() {
     assert!(!inventory.status.success());
     let value: serde_json::Value = serde_json::from_slice(&inventory.stdout).unwrap();
     assert_eq!(value["complete"], false);
-    assert!(value["errors"].as_array().unwrap().iter().any(|error| {
-        error
-            .as_str()
-            .is_some_and(|error| error.contains("generation changed"))
-    }));
+    assert!(
+        value["errors"].as_array().unwrap().iter().any(|error| {
+            error
+                .as_str()
+                .is_some_and(|error| error.contains("generation changed"))
+        }),
+        "{value:#}"
+    );
 }
 
 #[test]
@@ -427,7 +430,7 @@ fn completed_single_agent_writer_abas_during_runtime_observation_are_incomplete(
         write_executable(
             &bin.join("pty"),
             &format!(
-                "#!/bin/sh\n: > {:?}\nwhile [ ! -e {:?} ]; do :; done\nprintf '[]\\n'\n",
+                "#!/bin/sh\n: > {:?}\nwhile [ ! -e {:?} ]; do /bin/sleep 0.01; done\nprintf '[]\\n'\n",
                 observer_ready, observer_release
             ),
         );
@@ -440,13 +443,13 @@ fn completed_single_agent_writer_abas_during_runtime_observation_are_incomplete(
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
         while !observer_ready.exists() {
             assert!(
                 std::time::Instant::now() < deadline,
                 "runtime observer did not start"
             );
-            std::thread::yield_now();
+            std::thread::sleep(Duration::from_millis(10));
         }
 
         if writer == "publish" {

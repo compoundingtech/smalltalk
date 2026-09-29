@@ -31,6 +31,7 @@ struct Runtime {
     execs: Mutex<HashMap<String, RuntimeObservation>>,
     failed_starts: Mutex<BTreeSet<String>>,
     failed_stops: Mutex<BTreeSet<String>>,
+    snapshot_unavailable: std::sync::atomic::AtomicBool,
     incarnations: AtomicU64,
 }
 
@@ -46,6 +47,10 @@ impl Runtime {
 
 impl RuntimeControl for Runtime {
     fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
+        anyhow::ensure!(
+            !self.snapshot_unavailable.load(Ordering::SeqCst),
+            "the PTY registry did not answer"
+        );
         Ok(self
             .execs
             .lock()
@@ -121,10 +126,6 @@ impl RuntimeControl for Runtime {
         Ok(())
     }
 
-    fn attach(&self, _runtime_id: &str) -> Result<()> {
-        Ok(())
-    }
-
     fn screen(&self, _runtime_id: &str) -> Result<String> {
         Ok(String::new())
     }
@@ -190,6 +191,10 @@ struct Host {
 
 impl Host {
     fn new() -> Self {
+        Self::with_cleanup_deadline(None)
+    }
+
+    fn with_cleanup_deadline(cleanup_deadline: Option<std::time::Duration>) -> Self {
         let root = tempfile::tempdir().unwrap();
         let workspace = root.path().join("workspace");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -203,6 +208,10 @@ impl Host {
             Arc::new(Notify::new()),
         )
         .with_fault_injection(faults.clone());
+        let reconciler = match cleanup_deadline {
+            Some(deadline) => reconciler.with_cleanup_deadline(deadline),
+            None => reconciler,
+        };
         let host = Self {
             _root: root,
             workspace,
@@ -216,11 +225,28 @@ impl Host {
 mission "worker" state="ready" {
   goal "Keep one worker running until the run is cancelled."
   concurrent-runs max=8
-  agent "worker" { workspace "${ST_WORKSPACE}"; command "sleep 600"; restart "never" }
+  agent "worker" { workspace "${ST_WORKSPACE}"; command "sleep 600"; restart "never"; shutdown-timeout "50ms" }
   step "wait" {
     assigned-to "agent/${ST_MISSION_RUN}/worker"
     goal "Wait for cancellation."
   }
+}
+mission "job" state="ready" {
+  goal "Run one command beside the seats."
+  concurrent-runs max=8
+  agent "worker" { workspace "${ST_WORKSPACE}"; command "sleep 600"; restart "never" }
+  exec "task" { command "sleep 600"; restart "never" }
+  step "wait" {
+    assigned-to "agent/${ST_MISSION_RUN}/worker"
+    goal "Wait for cancellation."
+  }
+}
+mission "pair" state="ready" {
+  goal "Offer two independent steps."
+  concurrent-runs max=8
+  agent "worker" { workspace "${ST_WORKSPACE}"; command "sleep 600"; restart "never" }
+  step "first" { assigned-to "agent/${ST_MISSION_RUN}/worker"; goal "Do the first part." }
+  step "second" { assigned-to "agent/${ST_MISSION_RUN}/worker"; goal "Do the second part." }
 }"#,
             "publish-worker",
         );
@@ -997,4 +1023,171 @@ mission "review" state="ready" {
             "the second subscription's delivery did not start"
         );
     }
+}
+
+fn exec_member(host: &Host, run: &MissionRunView) -> String {
+    host.store
+        .desired_subjects_for_owner_run(&run.subject)
+        .unwrap()
+        .into_iter()
+        .filter(|desired| desired.kind == "exec")
+        .find_map(|desired| desired.member)
+        .map(|member| member.runtime_id)
+        .unwrap_or_else(|| panic!("run {} declares no exec member", run.id))
+}
+
+fn actual_status(host: &Host, subject: &str) -> Option<String> {
+    host.store
+        .latest_actual_value(subject)
+        .unwrap()
+        .and_then(|actual| {
+            actual
+                .get("fields")
+                .unwrap_or(&actual)
+                .get("status")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+}
+
+/// While the PTY registry does not answer, a terminal seat is neither started, restarted, nor
+/// judged stopped, and everything else on the host still runs.
+#[test]
+fn an_unavailable_pty_snapshot_holds_only_terminal_members() {
+    let host = Host::new();
+    let (cancelled, cancelled_worker) = running_run(&host, "cancelled");
+    let seat = host.owned(&cancelled, "agent");
+    host.runtime
+        .snapshot_unavailable
+        .store(true, Ordering::SeqCst);
+    host.cancel(&cancelled);
+    let fresh = host.start("fresh");
+    let job = host.start_mission("job", "job");
+    host.pass(8);
+    assert!(
+        host.runtime.running(&exec_member(&host, &job)),
+        "an exec member did not start while the PTY snapshot was unavailable"
+    );
+    assert_eq!(
+        actual_status(&host, &seat).as_deref(),
+        Some("running"),
+        "the cancelled seat was judged without a snapshot"
+    );
+    assert_ne!(host.state(&cancelled).1, "terminal");
+    assert!(
+        !host.runtime.running(&host.worker(&fresh)),
+        "a seat started without knowing whether it already runs"
+    );
+    host.runtime
+        .snapshot_unavailable
+        .store(false, Ordering::SeqCst);
+    host.pass(8);
+    assert!(!host.runtime.running(&cancelled_worker));
+    assert_eq!(
+        host.state(&cancelled),
+        ("cancelled".into(), "terminal".into())
+    );
+    assert!(host.runtime.running(&host.worker(&fresh)));
+}
+
+/// A PTY whose record cannot be read may still run, so its stop waits instead of recording it
+/// stopped.
+#[test]
+fn a_pty_in_an_unknown_state_is_never_recorded_stopped() {
+    let host = Host::new();
+    let (cancelled, cancelled_worker) = running_run(&host, "cancelled");
+    let seat = host.owned(&cancelled, "agent");
+    host.runtime
+        .execs
+        .lock()
+        .unwrap()
+        .get_mut(&cancelled_worker)
+        .unwrap()
+        .status = "unknown".into();
+    host.cancel(&cancelled);
+    host.pass(8);
+    assert_ne!(actual_status(&host, &seat).as_deref(), Some("stopped"));
+    assert_ne!(host.state(&cancelled).1, "terminal");
+    host.runtime
+        .execs
+        .lock()
+        .unwrap()
+        .get_mut(&cancelled_worker)
+        .unwrap()
+        .status = "running".into();
+    host.pass(8);
+    assert_eq!(
+        host.state(&cancelled),
+        ("cancelled".into(), "terminal".into())
+    );
+}
+
+/// One step of a run that fails does not hold back the run's other steps.
+#[test]
+fn a_failing_step_does_not_hold_back_the_other_steps_of_its_run() {
+    for fault in [Fault::Error, Fault::Panic] {
+        let host = Host::new();
+        let run = host.start_mission("pair", "pair");
+        let step = |path: &str| {
+            host.store
+                .mission_run(&run.id)
+                .unwrap()
+                .unwrap()
+                .steps
+                .into_iter()
+                .find(|step| step.step == path)
+                .unwrap()
+        };
+        // The failing step comes first in the run's step order.
+        let first = step("first").subject;
+        host.faults.fail("step", &first, fault);
+        host.pass(4);
+        assert_eq!(step("first").status, "pending");
+        assert_eq!(step("second").status, "ready");
+        assert!(host.fault(&first, "step").is_some());
+        assert_eq!(host.fault(&run.subject, "mission-run"), None);
+        host.faults.clear();
+        host.pass(2);
+        assert_eq!(step("first").status, "ready");
+        assert_eq!(host.fault(&first, "step"), None);
+    }
+}
+
+/// A runtime that never stops ends its run at the cleanup deadline instead of holding it and its
+/// active-run slot forever. Its stop stays declared and completes once the runtime can stop.
+#[test]
+fn a_runtime_that_never_stops_ends_its_run_at_the_cleanup_deadline() {
+    let host = Host::with_cleanup_deadline(Some(std::time::Duration::ZERO));
+    let (stubborn, stubborn_worker) = running_run(&host, "stubborn");
+    host.runtime
+        .failed_stops
+        .lock()
+        .unwrap()
+        .insert(stubborn_worker.clone());
+    host.cancel(&stubborn);
+    host.pass(8);
+    let ended = host.store.mission_run(&stubborn.id).unwrap().unwrap();
+    assert_eq!(
+        (ended.status.as_str(), ended.phase.as_str()),
+        ("cancelled", "terminal")
+    );
+    let reason = host
+        .store
+        .latest_claim(&stubborn.subject, Some("mission-run.state"))
+        .unwrap()
+        .unwrap()
+        .body["fields"]["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .to_owned();
+    assert!(reason.contains("still live"), "{reason}");
+    assert!(host.runtime.running(&stubborn_worker));
+    host.runtime.failed_stops.lock().unwrap().clear();
+    // The failed stop waits out the worker's shutdown timeout and then kills it.
+    std::thread::sleep(std::time::Duration::from_millis(60));
+    host.pass(4);
+    assert!(
+        !host.runtime.running(&stubborn_worker),
+        "the stop was abandoned when its run ended"
+    );
 }

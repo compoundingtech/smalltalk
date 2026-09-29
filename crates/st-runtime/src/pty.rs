@@ -4,17 +4,19 @@ use std::fmt;
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
-use std::os::unix::ffi::OsStringExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
+use pty_client::{PeekScreenOptions, SendOptions, StopError};
+use pty_core::registry::SessionInfo;
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 
 const SPAWN_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(5);
 const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const PTY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PtySpawnTimeoutPhase {
@@ -81,13 +83,13 @@ struct PtyStats {
 #[serde(rename_all = "camelCase")]
 struct PtyStatsProcess {
     alive: bool,
-    pid: Option<u32>,
+    pid: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PtyStatsDaemon {
-    pid: u32,
+    pid: i32,
 }
 
 #[derive(Clone)]
@@ -95,6 +97,7 @@ pub struct PtyRuntime {
     binary: String,
     root: PathBuf,
     spawn_timeout: Duration,
+    command_timeout: Duration,
     command_environment: Option<BTreeMap<String, String>>,
 }
 
@@ -116,6 +119,7 @@ impl PtyRuntime {
             binary: "pty".into(),
             root,
             spawn_timeout: SPAWN_PUBLICATION_TIMEOUT,
+            command_timeout: PTY_COMMAND_TIMEOUT,
             command_environment: None,
         }
     }
@@ -137,11 +141,39 @@ impl PtyRuntime {
         self
     }
 
+    #[cfg(test)]
+    fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = timeout;
+        self
+    }
+
     pub fn snapshot(&self) -> Result<Vec<PtyObservation>> {
-        let output = self.command().args(["list", "--json"]).output()?;
-        require_success("list PTYs", output).and_then(|bytes| {
-            serde_json::from_slice(&bytes).context("parse the atomic PTY snapshot")
-        })
+        self.sessions()?.into_iter().map(observation).collect()
+    }
+
+    /// One bounded read of the registry. `pty_client` lists an unreadable root as empty, but the
+    /// reconciler reads an empty snapshot as every PTY being gone, so that is an error here. A
+    /// root that does not exist yet holds no PTYs.
+    fn sessions(&self) -> Result<Vec<SessionInfo>> {
+        if let Err(error) = std::fs::read_dir(&self.root) {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                return Ok(Vec::new());
+            }
+            return Err(error).with_context(|| format!("list PTYs in {}", self.root.display()));
+        }
+        Ok(
+            pty_client::list::list(&self.root, &pty_client::list::ListOptions::default())
+                .into_iter()
+                .map(|listed| listed.info)
+                .collect(),
+        )
+    }
+
+    fn session(&self, id: &str) -> Result<SessionInfo> {
+        self.sessions()?
+            .into_iter()
+            .find(|session| session.name == id)
+            .with_context(|| format!("PTY `{id}` is not present"))
     }
 
     pub fn spawn(
@@ -235,7 +267,7 @@ impl PtyRuntime {
                 command.env_clear().envs(environment);
             }
             command.env("PTY_ROOT", &self.root);
-            let output = match command.output() {
+            let output = match output_within(command, self.command_timeout) {
                 Ok(output) => output,
                 Err(error) => {
                     let _ = std::fs::remove_file(&fence);
@@ -354,9 +386,28 @@ impl PtyRuntime {
     }
 
     pub fn stop_if(&self, id: &str, expected_incarnation: Option<&str>) -> Result<()> {
-        self.require_incarnation(id, expected_incarnation)?;
-        let output = self.command().args(["kill", id]).output()?;
-        require_success("stop PTY", output)?;
+        let session = self.require_incarnation(id, expected_incarnation)?;
+        // Fence the stop on the generation this read saw as well, so a replacement published
+        // after the incarnation check is never stopped in its place.
+        let generation = session
+            .metadata
+            .as_ref()
+            .and_then(|metadata| metadata.generation.as_deref());
+        let stopped =
+            pty_client::stop_in(&self.root, id, generation).map_err(|error| match error {
+                StopError::GenerationChanged { .. } => {
+                    anyhow::anyhow!("PTY `{id}` changed incarnation before the control action")
+                }
+                error => anyhow::anyhow!("stop PTY failed: {error}"),
+            })?;
+        anyhow::ensure!(
+            stopped.verified_empty(),
+            "stop PTY failed: the daemon stopped, but processes {:?} survived, {:?} survived \
+             SIGKILL to their group, and {:?} could not be checked",
+            stopped.aftermath.survived,
+            stopped.escalated.as_deref().unwrap_or_default(),
+            stopped.aftermath.unknown,
+        );
         Ok(())
     }
 
@@ -374,24 +425,23 @@ impl PtyRuntime {
         expected_incarnation: Option<&str>,
         signal: i32,
     ) -> Result<()> {
-        let observation = self
-            .snapshot()?
-            .into_iter()
-            .find(|item| item.name == id)
-            .with_context(|| format!("PTY `{id}` is not present"))?;
-        ensure_incarnation(id, &observation, expected_incarnation)?;
-        let daemon_pid = observation
+        let session = self.require_incarnation(id, expected_incarnation)?;
+        let daemon_pid = session
             .pid
             .with_context(|| format!("PTY `{id}` has no process identity"))?;
 
-        // `pty list` exposes the supporting daemon PID, not the process group leader running
-        // inside the terminal. Signalling that PID makes the registry disappear while leaving
-        // the provider tree alive. Resolve the terminal child through the same daemon and fence
-        // it against the list snapshot before delivering the signal.
-        let output = self.command().args(["stats", id, "--json"]).output()?;
-        let bytes = require_success("read PTY process identity", output)?;
+        // The registry names the supporting daemon, not the process group leader running inside
+        // the terminal. Signalling that PID makes the registry disappear while leaving the
+        // provider tree alive. Resolve the terminal child through the same daemon and fence it
+        // against the registry read before delivering the signal. `pty_client::signal_in` would
+        // also prove the daemon by a start token that daemons before pty-rust a2bfa66 never
+        // record, so it refuses every session those daemons run.
+        let status = pty_core::registry::with_root(&self.root, || {
+            pty_client::query_status_json(id, pty_client::STATS_TIMEOUT)
+        })
+        .map_err(|error| anyhow::anyhow!("read PTY process identity failed: {error}"))?;
         let stats: PtyStats =
-            serde_json::from_slice(&bytes).context("parse PTY process identity")?;
+            serde_json::from_str(&status).context("parse PTY process identity")?;
         anyhow::ensure!(
             stats.name == id,
             "PTY stats returned `{}` for `{id}`",
@@ -409,9 +459,15 @@ impl PtyRuntime {
             .process
             .pid
             .with_context(|| format!("PTY `{id}` has no terminal process identity"))?;
-        let group = unsafe { libc::kill(-(pid as i32), signal) };
+        // kill(2) reads 0, 1, a negative pid, and this process's own group as more than one
+        // program.
+        anyhow::ensure!(
+            pid > 1 && pid != unsafe { libc::getpgrp() },
+            "PTY `{id}` reported the process identity {pid}, which cannot be signalled alone"
+        );
+        let group = unsafe { libc::kill(-pid, signal) };
         if group != 0 {
-            let direct = unsafe { libc::kill(pid as i32, signal) };
+            let direct = unsafe { libc::kill(pid, signal) };
             if direct != 0 {
                 let error = std::io::Error::last_os_error();
                 if error.raw_os_error() != Some(libc::ESRCH) {
@@ -422,24 +478,32 @@ impl PtyRuntime {
         Ok(())
     }
 
-    fn require_incarnation(&self, id: &str, expected_incarnation: Option<&str>) -> Result<()> {
-        let observation = self
-            .snapshot()?
-            .into_iter()
-            .find(|item| item.name == id)
-            .with_context(|| format!("PTY `{id}` is not present"))?;
-        ensure_incarnation(id, &observation, expected_incarnation)
+    fn require_incarnation(
+        &self,
+        id: &str,
+        expected_incarnation: Option<&str>,
+    ) -> Result<SessionInfo> {
+        let session = self.session(id)?;
+        if expected_incarnation
+            .is_some_and(|expected| session_incarnation(&session).as_deref() != Some(expected))
+        {
+            anyhow::bail!("PTY `{id}` changed incarnation before the control action");
+        }
+        Ok(session)
     }
 
     pub fn remove(&self, id: &str) -> Result<()> {
-        let output = self.command().args(["remove", id]).output()?;
-        require_success("remove PTY", output)?;
-        Ok(())
+        pty_client::remove_in(&self.root, id)
+            .map_err(|error| anyhow::anyhow!("remove PTY failed: {error}"))
     }
 
     pub fn attach(&self, id: &str) -> Result<()> {
-        let status = self
-            .command()
+        let mut command = Command::new(&self.binary);
+        if let Some(environment) = &self.command_environment {
+            command.env_clear().envs(environment);
+        }
+        let status = command
+            .env("PTY_ROOT", &self.root)
             .args(["attach", id])
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
@@ -460,12 +524,7 @@ impl PtyRuntime {
         expected_incarnation: Option<&str>,
     ) -> Result<()> {
         self.require_incarnation(id, expected_incarnation)?;
-        let output = self
-            .command()
-            .args(["send", id, "--seq", text, "--seq", "key:return"])
-            .output()?;
-        require_success("send PTY input", output)?;
-        Ok(())
+        self.send(id, &[text.as_bytes(), b"\r"])
     }
 
     pub fn send_raw(&self, id: &str, bytes: &[u8]) -> Result<()> {
@@ -483,14 +542,7 @@ impl PtyRuntime {
             !bytes.contains(&0),
             "terminal input cannot contain a NUL byte"
         );
-        let output = self
-            .command()
-            .arg("send")
-            .arg(id)
-            .arg(OsString::from_vec(bytes.to_vec()))
-            .output()?;
-        require_success("send PTY input", output)?;
-        Ok(())
+        self.send(id, &[bytes])
     }
 
     pub fn send_key(&self, id: &str, key: &str) -> Result<()> {
@@ -504,18 +556,32 @@ impl PtyRuntime {
         expected_incarnation: Option<&str>,
     ) -> Result<()> {
         self.require_incarnation(id, expected_incarnation)?;
-        let output = self
-            .command()
-            .args(["send", id, "--seq", &format!("key:{key}")])
-            .output()?;
-        require_success("send PTY key", output)?;
-        Ok(())
+        let key = pty_core::keys::resolve_key(key)
+            .map_err(|error| anyhow::anyhow!("send PTY key failed: {error}"))?;
+        self.send(id, &[key.as_bytes()])
+    }
+
+    /// Each item is one write, with `pty send --seq`'s pause between items so a terminal
+    /// program reads a line and its Enter as typing rather than as one paste.
+    fn send(&self, id: &str, items: &[&[u8]]) -> Result<()> {
+        let options = SendOptions {
+            delay_ms: pty_client::DEFAULT_SEQ_DELAY_MS,
+            paste: false,
+        };
+        pty_client::send_in(&self.root, id, items, options)
+            .map_err(|error| anyhow::anyhow!("send PTY input failed: {error}"))
     }
 
     pub fn screen(&self, id: &str) -> Result<String> {
-        let output = self.command().args(["peek", "--plain", id]).output()?;
-        let bytes = require_success("read PTY screen", output)?;
-        String::from_utf8(bytes).context("the PTY screen is not UTF-8")
+        let options = PeekScreenOptions {
+            plain: true,
+            full: false,
+        };
+        let mut screen = pty_client::peek_screen_in(&self.root, id, options)
+            .map_err(|error| anyhow::anyhow!("read PTY screen failed: {error}"))?;
+        // `pty peek --plain` ended the screen with a newline.
+        screen.push('\n');
+        Ok(screen)
     }
 
     pub fn root(&self) -> &Path {
@@ -525,14 +591,29 @@ impl PtyRuntime {
     pub fn binary(&self) -> &str {
         &self.binary
     }
+}
 
-    fn command(&self) -> Command {
-        let mut command = Command::new(&self.binary);
-        if let Some(environment) = &self.command_environment {
-            command.env_clear().envs(environment);
+/// A wedged PTY command must not stall the reconciler indefinitely.
+fn output_within(mut command: Command, timeout: Duration) -> Result<Output> {
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(child.wait_with_output());
+    });
+    match receiver.recv_timeout(timeout) {
+        Ok(output) => Ok(output?),
+        Err(_) => {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            anyhow::bail!(
+                "the pty command did not finish within {}s",
+                timeout.as_secs()
+            )
         }
-        command.env("PTY_ROOT", &self.root);
-        command
     }
 }
 
@@ -564,36 +645,76 @@ fn observation_is_live(observation: &PtyObservation) -> bool {
     })
 }
 
-fn ensure_incarnation(
-    id: &str,
-    observation: &PtyObservation,
-    expected_incarnation: Option<&str>,
-) -> Result<()> {
-    let current = match (&observation.pid, &observation.created_at) {
-        (Some(pid), Some(created_at)) => Some(format!("{pid}:{created_at}")),
-        _ => None,
-    };
-    if expected_incarnation.is_some_and(|expected| current.as_deref() != Some(expected)) {
-        anyhow::bail!("PTY `{id}` changed incarnation before the control action");
+/// The registry entry as `pty list --json` printed it.
+fn observation(session: SessionInfo) -> Result<PtyObservation> {
+    // The old CLI snapshot kept a named but malformed record visible as unknown. Preserve that
+    // failure mode so one bad process identity cannot make every other PTY disappear.
+    if session.pid.is_some_and(|pid| pid < 0) {
+        return Ok(PtyObservation {
+            name: session.name,
+            status: "unknown".into(),
+            exit_code: None,
+            pid: None,
+            created_at: None,
+            display_name: None,
+            tags: BTreeMap::new(),
+        });
     }
-    Ok(())
+    let pid = session
+        .pid
+        .map(|pid| {
+            u32::try_from(pid).map_err(|_| {
+                anyhow::anyhow!(
+                    "parse the atomic PTY snapshot: PTY `{}` has the process identity {pid}",
+                    session.name
+                )
+            })
+        })
+        .transpose()?;
+    let (created_at, exit_code, display_name, tags) = match session.metadata {
+        Some(metadata) => (
+            Some(metadata.created_at),
+            metadata.exit_code.map(i64::from),
+            metadata.display_name.filter(|name| !name.is_empty()),
+            metadata
+                .tags
+                .map(|tags| tags.into_iter().collect())
+                .unwrap_or_default(),
+        ),
+        None => (None, None, None, BTreeMap::new()),
+    };
+    Ok(PtyObservation {
+        name: session.name,
+        status: session.status.as_str().into(),
+        exit_code,
+        pid,
+        created_at,
+        display_name,
+        tags,
+    })
 }
 
-fn require_success(action: &str, output: Output) -> Result<Vec<u8>> {
-    anyhow::ensure!(
-        output.status.success(),
-        "{action} failed: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
-    Ok(output.stdout)
+/// The same incarnation [`observation_incarnation`] derives, read from the registry entry.
+fn session_incarnation(session: &SessionInfo) -> Option<String> {
+    Some(format!(
+        "{}:{}",
+        session.pid?,
+        session.metadata.as_ref()?.created_at
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{Read as _, Write as _};
+    use std::os::unix::net::UnixListener;
     use std::os::unix::process::CommandExt as _;
+    use std::process::Command;
+    use std::sync::{Arc, Mutex};
     use std::time::{Duration, Instant};
+
+    use pty_core::protocol::{MessageType, PacketReader, encode_screen, encode_status_response};
 
     fn fake_executable(root: &Path, name: &str, body: &str) -> PathBuf {
         let source = root.join(format!("{name}.source"));
@@ -611,57 +732,265 @@ mod tests {
         binary
     }
 
+    /// A fake `pty` whose `run` records its arguments and launch count, then runs `on_run`, which
+    /// can call `publish CREATED_AT` to publish `work` into `$PTY_ROOT` the way a daemon does: a
+    /// socket entry, a pid file naming the test process (so it reads as alive), and a record.
+    fn fake_pty(root: &Path, name: &str, on_run: &str) -> PathBuf {
+        let binary = fake_executable(
+            root,
+            name,
+            &format!(
+                r#"#!/bin/sh
+publish() {{
+  mkdir -p "$PTY_ROOT"
+  test -e "$PTY_ROOT/work.sock" || : > "$PTY_ROOT/work.sock"
+  cat "$0.pid" > "$PTY_ROOT/work.pid"
+  printf '{{"createdAt":"%s"}}' "$1" > "$PTY_ROOT/work.json"
+}}
+if [ "$1" = run ]; then
+  printf '%s\n' "$@" > "$0.args"
+  count=0
+  test ! -f "$0.count" || count="$(cat "$0.count")"
+  count=$((count + 1))
+  printf '%s\n' "$count" > "$0.count"
+{on_run}
+fi
+exit 0
+"#
+            ),
+        );
+        fs::write(binary.with_extension("pid"), std::process::id().to_string()).unwrap();
+        binary
+    }
+
+    fn write_record(registry: &Path, name: &str, record: serde_json::Value) {
+        fs::create_dir_all(registry).unwrap();
+        fs::write(registry.join(format!("{name}.json")), record.to_string()).unwrap();
+    }
+
+    /// A live session's pid file, naming `pid` as its daemon.
+    fn write_pid(registry: &Path, name: &str, pid: u32) {
+        fs::write(registry.join(format!("{name}.pid")), pid.to_string()).unwrap();
+    }
+
+    /// A daemon socket for `name` that answers STATUS with `status` and PEEK with `screen`, and
+    /// records the payload of every DATA packet it reads.
+    fn fake_daemon(
+        registry: &Path,
+        name: &str,
+        status: String,
+        screen: &'static [u8],
+    ) -> Arc<Mutex<Vec<Vec<u8>>>> {
+        fs::create_dir_all(registry).unwrap();
+        let listener = UnixListener::bind(registry.join(format!("{name}.sock"))).unwrap();
+        let data = Arc::new(Mutex::new(Vec::new()));
+        let recorded = data.clone();
+        std::thread::spawn(move || {
+            for mut socket in listener.incoming().flatten() {
+                let mut reader = PacketReader::new();
+                let mut buffer = [0; 4096];
+                while let Ok(read) = socket.read(&mut buffer) {
+                    if read == 0 {
+                        break;
+                    }
+                    for packet in reader.feed(&buffer[..read]).unwrap() {
+                        match packet.type_ {
+                            MessageType::Status => {
+                                let _ = socket.write_all(&encode_status_response(&status));
+                            }
+                            MessageType::Peek => {
+                                let _ = socket.write_all(&encode_screen(screen));
+                            }
+                            MessageType::Data => recorded.lock().unwrap().push(packet.payload),
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        });
+        data
+    }
+
+    fn spawn_work(runtime: &PtyRuntime, cwd: &Path, env: &BTreeMap<String, String>) -> Result<()> {
+        runtime.spawn(
+            "work",
+            &Launch::Argv(vec!["true".into()]),
+            cwd,
+            env,
+            None,
+            &BTreeMap::new(),
+        )
+    }
+
+    #[test]
+    fn a_pty_spawn_that_never_answers_times_out() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_pty(root.path(), "fake-pty-hung-run", "  exec sleep 60");
+        let runtime = PtyRuntime::new(root.path().join("registry"))
+            .with_binary(binary.to_string_lossy())
+            .with_command_timeout(Duration::from_millis(200));
+        let started = Instant::now();
+        let error = spawn_work(&runtime, root.path(), &BTreeMap::new()).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(error.to_string().contains("did not finish"), "{error:#}");
+    }
+
+    #[test]
+    fn the_snapshot_reads_the_registry_the_way_pty_list_printed_it() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("registry");
+        fake_daemon(&registry, "live", "{}".into(), b"");
+        write_pid(&registry, "live", std::process::id());
+        write_record(
+            &registry,
+            "live",
+            serde_json::json!({
+                "createdAt": "2026-09-28T00:00:00.000Z",
+                "displayName": "Live",
+                "tags": { "st3.subject": "pty/live" },
+            }),
+        );
+        write_record(
+            &registry,
+            "done",
+            serde_json::json!({
+                "createdAt": "2026-09-27T00:00:00.000Z",
+                "displayName": "",
+                "exitCode": 3,
+                "exitedAt": "2026-09-27T01:00:00.000Z",
+            }),
+        );
+
+        let snapshot = PtyRuntime::new(registry).snapshot().unwrap();
+
+        assert_eq!(
+            snapshot,
+            [
+                PtyObservation {
+                    name: "done".into(),
+                    status: "exited".into(),
+                    exit_code: Some(3),
+                    pid: None,
+                    created_at: Some("2026-09-27T00:00:00.000Z".into()),
+                    display_name: None,
+                    tags: BTreeMap::new(),
+                },
+                PtyObservation {
+                    name: "live".into(),
+                    status: "running".into(),
+                    exit_code: None,
+                    pid: Some(std::process::id()),
+                    created_at: Some("2026-09-28T00:00:00.000Z".into()),
+                    display_name: Some("Live".into()),
+                    tags: BTreeMap::from([("st3.subject".into(), "pty/live".into())]),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_named_record_with_an_invalid_pid_stays_visible_as_unknown() {
+        let record = SessionInfo {
+            name: "bad".into(),
+            socket_path: PathBuf::from("bad.sock"),
+            pid: Some(-1),
+            status: pty_core::registry::SessionStatus::Running,
+            metadata: None,
+        };
+        let observed = observation(record).unwrap();
+        assert_eq!(observed.name, "bad");
+        assert_eq!(observed.status, "unknown");
+        assert_eq!(observed.pid, None);
+    }
+
+    #[test]
+    fn a_missing_registry_is_empty_but_an_unreadable_one_is_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("registry");
+        assert!(
+            PtyRuntime::new(registry.clone())
+                .snapshot()
+                .unwrap()
+                .is_empty()
+        );
+
+        // An empty snapshot reads as every PTY being gone, so a registry this process cannot read
+        // must fail the snapshot instead.
+        fs::write(&registry, b"not a directory").unwrap();
+        let error = PtyRuntime::new(registry).snapshot().unwrap_err();
+        assert!(error.to_string().starts_with("list PTYs in "), "{error:#}");
+    }
+
     #[test]
     fn terminal_input_checks_the_expected_incarnation() {
         let root = tempfile::tempdir().unwrap();
-        let binary = fake_executable(
-            root.path(),
-            "fake-pty",
-            r#"#!/bin/sh
-if [ "$1" = list ]; then
-  printf '[{"name":"work","status":"running","pid":42,"createdAt":"now"}]'
-  exit 0
-fi
-exit 0
-"#,
-        );
-        let runtime =
-            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+        let registry = root.path().join("registry");
+        let data = fake_daemon(&registry, "work", "{}".into(), b"");
+        write_pid(&registry, "work", std::process::id());
+        write_record(&registry, "work", serde_json::json!({ "createdAt": "now" }));
+        let runtime = PtyRuntime::new(registry);
+        let incarnation = format!("{}:now", std::process::id());
 
         runtime
-            .send_line_if("work", "hello", Some("42:now"))
+            .send_line_if("work", "hello", Some(&incarnation))
             .unwrap();
         runtime
-            .send_raw_if("work", b"bytes", Some("42:now"))
+            .send_raw_if("work", b"--bytes", Some(&incarnation))
             .unwrap();
         runtime
-            .send_key_if("work", "escape", Some("42:now"))
+            .send_key_if("work", "escape", Some(&incarnation))
             .unwrap();
         let error = runtime
             .send_key_if("work", "escape", Some("41:old"))
             .unwrap_err();
         assert!(error.to_string().contains("changed incarnation"));
+
+        assert_eq!(
+            *data.lock().unwrap(),
+            [
+                b"hello".to_vec(),
+                b"\r".to_vec(),
+                b"--bytes".to_vec(),
+                b"\x1b".to_vec()
+            ]
+        );
+    }
+
+    #[test]
+    fn the_screen_is_the_plain_peek_text() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("registry");
+        fake_daemon(&registry, "work", "{}".into(), b"line one\nline two");
+        write_pid(&registry, "work", std::process::id());
+        write_record(&registry, "work", serde_json::json!({ "createdAt": "now" }));
+
+        let screen = PtyRuntime::new(registry).screen("work").unwrap();
+
+        assert_eq!(screen, "line one\nline two\n");
+    }
+
+    #[test]
+    fn a_stop_for_a_replaced_session_stops_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("registry");
+        fake_daemon(&registry, "work", "{}".into(), b"");
+        write_pid(&registry, "work", std::process::id());
+        write_record(&registry, "work", serde_json::json!({ "createdAt": "new" }));
+
+        let error = PtyRuntime::new(registry)
+            .stop_if("work", Some(&format!("{}:old", std::process::id())))
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("changed incarnation"),
+            "{error:#}"
+        );
     }
 
     #[test]
     fn terminal_signal_targets_the_terminal_process_group_not_the_daemon() {
         let root = tempfile::tempdir().unwrap();
-        let binary = fake_executable(
-            root.path(),
-            "fake-pty-signal",
-            r#"#!/bin/sh
-if [ "$1" = list ]; then
-  printf '[{"name":"work","status":"running","pid":42,"createdAt":"now"}]'
-  exit 0
-fi
-if [ "$1" = stats ]; then
-  process_pid="$(cat "$0.process")"
-  printf '{"name":"work","process":{"alive":true,"pid":%s},"daemon":{"pid":42}}' "$process_pid"
-  exit 0
-fi
-exit 1
-"#,
-        );
+        let registry = root.path().join("registry");
         let mut command = Command::new("sh");
         command.args(["-c", "trap 'exit 0' HUP; while :; do sleep 1; done"]);
         unsafe {
@@ -673,12 +1002,22 @@ exit 1
             });
         }
         let mut child = command.spawn().unwrap();
-        fs::write(binary.with_extension("process"), child.id().to_string()).unwrap();
-        let runtime =
-            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+        let daemon = std::process::id();
+        fake_daemon(
+            &registry,
+            "work",
+            format!(
+                r#"{{"name":"work","process":{{"alive":true,"pid":{}}},"daemon":{{"pid":{daemon}}}}}"#,
+                child.id()
+            ),
+            b"",
+        );
+        write_pid(&registry, "work", daemon);
+        write_record(&registry, "work", serde_json::json!({ "createdAt": "now" }));
+        let runtime = PtyRuntime::new(registry);
 
         runtime
-            .signal_if("work", Some("42:now"), libc::SIGHUP)
+            .signal_if("work", Some(&format!("{daemon}:now")), libc::SIGHUP)
             .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -695,26 +1034,35 @@ exit 1
     }
 
     #[test]
+    fn a_signal_refuses_a_process_identity_kill_would_read_as_a_group() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("registry");
+        let daemon = std::process::id();
+        fake_daemon(
+            &registry,
+            "work",
+            format!(
+                r#"{{"name":"work","process":{{"alive":true,"pid":1}},"daemon":{{"pid":{daemon}}}}}"#
+            ),
+            b"",
+        );
+        write_pid(&registry, "work", daemon);
+        write_record(&registry, "work", serde_json::json!({ "createdAt": "now" }));
+
+        let error = PtyRuntime::new(registry)
+            .signal_if("work", None, 0)
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("cannot be signalled alone"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn spawn_records_the_shared_isolation_mode() {
         let root = tempfile::tempdir().unwrap();
-        let binary = fake_executable(
-            root.path(),
-            "fake-pty-spawn",
-            r#"#!/bin/sh
-if [ "$1" = list ]; then
-  if [ -f "$0.published" ]; then
-    pid="$(cat "$0.pid")"
-    printf '[{"name":"work","status":"running","pid":%s,"createdAt":"new"}]' "$pid"
-  else
-    printf '[]'
-  fi
-  exit 0
-fi
-printf '%s\n' "$@" > "$0.args"
-touch "$0.published"
-"#,
-        );
-        fs::write(binary.with_extension("pid"), std::process::id().to_string()).unwrap();
+        let binary = fake_pty(root.path(), "fake-pty-spawn", "  publish new");
         let runtime =
             PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
         assert!(!runtime.spawn_state_directory().starts_with(runtime.root()));
@@ -740,37 +1088,16 @@ touch "$0.published"
     #[test]
     fn spawn_preserves_an_explicit_terminal_type() {
         let root = tempfile::tempdir().unwrap();
-        let binary = fake_executable(
-            root.path(),
-            "fake-pty-term",
-            r#"#!/bin/sh
-if [ "$1" = list ]; then
-  if [ -f "$0.published" ]; then
-    pid="$(cat "$0.pid")"
-    printf '[{"name":"work","status":"running","pid":%s,"createdAt":"new"}]' "$pid"
-  else
-    printf '[]'
-  fi
-  exit 0
-fi
-printf '%s\n' "$@" > "$0.args"
-touch "$0.published"
-"#,
-        );
-        fs::write(binary.with_extension("pid"), std::process::id().to_string()).unwrap();
+        let binary = fake_pty(root.path(), "fake-pty-term", "  publish new");
         let runtime =
             PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
 
-        runtime
-            .spawn(
-                "work",
-                &Launch::Argv(vec!["true".into()]),
-                root.path(),
-                &BTreeMap::from([("TERM".into(), "screen-256color".into())]),
-                None,
-                &BTreeMap::new(),
-            )
-            .unwrap();
+        spawn_work(
+            &runtime,
+            root.path(),
+            &BTreeMap::from([("TERM".into(), "screen-256color".into())]),
+        )
+        .unwrap();
 
         let arguments = fs::read_to_string(binary.with_extension("args")).unwrap();
         assert!(arguments.contains("TERM=screen-256color"));
@@ -780,49 +1107,31 @@ touch "$0.published"
     #[test]
     fn spawn_reaps_a_recent_session_id_and_retries() {
         let root = tempfile::tempdir().unwrap();
-        let binary = fake_executable(
+        let registry = root.path().join("registry");
+        // The first launch meets the exited record of the previous session and refuses the id.
+        write_record(
+            &registry,
+            "work",
+            serde_json::json!({
+                "generation": "previous",
+                "createdAt": "old",
+                "exitCode": 0,
+                "exitedAt": "2026-09-27T00:00:00.000Z",
+            }),
+        );
+        let binary = fake_pty(
             root.path(),
             "fake-pty-retry",
-            r#"#!/bin/sh
-if [ "$1" = run ]; then
-  count=0
-  test ! -f "$0.count" || count="$(cat "$0.count")"
-  count=$((count + 1))
-  printf '%s\n' "$count" > "$0.count"
-  if [ "$count" -eq 1 ]; then
+            r#"  if [ "$count" -eq 1 ]; then
     printf '%s\n' 'Session id "work" is already in use.' >&2
     exit 1
   fi
-  touch "$0.published"
-fi
-if [ "$1" = remove ]; then
-  touch "$0.removed"
-fi
-if [ "$1" = list ]; then
-  if [ -f "$0.published" ]; then
-    pid="$(cat "$0.pid")"
-    printf '[{"name":"work","status":"running","pid":%s,"createdAt":"new"}]' "$pid"
-  else
-    printf '[]'
-  fi
-fi
-exit 0
-"#,
+  test ! -f "$PTY_ROOT/work.json" || touch "$0.stale"
+  publish new"#,
         );
-        fs::write(binary.with_extension("pid"), std::process::id().to_string()).unwrap();
-        let runtime =
-            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+        let runtime = PtyRuntime::new(registry).with_binary(binary.to_string_lossy());
 
-        runtime
-            .spawn(
-                "work",
-                &Launch::Argv(vec!["true".into()]),
-                root.path(),
-                &BTreeMap::new(),
-                None,
-                &BTreeMap::new(),
-            )
-            .unwrap();
+        spawn_work(&runtime, root.path(), &BTreeMap::new()).unwrap();
 
         assert_eq!(
             fs::read_to_string(binary.with_extension("count"))
@@ -830,95 +1139,58 @@ exit 0
                 .trim(),
             "2"
         );
-        assert!(binary.with_extension("removed").is_file());
+        assert!(
+            !binary.with_extension("stale").exists(),
+            "the retry ran before the exited record was removed"
+        );
     }
 
     #[test]
     fn spawn_waits_for_an_exact_new_registry_incarnation() {
         let root = tempfile::tempdir().unwrap();
-        let binary = fake_executable(
+        let registry = root.path().join("registry");
+        // The previous session exited under the same daemon pid, so only `createdAt` tells the
+        // incarnations apart.
+        fs::create_dir_all(&registry).unwrap();
+        fs::write(registry.join("work.sock"), b"").unwrap();
+        write_pid(&registry, "work", std::process::id());
+        write_record(
+            &registry,
+            "work",
+            serde_json::json!({
+                "createdAt": "old",
+                "exitCode": 0,
+                "exitedAt": "2026-09-27T00:00:00.000Z",
+            }),
+        );
+        let binary = fake_pty(
             root.path(),
             "fake-pty-delayed-publication",
-            r#"#!/bin/sh
-if [ "$1" = list ]; then
-  if [ ! -f "$0.started" ]; then
-    printf '[{"name":"work","status":"exited","pid":999,"createdAt":"old"}]'
-    exit 0
-  fi
-  count=0
-  test ! -f "$0.lists" || count="$(cat "$0.lists")"
-  count=$((count + 1))
-  printf '%s\n' "$count" > "$0.lists"
-  if [ "$count" -lt 3 ]; then
-    printf '[{"name":"work","status":"exited","pid":999,"createdAt":"old"}]'
-  else
-    pid="$(cat "$0.pid")"
-    printf '[{"name":"work","status":"running","pid":%s,"createdAt":"new"}]' "$pid"
-  fi
-  exit 0
-fi
-if [ "$1" = run ]; then
-  touch "$0.started"
-fi
-exit 0
-"#,
+            r#"  (sleep 0.3; publish new) >/dev/null 2>&1 &"#,
         );
-        fs::write(binary.with_extension("pid"), std::process::id().to_string()).unwrap();
-        let runtime =
-            PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy());
+        let runtime = PtyRuntime::new(registry).with_binary(binary.to_string_lossy());
+        let started = Instant::now();
 
-        runtime
-            .spawn(
-                "work",
-                &Launch::Argv(vec!["true".into()]),
-                root.path(),
-                &BTreeMap::new(),
-                None,
-                &BTreeMap::new(),
-            )
+        spawn_work(&runtime, root.path(), &BTreeMap::new()).unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        let observation = runtime
+            .snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|observation| observation.name == "work")
             .unwrap();
-
-        assert!(
-            fs::read_to_string(binary.with_extension("lists"))
-                .unwrap()
-                .trim()
-                .parse::<u32>()
-                .unwrap()
-                >= 3
-        );
+        assert_eq!(observation.created_at.as_deref(), Some("new"));
     }
 
     #[test]
     fn concurrent_spawns_for_one_runtime_launch_only_once() {
         let root = tempfile::tempdir().unwrap();
-        let binary = fake_executable(
-            root.path(),
-            "fake-pty-concurrent",
-            r#"#!/bin/sh
-if [ "$1" = list ]; then
-  if [ -f "$0.published" ]; then
-    pid="$(cat "$0.pid")"
-    printf '[{"name":"work","status":"running","pid":%s,"createdAt":"new"}]' "$pid"
-  else
-    printf '[]'
-  fi
-  exit 0
-fi
-if [ "$1" = run ]; then
-  count=0
-  test ! -f "$0.count" || count="$(cat "$0.count")"
-  count=$((count + 1))
-  printf '%s\n' "$count" > "$0.count"
-  touch "$0.published"
-fi
-exit 0
-"#,
-        );
-        fs::write(binary.with_extension("pid"), std::process::id().to_string()).unwrap();
-        let runtime = std::sync::Arc::new(
+        let binary = fake_pty(root.path(), "fake-pty-concurrent", "  publish new");
+        let runtime = Arc::new(
             PtyRuntime::new(root.path().join("registry")).with_binary(binary.to_string_lossy()),
         );
-        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
         let mut threads = Vec::new();
         for _ in 0..2 {
             let runtime = runtime.clone();
@@ -926,14 +1198,7 @@ exit 0
             let cwd = root.path().to_path_buf();
             threads.push(std::thread::spawn(move || {
                 barrier.wait();
-                runtime.spawn(
-                    "work",
-                    &Launch::Argv(vec!["true".into()]),
-                    &cwd,
-                    &BTreeMap::new(),
-                    None,
-                    &BTreeMap::new(),
-                )
+                spawn_work(&runtime, &cwd, &BTreeMap::new())
             }));
         }
         for thread in threads {
@@ -951,32 +1216,14 @@ exit 0
     #[test]
     fn publication_timeout_is_typed_and_bounded() {
         let root = tempfile::tempdir().unwrap();
-        let binary = fake_executable(
-            root.path(),
-            "fake-pty-never-publishes",
-            r#"#!/bin/sh
-if [ "$1" = list ]; then
-  printf '[]'
-fi
-exit 0
-"#,
-        );
+        let binary = fake_pty(root.path(), "fake-pty-never-publishes", "");
         let timeout = Duration::from_millis(30);
         let runtime = PtyRuntime::new(root.path().join("registry"))
             .with_binary(binary.to_string_lossy())
             .with_spawn_timeout(timeout);
         let started = Instant::now();
 
-        let error = runtime
-            .spawn(
-                "work",
-                &Launch::Argv(vec!["true".into()]),
-                root.path(),
-                &BTreeMap::new(),
-                None,
-                &BTreeMap::new(),
-            )
-            .unwrap_err();
+        let error = spawn_work(&runtime, root.path(), &BTreeMap::new()).unwrap_err();
 
         let timeout_error = error.downcast_ref::<PtySpawnTimeout>().unwrap();
         assert_eq!(timeout_error.phase, PtySpawnTimeoutPhase::Publication);
@@ -987,36 +1234,11 @@ exit 0
     #[test]
     fn an_unresolved_publication_fences_followup_launches() {
         let root = tempfile::tempdir().unwrap();
-        let binary = fake_executable(
-            root.path(),
-            "fake-pty-unresolved-publication",
-            r#"#!/bin/sh
-if [ "$1" = list ]; then
-  printf '[]'
-  exit 0
-fi
-if [ "$1" = run ]; then
-  count=0
-  test ! -f "$0.count" || count="$(cat "$0.count")"
-  count=$((count + 1))
-  printf '%s\n' "$count" > "$0.count"
-fi
-exit 0
-"#,
-        );
+        let binary = fake_pty(root.path(), "fake-pty-unresolved-publication", "");
         let runtime = PtyRuntime::new(root.path().join("registry"))
             .with_binary(binary.to_string_lossy())
             .with_spawn_timeout(Duration::from_millis(30));
-        let spawn = || {
-            runtime.spawn(
-                "work",
-                &Launch::Argv(vec!["true".into()]),
-                root.path(),
-                &BTreeMap::new(),
-                None,
-                &BTreeMap::new(),
-            )
-        };
+        let spawn = || spawn_work(&runtime, root.path(), &BTreeMap::new());
 
         let first = spawn().unwrap_err();
         let second = spawn().unwrap_err();
@@ -1049,16 +1271,7 @@ exit 0
         let _held = runtime.acquire_spawn_lock("work").unwrap();
         let started = Instant::now();
 
-        let error = runtime
-            .spawn(
-                "work",
-                &Launch::Argv(vec!["true".into()]),
-                root.path(),
-                &BTreeMap::new(),
-                None,
-                &BTreeMap::new(),
-            )
-            .unwrap_err();
+        let error = spawn_work(&runtime, root.path(), &BTreeMap::new()).unwrap_err();
 
         let timeout_error = error.downcast_ref::<PtySpawnTimeout>().unwrap();
         assert_eq!(timeout_error.phase, PtySpawnTimeoutPhase::Lock);

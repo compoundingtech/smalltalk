@@ -1,8 +1,9 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result, bail};
 use serde_json::{Value, json};
@@ -15,6 +16,7 @@ pub struct ObservationRequest {
     pub fields: BTreeSet<String>,
     pub cursor: Option<String>,
     pub previous_facts: Option<Value>,
+    pub every_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -108,6 +110,28 @@ fn github_response(
     Ok(response.error_for_status()?)
 }
 
+/// A hung connection must end, or its observer would never be polled again.
+const GITHUB_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+const GITHUB_REQUEST_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_secs(2)
+} else {
+    Duration::from_secs(60)
+};
+
+fn github_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .user_agent("st3-resource-observer/0.1")
+                .connect_timeout(GITHUB_CONNECT_TIMEOUT)
+                .timeout(GITHUB_REQUEST_TIMEOUT)
+                .build()
+                .expect("GitHub HTTP client configuration is valid")
+        })
+        .clone()
+}
+
 pub trait ResourceProvider: Send + Sync + 'static {
     fn observe(
         &self,
@@ -164,31 +188,22 @@ fn parse_github_ref_locator(locator: &str) -> Result<GithubRefLocator> {
 }
 
 async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObservation> {
+    let cache_for = github_cache_for(&request);
     let locator = parse_github_ref_locator(&request.locator)?;
-    let client = reqwest::Client::builder()
-        .user_agent("st3-resource-observer/0.1")
-        .build()?;
+    let client = github_client();
     let token = github_token().await?;
-    let request_json = |url: String| {
-        let request = client
-            .get(url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28");
-        request.bearer_auth(&token)
-    };
     let base = format!(
         "https://api.github.com/repos/{}/{}",
         locator.owner, locator.repository
     );
-    let branch: Value = request_json(format!(
-        "{base}/branches/{}",
-        urlencoding::encode(&locator.name)
-    ))
-    .send()
+    let branch = github_json(
+        &client,
+        format!("{base}/branches/{}", urlencoding::encode(&locator.name)),
+        &token,
+        cache_for,
+    )
     .await?
-    .error_for_status()?
-    .json()
-    .await?;
+    .value;
     let head = branch
         .pointer("/commit/sha")
         .and_then(Value::as_str)
@@ -199,13 +214,16 @@ async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObser
     if request.fields.contains("ancestors") {
         let mut page = 1_u64;
         loop {
-            let branches: Vec<Value> =
-                request_json(format!("{base}/branches?per_page=100&page={page}"))
-                    .send()
-                    .await?
-                    .error_for_status()?
-                    .json()
-                    .await?;
+            let branches: Vec<Value> = serde_json::from_value(
+                github_json(
+                    &client,
+                    format!("{base}/branches?per_page=100&page={page}"),
+                    &token,
+                    cache_for,
+                )
+                .await?
+                .value,
+            )?;
             let count = branches.len();
             for candidate in branches {
                 let Some(name) = candidate.get("name").and_then(Value::as_str) else {
@@ -221,13 +239,14 @@ async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObser
                 let merged = if candidate_head == head {
                     true
                 } else {
-                    let comparison: Value =
-                        request_json(format!("{base}/compare/{candidate_head}...{head}"))
-                            .send()
-                            .await?
-                            .error_for_status()?
-                            .json()
-                            .await?;
+                    let comparison = github_json(
+                        &client,
+                        format!("{base}/compare/{candidate_head}...{head}"),
+                        &token,
+                        cache_for,
+                    )
+                    .await?
+                    .value;
                     comparison
                         .get("status")
                         .and_then(Value::as_str)
@@ -255,7 +274,7 @@ async fn observe_github_ref(request: ObservationRequest) -> Result<ProviderObser
     Ok(ProviderObservation {
         facts,
         cursor,
-        next_check_unix_ms: now.saturating_add(60_000),
+        next_check_unix_ms: now.saturating_add(300_000),
     })
 }
 
@@ -293,6 +312,7 @@ async fn observe_github_repository_at(
     api_base: &str,
     token: Option<&str>,
 ) -> Result<ProviderObservation> {
+    let cache_for = github_cache_for(&request);
     let token = token
         .filter(|value| !value.trim().is_empty())
         .context(GITHUB_AUTH_REMEDY)?;
@@ -304,100 +324,47 @@ async fn observe_github_repository_at(
         !owner.is_empty() && !repository.is_empty() && !repository.contains('/'),
         "a GitHub repository locator needs OWNER/REPO"
     );
-    let client = reqwest::Client::builder()
-        .user_agent("st3-resource-observer/0.1")
-        .build()?;
-    let request_json = |url: String, etag: Option<&str>| {
-        let mut request = client
-            .get(url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28");
-        if let Some(etag) = etag {
-            request = request.header(reqwest::header::IF_NONE_MATCH, etag);
-        }
-        request = request.bearer_auth(token);
-        request
-    };
+    let client = github_client();
     let base = format!("{api_base}/repos/{owner}/{repository}");
-    let previous_cursor: Value = request
-        .cursor
-        .as_deref()
-        .and_then(|cursor| serde_json::from_str(cursor).ok())
-        .unwrap_or(Value::Null);
-    let previous_etag = |name: &str| {
-        request
-            .previous_facts
-            .as_ref()
-            .and_then(|_| previous_cursor.get(name))
-            .and_then(Value::as_str)
-    };
-    let previous_repository_id = request
-        .previous_facts
-        .as_ref()
-        .and_then(|facts| facts.get("repository_id"))
-        .and_then(Value::as_u64);
     // A renamed repository answers through a redirect. Its numeric ID proves that the locator
     // still names the repository whose items were observed before.
-    let mut repository_etag = previous_repository_id
-        .and(previous_etag("repository"))
-        .map(str::to_owned);
-    let response = github_response(
-        request_json(base.clone(), repository_etag.as_deref())
-            .send()
-            .await?,
-        false,
-    )?;
-    let repository_id = match previous_repository_id {
-        Some(previous) if response.status() == reqwest::StatusCode::NOT_MODIFIED => previous,
-        _ => {
-            repository_etag = response_etag(&response);
-            let metadata: Value = response.json().await?;
-            metadata
-                .get("id")
-                .and_then(Value::as_u64)
-                .context("the GitHub repository response has no numeric ID")?
-        }
-    };
-    let mut pulls_etag = previous_etag("pulls").map(str::to_owned);
-    let mut pulls = Vec::new();
-    if request.fields.contains("pull_requests")
-        && let Some((items, etag)) = github_list(
-            &request_json,
+    let repository_id = github_json(&client, base.clone(), token, cache_for)
+        .await?
+        .value
+        .get("id")
+        .and_then(Value::as_u64)
+        .context("the GitHub repository response has no numeric ID")?;
+    let pulls = if request.fields.contains("pull_requests") {
+        github_pages(
+            &client,
             format!("{base}/pulls?state=open&per_page=100"),
-            pulls_etag.as_deref(),
-            false,
+            token,
+            cache_for,
         )
         .await?
-    {
-        pulls = items;
-        pulls_etag = etag;
-    }
-    let mut issues_etag = previous_etag("issues").map(str::to_owned);
-    let mut issues = Vec::new();
-    if request.fields.contains("issues")
-        && let Some((items, etag)) = github_list(
-            &request_json,
+    } else {
+        Vec::new()
+    };
+    let issues = if request.fields.contains("issues") {
+        github_pages(
+            &client,
             format!("{base}/issues?state=open&per_page=100"),
-            issues_etag.as_deref(),
-            false,
+            token,
+            cache_for,
         )
         .await?
-    {
-        issues = items;
-        issues_etag = etag;
-    }
-    let facts = normalize_github_repository(
+    } else {
+        Vec::new()
+    };
+    let mut facts = normalize_github_repository(
         request.previous_facts.as_ref(),
         repository_id,
         &pulls,
         &issues,
         &request.fields,
     )?;
-    let cursor = Some(serde_json::to_string(&json!({
-        "repository": repository_etag,
-        "pulls": pulls_etag,
-        "issues": issues_etag
-    }))?);
+    facts["github_http_requests_since_start"] = Value::from(github_request_count(&request.locator));
+    let cursor = Some(hex::encode(Sha256::digest(serde_json::to_vec(&facts)?)));
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
@@ -405,54 +372,13 @@ async fn observe_github_repository_at(
     Ok(ProviderObservation {
         facts,
         cursor,
-        next_check_unix_ms: now.saturating_add(60_000),
+        next_check_unix_ms: now.saturating_add(300_000),
     })
 }
 
 /// The most pages one GitHub listing reads. A larger listing fails the observation instead of
 /// recording a partial one, because a partial listing makes older items look new later.
 const GITHUB_LIST_PAGES: usize = 10;
-
-/// Read every page of one GitHub list endpoint. `None` means the first page answered
-/// `304 Not Modified` for `etag`. The listing's ETag is returned only for a single page, because
-/// the first page's ETag says nothing about the pages after it.
-async fn github_list(
-    request_json: &impl Fn(String, Option<&str>) -> reqwest::RequestBuilder,
-    url: String,
-    etag: Option<&str>,
-    unauthenticated: bool,
-) -> Result<Option<(Vec<Value>, Option<String>)>> {
-    let mut items = Vec::new();
-    let mut next = Some(url);
-    let mut pages = 0;
-    let mut first_etag = None;
-    while let Some(url) = next {
-        anyhow::ensure!(
-            pages < GITHUB_LIST_PAGES,
-            "the GitHub listing has more than {GITHUB_LIST_PAGES} pages"
-        );
-        let response = github_response(
-            request_json(url, etag.filter(|_| pages == 0))
-                .send()
-                .await?,
-            unauthenticated,
-        )?;
-        if pages == 0 {
-            if response.status() == reqwest::StatusCode::NOT_MODIFIED {
-                return Ok(None);
-            }
-            first_etag = response_etag(&response);
-        }
-        pages += 1;
-        next = response
-            .headers()
-            .get(reqwest::header::LINK)
-            .and_then(|value| value.to_str().ok())
-            .and_then(github_next_page);
-        items.extend(response.json::<Vec<Value>>().await?);
-    }
-    Ok(Some((items, first_etag.filter(|_| pages == 1))))
-}
 
 fn response_etag(response: &reqwest::Response) -> Option<String> {
     response
@@ -479,13 +405,158 @@ fn github_next_page(link: &str) -> Option<String> {
     })
 }
 
+const GITHUB_CACHE_FOR: Duration = Duration::from_secs(300);
+
+fn github_cache_for(request: &ObservationRequest) -> Duration {
+    request
+        .every_ms
+        .map(Duration::from_millis)
+        .unwrap_or(GITHUB_CACHE_FOR)
+        .min(GITHUB_CACHE_FOR)
+}
+
+#[derive(Clone)]
+struct GithubPayload {
+    value: Value,
+    etag: Option<String>,
+    next: Option<String>,
+    checked_at: Instant,
+}
+
+type GithubCache =
+    tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<Option<GithubPayload>>>>>;
+
+fn github_cache() -> &'static GithubCache {
+    static CACHE: OnceLock<GithubCache> = OnceLock::new();
+    CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
+}
+
+fn github_request_counts() -> &'static std::sync::Mutex<HashMap<String, u64>> {
+    static COUNTS: OnceLock<std::sync::Mutex<HashMap<String, u64>>> = OnceLock::new();
+    COUNTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn github_repository_key(url: &str) -> Option<String> {
+    let path = url.split("/repos/").nth(1)?;
+    let mut parts = path.split('/');
+    Some(format!(
+        "{}/{}",
+        parts.next()?,
+        parts.next()?.split('?').next()?
+    ))
+}
+
+fn github_request_count(repository: &str) -> u64 {
+    github_request_counts()
+        .lock()
+        .expect("GitHub count mutex poisoned")
+        .get(repository)
+        .copied()
+        .unwrap_or(0)
+}
+
+/// A URL is fetched at most once per cache interval on this host. A stale entry is revalidated
+/// with its ETag; a 304 keeps the complete prior body, including pagination links.
+async fn github_json(
+    client: &reqwest::Client,
+    url: String,
+    token: &str,
+    cache_for: Duration,
+) -> Result<GithubPayload> {
+    let entry = {
+        let mut cache = github_cache().lock().await;
+        if cache.len() > 4_096 {
+            cache.clear();
+        }
+        cache
+            .entry(url.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(None)))
+            .clone()
+    };
+    let mut cached = entry.lock().await;
+    if let Some(payload) = cached.as_ref()
+        && payload.checked_at.elapsed() < cache_for
+    {
+        return Ok(payload.clone());
+    }
+    let mut request = client
+        .get(&url)
+        .header("Accept", "application/vnd.github+json")
+        .header("X-GitHub-Api-Version", "2022-11-28")
+        .bearer_auth(token);
+    if let Some(etag) = cached.as_ref().and_then(|payload| payload.etag.as_deref()) {
+        request = request.header(reqwest::header::IF_NONE_MATCH, etag);
+    }
+    let response = request.send().await?;
+    if let Some(repository) = github_repository_key(&url) {
+        let mut counts = github_request_counts()
+            .lock()
+            .expect("GitHub count mutex poisoned");
+        *counts.entry(repository).or_default() += 1;
+    }
+    let response = github_response(response, false)?;
+    if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+        let payload = cached
+            .as_mut()
+            .context("GitHub returned 304 without a cached body")?;
+        payload.checked_at = Instant::now();
+        return Ok(payload.clone());
+    }
+    let etag = response_etag(&response);
+    let next = response
+        .headers()
+        .get(reqwest::header::LINK)
+        .and_then(|value| value.to_str().ok())
+        .and_then(github_next_page);
+    let payload = GithubPayload {
+        value: response.json().await?,
+        etag,
+        next,
+        checked_at: Instant::now(),
+    };
+    *cached = Some(payload.clone());
+    Ok(payload)
+}
+
+async fn github_pages(
+    client: &reqwest::Client,
+    url: String,
+    token: &str,
+    cache_for: Duration,
+) -> Result<Vec<Value>> {
+    let mut next = Some(url);
+    let mut pages = 0;
+    let mut values = Vec::new();
+    while let Some(url) = next {
+        anyhow::ensure!(
+            pages < GITHUB_LIST_PAGES,
+            "the GitHub listing has more than {GITHUB_LIST_PAGES} pages"
+        );
+        let payload = github_json(client, url, token, cache_for).await?;
+        values.extend(serde_json::from_value::<Vec<Value>>(payload.value)?);
+        next = payload.next;
+        pages += 1;
+    }
+    Ok(values)
+}
+
 pub(crate) const GITHUB_AUTH_REMEDY: &str = "GitHub observers have no token; run `gh auth login` as the daemon account or export GH_TOKEN/GITHUB_TOKEN in that account's login-shell startup files. Check the daemon PATH with `st doctor`. No anonymous request was sent; authentication is checked again on the next poll.";
 
 pub(crate) async fn github_token() -> Result<String> {
+    static TOKEN: OnceLock<tokio::sync::Mutex<Option<(Instant, String)>>> = OnceLock::new();
+    let cache = TOKEN.get_or_init(|| tokio::sync::Mutex::new(None));
+    let mut cached = cache.lock().await;
+    if let Some((checked_at, token)) = cached.as_ref()
+        && checked_at.elapsed() < Duration::from_secs(180)
+    {
+        return Ok(token.clone());
+    }
     let environment = tokio::task::spawn_blocking(crate::environment::snapshot).await??;
-    lookup_github_token(&environment)
+    let token = lookup_github_token(&environment)
         .await
-        .context(GITHUB_AUTH_REMEDY)
+        .context(GITHUB_AUTH_REMEDY)?;
+    *cached = Some((Instant::now(), token.clone()));
+    Ok(token)
 }
 
 async fn lookup_github_token(
@@ -498,7 +569,6 @@ async fn lookup_github_token(
     {
         return Ok(token.clone());
     }
-    // Do not cache successes or failures: gh's credential store can change between polls.
     let mut command =
         tokio::process::Command::from(crate::environment::command_in("gh", environment)?);
     let output = tokio::time::timeout(
@@ -551,19 +621,28 @@ pub(crate) fn normalize_github_repository(
             .and_then(Value::as_array)
             .cloned()
             .unwrap_or_default();
-        for pull in pulls
-            .iter()
-            .filter(|pull| pull.get("draft").and_then(Value::as_bool) == Some(false))
-        {
+        for pull in pulls {
             let value = json!({
                 "number": pull.get("number").cloned().unwrap_or(Value::Null),
                 "url": pull.get("html_url").cloned().unwrap_or(Value::Null),
                 "title": pull.get("title").cloned().unwrap_or(Value::Null),
                 "head": pull.pointer("/head/sha").cloned().unwrap_or(Value::Null),
+                "state": "open",
+                "draft": pull.get("draft").cloned().unwrap_or(Value::Bool(false)),
             });
             let number = value.get("number");
-            if !values.iter().any(|old| old.get("number") == number) {
+            if let Some(old) = values.iter_mut().find(|old| old.get("number") == number) {
+                *old = value;
+            } else if value.get("draft").and_then(Value::as_bool) == Some(false) {
                 values.push(value);
+            }
+        }
+        for value in &mut values {
+            if !pulls
+                .iter()
+                .any(|pull| pull.get("number") == value.get("number"))
+            {
+                value["state"] = Value::String("closed".into());
             }
         }
         values.sort_by_key(|value| value.get("number").and_then(Value::as_u64));
@@ -641,6 +720,19 @@ fn observe_local_file(request: ObservationRequest) -> Result<ProviderObservation
 }
 
 async fn observe_github_pull_request(request: ObservationRequest) -> Result<ProviderObservation> {
+    let token = github_token().await?;
+    observe_github_pull_request_at(request, "https://api.github.com", Some(&token)).await
+}
+
+async fn observe_github_pull_request_at(
+    request: ObservationRequest,
+    api_base: &str,
+    token: Option<&str>,
+) -> Result<ProviderObservation> {
+    let cache_for = github_cache_for(&request);
+    let token = token
+        .filter(|value| !value.trim().is_empty())
+        .context(GITHUB_AUTH_REMEDY)?;
     let (repository, number) = request
         .locator
         .rsplit_once('#')
@@ -651,24 +743,25 @@ async fn observe_github_pull_request(request: ObservationRequest) -> Result<Prov
     let number = number
         .parse::<u64>()
         .context("a GitHub pull request number must be an integer")?;
-    let client = reqwest::Client::builder()
-        .user_agent("st3-resource-observer/0.1")
-        .build()?;
-    let token = github_token().await?;
-    let request_json = |url: String| {
-        let request = client
-            .get(url)
-            .header("Accept", "application/vnd.github+json")
-            .header("X-GitHub-Api-Version", "2022-11-28");
-        request.bearer_auth(&token)
+    let client = github_client();
+    let base = format!("{api_base}/repos/{owner}/{repository}");
+    let pulls = github_pages(
+        &client,
+        format!("{base}/pulls?state=open&per_page=100"),
+        token,
+        cache_for,
+    )
+    .await?;
+    let pull = if let Some(pull) = pulls
+        .into_iter()
+        .find(|pull| pull.get("number").and_then(Value::as_u64) == Some(number))
+    {
+        pull
+    } else {
+        github_json(&client, format!("{base}/pulls/{number}"), token, cache_for)
+            .await?
+            .value
     };
-    let base = format!("https://api.github.com/repos/{owner}/{repository}");
-    let pull: Value = request_json(format!("{base}/pulls/{number}"))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
     let mut facts = serde_json::Map::new();
     if request.fields.contains("head") {
         facts.insert(
@@ -687,13 +780,13 @@ async fn observe_github_pull_request(request: ObservationRequest) -> Result<Prov
         );
     }
     if request.fields.contains("review") {
-        let reviews: Vec<Value> =
-            request_json(format!("{base}/pulls/{number}/reviews?per_page=100"))
-                .send()
-                .await?
-                .error_for_status()?
-                .json()
-                .await?;
+        let reviews = github_pages(
+            &client,
+            format!("{base}/pulls/{number}/reviews?per_page=100"),
+            token,
+            cache_for,
+        )
+        .await?;
         let normalized = reviews
             .into_iter()
             .map(|review| {
@@ -713,12 +806,14 @@ async fn observe_github_pull_request(request: ObservationRequest) -> Result<Prov
             .pointer("/head/sha")
             .and_then(Value::as_str)
             .context("the GitHub pull request has no head SHA")?;
-        let checks: Value = request_json(format!("{base}/commits/{head}/check-runs?per_page=100"))
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let checks = github_json(
+            &client,
+            format!("{base}/commits/{head}/check-runs?per_page=100"),
+            token,
+            cache_for,
+        )
+        .await?
+        .value;
         let normalized = checks
             .get("check_runs")
             .and_then(Value::as_array)
@@ -745,7 +840,7 @@ async fn observe_github_pull_request(request: ObservationRequest) -> Result<Prov
     Ok(ProviderObservation {
         facts,
         cursor,
-        next_check_unix_ms: now.saturating_add(60_000),
+        next_check_unix_ms: now.saturating_add(300_000),
     })
 }
 
@@ -787,6 +882,7 @@ mod tests {
             fields: BTreeSet::new(),
             cursor: None,
             previous_facts: None,
+            every_ms: None,
         };
         for token in [None, Some(""), Some(" ")] {
             let error = observe_github_repository_at(request.clone(), &base, token)
@@ -828,6 +924,7 @@ mod tests {
                 fields: BTreeSet::from(["state".into()]),
                 cursor: None,
                 previous_facts: None,
+                every_ms: None,
             })
             .await
             .unwrap();
@@ -901,6 +998,7 @@ mod tests {
                 fields: BTreeSet::from(["content_hash".into(), "size".into(), "status".into()]),
                 cursor: None,
                 previous_facts: None,
+                every_ms: None,
             })
             .await
             .unwrap();
@@ -921,6 +1019,7 @@ mod tests {
                 fields: BTreeSet::from(["status".into()]),
                 cursor: None,
                 previous_facts: None,
+                every_ms: None,
             })
             .await
             .unwrap();
@@ -964,7 +1063,35 @@ mod tests {
         .unwrap();
         assert_eq!(facts["pull_requests"].as_array().unwrap().len(), 2);
         let repeated = normalize_github_repository(Some(&facts), 7, &[], &[], &fields).unwrap();
-        assert_eq!(repeated, facts);
+        assert_eq!(repeated["pull_requests"][1]["state"], "closed");
+    }
+
+    /// A provider that accepts the connection and never answers must not hold its observer forever.
+    #[tokio::test]
+    async fn a_github_request_that_never_answers_times_out() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(60)).await;
+            drop(stream);
+        });
+        let request = ObservationRequest {
+            provider: "github.repository".into(),
+            locator: "example/repo".into(),
+            fields: BTreeSet::from(["issues".into()]),
+            cursor: None,
+            previous_facts: None,
+            every_ms: None,
+        };
+        let observed = tokio::time::timeout(
+            Duration::from_secs(10),
+            observe_github_repository_at(request, &base, Some("test")),
+        )
+        .await
+        .expect("the request did not time out");
+        assert!(observed.is_err());
+        server.abort();
     }
 
     #[tokio::test]
@@ -973,7 +1100,7 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
-            // Each observation reads the repository, then its issues.
+            // Two observers share a poll; a later poll revalidates both URLs.
             for index in 0..4 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
@@ -1013,6 +1140,7 @@ mod tests {
             fields: BTreeSet::from(["issues".into()]),
             cursor: None,
             previous_facts: None,
+            every_ms: None,
         };
         let first = observe_github_repository_at(request.clone(), &base, Some("orchid-test-token"))
             .await
@@ -1030,6 +1158,22 @@ mod tests {
         .unwrap();
         assert_eq!(second.facts, first.facts);
         assert_eq!(second.facts["repository_id"], 7);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let third = observe_github_repository_at(
+            ObservationRequest {
+                cursor: second.cursor.clone(),
+                previous_facts: Some(second.facts.clone()),
+                provider: "github.repository".into(),
+                locator: "example/repo".into(),
+                fields: BTreeSet::from(["issues".into()]),
+                every_ms: Some(1),
+            },
+            &base,
+            Some("orchid-test-token"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(third.facts["issues"], second.facts["issues"]);
         let requests = server
             .await
             .unwrap()
@@ -1047,6 +1191,49 @@ mod tests {
         assert!(!requests[1].contains("if-none-match"));
         assert!(requests[2].contains("if-none-match: \"repo-v1\""));
         assert!(requests[3].contains("if-none-match: \"issues-v1\""));
+    }
+
+    #[tokio::test]
+    async fn pull_observers_share_one_repository_list_request() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut chunk = [0_u8; 1024];
+                let size = stream.read(&mut chunk).await.unwrap();
+                request.extend_from_slice(&chunk[..size]);
+                if size == 0 || request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = r#"[{"number":4,"head":{"sha":"aaaa"}},{"number":5,"head":{"sha":"bbbb"}}]"#;
+            stream.write_all(format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nETag: \"pulls-v1\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ).as_bytes()).await.unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        for (number, head) in [(4, "aaaa"), (5, "bbbb")] {
+            let result = observe_github_pull_request_at(
+                ObservationRequest {
+                    provider: "github.pull-request".into(),
+                    locator: format!("orchid/garden#{number}"),
+                    fields: BTreeSet::from(["head".into()]),
+                    cursor: None,
+                    previous_facts: None,
+                    every_ms: None,
+                },
+                &base,
+                Some("orchid-test-token"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(result.facts["head"], head);
+        }
+        let request = server.await.unwrap();
+        assert!(request.starts_with("GET /repos/orchid/garden/pulls?state=open&per_page=100 "));
     }
 
     #[test]
@@ -1078,7 +1265,11 @@ mod tests {
             &fields,
         )
         .unwrap();
-        assert_eq!(renamed, before);
+        assert_eq!(renamed["repository_id"], before["repository_id"]);
+        assert_eq!(
+            renamed["pull_requests"][0]["number"],
+            before["pull_requests"][0]["number"]
+        );
 
         let narrower = normalize_github_repository(
             Some(&before),
@@ -1088,7 +1279,8 @@ mod tests {
             &BTreeSet::from(["pull_requests".into()]),
         )
         .unwrap();
-        assert_eq!(narrower, before);
+        assert_eq!(narrower["issues"], before["issues"]);
+        assert_eq!(narrower["pull_requests"][0]["state"], "closed");
 
         let error = normalize_github_repository(Some(&before), 8, &[], &[], &fields).unwrap_err();
         assert!(error.to_string().contains("repository 8"), "{error}");
