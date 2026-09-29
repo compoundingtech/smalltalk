@@ -1,7 +1,9 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -40,6 +42,7 @@ use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
 mod checkpoint;
 mod checkpoint_agreement;
+mod lanes;
 
 pub use checkpoint_agreement::{
     CHECKPOINT_ATTENTION_AFTER_MS, CHECKPOINT_EXCUSED, CHECKPOINT_PROTOCOL, CHECKPOINT_SEALED,
@@ -673,11 +676,55 @@ impl Drop for WriterGuard<'_> {
 struct ReadPool {
     connections: Mutex<Vec<Connection>>,
     available: Condvar,
+    /// How many connections `Store::read_snapshot` holds. At least one always stays unpinned,
+    /// so a pinned read that fans out to worker threads can never wait on itself.
+    pinned: Mutex<usize>,
+    unpinned: Condvar,
 }
 
 struct ReadGuard<'a> {
     pool: &'a ReadPool,
     connection: Option<Connection>,
+    /// The connection `Store::read_snapshot` pinned for this thread, shared by every read in it.
+    pinned: Option<Rc<Connection>>,
+}
+
+thread_local! {
+    /// While `Store::read_snapshot` runs on this thread: the pool it pinned a connection from,
+    /// and that connection, held inside one read transaction.
+    static PINNED_READER: RefCell<Option<(usize, Rc<Connection>)>> = const { RefCell::new(None) };
+}
+
+/// Ends a pinned read on every exit path, panics included.
+struct PinnedRead<'a> {
+    pool: &'a ReadPool,
+    connection: Option<Rc<Connection>>,
+}
+
+impl Drop for PinnedRead<'_> {
+    fn drop(&mut self) {
+        PINNED_READER.with(|slot| slot.borrow_mut().take());
+        {
+            let mut pinned = self.pool.pinned.lock().unwrap_or_else(PoisonError::into_inner);
+            *pinned -= 1;
+            self.pool.unpinned.notify_one();
+        }
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        let _ = connection.execute_batch("COMMIT");
+        // Every guard lent from the pin is gone by now; if one escaped, the pool loses that
+        // connection rather than sharing it.
+        if let Ok(connection) = Rc::try_unwrap(connection) {
+            let mut connections = self
+                .pool
+                .connections
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            connections.push(connection);
+            self.pool.available.notify_one();
+        }
+    }
 }
 
 impl ReadPool {
@@ -685,10 +732,29 @@ impl ReadPool {
         Self {
             connections: Mutex::new(connections),
             available: Condvar::new(),
+            pinned: Mutex::new(0),
+            unpinned: Condvar::new(),
         }
     }
 
+    fn key(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
     fn get(&self) -> ReadGuard<'_> {
+        let pinned = PINNED_READER.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|(pool, _)| *pool == self.key())
+                .map(|(_, connection)| connection.clone())
+        });
+        if pinned.is_some() {
+            return ReadGuard {
+                pool: self,
+                connection: None,
+                pinned,
+            };
+        }
         let mut connections = self
             .connections
             .lock()
@@ -702,6 +768,7 @@ impl ReadPool {
         ReadGuard {
             pool: self,
             connection: connections.pop(),
+            pinned: None,
         }
     }
 }
@@ -710,26 +777,39 @@ impl Deref for ReadGuard<'_> {
     type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
-        self.connection
-            .as_ref()
+        self.pinned
+            .as_deref()
+            .or(self.connection.as_ref())
             .expect("a read guard always has a connection")
     }
 }
 
 impl Drop for ReadGuard<'_> {
     fn drop(&mut self) {
+        // A pinned connection goes back when its snapshot ends, not here.
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
         let mut connections = self
             .pool
             .connections
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        connections.push(
-            self.connection
-                .take()
-                .expect("a read guard always returns its connection"),
-        );
+        connections.push(connection);
         self.pool.available.notify_one();
     }
+}
+
+/// A step as a person reads it in a list: which mission, which step, and what it is for.
+#[derive(Clone, Debug)]
+pub struct StepLabel {
+    pub run: String,
+    pub mission: String,
+    pub path: String,
+    pub title: Option<String>,
+    pub goal: Option<String>,
+    pub status: String,
+    pub updated_at_unix_ms: u128,
 }
 
 pub struct Store {
@@ -891,9 +971,22 @@ struct PeerSyncProgress {
     window_started_at_unix_ms: u128,
     window_peer_only: u64,
     window_received: u64,
+    graph_compared_at_unix_ms: Option<u128>,
+    graph_differs_since_unix_ms: Option<u128>,
 }
 
 impl PeerSyncProgress {
+    /// Record one comparison of this node's graph digest with the peer's, made while both nodes
+    /// held the same envelopes.
+    fn compare_graphs(&mut self, equal: bool, now: u128) {
+        self.graph_compared_at_unix_ms = Some(now);
+        if equal {
+            self.graph_differs_since_unix_ms = None;
+        } else {
+            self.graph_differs_since_unix_ms.get_or_insert(now);
+        }
+    }
+
     /// Record one receipt from the peer and, when the peer's inventory allowed it, the measured
     /// difference `(peer_only, local_only)`. Rates are sampled over windows of at least
     /// `REPLICATION_SYNC_WINDOW_MS` and smoothed so one slow exchange does not swing the estimate.
@@ -944,6 +1037,14 @@ impl PeerSyncProgress {
         let mut sync = self.measured.clone()?;
         sync.catching_up = sync.peer_only_envelopes > REPLICATION_EXCHANGE_ENVELOPE_LIMIT as u64
             && now.saturating_sub(sync.measured_at_unix_ms) <= REPLICATION_SYNC_STALE_MS;
+        sync.graph_compared_at_unix_ms = self.graph_compared_at_unix_ms;
+        sync.graph_differs_since_unix_ms = self.graph_differs_since_unix_ms;
+        sync.diverged = self
+            .graph_differs_since_unix_ms
+            .zip(self.graph_compared_at_unix_ms)
+            .is_some_and(|(since, compared)| {
+                compared.saturating_sub(since) >= REPLICATION_DIVERGED_AFTER_MS
+            });
         Some(sync)
     }
 }
@@ -1778,6 +1879,52 @@ impl Store {
         Ok(self.committed_index.load(Ordering::Acquire))
     }
 
+    /// Run `read` with every read this thread makes through the store seeing one SQLite
+    /// snapshot, and give it that snapshot's store index. Rows read inside always match the
+    /// index, however many commits land meanwhile. A nested call joins the outer snapshot.
+    pub fn read_snapshot<T>(&self, read: impl FnOnce(u64) -> Result<T>) -> Result<T> {
+        let key = self.readers.key();
+        if PINNED_READER.with(|slot| slot.borrow().as_ref().is_some_and(|(pool, _)| *pool == key))
+        {
+            let index = current_index(&self.readers.get())?;
+            return read(index);
+        }
+        {
+            let mut pinned = self
+                .readers
+                .pinned
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            while *pinned + 1 >= READ_CONNECTIONS {
+                pinned = self
+                    .readers
+                    .unpinned
+                    .wait(pinned)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            *pinned += 1;
+        }
+        let mut guard = self.readers.get();
+        // Declared first so it drops last: on every exit it ends the transaction, releases the
+        // pin, and returns the connection to the pool.
+        let pinned = PinnedRead {
+            pool: &self.readers,
+            connection: Some(Rc::new(
+                guard
+                    .connection
+                    .take()
+                    .expect("an unpinned read guard holds a pooled connection"),
+            )),
+        };
+        drop(guard);
+        let connection = pinned.connection.clone().expect("the pin holds its connection");
+        connection.execute_batch("BEGIN")?;
+        // The first read starts the snapshot; every later read in `read` sees the same one.
+        let index = current_index(&connection)?;
+        PINNED_READER.with(|slot| *slot.borrow_mut() = Some((key, connection)));
+        read(index)
+    }
+
     /// Diagnostic claims on the daemon cannot change agent cards. Ignore them when deciding
     /// whether an agent projection must be rebuilt, including diagnostics raised by a slow
     /// agent-list request itself.
@@ -1787,6 +1934,26 @@ impl Store {
             .query_row(
                 "SELECT store_index FROM claims WHERE store_index<=?1
                  AND kind!='daemon.diagnostic' ORDER BY store_index DESC LIMIT 1",
+                [snapshot_index],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// The last claim that can change an agent's status: one about an agent, or about the run
+    /// or generation that owns it, whose row decides the agent's projection layer. Steps,
+    /// gates, subscriptions and diagnostics commit far more often and change no agent status.
+    fn agent_status_index(&self, snapshot_index: u64) -> Result<u64> {
+        // Walk back from the snapshot: about one recent claim in ten matches, so this stops
+        // after a few rows instead of scanning every agent observation.
+        let connection = self.readers.get();
+        Ok(connection
+            .query_row(
+                "SELECT store_index FROM claims WHERE store_index<=?1
+                 AND (subject GLOB 'agent/*' OR subject GLOB 'mission-run/*'
+                      OR subject GLOB 'run-generation/*')
+                 ORDER BY store_index DESC LIMIT 1",
                 [snapshot_index],
                 |row| row.get(0),
             )
@@ -1964,6 +2131,76 @@ impl Store {
             .collect()
     }
 
+    /// Name steps for display in one read: each step's mission, run, path, title, first goal,
+    /// status and last change. Unknown subjects are left out.
+    pub fn step_labels(&self, subjects: &[String]) -> Result<BTreeMap<String, StepLabel>> {
+        if subjects.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT s.subject, s.run_id, r.mission_id, s.step_path, s.title, s.goals, s.status,
+                    s.updated_at_unix_ms
+             FROM step_runs s
+             JOIN mission_runs r ON r.id=s.run_id
+             WHERE s.subject IN (SELECT value FROM json_each(?1))",
+        )?;
+        statement
+            .query_map([serde_json::to_string(subjects)?], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })?
+            .map(|row| {
+                let (subject, run, mission, path, title, goals, status, updated_at) = row?;
+                let goals: Vec<String> = serde_json::from_str(&goals)?;
+                Ok((
+                    subject,
+                    StepLabel {
+                        run: format!("mission-run/{run}"),
+                        mission: format!("mission/{mission}"),
+                        path,
+                        title,
+                        goal: goals.into_iter().next(),
+                        status,
+                        updated_at_unix_ms: updated_at.parse()?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// The mission behind each of these runs, in one read.
+    pub fn run_missions(&self, runs: &[String]) -> Result<BTreeMap<String, String>> {
+        if runs.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let ids = runs
+            .iter()
+            .map(|run| run.strip_prefix("mission-run/").unwrap_or(run))
+            .collect::<Vec<_>>();
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT id, mission_id FROM mission_runs WHERE id IN (SELECT value FROM json_each(?1))",
+        )?;
+        statement
+            .query_map([serde_json::to_string(&ids)?], |row| {
+                Ok((
+                    format!("mission-run/{}", row.get::<_, String>(0)?),
+                    format!("mission/{}", row.get::<_, String>(1)?),
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(Into::into)
+    }
+
     /// Return every current published mission definition, including definitions with no runs.
     pub fn mission_definitions(&self) -> Result<Vec<MissionDefinitionView>> {
         let connection = self.readers.get();
@@ -1999,6 +2236,7 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<String>> {
+        let ended_since = recently_ended_since();
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "WITH ids AS (
@@ -2023,15 +2261,21 @@ impl Store {
                    WHEN COALESCE(run_states.running,0)>0 THEN 'running'
                    WHEN COALESCE(run_states.standing,0)>0 THEN 'standing'
                    WHEN latest.status IS NOT NULL THEN latest.status
-                   ELSE def.state END NOT IN ('completed','failed','cancelled','retired'))
+                   ELSE def.state END NOT IN ('completed','failed','cancelled','retired')
+                   -- A run that failed or was cancelled stays in view for a while with its
+                   -- outcome, instead of vanishing the moment it ends.
+                   OR (latest.status IN ('failed','cancelled')
+                       AND COALESCE(run_states.running,0)=0 AND COALESCE(run_states.standing,0)=0
+                       AND CAST(latest.updated_at_unix_ms AS INTEGER)>=?4))
              ORDER BY CAST(COALESCE(latest.updated_at_unix_ms,published.accepted_at_unix_ms) AS INTEGER) DESC,
                       ids.mission_id ASC
              LIMIT ?2 OFFSET ?3",
         )?;
         statement
-            .query_map(params![history, limit as i64, offset as i64], |row| {
-                row.get::<_, String>(0).map(|id| format!("mission/{id}"))
-            })?
+            .query_map(
+                params![history, limit as i64, offset as i64, ended_since as i64],
+                |row| row.get::<_, String>(0).map(|id| format!("mission/{id}")),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -7986,7 +8230,7 @@ impl Store {
                 result.store_index = index;
                 return Ok(result);
             }
-            let projection_index = self.agent_projection_index(index)?;
+            let projection_index = self.agent_status_index(index)?;
             if let Some((cached_index, _, status)) = cache
                 .iter_mut()
                 .find(|(_, cached_projection, _)| *cached_projection == projection_index)
@@ -9614,7 +9858,32 @@ impl Store {
             }
         }
 
-        let messages = selected_actionable_messages(self.messages(person, false)?);
+        // Only a person's messages need attention. Without a person, read each person's
+        // mailbox through the recipient index instead of every open message in the fleet.
+        let messages = match person {
+            Some(person) => self.messages(Some(person), false)?,
+            None => {
+                let people = {
+                    let connection = self.readers.get();
+                    let mut statement = connection.prepare(
+                        "SELECT DISTINCT json_extract(body, '$.fields.to')
+                         FROM claims INDEXED BY claims_message_to_index
+                         WHERE kind='message.sent'
+                           AND json_extract(body, '$.fields.to') >= 'person/'
+                           AND json_extract(body, '$.fields.to') < 'person0'",
+                    )?;
+                    statement
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                let mut messages = Vec::new();
+                for person in people {
+                    messages.extend(self.messages(Some(&person), false)?);
+                }
+                messages
+            }
+        };
+        let messages = selected_actionable_messages(messages);
         if !messages.is_empty() {
             let connection = self.readers.get();
             for message in messages.into_iter().filter(|message| {
@@ -9699,7 +9968,13 @@ impl Store {
                     review_mode: None,
                     subject: attention_subject,
                     person: reviewer,
-                    requester_id: None,
+                    // st's subscription observer raised it.
+                    requester_id: Some(
+                        failure
+                            .actor
+                            .clone()
+                            .unwrap_or_else(|| "agent/st3/reconciler".into()),
+                    ),
                     launch_id: None,
                     variant_id: None,
                     message_id: None,
@@ -12081,12 +12356,27 @@ impl Store {
             &snapshot.buckets,
             &input.inventory,
         );
-        self.replication_sync
+        // Each graph projects the envelopes its node holds, so the digests are comparable only
+        // while both nodes hold the same ones, and only once this node has projected them all:
+        // nothing new arrived that still waits for admission, and no projection is deferred.
+        let graph_equal = (!input.inventory.digest.is_empty()
+            && input.inventory.digest == snapshot.inventory.digest
+            && !input.graph_digest.is_empty()
+            && received == 0
+            && signatures == 0
+            && !self.replication_projection_deferred())
+        .then(|| input.graph_digest == snapshot.graph_digest);
+        let now = now_ms();
+        let mut sync = self
+            .replication_sync
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(relay.to_owned())
-            .or_default()
-            .observe(received, difference, now_ms());
+            .unwrap_or_else(PoisonError::into_inner);
+        let progress = sync.entry(relay.to_owned()).or_default();
+        progress.observe(received, difference, now);
+        if let Some(equal) = graph_equal {
+            progress.compare_graphs(equal, now);
+        }
+        drop(sync);
         Ok(ReplicationReceipt {
             received,
             duplicate,
@@ -12642,6 +12932,16 @@ impl Store {
             .unwrap_or_else(PoisonError::into_inner)
             .values()
             .any(|progress| progress.view(now).is_some_and(|sync| sync.catching_up))
+    }
+
+    /// Whether any peer's comparisons say this node's graph has diverged from that peer's.
+    pub fn replication_diverged(&self) -> bool {
+        let now = now_ms();
+        self.replication_sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .any(|progress| progress.view(now).is_some_and(|sync| sync.diverged))
     }
 
     /// The latest sync measurement for each configured peer that has one.
@@ -17003,6 +17303,8 @@ fn current_human_review(
     else {
         return Ok(None);
     };
+    // Only the run's header decides whether a review is current: its steps' queue and wake
+    // enrichment is the costliest read in st and would run for every open review.
     let (run, step, title) = if owner.starts_with("step-run/") {
         let step = connection
             .query_row(
@@ -17019,7 +17321,7 @@ fn current_human_review(
         let Some(step) = step else {
             return Ok(None);
         };
-        let run = mission_run_view_tx(
+        let run = mission_run_header_tx(
             connection,
             step.run.strip_prefix("mission-run/").unwrap_or(&step.run),
         )
@@ -17039,7 +17341,7 @@ fn current_human_review(
         let title = step.title.clone();
         (run, Some(step.step), title)
     } else if owner.starts_with("mission-run/") {
-        let run = mission_run_view_tx(
+        let run = mission_run_header_tx(
             connection,
             owner.strip_prefix("mission-run/").unwrap_or(owner),
         )
@@ -19039,6 +19341,14 @@ fn canonical_json_text(value: &Value) -> Result<String> {
 
 fn canonical_serialized_json_text(value: &impl Serialize) -> Result<String> {
     canonical_json_text(&serde_json::to_value(value)?)
+}
+
+/// How long a mission whose run failed or was cancelled stays in the current missions view.
+pub(crate) const RECENTLY_ENDED_MS: u128 = 24 * 60 * 60 * 1000;
+
+/// The earliest end that still counts as recent.
+pub(crate) fn recently_ended_since() -> u128 {
+    now_ms().saturating_sub(RECENTLY_ENDED_MS)
 }
 
 fn now_ms() -> u128 {
@@ -21177,6 +21487,12 @@ const REPLICATION_SYNC_WINDOW_MS: u128 = 10_000;
 /// A sync measurement older than this no longer says the node is catching up, and a longer gap
 /// between measurements gives no rate sample.
 const REPLICATION_SYNC_STALE_MS: u128 = 300_000;
+
+/// How long comparisons must keep finding the same envelopes projecting different graphs before
+/// the two nodes count as diverged. A peer can export between storing envelopes and projecting
+/// them, and a catching-up peer defers projection for up to `CATCH_UP_PROJECTION_INTERVAL_MS`,
+/// so a shorter difference can still settle by itself.
+const REPLICATION_DIVERGED_AFTER_MS: u128 = 2 * CATCH_UP_PROJECTION_INTERVAL_MS as u128;
 
 /// Sequences per compact inventory range. A range digest lets two peers skip every range they
 /// already share, so an exchange lists only the identities in ranges that differ.
@@ -27566,6 +27882,83 @@ mod tests {
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
 
     #[test]
+    fn a_pinned_read_sees_one_snapshot_while_commits_land() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("state.sqlite3"), "node").unwrap();
+        let observe = |n: u64| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "resource/pinned".into(),
+                    kind: "resource.observed".into(),
+                    actor: Some("person/avery".into()),
+                    fields: BTreeMap::from([
+                        ("kind".into(), Value::String("human.review".into())),
+                        ("reason".into(), Value::String(format!("change {n}"))),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        observe(0);
+        let before = store.index().unwrap();
+        let seen = store
+            .read_snapshot(|index| {
+                assert_eq!(index, before);
+                // A commit lands in the middle of the read. The writer sees it; the read does not.
+                observe(1);
+                assert!(store.index().unwrap() > index);
+                let claims = store.claims_for("resource/pinned", None)?.len();
+                let nested = store.read_snapshot(|nested| {
+                    Ok((nested, store.claims_for("resource/pinned", None)?.len()))
+                })?;
+                assert_eq!(nested, (index, claims), "a nested read joins the outer snapshot");
+                Ok(claims)
+            })
+            .unwrap();
+        assert_eq!(seen, 1);
+        assert_eq!(store.claims_for("resource/pinned", None).unwrap().len(), 2);
+        // Every pinned connection went back to the pool, even after a failed read.
+        for _ in 0..32 {
+            let _ = store.read_snapshot(|_| -> Result<()> { anyhow::bail!("a failed read") });
+            store.read_snapshot(|_| Ok(())).unwrap();
+        }
+        assert_eq!(store.claims_for("resource/pinned", None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pinned_reads_that_fan_out_never_wait_on_each_other() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&directory.path().join("state.sqlite3"), "node").unwrap());
+        // Every pinned read holds its connection while a worker thread, like the agent status
+        // reduction's, needs another one from the pool.
+        let (done, finished) = std::sync::mpsc::channel();
+        let barrier = Arc::new(std::sync::Barrier::new(READ_CONNECTIONS));
+        for _ in 0..READ_CONNECTIONS {
+            let (store, done, barrier) = (store.clone(), done.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                let result = store.read_snapshot(|_| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::scope(|scope| {
+                        scope
+                            .spawn(|| store.claims_for("resource/pinned", None).map(|claims| claims.len()))
+                            .join()
+                            .unwrap()
+                    })
+                });
+                done.send(result.is_ok()).unwrap();
+            });
+        }
+        for _ in 0..READ_CONNECTIONS {
+            assert!(finished
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("a pinned read waited forever for a connection"));
+        }
+    }
+
+    #[test]
     fn recent_up_observation_prevents_a_transport_timeout_flap() {
         let store = Store::open_memory("source").unwrap();
         store
@@ -32081,6 +32474,146 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     }
 
     #[test]
+    fn the_same_envelopes_projecting_different_graphs_diverge() {
+        let left = Store::open_memory("left").unwrap();
+        let right = Store::open_memory("right").unwrap();
+        let intent = simple("true");
+        let preview = left
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: "work".into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        left.apply(&intent, &preview.subject_tokens, "work")
+            .unwrap();
+        receive_and_project(
+            &right,
+            "left",
+            &exchange_from(&left, &right.replication_inventory().unwrap()),
+        );
+        receive_and_project(
+            &left,
+            "right",
+            &exchange_from(&right, &left.replication_inventory().unwrap()),
+        );
+        // Each exchange a worker starts carries its node's inventory and graph digest.
+        let summary = |from: &Store, to: &Store, relay: &str| {
+            let exchange = from.export_replication_summary(TEST_FLEET).unwrap();
+            to.receive_replication_exchange(relay, TEST_FLEET, &exchange)
+                .unwrap();
+            to.replication_peer_sync(&[relay.to_owned()])
+                .remove(relay)
+                .unwrap()
+        };
+        let synced = summary(&left, &right, "left");
+        assert_eq!(
+            (synced.peer_only_envelopes, synced.local_only_envelopes),
+            (0, 0)
+        );
+        assert!(synced.graph_compared_at_unix_ms.is_some());
+        assert_eq!(synced.graph_differs_since_unix_ms, None);
+        assert!(!synced.diverged);
+
+        // Right loses the desired claim while keeping its envelope, as a node that drops
+        // received claims would: the inventories still match, the graphs no longer do.
+        {
+            let connection = right.connection.lock().unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TEMP TABLE dropped_claims AS
+                         SELECT * FROM claims WHERE subject='exec/work' AND kind='intent.desired';
+                     CREATE TEMP TABLE dropped_desired AS
+                         SELECT * FROM desired WHERE subject='exec/work';
+                     PRAGMA foreign_keys=OFF;
+                     DELETE FROM desired WHERE subject='exec/work';
+                     DELETE FROM claims WHERE subject='exec/work' AND kind='intent.desired';
+                     PRAGMA foreign_keys=ON;",
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            left.replication_inventory().unwrap().digest,
+            right.replication_inventory().unwrap().digest
+        );
+        let differs = summary(&left, &right, "left");
+        let since = differs.graph_differs_since_unix_ms.expect("graphs differ");
+        assert_eq!(differs.graph_compared_at_unix_ms, Some(since));
+        assert!(
+            !differs.diverged,
+            "one comparison can catch a peer mid-projection"
+        );
+        assert!(!right.replication_diverged());
+        assert!(
+            summary(&right, &left, "right")
+                .graph_differs_since_unix_ms
+                .is_some(),
+            "the peer sees the difference too"
+        );
+
+        // A difference that outlasts any projection delay is divergence.
+        right
+            .replication_sync
+            .lock()
+            .unwrap()
+            .get_mut("left")
+            .unwrap()
+            .graph_differs_since_unix_ms = Some(since - REPLICATION_DIVERGED_AFTER_MS);
+        let diverged = summary(&left, &right, "left");
+        assert!(diverged.diverged);
+        assert_eq!(
+            diverged.graph_differs_since_unix_ms,
+            Some(since - REPLICATION_DIVERGED_AFTER_MS)
+        );
+        assert!(right.replication_diverged());
+        let status = right
+            .replication_status(true, Some(TEST_FLEET), &["left".to_owned()])
+            .unwrap();
+        assert!(status.peers[0].sync.as_ref().unwrap().diverged);
+        assert_ne!(
+            status.peers[0].graph_digest.as_deref(),
+            Some(status.graph_digest.as_str())
+        );
+
+        // Different envelopes cannot be compared, so they leave the last comparison standing.
+        let compared = diverged.graph_compared_at_unix_ms;
+        left.record_transport_observation("right", "up", None, None)
+            .unwrap();
+        let moved = summary(&left, &right, "left");
+        assert_eq!(moved.peer_only_envelopes, 1);
+        assert_eq!(moved.graph_compared_at_unix_ms, compared);
+        assert!(moved.diverged);
+
+        // Once the same envelopes project the same graph again, the divergence clears.
+        receive_and_project(
+            &right,
+            "left",
+            &exchange_from(&left, &right.replication_inventory().unwrap()),
+        );
+        {
+            let connection = right.connection.lock().unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA foreign_keys=OFF;
+                     INSERT INTO claims SELECT * FROM dropped_claims;
+                     INSERT INTO desired SELECT * FROM dropped_desired;
+                     PRAGMA foreign_keys=ON;",
+                )
+                .unwrap();
+        }
+        let healed = summary(&left, &right, "left");
+        assert_eq!(
+            (healed.peer_only_envelopes, healed.local_only_envelopes),
+            (0, 0)
+        );
+        assert_eq!(healed.graph_differs_since_unix_ms, None);
+        assert!(!healed.diverged);
+        assert!(!right.replication_diverged());
+    }
+
+    #[test]
     fn concurrent_graph_writes_converge_after_a_partition() {
         let left = Store::open_memory("left").unwrap();
         let right = Store::open_memory("right").unwrap();
@@ -36386,6 +36919,31 @@ mission "takeover" state="ready" {
             .retry_failed_step(&old_check, "person/operator", "again", "retry-stale")
             .unwrap_err();
         assert_eq!(stale.code, "stale-run-generation");
+    }
+
+    #[test]
+    fn a_failed_mission_stays_in_the_current_view_for_a_day() {
+        let store = Store::open_memory("node").unwrap();
+        let failed = failed_takeover_run(&store, &["deploy-check"]);
+        assert_eq!(failed.status, "failed");
+        let current = store.mission_collection_ids(false, 0, 50).unwrap();
+        assert!(current.contains(&failed.mission), "{current:?}");
+
+        // A day later it is history only.
+        let old = crate::store::recently_ended_since().saturating_sub(1_000);
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE id=?1",
+                params![failed.id, old.to_string()],
+            )
+            .unwrap();
+        let current = store.mission_collection_ids(false, 0, 50).unwrap();
+        assert!(!current.contains(&failed.mission), "{current:?}");
+        let history = store.mission_collection_ids(true, 0, 50).unwrap();
+        assert!(history.contains(&failed.mission), "{history:?}");
     }
 
     #[test]

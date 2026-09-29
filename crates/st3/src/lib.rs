@@ -6,10 +6,12 @@ pub mod boot;
 pub(crate) mod checkout;
 pub mod client;
 pub mod config;
+pub(crate) mod disk;
 pub mod environment;
 pub(crate) mod external_sessions;
 pub mod fleet;
 pub mod graph;
+pub mod lane;
 pub mod mission;
 pub mod model;
 pub mod otlp;
@@ -20,6 +22,8 @@ pub mod reconcile;
 pub mod recorder;
 /// Summarizes command recorder logs from one or more hosts.
 pub mod recorder_report;
+/// Attaches a local terminal to a terminal another fleet host owns.
+pub mod remote_terminal;
 pub mod render;
 pub mod resource;
 pub mod seat_queue;

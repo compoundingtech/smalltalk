@@ -1295,6 +1295,12 @@ fn parse_step(
                         format!("step `{path}` cannot own an account"),
                     ));
                 }
+                "lane" => {
+                    return Err(St3Error::new(
+                        "lane-inside-step",
+                        format!("step `{path}` cannot declare a lane; declare it on the mission"),
+                    ));
+                }
                 name if crate::graph::is_mission_declaration(name) => {
                     crate::graph::validate_deferred_declaration(child)?;
                     let child =

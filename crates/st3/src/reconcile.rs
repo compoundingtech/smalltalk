@@ -412,6 +412,13 @@ pub struct Reconciler<R = NativeRuntime> {
     /// Faults that could not be recorded in the graph during the current pass.
     unrecorded_faults: Mutex<Vec<String>>,
     fault_injection: Option<Arc<dyn FaultInjection>>,
+    /// Reads free space for the disk stage. Without one the stage does nothing.
+    disk_probe: Option<DiskProbe>,
+    /// Paths whose filesystems the disk stage always watches, beside this host's workspaces.
+    disk_paths: Vec<PathBuf>,
+    /// When the disk stage last read free space, and whether its episode raised an item.
+    disk_check: Mutex<(Option<u128>, bool)>,
+    disk_check_every_ms: u128,
     /// How long run cleanup waits for its runtimes to stop before the run ends without them.
     cleanup_deadline: Duration,
     /// Unit tests fail a pass that raises a fault unless they opt in, so an isolated error
@@ -497,6 +504,10 @@ impl Reconciler<NativeRuntime> {
             faults: Mutex::new(None),
             unrecorded_faults: Mutex::new(Vec::new()),
             fault_injection: None,
+            disk_probe: Some(Arc::new(crate::disk::disk_space)),
+            disk_paths: vec![state_dir.to_path_buf()],
+            disk_check: Mutex::new((None, false)),
+            disk_check_every_ms: DISK_CHECK_EVERY_MS,
             cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
             raised_faults: Mutex::new(Some(Vec::new())),
@@ -534,6 +545,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             faults: Mutex::new(None),
             unrecorded_faults: Mutex::new(Vec::new()),
             fault_injection: None,
+            disk_probe: None,
+            disk_paths: Vec::new(),
+            disk_check: Mutex::new((None, false)),
+            disk_check_every_ms: 0,
             cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
             raised_faults: Mutex::new(Some(Vec::new())),
@@ -549,6 +564,14 @@ impl<R: RuntimeControl> Reconciler<R> {
     #[doc(hidden)]
     pub fn with_cleanup_deadline(mut self, deadline: Duration) -> Self {
         self.cleanup_deadline = deadline;
+        self
+    }
+
+    /// Read free space for `paths` and this host's workspaces with `probe` on every pass.
+    #[cfg(test)]
+    fn with_disk_probe(mut self, paths: Vec<PathBuf>, probe: DiskProbe) -> Self {
+        self.disk_probe = Some(probe);
+        self.disk_paths = paths;
         self
     }
 
@@ -688,6 +711,104 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn signal_changed(&self) {
         signal_changed(&self.notify, &self.event_notify);
+    }
+
+    /// Raise one host item while a filesystem that this daemon or one of its workspaces writes to
+    /// is low on space, and close it once every one of them has recovered. A person who closes
+    /// the item early is not asked again until the space recovers.
+    fn reconcile_disk_space(&self, desired: &[DesiredSubject]) -> Result<()> {
+        let Some(probe) = &self.disk_probe else {
+            return Ok(());
+        };
+        let now = now_ms();
+        {
+            let mut check = self
+                .disk_check
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if check
+                .0
+                .is_some_and(|at| now.saturating_sub(at) < self.disk_check_every_ms)
+            {
+                return Ok(());
+            }
+            check.0 = Some(now);
+        }
+        let workspaces = desired
+            .iter()
+            .filter(|subject| subject.kind != "stop")
+            .filter_map(|subject| subject.member.as_ref())
+            .filter(|member| member.host == self.host)
+            .map(|member| PathBuf::from(&member.workspace));
+        // One reading per filesystem, named by the first path on it. A workspace that does not
+        // exist yet has no filesystem to read.
+        let mut filesystems = BTreeMap::<u64, (PathBuf, crate::disk::DiskSpace)>::new();
+        for path in self.disk_paths.iter().cloned().chain(workspaces) {
+            if let Ok(space) = probe(&path) {
+                filesystems.entry(space.filesystem).or_insert((path, space));
+            }
+        }
+        if filesystems.is_empty() {
+            return Ok(());
+        }
+        let daemon = format!("daemon/{}", self.host);
+        let title = format!("Disk space is low on {}", self.host);
+        let pending = self
+            .store
+            .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
+            .into_iter()
+            .filter(|request| request.title == title && request.targets == [daemon.as_str()])
+            .collect::<Vec<_>>();
+        let low = filesystems
+            .values()
+            .filter(|(_, space)| space.is_low())
+            .map(|(path, space)| format!("`{}` has {}", path.display(), space.describe()))
+            .collect::<Vec<_>>();
+        if !low.is_empty() {
+            let mut check = self
+                .disk_check
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if pending.is_empty() && !check.1 {
+                let key = format!("disk-low:{}:{}", self.host, self.store.index()?);
+                let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+                self.store.request_attention(
+                    &format!("attention/{}", &digest[..32]),
+                    &AttentionRequest {
+                        reviewer: "person/operator".into(),
+                        title,
+                        reason: format!(
+                            "On {}, {}. Builds and the claim store fail once a filesystem fills. Free space there, for example by removing the `target/` directories of finished worktrees with `cargo clean`; `df -h PATH` and `st doctor` show what is left. This item closes once each filesystem has 4 GiB and 4% free.",
+                            self.host,
+                            low.join("; ")
+                        ),
+                        severity: "error".into(),
+                        targets: vec![daemon],
+                        actor: RECONCILER_ACTOR.into(),
+                        idempotency_key: key,
+                    },
+                )?;
+                self.signal_changed();
+            }
+            check.1 = true;
+            return Ok(());
+        }
+        if !filesystems.values().all(|(_, space)| space.has_recovered()) {
+            return Ok(());
+        }
+        for request in pending {
+            self.store.resolve_attention_automatically(
+                &request.subject,
+                "every filesystem this daemon writes to has 4 GiB and 4% free again",
+                &format!("disk-recovered:{}", request.request),
+            )?;
+            self.signal_changed();
+        }
+        self.disk_check
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .1 = false;
+        Ok(())
     }
 
     /// Raise one host item while whole reconcile passes fail or the reconciler panics. Nothing on
@@ -1466,6 +1587,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         });
         self.isolate("stage/retired-agent-attention", &daemon, || {
             self.resolve_attention_for_retired_agents(&desired)
+        });
+        self.isolate("stage/disk-space", &daemon, || {
+            self.reconcile_disk_space(&desired)
         });
         self.file_watchers_used
             .lock()
@@ -4382,7 +4506,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                         return Ok(changed);
                     }
                     if let Some(loop_spec) = &step.spec.loop_spec {
-                        changed |= self.evaluate_loop_step(run, &step, view, loop_spec)?;
+                        if self.evaluate_loop_step(run, &step, view, loop_spec)? {
+                            changed = true;
+                            self.request_stopped_loop_attention(run, view, loop_spec)?;
+                        }
                         return Ok(changed);
                     }
                     if let Some(nested) = &step.spec.nested_mission {
@@ -6784,7 +6911,6 @@ impl<R: RuntimeControl> Reconciler<R> {
     ) -> Result<bool> {
         match &loop_spec.on_exhausted {
             LoopExhaustionSpec::Fail => {
-                self.request_loop_exhaustion_attention(run, loop_spec, loop_subject, reason)?;
                 self.record_once(
                     loop_subject,
                     "loop.state",
@@ -6856,19 +6982,47 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
     }
 
-    fn request_loop_exhaustion_attention(
+    /// Raise one attention item for a loop whose step just failed or was cancelled: it failed
+    /// at exhaustion or in its human review, or a round or branch mission stopped it. The item
+    /// names the loop, the cause and the command that continues or ends it. It closes when the
+    /// loop runs again, a revision replaces its generation, or its run is cancelled. A loop that
+    /// declares `on-exhausted { attention }` names its title, reviewer and severity; any other
+    /// loop asks the person who requested the run.
+    fn request_stopped_loop_attention(
         &self,
         run: &MissionRunView,
+        view: &crate::model::StepRunView,
         loop_spec: &LoopSpec,
-        loop_subject: &str,
-        reason: &str,
     ) -> Result<()> {
-        let Some(attention) = &loop_spec.exhaustion_attention else {
+        let Some(state) = self
+            .store
+            .latest_claim(&view.subject, Some("step-run.state"))?
+        else {
             return Ok(());
         };
+        let status = state
+            .body
+            .pointer("/fields/status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(status, "failed" | "cancelled") {
+            return Ok(());
+        }
+        let reason = state
+            .body
+            .pointer("/fields/reason")
+            .and_then(Value::as_str)
+            .unwrap_or("the loop stopped");
+        let loop_subject = format!(
+            "loop-run/{}/{}",
+            run.generation
+                .strip_prefix("run-generation/")
+                .unwrap_or(&run.generation),
+            loop_spec.path
+        );
         let feedback = self
             .store
-            .claims_for(loop_subject, Some("loop.round-result"))?
+            .claims_for(&loop_subject, Some("loop.round-result"))?
             .into_iter()
             .rev()
             .find_map(|claim| {
@@ -6876,25 +7030,63 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .body
                     .pointer("/fields/feedback")
                     .and_then(Value::as_str)
+                    .filter(|feedback| !feedback.is_empty())
                     .map(str::to_owned)
             });
-        let detail = feedback.as_deref().map_or_else(
-            || format!("Loop `{loop_subject}` failed: {reason}."),
-            |feedback| {
-                format!("Loop `{loop_subject}` failed: {reason}. Latest feedback: `{feedback}`.")
-            },
+        let mission = run.mission.strip_prefix("mission/").unwrap_or(&run.mission);
+        let remedy = if status == "failed" {
+            format!(
+                "`st work retry {} --reason \"...\"` runs round {} after you address the cause; `st missions cancel {} --reason \"...\"` ends the run.",
+                view.subject,
+                view.attempt.saturating_add(1),
+                run.subject
+            )
+        } else {
+            format!(
+                "st cannot retry a cancelled step. Correct the mission, then end this run with `st missions cancel {} --reason \"...\"` if it still runs, and start a new one with `st missions start {mission}`.",
+                run.subject
+            )
+        };
+        let mut detail = format!(
+            "Loop `{loop_subject}` stopped in round {}: {reason}.",
+            view.attempt
         );
-        let idempotency_key = format!("loop-exhausted-attention:{loop_subject}");
+        if let Some(feedback) = feedback {
+            detail.push_str(&format!(" Latest feedback: `{feedback}`."));
+        }
+        detail.push(' ');
+        detail.push_str(&remedy);
+        detail.push_str(
+            " This item closes when the loop runs again or its run is revised or cancelled.",
+        );
+        let (title, reviewer, severity) = match &loop_spec.exhaustion_attention {
+            Some(attention) => (
+                attention.title.clone(),
+                attention.reviewer.clone(),
+                attention.severity.clone(),
+            ),
+            None => (
+                format!("Loop `{}` stopped", loop_spec.id),
+                if run.requester.starts_with("person/") {
+                    run.requester.clone()
+                } else {
+                    "person/operator".into()
+                },
+                "error".into(),
+            ),
+        };
+        // One item per stop. A retry runs the next round, so a later stop raises a new item.
+        let idempotency_key = format!("loop-stopped-attention:{loop_subject}:{}", view.attempt);
         let digest = hex::encode(sha2::Sha256::digest(idempotency_key.as_bytes()));
         self.store.request_attention(
             &format!("attention/{}", &digest[..32]),
             &AttentionRequest {
-                reviewer: attention.reviewer.clone(),
-                title: attention.title.clone(),
+                reviewer,
+                title,
                 reason: detail,
-                severity: attention.severity.clone(),
-                targets: vec![loop_subject.into(), run.subject.clone()],
-                actor: "agent/st3/reconciler".into(),
+                severity,
+                targets: vec![loop_subject, run.subject.clone()],
+                actor: RECONCILER_ACTOR.into(),
                 idempotency_key,
             },
         )?;
@@ -7122,8 +7314,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok((changed, complete))
     }
 
-    /// Stop owned observers, subscriptions, and schedules durably. Each one remains a stopped
-    /// declaration of its own kind, so it settles its state and starts no more work.
+    /// Stop owned lanes, observers, subscriptions, and schedules durably. Each one remains a
+    /// stopped declaration of its own kind, so it settles its state and starts no more work, and a
+    /// stopped lane is no longer listed.
     fn stop_owned_intake(
         &self,
         subjects: &[&DesiredSubject],
@@ -7134,7 +7327,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         for subject in subjects {
             if !matches!(
                 subject.kind.as_str(),
-                "observer" | "subscription" | "schedule"
+                "lane" | "observer" | "subscription" | "schedule"
             ) || intake_is_stopped(subject, &self.host)
             {
                 continue;
@@ -8774,8 +8967,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                     cursor,
                     previous_facts: previous_facts.clone(),
                     every_ms: spec.every_ms,
+                    refresh: refresh_attempt.is_some(),
                 };
-                match provider.observe(request).await {
+                let observed =
+                    crate::resource::spend_as(observer_subject.clone(), provider.observe(request))
+                        .await;
+                match observed {
                     Ok(mut observation) => {
                         if spec.provider == "github.repository" {
                             crate::resource::attach_pull_request_openers(
@@ -9834,6 +10031,10 @@ fn permanent_observation_error(code: &str) -> bool {
 }
 
 const HELD_SUBSCRIPTION_TITLE: &str = "A subscription is holding mission requests";
+/// How often the disk stage reads free space.
+const DISK_CHECK_EVERY_MS: u128 = 30_000;
+
+type DiskProbe = Arc<dyn Fn(&Path) -> std::io::Result<crate::disk::DiskSpace> + Send + Sync>;
 const RECONCILER_FAILING_TITLE: &str = "The reconciler is failing";
 
 /// How long a fault must last before it asks a person. st retries a faulted item on every pass,
@@ -9935,15 +10136,15 @@ impl ObserverCondition {
         }
     }
 
-    /// The cause and the command that fixes it.
-    fn reason(&self, subject: &str) -> String {
+    /// The cause and the command that fixes it. `host` polls the observer.
+    fn reason(&self, subject: &str, host: &str) -> String {
         let closes = "This item closes when the observer observes again.";
         match self {
             Self::Access(reason) => format!(
                 "{subject} cannot observe its resource: {reason}. Give the daemon account's GitHub token access to the repository, with `gh auth login` or `gh auth refresh -h github.com -s repo` as that account. The observer tries again on its own. {closes}"
             ),
             Self::RateLimited { reason, .. } => format!(
-                "{subject} is still limited after the reset GitHub named: {reason}. Something else spends the shared GitHub budget; `st doctor` shows the requests each observer made. The observer waits for each reset on its own. {closes}"
+                "{subject} is still limited after the reset GitHub named: {reason}. Something else spends the GitHub budget that every host shares; `st doctor` on {host} shows how much of it remains, how much that host's observers spent, and each observer's requests. The observer waits for each reset on its own. {closes}"
             ),
             Self::Unreachable(reason) => format!(
                 "{subject} has failed to observe for over an hour: {reason}. Inspect it with `st subject {subject}`. {closes}"
@@ -9992,7 +10193,7 @@ fn request_observer_attention(
         &AttentionRequest {
             reviewer,
             title: condition.title().into(),
-            reason: condition.reason(subject),
+            reason: condition.reason(subject, store.origin()),
             severity: "error".into(),
             targets: vec![subject.into()],
             actor: RECONCILER_ACTOR.into(),
@@ -10268,9 +10469,10 @@ fn expand_gate(
     Ok(())
 }
 
-/// Report whether an observer, subscription, or schedule declaration is a stop.
+/// Report whether a lane, observer, subscription, or schedule declaration is a stop.
 fn intake_is_stopped(subject: &DesiredSubject, host: &str) -> bool {
     match subject.kind.as_str() {
+        "lane" => crate::graph::lane_spec(&subject.desired).is_some_and(|spec| spec.stopped),
         "observer" => {
             crate::graph::observer_spec(&subject.desired).is_some_and(|spec| spec.stopped)
         }
@@ -17854,6 +18056,11 @@ mission "alert-exhaustion" state="ready" {
         assert_eq!(attention[0].title, "Automatic review failed");
         assert_eq!(attention[0].kind, "fault");
         assert!(attention[0].targets.contains(&run.subject));
+        assert!(
+            attention[0].detail.contains("`st work retry step-run/"),
+            "{}",
+            attention[0].detail
+        );
         for _ in 0..5 {
             reconciler.reconcile_once().unwrap();
         }
@@ -17861,6 +18068,156 @@ mission "alert-exhaustion" state="ready" {
             store.attention_items(Some("person/nathan")).unwrap().len(),
             1
         );
+    }
+
+    fn stopping_loop_run(
+        requester: &str,
+        round: &str,
+        idempotency_key: &str,
+    ) -> (Arc<Store>, Reconciler<FakeRuntime>, MissionRunView) {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = format!(
+            r#"
+version 2
+resource "result" {{ kind "custom.test.loop-result" }}
+resource "never" {{ kind "custom.test.loop-result" }}
+mission "stopping" state="ready" {{
+  goal "Stop a bounded loop."
+  completion {{ when "all-steps-exhausted" }}
+  loop "review" {{
+    max-rounds 3
+    until {{ gate "ready" {{ field "state" "resource/result" is "ready" }} }}
+    round {{
+      completion {{ when "all-steps-exhausted" }}
+      {round}
+    }}
+  }}
+}}
+"#
+        );
+        apply_source(&store, &source, idempotency_key);
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "stopping".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some(requester.into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: format!("{idempotency_key}-run"),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        (store, reconciler, run)
+    }
+
+    #[test]
+    fn every_stopped_loop_asks_its_requester_once_per_stop_until_it_runs_again() {
+        let (store, reconciler, run) = stopping_loop_run(
+            "person/lichen",
+            r#"step "work" { agentless; goal "Round ${loop.round} finds nothing ready." }"#,
+            "stopping-loop",
+        );
+        for _ in 0..30 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let failed = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(failed.status, "failed");
+        let step = failed.steps[0].subject.clone();
+        let loop_run = format!(
+            "loop-run/{}/review",
+            failed.generation.strip_prefix("run-generation/").unwrap()
+        );
+        let items = store.attention_items(Some("person/lichen")).unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        let first = &items[0];
+        assert_eq!(first.title, "Loop `review` stopped");
+        assert_eq!(first.kind, "fault");
+        assert_eq!(first.targets, vec![loop_run.clone(), run.subject.clone()]);
+        for expected in [
+            format!("Loop `{loop_run}` stopped in round 3"),
+            format!("`st work retry {step} --reason"),
+            "runs round 4".into(),
+            format!("`st missions cancel {} --reason", run.subject),
+        ] {
+            assert!(first.detail.contains(&expected), "{}", first.detail);
+        }
+        for _ in 0..5 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(
+            store.attention_items(Some("person/lichen")).unwrap().len(),
+            1
+        );
+
+        // A retry reopens the run in a new generation, which ends the item. The loop stops
+        // again there, and that stop raises its own item.
+        store
+            .retry_failed_step(&step, "person/lichen", "try the loop again", "retry-loop")
+            .unwrap();
+        for _ in 0..30 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let items = store.attention_items(Some("person/lichen")).unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_ne!(items[0].subject, first.subject);
+        assert!(!items[0].targets.contains(&loop_run));
+        assert!(
+            items[0].detail.contains("stopped in round 4"),
+            "the retry ran the round the first item named: {}",
+            items[0].detail
+        );
+    }
+
+    #[test]
+    fn a_loop_stopped_by_a_cancelled_round_says_how_to_start_over() {
+        let (store, reconciler, run) = stopping_loop_run(
+            "agent/fleet/orchid",
+            r#"step "wait" {
+        agentless
+        gate "never" { field "status" "resource/never" "is" "ready" }
+      }"#,
+            "cancelled-round",
+        );
+        for _ in 0..10 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let current = store.mission_run(&run.id).unwrap().unwrap();
+        let round = store
+            .mission_run(&store.mission_run_subject_for_idempotency_key(&format!(
+                "loop-round:{}:1",
+                current.steps[0].subject
+            )))
+            .unwrap()
+            .unwrap();
+        store
+            .set_mission_run_state(
+                &round.id,
+                "cancelled",
+                "terminal",
+                Some("cancelled by test"),
+            )
+            .unwrap();
+        for _ in 0..10 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let stopped = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(stopped.steps[0].status, "cancelled");
+        // The requester is not a person, so the operator is asked.
+        let items = store.attention_items(Some("person/operator")).unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        for expected in [
+            "stopped in round 1: the loop round mission had a structural failure.",
+            "st cannot retry a cancelled step.",
+            "`st missions start stopping`",
+        ] {
+            assert!(items[0].detail.contains(expected), "{}", items[0].detail);
+        }
     }
 
     #[test]
@@ -19392,7 +19749,9 @@ observer "repo" {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "A GitHub rate limit outlasted its reset");
         assert!(
-            items[0].detail.contains("`st doctor`"),
+            items[0]
+                .detail
+                .contains(&format!("`st doctor` on {}", store.origin())),
             "{}",
             items[0].detail
         );
@@ -19526,6 +19885,91 @@ observer "repo" {
                 .status,
             "resolved"
         );
+    }
+
+    #[test]
+    fn low_disk_space_raises_one_host_item_until_the_space_recovers() {
+        const GIB: u64 = 1 << 30;
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let available = Arc::new(Mutex::new(GIB));
+        let reading = available.clone();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_disk_probe(
+            vec![PathBuf::from("/state"), PathBuf::from("/missing")],
+            Arc::new(move |path: &Path| {
+                if path != Path::new("/state") {
+                    return Err(std::io::ErrorKind::NotFound.into());
+                }
+                Ok(crate::disk::DiskSpace {
+                    filesystem: 7,
+                    available: *reading.lock().unwrap(),
+                    total: 100 * GIB,
+                })
+            }),
+        );
+        let set = |bytes: u64| *available.lock().unwrap() = bytes;
+        let items = || {
+            store
+                .attention_items(Some("person/operator"))
+                .unwrap()
+                .into_iter()
+                .filter(|item| item.title == "Disk space is low on node")
+                .collect::<Vec<_>>()
+        };
+
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let first = items();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].targets, vec!["daemon/node".to_owned()]);
+        for expected in [
+            "On node, `/state` has 1.0 GiB of 100.0 GiB free (1.0%).",
+            "`cargo clean`",
+            "`st doctor`",
+            "closes once each filesystem has 4 GiB and 4% free",
+        ] {
+            assert!(first[0].detail.contains(expected), "{}", first[0].detail);
+        }
+
+        // Between low and recovered the item stays open.
+        set(3 * GIB);
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(items().len(), 1);
+
+        set(10 * GIB);
+        reconciler.reconcile_once().unwrap();
+        assert!(items().is_empty());
+        let closed = store.attention_request(&first[0].subject).unwrap().unwrap();
+        assert_eq!(closed.status, "resolved");
+
+        // A new episode raises a new item. A person who closes it early is not asked again
+        // while the space stays low.
+        set(GIB);
+        reconciler.reconcile_once().unwrap();
+        let second = items();
+        assert_eq!(second.len(), 1);
+        assert_ne!(second[0].subject, first[0].subject);
+        store
+            .resolve_attention(
+                &second[0].subject,
+                &crate::model::AttentionResolveRequest {
+                    outcome: "dismissed".into(),
+                    reason: Some("cleaning up".into()),
+                    actor: "person/operator".into(),
+                    idempotency_key: "dismiss-disk".into(),
+                },
+            )
+            .unwrap();
+        for _ in 0..3 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert!(items().is_empty());
     }
 
     #[test]

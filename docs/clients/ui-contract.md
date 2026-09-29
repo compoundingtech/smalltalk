@@ -42,10 +42,18 @@ Agreed with Nathan on 2026-09-28. Every screen is judged by these.
 
 Mauve (`person`) means a person is needed. Nothing else may use it.
 
+## Header
+
+The header's right side names the host and person, led by the connection: `● live`, a spinner
+while connecting, `○ offline`, or a red `⚠ diverged` while the host's pages carry a `sync` notice
+in the `diverged` state (`World.diverged` lists those peers). A diverged host holds the same
+envelopes as a peer but projects a different graph from them, so what the client shows can be
+wrong until the host is repaired; exchanges cannot fix it.
+
 ## Tabs
 
-Home, Agents, Missions, Fleet, Worktrees. Worktrees shows invented data labelled **demo** until
-the graph has worktree resources, and must be hidden before a release.
+Home, Agents, Missions, Fleet. A Worktrees tab waits, hidden, until the graph has worktree
+resources: until then it could only show invented data.
 
 ### Home: what needs you
 
