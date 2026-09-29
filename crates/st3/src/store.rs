@@ -1724,6 +1724,81 @@ impl Store {
             .collect()
     }
 
+    /// Ordered mission IDs for one bounded collection page. Selection and
+    /// history filtering happen in SQL before resource joins are hydrated.
+    pub fn mission_collection_ids(
+        &self,
+        history: bool,
+        offset: usize,
+        limit: usize,
+    ) -> Result<Vec<String>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "WITH ids AS (
+                SELECT mission_id FROM mission_definitions
+                UNION SELECT mission_id FROM mission_runs
+             ), run_states AS (
+                SELECT mission_id, SUM(status='running') AS running, SUM(status='standing') AS standing
+                FROM mission_runs GROUP BY mission_id
+             ), latest AS (
+                SELECT mission_id, status, updated_at_unix_ms,
+                       ROW_NUMBER() OVER (PARTITION BY mission_id ORDER BY created_at_unix_ms DESC, id DESC) AS rank
+                FROM mission_runs
+             )
+             SELECT ids.mission_id
+             FROM ids
+             LEFT JOIN mission_definitions def ON def.mission_id=ids.mission_id
+             LEFT JOIN claims published ON published.id=def.claim_id
+             LEFT JOIN run_states ON run_states.mission_id=ids.mission_id
+             LEFT JOIN latest ON latest.mission_id=ids.mission_id AND latest.rank=1
+             WHERE (?1 OR ids.mission_id NOT LIKE '__st3/%')
+               AND (?1 OR CASE
+                   WHEN COALESCE(run_states.running,0)>0 THEN 'running'
+                   WHEN COALESCE(run_states.standing,0)>0 THEN 'standing'
+                   WHEN latest.status IS NOT NULL THEN latest.status
+                   ELSE def.state END NOT IN ('completed','failed','cancelled','retired'))
+             ORDER BY CAST(COALESCE(latest.updated_at_unix_ms,published.accepted_at_unix_ms) AS INTEGER) DESC,
+                      ids.mission_id ASC
+             LIMIT ?2 OFFSET ?3",
+        )?;
+        statement
+            .query_map(params![history, limit as i64, offset as i64], |row| {
+                row.get::<_, String>(0).map(|id| format!("mission/{id}"))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    pub fn mission_definitions_for_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<MissionDefinitionView>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let placeholders = vec!["?"; ids.len()].join(",");
+        let sql = format!(
+            "SELECT r.body, c.accepted_at_unix_ms FROM mission_definitions d
+             JOIN mission_revisions r ON r.mission_id=d.mission_id AND r.revision=d.revision
+             JOIN claims c ON c.id=d.claim_id WHERE d.mission_id IN ({placeholders})"
+        );
+        let bare = ids.iter().map(|id| id.trim_start_matches("mission/"));
+        let mut statement = connection.prepare(&sql)?;
+        statement
+            .query_map(rusqlite::params_from_iter(bare), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .map(|row| {
+                let (body, accepted) = row?;
+                Ok(MissionDefinitionView {
+                    mission: serde_json::from_str(&body)?,
+                    updated_at_unix_ms: accepted.parse()?,
+                })
+            })
+            .collect()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn create_planning_session(
         &self,
@@ -3700,14 +3775,94 @@ impl Store {
     /// Unlike `mission_runs`, this avoids per-step queue and loop history scans.
     pub fn mission_run_headers(&self) -> Result<Vec<MissionRunView>> {
         let connection = self.readers.get();
-        let mut statement =
-            connection.prepare("SELECT id FROM mission_runs ORDER BY created_at_unix_ms, id")?;
-        let ids = statement
-            .query_map([], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        ids.into_iter()
-            .map(|id| mission_run_header_tx(&connection, &id).map_err(Into::into))
-            .collect()
+        let mut statement = connection.prepare(MISSION_RUN_HEADER_SELECT)?;
+        statement
+            .query_map([], mission_run_header_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Current generation steps for all runs in two SQL scans. Collection reads
+    /// never hydrate each run and each step through their detail endpoints.
+    pub fn mission_run_summaries(&self) -> Result<Vec<MissionRunView>> {
+        self.mission_run_summaries_for_ids(None)
+    }
+
+    pub fn mission_run_summaries_for_missions(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<MissionRunView>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.mission_run_summaries_for_ids(Some(ids))
+    }
+
+    fn mission_run_summaries_for_ids(&self, ids: Option<&[String]>) -> Result<Vec<MissionRunView>> {
+        let connection = self.readers.get();
+        let placeholders = ids.map(|ids| vec!["?"; ids.len()].join(","));
+        let sql = placeholders.as_ref().map(|placeholders| MISSION_RUN_HEADER_SELECT.replace(
+            "ORDER BY mission_runs.created_at_unix_ms, mission_runs.id",
+            &format!("WHERE mission_runs.mission_id IN ({placeholders}) ORDER BY mission_runs.created_at_unix_ms, mission_runs.id"),
+        )).unwrap_or_else(|| MISSION_RUN_HEADER_SELECT.to_owned());
+        let mut headers = connection
+            .prepare(&sql)?
+            .query_map(
+                rusqlite::params_from_iter(
+                    ids.into_iter()
+                        .flatten()
+                        .map(|id| id.trim_start_matches("mission/")),
+                ),
+                mission_run_header_from_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let by_generation = headers
+            .iter()
+            .enumerate()
+            .map(|(index, run)| (run.generation.clone(), index))
+            .collect::<BTreeMap<_, _>>();
+        let steps_sql = format!(
+            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                    lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints,
+                    generation_id
+             FROM step_runs {} ORDER BY created_at_unix_ms, step_path",
+            placeholders.as_ref().map(|p| format!("WHERE generation_id IN (SELECT current_generation_id FROM mission_runs WHERE mission_id IN ({p}))")).unwrap_or_default(),
+        );
+        let mut steps = connection.prepare(&steps_sql)?;
+        for row in steps.query_map(
+            rusqlite::params_from_iter(
+                ids.into_iter()
+                    .flatten()
+                    .map(|id| id.trim_start_matches("mission/")),
+            ),
+            |row| {
+                let step = step_run_from_row(row)?;
+                let generation: String = row.get(21)?;
+                Ok((generation, step))
+            },
+        )? {
+            let (generation, step) = row?;
+            if let Some(index) = by_generation.get(&format!("run-generation/{generation}")) {
+                headers[*index].steps.push(step);
+            }
+        }
+        Ok(headers)
+    }
+
+    pub fn mission_run_state_times(&self) -> Result<BTreeMap<String, u128>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, accepted_at_unix_ms FROM claims
+             WHERE kind='mission-run.state' ORDER BY store_index",
+        )?;
+        let mut times = BTreeMap::new();
+        for row in statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (subject, at) = row?;
+            times.insert(subject, at.parse().unwrap_or_default());
+        }
+        Ok(times)
     }
 
     pub fn active_mission_runs_for_origin(&self, origin: &str) -> Result<Vec<MissionRunView>> {
@@ -26209,11 +26364,7 @@ fn mission_run_view_with_enrichment_tx(
     Ok(view)
 }
 
-fn mission_run_header_tx(
-    connection: &Connection,
-    run_id: &str,
-) -> rusqlite::Result<MissionRunView> {
-    connection.query_row(
+const MISSION_RUN_HEADER_SELECT: &str =
         "SELECT mission_runs.id, mission_runs.mission_id, mission_runs.initial_revision,
                 mission_runs.current_generation_id, run_generations.revision,
                 mission_runs.root_revision, mission_runs.root_run_id, mission_runs.parent_step_run,
@@ -26225,41 +26376,50 @@ fn mission_run_header_tx(
            ON run_generations.id=mission_runs.current_generation_id
          LEFT JOIN mission_run_deadlines ON mission_run_deadlines.run_id=mission_runs.id
          LEFT JOIN mission_run_after ON mission_run_after.run_id=mission_runs.id
-         WHERE mission_runs.id=?1",
-        [run_id],
-        |row| {
-            let id: String = row.get(0)?;
-            let generation_id: String = row.get(3)?;
-            let root_run_id: String = row.get(6)?;
-            let deadline: Option<String> = row.get(13)?;
-            let created: String = row.get(16)?;
-            let updated: String = row.get(17)?;
-            Ok(MissionRunView {
-                subject: format!("mission-run/{id}"),
-                id,
-                mission: format!("mission/{}", row.get::<_, String>(1)?),
-                generation: format!("run-generation/{generation_id}"),
-                initial_revision: row.get(2)?,
-                revision: row.get(4)?,
-                root_revision: row.get(5)?,
-                root_mission_run: format!("mission-run/{root_run_id}"),
-                parent_step_run: row.get(7)?,
-                workspace: row.get(8)?,
-                requester: row.get(9)?,
-                inputs: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
-                mode: row.get(11)?,
-                timeout_ms: row.get(12)?,
-                deadline_at_unix_ms: deadline.and_then(|value| value.parse().ok()),
-                after: row.get(18)?,
-                status: row.get(14)?,
-                phase: row.get(15)?,
-                created_at_unix_ms: created.parse().unwrap_or(0),
-                updated_at_unix_ms: updated.parse().unwrap_or(0),
-                steps: Vec::new(),
-                loops: Vec::new(),
-            })
-        },
-    )
+         ORDER BY mission_runs.created_at_unix_ms, mission_runs.id";
+
+fn mission_run_header_tx(
+    connection: &Connection,
+    run_id: &str,
+) -> rusqlite::Result<MissionRunView> {
+    let query = MISSION_RUN_HEADER_SELECT.replace(
+        "ORDER BY mission_runs.created_at_unix_ms, mission_runs.id",
+        "WHERE mission_runs.id=?1",
+    );
+    connection.query_row(&query, [run_id], mission_run_header_from_row)
+}
+
+fn mission_run_header_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MissionRunView> {
+    let id: String = row.get(0)?;
+    let generation_id: String = row.get(3)?;
+    let root_run_id: String = row.get(6)?;
+    let deadline: Option<String> = row.get(13)?;
+    let created: String = row.get(16)?;
+    let updated: String = row.get(17)?;
+    Ok(MissionRunView {
+        subject: format!("mission-run/{id}"),
+        id,
+        mission: format!("mission/{}", row.get::<_, String>(1)?),
+        generation: format!("run-generation/{generation_id}"),
+        initial_revision: row.get(2)?,
+        revision: row.get(4)?,
+        root_revision: row.get(5)?,
+        root_mission_run: format!("mission-run/{root_run_id}"),
+        parent_step_run: row.get(7)?,
+        workspace: row.get(8)?,
+        requester: row.get(9)?,
+        inputs: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
+        mode: row.get(11)?,
+        timeout_ms: row.get(12)?,
+        deadline_at_unix_ms: deadline.and_then(|value| value.parse().ok()),
+        after: row.get(18)?,
+        status: row.get(14)?,
+        phase: row.get(15)?,
+        created_at_unix_ms: created.parse().unwrap_or(0),
+        updated_at_unix_ms: updated.parse().unwrap_or(0),
+        steps: Vec::new(),
+        loops: Vec::new(),
+    })
 }
 
 fn loop_run_views_tx(
