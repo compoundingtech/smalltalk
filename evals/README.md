@@ -136,7 +136,7 @@ An eval can use a Claude judge for a specific reason. Record the choice in this 
 
 The graph owns planned work, assignment, dependencies, progress, products, and judgement state.
 
-An eval does not author a harness prompt. st3 supplies the normal boot contract.
+An eval does not author a harness prompt; st refuses one. A seat starts idle, and its work arrives as the message st posts when an assigned step is ready.
 
 Put mission work in goals and steps. Keep only stable repository facts in `AGENTS.md`, `CLAUDE.md`, or a persona file.
 

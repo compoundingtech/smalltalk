@@ -862,9 +862,13 @@ fn manual_pty_restart_preserves_every_st2_managed_environment_and_config_value()
     );
     let initial_pid = read_pid(&fx.task_pidfile("pty", identity)).unwrap();
 
+    // After the restart, `pty restart` attaches to the new session unless it runs inside
+    // another one, and a client with no input stays attached until the task exits, two
+    // minutes later. Run it as if from inside a session, as pty's own restart tests do.
     let restarted = Command::new("pty")
         .env_remove("ST2_TEST_AMBIENT_ONLY")
         .env("PTY_ROOT", &fx.pty_root)
+        .env("PTY_SESSION", "operator")
         .args(["restart", "-y", &session_id])
         .output()
         .unwrap();

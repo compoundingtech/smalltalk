@@ -35,7 +35,8 @@ host "local" {
 ```
 
 Include the host declaration in the mission candidate. Approval fails when the exact document is
-absent.
+absent. st writes no file for it: `st work claim` on that host prints each host document after the
+claimed step.
 
 ## Prepare a durable seat
 
@@ -54,10 +55,12 @@ agent "agents/example" {
 The stable subject is `agent/agents/example`. The host places the seat but does not become part of
 that slash-qualified identity.
 
-The harness prompt is optional. st generates `.st3/boot.md` and appends the required boot instruction.
+A harness block takes no `prompt` child; st refuses one with `harness-prompt-removed`. The seat
+starts idle and takes no turn until a person types or a message is posted.
 
 Put current work in separate finite mission steps assigned to this subject. Do not put it in the
-boot file, host document, or harness prompt.
+host document. When a step assigned to the seat becomes ready, st posts the seat a message that
+names it.
 
 Publish exact authored seat KDL without creating a planner session:
 
@@ -90,7 +93,7 @@ Run the `agent-migration-rehearsal` eval before a live cutover. The eval uses a 
 The rehearsal proves these facts:
 
 - the exact host document exists;
-- the runtime renders the canonical boot file;
+- the seat starts with no startup prompt, and the runtime writes no `.st3` directory;
 - an agent claims and completes normal graph work;
 - mission cleanup stops the test agent.
 
@@ -111,7 +114,7 @@ st missions start work/example \
   --follow
 ```
 
-Verify the exact mission run, agent subject, runtime incarnation, generated boot file, host document, and work queue.
+Verify the exact mission run, agent subject, runtime incarnation, host document, and work queue.
 
 The agent subject remains `agent/agents/example` across that mission and every later mission.
 

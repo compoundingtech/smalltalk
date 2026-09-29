@@ -4,5 +4,3 @@
 # exclude patterns (uncomment them if you want to use them):
 # *.[oa]
 # *~
-# st3 writes its runtime boot contract to .st3/ in every agent workspace.
-.st3/
