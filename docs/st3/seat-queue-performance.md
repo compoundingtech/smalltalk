@@ -791,7 +791,7 @@ cc -O2 -shared -fPIC -o trim.so scripts/st3-seat-queue-perf/trim.c
 PERF_DATA=$PWD/target/seat-queue-perf PERF_TRIM_SHIM=trim.so \
   scripts/st3-seat-queue-perf/startup /tmp/sqp.fix OUT 3 "base|BASE_ST3|" "branch|BRANCH_ST3|"
 ST3_PERF_STORE=/path/to/copy/claims.sqlite3 \
-  cargo test --release -p st3 --test seat_queue_perf -- --ignored --nocapture
+  cargo test --release -p st3 --test integration seat_queue_perf:: -- --ignored --nocapture
 scripts/st3-seat-queue-perf/traffic-test       # the generator keeps each seat on its schedule
 PERF_DATA=$PWD/target/seat-queue-perf PERF_WRITES_PER_MINUTE=6 \
   scripts/st3-seat-queue-perf/overnight BASE_ST3 BRANCH_ST3 /tmp/sqp.fix OUT 2026-01-01T11:20Z 5

@@ -5,7 +5,7 @@
 //! Needs `pty` on PATH (the runner lists pty sessions) — HARD failure if absent unless
 //! `ST2_ALLOW_PTY_SKIP` is set (a gate must not silently skip).
 
-mod support;
+use crate::support;
 
 use std::path::Path;
 use std::process::Command;
@@ -63,7 +63,8 @@ fn wait_for_file(path: &Path) {
 
 #[test]
 fn owned_test_child_group_dies_after_hard_parent_death() {
-    const TEST_NAME: &str = "owned_test_child_group_dies_after_hard_parent_death";
+    // Its name in the integration test binary, which this test runs again as the owner.
+    const TEST_NAME: &str = "eval_up::owned_test_child_group_dies_after_hard_parent_death";
     const ROLE: &str = "ST2_OWNED_CHILD_TEST_ROLE";
     const LEADER_PATH: &str = "ST2_OWNED_CHILD_TEST_LEADER";
     const DESCENDANT_PATH: &str = "ST2_OWNED_CHILD_TEST_DESCENDANT";

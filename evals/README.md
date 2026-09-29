@@ -166,7 +166,7 @@ Commit the report with the run evidence. Do not leave the only report in termina
 ```sh
 st2 eval ./evals/st2/license-mit
 st2 eval ./evals/st2/network-smoke
-cargo test -p st3 --test examples
+cargo test -p st3 --test integration examples::
 ```
 
 st3 eval orchestration is exercised through repository integration controllers and is deliberately

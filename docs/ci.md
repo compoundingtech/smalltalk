@@ -5,17 +5,33 @@ The fleet CI definitions and trusted scripts live in
 as `smalltalk-ci-*.kdl` and `smalltalk-ci*.sh`. The standing `st` mission observes
 same-repository pull request heads and pushes to `main`. Each run checks the exact observed
 commit. A pull request run merges that commit with the latest `main` in a temporary checkout
-before running `cargo test --workspace --locked` and
-`cargo clippy --workspace --all-targets --locked`. The workspace tests run
+before building the workspace tests and running them alongside Clippy, generated client checks,
+and fleet compatibility checks. The workspace tests run
 `scripts/check-public-repo`; the public GitHub Actions job runs the same script on every pull
 request and push to `main`. The scan covers repository content, including example fixtures, and
-rejects real host names, personal home paths, real person IDs, and internal fleet agent IDs. Linux also checks generated clients and
-runs the fleet compatibility test against the pinned older st3 baseline.
+rejects real host names, personal home paths, real person IDs, and internal fleet agent IDs.
 
-`st/ci` is the Linux result from example-linux and is the pull request merge check.
-`st/ci-macos` runs on ExampleMac for `main` commits. To request a macOS run on a
+On Linux, the workspace test build runs first and alone, without debug information. Then the
+tests, Clippy, the generated client check and the fleet compatibility test run side by side, and
+the run fails if any of them fails. The tests run under nextest, 8 at a time, with the tests
+that take a minute or more started first. A failed test is retried twice, 30 seconds apart, and
+one that passes on a retry is reported as flaky rather than failing the run.
+
+st2's catalog, supervisor and end-to-end tests cover st2 code that st3 does not use: the
+`agent_author`, `catalog*`, `eval_run`, `resync` and `resource_profile_supervisor` modules and
+the `catalog_*`, `nomad_survival`, `event_e2e`, `eval_run_e2e`, `resync*`,
+`supervisor_auto_archive` and `resource_profile_supervisor_e2e` test files. A pull request skips
+them when every path it changes is st3's own code, clients or documents, one of the st2 modules
+st3 uses (driver, channels, hooks, messages, harness state and sessions), or another st2 test
+file. Any other change runs them, including `Cargo.lock`, the root `Cargo.toml`, shared test
+support and the shared crates. A run that skips them says "st2 catalog and supervisor tests not
+needed" in its `st/ci` description. `main` runs them once a day: the first `main` run after a day
+without a passing one.
+
+`st/ci` is the Linux result from the CI machine and is the pull request merge check.
+`st/ci-macos` runs on the macOS CI machine for `main` commits. To request a macOS run on a
 pull request, add the `macos-ci` label; the run starts after Linux succeeds.
-Linux runs use three host-local Cargo target lanes, while ExampleMac reuses one target
+Linux runs use two host-local Cargo target lanes, while macOS reuses one target
 directory. Each run isolates `HOME` and XDG directories. Forked pull requests
 are excluded before any code from them runs on these machines. GitHub Actions handles tags
 and forks.
@@ -48,16 +64,17 @@ one pull request at a time.
 The commit status description includes the mission run ID. On example-linux:
 
 ```sh
-st missions show mission-run/fleet/smalltalk/ci/run/RUN-ID
-st trace show mission-run/fleet/smalltalk/ci/run/RUN-ID
+st missions show mission-run/RUN-ID
+st trace show mission-run/RUN-ID
 ```
 
 The Linux checkout, summary and test logs are under
-`~/.local/state/st3/smalltalk-ci/runs/RUN-ID/`; the relevant files are
-`summary`, `logs/test.log`, `logs/test.time`, `logs/clippy.log`, and
-`logs/clippy.time`. On ExampleMac, the corresponding files are in the `macos/`
-subdirectory. A failed command's stderr is in its log. The summary records
-the measured elapsed time and final result. Use the run's source claim and
+`~/.local/state/st3/smalltalk-ci/runs/RUN-ID/`. Each step writes `logs/STEP.log` and
+`logs/STEP.time`; the steps are `components`, `hooks`, `build`, `test`, `clippy`, `codegen` and
+`fleet-compat`. On macOS, the corresponding files are in the `macos/`
+subdirectory. A failed command's stderr is in its log. The summary records whether st2's
+catalog and supervisor tests ran and why (`st2_rest=`), the failed steps (`failed=`), each step's
+seconds (`stages=`), the elapsed time and the final result. Use the run's source claim and
 head SHA to distinguish a current failure from a run superseded by a newer
 commit.
 

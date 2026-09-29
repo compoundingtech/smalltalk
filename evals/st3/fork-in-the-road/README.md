@@ -10,5 +10,5 @@ The graph stores each proposal revision and the final message receipt.
 
 The held-out gates check ownership, distinct designs, privacy analysis, Small Talk debate, graph products, and the final recommendation.
 
-Validate its graph contract with `cargo test -p st3 --test examples`; paid live orchestration uses
+Validate its graph contract with `cargo test -p st3 --test integration examples::`; paid live orchestration uses
 the repository's internal eval controller, not the public CLI.

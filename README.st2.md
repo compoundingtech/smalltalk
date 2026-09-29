@@ -547,7 +547,7 @@ forced kill, atomic binary replacement, adoption, a live-task heartbeat, and a d
 receipt:
 
 ```sh
-cargo test --test nomad_survival --all-features
+cargo test --test integration --all-features nomad_survival::
 ```
 
 ## Messages, DING, status, and context
@@ -704,7 +704,7 @@ both maintained hand-authored KDL examples in fresh Git workspaces, validates an
 twice, and verifies the help/doctor/native authoring surface without a predecessor transport binary:
 
 ```sh
-cargo test --test native_only --all-features
+cargo test --test integration --all-features native_only::
 ```
 
 Run the complete local gate with:
