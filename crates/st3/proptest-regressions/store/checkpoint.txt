@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc efa367bc3190840257f2cd0e08e69eef911169804aedf7551dd84d90d88d0a56 # shrinks to steps = [Renew(4, 26), Renew(14, 1)], late = Progress(1, 3), late_at = 0
+cc 53981fe26e3d6ecea20dac4308cd92ee4f8ab6ecaf0d12c070954a17e82da6f6 # shrinks to states = [Some("working"), Some("working"), Some("working"), Some("working"), Some("working"), Some("working"), Some("working"), Some("working"), Some("working"), Some("working"), Some("working")], late = Some("idle"), late_at = 0
