@@ -457,7 +457,7 @@
           "properties": {
             "kind": { "const": "mission" },
             "title": { "type": "string" },
-            "state": { "enum": ["draft", "ready", "running", "standing", "completed", "failed", "cancelled"] },
+            "state": { "enum": ["draft", "ready", "retired", "running", "standing", "completed", "failed", "cancelled"] },
             "mission_revision": { "$ref": "#/$defs/Revision" },
             "runs": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "run_details": { "type": "array", "items": { "$ref": "#/$defs/MissionRunSummary" } },
@@ -484,11 +484,24 @@
         "current_steps": { "type": "array", "items": { "type": "object", "required": ["id", "title", "state", "since"], "properties": { "id": { "$ref": "#/$defs/Id" }, "title": { "type": ["string", "null"] }, "assignee": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] }, "claimant": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] }, "state": { "type": "string" }, "since": { "$ref": "#/$defs/Timestamp" } } } },
         "must_act": { "enum": ["you", "agent", "system", "blocked", "nobody"] },
         "state_since": { "$ref": "#/$defs/Timestamp" },
+        "outcome": { "oneOf": [{ "$ref": "#/$defs/MissionRunOutcome" }, { "type": "null" }], "description": "The outcome a person or an authorized agent set after the run finished." },
         "last_progress": { "type": ["string", "null"] },
         "blocker": { "type": ["object", "null"] },
         "after": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
         "deadline": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
         "steps": { "oneOf": [{ "type": "array", "items": { "$ref": "#/$defs/MissionStep" } }, { "type": "null" }], "description": "The run's steps: for an open run or a mission's latest run, and for every run in a mission detail read." }
+      }
+    },
+    "MissionRunOutcome": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "reason", "actor", "at"],
+      "properties": {
+        "status": { "enum": ["completed", "failed", "cancelled"] },
+        "previous_status": { "type": ["string", "null"] },
+        "reason": { "type": "string" },
+        "actor": { "$ref": "#/$defs/Id" },
+        "at": { "$ref": "#/$defs/Timestamp" }
       }
     },
     "MissionStep": {

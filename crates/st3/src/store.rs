@@ -22,18 +22,19 @@ use crate::model::{
     ClaimsPage, ContextUsage, DependencySpec, DesiredSubject, DocumentVersion, EventRecord,
     HumanReviewView, IntentInput, LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS, MessageView,
     MissionDefinitionView, MissionInputKind, MissionOutputView, MissionResponse,
-    MissionRevisionOperation, MissionRunDeclaration, MissionRunInput, MissionRunRequest,
-    MissionRunView, MissionSpec, MissionState, NormalizedIntent, OperationalAnnotation,
-    OperationalRepairItem, OperationalRepairPlan, OperationalRepairResult, PlannedAction,
-    PlannerSpec, PlanningCandidateView, PlanningPreviewView, PlanningSessionDeclaration,
-    PlanningSessionView, PlanningVariantView, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId,
-    ReplicaRecordView, ReplicaRepairDeclaration, ReplicationExchange, ReplicationInventory,
-    ReplicationInventoryBucket, ReplicationPeerStatus, ReplicationPeerSync, ReplicationReceipt,
-    ReplicationStatus, ReplicationTimings, ResourceObservationOutcome, ResourceRefreshOperation,
-    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
-    RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus,
-    SubscriptionConditionSpec, SubscriptionRequestDecision, SubscriptionRequestView,
-    SubscriptionSpec, UsageSummary, WorkRequest, WorkSelector, WorkWakeView,
+    MissionRevisionOperation, MissionRunDeclaration, MissionRunInput, MissionRunOutcomeView,
+    MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent,
+    OperationalAnnotation, OperationalRepairItem, OperationalRepairPlan, OperationalRepairResult,
+    PlannedAction, PlannerSpec, PlanningCandidateView, PlanningPreviewView,
+    PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView, ReplicaBatch,
+    ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView, ReplicaRepairDeclaration,
+    ReplicationExchange, ReplicationInventory, ReplicationInventoryBucket, ReplicationPeerStatus,
+    ReplicationPeerSync, ReplicationReceipt, ReplicationStatus, ReplicationTimings,
+    ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover, RevisionProposalView,
+    RevisionSubmissionView, RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse,
+    StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
+    SubscriptionRequestDecision, SubscriptionRequestView, SubscriptionSpec, UsageSummary,
+    WorkRequest, WorkSelector, WorkWakeView,
 };
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
@@ -810,6 +811,15 @@ pub struct StepLabel {
     pub goal: Option<String>,
     pub status: String,
     pub updated_at_unix_ms: u128,
+}
+
+/// A run's latest state claim: when it was accepted, the status it set, and the outcome
+/// someone set when it moved a finished run to another finished state.
+#[derive(Clone, Debug, Default)]
+pub struct MissionRunStateMoment {
+    pub since_unix_ms: u128,
+    pub status: Option<String>,
+    pub outcome: Option<MissionRunOutcomeView>,
 }
 
 pub struct Store {
@@ -3922,6 +3932,233 @@ impl Store {
         Ok(view)
     }
 
+    /// Set the outcome of a finished root run to `completed`, `failed` or `cancelled`. The run
+    /// and its steps stay as they ended; the new outcome, who set it and why are its latest
+    /// state claims, so every node and client shows the same outcome.
+    pub fn set_mission_run_outcome(
+        &self,
+        run: &str,
+        status: &str,
+        actor: &str,
+        reason: &str,
+        idempotency_key: &str,
+    ) -> Result<MissionRunView, St3Error> {
+        if let Some(response) = self
+            .cached_idempotency_response(idempotency_key)
+            .map_err(internal)?
+        {
+            return Ok(response);
+        }
+        if !is_terminal_run_state(status) {
+            return Err(St3Error::new(
+                "invalid-run-outcome",
+                format!("a run outcome is completed, failed or cancelled, not `{status}`"),
+            ));
+        }
+        let reason = reason.trim();
+        if reason.is_empty() {
+            return Err(St3Error::new(
+                "missing-outcome-reason",
+                "setting a run outcome needs a reason",
+            ));
+        }
+        let actor = normalize_actor(actor, "agent");
+        let run_id = run.strip_prefix("mission-run/").unwrap_or(run);
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction().map_err(internal)?;
+        let current = mission_run_header_tx(&transaction, run_id)
+            .optional()
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-mission-run",
+                    format!("mission run `mission-run/{run_id}` does not exist"),
+                )
+            })?;
+        if current.phase != "terminal" || !is_terminal_run_state(&current.status) {
+            return Err(St3Error::new(
+                "mission-run-not-finished",
+                format!(
+                    "mission run `{}` is {} in its {} phase; only a finished run takes an outcome, so cancel it with `st missions cancel` or let it finish",
+                    current.subject, current.status, current.phase
+                ),
+            ));
+        }
+        if current.parent_step_run.is_some() {
+            return Err(St3Error::new(
+                "child-run-outcome",
+                format!(
+                    "mission run `{}` is a child run; its outcome belongs to its parent step",
+                    current.subject
+                ),
+            ));
+        }
+        if current.mode == "eval" {
+            return Err(St3Error::new(
+                "eval-run-outcome",
+                format!(
+                    "mission run `{}` is an eval run and keeps its verdict",
+                    current.subject
+                ),
+            ));
+        }
+        if current.status == status {
+            return Err(St3Error::new(
+                "mission-run-outcome-unchanged",
+                format!("mission run `{}` is already {status}", current.subject),
+            ));
+        }
+        let now = now_ms();
+        let generation = generation_id_from_subject(&current.generation).to_owned();
+        transaction
+            .execute(
+                "UPDATE mission_runs SET status=?2, updated_at_unix_ms=?3 WHERE id=?1",
+                params![run_id, status, now.to_string()],
+            )
+            .map_err(internal)?;
+        transaction
+            .execute(
+                "UPDATE run_generations SET status=?2, updated_at_unix_ms=?3 WHERE id=?1",
+                params![generation, status, now.to_string()],
+            )
+            .map_err(internal)?;
+        // A terminal state that follows a terminal state is an outcome someone set; the
+        // reconciler never writes one.
+        append_claim_tx(
+            &transaction,
+            &self.origin,
+            &current.subject,
+            "mission-run.state",
+            Some(&actor),
+            &json!({"fields": {
+                "status": status,
+                "phase": "terminal",
+                "previous_phase": "terminal",
+                "reason": reason,
+            }}),
+            &[],
+            None,
+        )
+        .map_err(internal)?;
+        append_claim_tx(
+            &transaction,
+            &self.origin,
+            &current.generation,
+            "run-generation.state",
+            Some(&actor),
+            &json!({"fields": {"status": status, "phase": "terminal", "reason": reason}}),
+            &[],
+            None,
+        )
+        .map_err(internal)?;
+        let view = mission_run_view_tx(&transaction, run_id).map_err(internal)?;
+        transaction
+            .execute(
+                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
+                params![
+                    opaque_cache_key(idempotency_key),
+                    serde_json::to_string(&view).map_err(internal)?
+                ],
+            )
+            .map_err(internal)?;
+        transaction.commit().map_err(internal)?;
+        Ok(view)
+    }
+
+    /// Retire a published mission: publish its current definition again as `retired`, so it
+    /// leaves the mission lists and cannot start, while every revision and run stays in its
+    /// history. The publication names who retired it. Publishing a ready revision brings the
+    /// mission back.
+    pub fn retire_mission(
+        &self,
+        mission: &str,
+        actor: &str,
+        idempotency_key: &str,
+    ) -> Result<MissionSpec, St3Error> {
+        if let Some(response) = self
+            .cached_idempotency_response(idempotency_key)
+            .map_err(internal)?
+        {
+            return Ok(response);
+        }
+        let mission_id = mission.strip_prefix("mission/").unwrap_or(mission);
+        let actor = normalize_actor(actor, "agent");
+        let current = self
+            .mission_spec(mission_id, None)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                St3Error::new(
+                    "missing-mission",
+                    format!("mission `mission/{mission_id}` is not published"),
+                )
+            })?;
+        if current.state == MissionState::Retired {
+            return Err(St3Error::new(
+                "mission-already-retired",
+                format!("mission `mission/{mission_id}` is already retired"),
+            ));
+        }
+        let retired = crate::mission::retired_mission(current)?;
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction().map_err(internal)?;
+        let active = transaction
+            .query_row(
+                "SELECT id FROM mission_runs
+                 WHERE mission_id=?1 AND status IN ('running','standing','blocked')
+                 ORDER BY created_at_unix_ms, id LIMIT 1",
+                [mission_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        if let Some(run) = active {
+            return Err(St3Error::new(
+                "mission-has-active-run",
+                format!(
+                    "mission `mission/{mission_id}` has the active run `mission-run/{run}`; cancel it before retiring the mission"
+                ),
+            ));
+        }
+        let predecessors =
+            mission_definition_token_tx(&transaction, mission_id).map_err(internal)?;
+        let body = serde_json::to_value(&retired).map_err(internal)?;
+        let claim = append_claim_tx(
+            &transaction,
+            &self.origin,
+            &retired.subject,
+            "mission.published",
+            Some(&actor),
+            &body,
+            &predecessors,
+            None,
+        )
+        .map_err(internal)?;
+        transaction
+            .execute(
+                "INSERT OR IGNORE INTO mission_revisions(mission_id, revision, state, body, claim_id, created_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![retired.id, retired.revision, mission_state_name(&retired.state), serde_json::to_string(&retired).map_err(internal)?, claim.id, claim.store_index],
+            )
+            .map_err(internal)?;
+        transaction
+            .execute(
+                "INSERT INTO mission_definitions(mission_id, revision, state, claim_id) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(mission_id) DO UPDATE SET revision=excluded.revision, state=excluded.state, claim_id=excluded.claim_id",
+                params![retired.id, retired.revision, mission_state_name(&retired.state), claim.id],
+            )
+            .map_err(internal)?;
+        transaction
+            .execute(
+                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
+                params![
+                    opaque_cache_key(idempotency_key),
+                    serde_json::to_string(&retired).map_err(internal)?
+                ],
+            )
+            .map_err(internal)?;
+        transaction.commit().map_err(internal)?;
+        Ok(retired)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn adopt_mission_revision_inner(
         &self,
@@ -4360,20 +4597,57 @@ impl Store {
         Ok(headers)
     }
 
-    pub fn mission_run_state_times(&self) -> Result<BTreeMap<String, u128>> {
+    /// When each run entered its current state, and the outcome someone set on it, from its
+    /// state claims in canonical order, so every node that holds the same claims agrees.
+    pub fn mission_run_states(&self) -> Result<BTreeMap<String, MissionRunStateMoment>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT subject, accepted_at_unix_ms FROM claims
-             WHERE kind='mission-run.state' ORDER BY store_index",
-        )?;
-        let mut times = BTreeMap::new();
+        let mut statement = connection.prepare(&format!(
+            "SELECT claims.subject, claims.accepted_at_unix_ms, claims.actor,
+                    json_extract(claims.body, '$.fields.status'),
+                    json_extract(claims.body, '$.fields.phase'),
+                    json_extract(claims.body, '$.fields.previous_phase'),
+                    json_extract(claims.body, '$.fields.reason')
+             FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.kind='mission-run.state'
+             ORDER BY claims.subject, {CANONICAL_ORDER}"
+        ))?;
+        let mut states = BTreeMap::<String, MissionRunStateMoment>::new();
         for row in statement.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
+            ))
         })? {
-            let (subject, at) = row?;
-            times.insert(subject, at.parse().unwrap_or_default());
+            let (subject, at, actor, status, phase, previous_phase, reason) = row?;
+            let at = at.parse().unwrap_or_default();
+            let previous_status = states.get(&subject).and_then(|state| state.status.clone());
+            let outcome = (phase.as_deref() == Some("terminal")
+                && previous_phase.as_deref() == Some("terminal"))
+            .then(|| {
+                Some(MissionRunOutcomeView {
+                    status: status.clone()?,
+                    previous_status,
+                    reason: reason.unwrap_or_default(),
+                    actor: actor?,
+                    at_unix_ms: at,
+                })
+            })
+            .flatten();
+            states.insert(
+                subject,
+                MissionRunStateMoment {
+                    since_unix_ms: at,
+                    status,
+                    outcome,
+                },
+            );
         }
-        Ok(times)
+        Ok(states)
     }
 
     pub fn active_mission_runs_for_origin(&self, origin: &str) -> Result<Vec<MissionRunView>> {
@@ -27504,7 +27778,56 @@ fn mission_run_view_with_enrichment_tx(
         }
     }
     view.loops = loop_run_views_tx(connection, &view)?;
+    view.outcome = mission_run_outcome_tx(connection, &view)?;
     Ok(view)
+}
+
+/// The outcome someone set on a finished run: its latest state claim when that claim moved it
+/// from one terminal state to another, together with the state it replaced.
+fn mission_run_outcome_tx(
+    connection: &Connection,
+    run: &MissionRunView,
+) -> rusqlite::Result<Option<MissionRunOutcomeView>> {
+    if run.phase != "terminal" {
+        return Ok(None);
+    }
+    let mut statement = connection.prepare(&format!(
+        "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind='mission-run.state'
+         ORDER BY {CANONICAL_ORDER_DESC} LIMIT 2"
+    ))?;
+    let claims = statement
+        .query_map([&run.subject], claim_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    Ok(claims
+        .first()
+        .and_then(|latest| run_outcome_from_claim(latest, claims.get(1))))
+}
+
+fn run_outcome_from_claim(
+    claim: &ClaimRecord,
+    previous: Option<&ClaimRecord>,
+) -> Option<MissionRunOutcomeView> {
+    let fields = claim.body.get("fields").unwrap_or(&claim.body);
+    let text =
+        |fields: &Value, name: &str| fields.get(name).and_then(Value::as_str).map(str::to_owned);
+    if text(fields, "phase").as_deref() != Some("terminal")
+        || text(fields, "previous_phase").as_deref() != Some("terminal")
+    {
+        return None;
+    }
+    Some(MissionRunOutcomeView {
+        status: text(fields, "status")?,
+        previous_status: previous.and_then(|previous| {
+            text(
+                previous.body.get("fields").unwrap_or(&previous.body),
+                "status",
+            )
+        }),
+        reason: text(fields, "reason").unwrap_or_default(),
+        actor: claim.actor.clone()?,
+        at_unix_ms: claim.accepted_at_unix_ms,
+    })
 }
 
 const MISSION_RUN_HEADER_SELECT: &str =
@@ -27558,6 +27881,7 @@ fn mission_run_header_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Miss
         after: row.get(18)?,
         status: row.get(14)?,
         phase: row.get(15)?,
+        outcome: None,
         created_at_unix_ms: created.parse().unwrap_or(0),
         updated_at_unix_ms: updated.parse().unwrap_or(0),
         steps: Vec::new(),
@@ -37102,6 +37426,278 @@ mission "takeover" state="ready" {
                 .collect::<Vec<_>>()
         };
         assert_eq!(states(&replicated), states(&reopened));
+    }
+
+    #[test]
+    fn a_person_sets_the_outcome_of_a_finished_run_and_every_node_shows_it() {
+        let source = Store::open_memory("source").unwrap();
+        let failed = failed_takeover_run(&source, &["deploy-check"]);
+        let reason = "the deploy shipped after the check host came back";
+        let completed = source
+            .set_mission_run_outcome(
+                &failed.subject,
+                "completed",
+                "person/operator",
+                reason,
+                "outcome-completed",
+            )
+            .unwrap();
+        assert_eq!(
+            (completed.status.as_str(), completed.phase.as_str()),
+            ("completed", "terminal")
+        );
+        let outcome = completed
+            .outcome
+            .clone()
+            .expect("the run shows its outcome");
+        assert_eq!(outcome.status, "completed");
+        assert_eq!(outcome.previous_status.as_deref(), Some("failed"));
+        assert_eq!(outcome.actor, "person/operator");
+        assert_eq!(outcome.reason, reason);
+        assert_eq!(
+            takeover_step(&completed, "deploy-check").status,
+            "failed",
+            "the steps stay as they ended"
+        );
+        let claim = source
+            .latest_claim(&failed.subject, Some("mission-run.state"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(claim.actor.as_deref(), Some("person/operator"));
+        assert_eq!(outcome.at_unix_ms, claim.accepted_at_unix_ms);
+        let states = source.mission_run_states().unwrap();
+        assert_eq!(
+            states[&failed.subject].since_unix_ms,
+            claim.accepted_at_unix_ms
+        );
+        assert_eq!(states[&failed.subject].outcome.as_ref(), Some(&outcome));
+        assert_eq!(
+            source
+                .set_mission_run_outcome(
+                    &failed.subject,
+                    "completed",
+                    "person/operator",
+                    reason,
+                    "outcome-completed",
+                )
+                .unwrap()
+                .outcome,
+            Some(outcome.clone()),
+            "the same request is answered from its first result"
+        );
+
+        let target = Store::open_memory("target").unwrap();
+        target
+            .import_replication("source", &source.export_replication(0).unwrap())
+            .unwrap();
+        let replicated = target.mission_run(&failed.id).unwrap().unwrap();
+        assert_eq!(
+            (replicated.status.as_str(), replicated.phase.as_str()),
+            ("completed", "terminal")
+        );
+        assert_eq!(replicated.outcome, Some(outcome));
+        assert_eq!(
+            target.mission_run_states().unwrap()[&failed.subject].since_unix_ms,
+            claim.accepted_at_unix_ms
+        );
+
+        let rolled_back = source
+            .set_mission_run_outcome(
+                &failed.subject,
+                "failed",
+                "person/operator",
+                "the deploy was rolled back",
+                "outcome-failed",
+            )
+            .unwrap();
+        assert_eq!(rolled_back.status, "failed");
+        assert_eq!(
+            rolled_back
+                .outcome
+                .and_then(|outcome| outcome.previous_status),
+            Some("completed".into())
+        );
+    }
+
+    #[test]
+    fn only_a_finished_root_run_takes_a_different_outcome_with_a_reason() {
+        let store = Store::open_memory("node").unwrap();
+        publish_takeover(&store, TAKEOVER_SOURCE, "takeover-mission");
+        let running = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "takeover".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "running-takeover".into(),
+            })
+            .unwrap();
+        let refusal = |store: &Store, run: &str, status: &str, reason: &str, key: &str| {
+            store
+                .set_mission_run_outcome(run, status, "person/operator", reason, key)
+                .unwrap_err()
+                .code
+        };
+        assert_eq!(
+            refusal(&store, &running.subject, "completed", "done", "running"),
+            "mission-run-not-finished"
+        );
+        assert!(
+            store
+                .latest_claim(&running.subject, Some("mission-run.state"))
+                .unwrap()
+                .is_none()
+        );
+
+        let store = Store::open_memory("node").unwrap();
+        let failed = failed_takeover_run(&store, &["deploy-check"]);
+        assert_eq!(
+            refusal(
+                &store,
+                &failed.subject,
+                "running",
+                "reopen",
+                "running-state"
+            ),
+            "invalid-run-outcome"
+        );
+        assert_eq!(
+            refusal(&store, &failed.subject, "completed", "  ", "no-reason"),
+            "missing-outcome-reason"
+        );
+        assert_eq!(
+            refusal(&store, &failed.subject, "failed", "still failed", "same"),
+            "mission-run-outcome-unchanged"
+        );
+        assert_eq!(
+            refusal(
+                &store,
+                "mission-run/missing",
+                "completed",
+                "done",
+                "missing"
+            ),
+            "missing-mission-run"
+        );
+        let unchanged = store.mission_run(&failed.id).unwrap().unwrap();
+        assert_eq!(unchanged.status, "failed");
+        assert!(unchanged.outcome.is_none());
+    }
+
+    #[test]
+    fn a_retired_mission_leaves_the_lists_keeps_its_history_and_returns_when_published() {
+        let store = Store::open_memory("node").unwrap();
+        let ready = publish_takeover(&store, TAKEOVER_SOURCE, "takeover-mission");
+        let listed = |store: &Store, history: bool| {
+            store
+                .mission_collection_ids(history, 0, 50)
+                .unwrap()
+                .contains(&"mission/takeover".to_owned())
+        };
+        assert!(listed(&store, false));
+
+        let retired = store
+            .retire_mission("mission/takeover", "person/operator", "retire-takeover")
+            .unwrap();
+        assert_eq!(retired.state, MissionState::Retired);
+        assert_ne!(retired.revision, ready.revision);
+        assert!(!listed(&store, false), "a retired mission leaves the list");
+        assert!(listed(&store, true), "its history still lists it");
+        assert_eq!(
+            store
+                .mission_spec("takeover", Some(&ready.revision))
+                .unwrap()
+                .unwrap()
+                .state,
+            MissionState::Ready,
+            "the ready revision stays in the history"
+        );
+        let publication = store
+            .latest_claim("mission/takeover", Some("mission.published"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(publication.actor.as_deref(), Some("person/operator"));
+        assert!(
+            store
+                .create_mission_run(&MissionRunRequest {
+                    mission: "takeover".into(),
+                    revision: None,
+                    workspace: "/tmp".into(),
+                    requester: Some("person/requester".into()),
+                    mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: "retired-run".into(),
+                })
+                .is_err(),
+            "a retired mission does not start"
+        );
+        assert_eq!(
+            store
+                .retire_mission("mission/takeover", "person/operator", "retire-takeover")
+                .unwrap(),
+            retired,
+            "the same request is answered from its first result"
+        );
+        assert_eq!(
+            store
+                .retire_mission("takeover", "person/operator", "retire-again")
+                .unwrap_err()
+                .code,
+            "mission-already-retired"
+        );
+
+        let target = Store::open_memory("target").unwrap();
+        target
+            .import_replication("node", &store.export_replication(0).unwrap())
+            .unwrap();
+        assert_eq!(
+            target
+                .mission_spec("takeover", None)
+                .unwrap()
+                .unwrap()
+                .state,
+            MissionState::Retired
+        );
+        assert!(!listed(&target, false));
+
+        publish_takeover(&store, TAKEOVER_SOURCE, "takeover-mission-again");
+        assert_eq!(
+            store
+                .mission_spec("takeover", None)
+                .unwrap()
+                .unwrap()
+                .revision,
+            ready.revision
+        );
+        assert!(listed(&store, false), "publishing it again brings it back");
+    }
+
+    #[test]
+    fn a_mission_with_an_active_run_is_not_retired() {
+        let store = Store::open_memory("node").unwrap();
+        publish_takeover(&store, TAKEOVER_SOURCE, "takeover-mission");
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "takeover".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "active-takeover".into(),
+            })
+            .unwrap();
+        let refused = store
+            .retire_mission("takeover", "person/operator", "retire-active")
+            .unwrap_err();
+        assert_eq!(refused.code, "mission-has-active-run");
+        assert!(refused.message.contains(&run.subject));
+        assert_eq!(
+            store.mission_spec("takeover", None).unwrap().unwrap().state,
+            MissionState::Ready
+        );
     }
 
     #[test]

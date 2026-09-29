@@ -575,6 +575,9 @@ pub struct MissionRunSummary {
     pub current_steps: Vec<Value>,
     pub must_act: String,
     pub state_since: String,
+    /// The outcome a person or an authorized agent set after the run finished.
+    #[serde(default)]
+    pub outcome: Option<MissionRunOutcome>,
     pub last_progress: Option<String>,
     pub blocker: Option<Value>,
     pub after: Option<String>,
@@ -582,6 +585,15 @@ pub struct MissionRunSummary {
     /// The run's steps: for an open run or a mission's latest run, and every run in a detail read.
     #[serde(default)]
     pub steps: Option<Vec<MissionStep>>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MissionRunOutcome {
+    pub status: String,
+    #[serde(default)]
+    pub previous_status: Option<String>,
+    pub reason: String,
+    pub actor: String,
+    pub at: String,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct MissionStep {

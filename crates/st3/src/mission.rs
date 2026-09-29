@@ -2534,6 +2534,14 @@ fn parse_duration(value: &str) -> Result<u64, St3Error> {
     ))
 }
 
+/// The same mission definition in the `retired` state, with the revision that state gives it.
+pub fn retired_mission(mut mission: MissionSpec) -> Result<MissionSpec, St3Error> {
+    mission.state = MissionState::Retired;
+    mission.revision = String::new();
+    mission.revision = hash(&mission)?;
+    Ok(mission)
+}
+
 fn hash(value: &impl Serialize) -> Result<String, St3Error> {
     let bytes = serde_json::to_vec(value).map_err(internal)?;
     Ok(hex::encode(Sha256::digest(bytes)))
