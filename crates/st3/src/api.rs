@@ -1155,6 +1155,20 @@ fn client_work_resources(
         });
     }
     let desired = store.desired_subjects()?;
+    let work_subjects = work
+        .iter()
+        .map(|step| step.subject.as_str())
+        .collect::<BTreeSet<_>>();
+    let usage_subjects = desired
+        .iter()
+        .filter(|seat| {
+            seat.owner_step
+                .as_deref()
+                .is_some_and(|step| work_subjects.contains(step))
+        })
+        .map(|seat| seat.subject.clone())
+        .collect::<Vec<_>>();
+    let usage_summaries = store.usage_summaries_at(&usage_subjects, Some(snapshot_index))?;
     let mut step_specs = BTreeMap::<String, BTreeMap<String, crate::model::StepSpec>>::new();
     for run_id in work
         .iter()
@@ -1184,8 +1198,12 @@ fn client_work_resources(
                 "working" => "claimed",
                 other => other,
             };
-            let usage =
-                aggregate_usage_for_step(store, &desired, &work.subject, Some(snapshot_index))?;
+            let usage = aggregate_usage_values(
+                desired
+                    .iter()
+                    .filter(|seat| seat.owner_step.as_deref() == Some(work.subject.as_str()))
+                    .filter_map(|seat| usage_summaries.get(&seat.subject)),
+            );
             let gate_kind = if work.agentless {
                 let spec = step_specs
                     .get(&work.run)
@@ -1268,16 +1286,23 @@ fn client_work_resources(
         .collect()
 }
 
+#[cfg(test)]
 fn aggregate_usage<'a>(
     store: &Store,
     subjects: impl Iterator<Item = &'a str>,
     at_index: Option<u64>,
 ) -> anyhow::Result<Option<crate::model::UsageSummary>> {
+    let usages = subjects
+        .map(|subject| store.usage_summary_at(subject, None, at_index))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(aggregate_usage_values(usages.iter().flatten()))
+}
+
+fn aggregate_usage_values<'a>(
+    usages: impl Iterator<Item = &'a crate::model::UsageSummary>,
+) -> Option<crate::model::UsageSummary> {
     let mut aggregate = None::<crate::model::UsageSummary>;
-    for subject in subjects {
-        let Some(usage) = store.usage_summary_at(subject, None, at_index)? else {
-            continue;
-        };
+    for usage in usages {
         let total = aggregate.get_or_insert_with(|| crate::model::UsageSummary {
             aggregation: "cumulative-per-incarnation-else-response-deltas".into(),
             ..crate::model::UsageSummary::default()
@@ -1295,11 +1320,12 @@ fn aggregate_usage<'a>(
         if let Some(cost) = usage.cost {
             total.cost = Some(total.cost.unwrap_or_default() + cost);
         }
-        total.currency = total.currency.clone().or(usage.currency);
+        total.currency = total.currency.clone().or(usage.currency.clone());
     }
-    Ok(aggregate)
+    aggregate
 }
 
+#[cfg(test)]
 fn aggregate_usage_for_step(
     store: &Store,
     desired: &[crate::model::DesiredSubject],
@@ -1316,6 +1342,7 @@ fn aggregate_usage_for_step(
     )
 }
 
+#[cfg(test)]
 fn aggregate_usage_for_runs(
     store: &Store,
     desired: &[crate::model::DesiredSubject],

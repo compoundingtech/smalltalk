@@ -10196,19 +10196,6 @@ impl Store {
         incarnation: Option<&str>,
         at_index: Option<u64>,
     ) -> Result<Option<UsageSummary>> {
-        #[derive(Default)]
-        struct Spend {
-            cumulative: Option<CumulativeUsage>,
-            rollups: BTreeMap<String, (u64, u64, u64, u64, u64)>,
-            response_total: u64,
-            response_input: u64,
-            response_output: u64,
-            response_cached: u64,
-            response_cost: f64,
-            response_has_cost: bool,
-            response_currency: Option<String>,
-        }
-
         let connection = self.readers.get();
         let at_index = at_index.unwrap_or(i64::MAX as u64);
         let mut statement = connection.prepare(
@@ -10223,6 +10210,74 @@ impl Store {
                 row.get::<_, String>(2)?,
             ))
         })?;
+        Self::usage_summary_from_rows(rows, incarnation)
+    }
+
+    /// Fetch usage for a bounded resource page with one SQL read per SQLite
+    /// parameter chunk, then apply the same reduction as a detail read.
+    pub fn usage_summaries_at(
+        &self,
+        subjects: &[String],
+        at_index: Option<u64>,
+    ) -> Result<BTreeMap<String, UsageSummary>> {
+        let connection = self.readers.get();
+        let mut grouped = BTreeMap::<String, Vec<rusqlite::Result<(u64, String, String)>>>::new();
+        for chunk in subjects.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT subject, store_index, body, accepted_at_unix_ms FROM claims
+                 WHERE kind='harness.usage' AND store_index<={} AND subject IN ({placeholders})
+                 ORDER BY subject, store_index",
+                at_index.unwrap_or(i64::MAX as u64)
+            );
+            let mut statement = connection.prepare(&sql)?;
+            for row in statement.query_map(rusqlite::params_from_iter(chunk), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })? {
+                let (subject, index, body, accepted) = row?;
+                grouped
+                    .entry(subject)
+                    .or_default()
+                    .push(Ok((index, body, accepted)));
+            }
+        }
+        let mut summaries = BTreeMap::new();
+        for (subject, rows) in grouped {
+            if let Some(summary) = Self::usage_summary_from_rows(rows, None)? {
+                summaries.insert(subject, summary);
+            }
+        }
+        Ok(summaries)
+    }
+
+    fn usage_summary_from_rows<I>(
+        rows: I,
+        incarnation: Option<&str>,
+    ) -> Result<Option<UsageSummary>>
+    where
+        I: IntoIterator<Item = rusqlite::Result<(u64, String, String)>>,
+    {
+        #[derive(Default)]
+        struct Spend {
+            cumulative: Option<CumulativeUsage>,
+            rollups: BTreeMap<String, (u64, u64, u64, u64, u64)>,
+            response_total: u64,
+            response_input: u64,
+            response_output: u64,
+            response_cached: u64,
+            response_cost: f64,
+            response_has_cost: bool,
+            response_currency: Option<String>,
+        }
+
         let mut spend = BTreeMap::<String, Spend>::new();
         let mut context = None::<(u64, ContextUsage)>;
         let mut saw = false;
@@ -38866,6 +38921,11 @@ message "human-attention" {
             .usage_summary_at(subject, None, None)
             .unwrap()
             .unwrap();
+        let batch = store
+            .usage_summaries_at(&[subject.into(), "agent/missing".into()], None)
+            .unwrap();
+        assert_eq!(batch.get(subject), Some(&usage));
+        assert!(!batch.contains_key("agent/missing"));
         assert_eq!(usage.total_tokens, 200);
         assert_eq!(usage.incarnation_count, 2);
         assert_eq!(usage.context.unwrap().used_tokens, Some(999));

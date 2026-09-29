@@ -673,6 +673,21 @@ fn mission_resources_filtered(
         missions.entry(mission.clone()).or_default();
     }
     let desired = store.desired_subjects()?;
+    let page_runs = missions
+        .values()
+        .flatten()
+        .map(|run| run.subject.as_str())
+        .collect::<BTreeSet<_>>();
+    let usage_subjects = desired
+        .iter()
+        .filter(|seat| {
+            seat.owner_run
+                .as_deref()
+                .is_some_and(|run| page_runs.contains(run))
+        })
+        .map(|seat| seat.subject.clone())
+        .collect::<Vec<_>>();
+    let usage_summaries = store.usage_summaries_at(&usage_subjects, Some(snapshot_index))?;
     let state_times = store.mission_run_state_times()?;
     let mut values = missions
         .into_iter()
@@ -816,7 +831,16 @@ fn mission_resources_filtered(
                 .into_iter()
                 .find(|kind| run_details.iter().any(|run| run["must_act"] == *kind))
                 .unwrap_or("nobody");
-            let usage = aggregate_usage_for_runs(store, &desired, &run_ids, Some(snapshot_index))?;
+            let usage = aggregate_usage_values(
+                desired
+                    .iter()
+                    .filter(|seat| {
+                        seat.owner_run
+                            .as_deref()
+                            .is_some_and(|run| run_ids.contains(run))
+                    })
+                    .filter_map(|seat| usage_summaries.get(&seat.subject)),
+            );
             let revision = latest
                 .map(|run| run.revision.as_str())
                 .or_else(|| definition.map(|(definition, _)| definition.revision.as_str()))
