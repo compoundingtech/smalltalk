@@ -394,7 +394,7 @@ keeps clock skew out of authentication.
 
 ```text
 st fleet join [CODE | - | --code-file PATH | --fabric-inbox] [--name NAME] [--dial-out]
-              [--via auto|tailscale|fabric|URL] [--no-service] [--wait DURATION] [--as PERSON]
+              [--via auto|tailscale|fabric|URL] [--no-service] [--no-wait] [--as PERSON]
 ```
 
 With no `CODE`, `join` prompts for it without echo. `-` reads it from standard input.
@@ -429,10 +429,15 @@ continues from the last completed step:
 6. **Start.** Install or refresh the services (`--no-service` prints the two foreground commands
    instead). The daemon binds the store to the fleet ID and applies the writer floor before it
    writes anything. Checkpoint `started`.
-7. **Sync.** Wait until the sponsor reports this member up and the authority digests match, and
-   print progress (`received 12,480 envelopes; 3 exchanges left`). `--wait` defaults to 10
-   minutes. If it runs out, `join` says the machine is a member and still syncing, and exits 0.
-   Checkpoint `synced`.
+7. **Sync.** Wait for the first sync to end, and print progress (`first sync: 12,480 envelopes
+   so far; sponsor has 3,120 this node lacks`). It ends at the first exchange at which this
+   machine holds the same envelopes as a peer. That exchange also checks that both project the
+   same graph, and a difference heals at once (see
+   [Fleet replication](st3/replication.md#first-sync)). A first sync that still differs after
+   the heal fails `join` with both graph digests and the reason. The wait lasts up to 30 minutes;
+   if it runs out, `join` says the machine is a member and still syncing, and exits 0.
+   `--no-wait` returns once the services start. `st fleet wait [--timeout 30m]` waits for the
+   first sync later and fails if it failed.
 
 Until its first exchange brings the membership claims, the new member knows only the sponsor. It
 checks the sponsor's responses against the key from the handshake, which `join.json` keeps. It
