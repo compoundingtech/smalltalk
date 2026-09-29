@@ -44,6 +44,8 @@ use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
 mod checkpoint;
 mod checkpoint_agreement;
+#[cfg(test)]
+mod convergence;
 mod heal;
 mod lanes;
 
