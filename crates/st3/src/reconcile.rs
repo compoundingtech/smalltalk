@@ -18045,6 +18045,11 @@ mission "stopping" state="ready" {{
         assert_eq!(items.len(), 1, "{items:?}");
         assert_ne!(items[0].subject, first.subject);
         assert!(!items[0].targets.contains(&loop_run));
+        assert!(
+            items[0].detail.contains("stopped in round 4"),
+            "the retry ran the round the first item named: {}",
+            items[0].detail
+        );
     }
 
     #[test]
