@@ -59,26 +59,46 @@ function errorMessage(error: unknown): string {
   return code ? `${code}: ${message}` : message;
 }
 
+/** The app's foreground state, such as `ForegroundGate`. */
+export type Foreground = {
+  readonly active: boolean;
+  subscribe(listener: (active: boolean) => void): () => void;
+};
+
 // Follow one terminal without polling: read its current screen, attach, then hold one stream
 // open and show each screen the server sends. A dropped stream reattaches after a backoff and
-// resumes from the current screen. A new runtime incarnation (`stale-fence`) or a refused
-// request stops following, because only reopening the terminal can resolve it.
+// resumes from the current screen. Leaving the foreground closes the stream and schedules
+// nothing; returning reads the current screen and attaches again. A new runtime incarnation
+// (`stale-fence`) or a refused request stops following, because only reopening the terminal
+// can resolve it.
 export function followTerminal(
   client: Client,
   terminalId: string,
   handlers: TerminalFollowHandlers,
   newActionId: () => string,
+  foreground: Foreground,
   retryDelaysMs: readonly number[] = RETRY_DELAYS_MS,
 ): { close(): void } {
-  let closed = false, incarnation = '', failures = 0;
+  let closed = false, incarnation = '', failures = 0, attempt = 0;
   let stream: TerminalStream | undefined, timer: ReturnType<typeof setTimeout> | undefined;
 
-  function stop(issue: string) { closed = true; handlers.onIssue(issue); }
+  // Each open or suspension starts a new attempt, so work an older attempt still has in flight
+  // never shows a screen or keeps a stream.
+  function suspend() {
+    attempt++;
+    clearTimeout(timer);
+    timer = undefined;
+    const open = stream;
+    stream = undefined;
+    open?.close();
+  }
+  function stop(issue: string) { closed = true; suspend(); unsubscribe(); handlers.onIssue(issue); }
   function retry(error: unknown) {
     if (closed) return;
     const code = errorCode(error);
     if (code === 'stale-fence' || (error instanceof Error && error.message === TERMINAL_RESTARTED)) { stop(TERMINAL_RESTARTED); return; }
     if (code && code !== 'internal' && code !== 'remote-unavailable' && code !== 'rate-limited') { stop(errorMessage(error)); return; }
+    if (!foreground.active) return;
     const delay = retryDelaysMs[Math.min(failures, retryDelaysMs.length - 1)];
     failures++;
     handlers.onIssue(`Terminal stream interrupted; reconnecting (${errorMessage(error)}).`);
@@ -86,9 +106,12 @@ export function followTerminal(
   }
 
   async function open() {
+    suspend();
+    const current = attempt;
+    const stale = () => closed || current !== attempt;
     try {
       const screen = await client.terminalScreen(terminalId);
-      if (closed) return;
+      if (stale()) return;
       if (!incarnation) incarnation = screen.value.runtime_incarnation;
       if (screen.value.runtime_incarnation !== incarnation) throw new Error(TERMINAL_RESTARTED);
       handlers.onScreen(screen.value);
@@ -98,23 +121,33 @@ export function followTerminal(
       });
       const attachment = result.value.terminal_attachment;
       if (!attachment?.stream_capability) throw new Error('The gateway returned no terminal stream.');
-      if (closed) return;
-      stream = await client.terminalStream(terminalId, {
+      if (stale()) return;
+      const opened = await client.terminalStream(terminalId, {
         streamCapability: attachment.stream_capability,
         incarnation: attachment.runtime_incarnation,
         onScreen: next => {
-          if (closed) return;
-          if (next.value.runtime_incarnation !== incarnation) { stream?.close(); stop(TERMINAL_RESTARTED); return; }
+          if (stale()) return;
+          if (next.value.runtime_incarnation !== incarnation) { stop(TERMINAL_RESTARTED); return; }
           failures = 0;
           handlers.onIssue('');
           handlers.onScreen(next.value);
         },
-        onEnd: error => { stream = undefined; retry(error ?? new Error('The terminal stream closed.')); },
+        onEnd: error => {
+          if (stale()) return;
+          stream = undefined;
+          retry(error ?? new Error('The terminal stream closed.'));
+        },
       });
-      if (closed) stream.close();
-    } catch (error) { retry(error); }
+      if (stale()) opened.close();
+      else stream = opened;
+    } catch (error) { if (!stale()) retry(error); }
   }
 
-  void open();
-  return { close() { closed = true; clearTimeout(timer); stream?.close(); } };
+  const unsubscribe = foreground.subscribe(active => {
+    if (closed) return;
+    if (active) { failures = 0; void open(); }
+    else suspend();
+  });
+  if (foreground.active) void open();
+  return { close() { if (!closed) { closed = true; suspend(); unsubscribe(); } } };
 }

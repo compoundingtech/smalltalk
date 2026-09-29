@@ -95,6 +95,8 @@ enum Command {
     Up(UpArgs),
     /// Understand what needs action now.
     Now(NowArgs),
+    /// Show token spend over a period, with the largest spenders first.
+    Usage(UsageArgs),
     /// Inspect and control missions.
     Missions {
         #[command(subcommand)]
@@ -138,6 +140,11 @@ enum Command {
     },
     /// Check the daemon and runtime dependencies.
     Doctor(DoctorArgs),
+    /// Summarize git and gh command logs.
+    Recorder {
+        #[command(subcommand)]
+        command: RecorderCommand,
+    },
     /// Preview or apply bounded graph-authorized operational repairs.
     Repair {
         #[command(subcommand)]
@@ -1834,6 +1841,24 @@ struct NowArgs {
     limit: usize,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum UsageBy {
+    Agent,
+    Mission,
+    Model,
+    Host,
+}
+
+#[derive(Args)]
+struct UsageArgs {
+    /// Length of the period ending now.
+    #[arg(long, default_value_t = 24)]
+    hours: u64,
+    /// Show only this grouping; the default shows all four.
+    #[arg(long, value_enum)]
+    by: Option<UsageBy>,
+}
+
 #[derive(Args)]
 struct MachinesArgs {
     /// Include historical and discovered hosts beyond the current configured fleet.
@@ -1913,6 +1938,25 @@ enum TraceCommand {
 struct DoctorArgs {
     #[arg(long)]
     strict: bool,
+}
+
+#[derive(Subcommand)]
+enum RecorderCommand {
+    /// Summarize recent calls from local or supplied host logs.
+    Report(RecorderReportArgs),
+}
+
+#[derive(Args)]
+struct RecorderReportArgs {
+    /// Include calls from the last number of hours.
+    #[arg(long, default_value_t = 24)]
+    hours: u64,
+    /// Read this JSONL log. Repeat for logs copied from other hosts; defaults to this host's log.
+    #[arg(long = "log")]
+    logs: Vec<PathBuf>,
+    /// Number of slow calls to show.
+    #[arg(long, default_value_t = 10)]
+    top: usize,
 }
 
 #[derive(Subcommand)]
@@ -2758,6 +2802,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Up(_) => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
         Command::Now(args) => run_now(&endpoint, config.person.as_deref(), args, cli.json).await,
+        Command::Usage(args) => run_usage(&immediate, args, cli.json).await,
         Command::Launch { command } => {
             run_launch(&client, &endpoint, command, &config.planner, cli.json).await
         }
@@ -2804,6 +2849,7 @@ async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Command::Doctor(args) => run_doctor(&immediate, args, cli.json).await,
+        Command::Recorder { command } => run_recorder(command, &config, cli.json),
         Command::Repair { command } => run_repair(&client, command, cli.json).await,
         Command::Replication { command } => run_replication(&client, command, cli.json).await,
         Command::Fleet { command } => run_fleet(&endpoint, command, cli.json).await,
@@ -2922,6 +2968,37 @@ fn run_claude_channel(command: ClaudeChannelCommand) -> Result<()> {
             st2::claude_channel::install_st3_policy().map(|_| ())
         }
         ClaudeChannelCommand::UninstallPolicy => st2::claude_channel::uninstall_st3_policy(),
+    }
+}
+
+fn run_recorder(command: RecorderCommand, config: &Config, json_output: bool) -> Result<()> {
+    match command {
+        RecorderCommand::Report(args) => {
+            anyhow::ensure!(args.hours > 0, "--hours must be greater than zero");
+            let hours = i64::try_from(args.hours).context("--hours is too large")?;
+            let window = chrono::Duration::try_hours(hours).context("--hours is too large")?;
+            let until = chrono::Utc::now();
+            let since = until
+                .checked_sub_signed(window)
+                .context("--hours is too large")?;
+            let logs = if args.logs.is_empty() {
+                let local = st3::recorder::log_path(&config.state_dir)?;
+                if local.exists() {
+                    vec![local]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                args.logs
+            };
+            let report = st3::recorder_report::summarize(logs, since, until, args.top)?;
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", st3::recorder_report::render(&report));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -5065,6 +5142,77 @@ fn render_usage(usage: &st3_client::UsageSummary) -> String {
     }
 }
 
+async fn run_usage(client: &Client, args: UsageArgs, json_output: bool) -> Result<()> {
+    anyhow::ensure!(args.hours > 0, "usage hours must be positive");
+    let until = current_unix_ms()? as u64;
+    let since = until.saturating_sub(args.hours.saturating_mul(3_600_000));
+    let report: Value = client.get(&format!("/v1/usage?since_ms={since}&until_ms={until}")).await?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    print!("{}", render_usage_report(&report, args.hours, args.by));
+    Ok(())
+}
+
+fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let groups = only.map(|by| vec![by]).unwrap_or_else(|| {
+        vec![UsageBy::Agent, UsageBy::Mission, UsageBy::Model, UsageBy::Host]
+    });
+    for by in groups {
+        let mut totals = BTreeMap::<String, [u64; 5]>::new();
+        for row in report["rows"].as_array().into_iter().flatten() {
+            let dimension = match by {
+                UsageBy::Agent => "agent",
+                UsageBy::Mission => "mission_run",
+                UsageBy::Model => "model",
+                UsageBy::Host => "host",
+            };
+            let label = row[dimension]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("unknown");
+            let entry = totals.entry(label.to_owned()).or_default();
+            for (index, field) in [
+                "total_tokens",
+                "input_tokens",
+                "output_tokens",
+                "cache_write_tokens",
+                "cached_tokens",
+            ]
+            .iter()
+            .enumerate()
+            {
+                entry[index] = entry[index].saturating_add(row[*field].as_u64().unwrap_or(0));
+            }
+        }
+        let mut totals = totals.into_iter().collect::<Vec<_>>();
+        totals.sort_by(|left, right| right.1[0].cmp(&left.1[0]).then_with(|| left.0.cmp(&right.0)));
+        let by = match by {
+            UsageBy::Agent => "agent",
+            UsageBy::Mission => "mission",
+            UsageBy::Model => "model",
+            UsageBy::Host => "host",
+        };
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        let _ = writeln!(output, "USAGE  {} · {}h · by {by}", totals.len(), hours);
+        let _ = writeln!(output, "TOTAL  INPUT  OUTPUT  CACHE WRITE  CACHE READ  {by}");
+        for (name, values) in totals {
+            let _ = writeln!(
+                output,
+                "{}  {}  {}  {}  {}  {name}",
+                values[0], values[1], values[2], values[3], values[4]
+            );
+        }
+    }
+    output
+}
+
 fn print_activity_page(
     response: &ClientEnvelope<ClientEventPage>,
     json_output: bool,
@@ -5677,6 +5825,24 @@ async fn run_replication(
                     projection.error_message.as_deref().unwrap_or("")
                 );
             }
+            let timings = &status.timings;
+            println!(
+                "timings\t{} exchanges, {} envelopes received; ms: round-trip={} export={} snapshot={} receipt={} admission={} (verify={}) projection={} repair={} signing={} sqlite={} ({} commits, {} ms)",
+                timings.exchanges,
+                timings.envelopes_received,
+                timings.round_trip_ms,
+                timings.export_ms,
+                timings.snapshot_ms,
+                timings.receipt_ms,
+                timings.admission_ms,
+                timings.verify_ms,
+                timings.projection_ms,
+                timings.repair_ms,
+                timings.signing_ms,
+                timings.sqlite_ms,
+                timings.commits,
+                timings.commit_ms
+            );
             print!("{}", render_replication_peers(&status.peers, now_ms()));
             Ok(())
         }
@@ -6820,6 +6986,13 @@ fn render_client_agent(
     }
     if let Some(owner) = &agent.owner_run_id {
         let _ = writeln!(output, "MISSION      {owner}");
+    }
+    if let Some(usage) = &agent.usage {
+        let _ = writeln!(output, "USAGE        {}", render_usage(usage));
+        if usage.incarnation_count > 0 {
+            let _ = writeln!(output, "TOKENS       input {} · output {} · cache write {} · cache read {}",
+                usage.input_tokens, usage.output_tokens, usage.cache_write_tokens, usage.cached_tokens);
+        }
     }
     for current in &agent.current_work_ids {
         let _ = writeln!(output, "CURRENT WORK {current}");
@@ -9374,7 +9547,7 @@ fn timeline_claim_fields(
     operation: st2::harness_timeline::Operation,
     runtime_incarnation: &str,
 ) -> BTreeMap<String, Value> {
-    BTreeMap::from([
+    let mut fields = BTreeMap::from([
         (
             "operation".into(),
             Value::String(operation.operation.clone()),
@@ -9395,7 +9568,11 @@ fn timeline_claim_fields(
             "observed_at_unix_ms".into(),
             Value::from(operation.observed_at_unix_ms),
         ),
-    ])
+    ]);
+    if fields["entry_type"] == "usage" && let Some(source_id) = operation.source_id {
+        fields.insert("source_id".into(), Value::String(source_id));
+    }
+    fields
 }
 
 async fn publish_harness_state(
@@ -10206,11 +10383,12 @@ async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Resu
     let work: Vec<StepRunView> = client
         .get(&format!("/v1/work?actor={}", urlencoding::encode(subject)))
         .await?;
+    let mut failure = None;
     for step in work
         .into_iter()
         .filter(|step| work_claim_has_active_harness(step, subject, harness))
     {
-        let _: StepRunView = client
+        let renewed: Result<StepRunView> = client
             .post(
                 &format!("/v1/work/renew/{}", urlencoding::encode(&step.subject)),
                 &WorkRequest {
@@ -10222,9 +10400,31 @@ async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Resu
                     idempotency_key: format!("native-renew:{}:{subject}:{minute}", step.subject),
                 },
             )
-            .await?;
+            .await;
+        match renewed {
+            Ok(_) => {}
+            // The claim moved on between reading the work and renewing it. That step no longer
+            // needs this lease, and the driver's other steps still do.
+            Err(error) if renewal_lost_its_claim(&error) => {
+                let _ = write_driver_log(
+                    subject,
+                    &format!("skip renewing {}: {error:#}", step.subject),
+                );
+            }
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
     }
-    Ok(())
+    failure.map_or(Ok(()), Err)
+}
+
+/// Whether a renewal failed only because the step's claim ended or moved to another incarnation.
+fn renewal_lost_its_claim(error: &anyhow::Error) -> bool {
+    matches!(
+        st3::client::api_error_code(error),
+        Some("work-not-claimed" | "wrong-work-incarnation")
+    )
 }
 
 fn work_claim_has_active_harness(
@@ -10368,6 +10568,42 @@ async fn record_native_delivery_diagnostic(
     Ok(())
 }
 
+async fn report_unforwarded_message(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    transport: &str,
+    message: &str,
+    reason: &str,
+) -> Result<()> {
+    let _: ClaimRecord = client
+        .post(
+            "/v1/claims",
+            &ClaimInput {
+                subject: subject.into(),
+                kind: "harness.diagnostic".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("severity".into(), Value::String("warning".into())),
+                    ("status".into(), Value::String("degraded".into())),
+                    ("code".into(), Value::String("message-unforwarded".into())),
+                    (
+                        "reason".into(),
+                        Value::String(format!("{message} could not be forwarded: {reason}")),
+                    ),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!(
+                    "message-unforwarded:{subject}:{incarnation}:{transport}:{message}"
+                )),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn supervise_native_delivery(
     client: &Client,
@@ -10383,7 +10619,20 @@ async fn supervise_native_delivery(
         return;
     }
     match forward_projected_messages(client, subject, inbox, archive, transport, receipts).await {
-        Ok(()) => {
+        Ok(unforwarded) => {
+            // A message that cannot be forwarded is recorded once on its own and retried with the
+            // next poll. It never pauses delivery of the recipient's other messages.
+            for (message, reason) in unforwarded {
+                let _ = report_unforwarded_message(
+                    client,
+                    subject,
+                    incarnation,
+                    transport,
+                    &message,
+                    &reason,
+                )
+                .await;
+            }
             if supervisor.failures == 0 {
                 return;
             }
@@ -10457,6 +10706,8 @@ async fn supervise_native_delivery(
     }
 }
 
+/// Forward the recipient's queued messages into its native inbox. Each message is forwarded on
+/// its own; the ones that could not be forwarded are returned with their reasons.
 async fn forward_projected_messages(
     client: &Client,
     subject: &str,
@@ -10464,7 +10715,7 @@ async fn forward_projected_messages(
     archive: &Path,
     transport: &str,
     receipts: NativeDeliveryReceipts<'_>,
-) -> Result<()> {
+) -> Result<Vec<(String, String)>> {
     const TAG_PREFIX: &str = "st3-message:";
     let mut present = projected_message_files(inbox, archive)?;
     let mut consumed_by_recipient = BTreeSet::new();
@@ -10491,6 +10742,7 @@ async fn forward_projected_messages(
         } => st2::opencode_session::consumed_delivery_filenames(catalog_root, identity, runtime_id),
     }?;
     let mut cursor = None;
+    let mut failures = Vec::new();
     loop {
         let page = message_page(client, Some(subject), false, cursor.as_deref()).await?;
         for message in page.items {
@@ -10502,69 +10754,79 @@ async fn forward_projected_messages(
             if !matches!(message.status.as_str(), "sent" | "staged") {
                 continue;
             }
-            let filename = if let Some(filename) = present.get(&message.subject) {
-                filename.clone()
-            } else {
-                let content = if message.content.starts_with("doc/") {
-                    let value: Value = client
-                        .get(&format!(
-                            "/v1/documents/content?reference={}",
-                            urlencoding::encode(&message.content)
-                        ))
-                        .await?;
-                    let bytes = serde_json::from_value::<Vec<u8>>(
-                        value
-                            .get("bytes")
-                            .cloned()
-                            .context("document response lacks bytes")?,
-                    )?;
-                    String::from_utf8(bytes).context("message document is not UTF-8")?
+            // One message that cannot be forwarded, such as a document missing on this host, is
+            // reported without holding back the messages after it.
+            let message_subject = message.subject.clone();
+            let forwarded: Result<()> = async {
+                let filename = if let Some(filename) = present.get(&message.subject) {
+                    filename.clone()
                 } else {
-                    message.content.clone()
+                    let content = if message.content.starts_with("doc/") {
+                        let value: Value = client
+                            .get(&format!(
+                                "/v1/documents/content?reference={}",
+                                urlencoding::encode(&message.content)
+                            ))
+                            .await?;
+                        let bytes = serde_json::from_value::<Vec<u8>>(
+                            value
+                                .get("bytes")
+                                .cloned()
+                                .context("document response lacks bytes")?,
+                        )?;
+                        String::from_utf8(bytes).context("message document is not UTF-8")?
+                    } else {
+                        message.content.clone()
+                    };
+                    let mut tags = message.tags.clone();
+                    tags.push(format!("{TAG_PREFIX}{}", message.subject));
+                    tags.push(format!("{}{}", st2::ding::ST3_TO_TAG, message.to));
+                    tags.push(format!(
+                        "{}{}",
+                        st2::ding::ST3_SHA256_TAG,
+                        st2::ding::st3_body_sha256(&content)
+                    ));
+                    let filename = st2::message::send_to_inbox(
+                        inbox,
+                        &message.from,
+                        message.title.as_deref(),
+                        message.in_reply_to.as_deref(),
+                        &tags,
+                        &content,
+                    )?;
+                    present.insert(message.subject.clone(), filename.clone());
+                    filename
                 };
-                let mut tags = message.tags.clone();
-                tags.push(format!("{TAG_PREFIX}{}", message.subject));
-                tags.push(format!("{}{}", st2::ding::ST3_TO_TAG, message.to));
-                tags.push(format!(
-                    "{}{}",
-                    st2::ding::ST3_SHA256_TAG,
-                    st2::ding::st3_body_sha256(&content)
-                ));
-                let filename = st2::message::send_to_inbox(
-                    inbox,
-                    &message.from,
-                    message.title.as_deref(),
-                    message.in_reply_to.as_deref(),
-                    &tags,
-                    &content,
-                )?;
-                present.insert(message.subject.clone(), filename.clone());
-                filename
-            };
-            if message.status == "sent" {
-                stage_message(
+                if message.status == "sent" {
+                    stage_message(
+                        client,
+                        &message.subject,
+                        subject,
+                        transport,
+                        stage_runtime_id,
+                        format!("native-staged:{transport}:{subject}:{}", message.subject),
+                    )
+                    .await?;
+                }
+                // Receipt-backed transports advance graph delivery only after their durable ledger proves
+                // that the exact inbox file was consumed by a provider turn. Materialization alone is
+                // merely queued native delivery.
+                if !native_delivery_receipted(&consumed, &filename) {
+                    return Ok(());
+                }
+                deliver_message(
                     client,
                     &message.subject,
                     subject,
-                    transport,
-                    stage_runtime_id,
-                    format!("native-staged:{transport}:{subject}:{}", message.subject),
+                    format!("native-delivered:{transport}:{subject}:{}", message.subject),
                 )
                 .await?;
+                Ok(())
             }
-            // Receipt-backed transports advance graph delivery only after their durable ledger proves
-            // that the exact inbox file was consumed by a provider turn. Materialization alone is
-            // merely queued native delivery.
-            if !native_delivery_receipted(&consumed, &filename) {
-                continue;
+            .await;
+            if let Err(error) = forwarded {
+                failures.push((message_subject, format!("{error:#}")));
             }
-            deliver_message(
-                client,
-                &message.subject,
-                subject,
-                format!("native-delivered:{transport}:{subject}:{}", message.subject),
-            )
-            .await?;
         }
         match page.next_cursor {
             Some(next) => cursor = Some(next),
@@ -10592,7 +10854,7 @@ async fn forward_projected_messages(
         }
     }
     sync_consumed_projected_messages(inbox, archive, &consumed_by_recipient)?;
-    Ok(())
+    Ok(failures)
 }
 
 #[derive(Clone, Copy)]
@@ -10958,6 +11220,22 @@ mod tests {
                 command: MissionViewCommand::Tree
             }
         ));
+    }
+
+    #[test]
+    fn usage_report_ranks_each_fleet_group_by_spend() {
+        let report = json!({"rows": [
+            {"agent":"agent/small","mission_run":"mission-run/one","model":"model-a","host":"host/a","total_tokens":9,"input_tokens":2,"output_tokens":1,"cache_write_tokens":0,"cached_tokens":6},
+            {"agent":"agent/large","mission_run":"mission-run/two","model":"model-b","host":"host/b","total_tokens":30,"input_tokens":5,"output_tokens":2,"cache_write_tokens":3,"cached_tokens":20},
+            {"agent":"agent/large","mission_run":"mission-run/two","model":"model-b","host":"host/b","total_tokens":10,"input_tokens":2,"output_tokens":1,"cache_write_tokens":1,"cached_tokens":6},
+        ]});
+        let output = render_usage_report(&report, 24, None);
+        assert_eq!(output.matches("USAGE  ").count(), 4);
+        assert!(output.find("40  7  3  4  26  agent/large").unwrap()
+            < output.find("9  2  1  0  6  agent/small").unwrap());
+        assert!(output.contains("40  7  3  4  26  mission-run/two"));
+        assert!(output.contains("40  7  3  4  26  model-b"));
+        assert!(output.contains("40  7  3  4  26  host/b"));
     }
 
     #[test]
@@ -13757,6 +14035,122 @@ mission "review" state="ready" {
                 st2::ding::st3_body_sha256("FACT <b>QUARTZ</b>")
             )
         );
+    }
+
+    /// A renewal race, where the step's claim ended between reading the work and renewing it, is
+    /// not a reason to end the driver. Any other API error still is.
+    #[tokio::test]
+    async fn a_renewal_that_lost_its_claim_is_skipped_rather_than_ending_the_driver() {
+        use axum::{Router, http::StatusCode, response::IntoResponse as _, routing::post};
+
+        let app = Router::new()
+            .route(
+                "/v1/work/renew/step-run/lost",
+                post(|| async {
+                    (
+                        StatusCode::CONFLICT,
+                        axum::Json(serde_json::json!({
+                            "code": "work-not-claimed",
+                            "message": "the step is not claimed"
+                        })),
+                    )
+                        .into_response()
+                }),
+            )
+            .route(
+                "/v1/work/renew/step-run/broken",
+                post(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({
+                            "code": "internal",
+                            "message": "the store failed"
+                        })),
+                    )
+                        .into_response()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(Endpoint::Http(format!("http://{address}")));
+        let renew = |step: &'static str| {
+            let client = &client;
+            async move {
+                client
+                    .post::<_, Value>(
+                        &format!("/v1/work/renew/step-run/{step}"),
+                        &serde_json::json!({}),
+                    )
+                    .await
+                    .unwrap_err()
+            }
+        };
+        assert!(renewal_lost_its_claim(&renew("lost").await));
+        assert!(!renewal_lost_its_claim(&renew("broken").await));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn one_message_that_cannot_be_forwarded_does_not_hold_back_the_next() {
+        use axum::{Json, Router, routing::get};
+
+        let app = Router::new().route(
+            "/v1/messages/page",
+            get(|| async {
+                Json(serde_json::json!({
+                    "api_version": "st3.v1",
+                    "value": {
+                        "items": [
+                            {
+                                "subject": "message/missing", "from": "agent/sender",
+                                "to": "agent/test", "content": "doc/notes/missing@abc",
+                                "status": "staged", "created_index": 1
+                            },
+                            {
+                                "subject": "message/next", "from": "agent/sender",
+                                "to": "agent/test", "content": "the next message",
+                                "status": "staged", "created_index": 2
+                            }
+                        ],
+                        "has_more": false, "next_cursor": null, "limit": 100
+                    }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(Endpoint::Http(format!("http://{address}")));
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("inbox");
+        let archive = root.path().join("archive");
+
+        let unforwarded = forward_projected_messages(
+            &client,
+            "agent/test",
+            &inbox,
+            &archive,
+            "claude-channel",
+            NativeDeliveryReceipts::ClaudeChannel {
+                agent_dir: root.path(),
+                incarnation: "one",
+            },
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert_eq!(
+            unforwarded
+                .iter()
+                .map(|(message, _)| message.as_str())
+                .collect::<Vec<_>>(),
+            ["message/missing"]
+        );
+        let projected = st2::message::list_inbox(&inbox).unwrap();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].body, "the next message\n");
     }
 
     #[tokio::test]

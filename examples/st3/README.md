@@ -58,6 +58,7 @@ the setup.
 | Serve several missions from one seat, and reorder its queue | [`seat-queue.kdl`](seat-queue.kdl) |
 | Let an agent reorder another seat's queue (`queue-authority`) | [`seats/chief.kdl`](seats/chief.kdl) |
 | Run steps of one mission in a fixed order | [`queued-work.kdl`](queued-work.kdl) |
+| Start a fresh harness session for one step or every step a seat claims | [`fresh-context.kdl`](fresh-context.kdl) |
 | Run nested jobs one after another | [`queued-nested-work.kdl`](queued-nested-work.kdl) |
 | Delegate a step to an inline child mission with its own agent | [`nested-mission.kdl`](nested-mission.kdl) |
 | Fan work out to parallel mission-scoped seats, each in a worktree that st creates and removes (`checkout`) | [`fan-out.kdl`](fan-out.kdl) |
@@ -100,9 +101,9 @@ the setup.
 
 ## Gates that work
 
-Gates run through `sh -c` with a minimal environment and no login shell:
+Gates run through `sh -c` with the daemon's login environment and the command recorder first on `PATH`:
 
-- Use absolute binary paths, such as `/usr/bin/git`.
+- Call `git` by name so its calls appear in the recorder log.
 - `${NAME}` is an st variable; write shell variables as plain `$NAME`, or `$${NAME}` for braces.
 - A gate on files checks the committed, pushed tree, not an agent's working tree.
 - A gate result is cached by its definition and step attempt. A loop's `until` gate puts

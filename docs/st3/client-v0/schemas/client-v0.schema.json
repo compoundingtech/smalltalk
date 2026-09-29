@@ -48,6 +48,7 @@
         "value": {
           "oneOf": [
             { "$ref": "#/$defs/Capabilities" },
+            { "$ref": "#/$defs/DocumentContent" },
             { "$ref": "#/$defs/Page" },
             { "$ref": "#/$defs/Resource" },
             { "$ref": "#/$defs/TimelinePage" },
@@ -119,6 +120,14 @@
             "source_id": { "$ref": "#/$defs/Id" },
             "person_id": { "$ref": "#/$defs/Id" },
             "requester_id": { "$ref": "#/$defs/Id" },
+            "launch_id": { "$ref": "#/$defs/Id" },
+            "variant_id": { "$ref": "#/$defs/Id" },
+            "message_id": { "$ref": "#/$defs/Id" },
+            "preview_token": { "type": ["string", "null"] },
+            "preview": { "oneOf": [{ "$ref": "#/$defs/LaunchPreview" }, { "type": "null" }] },
+            "what": { "type": "string" },
+            "because": { "type": "string" },
+            "fix": { "type": "object" },
             "review_mode": { "enum": ["approve", "feedback"] },
             "mission_id": { "$ref": "#/$defs/Id" },
             "mission_run_id": { "$ref": "#/$defs/Id" },
@@ -143,6 +152,15 @@
         "id": { "$ref": "#/$defs/Id" },
         "state": { "type": "string" },
         "since": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "DocumentContent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference", "bytes"],
+      "properties": {
+        "reference": { "type": "string" },
+        "bytes": { "type": "array", "items": { "type": "integer", "minimum": 0, "maximum": 255 } }
       }
     },
     "Message": {
@@ -194,7 +212,9 @@
             "variants": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "decisions": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "approvals": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
-            "visualization": { "$ref": "#/$defs/Visualization" }
+            "visualization": { "$ref": "#/$defs/Visualization" },
+            "preview_token": { "type": ["string", "null"] },
+            "preview": { "oneOf": [{ "$ref": "#/$defs/LaunchPreview" }, { "type": "null" }] }
           }
         }
       ]
@@ -205,6 +225,19 @@
         "provider": { "enum": ["codex", "claude", "pi", "omp", "opencode"] },
         "model": { "type": "string", "minLength": 1 },
         "effort": { "type": "string", "minLength": 1 }
+      }
+    },
+    "LaunchPreview": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["goal", "steps", "agents", "gates", "diagnostics_count", "request_excerpt"],
+      "properties": {
+        "goal": { "type": "string" },
+        "steps": { "type": "array", "items": { "type": "object", "required": ["path", "title", "depends"], "properties": { "path": { "type": "string" }, "title": { "type": "string" }, "assignee": { "type": ["string", "null"] }, "depends": { "type": "array", "items": { "type": "string" } } } } },
+        "agents": { "type": "array", "items": { "type": "object", "required": ["id"], "properties": { "id": { "type": "string" }, "harness": {}, "host": { "type": ["string", "null"] }, "worktree": { "type": ["string", "null"] } } } },
+        "gates": { "type": "object", "required": ["human", "automated"], "properties": { "human": { "type": "integer" }, "automated": { "type": "integer" } } },
+        "diagnostics_count": { "type": "integer" },
+        "request_excerpt": { "type": "string" }
       }
     },
     "LaunchVariant": {
@@ -407,6 +440,7 @@
         "input_tokens": { "type": "integer", "minimum": 0 },
         "output_tokens": { "type": "integer", "minimum": 0 },
         "cached_tokens": { "type": "integer", "minimum": 0 },
+        "cache_write_tokens": { "type": "integer", "minimum": 0 },
         "cost": { "type": "number", "minimum": 0 },
         "currency": { "type": "string" },
         "incarnation_count": { "type": "integer", "minimum": 0 },
@@ -426,6 +460,8 @@
             "state": { "enum": ["draft", "ready", "running", "standing", "completed", "failed", "cancelled"] },
             "mission_revision": { "$ref": "#/$defs/Revision" },
             "runs": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+            "run_details": { "type": "array", "items": { "$ref": "#/$defs/MissionRunSummary" } },
+            "must_act": { "enum": ["you", "agent", "system", "blocked", "nobody"] },
             "active_runs": { "type": "integer", "minimum": 0 },
             "run_generations": { "type": "object", "additionalProperties": { "$ref": "#/$defs/Id" } },
             "visualization": { "$ref": "#/$defs/Visualization" },
@@ -433,6 +469,26 @@
           }
         }
       ]
+    },
+    "MissionRunSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "requester", "status", "phase", "progress", "current_steps", "must_act", "state_since"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "generation_id": { "$ref": "#/$defs/Id" },
+        "requester": { "$ref": "#/$defs/Id" },
+        "status": { "type": "string" },
+        "phase": { "type": "string" },
+        "progress": { "type": "object", "required": ["done", "total"], "properties": { "done": { "type": "integer" }, "total": { "type": "integer" } } },
+        "current_steps": { "type": "array", "items": { "type": "object", "required": ["id", "title", "state", "since"], "properties": { "id": { "$ref": "#/$defs/Id" }, "title": { "type": ["string", "null"] }, "assignee": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] }, "claimant": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] }, "state": { "type": "string" }, "since": { "$ref": "#/$defs/Timestamp" } } } },
+        "must_act": { "enum": ["you", "agent", "system", "blocked", "nobody"] },
+        "state_since": { "$ref": "#/$defs/Timestamp" },
+        "last_progress": { "type": ["string", "null"] },
+        "blocker": { "type": ["object", "null"] },
+        "after": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+        "deadline": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }
+      }
     },
     "Work": {
       "allOf": [
@@ -447,6 +503,9 @@
             "generation_id": { "$ref": "#/$defs/Id" },
             "definition_id": { "$ref": "#/$defs/Revision" },
             "path": { "type": "string" },
+            "title": { "type": ["string", "null"] },
+            "assigned_to": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+            "last_progress": { "type": ["string", "null"] },
             "state": { "enum": ["waiting", "ready", "claimed", "blocked", "verifying", "completed", "failed", "cancelled"] },
             "attempt": { "type": "integer", "minimum": 0 },
             "readiness_epoch": { "type": "integer", "minimum": 0 },
@@ -476,6 +535,9 @@
             "owner_run_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "driver": { "type": ["string", "null"] },
             "harness_state": { "type": ["string", "null"] },
+            "host_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+            "last_activity_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+            "silent_since": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
             "fault": { "type": ["string", "null"], "description": "Current member reconcile failure; cleared by a successful pass." },
             "incarnation_id": { "type": ["string", "null"] },
             "current_session_id": { "type": ["string", "null"] },
@@ -484,6 +546,7 @@
             "next_work_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "upcoming_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "queued_work_count": { "type": "integer", "minimum": 0 },
+            "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] },
             "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } }
           }
         }
@@ -864,6 +927,8 @@
         "input_tokens": { "type": "integer", "minimum": 0 },
         "output_tokens": { "type": "integer", "minimum": 0 },
         "cached_tokens": { "type": "integer", "minimum": 0 },
+        "cache_write_tokens": { "type": "integer", "minimum": 0 },
+        "turn_id": { "type": "string" },
         "total_tokens": { "type": "integer", "minimum": 0 },
         "context_used_tokens": { "type": "integer", "minimum": 0 },
         "context_window_tokens": { "type": "integer", "minimum": 0 },

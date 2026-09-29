@@ -8,6 +8,38 @@ const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
 const TERMINAL_CAPABILITY_PROTOCOL_PREFIX: &str = "st3.cap.";
 const LOCAL_PERSON_HEADER: &str = "x-st3-person";
 
+#[derive(Deserialize)]
+pub(super) struct ClientDocumentQuery {
+    name: String,
+}
+
+pub(super) async fn document_get(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<ClientDocumentQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let (name, hash) = query.name.rsplit_once('@').ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "invalid-document-reference",
+            "a document name needs `@HASH`",
+        ))
+    })?;
+    if name.is_empty() || hash.is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-document-reference",
+            "a document name needs `@HASH`",
+        )));
+    }
+    let store = state.store.clone();
+    let name = name.to_owned();
+    let hash = hash.to_owned();
+    let bytes = blocking_store(move || store.get_document(&name, &hash))
+        .await?
+        .ok_or_else(|| ApiError::not_found(format!("document `{}` is not stored", query.name)))?;
+    Ok(Json(json!({ "reference": query.name, "bytes": bytes })))
+}
+
 const ALL_SCOPES: &[&str] = &[
     "read.projections",
     "terminal.read",
@@ -407,6 +439,11 @@ fn mission_resources(
     history: bool,
     selected_id: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
+    let attention = store.attention_items(None)?;
+    let human_attention_runs = attention
+        .iter()
+        .filter_map(|item| item.mission_run.as_deref())
+        .collect::<BTreeSet<_>>();
     let mut missions = BTreeMap::<String, Vec<MissionRunView>>::new();
     for run in store.mission_run_headers()? {
         missions.entry(run.mission.clone()).or_default().push(run);
@@ -476,6 +513,94 @@ fn mission_resources(
                 .iter()
                 .filter(|run| !matches!(run.status.as_str(), "completed" | "failed" | "cancelled"))
                 .count();
+            let run_details = runs
+                .iter()
+                .map(|header| {
+                    let run = store
+                        .mission_run(&header.id)?
+                        .unwrap_or_else(|| header.clone());
+                    let done = run
+                        .steps
+                        .iter()
+                        .filter(|step| step.status == "completed")
+                        .count();
+                    let current_steps = run
+                        .steps
+                        .iter()
+                        .filter(|step| {
+                            matches!(
+                                step.status.as_str(),
+                                "ready" | "claimed" | "working" | "verifying" | "blocked"
+                            )
+                        })
+                        .map(|step| {
+                            json!({
+                                "id": step.subject,
+                                "title": step.title,
+                                "assignee": step.assigned_to,
+                                "claimant": step.claimant,
+                                "state": step.status,
+                                "since": client_timestamp(step.updated_at_unix_ms),
+                            })
+                        })
+                        .collect::<Vec<_>>();
+                    let last_progress = run
+                        .steps
+                        .iter()
+                        .filter_map(|step| {
+                            Some((step.progress_at_unix_ms?, step.progress_summary.as_ref()?))
+                        })
+                        .max_by_key(|(at, _)| *at)
+                        .map(|(_, summary)| summary.clone());
+                    let must_act =
+                        if matches!(run.status.as_str(), "completed" | "failed" | "cancelled") {
+                            "nobody"
+                        } else if human_attention_runs.contains(run.subject.as_str()) {
+                            "you"
+                        } else if run.steps.iter().any(|step| {
+                            matches!(step.status.as_str(), "ready" | "claimed" | "working")
+                                && (step.assigned_to.is_some()
+                                    || !step.available_to.is_empty()
+                                    || step.claimant.is_some())
+                        }) {
+                            "agent"
+                        } else if run.status == "blocked"
+                            || run.steps.iter().any(|step| step.status == "blocked")
+                        {
+                            "blocked"
+                        } else {
+                            "system"
+                        };
+                    let state_since = store
+                        .claims_for(&run.subject, Some("mission-run.state"))?
+                        .last()
+                        .map(|claim| claim.accepted_at_unix_ms)
+                        .unwrap_or(run.created_at_unix_ms);
+                    let blocker =
+                        run.steps.iter().find(|step| step.status == "blocked").map(
+                            |step| json!({"step": step.subject, "reason": step.blocked_reason}),
+                        );
+                    Ok::<Value, anyhow::Error>(json!({
+                        "id": run.subject,
+                        "generation_id": run.generation,
+                        "requester": run.requester,
+                        "status": run.status,
+                        "phase": run.phase,
+                        "progress": {"done": done, "total": run.steps.len()},
+                        "current_steps": current_steps,
+                        "must_act": must_act,
+                        "state_since": client_timestamp(state_since),
+                        "last_progress": last_progress,
+                        "blocker": blocker,
+                        "after": run.after,
+                        "deadline": run.deadline_at_unix_ms.map(client_timestamp),
+                    }))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            let must_act = ["you", "agent", "blocked", "system"]
+                .into_iter()
+                .find(|kind| run_details.iter().any(|run| run["must_act"] == *kind))
+                .unwrap_or("nobody");
             let usage = aggregate_usage_for_runs(store, &desired, &run_ids, Some(snapshot_index))?;
             let revision = latest
                 .map(|run| run.revision.as_str())
@@ -499,6 +624,8 @@ fn mission_resources(
                 "state": state,
                 "mission_revision": revision,
                 "runs": runs.into_iter().map(|run| run.subject).collect::<Vec<_>>(),
+                "run_details": run_details,
+                "must_act": must_act,
                 "active_runs": active_runs,
                 "run_generations": run_generations,
                 "visualization": visualization,
@@ -1333,7 +1460,7 @@ pub(super) async fn now(
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
     let mut items =
-        super::client_attention_resources(&state.store, person.as_deref(), query.history)
+        super::client_attention_resources_with_previews(&state, person.as_deref(), query.history)
             .map_err(ApiError::internal)?;
     // The default Now view is the person's attention queue. Mission work belongs
     // in Control; only an explicit work filter opts it into this combined view.
@@ -1351,16 +1478,7 @@ pub(super) async fn now(
         }
         items.extend(work);
     }
-    let priority = |item: &Value| match item["kind"].as_str() {
-        Some("attention") => 0,
-        Some("work") => 1,
-        _ => 2,
-    };
-    items.sort_by(|left, right| {
-        priority(left)
-            .cmp(&priority(right))
-            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
-    });
+    // Attention is already ranked by the daemon. Keep that order when work is included.
     client_page(&state, &snapshot, "now", items, &effective_query).map(Json)
 }
 
@@ -2030,7 +2148,7 @@ pub(super) fn timeline_value(
             if entry_type == "usage" {
                 body = normalized_timeline_usage_body(
                     body,
-                    &attribution,
+                    fields.get("attribution").unwrap_or(&attribution),
                     fields.get("driver").and_then(Value::as_str),
                 );
             }
@@ -2165,6 +2283,9 @@ pub(super) fn timeline_value(
             continue;
         }
         if claim.subject == owner && claim.kind == "harness.usage" {
+            if fields.get("semantics").and_then(Value::as_str) == Some("response_rollup") {
+                continue;
+            }
             if !applies_to_incarnation(fields) {
                 continue;
             }
@@ -4694,11 +4815,32 @@ async fn dispatch_action(
             let attention = state
                 .store
                 .attention_request(&target)
-                .map_err(ApiError::internal)?
-                .ok_or_else(|| {
-                    ApiError::not_found(format!("attention `{target}` does not exist"))
-                })?;
-            if attention.reviewer != *authority_actor {
+                .map_err(ApiError::internal)?;
+            let reviewer = if let Some(attention) = attention {
+                attention.reviewer
+            } else if target.starts_with("attention/subscription-failure-") {
+                state
+                    .store
+                    .attention_items(Some(authority_actor))
+                    .map_err(ApiError::internal)?
+                    .into_iter()
+                    .find(|item| item.subject == target)
+                    .map(|item| {
+                        if item.person.is_empty() {
+                            authority_actor.clone()
+                        } else {
+                            item.person
+                        }
+                    })
+                    .ok_or_else(|| {
+                        ApiError::not_found(format!("attention `{target}` does not exist"))
+                    })?
+            } else {
+                return Err(ApiError::not_found(format!(
+                    "attention `{target}` does not exist"
+                )));
+            };
+            if reviewer != *authority_actor {
                 return Err(forbidden(format!(
                     "attention `{target}` belongs to another person"
                 )));
@@ -5131,7 +5273,7 @@ async fn dispatch_action(
             let runtime_id = live.runtime_id.clone();
             tokio::task::spawn_blocking(move || {
                 let stream = std::os::unix::net::UnixStream::connect(&socket)?;
-                let mut connection = pty_core::client::SessionConnection::attach_over(
+                let mut connection = pty_client::SessionConnection::attach_over(
                     stream,
                     &runtime_id,
                     rows,
@@ -6098,9 +6240,12 @@ subscription "watch/source" {
         assert!(page(&state).sync.is_none(), "nothing is measured yet");
         let pull = |state: &AppState| {
             let summary = state.store.export_replication_summary(FLEET).unwrap();
-            let exchange = edge
-                .export_replication_exchange(FLEET, &summary.inventory)
-                .unwrap();
+            // Classic 512-envelope pages, so the backlog takes more than one exchange.
+            let inventory = crate::model::ReplicationInventory {
+                accepts: None,
+                ..summary.inventory
+            };
+            let exchange = edge.export_replication_exchange(FLEET, &inventory).unwrap();
             state
                 .store
                 .receive_replication_exchange("edge", FLEET, &exchange)
@@ -6395,6 +6540,17 @@ mission "example/looped" state="ready" {
             .unwrap();
         assert_eq!(looped["runs"].as_array().unwrap().len(), 2);
         assert_eq!(looped["active_runs"], 1);
+        assert_eq!(looped["run_details"].as_array().unwrap().len(), 2);
+        let current_run = looped["run_details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|run| run["status"] == "running")
+            .unwrap();
+        assert_eq!(current_run["requester"], "person/operator");
+        assert_eq!(current_run["progress"]["total"], 1);
+        assert_eq!(current_run["current_steps"].as_array().unwrap().len(), 0);
+        assert!(current_run["state_since"].is_string());
     }
 
     #[test]

@@ -13,8 +13,6 @@ version 2
 //
 //   st agents apply examples/st3/seats/omp.kdl --as person/operator
 //   st missions publish examples/st3/github-intake-work.kdl --as person/operator
-//   # Replace both zero revisions below with the hashes from `st missions ls --all --json`;
-//   # github-intake-work.kdl shows the query.
 //   st missions publish examples/st3/github-intake.kdl --as person/operator
 //   st missions start example/app/intake --id example/app/intake/main \
 //     --workspace /srv/example/intake --as person/operator
@@ -49,7 +47,7 @@ mission "example/app/intake" state="ready" {
     observer "observer/repository"
     on "pull_requests"
     delivery "mission" {
-      mission "example/app/review-pull-request@0000000000000000000000000000000000000000000000000000000000000000"
+      mission "example/app/review-pull-request"
       resource "source"
       workspace "${ST_WORKSPACE}/reviews"
     }
@@ -59,7 +57,7 @@ mission "example/app/intake" state="ready" {
     observer "observer/repository"
     on "issues"
     delivery "mission" {
-      mission "example/app/triage-issue@0000000000000000000000000000000000000000000000000000000000000000"
+      mission "example/app/triage-issue"
       resource "source"
       workspace "${ST_WORKSPACE}/triage"
     }

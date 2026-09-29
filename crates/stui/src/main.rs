@@ -1,6 +1,7 @@
 mod cache;
 mod model;
 mod tree;
+mod ui;
 
 use anyhow::{Context, Result};
 use crossterm::{
@@ -610,7 +611,7 @@ impl App {
                     .iter()
                     .map(|(v, depth)| {
                         format!(
-                            "{}{} {}{}  ·  {}",
+                            "{}{} {}{}{}  ·  {}",
                             "  ".repeat(*depth),
                             state_glyph(&v.state),
                             agent_label(v),
@@ -624,6 +625,11 @@ impl App {
                             } else {
                                 String::new()
                             },
+                            v.usage
+                                .as_ref()
+                                .filter(|usage| usage.incarnation_count > 0)
+                                .map(|usage| format!(" · {} tokens", usage.total_tokens))
+                                .unwrap_or_default(),
                             v.reachability
                         )
                     })
@@ -784,6 +790,18 @@ impl App {
                             "Harness: {driver} · {}",
                             peer.harness_state.as_deref().unwrap_or("unknown")
                         ));
+                    }
+                    if let Some(usage) = &peer.usage {
+                        if usage.incarnation_count > 0 {
+                            lines.push(format!("Usage: {} tokens", usage.total_tokens));
+                            lines.push(format!(
+                                "  input {} · output {} · cache write {} · cache read {}",
+                                usage.input_tokens,
+                                usage.output_tokens,
+                                usage.cache_write_tokens,
+                                usage.cached_tokens
+                            ));
+                        }
                     }
                     lines.push(format!(
                         "Current session: {}",
@@ -1752,9 +1770,18 @@ async fn attach(app: &mut App, client: &Client) -> Result<()> {
         return Ok(());
     };
     let runtime_id = runtime.header.id.clone();
+    app.attached = Some(attach_terminal(client, &runtime_id, &terminal_id).await?);
+    app.notice = None;
+    app.dirty = true;
+    Ok(())
+}
+
+/// Attach to one runtime's terminal and follow its screen stream. Shared by both screen sets.
+async fn attach_terminal(client: &Client, runtime_id: &str, terminal_id: &str) -> Result<Attached> {
+    let terminal_id = terminal_id.to_owned();
     let mut attached = None;
     for attempt in 0..3 {
-        let current = client.runtimes_get(&runtime_id).await?;
+        let current = client.runtimes_get(runtime_id).await?;
         let Resource::Runtime(runtime) = current.value else {
             anyhow::bail!("Selected runtime is no longer available");
         };
@@ -1820,21 +1847,26 @@ async fn attach(app: &mut App, client: &Client) -> Result<()> {
             }
         }
     });
-    app.attached = Some(Attached {
+    Ok(Attached {
         terminal_id,
         attachment_id: attachment.attachment_id,
         screen,
         updates: Some(receiver),
         follower: Some(follower),
-    });
-    app.notice = None;
-    app.dirty = true;
-    Ok(())
+    })
 }
 async fn detach(app: &mut App, client: &Client) -> Result<()> {
     let Some(attached) = app.attached.as_ref() else {
         return Ok(());
     };
+    detach_terminal(client, attached).await?;
+    app.attached = None;
+    app.dirty = true;
+    Ok(())
+}
+
+/// Detach from an attached terminal. Shared by both screen sets.
+async fn detach_terminal(client: &Client, attached: &Attached) -> Result<()> {
     let terminal_id = attached.terminal_id.clone();
     let attachment_id = attached.attachment_id.clone();
     let incarnation = attached.screen.runtime_incarnation.clone();
@@ -1858,8 +1890,6 @@ async fn detach(app: &mut App, client: &Client) -> Result<()> {
             Err(error) => return Err(error.into()),
         }
     }
-    app.attached = None;
-    app.dirty = true;
     Ok(())
 }
 async fn terminal_fence(client: &Client, terminal_id: &str, incarnation: &str) -> Result<Fence> {
@@ -1889,12 +1919,27 @@ async fn run_attention_action(
     reason: Option<String>,
 ) -> Result<String> {
     anyhow::ensure!(app.live_ready, "Reconnect before acting");
+    let outcome = attention_action(client, &app.model.actor, attention_id, action, reason).await?;
+    match app.model.reload(client).await {
+        Ok(()) => Ok(outcome),
+        Err(error) => Ok(format!("{outcome}; refresh failed: {error}")),
+    }
+}
+
+/// Perform one attention action against fresh fences. Shared by the old and new screens.
+async fn attention_action(
+    client: &Client,
+    actor: &str,
+    attention_id: &str,
+    action: &str,
+    reason: Option<String>,
+) -> Result<String> {
     let current = client.attention_get(attention_id).await?;
     let Resource::Attention(attention) = &current.value else {
         anyhow::bail!("Attention changed; refresh and choose again");
     };
     anyhow::ensure!(
-        attention.person_id == app.model.actor
+        attention.person_id == actor
             && attention
                 .actions
                 .iter()
@@ -2019,11 +2064,7 @@ async fn run_attention_action(
         }
         _ => anyhow::bail!("This action needs the CLI: {action}"),
     };
-    let outcome = format!("{}: {}", action_label(action), result.value.kind);
-    match app.model.reload(client).await {
-        Ok(()) => Ok(outcome),
-        Err(error) => Ok(format!("{outcome}; refresh failed: {error}")),
-    }
+    Ok(format!("{}: {}", action_label(action), result.value.kind))
 }
 async fn fresh_import_fence(client: &Client, target: &str) -> Result<Fence> {
     let mut cursor = None;
@@ -2518,6 +2559,10 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
 }
 
 fn main() -> Result<()> {
+    let args = std::env::args().collect::<Vec<_>>();
+    if args.iter().any(|arg| arg == "--demo") {
+        return ui::run_demo(&args);
+    }
     if !io::stdout().is_terminal() {
         anyhow::bail!("stui needs an interactive terminal");
     }
@@ -2676,6 +2721,20 @@ fn main() -> Result<()> {
             }
         }
     });
+    // The new screens are the default; `--old` keeps the previous ones for a while.
+    if !args.iter().any(|arg| arg == "--old") {
+        let cached = cache_path
+            .as_deref()
+            .zip(person.as_deref())
+            .and_then(|(path, actor)| cache::load(path, actor));
+        return ui::live::run(ui::live::Context {
+            client,
+            runtime,
+            incoming,
+            person: person.unwrap_or_default(),
+            cached,
+        });
+    }
     let mut app = App::new(Model::default());
     app.model.status = "Loading…".into();
     let mut guard = TerminalGuard::enter()?;
@@ -3045,7 +3104,7 @@ mod tests {
     #[test]
     fn regression_agent_header_shows_harness_state() {
         let mut model = Model::default();
-        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"ST","state":"running","reachability":"reachable","driver":"claude","harness_state":"ready"}"#).unwrap());
+        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"ST","state":"running","reachability":"reachable","driver":"claude","harness_state":"ready","usage":{"total_tokens":42,"input_tokens":4,"output_tokens":2,"cache_write_tokens":6,"cached_tokens":30,"incarnation_count":1,"aggregation":"cumulative-per-incarnation-else-response-deltas"}}"#).unwrap());
         let mut app = App::new(model);
         app.tab = 1;
         let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
@@ -3058,6 +3117,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains("Harness: claude · ready"));
+        assert!(content.contains("Usage: 42 tokens"));
+        assert!(content.contains("cache write 6 · cache read 30"));
         assert!(content.contains("observed"));
     }
 

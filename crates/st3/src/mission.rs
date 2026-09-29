@@ -728,6 +728,7 @@ fn parse_loop_group(
     let mut step = StepSpec {
         id,
         path,
+        fresh_context: false,
         queue: None,
         queue_position: None,
         title: None,
@@ -850,7 +851,7 @@ fn parse_loop_branch(
 }
 
 fn require_approve_mode_outside_step(gate: &GateSpec) -> Result<(), St3Error> {
-    if matches!(gate, GateSpec::Human { mode, .. } if mode == "feedback") {
+    if matches!(gate, GateSpec::Human { mode, .. } if mode.as_deref() == Some("feedback")) {
         return Err(St3Error::new(
             "feedback-gate-needs-step",
             "a feedback gate must be a step gate so the worker can rerun the step",
@@ -1207,6 +1208,7 @@ fn parse_step(
     let revisions_human_only = parse_revision_protection(node)?;
     let revision_reviewer = parse_revision_reviewer(node, revisions_human_only)?;
     let mut title = None;
+    let mut fresh_context = false;
     let mut goals = Vec::new();
     let mut constraints = Vec::new();
     let mut agent_constraints = BTreeMap::new();
@@ -1250,6 +1252,10 @@ fn parse_step(
             }
             match name {
                 "title" => title = Some(first_string(child)?),
+                "fresh-context" => {
+                    ensure_bare(child)?;
+                    fresh_context = true;
+                }
                 "goal" => goals.push(plain_string(child)?),
                 "constraint" => {
                     push_constraint(&mut constraints, child, &format!("step `{path}`"))?
@@ -1361,7 +1367,7 @@ fn parse_step(
     if agentless
         && gates
             .iter()
-            .any(|gate| matches!(gate, GateSpec::Human { mode, .. } if mode == "feedback"))
+            .any(|gate| matches!(gate, GateSpec::Human { mode, .. } if mode.as_deref() == Some("feedback")))
     {
         return Err(St3Error::new(
             "feedback-gate-needs-worker",
@@ -1378,6 +1384,7 @@ fn parse_step(
     let mut step = StepSpec {
         id,
         path,
+        fresh_context,
         queue: None,
         queue_position: None,
         title,
@@ -2134,6 +2141,7 @@ pub fn mission_after_run(mut mission: MissionSpec, run: &str) -> Result<MissionS
     let mut step = StepSpec {
         id: AFTER_RUN_STEP.into(),
         path: AFTER_RUN_STEP.into(),
+        fresh_context: false,
         queue: None,
         queue_position: None,
         title: None,
@@ -2776,6 +2784,37 @@ fn json_value(value: &KdlValue) -> Result<Value, St3Error> {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn fresh_context_is_opt_in_on_steps_and_seats() {
+        let source = r#"version 2
+agent "worker" { workspace "/tmp"; command "true"; fresh-context }
+mission "context" state="ready" {
+  goal "Choose each step's context."
+  step "kept" { assigned-to "agent/node.worker" }
+  step "fresh" { assigned-to "agent/node.worker"; fresh-context }
+}"#;
+        let intent = crate::graph::parse_intent(source, "node").unwrap();
+        let mission = &intent.missions["context"];
+        assert!(!mission.steps["kept"].fresh_context);
+        assert!(mission.steps["fresh"].fresh_context);
+        assert_eq!(
+            intent.subjects["agent/node.worker"]
+                .member
+                .as_ref()
+                .unwrap()
+                .tags
+                .get("st3.fresh_context")
+                .map(String::as_str),
+            Some("true")
+        );
+        for invalid in [
+            source.replace("fresh-context }", "fresh-context \"yes\" }"),
+            source.replace("fresh-context }\n}", "fresh-context \"yes\" }\n}"),
+        ] {
+            assert!(crate::graph::parse_intent(&invalid, "node").is_err());
+        }
+    }
+
+    #[test]
     fn quantified_fields_are_available_to_gates_loops_and_dependencies() {
         let source = r#"
 version 2
@@ -3086,7 +3125,7 @@ version 2
             panic!("the gate is not human");
         };
         assert_eq!(reviewer, "person/nathan");
-        assert_eq!(mode, "approve");
+        assert_eq!(mode.as_deref(), Some("approve"));
         assert_eq!(question.as_deref(), Some("Is this change ready to merge?"));
         assert_eq!(
             review_targets,
@@ -3102,7 +3141,9 @@ version 2
         let source = include_str!("../../../examples/st3/human-feedback.kdl");
         let intent = crate::graph::parse_intent(source, "node").unwrap();
         let gate = &intent.missions["example/draft-feedback"].steps["draft"].gates[0];
-        assert!(matches!(gate, crate::model::GateSpec::Human { mode, .. } if mode == "feedback"));
+        assert!(
+            matches!(gate, crate::model::GateSpec::Human { mode, .. } if mode.as_deref() == Some("feedback"))
+        );
 
         let invalid = source.replace("assigned-to \"agent/example/worker\"", "agentless");
         let error = crate::graph::parse_intent(&invalid, "node").unwrap_err();

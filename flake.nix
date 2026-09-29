@@ -6,9 +6,11 @@
     flake-utils.url = "github:numtide/flake-utils";
     fenix.url = "github:nix-community/fenix";
     fenix.inputs.nixpkgs.follows = "nixpkgs";
-    # Rust PTY candidate with atomic registry publication and the
-    # fleet-observation guarantees required by st2 reconciliation.
-    pty.url = "github:compoundingtech/pty-rust/a93b021743c3c50bf37d66655085149082edd8a4";
+    # pty-rust main, with pty-client (#51) and the Darwin link fix for the
+    # pty binary (#52). The `pty` binary st3 starts sessions with comes from
+    # the same commit as the pty-core and pty-client crates it reads and
+    # controls them through (Cargo.lock).
+    pty.url = "github:compoundingtech/pty-rust/06c303f708a49a8110a5eb640194deab0561fa3a";
     pty.inputs.nixpkgs.follows = "nixpkgs";
     # Shared tooling packages from overengineering: provides the `otelite`
     # OTLP collector binary that `checks.release-integration` drives to prove
@@ -31,6 +33,33 @@
       system:
       let
         pkgs = import nixpkgs { inherit system; };
+        hmModuleEval = nixpkgs.lib.evalModules {
+          specialArgs = {
+            inherit pkgs;
+            lib = pkgs.lib // { hm.dag.entryAfter = _: value: value; };
+          };
+          modules = [
+            self.homeManagerModules.default
+            ({ lib, ... }: {
+              options = {
+                xdg.configHome = lib.mkOption { type = lib.types.str; default = "/home/test/.config"; };
+                xdg.stateHome = lib.mkOption { type = lib.types.str; default = "/home/test/.local/state"; };
+                xdg.configFile = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
+                home.packages = lib.mkOption { type = lib.types.listOf lib.types.package; default = [ ]; };
+                home.activation = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
+                systemd.user.services = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
+                launchd.agents = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
+              };
+              config.services.smalltalk = {
+                enable = true;
+                person = "person/ada";
+                socket = "/tmp/smalltalk-test.sock";
+                ptyPackage = ptyPackage;
+                declarations.seats = [ ./examples/st3/seats/claude.kdl ];
+              };
+            })
+          ];
+        };
         providerRustToolchain = fenix.packages.${system}.combine [
           fenix.packages.${system}.stable.cargo
           fenix.packages.${system}.stable.rustc
@@ -103,7 +132,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-q5Aa7pmAKBakzAyl5pXSfD7d/x9a2mtDC96tLbPPi4w=";
+              "pty-core-0.13.0-rust" = "sha256-TSW58AGBm8pidBkv894prejHmfJts24Ns9vwMw8FaEo=";
             };
           };
 
@@ -258,7 +287,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-q5Aa7pmAKBakzAyl5pXSfD7d/x9a2mtDC96tLbPPi4w=";
+              "pty-core-0.13.0-rust" = "sha256-TSW58AGBm8pidBkv894prejHmfJts24Ns9vwMw8FaEo=";
             };
           };
           cargoBuildFlags = [
@@ -439,7 +468,7 @@
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
-              "pty-core-0.13.0-rust" = "sha256-q5Aa7pmAKBakzAyl5pXSfD7d/x9a2mtDC96tLbPPi4w=";
+              "pty-core-0.13.0-rust" = "sha256-TSW58AGBm8pidBkv894prejHmfJts24Ns9vwMw8FaEo=";
             };
           };
           buildPhase = ''
@@ -630,6 +659,23 @@
         checks.install-layout = installLayout;
         checks.release-integration = st2ReleaseIntegration;
         checks.debug-assertions = st2DebugAssertions;
+        checks.hm-module-eval =
+          let
+            rendered = hmModuleEval.config;
+            args = if pkgs.stdenv.hostPlatform.isLinux then
+              rendered.systemd.user.services.smalltalk.Service.ExecStart
+            else
+              builtins.concatStringsSep " " rendered.launchd.agents.smalltalk.config.ProgramArguments;
+          in
+          assert pkgs.lib.hasInfix ''person = "person/ada"'' rendered.xdg.configFile."st3/config.toml".text;
+          assert pkgs.lib.hasInfix "/tmp/smalltalk-test.sock" args;
+          assert pkgs.lib.hasInfix "--pty-binary" args;
+          assert builtins.length rendered.home.packages == 1;
+          assert builtins.deepSeq (if pkgs.stdenv.hostPlatform.isLinux then
+            rendered.systemd.user.services.smalltalk-apply.Service.ExecStart
+          else
+            rendered.launchd.agents.smalltalk-apply.config.ProgramArguments) true;
+          pkgs.runCommand "smalltalk-hm-module-eval" { } "touch $out";
         checks.wasm-resolver-feature = st2WasmResolver;
         checks.wasip2-resource-providers = st2ProviderRuntime;
         checks.provider-components = st2ProviderComponents;
@@ -908,5 +954,8 @@
           RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
         };
       }
-    );
+    ) // {
+      homeManagerModules.smalltalk = import ./nix/hm-module.nix { inherit self; };
+      homeManagerModules.default = self.homeManagerModules.smalltalk;
+    };
 }
