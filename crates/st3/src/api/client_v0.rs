@@ -105,8 +105,7 @@ async fn collection_items(
                         store.mission_collection_ids(false, 0, limit.saturating_add(1))?;
                     let has_more = ids.len() > limit;
                     ids.truncate(limit);
-                    let items =
-                        mission_resources_filtered(&store, index, false, None, Some(&ids))?;
+                    let items = mission_resources_filtered(&store, index, false, None, Some(&ids))?;
                     return Ok((snapshot, items, has_more));
                 }
                 "attention" => client_attention_resources(&store, person.as_deref(), false)?,
@@ -151,15 +150,15 @@ enum Refreshed {
     Closed,
 }
 
-/// Bring one subscription up to date: its snapshot first, then only what changed.
-async fn refresh_collection(
+/// Bring one subscription up to date from a fresh read: its snapshot first, then only what
+/// changed.
+async fn deliver_collection(
     socket: &mut WebSocket,
-    state: &AppState,
-    session: &ClientSession,
     subscription: &mut CollectionSubscription,
+    read: Result<(ClientSnapshot, Vec<Value>, bool), ApiError>,
 ) -> Refreshed {
     let request = &subscription.request;
-    let (snapshot, items, has_more) = match collection_items(state, session, request).await {
+    let (snapshot, items, has_more) = match read {
         Ok(read) => read,
         Err(error) if !subscription.delivered => {
             let sent = send_collection(socket, json!({"kind":"error", "id":request.id, "code":error.code, "message":error.message})).await;
@@ -282,41 +281,50 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
         let mut refresh = Vec::<String>::new();
         tokio::select! {
             incoming = socket.recv() => {
-                let Some(Ok(message)) = incoming else { return; };
-                let WsMessage::Text(payload) = message else {
-                    if matches!(message, WsMessage::Close(_)) { return; }
-                    continue;
-                };
-                let Ok(request) = serde_json::from_str::<CollectionSubscribe>(&payload) else {
-                    if !send_collection(&mut socket, json!({"kind":"error", "message":"invalid collection command"})).await { return; }
-                    continue;
-                };
-                if request.kind == "unsubscribe" {
-                    subscriptions.remove(&request.id);
-                    terminals.remove(&request.id);
-                    continue;
-                }
-                let held = subscriptions.contains_key(&request.id) || terminals.contains_key(&request.id);
-                if request.kind != "subscribe" || request.id.is_empty() || request.id.len() > 128 || subscriptions.len() + terminals.len() >= COLLECTION_MAX_SUBSCRIPTIONS && !held {
-                    if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "message":"invalid subscription or subscription limit exceeded"})).await { return; }
-                    continue;
-                }
-                // A subscription with a held ID replaces it.
-                subscriptions.remove(&request.id);
-                terminals.remove(&request.id);
-                if request.collection == "terminal" {
-                    match open_terminal_subscription(&state, &session, &request).await {
-                        Ok(receiver) => {
-                            terminals.insert(request.id.clone(), receiver);
+                // Take every command already waiting, so subscriptions sent together are read
+                // together below.
+                let mut next = Some(incoming);
+                while let Some(incoming) = next.take() {
+                    'command: {
+                        let Some(Ok(message)) = incoming else { return; };
+                        let WsMessage::Text(payload) = message else {
+                            if matches!(message, WsMessage::Close(_)) { return; }
+                            break 'command;
+                        };
+                        let Ok(request) = serde_json::from_str::<CollectionSubscribe>(&payload) else {
+                            if !send_collection(&mut socket, json!({"kind":"error", "message":"invalid collection command"})).await { return; }
+                            break 'command;
+                        };
+                        if request.kind == "unsubscribe" {
+                            subscriptions.remove(&request.id);
+                            terminals.remove(&request.id);
+                            break 'command;
                         }
-                        Err(error) => {
-                            if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "collection":"terminal", "code":error.code, "message":error.message})).await { return; }
+                        let held = subscriptions.contains_key(&request.id) || terminals.contains_key(&request.id);
+                        if request.kind != "subscribe" || request.id.is_empty() || request.id.len() > 128 || subscriptions.len() + terminals.len() >= COLLECTION_MAX_SUBSCRIPTIONS && !held {
+                            if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "message":"invalid subscription or subscription limit exceeded"})).await { return; }
+                            break 'command;
                         }
+                        // A subscription with a held ID replaces it.
+                        subscriptions.remove(&request.id);
+                        terminals.remove(&request.id);
+                        if request.collection == "terminal" {
+                            match open_terminal_subscription(&state, &session, &request).await {
+                                Ok(receiver) => {
+                                    terminals.insert(request.id.clone(), receiver);
+                                }
+                                Err(error) => {
+                                    if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "collection":"terminal", "code":error.code, "message":error.message})).await { return; }
+                                }
+                            }
+                            break 'command;
+                        }
+                        refresh.push(request.id.clone());
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { request, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false });
+
                     }
-                    continue;
+                    next = futures_util::FutureExt::now_or_never(socket.recv());
                 }
-                refresh.push(request.id.clone());
-                subscriptions.insert(request.id.clone(), CollectionSubscription { request, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false });
             }
             result = changed.changed() => {
                 if result.is_err() { return; }
@@ -342,11 +350,19 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
         if refresh.is_empty() {
             continue;
         }
-        for id in refresh {
+        // Read every due window at once, each in its own snapshot, then send them in order:
+        // one slow window never holds back the others' reads.
+        let reads = futures_util::future::join_all(refresh.into_iter().filter_map(|id| {
+            let request = subscriptions.get(&id)?.request.clone();
+            let (state, session) = (&state, &session);
+            Some(async move { (id, collection_items(state, session, &request).await) })
+        }))
+        .await;
+        for (id, read) in reads {
             let Some(subscription) = subscriptions.get_mut(&id) else {
                 continue;
             };
-            match refresh_collection(&mut socket, &state, &session, subscription).await {
+            match deliver_collection(&mut socket, subscription, read).await {
                 Refreshed::Current => {}
                 Refreshed::Dropped => {
                     subscriptions.remove(&id);

@@ -586,6 +586,10 @@ impl Drop for WriterGuard<'_> {
 struct ReadPool {
     connections: Mutex<Vec<Connection>>,
     available: Condvar,
+    /// How many connections `Store::read_snapshot` holds. At least one always stays unpinned,
+    /// so a pinned read that fans out to worker threads can never wait on itself.
+    pinned: Mutex<usize>,
+    unpinned: Condvar,
 }
 
 struct ReadGuard<'a> {
@@ -610,6 +614,11 @@ struct PinnedRead<'a> {
 impl Drop for PinnedRead<'_> {
     fn drop(&mut self) {
         PINNED_READER.with(|slot| slot.borrow_mut().take());
+        {
+            let mut pinned = self.pool.pinned.lock().unwrap_or_else(PoisonError::into_inner);
+            *pinned -= 1;
+            self.pool.unpinned.notify_one();
+        }
         let Some(connection) = self.connection.take() else {
             return;
         };
@@ -633,6 +642,8 @@ impl ReadPool {
         Self {
             connections: Mutex::new(connections),
             available: Condvar::new(),
+            pinned: Mutex::new(0),
+            unpinned: Condvar::new(),
         }
     }
 
@@ -1757,9 +1768,24 @@ impl Store {
             let index = current_index(&self.readers.get())?;
             return read(index);
         }
+        {
+            let mut pinned = self
+                .readers
+                .pinned
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            while *pinned + 1 >= READ_CONNECTIONS {
+                pinned = self
+                    .readers
+                    .unpinned
+                    .wait(pinned)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            *pinned += 1;
+        }
         let mut guard = self.readers.get();
-        // Declared first so it drops last: on every exit it ends the transaction and returns
-        // the connection to the pool.
+        // Declared first so it drops last: on every exit it ends the transaction, releases the
+        // pin, and returns the connection to the pool.
         let pinned = PinnedRead {
             pool: &self.readers,
             connection: Some(Rc::new(
@@ -1787,6 +1813,26 @@ impl Store {
             .query_row(
                 "SELECT store_index FROM claims WHERE store_index<=?1
                  AND kind!='daemon.diagnostic' ORDER BY store_index DESC LIMIT 1",
+                [snapshot_index],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// The last claim that can change an agent's status: one about an agent, or about the run
+    /// or generation that owns it, whose row decides the agent's projection layer. Steps,
+    /// gates, subscriptions and diagnostics commit far more often and change no agent status.
+    fn agent_status_index(&self, snapshot_index: u64) -> Result<u64> {
+        // Walk back from the snapshot: about one recent claim in ten matches, so this stops
+        // after a few rows instead of scanning every agent observation.
+        let connection = self.readers.get();
+        Ok(connection
+            .query_row(
+                "SELECT store_index FROM claims WHERE store_index<=?1
+                 AND (subject GLOB 'agent/*' OR subject GLOB 'mission-run/*'
+                      OR subject GLOB 'run-generation/*')
+                 ORDER BY store_index DESC LIMIT 1",
                 [snapshot_index],
                 |row| row.get(0),
             )
@@ -8025,7 +8071,7 @@ impl Store {
                 result.store_index = index;
                 return Ok(result);
             }
-            let projection_index = self.agent_projection_index(index)?;
+            let projection_index = self.agent_status_index(index)?;
             if let Some((cached_index, _, status)) = cache
                 .iter_mut()
                 .find(|(_, cached_projection, _)| *cached_projection == projection_index)
@@ -27263,6 +27309,37 @@ mod tests {
             store.read_snapshot(|_| Ok(())).unwrap();
         }
         assert_eq!(store.claims_for("resource/pinned", None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pinned_reads_that_fan_out_never_wait_on_each_other() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&directory.path().join("state.sqlite3"), "node").unwrap());
+        // Every pinned read holds its connection while a worker thread, like the agent status
+        // reduction's, needs another one from the pool.
+        let (done, finished) = std::sync::mpsc::channel();
+        let barrier = Arc::new(std::sync::Barrier::new(READ_CONNECTIONS));
+        for _ in 0..READ_CONNECTIONS {
+            let (store, done, barrier) = (store.clone(), done.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                let result = store.read_snapshot(|_| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::scope(|scope| {
+                        scope
+                            .spawn(|| store.claims_for("resource/pinned", None).map(|claims| claims.len()))
+                            .join()
+                            .unwrap()
+                    })
+                });
+                done.send(result.is_ok()).unwrap();
+            });
+        }
+        for _ in 0..READ_CONNECTIONS {
+            assert!(finished
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("a pinned read waited forever for a connection"));
+        }
     }
 
     #[test]
