@@ -9092,6 +9092,18 @@ impl Store {
         } else {
             format!("attention/{subject}")
         };
+        // Any person can close any item, whoever it was routed to, so an item routed to an agent
+        // or to another person never outlives everyone who could close it. The resolution
+        // records who closed it. An agent withdraws its own requests instead.
+        let actor = normalize_actor(&request.actor, "person");
+        if !actor.starts_with("person/") {
+            return Err(St3Error::new(
+                "attention-resolver-not-person",
+                format!(
+                    "only a person resolves or dismisses attention request `{subject}`; its requester can withdraw it"
+                ),
+            ));
+        }
         if self
             .attention_request(&subject)
             .map_err(internal)?
@@ -9124,21 +9136,17 @@ impl Store {
                         .map(str::to_owned)
                 })
                 .unwrap_or_default();
-            let requester = if requester.is_empty() {
-                normalize_actor(&request.actor, "person")
-            } else {
+            // The failure is routed to the person who requested the delivery. A subscription
+            // that requests as an agent routes it to no person, so it goes to whoever closes it.
+            let reviewer = if requester.starts_with("person/") {
                 requester
+            } else {
+                actor.clone()
             };
-            if requester != normalize_actor(&request.actor, "person") {
-                return Err(St3Error::new(
-                    "wrong-attention-reviewer",
-                    format!("attention request `{subject}` requires `{requester}`"),
-                ));
-            }
             self.request_attention(
                 &subject,
                 &AttentionRequest {
-                    reviewer: requester,
+                    reviewer,
                     title: "Subscription mission failed".into(),
                     reason: fields
                         .get("reason")
@@ -9161,16 +9169,6 @@ impl Store {
                     format!("attention request `{subject}` does not exist"),
                 )
             })?;
-        let actor = normalize_actor(&request.actor, "person");
-        if actor != current.reviewer {
-            return Err(St3Error::new(
-                "wrong-attention-reviewer",
-                format!(
-                    "attention request `{subject}` requires `{}`",
-                    current.reviewer
-                ),
-            ));
-        }
         self.append_claim(&ClaimInput {
             subject: subject.clone(),
             kind: "attention.resolved".into(),
@@ -9529,6 +9527,7 @@ impl Store {
                 let attention_subject = subscription_failure_attention_subject(&failure.id);
                 if attention_request_view_tx(&connection, &attention_subject)?
                     .is_some_and(|request| request.status != "pending")
+                    || !subscription_failure_is_current_tx(&connection, &failure)?
                 {
                     continue;
                 }
@@ -17133,16 +17132,24 @@ fn selected_actionable_messages(messages: Vec<MessageView>) -> Vec<MessageView> 
 }
 
 /// A fault request stays current until a target that owns its lifecycle ends it. A stale
-/// `run-generation/` or `step-run/` target ends it at once. Otherwise it ends once every target
-/// that is not context has moved on after the request was accepted. `resource/` and `doc/`
-/// targets are context. A target that had already moved on when the request was made keeps it
-/// current, because the request is then about that outcome.
+/// `run-generation/` or `step-run/` target ends it at once, and so does a pull request that is
+/// merged or closed. Otherwise it ends once every target that is not context has moved on after
+/// the request was accepted. Other `resource/` targets and `doc/` targets are context. A target
+/// that had already moved on when the request was made keeps it current, because the request is
+/// then about that outcome.
 fn attention_request_is_current_tx(
     connection: &Connection,
     request: &AttentionRequestView,
 ) -> Result<bool> {
     if request.reason.to_ascii_lowercase().contains("superseded") {
         return Ok(false);
+    }
+    // A decision about a pull request has nothing left to decide once it is merged or closed,
+    // even when that happened before the request.
+    for target in &request.targets {
+        if pull_request_closed_tx(connection, target)? {
+            return Ok(false);
+        }
     }
     let mut runtime_targets = false;
     for target in &request.targets {
@@ -17341,12 +17348,191 @@ fn attention_target_moved_on_tx(
             .optional()?;
         return Ok(after(started));
     }
-    // Resources and documents are context. A target of any other kind, such as a loop, has no
-    // rule here, so it keeps the request current.
+    if target.starts_with("observer/") {
+        // A stopped observer has nothing left to observe. One that observes successfully again
+        // has recovered from what the request described.
+        if let Some(stopped) = declaration_stopped_tx(connection, target)? {
+            return Ok(after(Some(stopped)));
+        }
+        let state = connection
+            .query_row(
+                "SELECT json_extract(body, '$.fields.state'), accepted_at_unix_ms, store_index
+                 FROM claims WHERE subject=?1 AND kind='observer.state'
+                 ORDER BY store_index DESC LIMIT 1",
+                [target],
+                |row| {
+                    let accepted_at = row.get::<_, String>(1)?;
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        (
+                            accepted_at.parse().unwrap_or_default(),
+                            row.get::<_, u64>(2)?,
+                        ),
+                    ))
+                },
+            )
+            .optional()?;
+        return Ok(match state {
+            Some((Some(state), moment)) if state == "healthy" => after(Some(moment)),
+            _ => Some(false),
+        });
+    }
+    if target.starts_with("subscription/") {
+        return Ok(after(declaration_stopped_tx(connection, target)?));
+    }
+    if let Some(path) = target.strip_prefix("loop-run/") {
+        return loop_run_moved_on_tx(connection, target, path, since);
+    }
+    if target.starts_with("message/") {
+        let closed = connection
+            .query_row(
+                "SELECT accepted_at_unix_ms, store_index FROM claims
+                 WHERE subject=?1 AND kind='message.closed'
+                 ORDER BY store_index DESC LIMIT 1",
+                [target],
+                claim_moment,
+            )
+            .optional()?;
+        return Ok(after(closed));
+    }
+    // Resources and documents are context. A target of any other kind has no rule here, so it
+    // keeps the request current.
     if target.starts_with("resource/") || target.starts_with("doc/") {
         return Ok(None);
     }
     Ok(Some(false))
+}
+
+/// Whether `target`, with or without a pinned observation, names a pull request whose latest
+/// observation shows it merged or closed.
+fn pull_request_closed_tx(connection: &Connection, target: &str) -> Result<bool> {
+    Ok(pull_request_state_tx(connection, target)?.is_some_and(|(state, _)| state != "open"))
+}
+
+/// The state of the pull request that `target` names, with or without a pinned observation, from
+/// its latest observation: `open`, `closed` or `merged`. An open listing records a pull request
+/// that left it as `closed`; the pull request provider records `state.state` and `state.merged`.
+fn pull_request_state_tx(connection: &Connection, target: &str) -> Result<Option<(String, u128)>> {
+    let subject = target
+        .split_once('@')
+        .map_or(target, |(subject, _)| subject);
+    if !subject.starts_with("resource/") {
+        return Ok(None);
+    }
+    let observed = connection
+        .query_row(
+            "SELECT json_extract(body, '$.fields'), accepted_at_unix_ms FROM claims
+             WHERE subject=?1 AND kind='resource.observed'
+             ORDER BY store_index DESC LIMIT 1",
+            [subject],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((Some(fields), accepted_at)) = observed else {
+        return Ok(None);
+    };
+    let fields = serde_json::from_str::<Value>(&fields).unwrap_or(Value::Null);
+    if fields.get("kind").and_then(Value::as_str) != Some("vcs.pull-request") {
+        return Ok(None);
+    }
+    let Some(facts) = fields.get("facts") else {
+        return Ok(None);
+    };
+    let merged = |value: &Value| value.get("merged").and_then(Value::as_bool) == Some(true);
+    let state = match facts.get("state") {
+        _ if merged(facts) => "merged",
+        Some(Value::String(state)) if state == "open" => "open",
+        Some(Value::String(_)) => "closed",
+        Some(state @ Value::Object(_)) if merged(state) => "merged",
+        Some(state @ Value::Object(_))
+            if state.get("state").and_then(Value::as_str) == Some("closed") =>
+        {
+            "closed"
+        }
+        _ => "open",
+    };
+    Ok(Some((
+        state.into(),
+        accepted_at.parse().unwrap_or_default(),
+    )))
+}
+
+/// When the current declaration of `subject` became a `stop`, or `None` while it still runs.
+fn declaration_stopped_tx(connection: &Connection, subject: &str) -> Result<Option<ClaimMoment>> {
+    let Some(row) = current_desired_row(connection, subject)? else {
+        return Ok(None);
+    };
+    let body = serde_json::from_str::<Value>(&row.body).unwrap_or(Value::Null);
+    let stopped = row.kind == "stop"
+        || body
+            .get("children")
+            .and_then(Value::as_array)
+            .is_some_and(|children| {
+                children.len() == 1
+                    && children[0].get("name").and_then(Value::as_str) == Some("stop")
+            });
+    if !stopped {
+        return Ok(None);
+    }
+    Ok(connection
+        .query_row(
+            "SELECT accepted_at_unix_ms, store_index FROM claims WHERE id=?1",
+            [&row.claim_id],
+            claim_moment,
+        )
+        .optional()?)
+}
+
+/// A loop that stopped moved on once it runs again after a retry, once a revision replaced its
+/// run generation, or once its run was cancelled. Its run failing because it stopped does not
+/// end it: that failure is what the request reports.
+fn loop_run_moved_on_tx(
+    connection: &Connection,
+    target: &str,
+    path: &str,
+    since: ClaimMoment,
+) -> Result<Option<bool>> {
+    let after = |moment: Option<ClaimMoment>| Some(moment.is_some_and(|moment| moment > since));
+    let running_again = connection
+        .query_row(
+            "SELECT accepted_at_unix_ms, store_index FROM claims
+             WHERE subject=?1 AND kind='loop.state'
+               AND json_extract(body, '$.fields.status')!='failed'
+             ORDER BY store_index DESC LIMIT 1",
+            [target],
+            claim_moment,
+        )
+        .optional()?;
+    if after(running_again) == Some(true) {
+        return Ok(Some(true));
+    }
+    let Some((generation, _)) = path.split_once('/') else {
+        return Ok(Some(false));
+    };
+    let run = connection
+        .query_row(
+            "SELECT mission_runs.id, mission_runs.status,
+                    mission_runs.current_generation_id=run_generations.id
+             FROM run_generations
+             JOIN mission_runs ON mission_runs.id=run_generations.run_id
+             WHERE run_generations.id=?1",
+            [generation],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(match run {
+        Some((_, _, false)) => Some(true),
+        Some((run, status, true)) if status == "cancelled" => {
+            after(mission_run_ended_tx(connection, &run)?)
+        }
+        _ => Some(false),
+    })
 }
 
 /// When a terminal run first reached a terminal status, from its own state history.
@@ -17477,7 +17663,35 @@ fn attention_target_state_tx(connection: &Connection, target: &str) -> Result<Op
             target,
         );
     }
-    Ok(None)
+    if target.starts_with("observer/") || target.starts_with("subscription/") {
+        if let Some((stopped_at, _)) = declaration_stopped_tx(connection, target)? {
+            return Ok(Some(("stopped".into(), Some(stopped_at))));
+        }
+        return row(
+            "SELECT coalesce(json_extract(body, '$.fields.state'), 'unknown'), accepted_at_unix_ms
+             FROM claims WHERE subject=?1 AND kind IN ('observer.state', 'subscription.state')
+             ORDER BY store_index DESC LIMIT 1",
+            target,
+        );
+    }
+    if target.starts_with("loop-run/") {
+        return row(
+            "SELECT coalesce(json_extract(body, '$.fields.status'), 'unknown'), accepted_at_unix_ms
+             FROM claims WHERE subject=?1 AND kind='loop.state'
+             ORDER BY store_index DESC LIMIT 1",
+            target,
+        );
+    }
+    if target.starts_with("message/") {
+        return row(
+            "SELECT substr(kind, 9), accepted_at_unix_ms FROM claims
+             WHERE subject=?1 AND kind IN
+               ('message.sent', 'message.staged', 'message.delivered', 'message.read', 'message.closed')
+             ORDER BY store_index DESC LIMIT 1",
+            target,
+        );
+    }
+    Ok(pull_request_state_tx(connection, target)?.map(|(state, since)| (state, Some(since))))
 }
 
 fn attention_action(label: &str, argv: &[&str]) -> AttentionActionView {
@@ -17485,6 +17699,15 @@ fn attention_action(label: &str, argv: &[&str]) -> AttentionActionView {
         label: label.into(),
         argv: argv.iter().map(|value| (*value).to_owned()).collect(),
     }
+}
+
+/// A failed subscription request stays a fault while its subscription runs. A failed request is
+/// never retried, so only a stop ends it on its own: a stopped subscription starts nothing more.
+fn subscription_failure_is_current_tx(
+    connection: &Connection,
+    failure: &ClaimRecord,
+) -> Result<bool> {
+    Ok(declaration_stopped_tx(connection, &failure.subject)?.is_none())
 }
 
 fn subscription_failure_attention_subject(claim_id: &str) -> String {
@@ -38890,6 +39113,182 @@ mission "{mission}" state="ready" {{
     }
 
     #[test]
+    fn a_decision_about_a_pull_request_ends_when_it_merges_or_closes() {
+        let store = Store::open_memory("node").unwrap();
+        let observe = |number: u64, state: &str, merged: Option<bool>| {
+            let mut facts = json!({
+                "repository": "resource/github/acme/demo",
+                "number": number,
+                "state": state,
+                "draft": false,
+                "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            });
+            if let Some(merged) = merged {
+                facts["merged"] = Value::Bool(merged);
+            }
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("resource/github/acme/demo/pull-request/{number}"),
+                    kind: "resource.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("kind".into(), Value::String("vcs.pull-request".into())),
+                        ("facts".into(), facts),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        let snapshot = observe(7, "open", Some(false));
+        request_fault(
+            &store,
+            "attention/review-7",
+            &[
+                &format!("resource/github/acme/demo/pull-request/7@{}", snapshot.id),
+                "doc/mission-run/example/review@abc",
+            ],
+        );
+        request_fault(
+            &store,
+            "attention/gate-8",
+            &["resource/github/acme/demo/pull-request/8"],
+        );
+        observe(8, "open", Some(false));
+        request_fault(&store, "attention/queue", &["resource/fabric/queue"]);
+        assert!(fault_is_current(&store, "attention/review-7"));
+        assert!(fault_is_current(&store, "attention/gate-8"));
+
+        // An open listing records a pull request that left it as closed.
+        observe(7, "closed", None);
+        assert!(!fault_is_current(&store, "attention/review-7"));
+        // The pull request provider records a merge.
+        observe(8, "closed", Some(true));
+        assert!(!fault_is_current(&store, "attention/gate-8"));
+
+        // A review raised after its pull request already merged has nothing to decide either.
+        request_fault(
+            &store,
+            "attention/late-review",
+            &["resource/github/acme/demo/pull-request/8"],
+        );
+        assert!(!fault_is_current(&store, "attention/late-review"));
+        // Other resources are still context.
+        assert!(fault_is_current(&store, "attention/queue"));
+        let states = store
+            .attention_target_states(&[
+                format!("resource/github/acme/demo/pull-request/7@{}", snapshot.id),
+                "resource/github/acme/demo/pull-request/8".into(),
+                "resource/fabric/queue".into(),
+            ])
+            .unwrap()
+            .into_iter()
+            .map(|state| state.state)
+            .collect::<Vec<_>>();
+        assert_eq!(states, ["closed", "merged"]);
+    }
+
+    #[test]
+    fn attention_about_an_observer_ends_when_it_observes_again() {
+        let store = Store::open_memory("node").unwrap();
+        let state = |state: &str, key: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "observer/demo".into(),
+                    kind: "observer.state".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String(state.into())),
+                        ("revision".into(), Value::String("r1".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap();
+        };
+        state("healthy", "healthy-before");
+        state("unreachable", "unreachable");
+        request_fault(&store, "attention/observer", &["observer/demo"]);
+        assert!(
+            fault_is_current(&store, "attention/observer"),
+            "a healthy state from before the request is not a recovery"
+        );
+        assert_eq!(
+            store
+                .attention_target_states(&["observer/demo".into()])
+                .unwrap()[0]
+                .state,
+            "unreachable"
+        );
+        state("healthy", "healthy-after");
+        assert!(!fault_is_current(&store, "attention/observer"));
+    }
+
+    #[test]
+    fn attention_about_a_stopped_loop_ends_when_the_loop_runs_again() {
+        let store = Store::open_memory("node").unwrap();
+        let run = start_agentless_run(&store, "looping");
+        let generation = run.generation.strip_prefix("run-generation/").unwrap();
+        let loop_run = format!("loop-run/{generation}/review");
+        let loop_state = |status: &str, round: u64| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: loop_run.clone(),
+                    kind: "loop.state".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String(status.into())),
+                        ("round".into(), Value::from(round)),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("{status}-{round}")),
+                })
+                .unwrap();
+        };
+        loop_state("running", 3);
+        request_fault(&store, "attention/loop", &[&loop_run, &run.subject]);
+        loop_state("failed", 3);
+        store
+            .set_mission_run_state(&run.id, "failed", "terminal", Some("the loop stopped"))
+            .unwrap();
+        assert!(
+            fault_is_current(&store, "attention/loop"),
+            "the run failing because its loop stopped is what the request reports"
+        );
+
+        loop_state("running", 4);
+        assert!(!fault_is_current(&store, "attention/loop"));
+    }
+
+    #[test]
+    fn attention_about_a_message_ends_when_the_message_is_closed() {
+        let store = Store::open_memory("node").unwrap();
+        let append = |kind: &str, status: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "message/0123456789abcdef".into(),
+                    kind: kind.into(),
+                    actor: Some("agent/example".into()),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("anchor-{status}")),
+                })
+                .unwrap();
+        };
+        append("message.sent", "sent");
+        request_fault(&store, "attention/anchor", &["message/0123456789abcdef"]);
+        append("message.delivered", "delivered");
+        append("message.read", "read");
+        assert!(fault_is_current(&store, "attention/anchor"));
+        append("message.closed", "closed");
+        assert!(!fault_is_current(&store, "attention/anchor"));
+    }
+
+    #[test]
     fn attention_whose_agent_target_moved_on_is_not_current() {
         let store = Store::open_memory("node").unwrap();
         let observe = |agent: &str, incarnation: &str| {
@@ -39089,29 +39488,39 @@ mission "typecase" state="ready" {
                 .is_empty()
         );
 
-        let wrong = AttentionResolveRequest {
+        let agent = AttentionResolveRequest {
             outcome: "resolved".into(),
             reason: None,
-            actor: "person/someone-else".into(),
-            idempotency_key: "resolve-fabric-wrong".into(),
+            actor: "agent/fabric/worker".into(),
+            idempotency_key: "resolve-fabric-agent".into(),
         };
         assert_eq!(
             store
-                .resolve_attention(&first.subject, &wrong)
+                .resolve_attention(&first.subject, &agent)
                 .unwrap_err()
                 .code,
-            "wrong-attention-reviewer"
+            "attention-resolver-not-person"
         );
+        // Any person can close an item routed to another person.
         let resolution = AttentionResolveRequest {
             outcome: "dismissed".into(),
             reason: Some("The fault is expected during maintenance.".into()),
-            actor: "nathan".into(),
+            actor: "someone-else".into(),
             idempotency_key: "resolve-fabric".into(),
         };
         let closed = store
             .resolve_attention(&first.subject, &resolution)
             .unwrap();
         assert_eq!(closed.status, "dismissed");
+        assert_eq!(
+            store
+                .latest_claim(&first.subject, Some("attention.resolved"))
+                .unwrap()
+                .unwrap()
+                .actor
+                .as_deref(),
+            Some("person/someone-else")
+        );
         assert_eq!(closed.outcome.as_deref(), Some("dismissed"));
         assert!(store.attention_items(None).unwrap().is_empty());
         let retry = store
