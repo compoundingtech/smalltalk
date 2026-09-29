@@ -574,22 +574,6 @@ async fn response_envelope(
 ) -> Response {
     let started = Instant::now();
     let request_path = request.uri().path().to_owned();
-    // Keep these small control-plane reads out of the pool used by potentially
-    // long client projections and history queries. In particular, authentication
-    // and snapshot admission must use the same reserved lane as the handler.
-    let read_class = if request.method() == axum::http::Method::GET
-        && (request_path == "/v1/status"
-            || request_path == "/v1/client/agents"
-            || request_path.starts_with("/v1/client/agents/"))
-    {
-        crate::store::ReadClass::Critical
-    } else if request.method() == axum::http::Method::GET
-        && request_path == "/v1/client/machines"
-    {
-        crate::store::ReadClass::Operational
-    } else {
-        crate::store::ReadClass::Interactive
-    };
     let request_route = request
         .extensions()
         .get::<axum::extract::MatchedPath>()
@@ -641,11 +625,9 @@ async fn response_envelope(
         let auth_profile = profile.clone();
         let admitted = tokio::task::spawn_blocking(move || {
             let _entered = crate::profile::enter(auth_profile.as_ref());
-            crate::store::with_read_class(read_class, || {
-                let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
-                let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
-                (authentication, snapshot)
-            })
+            let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
+            let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
+            (authentication, snapshot)
         })
         .await;
         match admitted {
@@ -664,8 +646,9 @@ async fn response_envelope(
     let response = match (fabric_boundary_error, client_authentication) {
         (Some(error), _) | (None, Err(error)) => error.into_response(),
         // Most handlers use synchronous SQLite and filesystem APIs. Run the whole
-        // handler on a blocking thread so a busy projection, replication pass, or
-        // reader pool cannot occupy an async worker needed to accept another call.
+        // handler on a blocking thread so a busy projection or replication pass cannot
+        // occupy an async worker needed to accept another call. Each read on that
+        // thread takes its own read connection, so it never waits for another read.
         (None, Ok(_)) if request_path == "/v1/health" => next.run(request).await,
         (None, Ok(_)) => {
             let runtime = tokio::runtime::Handle::current();
@@ -675,7 +658,7 @@ async fn response_envelope(
                     profile.queued();
                 }
                 let _entered = crate::profile::enter(handler_profile.as_ref());
-                crate::store::with_read_class(read_class, || runtime.block_on(next.run(request)))
+                runtime.block_on(next.run(request))
             })
             .await
             {
@@ -3652,15 +3635,10 @@ where
     T: Send + 'static,
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
-    let read_class = match crate::store::read_class() {
-        crate::store::ReadClass::Critical => crate::store::ReadClass::Critical,
-        crate::store::ReadClass::Operational => crate::store::ReadClass::Operational,
-        _ => crate::store::ReadClass::Interactive,
-    };
     let profile = crate::profile::current();
     tokio::task::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
-        crate::store::with_read_class(read_class, operation)
+        operation()
     })
     .await
     .map_err(ApiError::internal)?
@@ -3672,15 +3650,10 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, St3Error> + Send + 'static,
 {
-    let read_class = match crate::store::read_class() {
-        crate::store::ReadClass::Critical => crate::store::ReadClass::Critical,
-        crate::store::ReadClass::Operational => crate::store::ReadClass::Operational,
-        _ => crate::store::ReadClass::Interactive,
-    };
     let profile = crate::profile::current();
     tokio::task::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
-        crate::store::with_read_class(read_class, operation)
+        operation()
     })
     .await
     .map_err(ApiError::internal)?
@@ -3913,12 +3886,10 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         st_runtime::priority_report(&observations)
     });
     let token = crate::resource::github_token().await;
-    let mut report = tokio::task::spawn_blocking(move || {
-        crate::store::with_interactive_reads(|| doctor_report(&state))
-    })
-    .await
-    .map_err(ApiError::internal)??
-    .0;
+    let mut report = tokio::task::spawn_blocking(move || doctor_report(&state))
+        .await
+        .map_err(ApiError::internal)??
+        .0;
     if let Some(build_tools) = build_tools {
         report.checks.push(build_tools_check(
             &build_tools.await.map_err(ApiError::internal)?,
@@ -4491,7 +4462,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             driver_gaps.join("; ")
         },
     });
-    match state.store.replication_status(
+    match state.store.replication_status_sealed(
         state.fleet_id.is_some(),
         state.fleet_id.as_deref(),
         &replication_peer_names(state),
@@ -4593,7 +4564,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         Ok(Some(_)) => match (
             state
                 .store
-                .replication_status(true, state.fleet_id.as_deref(), &[]),
+                .replication_status_sealed(true, state.fleet_id.as_deref(), &[]),
             state.store.fleet_admission_residue(),
         ) {
             (Ok(holds), Ok(residue)) => {
@@ -4680,7 +4651,7 @@ async fn replication_status(
     let configured = state.fleet_id.is_some();
     let fleet = state.fleet_id.clone();
     let peers = replication_peer_names(&state);
-    blocking_store(move || store.replication_status(configured, fleet.as_deref(), &peers))
+    blocking_store(move || store.replication_status_sealed(configured, fleet.as_deref(), &peers))
         .await
         .map(Json)
 }
@@ -5036,7 +5007,7 @@ async fn fleet_publish_endpoints(
 /// The peers a node reports on: its config peers and the current listening members it dials.
 /// A dial-out member is never dialed, and an ended name is history, so neither is reported.
 fn replication_peer_names(state: &AppState) -> Vec<String> {
-    let view = state.store.fleet_view().unwrap_or_default();
+    let view = state.store.fleet_view_sealed().unwrap_or_default();
     let mut names = state
         .configured_peers
         .iter()
@@ -5113,12 +5084,12 @@ async fn fleet_status(State(state): State<AppState>) -> Result<Json<FleetStatus>
     let fleet_id = state.fleet_id.clone();
     blocking_store(move || {
         let replication =
-            store.replication_status(fleet_id.is_some(), fleet_id.as_deref(), &peers)?;
+            store.replication_status_sealed(fleet_id.is_some(), fleet_id.as_deref(), &peers)?;
         Ok(FleetStatus {
             node,
             fleet_id,
             member_key: store.member_public_key(),
-            view: store.fleet_view()?,
+            view: store.fleet_view_sealed()?,
             peers: replication.peers,
             invites: store.fleet_invites(false)?,
         })
@@ -5422,7 +5393,9 @@ async fn fleet_membership_view(
     State(state): State<AppState>,
 ) -> Result<Json<crate::fleet::FleetView>, ApiError> {
     let store = state.store.clone();
-    blocking_store(move || store.fleet_view()).await.map(Json)
+    blocking_store(move || store.fleet_view_sealed())
+        .await
+        .map(Json)
 }
 
 async fn replication_wake(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -11193,7 +11166,7 @@ mod tests {
         let store = state.store.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
-            store.hold_interactive_read_connections_for_test(|| {
+            store.hold_read_connections_for_test(|| {
                 ready_tx.send(()).unwrap();
                 std::thread::sleep(Duration::from_millis(500));
             });
@@ -11230,7 +11203,7 @@ mod tests {
         let store = state.store.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
-            store.hold_interactive_read_connections_for_test(|| {
+            store.hold_read_connections_for_test(|| {
                 ready_tx.send(()).unwrap();
                 std::thread::sleep(Duration::from_millis(500));
             });
@@ -11268,7 +11241,7 @@ mod tests {
         let store = state.store.clone();
         let (read_ready_tx, read_ready_rx) = std::sync::mpsc::channel();
         let read_holder = std::thread::spawn(move || {
-            store.hold_interactive_read_connections_for_test(|| {
+            store.hold_read_connections_for_test(|| {
                 read_ready_tx.send(()).unwrap();
                 std::thread::sleep(Duration::from_secs(30));
             });
@@ -11300,6 +11273,87 @@ mod tests {
         }
         read_holder.join().unwrap();
         write_holder.join().unwrap();
+    }
+
+    /// A seat's mailbox poll, one subject's status, a client's admission, and replication and
+    /// fleet status each open a read connection of their own. They answer while the writer is
+    /// held, more reads than the pool keeps idle are held, and long snapshots run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn small_reads_answer_while_the_writer_and_long_reads_are_held() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), "node").unwrap());
+        // A local batch that no exchange has sealed yet: sealing it would need the writer.
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "agent/probe".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/probe".into()),
+                fields: BTreeMap::from([("state".into(), Value::String("idle".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let hold = Duration::from_secs(5);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let mut holders = Vec::new();
+        let store = state.store.clone();
+        let ready = ready_tx.clone();
+        holders.push(std::thread::spawn(move || {
+            store.hold_write_transaction_for_test(|| {
+                ready.send(()).unwrap();
+                std::thread::sleep(hold);
+            });
+        }));
+        let store = state.store.clone();
+        let ready = ready_tx.clone();
+        holders.push(std::thread::spawn(move || {
+            store.hold_read_connections_for_test(|| {
+                ready.send(()).unwrap();
+                std::thread::sleep(hold);
+            });
+        }));
+        for _ in 0..8 {
+            let (store, ready) = (state.store.clone(), ready_tx.clone());
+            holders.push(std::thread::spawn(move || {
+                store
+                    .read_snapshot(|_| {
+                        ready.send(()).unwrap();
+                        std::thread::sleep(hold);
+                        Ok(())
+                    })
+                    .unwrap();
+            }));
+        }
+        for _ in 0..holders.len() {
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+
+        let app = router(state);
+        for path in [
+            "/v1/messages/page?include_closed=false&limit=100&to=agent%2Fprobe",
+            "/v1/status?subject=agent%2Fprobe",
+            "/v1/client/now",
+            "/v1/replication/status",
+            "/v1/internal/fleet/membership",
+            "/v1/client/operations",
+        ] {
+            let started = Instant::now();
+            let response =
+                tokio::time::timeout(Duration::from_millis(250), get_request(app.clone(), path))
+                    .await;
+            assert!(
+                response.is_ok(),
+                "{path} waited {:?} behind the writer or other reads",
+                started.elapsed()
+            );
+            assert_eq!(response.unwrap().0, StatusCode::OK, "{path}");
+        }
+        for holder in holders {
+            holder.join().unwrap();
+        }
     }
 
     #[test]

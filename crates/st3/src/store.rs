@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -613,7 +612,11 @@ PRAGMA user_version = 13;
 const WRITE_CLOCK: &str =
     "CREATE TEMP TABLE IF NOT EXISTS write_clock(offset_ms INTEGER NOT NULL, at_ms INTEGER);";
 
-const READ_CONNECTIONS: usize = 4;
+/// Read connections a store keeps open between reads; more open while more reads run at once.
+/// Each caches up to 8 MiB of pages.
+const IDLE_READ_CONNECTIONS: usize = 32;
+/// How many threads one large status projection splits across.
+const STATUS_WORKERS: usize = 4;
 /// Prepared statements each connection keeps. The default of 16 is fewer than the cached
 /// statements one status reduction alone runs, so they evicted each other and were planned anew
 /// for every subject.
@@ -978,68 +981,21 @@ impl Drop for WriterGuard<'_> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReadClass {
-    Background,
-    Interactive,
-    Operational,
-    Critical,
-}
-
-thread_local! {
-    static READ_CLASS: Cell<ReadClass> = const { Cell::new(ReadClass::Background) };
-}
-
-pub(crate) fn read_class() -> ReadClass {
-    READ_CLASS.with(Cell::get)
-}
-
-pub(crate) fn with_read_class<T>(class: ReadClass, read: impl FnOnce() -> T) -> T {
-    READ_CLASS.with(|flag| {
-        struct Restore<'a>(&'a Cell<ReadClass>, ReadClass);
-        impl Drop for Restore<'_> {
-            fn drop(&mut self) {
-                self.0.set(self.1);
-            }
-        }
-        let _restore = Restore(flag, flag.replace(class));
-        read()
-    })
-}
-
-pub(crate) fn with_interactive_reads<T>(read: impl FnOnce() -> T) -> T {
-    with_read_class(ReadClass::Interactive, read)
-}
-
-struct ReadLane {
-    connections: Mutex<Vec<Connection>>,
-    available: Condvar,
-    /// How many connections `Store::read_snapshot` holds. At least one always stays unpinned,
-    /// so a pinned read that fans out to worker threads can never wait on itself.
-    pinned: Mutex<usize>,
-    unpinned: Condvar,
-}
-
-impl ReadLane {
-    fn new(connections: Vec<Connection>) -> Self {
-        Self {
-            connections: Mutex::new(connections),
-            available: Condvar::new(),
-            pinned: Mutex::new(0),
-            unpinned: Condvar::new(),
-        }
-    }
-}
-
+/// Read connections. A read takes an idle connection, or opens another when every one is busy,
+/// so a read never waits for another read to finish: the pool holds as many connections as reads
+/// ever ran at once, keeps up to `IDLE_READ_CONNECTIONS` of them between reads, and closes them
+/// with the store. Reads see the last committed state and, in WAL mode, never wait for the writer.
 struct ReadPool {
-    background: ReadLane,
-    interactive: ReadLane,
-    operational: ReadLane,
-    critical: ReadLane,
+    idle: Mutex<Vec<Connection>>,
+    /// Wakes a read waiting for an idle connection, which happens only when the operating system
+    /// refuses another one, for example past the open file limit.
+    returned: Condvar,
+    path: PathBuf,
+    shared_memory: bool,
 }
 
 struct ReadGuard<'a> {
-    lane: &'a ReadLane,
+    pool: &'a ReadPool,
     connection: Option<Connection>,
     /// The connection `Store::read_snapshot` pinned for this thread, shared by every read in it.
     pinned: Option<Rc<Connection>>,
@@ -1053,22 +1009,13 @@ thread_local! {
 
 /// Ends a pinned read on every exit path, panics included.
 struct PinnedRead<'a> {
-    lane: &'a ReadLane,
+    pool: &'a ReadPool,
     connection: Option<Rc<Connection>>,
 }
 
 impl Drop for PinnedRead<'_> {
     fn drop(&mut self) {
         PINNED_READER.with(|slot| slot.borrow_mut().take());
-        {
-            let mut pinned = self
-                .lane
-                .pinned
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            *pinned -= 1;
-            self.lane.unpinned.notify_one();
-        }
         let Some(connection) = self.connection.take() else {
             return;
         };
@@ -1076,39 +1023,23 @@ impl Drop for PinnedRead<'_> {
         // Every guard lent from the pin is gone by now; if one escaped, the pool loses that
         // connection rather than sharing it.
         if let Ok(connection) = Rc::try_unwrap(connection) {
-            let mut connections = self
-                .lane
-                .connections
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            connections.push(connection);
-            self.lane.available.notify_one();
+            self.pool.release(connection);
         }
     }
 }
 
 impl ReadPool {
-    fn new(
-        background: Vec<Connection>,
-        interactive: Vec<Connection>,
-        operational: Vec<Connection>,
-        critical: Vec<Connection>,
-    ) -> Self {
-        Self {
-            background: ReadLane::new(background),
-            interactive: ReadLane::new(interactive),
-            operational: ReadLane::new(operational),
-            critical: ReadLane::new(critical),
-        }
-    }
-
-    fn lane(&self) -> &ReadLane {
-        match read_class() {
-            ReadClass::Background => &self.background,
-            ReadClass::Interactive => &self.interactive,
-            ReadClass::Operational => &self.operational,
-            ReadClass::Critical => &self.critical,
-        }
+    fn new(path: &Path, shared_memory: bool) -> Result<Self> {
+        let pool = Self {
+            idle: Mutex::new(Vec::new()),
+            returned: Condvar::new(),
+            path: path.to_path_buf(),
+            shared_memory,
+        };
+        // Open one now, so a store that cannot be read fails to open.
+        let connection = open_read_connection(&pool.path, pool.shared_memory)?;
+        pool.release(connection);
+        Ok(pool)
     }
 
     fn key(&self) -> usize {
@@ -1124,30 +1055,55 @@ impl ReadPool {
         });
         if pinned.is_some() {
             return ReadGuard {
-                lane: self.lane(),
+                pool: self,
                 connection: None,
                 pinned,
             };
         }
-        let lane = self.lane();
         let waiting = crate::profile::enabled().then(std::time::Instant::now);
-        let mut connections = lane
-            .connections
+        let idle = self
+            .idle
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        while connections.is_empty() {
-            connections = lane
-                .available
-                .wait(connections)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        let connection = match idle {
+            Some(connection) => connection,
+            None => match open_read_connection(&self.path, self.shared_memory) {
+                Ok(connection) => {
+                    crate::profile::note("read connection opened");
+                    connection
+                }
+                Err(error) => {
+                    eprintln!("st3: open another read connection: {error:#}; waiting for one");
+                    let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+                    loop {
+                        if let Some(connection) = idle.pop() {
+                            break connection;
+                        }
+                        idle = self
+                            .returned
+                            .wait(idle)
+                            .unwrap_or_else(PoisonError::into_inner);
+                    }
+                }
+            },
+        };
         if let Some(waiting) = waiting {
             crate::profile::read_waited(waiting.elapsed());
         }
         ReadGuard {
-            lane,
-            connection: connections.pop(),
+            pool: self,
+            connection: Some(connection),
             pinned: None,
+        }
+    }
+
+    /// Keep `connection` for the next read, or close it when enough are idle already.
+    fn release(&self, connection: Connection) {
+        let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        if idle.len() < IDLE_READ_CONNECTIONS {
+            idle.push(connection);
+            self.returned.notify_one();
         }
     }
 }
@@ -1166,16 +1122,9 @@ impl Deref for ReadGuard<'_> {
 impl Drop for ReadGuard<'_> {
     fn drop(&mut self) {
         // A pinned connection goes back when its snapshot ends, not here.
-        let Some(connection) = self.connection.take() else {
-            return;
-        };
-        let mut connections = self
-            .lane
-            .connections
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        connections.push(connection);
-        self.lane.available.notify_one();
+        if let Some(connection) = self.connection.take() {
+            self.pool.release(connection);
+        }
     }
 }
 
@@ -1217,6 +1166,9 @@ pub struct Store {
     seeded_batch_rowid: AtomicI64,
     replica_generation: AtomicU64,
     replication_snapshot: Mutex<Option<Arc<ReplicationSnapshot>>>,
+    /// Held while one thread builds the next replication snapshot, so concurrent callers reuse
+    /// it instead of building their own.
+    replication_snapshot_build: Mutex<()>,
     replication_sync: Mutex<BTreeMap<String, PeerSyncProgress>>,
     replication_timers: ReplicationTimers,
     /// Admitted replicated claims wait for a projection a catching-up node deferred.
@@ -1288,13 +1240,12 @@ struct MessageCacheEntry {
 
 #[cfg(test)]
 impl Store {
+    /// Hold more read connections than the pool keeps idle, as a burst of long reads does.
     pub(crate) fn hold_read_connections_for_test(&self, hold: impl FnOnce()) {
-        let _guards: Vec<_> = (0..READ_CONNECTIONS).map(|_| self.readers.get()).collect();
+        let _guards: Vec<_> = (0..IDLE_READ_CONNECTIONS + 4)
+            .map(|_| self.readers.get())
+            .collect();
         hold();
-    }
-
-    pub(crate) fn hold_interactive_read_connections_for_test(&self, hold: impl FnOnce()) {
-        with_interactive_reads(|| self.hold_read_connections_for_test(hold));
     }
 
     pub(crate) fn hold_writer_for_test(&self, hold: impl FnOnce()) {
@@ -2236,27 +2187,23 @@ fn authoring_pull_request_runs_tx(
     Ok(runs)
 }
 
-fn open_read_connections(path: &Path, shared_memory: bool) -> Result<Vec<Connection>> {
+fn open_read_connection(path: &Path, shared_memory: bool) -> Result<Connection> {
     let flags = if shared_memory {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI
     } else {
         OpenFlags::SQLITE_OPEN_READ_ONLY
     };
-    (0..READ_CONNECTIONS)
-        .map(|_| {
-            let mut connection = Connection::open_with_flags(path, flags)
-                .with_context(|| format!("open st read connection {}", path.display()))?;
-            connection.profile(Some(record_sqlite_time));
-            connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
-            connection.execute_batch(
-                "PRAGMA busy_timeout = 5000;
-                 PRAGMA foreign_keys = ON;
-                 PRAGMA cache_size = -8192;
-                 PRAGMA query_only = ON;",
-            )?;
-            Ok(connection)
-        })
-        .collect()
+    let mut connection = Connection::open_with_flags(path, flags)
+        .with_context(|| format!("open st read connection {}", path.display()))?;
+    connection.profile(Some(record_sqlite_time));
+    connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+    connection.execute_batch(
+        "PRAGMA busy_timeout = 5000;
+         PRAGMA foreign_keys = ON;
+         PRAGMA cache_size = -8192;
+         PRAGMA query_only = ON;",
+    )?;
+    Ok(connection)
 }
 
 fn claims_page_query(subject: bool, descending: bool) -> String {
@@ -2297,12 +2244,7 @@ impl Store {
         }
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
-        let readers = ReadPool::new(
-            open_read_connections(path, false)?,
-            open_read_connections(path, false)?,
-            open_read_connections(path, false)?,
-            open_read_connections(path, false)?,
-        );
+        let readers = ReadPool::new(path, false)?;
         Ok(Self {
             connection: WriterConnection::new(connection, committed_index.clone()),
             readers,
@@ -2315,6 +2257,7 @@ impl Store {
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
+            replication_snapshot_build: Mutex::new(()),
             replication_sync: Mutex::new(BTreeMap::new()),
             replication_timers: ReplicationTimers::default(),
             replication_projection_deferred: AtomicBool::new(false),
@@ -2357,12 +2300,7 @@ impl Store {
         }
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
-        let readers = ReadPool::new(
-            open_read_connections(&uri, true)?,
-            open_read_connections(&uri, true)?,
-            open_read_connections(&uri, true)?,
-            open_read_connections(&uri, true)?,
-        );
+        let readers = ReadPool::new(&uri, true)?;
         Ok(Self {
             connection: WriterConnection::new(connection, committed_index.clone()),
             readers,
@@ -2375,6 +2313,7 @@ impl Store {
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
+            replication_snapshot_build: Mutex::new(()),
             replication_sync: Mutex::new(BTreeMap::new()),
             replication_timers: ReplicationTimers::default(),
             replication_projection_deferred: AtomicBool::new(false),
@@ -2406,26 +2345,11 @@ impl Store {
             let index = current_index(&self.readers.get())?;
             return read(index);
         }
-        let lane = self.readers.lane();
-        {
-            let waiting = crate::profile::enabled().then(std::time::Instant::now);
-            let mut pinned = lane.pinned.lock().unwrap_or_else(PoisonError::into_inner);
-            while *pinned + 1 >= READ_CONNECTIONS {
-                pinned = lane
-                    .unpinned
-                    .wait(pinned)
-                    .unwrap_or_else(PoisonError::into_inner);
-            }
-            *pinned += 1;
-            if let Some(waiting) = waiting {
-                crate::profile::read_waited(waiting.elapsed());
-            }
-        }
         let mut guard = self.readers.get();
         // Declared first so it drops last: on every exit it ends the transaction, releases the
         // pin, and returns the connection to the pool.
         let pinned = PinnedRead {
-            lane,
+            pool: &self.readers,
             connection: Some(Rc::new(
                 guard
                     .connection
@@ -9212,11 +9136,10 @@ impl Store {
                 Some(subjects),
             );
         }
-        // The read pool has four connections. Divide a large bounded projection across them;
-        // each worker holds one snapshot connection for its slice, then merge in subject order.
+        // Divide a large bounded projection across a few threads, each reading its slice on its
+        // own connection at the same store index, then merge in subject order.
         let subjects = subjects.into_iter().collect::<Vec<_>>();
-        let chunk_size = subjects.len().div_ceil(READ_CONNECTIONS);
-        let read_class = read_class();
+        let chunk_size = subjects.len().div_ceil(STATUS_WORKERS);
         let profile = crate::profile::current();
         let parts = std::thread::scope(|scope| {
             subjects
@@ -9226,15 +9149,13 @@ impl Store {
                     let profile = profile.clone();
                     scope.spawn(move || {
                         let _entered = crate::profile::enter(profile.as_ref());
-                        with_read_class(read_class, || {
-                            self.status_at_view_for_names(
-                                None,
-                                None,
-                                Some(store_index),
-                                include_history,
-                                Some(names),
-                            )
-                        })
+                        self.status_at_view_for_names(
+                            None,
+                            None,
+                            Some(store_index),
+                            include_history,
+                            Some(names),
+                        )
                     })
                 })
                 .collect::<Vec<_>>()
@@ -12792,28 +12713,20 @@ impl Store {
         Ok(self.replication_snapshot()?.inventory.public())
     }
 
+    /// The replication snapshot with every local batch sealed into a signed envelope first. The
+    /// exchange paths use it; they must offer peers everything this node wrote.
     fn replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
-        let store_index = self.index()?;
-        let replica_generation = self.replica_generation.load(Ordering::Acquire);
-        // The store index never moves back, so deleting the newest claim leaves it unchanged,
-        // and a projection or a replay writes no claims at all. The graph generation moves with
-        // every change to a digested table.
-        let current_graph_generation = graph_generation(&self.readers.get())?;
-        if let Some(snapshot) = self
-            .replication_snapshot
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .filter(|snapshot| {
-                snapshot.store_index == store_index
-                    && snapshot.replica_generation == replica_generation
-                    && snapshot.graph_generation == current_graph_generation
-            })
-            .cloned()
-        {
-            return Ok(snapshot);
-        }
+        self.seal_local_batches()?;
+        self.sealed_replication_snapshot()
+    }
 
+    /// Seal this node's batches that have no envelope yet, and sign them. Only this takes the
+    /// writer, and only when there are such batches.
+    fn seal_local_batches(&self) -> Result<()> {
+        if max_batch_rowid(&self.readers.get())? <= self.seeded_batch_rowid.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
         let mut connection = self.connection.write();
         let _timing = time_stage(&self.replication_timers.snapshot);
         let seeded_through = self.seeded_batch_rowid.load(Ordering::Acquire);
@@ -12827,6 +12740,57 @@ impl Store {
             self.seeded_batch_rowid
                 .store(latest_batch, Ordering::Release);
         }
+        Ok(())
+    }
+
+    /// The replication snapshot of the envelopes already sealed, built on a read connection. A
+    /// read such as `st replication status` uses it and never waits for the writer; a batch
+    /// written since the last exchange shows once the next exchange seals it.
+    fn sealed_replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
+        let current = |store: &Self| -> Result<Option<Arc<ReplicationSnapshot>>> {
+            let store_index = store.index()?;
+            let replica_generation = store.replica_generation.load(Ordering::Acquire);
+            // The store index never moves back, so deleting the newest claim leaves it
+            // unchanged, and a projection or a replay writes no claims at all. The graph
+            // generation moves with every change to a digested table, and sealing a batch adds
+            // an envelope row.
+            let reader = store.readers.get();
+            let current_graph_generation = graph_generation(&reader)?;
+            let envelope_rowid = max_envelope_rowid(&reader)?;
+            Ok(store
+                .replication_snapshot
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .filter(|snapshot| {
+                    snapshot.store_index == store_index
+                        && snapshot.replica_generation == replica_generation
+                        && snapshot.graph_generation == current_graph_generation
+                        && snapshot.max_envelope_rowid == envelope_rowid
+                })
+                .cloned())
+        };
+        if let Some(snapshot) = current(self)? {
+            return Ok(snapshot);
+        }
+        let _building = self
+            .replication_snapshot_build
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(snapshot) = current(self)? {
+            return Ok(snapshot);
+        }
+        let _timing = time_stage(&self.replication_timers.snapshot);
+        self.read_snapshot(|_| {
+            let connection = self.readers.get();
+            self.build_replication_snapshot(&connection)
+        })
+    }
+
+    fn build_replication_snapshot(
+        &self,
+        connection: &Connection,
+    ) -> Result<Arc<ReplicationSnapshot>> {
         let previous = self
             .replication_snapshot
             .lock()
@@ -12834,7 +12798,7 @@ impl Store {
             .take();
         // Harness observations, timelines, usage and lease renewals change none of the digested
         // tables, so their writes leave the generation, and the graph digest, unchanged.
-        let graph_generation = graph_generation(&connection)?;
+        let graph_generation = graph_generation(connection)?;
         let reusable_graph_digest = previous
             .as_ref()
             .filter(|previous| previous.graph_generation == graph_generation)
@@ -12925,10 +12889,10 @@ impl Store {
                         .unwrap_or(buckets.len());
                     (inventory, max_rowid, buckets, digest_prefixes, resume_from)
                 } else {
-                    full(&connection)?
+                    full(connection)?
                 }
             } else {
-                full(&connection)?
+                full(connection)?
             };
         inventory.resume_digest(&buckets, &mut digest_prefixes, resume_from);
         // Envelope hashes already commit the complete payload (and chain metadata). The
@@ -12937,10 +12901,10 @@ impl Store {
         let authority_digest = inventory.digest.clone();
         let graph_digest = match reusable_graph_digest {
             Some(digest) => digest,
-            None => graph_digest(&connection)?,
+            None => graph_digest(connection)?,
         };
         let snapshot = Arc::new(ReplicationSnapshot {
-            store_index: current_index(&connection)?,
+            store_index: current_index(connection)?,
             replica_generation: self.replica_generation.load(Ordering::Acquire),
             max_envelope_rowid,
             envelope_rows: envelope_count,
@@ -14113,7 +14077,19 @@ impl Store {
         fleet_id: Option<&str>,
         configured_peers: &[String],
     ) -> Result<ReplicationStatus> {
-        let snapshot = self.replication_snapshot()?;
+        self.seal_local_batches()?;
+        self.replication_status_sealed(configured, fleet_id, configured_peers)
+    }
+
+    /// Replication status from what is committed and sealed, without taking the writer: the
+    /// status a person reads. A batch written since the last exchange counts once it is sealed.
+    pub fn replication_status_sealed(
+        &self,
+        configured: bool,
+        fleet_id: Option<&str>,
+        configured_peers: &[String],
+    ) -> Result<ReplicationStatus> {
+        let snapshot = self.sealed_replication_snapshot()?;
         let connection = self.readers.get();
         let count = |state: &str| -> Result<u64> {
             Ok(connection.query_row(
@@ -21204,6 +21180,16 @@ impl Store {
     pub fn fleet_view(&self) -> Result<crate::fleet::FleetView> {
         Ok(crate::fleet::FleetView::from_membership(
             &self.fleet_membership()?,
+        ))
+    }
+
+    /// The fleet as its sealed envelopes show it, without taking the writer, for reads. A local
+    /// membership claim shows once the next exchange seals its batch.
+    pub fn fleet_view_sealed(&self) -> Result<crate::fleet::FleetView> {
+        self.sealed_replication_snapshot()?;
+        let connection = self.readers.get();
+        Ok(crate::fleet::FleetView::from_membership(
+            &fleet_membership_tx(&connection)?,
         ))
     }
 
@@ -29872,14 +29858,60 @@ mod tests {
     }
 
     #[test]
+    fn a_read_opens_another_connection_rather_than_wait_for_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&directory.path().join("state.sqlite3"), "node").unwrap());
+        let (ready, readied) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                store.hold_read_connections_for_test(|| {
+                    ready.send(()).unwrap();
+                    released.recv().unwrap();
+                });
+            })
+        };
+        readied.recv().unwrap();
+        // Every connection the pool kept is busy, and more besides. A read and a pinned read
+        // that fans out to worker threads still answer at once.
+        let (done, finished) = std::sync::mpsc::channel();
+        for _ in 0..8 {
+            let (store, done) = (store.clone(), done.clone());
+            std::thread::spawn(move || {
+                let result = store.read_snapshot(|_| {
+                    std::thread::scope(|scope| {
+                        scope
+                            .spawn(|| store.claims_for("resource/busy", None))
+                            .join()
+                            .unwrap()
+                    })
+                });
+                done.send(result.is_ok()).unwrap();
+            });
+        }
+        for _ in 0..8 {
+            assert!(
+                finished
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("a read waited for a busy connection")
+            );
+        }
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        // The pool keeps only so many between reads; the rest closed.
+        assert!(store.readers.idle.lock().unwrap().len() <= IDLE_READ_CONNECTIONS);
+    }
+
+    #[test]
     fn pinned_reads_that_fan_out_never_wait_on_each_other() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(&directory.path().join("state.sqlite3"), "node").unwrap());
         // Every pinned read holds its connection while a worker thread, like the agent status
         // reduction's, needs another one from the pool.
         let (done, finished) = std::sync::mpsc::channel();
-        let barrier = Arc::new(std::sync::Barrier::new(READ_CONNECTIONS));
-        for _ in 0..READ_CONNECTIONS {
+        let barrier = Arc::new(std::sync::Barrier::new(STATUS_WORKERS));
+        for _ in 0..STATUS_WORKERS {
             let (store, done, barrier) = (store.clone(), done.clone(), barrier.clone());
             std::thread::spawn(move || {
                 barrier.wait();
@@ -29899,7 +29931,7 @@ mod tests {
                 done.send(result.is_ok()).unwrap();
             });
         }
-        for _ in 0..READ_CONNECTIONS {
+        for _ in 0..STATUS_WORKERS {
             assert!(
                 finished
                     .recv_timeout(std::time::Duration::from_secs(10))
