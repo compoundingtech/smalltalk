@@ -537,6 +537,22 @@ async fn response_envelope(
 ) -> Response {
     let started = Instant::now();
     let request_path = request.uri().path().to_owned();
+    // Keep these small control-plane reads out of the pool used by potentially
+    // long client projections and history queries. In particular, authentication
+    // and snapshot admission must use the same reserved lane as the handler.
+    let read_class = if request.method() == axum::http::Method::GET
+        && (request_path == "/v1/status"
+            || request_path == "/v1/client/agents"
+            || request_path.starts_with("/v1/client/agents/"))
+    {
+        crate::store::ReadClass::Critical
+    } else if request.method() == axum::http::Method::GET
+        && request_path == "/v1/client/machines"
+    {
+        crate::store::ReadClass::Operational
+    } else {
+        crate::store::ReadClass::Interactive
+    };
     let request_route = request
         .extensions()
         .get::<axum::extract::MatchedPath>()
@@ -576,7 +592,7 @@ async fn response_envelope(
         let auth_state = state.clone();
         let transport = transport.as_str();
         let admitted = tokio::task::spawn_blocking(move || {
-            crate::store::with_interactive_reads(|| {
+            crate::store::with_read_class(read_class, || {
                 let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
                 let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
                 (authentication, snapshot)
@@ -605,7 +621,7 @@ async fn response_envelope(
         (None, Ok(_)) => {
             let runtime = tokio::runtime::Handle::current();
             match tokio::task::spawn_blocking(move || {
-                crate::store::with_interactive_reads(|| runtime.block_on(next.run(request)))
+                crate::store::with_read_class(read_class, || runtime.block_on(next.run(request)))
             })
             .await
             {
@@ -3498,7 +3514,12 @@ where
     T: Send + 'static,
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || crate::store::with_interactive_reads(operation))
+    let read_class = match crate::store::read_class() {
+        crate::store::ReadClass::Critical => crate::store::ReadClass::Critical,
+        crate::store::ReadClass::Operational => crate::store::ReadClass::Operational,
+        _ => crate::store::ReadClass::Interactive,
+    };
+    tokio::task::spawn_blocking(move || crate::store::with_read_class(read_class, operation))
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::internal)
@@ -3509,7 +3530,12 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, St3Error> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || crate::store::with_interactive_reads(operation))
+    let read_class = match crate::store::read_class() {
+        crate::store::ReadClass::Critical => crate::store::ReadClass::Critical,
+        crate::store::ReadClass::Operational => crate::store::ReadClass::Operational,
+        _ => crate::store::ReadClass::Interactive,
+    };
+    tokio::task::spawn_blocking(move || crate::store::with_read_class(read_class, operation))
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::bad)
@@ -10671,6 +10697,50 @@ mod tests {
         holder.join().unwrap();
         let (status, _) = attach.await.unwrap();
         assert!(!status.is_success());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_reads_answer_during_a_long_write_and_busy_query_pool() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        // A disk-backed store uses WAL like the daemon. Shared-cache memory stores
+        // deliberately make readers wait for an uncommitted writer.
+        state.store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), "node").unwrap());
+        let store = state.store.clone();
+        let (read_ready_tx, read_ready_rx) = std::sync::mpsc::channel();
+        let read_holder = std::thread::spawn(move || {
+            store.hold_interactive_read_connections_for_test(|| {
+                read_ready_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(30));
+            });
+        });
+        read_ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let store = state.store.clone();
+        let (write_ready_tx, write_ready_rx) = std::sync::mpsc::channel();
+        let write_holder = std::thread::spawn(move || {
+            store.hold_write_transaction_for_test(|| {
+                write_ready_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(30));
+            });
+        });
+        write_ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let app = router(state);
+        for path in ["/v1/status", "/v1/client/agents", "/v1/client/machines"] {
+            let started = Instant::now();
+            let response =
+                tokio::time::timeout(Duration::from_millis(100), get_request(app.clone(), path))
+                    .await;
+            assert!(
+                response.is_ok(),
+                "{path} waited {:?} behind a long write or query",
+                started.elapsed()
+            );
+            assert_eq!(response.unwrap().0, StatusCode::OK);
+        }
+        read_holder.join().unwrap();
+        write_holder.join().unwrap();
     }
 
     #[test]
