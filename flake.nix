@@ -920,14 +920,20 @@
         # The st3 package compiles st2's hooks as a dependency, not through the st2
         # derivation. Boot the shipped daemon to prove its own receipt carries the
         # flake's source order rather than build.rs's missing-git fallback.
-        checks.st3-hook-build-stamp = pkgs.runCommand "st3-hook-build-stamp-${version}" {
-          nativeBuildInputs = [ pkgs.curl pkgs.jq st3 ];
-        } ''
+        checks.st3-hook-build-stamp =
+          let
+            # The ordinary st3 package retains its complete check suite. This focused
+            # packaging probe needs only the shipped binary, not a second suite run.
+            st3Probe = st3.overrideAttrs (_: { doCheck = false; });
+          in
+          pkgs.runCommand "st3-hook-build-stamp-${version}" {
+            nativeBuildInputs = [ pkgs.curl pkgs.jq st3Probe ];
+          } ''
           export HOME=$(mktemp -d)
           export XDG_CONFIG_HOME="$HOME/config"
           export XDG_STATE_HOME="$HOME/state"
           export ST_HOOKS="$HOME/hooks"
-          ${st3}/bin/st up --node hook-stamp-check \
+          ${st3Probe}/bin/st up --node hook-stamp-check \
             --state-dir "$HOME/state/st3" \
             --socket "$HOME/st.sock" \
             --client-gateway-socket "$HOME/client.sock" > daemon.log 2>&1 &
