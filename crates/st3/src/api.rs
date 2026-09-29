@@ -556,6 +556,56 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .with_state(state)
 }
 
+/// The read lane a request uses. Seat message polls, one subject's status and one message take
+/// the reserved lane, as does the admission of every client request. Projections rebuilt from
+/// history take a lane of their own, a few at a time, so however many of them people's screens
+/// ask for, they never hold the connections those small reads need. The agent list divides its
+/// projection across a lane it keeps to itself.
+fn request_read_class(
+    method: &axum::http::Method,
+    path: &str,
+    query: Option<&str>,
+) -> crate::store::ReadClass {
+    use crate::store::ReadClass;
+    if method != axum::http::Method::GET {
+        return ReadClass::Interactive;
+    }
+    let parameter = |name: &str| {
+        query
+            .into_iter()
+            .flat_map(|query| query.split('&'))
+            .find_map(|pair| {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                (key == name).then_some(value)
+            })
+    };
+    match path {
+        "/v1/messages/page" => ReadClass::Critical,
+        // One subject's status is small; every subject's status, or its history, is not.
+        "/v1/status" => {
+            if parameter("subject").is_some_and(|subject| !subject.is_empty())
+                && parameter("history") != Some("true")
+            {
+                ReadClass::Critical
+            } else {
+                ReadClass::Projection
+            }
+        }
+        "/v1/client/agents" => ReadClass::Operational,
+        // Each of these rebuilds its answer from history on every request. The event feed and
+        // session timelines are not here: they can wait for news or for another host, and a
+        // waiting request must not hold a turn.
+        "/v1/client/sessions" | "/v1/client/machines" | "/v1/client/missions-tree" => {
+            ReadClass::Projection
+        }
+        _ if path.starts_with("/v1/messages/read/") => ReadClass::Critical,
+        _ if path.starts_with("/v1/client/agents/") => ReadClass::Operational,
+        // A work item's detail builds every historical work item before it selects one.
+        _ if path.starts_with("/v1/client/work/") => ReadClass::Projection,
+        _ => ReadClass::Interactive,
+    }
+}
+
 async fn schema() -> Json<Value> {
     let registry = st3_schema::registry();
     Json(json!({
@@ -574,22 +624,7 @@ async fn response_envelope(
 ) -> Response {
     let started = Instant::now();
     let request_path = request.uri().path().to_owned();
-    // Keep these small control-plane reads out of the pool used by potentially
-    // long client projections and history queries. In particular, authentication
-    // and snapshot admission must use the same reserved lane as the handler.
-    let read_class = if request.method() == axum::http::Method::GET
-        && (request_path == "/v1/status"
-            || request_path == "/v1/client/agents"
-            || request_path.starts_with("/v1/client/agents/"))
-    {
-        crate::store::ReadClass::Critical
-    } else if request.method() == axum::http::Method::GET
-        && request_path == "/v1/client/machines"
-    {
-        crate::store::ReadClass::Operational
-    } else {
-        crate::store::ReadClass::Interactive
-    };
+    let read_class = request_read_class(request.method(), &request_path, request.uri().query());
     let request_route = request
         .extensions()
         .get::<axum::extract::MatchedPath>()
@@ -629,7 +664,9 @@ async fn response_envelope(
         let auth_state = state.clone();
         let transport = transport.as_str();
         let admitted = tokio::task::spawn_blocking(move || {
-            crate::store::with_read_class(read_class, || {
+            // Admission reads one pairing and the graph index. It uses the reserved lane, so a
+            // client request never waits behind other clients' projections to be let in.
+            crate::store::with_read_class(crate::store::ReadClass::Critical, || {
                 let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
                 let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
                 (authentication, snapshot)
@@ -656,15 +693,24 @@ async fn response_envelope(
         // reader pool cannot occupy an async worker needed to accept another call.
         (None, Ok(_)) if request_path == "/v1/health" => next.run(request).await,
         (None, Ok(_)) => {
+            // A projection rebuilt from history waits for its turn before it takes a read
+            // connection, so a burst of them queues among themselves instead of every reader.
+            let turn = if read_class == crate::store::ReadClass::Projection {
+                Some(state.store.projection_turn().await)
+            } else {
+                None
+            };
             let runtime = tokio::runtime::Handle::current();
-            match tokio::task::spawn_blocking(move || {
+            let response = match tokio::task::spawn_blocking(move || {
                 crate::store::with_read_class(read_class, || runtime.block_on(next.run(request)))
             })
             .await
             {
                 Ok(response) => response,
                 Err(error) => ApiError::internal(error).into_response(),
-            }
+            };
+            drop(turn);
+            response
         }
     };
     if response.status() == StatusCode::SWITCHING_PROTOCOLS
@@ -3628,9 +3674,8 @@ where
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
     let read_class = match crate::store::read_class() {
-        crate::store::ReadClass::Critical => crate::store::ReadClass::Critical,
-        crate::store::ReadClass::Operational => crate::store::ReadClass::Operational,
-        _ => crate::store::ReadClass::Interactive,
+        crate::store::ReadClass::Background => crate::store::ReadClass::Interactive,
+        class => class,
     };
     tokio::task::spawn_blocking(move || crate::store::with_read_class(read_class, operation))
         .await
@@ -3644,9 +3689,8 @@ where
     F: FnOnce() -> Result<T, St3Error> + Send + 'static,
 {
     let read_class = match crate::store::read_class() {
-        crate::store::ReadClass::Critical => crate::store::ReadClass::Critical,
-        crate::store::ReadClass::Operational => crate::store::ReadClass::Operational,
-        _ => crate::store::ReadClass::Interactive,
+        crate::store::ReadClass::Background => crate::store::ReadClass::Interactive,
+        class => class,
     };
     tokio::task::spawn_blocking(move || crate::store::with_read_class(read_class, operation))
         .await
@@ -11259,6 +11303,108 @@ mod tests {
         }
         read_holder.join().unwrap();
         write_holder.join().unwrap();
+    }
+
+    #[test]
+    fn history_projections_take_their_own_read_lane_and_small_reads_take_the_reserved_one() {
+        use crate::store::ReadClass;
+        let get = axum::http::Method::GET;
+        let class = |path: &str, query: Option<&str>| request_read_class(&get, path, query);
+        assert!(class("/v1/messages/page", Some("to=agent/probe")) == ReadClass::Critical);
+        assert!(class("/v1/messages/read/message/probe", None) == ReadClass::Critical);
+        assert!(class("/v1/status", Some("subject=agent%2Fprobe")) == ReadClass::Critical);
+        assert!(class("/v1/status", None) == ReadClass::Projection);
+        assert!(class("/v1/status", Some("owner_run=mission-run/probe")) == ReadClass::Projection);
+        assert!(
+            class("/v1/status", Some("subject=agent/probe&history=true")) == ReadClass::Projection
+        );
+        assert!(class("/v1/client/agents", None) == ReadClass::Operational);
+        assert!(class("/v1/client/work/step-run/probe/one", None) == ReadClass::Projection);
+        assert!(class("/v1/client/machines", None) == ReadClass::Projection);
+        assert!(class("/v1/client/sessions", None) == ReadClass::Projection);
+        for path in [
+            "/v1/client/now",
+            "/v1/client/work",
+            "/v1/client/events",
+            "/v1/client/attention",
+            "/v1/client/sessions/session/probe/timeline",
+        ] {
+            assert!(class(path, None) == ReadClass::Interactive, "{path}");
+        }
+        assert!(
+            request_read_class(&axum::http::Method::POST, "/v1/messages/page", None)
+                == ReadClass::Interactive
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn small_reads_answer_while_history_projections_wait_their_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), "node").unwrap());
+        // Long projections hold every connection of their lane.
+        let store = state.store.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let holder = std::thread::spawn(move || {
+            store.hold_projection_read_connections_for_test(|| {
+                ready_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            });
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        // More work-item details than may run at once, as a few people's screens ask for.
+        let app = router(state.clone());
+        let details = (0..crate::store::PROJECTION_CONCURRENCY + 2)
+            .map(|_| {
+                let app = app.clone();
+                tokio::spawn(async move {
+                    app.oneshot(
+                        Request::builder()
+                            .uri("/v1/client/work/step-run/probe/one")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+                })
+            })
+            .collect::<Vec<_>>();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(state.store.available_projection_turns_for_test(), 0);
+        assert!(details.iter().all(|detail| !detail.is_finished()));
+
+        for path in [
+            "/v1/messages/page?to=agent%2Fprobe",
+            "/v1/status?subject=agent%2Fprobe",
+            "/v1/client/now",
+            "/v1/client/agents",
+            "/v1/client/attention",
+            "/v1/client/work",
+        ] {
+            let started = Instant::now();
+            let response =
+                tokio::time::timeout(Duration::from_millis(250), get_request(app.clone(), path))
+                    .await;
+            assert!(
+                response.is_ok(),
+                "{path} waited {:?} behind history projections",
+                started.elapsed()
+            );
+            assert_eq!(response.unwrap().0, StatusCode::OK, "{path}");
+        }
+
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        for detail in details {
+            assert_eq!(detail.await.unwrap(), StatusCode::NOT_FOUND);
+        }
+        assert_eq!(
+            state.store.available_projection_turns_for_test(),
+            crate::store::PROJECTION_CONCURRENCY
+        );
     }
 
     #[test]

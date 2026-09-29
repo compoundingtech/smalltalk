@@ -32,3 +32,27 @@ The agent list now builds its status and cards once for each graph index and his
 On a fresh isolated backup with 201,147 claims, a cold agent listing took 1.62 seconds before dividing the status scan and 0.74 seconds after. A cold batch of 24 agent listings plus one each of missions, work, and messages completed in 0.91 seconds. Agent calls took 0.887–0.894 seconds; the other calls took 0.238–0.543 seconds. A warm batch of the same shape completed in 0.46 seconds, with agent calls taking 8–22 ms. A profiling run before the parallel scan attributed 1.26 seconds of a cold 1.27 second agent projection to the status reduction, with work queues and card assembly taking about 11 ms together. The tests exercise cache reuse with all read connections occupied, graph-index invalidation, ordered reduction of more than 64 subjects, asynchronous handler responsiveness, and durable slow-request fault recording.
 
 The cold batch has less headroom than the warm batch; a larger graph or higher CPU pressure may still exceed one second, and those requests will raise durable faults. Reconciliation duration and writer-lock wait were not measured by the read-only reproduction.
+
+## Read lanes
+
+The store reads through five lanes of four connections each, so a read waits only for work in its
+own lane:
+
+| Lane | Reads |
+| --- | --- |
+| Critical | Seat message polls (`GET /v1/messages/page`), one message, one subject's status (`GET /v1/status?subject=`), and the admission of every client request: its credential and its graph snapshot. |
+| Operational | The agent list and agent details, which divide one projection across all four connections of the lane. |
+| Projection | Projections rebuilt from history on every request: every subject's status or a status history, a work item's detail, sessions, machines, and the missions tree. At most two such requests run at once. The rest wait for a turn before they take any connection. |
+| Interactive | Every other request. |
+| Background | The reconciler and other daemon tasks. |
+
+On hetz on 2026-09-29, before the projection lane existed, four concurrent work-item details held
+all four interactive connections for 36 seconds. Every seat's message poll waited 5.0 to
+5.8 seconds for a connection, and a client request spent 35 seconds being let in. Now those
+details queue among themselves. A test holds every projection connection with more details
+waiting than may run, and message polls, one subject's status, `client/now`, the agent list,
+attention and the work list still answer within 250 ms.
+
+The event feed and session timelines are not projection reads, although they read history. They
+can wait up to 30 seconds for news or for another host, and a waiting request must not hold a
+turn.

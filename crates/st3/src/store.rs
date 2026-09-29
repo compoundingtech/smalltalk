@@ -683,13 +683,27 @@ impl Drop for WriterGuard<'_> {
     }
 }
 
+/// Which of the store's read lanes a thread's reads use. Each lane has its own four connections,
+/// so work in one lane never waits for a connection another lane holds.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadClass {
+    /// The reconciler and other daemon tasks.
     Background,
+    /// Request handlers that no other class names.
     Interactive,
+    /// The agent list, which divides one projection across all four of its connections.
     Operational,
+    /// Reads that must answer in milliseconds whatever else runs: seat message polls, one
+    /// subject's status, one message, and the admission of every client request.
     Critical,
+    /// Projections rebuilt from history, such as a work item's detail or every subject's status.
+    /// At most `PROJECTION_CONCURRENCY` requests run in this class at once.
+    Projection,
 }
+
+/// How many history-sized projections run at once. The rest wait for one of them to finish
+/// before they take any read connection.
+pub(crate) const PROJECTION_CONCURRENCY: usize = 2;
 
 thread_local! {
     static READ_CLASS: Cell<ReadClass> = const { Cell::new(ReadClass::Background) };
@@ -741,6 +755,7 @@ struct ReadPool {
     interactive: ReadLane,
     operational: ReadLane,
     critical: ReadLane,
+    projection: ReadLane,
 }
 
 struct ReadGuard<'a> {
@@ -793,18 +808,14 @@ impl Drop for PinnedRead<'_> {
 }
 
 impl ReadPool {
-    fn new(
-        background: Vec<Connection>,
-        interactive: Vec<Connection>,
-        operational: Vec<Connection>,
-        critical: Vec<Connection>,
-    ) -> Self {
-        Self {
-            background: ReadLane::new(background),
-            interactive: ReadLane::new(interactive),
-            operational: ReadLane::new(operational),
-            critical: ReadLane::new(critical),
-        }
+    fn new(mut open: impl FnMut() -> Result<Vec<Connection>>) -> Result<Self> {
+        Ok(Self {
+            background: ReadLane::new(open()?),
+            interactive: ReadLane::new(open()?),
+            operational: ReadLane::new(open()?),
+            critical: ReadLane::new(open()?),
+            projection: ReadLane::new(open()?),
+        })
     }
 
     fn lane(&self) -> &ReadLane {
@@ -813,6 +824,7 @@ impl ReadPool {
             ReadClass::Interactive => &self.interactive,
             ReadClass::Operational => &self.operational,
             ReadClass::Critical => &self.critical,
+            ReadClass::Projection => &self.projection,
         }
     }
 
@@ -904,6 +916,8 @@ pub struct MissionRunStateMoment {
 pub struct Store {
     connection: WriterConnection,
     readers: ReadPool,
+    /// Admits requests to the projection read class, `PROJECTION_CONCURRENCY` at a time.
+    projection_permits: Arc<tokio::sync::Semaphore>,
     committed_index: Arc<AtomicU64>,
     actual_cache: Mutex<HashMap<String, (u64, Option<Value>)>>,
     message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
@@ -990,6 +1004,16 @@ impl Store {
 
     pub(crate) fn hold_interactive_read_connections_for_test(&self, hold: impl FnOnce()) {
         with_interactive_reads(|| self.hold_read_connections_for_test(hold));
+    }
+
+    pub(crate) fn available_projection_turns_for_test(&self) -> usize {
+        self.projection_permits.available_permits()
+    }
+
+    pub(crate) fn hold_projection_read_connections_for_test(&self, hold: impl FnOnce()) {
+        with_read_class(ReadClass::Projection, || {
+            self.hold_read_connections_for_test(hold)
+        });
     }
 
     pub(crate) fn hold_writer_for_test(&self, hold: impl FnOnce()) {
@@ -1989,15 +2013,11 @@ impl Store {
         }
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
-        let readers = ReadPool::new(
-            open_read_connections(path, false)?,
-            open_read_connections(path, false)?,
-            open_read_connections(path, false)?,
-            open_read_connections(path, false)?,
-        );
+        let readers = ReadPool::new(|| open_read_connections(path, false))?;
         Ok(Self {
             connection: WriterConnection::new(connection, committed_index.clone()),
             readers,
+            projection_permits: Arc::new(tokio::sync::Semaphore::new(PROJECTION_CONCURRENCY)),
             committed_index,
             actual_cache: Mutex::new(HashMap::new()),
             message_cache: Mutex::new(HashMap::new()),
@@ -2047,15 +2067,11 @@ impl Store {
         }
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
-        let readers = ReadPool::new(
-            open_read_connections(&uri, true)?,
-            open_read_connections(&uri, true)?,
-            open_read_connections(&uri, true)?,
-            open_read_connections(&uri, true)?,
-        );
+        let readers = ReadPool::new(|| open_read_connections(&uri, true))?;
         Ok(Self {
             connection: WriterConnection::new(connection, committed_index.clone()),
             readers,
+            projection_permits: Arc::new(tokio::sync::Semaphore::new(PROJECTION_CONCURRENCY)),
             committed_index,
             actual_cache: Mutex::new(HashMap::new()),
             message_cache: Mutex::new(HashMap::new()),
@@ -2080,6 +2096,15 @@ impl Store {
 
     pub fn origin(&self) -> &str {
         &self.origin
+    }
+
+    /// Wait for a turn to run a projection rebuilt from history. The permit ends the turn.
+    pub(crate) async fn projection_turn(&self) -> tokio::sync::OwnedSemaphorePermit {
+        self.projection_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("the projection permits are never closed")
     }
 
     pub fn index(&self) -> Result<u64> {
