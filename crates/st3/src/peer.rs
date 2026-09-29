@@ -447,6 +447,9 @@ impl std::fmt::Display for ClientReadRejected {
 
 impl std::error::Error for ClientReadRejected {}
 
+/// Up links as `(observer, observed)`, and when they were read.
+type ObservedLinks = (std::time::Instant, Arc<[(String, String)]>);
+
 /// A paired gateway uses this for bounded owner-local client operations. The peer worker
 /// authenticates both ends and the owner daemon rechecks the requested resource and fences.
 ///
@@ -463,7 +466,7 @@ pub struct ClientRelay {
     /// The store whose replicated transport observations say which nodes reach which.
     links: Option<Arc<Store>>,
     /// The links last read from that store, and when, so a busy gateway reads them rarely.
-    observed: Arc<std::sync::Mutex<Option<(std::time::Instant, Arc<[(String, String)]>)>>>,
+    observed: Arc<std::sync::Mutex<Option<ObservedLinks>>>,
 }
 
 impl ClientRelay {
