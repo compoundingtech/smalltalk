@@ -28,6 +28,7 @@ use crate::fleet::transport::{
     local_addresses, resolve_tool, routes_from_endpoints, tailscale_addresses,
 };
 use crate::fleet::{Acceptance, FleetView, MemberKey, Refusal, Sender, verify_signature};
+use crate::model::InventoryCheckpoint;
 use crate::model::{
     ApiResponse, ReplicaEnvelopeId, ReplicationExchange, ReplicationExportRequest,
     ReplicationExportResponse, ReplicationInventory, ReplicationPeerFailureRequest,
@@ -35,7 +36,10 @@ use crate::model::{
 };
 #[cfg(test)]
 use crate::store::Store;
-use crate::store::{CheckpointManifest, CheckpointManifestPage, CheckpointManifestRequest};
+use crate::store::{
+    CheckpointAction, CheckpointManifest, CheckpointManifestNeed, CheckpointManifestPage,
+    CheckpointManifestRequest,
+};
 
 const PROTOCOL: &str = "st3-replication-v1";
 const EXCHANGE_PATH: &str = "/v1/peer/exchange";
@@ -59,6 +63,9 @@ const HEADER_MEMBER_KEY: &str = "x-st3-member-key";
 const HEADER_MEMBER_SIGNATURE: &str = "x-st3-member-signature";
 const MEMBER_SIGNATURE_DOMAIN: &str = "st3-member-v1";
 pub(crate) const MAX_EXCHANGE_BYTES: usize = 64 * 1024 * 1024;
+/// The largest whole manifest the worker hands the daemon to adopt. A manifest lists every
+/// tombstone so far, about 400 bytes each.
+pub(crate) const MAX_MANIFEST_BYTES: usize = 1024 * 1024 * 1024;
 
 /// The HTTP content coding for large exchange bodies: zlib-wrapped deflate. A requester asks
 /// for it with `Accept-Encoding`, and a peer says with the same header in its answer that it
@@ -96,9 +103,11 @@ fn inflate(body: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn deflated(headers: &HeaderMap) -> bool {
-    headers
-        .get("content-encoding")
-        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(EXCHANGE_ENCODING.as_bytes()))
+    headers.get("content-encoding").is_some_and(|value| {
+        value
+            .as_bytes()
+            .eq_ignore_ascii_case(EXCHANGE_ENCODING.as_bytes())
+    })
 }
 
 fn accepts_deflate(headers: &HeaderMap) -> bool {
@@ -766,6 +775,38 @@ impl PeerBackend {
             }
             #[cfg(test)]
             Self::Local(store) => store.checkpoint_manifest_page(request),
+        }
+    }
+
+    async fn checkpoint_need(&self) -> Result<Option<CheckpointManifestNeed>> {
+        match self {
+            Self::Main(client) => {
+                client
+                    .post(
+                        "/v1/internal/replication/checkpoint-need",
+                        &serde_json::json!({}),
+                    )
+                    .await
+            }
+            #[cfg(test)]
+            Self::Local(store) => store.checkpoint_manifest_need(),
+        }
+    }
+
+    async fn adopt_checkpoint(
+        &self,
+        manifest: &CheckpointManifest,
+    ) -> Result<Vec<CheckpointAction>> {
+        match self {
+            Self::Main(client) => {
+                client
+                    .post("/v1/internal/replication/checkpoint-adopt", manifest)
+                    .await
+            }
+            #[cfg(test)]
+            Self::Local(store) => store
+                .adopt_checkpoint(manifest)
+                .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message)),
         }
     }
 
@@ -1814,7 +1855,6 @@ async fn receive_checkpoint_request(
 
 /// Fetch a checkpoint's whole manifest from a peer, page by page. The caller verifies it against
 /// the checkpoint's certificate before storing anything from it.
-#[allow(dead_code)] // Adoption calls it; see doc/fleet/smalltalk/checkpoint-design, P5.
 async fn fetch_checkpoint_manifest(
     http: &reqwest::Client,
     peer: &PeerConfig,
@@ -2118,6 +2158,7 @@ async fn exchange(
         .await?
         .exchange;
     let local_digest = first.inventory.digest.clone();
+    let own_checkpoint = first.inventory.checkpoint.clone();
     let query = ReplicationExchange {
         envelopes: Vec::new(),
         ..first
@@ -2164,7 +2205,110 @@ async fn exchange(
             wake_main(main_socket).await;
         }
     }
-    Ok(pulled || pulled_follow_up || pushed)
+    let adopted = match &remote.inventory.checkpoint {
+        Some(advertised) => {
+            adopt_advertised_checkpoint(
+                http,
+                backend,
+                node,
+                peer,
+                auth,
+                fleet,
+                own_checkpoint.as_ref(),
+                advertised,
+            )
+            .await
+        }
+        None => false,
+    };
+    if adopted {
+        wake_main(main_socket).await;
+    }
+    Ok(pulled || pulled_follow_up || pushed || adopted)
+}
+
+/// When an adoption last failed, by this node and the checkpoint's drop digest, so a manifest
+/// that cannot be adopted is not fetched again after every exchange.
+static ADOPTION_FAILURES: std::sync::LazyLock<
+    std::sync::Mutex<BTreeMap<(String, String), tokio::time::Instant>>,
+> = std::sync::LazyLock::new(Default::default);
+
+/// A peer advertised a checkpoint this node has not applied. If the daemon needs exactly that
+/// checkpoint's manifest, fetch it from this peer and hand it over to adopt. The daemon checks
+/// the whole manifest against the certificate before it stores anything. Returns whether the
+/// node adopted it.
+#[allow(clippy::too_many_arguments)]
+async fn adopt_advertised_checkpoint(
+    http: &reqwest::Client,
+    backend: &PeerBackend,
+    node: &str,
+    peer: &PeerConfig,
+    auth: &FleetAuth,
+    fleet: &FleetContext,
+    own: Option<&InventoryCheckpoint>,
+    advertised: &InventoryCheckpoint,
+) -> bool {
+    if own.is_some_and(|own| own == advertised || own.cut_unix_ms > advertised.cut_unix_ms) {
+        return false;
+    }
+    let need = match backend.checkpoint_need().await {
+        Ok(Some(need)) => need,
+        Ok(None) => return false,
+        Err(error) => {
+            eprintln!("st3: checkpoint need unavailable: {error:#}");
+            return false;
+        }
+    };
+    if need.checkpoint != advertised.id || need.drop_digest != advertised.drop_digest {
+        return false;
+    }
+    let key = (node.to_owned(), need.drop_digest.clone());
+    let retry_after = worker_interval(Duration::from_secs(10 * 60));
+    if ADOPTION_FAILURES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&key)
+        .is_some_and(|failed| failed.elapsed() < retry_after)
+    {
+        return false;
+    }
+    let adopted = async {
+        let manifest = fetch_checkpoint_manifest(
+            http,
+            peer,
+            node,
+            auth,
+            fleet,
+            &need.checkpoint,
+            need.cut_unix_ms,
+        )
+        .await?;
+        backend.adopt_checkpoint(&manifest).await
+    }
+    .await;
+    match adopted {
+        Ok(actions) => {
+            for action in &actions {
+                eprintln!(
+                    "st3: checkpoint {} (manifest from {})",
+                    serde_json::to_string(action).unwrap_or_default(),
+                    peer.name
+                );
+            }
+            !actions.is_empty()
+        }
+        Err(error) => {
+            eprintln!(
+                "st3: adopting {} from {} failed: {error:#}",
+                need.checkpoint, peer.name
+            );
+            ADOPTION_FAILURES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(key, tokio::time::Instant::now());
+            false
+        }
+    }
 }
 
 /// Send one signed exchange, compressed when `compress` is set and the body is large, and return
@@ -2358,8 +2502,8 @@ mod tests {
 
         // The owner's PTY session: a replay on PEEK, then whatever output the test writes.
         fs::create_dir_all(&owner.pty_root).unwrap();
-        let sessions = tokio::net::UnixListener::bind(owner.pty_root.join("remote-runtime.sock"))
-            .unwrap();
+        let sessions =
+            tokio::net::UnixListener::bind(owner.pty_root.join("remote-runtime.sock")).unwrap();
         let (output, _) = tokio::sync::broadcast::channel::<Vec<u8>>(16);
         let session_output = output.clone();
         tokio::spawn(async move {
@@ -2374,8 +2518,14 @@ mod tests {
                     };
                     let mut peek = [0_u8; 6];
                     if stream.read_exact(&mut peek).await.is_err()
-                        || stream.write_all(&packet(10, &[0, 24, 0, 80])).await.is_err()
-                        || stream.write_all(&packet(5, b"owner shell\r\n$ ")).await.is_err()
+                        || stream
+                            .write_all(&packet(10, &[0, 24, 0, 80]))
+                            .await
+                            .is_err()
+                        || stream
+                            .write_all(&packet(5, b"owner shell\r\n$ "))
+                            .await
+                            .is_err()
                     {
                         return;
                     }
@@ -2953,7 +3103,8 @@ mod tests {
 
     #[test]
     fn exchange_bodies_deflate_and_refuse_a_body_that_inflates_too_far() {
-        let body = serde_json::to_vec(&serde_json::json!({"envelopes": vec!["same"; 1_000]})).unwrap();
+        let body =
+            serde_json::to_vec(&serde_json::json!({"envelopes": vec!["same"; 1_000]})).unwrap();
         let compressed = deflate(&body).unwrap();
         assert!(compressed.len() * 10 < body.len());
         assert_eq!(inflate(&compressed).unwrap(), body);
@@ -2965,9 +3116,15 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         assert!(!accepts_deflate(&headers));
-        headers.insert("accept-encoding", HeaderValue::from_static("gzip, Deflate;q=0.5"));
+        headers.insert(
+            "accept-encoding",
+            HeaderValue::from_static("gzip, Deflate;q=0.5"),
+        );
         assert!(accepts_deflate(&headers));
-        headers.insert("accept-encoding", HeaderValue::from_static("gzip, deflated"));
+        headers.insert(
+            "accept-encoding",
+            HeaderValue::from_static("gzip, deflated"),
+        );
         assert!(!accepts_deflate(&headers));
     }
 
@@ -3042,7 +3199,10 @@ mod tests {
             let response = peer_router(state.clone()).oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             let headers = response.headers().clone();
-            assert!(accepts_deflate(&headers), "a new build takes compressed requests");
+            assert!(
+                accepts_deflate(&headers),
+                "a new build takes compressed requests"
+            );
             assert_eq!(deflated(&headers), ask);
             let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let response_body = if ask {
@@ -3150,6 +3310,132 @@ mod tests {
         )
         .await;
         assert!(forged.is_err());
+        server.abort();
+    }
+
+    /// A node that joins after a trim sees the checkpoint in its peer's inventory, fetches the
+    /// manifest from that peer, adopts it, and ends with the same inventory as the peer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_new_node_adopts_the_checkpoint_its_peer_advertises() {
+        use crate::store::{CheckpointContext, newest_due_cut};
+        const DAY_MS: u128 = 24 * 60 * 60 * 1_000;
+        let fleet = "3c2b6f0e-4d1a-4f7e-9a53-2e8b1c0d7f64";
+        let auth = FleetAuth::test(fleet, &[8; 32]);
+        let scratch = tempfile::tempdir().unwrap();
+        let context = CheckpointContext {
+            now_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis()
+                + 3 * DAY_MS,
+            configured_peers: Vec::new(),
+            scratch: scratch.path().to_path_buf(),
+            reviewer: "person/operator".into(),
+        };
+        let [alder, birch] = ["alder", "birch"].map(|name| {
+            let store = Arc::new(Store::open_memory(name).unwrap());
+            store.bind_fleet(fleet).unwrap();
+            store
+        });
+        let sync = || {
+            for (source, target) in [(&alder, &birch), (&birch, &alder)] {
+                let exchange = source
+                    .export_replication_exchange(fleet, &target.replication_inventory().unwrap())
+                    .unwrap();
+                target
+                    .receive_replication_exchange(source.origin(), fleet, &exchange)
+                    .unwrap();
+                target.validate_replication_backlog().unwrap();
+                target.project_replication_backlog().unwrap();
+            }
+        };
+        for (store, count) in [(&alder, 6), (&birch, 4)] {
+            for index in 0..count {
+                store
+                    .append_claim(&ClaimInput {
+                        subject: format!("daemon/{}", store.origin()),
+                        kind: "daemon.diagnostic".into(),
+                        actor: None,
+                        fields: BTreeMap::from([
+                            ("severity".into(), Value::String("warning".into())),
+                            ("code".into(), Value::String("slow-request".into())),
+                            ("reason".into(), Value::String(format!("slow {index}"))),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!("{}-slow-{index}", store.origin())),
+                    })
+                    .unwrap();
+            }
+        }
+        sync();
+        // Seal, verify, then trim on both.
+        for _ in 0..3 {
+            for store in [&alder, &birch] {
+                store.checkpoint_step(&context).unwrap();
+            }
+            sync();
+        }
+        let advertised = alder.trimmed_checkpoint().unwrap().expect("alder trimmed");
+        assert_eq!(
+            birch.trimmed_checkpoint().unwrap().as_ref(),
+            Some(&advertised)
+        );
+        assert_eq!(advertised.cut_unix_ms, newest_due_cut(context.now_unix_ms));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = PeerState {
+            backend: PeerBackend::Local(alder.clone()),
+            node: "alder".into(),
+            auth: auth.clone(),
+            fleet: FleetContext::legacy(BTreeSet::from(["cedar".into()])),
+            main_socket: PathBuf::from("/no/such/socket"),
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let server = tokio::spawn(axum::serve(listener, peer_router(state)).into_future());
+        let peer = PeerConfig {
+            name: "alder".into(),
+            url: format!("http://{address}"),
+        };
+        let cedar = Arc::new(Store::open_memory("cedar").unwrap());
+        cedar.bind_fleet(fleet).unwrap();
+        let http = replication_http_client();
+        let dialer = FleetContext::legacy(BTreeSet::from(["alder".into()]));
+        for _ in 0..10 {
+            let moved = exchange(
+                &http,
+                &PeerBackend::Local(cedar.clone()),
+                "cedar",
+                &peer,
+                &auth,
+                &dialer,
+                Path::new("/no/such/socket"),
+            )
+            .await
+            .unwrap();
+            if !moved {
+                break;
+            }
+        }
+        assert_eq!(
+            cedar.trimmed_checkpoint().unwrap().as_ref(),
+            Some(&advertised)
+        );
+        assert_eq!(cedar.checkpoint_manifest_need().unwrap(), None);
+        let status = |store: &Store| {
+            let status = store.replication_status(true, Some(fleet), &[]).unwrap();
+            (status.authority_digest, status.graph_digest)
+        };
+        assert_eq!(status(&cedar), status(&alder));
+        assert_eq!(
+            cedar
+                .checkpoint_manifest(&advertised.id, advertised.cut_unix_ms)
+                .unwrap(),
+            alder
+                .checkpoint_manifest(&advertised.id, advertised.cut_unix_ms)
+                .unwrap()
+        );
         server.abort();
     }
 
@@ -3284,7 +3570,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(!moved, "converged nodes store nothing, so the worker may rest");
+        assert!(
+            !moved,
+            "converged nodes store nothing, so the worker may rest"
+        );
         assert_eq!(
             connection_ports.lock().unwrap().len(),
             2,

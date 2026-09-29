@@ -8,12 +8,15 @@
 //! At every point the inventory lists the same identities, so peers cannot tell.
 
 use super::checkpoint::{
-    CheckpointManifest, ClaimTombstone, EnvelopeTombstone, checkpoint_name,
-    delete_dropped_rows_tx, plan_drops, record_checkpoint_tombstones_tx,
-    verify_checkpoint_manifest,
+    CheckpointManifest, ClaimTombstone, EnvelopeTombstone, checkpoint_name, delete_dropped_rows_tx,
+    plan_drops, record_checkpoint_tombstones_tx, verify_checkpoint_manifest,
 };
-use super::checkpoint_agreement::{CheckpointAction, CheckpointClaim, stable_checkpoints};
+use super::checkpoint_agreement::{
+    Certificate, CheckpointAction, CheckpointClaim, certificates, chosen_certificate,
+    stable_checkpoints,
+};
 use super::*;
+use crate::model::InventoryCheckpoint;
 
 /// Envelopes deleted per transaction, so a trim never holds the writer for long.
 pub const TRIM_CHUNK_ENVELOPES: usize = 2_000;
@@ -38,7 +41,10 @@ pub struct CheckpointManifestNeed {
     pub drop_digest: String,
 }
 
-fn local_checkpoint(connection: &Connection, checkpoint: &str) -> Result<Option<(String, Option<i64>)>> {
+fn local_checkpoint(
+    connection: &Connection,
+    checkpoint: &str,
+) -> Result<Option<(String, Option<i64>)>> {
     Ok(connection
         .query_row(
             "SELECT state, seal_rowid FROM checkpoints WHERE id=?1",
@@ -48,19 +54,81 @@ fn local_checkpoint(connection: &Connection, checkpoint: &str) -> Result<Option<
         .optional()?)
 }
 
-/// Whether this node has applied `checkpoint` or a newer one, by trimming or adopting it, or
-/// set it aside.
-fn applied_through(connection: &Connection, cut_unix_ms: u128) -> Result<bool> {
+/// Whether this node has applied the certificate with `drop_digest` for the cut, or anything
+/// newer, or set the cut aside. A node that applied the other side's certificate for the same
+/// cut has not applied this one.
+fn applied(connection: &Connection, cut_unix_ms: u128, drop_digest: &str) -> Result<bool> {
     Ok(connection
         .query_row(
             "SELECT 1 FROM checkpoints
-             WHERE cut_unix_ms >= ?1 AND state IN ('trimmed', 'set-aside', 'graph-changed')
+             WHERE (state='trimmed'
+                    AND (cut_unix_ms > ?1 OR (cut_unix_ms = ?1 AND drop_digest = ?2)))
+                OR (state IN ('set-aside', 'graph-changed') AND cut_unix_ms >= ?1)
              LIMIT 1",
-            [i64::try_from(cut_unix_ms)?],
+            params![i64::try_from(cut_unix_ms)?, drop_digest],
             |_| Ok(()),
         )
         .optional()?
         .is_some())
+}
+
+/// Delete every tombstone that is not among `envelopes` and `claims`.
+fn keep_only_tombstones_tx(
+    transaction: &Transaction<'_>,
+    envelopes: &[EnvelopeTombstone],
+    claims: &[ClaimTombstone],
+) -> Result<()> {
+    transaction.execute_batch(
+        "CREATE TEMP TABLE IF NOT EXISTS adopted_envelopes(
+             writer TEXT NOT NULL, sequence INTEGER NOT NULL, envelope_hash TEXT NOT NULL,
+             PRIMARY KEY (writer, sequence, envelope_hash));
+         CREATE TEMP TABLE IF NOT EXISTS adopted_claims(id TEXT PRIMARY KEY);
+         DELETE FROM temp.adopted_envelopes;
+         DELETE FROM temp.adopted_claims;",
+    )?;
+    {
+        let mut insert = transaction.prepare_cached(
+            "INSERT OR IGNORE INTO temp.adopted_envelopes(writer, sequence, envelope_hash)
+             VALUES (?1, ?2, ?3)",
+        )?;
+        for envelope in envelopes {
+            insert.execute(params![
+                envelope.writer,
+                envelope.sequence,
+                envelope.envelope_hash
+            ])?;
+        }
+        let mut insert = transaction
+            .prepare_cached("INSERT OR IGNORE INTO temp.adopted_claims(id) VALUES (?1)")?;
+        for claim in claims {
+            insert.execute([&claim.id])?;
+        }
+    }
+    transaction.execute_batch(
+        "DELETE FROM checkpoint_envelopes WHERE NOT EXISTS (
+             SELECT 1 FROM temp.adopted_envelopes AS adopted
+             WHERE adopted.writer=checkpoint_envelopes.writer
+               AND adopted.sequence=checkpoint_envelopes.sequence
+               AND adopted.envelope_hash=checkpoint_envelopes.envelope_hash);
+         DELETE FROM checkpoint_claims WHERE id NOT IN (SELECT id FROM temp.adopted_claims);
+         DELETE FROM temp.adopted_envelopes;
+         DELETE FROM temp.adopted_claims;",
+    )?;
+    Ok(())
+}
+
+/// How this node applies the newest stable checkpoint.
+enum Application {
+    /// It already did.
+    Done,
+    /// It verified the certificate every node applies, so it trims from its own plan.
+    OwnPlan {
+        checkpoint: String,
+        certificate: Certificate,
+        seal_rowid: i64,
+    },
+    /// It adopts the certificate's manifest from a peer.
+    Manifest(CheckpointManifestNeed),
 }
 
 impl Store {
@@ -79,7 +147,10 @@ impl Store {
     }
 
     fn stop_for_trim_fault(&self, at: TrimFault) -> Result<()> {
-        let mut fault = self.trim_fault.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut fault = self
+            .trim_fault
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if *fault == Some(at) {
             *fault = None;
             anyhow::bail!("the trim stopped at {at:?} for a test");
@@ -87,10 +158,41 @@ impl Store {
         Ok(())
     }
 
+    fn newest_application(&self, claims: &[CheckpointClaim]) -> Result<Option<Application>> {
+        let stable = stable_checkpoints(claims);
+        let Some((cut, certificates)) = stable.into_iter().next_back() else {
+            return Ok(None);
+        };
+        let certificate = chosen_certificate(&certificates)
+            .expect("a stable checkpoint has a certificate")
+            .clone();
+        let checkpoint = checkpoint_name(cut);
+        let connection = self.readers.get();
+        if applied(&connection, cut, &certificate.terms.drop_digest)? {
+            return Ok(Some(Application::Done));
+        }
+        if certificate.verifications.contains_key(&self.origin)
+            && let Some((state, Some(seal_rowid))) = local_checkpoint(&connection, &checkpoint)?
+            && state != "plan-changed"
+        {
+            return Ok(Some(Application::OwnPlan {
+                checkpoint,
+                certificate,
+                seal_rowid,
+            }));
+        }
+        Ok(Some(Application::Manifest(CheckpointManifestNeed {
+            checkpoint,
+            cut_unix_ms: cut,
+            drop_digest: certificate.terms.drop_digest,
+        })))
+    }
+
     /// Finish a trim a crash interrupted, then apply the newest stable checkpoint if this node
-    /// has not: trim it from its own plan when it verified it, or report that it needs the
-    /// manifest. Until it is applied, this node must not verify a newer checkpoint, because
-    /// every node trims the same checkpoints in the same order.
+    /// has not: trim it from its own plan when it verified the certificate every node applies,
+    /// or report that it needs that certificate's manifest. Until it is applied, this node must
+    /// not verify a newer checkpoint, because every node trims the same checkpoints in the same
+    /// order.
     pub(super) fn apply_stable_checkpoints(
         &self,
         claims: &[CheckpointClaim],
@@ -106,98 +208,99 @@ impl Store {
         for checkpoint in interrupted {
             self.finish_trim(&checkpoint, actions)?;
         }
-        let stable = stable_checkpoints(claims);
-        let Some((cut, certificates)) = stable.into_iter().next_back() else {
-            return Ok(None);
-        };
-        let checkpoint = checkpoint_name(cut);
-        let local = {
-            let connection = self.readers.get();
-            if applied_through(&connection, cut)? {
-                return Ok(None);
+        match self.newest_application(claims)? {
+            None | Some(Application::Done) => Ok(None),
+            Some(Application::Manifest(need)) => Ok(Some(need)),
+            Some(Application::OwnPlan {
+                checkpoint,
+                certificate,
+                seal_rowid,
+            }) => {
+                let cut = certificate.terms.cut_unix_ms;
+                let sealed = self.checkpoint_sealed_set_through(cut, Some(seal_rowid))?;
+                let plan = plan_drops(&sealed);
+                if plan.sealed_digest == certificate.terms.sealed_digest
+                    && plan.drop_digest == certificate.terms.drop_digest
+                {
+                    self.trim_checkpoint(
+                        &checkpoint,
+                        cut,
+                        &plan.drop_digest,
+                        &plan.envelopes,
+                        &plan.claims,
+                        false,
+                        actions,
+                    )?;
+                    return Ok(None);
+                }
+                // Its own rows no longer give the drop it verified, so it adopts the manifest
+                // from a peer like a node that did not take part.
+                self.set_checkpoint_state(&checkpoint, cut, "plan-changed")?;
+                self.checkpoint_diagnostic(
+                    "checkpoint-trim-plan-changed",
+                    &format!(
+                        "this node no longer plans the drop it verified for {checkpoint}; it \
+                         adopts the manifest from a peer instead"
+                    ),
+                    &checkpoint,
+                )?;
+                Ok(Some(CheckpointManifestNeed {
+                    checkpoint,
+                    cut_unix_ms: cut,
+                    drop_digest: certificate.terms.drop_digest,
+                }))
             }
-            local_checkpoint(&connection, &checkpoint)?
-        };
-        let own = certificates
-            .iter()
-            .find(|certificate| certificate.verifications.contains_key(&self.origin));
-        if let (Some(certificate), Some((_, Some(seal_rowid)))) = (own, local) {
-            let sealed = self.checkpoint_sealed_set_through(cut, Some(seal_rowid))?;
-            let plan = plan_drops(&sealed);
-            if plan.sealed_digest == certificate.terms.sealed_digest
-                && plan.drop_digest == certificate.terms.drop_digest
-            {
-                self.trim_checkpoint(&checkpoint, cut, &plan.envelopes, &plan.claims, actions)?;
-                return Ok(None);
-            }
-            self.checkpoint_diagnostic(
-                "checkpoint-trim-plan-changed",
-                &format!(
-                    "this node no longer plans the drop it verified for {checkpoint}; it adopts \
-                     the manifest from a peer instead"
-                ),
-                &checkpoint,
-            )?;
         }
-        if certificates.len() > 1 && own.is_some() {
-            // People excused each side of a partition and both sides certified this cut. This
-            // node applied its own side above; the other side's drops stay here as claims.
-            return Ok(None);
-        }
-        if certificates.len() > 1 {
-            // Neither side's manifest can be checked against a single certificate, so this
-            // node keeps every claim of the cut. Keeping a claim is always safe.
-            self.set_checkpoint_state(&checkpoint, cut, "set-aside")?;
-            return Ok(None);
-        }
-        Ok(Some(CheckpointManifestNeed {
-            checkpoint,
-            cut_unix_ms: cut,
-            drop_digest: certificates[0].terms.drop_digest.clone(),
-        }))
     }
 
     /// The newest stable checkpoint this node needs a manifest for, if any. The replication
-    /// worker asks after each exchange and fetches the manifest from that peer.
+    /// worker asks when a peer advertises a checkpoint this node has not applied, and fetches
+    /// the manifest from a peer that applied this one.
     pub fn checkpoint_manifest_need(&self) -> Result<Option<CheckpointManifestNeed>> {
         let claims = self.checkpoint_claims()?;
-        let stable = stable_checkpoints(&claims);
-        let Some((cut, certificates)) = stable.into_iter().next_back() else {
-            return Ok(None);
-        };
-        let [certificate] = certificates.as_slice() else {
-            return Ok(None);
-        };
-        let connection = self.readers.get();
-        if applied_through(&connection, cut)? {
-            return Ok(None);
-        }
-        let checkpoint = checkpoint_name(cut);
-        let verified_here = certificate.verifications.contains_key(&self.origin)
-            && local_checkpoint(&connection, &checkpoint)?
-                .is_some_and(|(_, seal_rowid)| seal_rowid.is_some());
-        Ok((!verified_here).then(|| CheckpointManifestNeed {
-            checkpoint,
-            cut_unix_ms: cut,
-            drop_digest: certificate.terms.drop_digest.clone(),
-        }))
+        Ok(match self.newest_application(&claims)? {
+            Some(Application::Manifest(need)) => Some(need),
+            _ => None,
+        })
+    }
+
+    /// The newest checkpoint this node has trimmed or adopted, as its inventory advertises it.
+    pub fn trimmed_checkpoint(&self) -> Result<Option<InventoryCheckpoint>> {
+        Ok(self
+            .readers
+            .get()
+            .prepare_cached(
+                "SELECT id, cut_unix_ms, drop_digest FROM checkpoints
+                 WHERE state='trimmed' AND drop_digest IS NOT NULL
+                 ORDER BY cut_unix_ms DESC LIMIT 1",
+            )?
+            .query_row([], |row| {
+                Ok(InventoryCheckpoint {
+                    id: row.get(0)?,
+                    cut_unix_ms: u128::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                    drop_digest: row.get(2)?,
+                })
+            })
+            .optional()?)
     }
 
     /// Adopt a stable checkpoint from a peer's manifest. The whole manifest is checked against
-    /// the drop digest every participant verified before anything from it is stored.
+    /// the drop digest every participant of the chosen certificate verified before anything
+    /// from it is stored. Afterwards this node's tombstones are exactly the manifest's, so it
+    /// goes on like every node that applied the same certificate.
     pub fn adopt_checkpoint(
         &self,
         manifest: &CheckpointManifest,
     ) -> Result<Vec<CheckpointAction>, St3Error> {
         let claims = self.checkpoint_claims().map_err(internal)?;
-        let certificates = super::checkpoint_agreement::certificates(&claims, &manifest.checkpoint);
-        let [certificate] = certificates.as_slice() else {
+        let certificates = certificates(&claims, &manifest.checkpoint);
+        let Some(certificate) = chosen_certificate(&certificates) else {
             return Err(St3Error::new(
-                "checkpoint-not-adoptable",
+                "checkpoint-not-stable",
                 format!(
-                    "`{}` has {} certificates here; a node adopts a checkpoint with exactly one",
-                    manifest.checkpoint,
-                    certificates.len()
+                    "`{}` is not stable on this node; it adopts a checkpoint once it holds \
+                     every participant's verification",
+                    manifest.checkpoint
                 ),
             ));
         };
@@ -209,14 +312,22 @@ impl Store {
         }
         verify_checkpoint_manifest(manifest, &certificate.terms.drop_digest)?;
         let mut actions = Vec::new();
-        if applied_through(&self.readers.get(), manifest.cut_unix_ms).map_err(internal)? {
+        let done = applied(
+            &self.readers.get(),
+            manifest.cut_unix_ms,
+            &certificate.terms.drop_digest,
+        )
+        .map_err(internal)?;
+        if done {
             return Ok(actions);
         }
         self.trim_checkpoint(
             &manifest.checkpoint,
             manifest.cut_unix_ms,
+            &certificate.terms.drop_digest,
             &manifest.envelopes,
             &manifest.claims,
+            true,
             &mut actions,
         )
         .map_err(internal)?;
@@ -261,26 +372,40 @@ impl Store {
     /// Record every tombstone and mark the checkpoint `trimming` in one transaction, then
     /// delete. The clamp's floor comes with the row, so nothing this node writes afterwards is
     /// dated before the cut.
+    ///
+    /// With `exact`, as in adoption, `envelopes` and `claims` are every tombstone through the
+    /// checkpoint, and any other tombstone this node holds goes. That happens only on a node
+    /// that applied the other side's certificate for a cut both sides of a partition certified.
+    /// Its identities leave the inventory, and peers that kept those envelopes send them again.
+    #[allow(clippy::too_many_arguments)]
     fn trim_checkpoint(
         &self,
         checkpoint: &str,
         cut_unix_ms: u128,
+        drop_digest: &str,
         envelopes: &[EnvelopeTombstone],
         claims: &[ClaimTombstone],
+        exact: bool,
         actions: &mut Vec<CheckpointAction>,
     ) -> Result<()> {
         {
             let mut connection = self.connection.write();
             let transaction = connection.transaction()?;
+            if exact {
+                keep_only_tombstones_tx(&transaction, envelopes, claims)?;
+            }
             record_checkpoint_tombstones_tx(&transaction, checkpoint, envelopes, claims)?;
             transaction.execute(
-                "INSERT INTO checkpoints(id, cut_unix_ms, state, detail, updated_at_unix_ms)
-                 VALUES (?1, ?2, 'trimming', ?3, ?4)
-                 ON CONFLICT(id) DO UPDATE SET state='trimming', detail=excluded.detail,
+                "INSERT INTO checkpoints(
+                     id, cut_unix_ms, state, drop_digest, detail, updated_at_unix_ms)
+                 VALUES (?1, ?2, 'trimming', ?3, ?4, ?5)
+                 ON CONFLICT(id) DO UPDATE SET state='trimming',
+                     drop_digest=excluded.drop_digest, detail=excluded.detail,
                      updated_at_unix_ms=excluded.updated_at_unix_ms",
                 params![
                     checkpoint,
                     i64::try_from(cut_unix_ms)?,
+                    drop_digest,
                     json!({"envelopes": envelopes.len(), "claims": claims.len()}).to_string(),
                     i64::try_from(now_ms())?
                 ],
@@ -335,7 +460,9 @@ impl Store {
                         statement
                             .query_map(
                                 params![envelope.writer, envelope.sequence, envelope.envelope_hash],
-                                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+                                |row| {
+                                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                                },
                             )?
                             .collect::<rusqlite::Result<Vec<_>>>()?,
                     );
@@ -374,10 +501,22 @@ impl Store {
                     accepted_at_unix_ms: 0,
                 })
                 .collect::<Vec<_>>();
-            let before = graph_digest(&transaction)?;
+            // Deleting claims touches no graph table, so the generation stays. Only if it moved
+            // are the digests themselves compared, before and after, in this transaction.
+            let generation = graph_generation(&transaction)?;
+            transaction.execute_batch("SAVEPOINT trim_chunk")?;
             delete_dropped_rows_tx(&transaction, &envelopes, &claims)?;
-            let after = graph_digest(&transaction)?;
-            if before != after {
+            let changed = if graph_generation(&transaction)? == generation {
+                false
+            } else {
+                let after = graph_digest(&transaction)?;
+                transaction.execute_batch("ROLLBACK TO trim_chunk")?;
+                let before = graph_digest(&transaction)?;
+                delete_dropped_rows_tx(&transaction, &envelopes, &claims)?;
+                before != after
+            };
+            transaction.execute_batch("RELEASE trim_chunk")?;
+            if changed {
                 transaction.rollback()?;
                 drop(connection);
                 self.set_checkpoint_state(checkpoint, 0, "graph-changed")?;

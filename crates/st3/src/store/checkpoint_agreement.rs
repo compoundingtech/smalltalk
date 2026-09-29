@@ -250,6 +250,23 @@ pub fn stable_checkpoints(claims: &[CheckpointClaim]) -> BTreeMap<u128, Vec<Cert
         .collect()
 }
 
+/// The certificate every node applies for a cut. Without excusals a cut has one. When people
+/// excused each side of a partition and both sides certified the cut, every node applies the
+/// one with the most participants, then the smallest drop digest. It is a pure function of the
+/// certificates, so every node picks the same one, and a node that applied the other side's
+/// adopts this one's manifest in its place.
+pub fn chosen_certificate(certificates: &[Certificate]) -> Option<&Certificate> {
+    certificates.iter().min_by(|left, right| {
+        right
+            .terms
+            .participants
+            .len()
+            .cmp(&left.terms.participants.len())
+            .then_with(|| left.terms.drop_digest.cmp(&right.terms.drop_digest))
+            .then_with(|| left.terms.cmp(&right.terms))
+    })
+}
+
 /// What one pass of checkpoint work needs from outside the store.
 #[derive(Clone, Debug)]
 pub struct CheckpointContext {
@@ -1190,6 +1207,23 @@ mod tests {
         assert_eq!(certified.len(), 2);
         claims.reverse();
         assert_eq!(certificates(&claims, &checkpoint_name(CUT)), certified);
+        // Every node applies the same one: here the smaller drop digest, since both sides
+        // have two participants.
+        let chosen = chosen_certificate(&certified).unwrap();
+        assert_eq!(chosen.terms.drop_digest, "east");
+        let mut reversed = certified.clone();
+        reversed.reverse();
+        assert_eq!(chosen_certificate(&reversed), Some(chosen));
+        // A side with more participants wins whatever its digest.
+        let larger = ["cedar", "dogwood", "elm"];
+        let mut claims = west.map(|writer| verified(writer, &west, "west")).to_vec();
+        claims.extend(larger.map(|writer| verified(writer, &larger, "zzz")));
+        let certified = certificates(&claims, &checkpoint_name(CUT));
+        assert_eq!(
+            chosen_certificate(&certified).unwrap().terms.drop_digest,
+            "zzz"
+        );
+        assert_eq!(chosen_certificate(&[]), None);
     }
 
     // Stores exchanging for real.
@@ -1442,7 +1476,10 @@ mod tests {
         let manifest = alder
             .checkpoint_manifest(&need.checkpoint, need.cut_unix_ms)
             .unwrap();
-        assert_eq!(kinds(&cedar.adopt_checkpoint(&manifest).unwrap()), ["trimmed"]);
+        assert_eq!(
+            kinds(&cedar.adopt_checkpoint(&manifest).unwrap()),
+            ["trimmed"]
+        );
         assert_eq!(claim_ids(&cedar), claim_ids(&alder));
         assert_eq!(kinds(&step(&cedar, &next)), ["sealed"]);
         sync(&[&alder, &birch, &cedar]);
@@ -1546,7 +1583,8 @@ mod tests {
         let kept = claim_ids(&alder);
         assert!(kept.len() < held.len());
         assert_eq!(kept, claim_ids(&birch));
-        let manifests = [&alder, &birch].map(|node| node.checkpoint_manifest(&checkpoint, cut).unwrap());
+        let manifests =
+            [&alder, &birch].map(|node| node.checkpoint_manifest(&checkpoint, cut).unwrap());
         assert!(!manifests[0].claims.is_empty());
         assert_eq!(manifests[0], manifests[1]);
         for claim in &manifests[0].claims {
@@ -1617,26 +1655,159 @@ mod tests {
         assert_ne!(authority(&cedar).0, authority(&alder).0);
         assert_eq!(kinds(&step(&cedar, &context)), ["manifest-needed"]);
         assert_eq!(
-            cedar.checkpoint_manifest_need().unwrap().map(|need| need.checkpoint),
+            cedar
+                .checkpoint_manifest_need()
+                .unwrap()
+                .map(|need| need.checkpoint),
             Some(checkpoint.clone())
         );
         let manifest = alder.checkpoint_manifest(&checkpoint, cut).unwrap();
 
         // A changed tombstone is refused before anything is stored.
         let mut changed = manifest.clone();
-        changed.claims[0].predecessors.push("an-invented-claim".into());
+        changed.claims[0]
+            .predecessors
+            .push("an-invented-claim".into());
         assert_eq!(
             cedar.adopt_checkpoint(&changed).unwrap_err().code,
             "checkpoint-manifest-mismatch"
         );
         assert_eq!(cedar.checkpointed_envelopes().unwrap(), 0);
 
-        assert_eq!(kinds(&cedar.adopt_checkpoint(&manifest).unwrap()), ["trimmed"]);
+        assert_eq!(
+            kinds(&cedar.adopt_checkpoint(&manifest).unwrap()),
+            ["trimmed"]
+        );
         assert_eq!(cedar.checkpoint_manifest_need().unwrap(), None);
         assert_eq!(authority(&cedar), authority(&alder));
         assert_eq!(claim_ids(&cedar), claim_ids(&alder));
-        assert_eq!(cedar.checkpoint_manifest(&checkpoint, cut).unwrap(), manifest);
+        assert_eq!(
+            cedar.checkpoint_manifest(&checkpoint, cut).unwrap(),
+            manifest
+        );
         assert!(step(&cedar, &context).is_empty());
+    }
+
+    fn excuse(store: &Store, writer: &str) {
+        store
+            .excuse_checkpoint_writer(&CheckpointExcuseRequest {
+                writer: writer.into(),
+                reason: "cut off by a partition".into(),
+                actor: "person/operator".into(),
+            })
+            .unwrap();
+    }
+
+    /// People on each side of a partition excuse the other side, and each side certifies and
+    /// trims the same cut alone. Once the partition heals, every node applies the same one of
+    /// the two certificates, and they end with identical tombstones, inventories and graphs,
+    /// and trim the next checkpoint together.
+    #[test]
+    fn both_sides_of_an_excused_partition_converge_on_one_certificate() {
+        let scratch = tempfile::tempdir().unwrap();
+        let context = context(scratch.path(), 0);
+        let cut = newest_due_cut(context.now_unix_ms);
+        let checkpoint = checkpoint_name(cut);
+        let [alder, birch, cedar, dogwood] =
+            ["alder", "birch", "cedar", "dogwood"].map(|name| Store::open_memory(name).unwrap());
+        let all = [&alder, &birch, &cedar, &dogwood];
+        for node in all {
+            observe(node, 4);
+        }
+        sync(&all);
+        let west = [&alder, &birch];
+        let east = [&cedar, &dogwood];
+        for (side, others) in [(west, ["cedar", "dogwood"]), (east, ["alder", "birch"])] {
+            for node in side {
+                observe(node, 3);
+            }
+            for writer in others {
+                excuse(side[0], writer);
+            }
+            sync(&side);
+            for round in ["sealed", "verified", "trimmed"] {
+                for node in side {
+                    assert_eq!(kinds(&step(node, &context)), [round], "{}", node.origin);
+                }
+                sync(&side);
+            }
+        }
+        let [west_certificate, east_certificate] =
+            [&alder, &cedar].map(|node| node.trimmed_checkpoint().unwrap().unwrap());
+        assert_ne!(west_certificate.drop_digest, east_certificate.drop_digest);
+
+        // The partition heals.
+        sync(&all);
+        let certified = certificates(&alder.checkpoint_claims().unwrap(), &checkpoint);
+        assert_eq!(certified.len(), 2);
+        let chosen = chosen_certificate(&certified).unwrap().clone();
+        let (kept, switching) = if chosen.terms.drop_digest == west_certificate.drop_digest {
+            (west, east)
+        } else {
+            (east, west)
+        };
+        for node in kept {
+            assert_eq!(node.checkpoint_manifest_need().unwrap(), None);
+            assert!(!kinds(&step(node, &context)).contains(&"manifest-needed"));
+        }
+        let manifest = kept[0].checkpoint_manifest(&checkpoint, cut).unwrap();
+        for node in switching {
+            assert_eq!(kinds(&step(node, &context)), ["manifest-needed"]);
+            let need = node.checkpoint_manifest_need().unwrap().unwrap();
+            assert_eq!(need.drop_digest, chosen.terms.drop_digest);
+            // The other side's manifest does not verify against the chosen certificate.
+            let own = node.checkpoint_manifest(&checkpoint, cut).unwrap();
+            assert!(node.adopt_checkpoint(&own).is_err());
+            assert_eq!(
+                kinds(&node.adopt_checkpoint(&manifest).unwrap()),
+                ["trimmed"]
+            );
+            assert_eq!(
+                node.checkpoint_manifest(&checkpoint, cut).unwrap(),
+                manifest
+            );
+        }
+        sync(&all);
+        for node in all {
+            assert_eq!(authority(node), authority(&alder), "{}", node.origin);
+            assert_eq!(claim_ids(node), claim_ids(&alder), "{}", node.origin);
+            assert_eq!(
+                node.checkpoint_manifest(&checkpoint, cut).unwrap(),
+                manifest,
+                "{}",
+                node.origin
+            );
+            assert_eq!(
+                node.trimmed_checkpoint().unwrap().unwrap().drop_digest,
+                chosen.terms.drop_digest
+            );
+            assert!(!kinds(&step(node, &context)).contains(&"manifest-needed"));
+        }
+
+        // Every writer seals the next checkpoint, which ends its excusal, and all four trim it
+        // together.
+        let next = CheckpointContext {
+            now_unix_ms: context.now_unix_ms + DAY_MS,
+            ..context.clone()
+        };
+        for node in all {
+            observe(node, 2);
+        }
+        sync(&all);
+        for round in ["sealed", "verified", "trimmed"] {
+            for node in all {
+                assert!(
+                    kinds(&step(node, &next)).contains(&round),
+                    "{} did not reach {round}",
+                    node.origin
+                );
+            }
+            sync(&all);
+        }
+        for node in all {
+            assert_eq!(authority(node), authority(&alder), "{}", node.origin);
+            assert_eq!(claim_ids(node), claim_ids(&alder), "{}", node.origin);
+        }
     }
 
     #[test]

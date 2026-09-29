@@ -46,7 +46,8 @@ pub use checkpoint_agreement::{
     CHECKPOINT_ATTENTION_AFTER_MS, CHECKPOINT_EXCUSED, CHECKPOINT_PROTOCOL, CHECKPOINT_SEALED,
     CHECKPOINT_VERIFIED, Certificate, CheckpointAction, CheckpointClaim, CheckpointContext,
     CheckpointExcuseRequest, CheckpointStatusView, PendingCheckpointView, SealTerms,
-    VerifiedTerms, certificates, checkpoint_build, excused_writers, first_verifications,
+    VerifiedTerms, certificates, checkpoint_build, chosen_certificate, excused_writers,
+    first_verifications,
     newest_seals, participants as checkpoint_participants, stable_checkpoints,
 };
 use checkpoint_agreement::write_time;
@@ -1163,6 +1164,7 @@ impl CompactReplicationInventory {
             envelopes: self.identities(&self.envelopes),
             buckets: Vec::new(),
             accepts: None,
+            checkpoint: None,
         }
     }
 
@@ -11770,6 +11772,7 @@ impl Store {
                 envelopes: Vec::new(),
                 buckets: snapshot.buckets.clone(),
                 accepts: Some(REPLICATION_PAGE_LIMIT),
+                checkpoint: self.trimmed_checkpoint()?,
             },
             envelopes: Vec::new(),
             signature_requests,
@@ -11827,6 +11830,7 @@ impl Store {
                     envelopes: listed,
                     buckets: snapshot.buckets.clone(),
                     accepts: Some(REPLICATION_PAGE_LIMIT),
+                    checkpoint: self.trimmed_checkpoint()?,
                 },
                 envelopes: self.replica_envelopes(missing)?,
                 signature_requests: Vec::new(),
@@ -11864,6 +11868,7 @@ impl Store {
             graph_digest: snapshot.graph_digest.clone(),
             inventory: ReplicationInventory {
                 accepts: Some(REPLICATION_PAGE_LIMIT),
+                checkpoint: self.trimmed_checkpoint()?,
                 ..if same {
                     ReplicationInventory {
                         digest: snapshot.inventory.digest.clone(),
@@ -12067,6 +12072,7 @@ impl Store {
                 envelopes: Vec::new(),
                 buckets: Vec::new(),
                 accepts: None,
+                checkpoint: None,
             },
         })
     }
@@ -21723,6 +21729,7 @@ impl TestReplica {
             envelopes: Vec::new(),
             buckets,
             accepts: None,
+            checkpoint: None,
         }
     }
 
@@ -21750,6 +21757,7 @@ impl TestReplica {
             envelopes: listed,
             buckets,
             accepts: None,
+            checkpoint: None,
         };
         (missing, inventory)
     }
@@ -21811,6 +21819,7 @@ fn compact_replication_exchange_lists_only_ranges_that_differ() {
         envelopes: left.0.iter().cloned().collect(),
         buckets: Vec::new(),
         accepts: None,
+        checkpoint: None,
     })
     .unwrap()
     .len();
@@ -21914,6 +21923,7 @@ fn compact_replication_exchange_waits_for_a_complete_listing() {
         envelopes: test_envelope_ids("origin", 1..=8, "a"),
         buckets: peer.summary().buckets,
         accepts: None,
+        checkpoint: None,
     };
     let (missing, _) = compact_replication_difference(&inventory, &buckets, &listing, limit);
     assert_eq!(missing, test_envelope_ids("origin", 9..=10, "a"));
@@ -31569,6 +31579,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                 }],
                 buckets: Vec::new(),
                 accepts: None,
+                checkpoint: None,
             },
             envelopes: vec![candidate],
             signature_requests: Vec::new(),
@@ -31641,6 +31652,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                     .collect(),
                 buckets: Vec::new(),
                 accepts: None,
+                checkpoint: None,
             },
             envelopes,
             signature_requests: Vec::new(),
@@ -31687,6 +31699,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                     .collect(),
                 buckets: Vec::new(),
                 accepts: None,
+                checkpoint: None,
             },
             envelopes,
             signature_requests: Vec::new(),

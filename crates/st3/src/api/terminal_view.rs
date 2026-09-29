@@ -403,7 +403,11 @@ impl Emulator {
                 }
                 let style = Style::of(cell.fg, cell.bg, cell.flags);
                 let hidden = cell.flags.contains(Flags::HIDDEN);
-                let character = if hidden || cell.c == '\t' { ' ' } else { cell.c };
+                let character = if hidden || cell.c == '\t' {
+                    ' '
+                } else {
+                    cell.c
+                };
                 let run = match runs.last_mut() {
                     Some(run) if run.style == style => run,
                     _ => {
@@ -473,9 +477,8 @@ impl Emulator {
         let Value::Object(body) = body else {
             unreachable!("the screen body is an object")
         };
-        let revision = hex::encode(
-            &Sha256::digest(serde_json::to_vec(&body).unwrap_or_default())[..12],
-        );
+        let revision =
+            hex::encode(&Sha256::digest(serde_json::to_vec(&body).unwrap_or_default())[..12]);
         Screen { body, revision }
     }
 }
@@ -646,7 +649,9 @@ mod tests {
     fn screen_of(rows: u16, columns: u16, bytes: &[u8]) -> Value {
         let mut emulator = Emulator::new(rows, columns, TitleListener::default());
         emulator.feed(bytes);
-        emulator.screen("fallback").value("terminal/demo", "1:now", 7)
+        emulator
+            .screen("fallback")
+            .value("terminal/demo", "1:now", 7)
     }
 
     #[test]
@@ -671,7 +676,10 @@ mod tests {
             screen["lines"][1]["runs"],
             json!([{ "text": "inv", "fg": "#010203", "bg": 200, "inverse": true }])
         );
-        assert_eq!(screen["lines"][2], json!({ "row": 2, "text": "", "runs": [], "redacted": false, "truncated": false }));
+        assert_eq!(
+            screen["lines"][2],
+            json!({ "row": 2, "text": "", "runs": [], "redacted": false, "truncated": false })
+        );
         assert_eq!(screen["rows"], 3);
         assert_eq!(screen["columns"], 20);
         assert_eq!(screen["title"], "fallback");
@@ -682,7 +690,10 @@ mod tests {
         let screen = screen_of(1, 10, b"ok\x1b[44m   \x1b[0m");
         let line = &screen["lines"][0];
         assert_eq!(line["text"], "ok");
-        assert_eq!(line["runs"], json!([{ "text": "ok" }, { "text": "   ", "bg": 4 }]));
+        assert_eq!(
+            line["runs"],
+            json!([{ "text": "ok" }, { "text": "   ", "bg": 4 }])
+        );
     }
 
     #[test]
@@ -730,14 +741,8 @@ mod tests {
         first.feed(b"same");
         let mut second = Emulator::new(2, 10, TitleListener::default());
         second.feed(b"sa\x1b[Kme");
-        assert_eq!(
-            first.screen("t").revision(),
-            second.screen("t").revision()
-        );
+        assert_eq!(first.screen("t").revision(), second.screen("t").revision());
         second.feed(b"!");
-        assert_ne!(
-            first.screen("t").revision(),
-            second.screen("t").revision()
-        );
+        assert_ne!(first.screen("t").revision(), second.screen("t").revision());
     }
 }

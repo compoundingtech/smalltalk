@@ -2531,6 +2531,7 @@ mod tests {
                     .collect(),
                 buckets: Vec::new(),
                 accepts: None,
+                checkpoint: None,
             },
             envelopes,
             ..exchange.clone()

@@ -432,6 +432,15 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/internal/replication/checkpoint",
             post(replication_checkpoint_manifest),
         )
+        .route(
+            "/v1/internal/replication/checkpoint-need",
+            post(replication_checkpoint_need),
+        )
+        .route(
+            "/v1/internal/replication/checkpoint-adopt",
+            post(replication_checkpoint_adopt)
+                .layer(DefaultBodyLimit::max(crate::peer::MAX_MANIFEST_BYTES)),
+        )
         .route("/v1/internal/fleet/membership", get(fleet_membership_view))
         .route("/v1/internal/fleet/status", get(fleet_status))
         .route(
@@ -4216,6 +4225,29 @@ async fn replication_checkpoint_manifest(
     blocking_store(move || store.checkpoint_manifest_page(&request))
         .await
         .map(Json)
+}
+
+/// The newest stable checkpoint this node needs a peer's manifest for, if any.
+async fn replication_checkpoint_need(
+    State(state): State<AppState>,
+) -> Result<Json<Option<crate::store::CheckpointManifestNeed>>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.checkpoint_manifest_need())
+        .await
+        .map(Json)
+}
+
+/// Adopt a checkpoint from the manifest the replication worker fetched from a peer.
+async fn replication_checkpoint_adopt(
+    State(state): State<AppState>,
+    Json(manifest): Json<crate::store::CheckpointManifest>,
+) -> Result<Json<Vec<crate::store::CheckpointAction>>, ApiError> {
+    let store = state.store.clone();
+    let actions = blocking_action(move || store.adopt_checkpoint(&manifest)).await?;
+    if !actions.is_empty() {
+        signal_changed(&state);
+    }
+    Ok(Json(actions))
 }
 
 async fn replication_receive(
