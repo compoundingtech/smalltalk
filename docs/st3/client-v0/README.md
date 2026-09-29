@@ -156,6 +156,12 @@ replication exchange carries, with `peer_only_envelopes` (held by the peer, miss
 `local_only_envelopes`, `last_exchange_at`, and `estimated_catch_up_seconds` (null until a rate is
 measured). Clients show the notice above the page. The page omits it once the host has caught up.
 
+The notice's `state` is `diverged` instead while the host's graph has diverged from a peer's: both
+hold the same envelopes but project different graphs from them, so the page can be wrong, not just
+early, and more exchanges will not fix it. Each diverged peer carries `diverged_since`; a notice can
+list catching-up peers beside it. Clients say so prominently (stui's header shows `⚠ diverged`)
+until the page omits the notice.
+
 IDs are stable opaque strings with a type prefix. Renames change labels, not IDs. A detail response
 uses the same representation as its list item plus its documented detail fields. Deletion is
 represented by an event tombstone; an ID is never reused.
