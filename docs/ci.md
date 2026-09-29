@@ -17,6 +17,28 @@ directory. Each run isolates `HOME` and XDG directories. Forked pull requests
 are excluded before any code from them runs on these machines. GitHub Actions handles tags
 and forks.
 
+## Merge rule
+
+The `main` ruleset refuses to merge a pull request into `main` unless `st/ci` succeeded on the
+pull request's exact head and that head is up to date with `main`. Nobody can bypass it.
+Merging one pull request therefore makes every other open pull request behind `main`.
+
+To merge, update the branch with `main` (`gh pr update-branch NUMBER`, or merge `main` yourself),
+wait for `st/ci` on the new head, and merge while the pull request is still not behind. Merge
+one pull request at a time.
+
+- A head that is not up to date is refused with "Head branch is not up to date with the base
+  branch", and a head without a passing `st/ci` is refused with "Required status check st/ci is
+  expected", however the merge is attempted.
+- A failed run, or a head whose run was skipped, is re-run by pushing a new head; merging
+  `main` into the branch is enough. A closed pull request and a draft get no `st/ci` status. The
+  observed head of a reopened or ready pull request is only run again when it changes.
+- A fork's code never runs on these machines. So the rule does not block forks, `st/ci` posts
+  one success on a fork's head that says it does not run for forks. GitHub Actions is what checks
+  the fork.
+- `st/ci` runs as the `agent/fleet/smalltalk-ci` seat. If it stops, no pull request can merge
+  until CI runs again; change the `main` ruleset only for that.
+
 ## Inspect a failure
 
 The commit status description includes the mission run ID. On hetz:
