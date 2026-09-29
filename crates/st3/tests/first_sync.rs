@@ -2,10 +2,10 @@
 //! loopback, with the time split by stage on both nodes.
 //!
 //! ```sh
-//! TMPDIR=/var/tmp cargo test --release -p st3 --test first_sync -- --ignored --nocapture
+//! TMPDIR=/var/tmp cargo test --release -p st3 --test first_sync -- --nocapture
 //! ```
 //!
-//! It is ignored by default because it takes minutes, and a debug build skips it.
+//! A debug build skips it, as does a Nix build, whose sandbox is no place to time a sync.
 //!
 //! - `FIRST_SYNC_ENVELOPES` changes the store size.
 //! - `FIRST_SYNC_DEADLINE_SECS` changes the two-minute limit, for example to profile a sync that
@@ -59,10 +59,13 @@ mission "bench/build" state="ready" {
 const RENEWALS_PER_STEP: usize = 5;
 
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "benchmark: cargo test --release -p st3 --test first_sync -- --ignored --nocapture"]
 async fn an_empty_node_syncs_its_peer_within_two_minutes() {
     if cfg!(debug_assertions) {
         println!("skipped: a debug build is too slow to measure; run with cargo test --release");
+        return;
+    }
+    if std::env::var_os("NIX_BUILD_TOP").is_some() {
+        println!("skipped: a Nix build sandbox is no place to time a sync");
         return;
     }
     let target_envelopes = env_number("FIRST_SYNC_ENVELOPES", 130_000);
