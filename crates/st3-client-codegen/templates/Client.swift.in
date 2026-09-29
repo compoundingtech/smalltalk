@@ -38,6 +38,34 @@ public actor St3Client {
         if let limit { query.append(.init(name: "limit", value: String(limit))) }
         return try await get("v1/client/sessions/\(Self.routedSessionID(sessionID))/timeline", query: query)
     }
+    public func conversationChanges(sessionID: String, after: String? = nil, waitMS: UInt64 = 0) async throws -> Envelope<ConversationChanges> {
+        var query: [URLQueryItem] = [.init(name: "wait_ms", value: String(waitMS))]
+        if let after { query.append(.init(name: "after", value: after)) }
+        return try await get("v1/client/conversations/\(Self.routedSessionID(sessionID))/changes", query: query)
+    }
+    public func conversationStream(sessionID: String, after: String? = nil) -> AsyncThrowingStream<Envelope<ConversationChanges>, Error> {
+        var components = URLComponents(url: baseURL.appending(path: "v1/client/conversations/\(Self.routedSessionID(sessionID))/stream"), resolvingAgainstBaseURL: false)!
+        components.scheme = components.scheme == "https" ? "wss" : "ws"
+        if let after { components.queryItems = [.init(name: "after", value: after)] }
+        var request = URLRequest(url: components.url!); request.setValue("st3.client.conversation.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
+        let task = session.webSocketTask(with: request)
+        return AsyncThrowingStream { continuation in
+            continuation.onTermination = { _ in task.cancel(with: .normalClosure, reason: nil) }
+            task.resume()
+            Task {
+                let decoder = JSONDecoder()
+                while true {
+                    let message: URLSessionWebSocketTask.Message
+                    do { message = try await task.receive() } catch { continuation.finish(throwing: task.closeCode == .normalClosure ? nil : error); return }
+                    do {
+                        let data = try Self.websocketData(from: message)
+                        if let error = try? decoder.decode(ErrorEnvelope.self, from: data) { throw error }
+                        continuation.yield(try decoder.decode(Envelope<ConversationChanges>.self, from: data))
+                    } catch { continuation.finish(throwing: error); task.cancel(with: .normalClosure, reason: nil); return }
+                }
+            }
+        }
+    }
     public func events(after: String? = nil, limit: Int? = nil, waitMS: UInt64? = nil) async throws -> Envelope<EventPage> {
         var query: [URLQueryItem] = []
         if let after { query.append(.init(name: "after", value: after)) }; if let limit { query.append(.init(name: "limit", value: String(limit))) }; if let waitMS { query.append(.init(name: "wait_ms", value: String(waitMS))) }

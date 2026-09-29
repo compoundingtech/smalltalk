@@ -193,10 +193,20 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn capabilities(&self) -> Result<Envelope<Capabilities>, ClientError> {{ self.capabilities_internal().await }}"
             )?;
+        } else if id == "document.get" {
+            writeln!(
+                out,
+                "    pub async fn document_get(&self, name: &str) -> Result<Envelope<DocumentContent>, ClientError> {{ self.get(&format!(\"/v1/client/documents/content?name={{}}\", percent_encode(name))).await }}"
+            )?;
         } else if id == "timeline.list" {
             writeln!(
                 out,
                 "    pub async fn timeline(&self, session_id: &str, cursor: Option<&str>, limit: Option<usize>) -> Result<Envelope<TimelinePage>, ClientError> {{ self.timeline_page_internal(session_id, cursor, limit).await }}"
+            )?;
+        } else if id == "conversation.changes" {
+            writeln!(
+                out,
+                "    pub async fn conversation_changes(&self, session_id: &str, after: Option<&str>, wait_ms: u64) -> Result<Envelope<ConversationChanges>, ClientError> {{ self.conversation_changes_internal(session_id, after, wait_ms).await }}"
             )?;
         } else if id == "events.list" {
             writeln!(
@@ -267,11 +277,17 @@ fn swift_operation_methods(
             id,
             "capabilities.get"
                 | "timeline.list"
+                | "conversation.changes"
                 | "events.list"
                 | "terminal.screen"
                 | "agent-queue.get"
         ) {
             continue;
+        } else if id == "document.get" {
+            writeln!(
+                out,
+                "    public func documentGet(name: String) async throws -> Envelope<DocumentContent> {{ try await get(\"v1/client/documents/content\", query: [.init(name: \"name\", value: name)]) }}"
+            )?;
         } else if id.ends_with(".get") {
             let collection = path
                 .trim_start_matches("/v1/client/")
@@ -433,11 +449,15 @@ fn validate_surfaces(
     }
     for definition in [
         "AttentionTargetState",
+        "DocumentContent",
+        "LaunchPreview",
+        "MissionRunSummary",
         "AgentQueue",
         "AgentQueueRun",
         "AgentQueueMove",
         "TimelineEntry",
         "TimelinePage",
+        "ConversationChanges",
         "PairingBegin",
         "PairingChallenge",
         "PairingComplete",
@@ -450,6 +470,10 @@ fn validate_surfaces(
         "MachineCapacity",
         "MachineOccupancy",
         "MachineTransport",
+        "ObserverSpec",
+        "SubscriptionSpec",
+        "SyncNotice",
+        "SyncPeer",
         "StructuredDiff",
         "Visualization",
         "VisualizationNode",
@@ -498,6 +522,7 @@ fn validate_surfaces(
         let rust_method = match read["id"].as_str().context("read id")? {
             "capabilities.get" => "capabilities".into(),
             "timeline.list" => "timeline".into(),
+            "conversation.changes" => "conversation_changes".into(),
             "events.list" => "events".into(),
             "terminal.screen" => "terminal_screen".into(),
             "agent-queue.get" => "agent_queue".into(),
@@ -507,6 +532,7 @@ fn validate_surfaces(
         let swift_method = match read["id"].as_str().unwrap() {
             "capabilities.get" => "capabilities".into(),
             "timeline.list" => "timeline".into(),
+            "conversation.changes" => "conversationChanges".into(),
             "events.list" => "events".into(),
             "terminal.screen" => "terminalScreen".into(),
             "agent-queue.get" => "agentQueue".into(),
@@ -921,6 +947,16 @@ fn typescript_operation_methods(
             writeln!(
                 out,
                 "    async {method}(options: EventOptions = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query(options), 'events'); }}"
+            )?;
+        } else if id == "document.get" {
+            writeln!(
+                out,
+                "    async {method}(name: string): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ name }})); }}"
+            )?;
+        } else if id == "conversation.changes" {
+            writeln!(
+                out,
+                "    async {method}(id: string, options: {{ after?: string; wait_ms?: number }} = {{}}): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query(options)); }}"
             )?;
         } else if id == "timeline.list" || id == "terminal.screen" || id.ends_with(".get") {
             let query_suffix = if id == "timeline.list" {

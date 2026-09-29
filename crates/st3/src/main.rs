@@ -27,11 +27,12 @@ use st3::model::{
     MissionRevisionRequest, MissionRunView, MissionState, OperationalRepairApplyRequest,
     OperationalRepairPlan, OperationalRepairResult, PlannerSpec, PlanningApprovalRequest,
     PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningSessionView,
-    ReplicaRecordView, ReplicationRepairRequest, ReplicationStatus, ReviewRequest,
-    RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView,
-    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
-    SessionScreen, SessionSignalRequest, StatusResponse, StepRunView, SubscriptionRequestDecision,
-    SubscriptionRequestView, WorkRequest, WorkRetryRequest, WorkWakeRequest,
+    ReplicaRecordView, ReplicationPeerStatus, ReplicationRepairRequest, ReplicationStatus,
+    ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView,
+    RevisionSubmissionView, RunGenerationView, SessionControlResponse, SessionInputMode,
+    SessionInputRequest, SessionScreen, SessionSignalRequest, StatusResponse, StepRunView,
+    SubscriptionRequestDecision, SubscriptionRequestView, WorkRequest, WorkRetryRequest,
+    WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -43,7 +44,8 @@ use st3_client::{
     TargetParameters as ClientTargetParameters, TerminalInputMode as ClientTerminalInputMode,
     TerminalInputParameters as ClientTerminalInputParameters,
     TerminalScreen as ClientTerminalScreen, TimelineBody as ClientTimelineBody,
-    TimelineEntry as ClientTimelineEntry, TimelinePage as ClientTimelinePage,
+    TimelineEntry as ClientTimelineEntry, TimelinePage as ClientTimelinePage, catch_up_estimate,
+    envelope_count,
 };
 use tokio::sync::{Notify, watch};
 
@@ -93,6 +95,8 @@ enum Command {
     Up(UpArgs),
     /// Understand what needs action now.
     Now(NowArgs),
+    /// Show token spend over a period, with the largest spenders first.
+    Usage(UsageArgs),
     /// Inspect and control missions.
     Missions {
         #[command(subcommand)]
@@ -136,6 +140,11 @@ enum Command {
     },
     /// Check the daemon and runtime dependencies.
     Doctor(DoctorArgs),
+    /// Summarize git and gh command logs.
+    Recorder {
+        #[command(subcommand)]
+        command: RecorderCommand,
+    },
     /// Preview or apply bounded graph-authorized operational repairs.
     Repair {
         #[command(subcommand)]
@@ -1438,6 +1447,8 @@ enum LaunchCommand {
 
 #[derive(Subcommand)]
 enum MissionViewCommand {
+    /// Show active runs, standing queues, unstarted missions, and agents by host.
+    Tree,
     /// List current missions; use --all for historical terminal missions.
     Ls {
         #[arg(long)]
@@ -1830,6 +1841,24 @@ struct NowArgs {
     limit: usize,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum UsageBy {
+    Agent,
+    Mission,
+    Model,
+    Host,
+}
+
+#[derive(Args)]
+struct UsageArgs {
+    /// Length of the period ending now.
+    #[arg(long, default_value_t = 24)]
+    hours: u64,
+    /// Show only this grouping; the default shows all four.
+    #[arg(long, value_enum)]
+    by: Option<UsageBy>,
+}
+
 #[derive(Args)]
 struct MachinesArgs {
     /// Include historical and discovered hosts beyond the current configured fleet.
@@ -1909,6 +1938,25 @@ enum TraceCommand {
 struct DoctorArgs {
     #[arg(long)]
     strict: bool,
+}
+
+#[derive(Subcommand)]
+enum RecorderCommand {
+    /// Summarize recent calls from local or supplied host logs.
+    Report(RecorderReportArgs),
+}
+
+#[derive(Args)]
+struct RecorderReportArgs {
+    /// Include calls from the last number of hours.
+    #[arg(long, default_value_t = 24)]
+    hours: u64,
+    /// Read this JSONL log. Repeat for logs copied from other hosts; defaults to this host's log.
+    #[arg(long = "log")]
+    logs: Vec<PathBuf>,
+    /// Number of slow calls to show.
+    #[arg(long, default_value_t = 10)]
+    top: usize,
 }
 
 #[derive(Subcommand)]
@@ -2281,6 +2329,8 @@ enum AttentionCommand {
     Approve(ReviewArgs),
     /// Reject one person-owned gate or launch review.
     Reject(ReviewArgs),
+    /// Ask a feedback-mode step to change its work and rerun.
+    RequestChanges(FeedbackReviewArgs),
 }
 
 #[derive(Args)]
@@ -2583,6 +2633,15 @@ struct ReviewArgs {
 }
 
 #[derive(Args)]
+struct FeedbackReviewArgs {
+    target: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    actor: String,
+}
+
+#[derive(Args)]
 struct DriverArgs {
     #[arg(value_parser = ["claude", "claude-mcp", "codex", "pi", "pi-channel", "omp", "omp-channel", "opencode", "exec"])]
     driver: String,
@@ -2618,9 +2677,41 @@ impl std::fmt::Display for CommandExit {
 
 impl std::error::Error for CommandExit {}
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // A recorder link starts st3 as `git` or `gh`. It must not build the async runtime.
+    if let Some(program) = st3::recorder::invoked_program() {
+        st3::recorder::run(program);
+    }
     let cli = Cli::parse();
+    if let Command::Up(args) = &cli.command {
+        record_daemon_commands(args);
+    }
+    run_cli(cli)
+}
+
+/// The daemon finds `git` and `gh` through its recorder like every member does. `run_up` installs
+/// the directory; until then PATH lookups skip it.
+fn record_daemon_commands(args: &UpArgs) {
+    let state_dir = match &args.state_dir {
+        Some(state_dir) => state_dir.clone(),
+        None => match Config::load_unvalidated(args.config.as_deref()) {
+            Ok(config) => config.state_dir,
+            // `run_up` reports the configuration error.
+            Err(_) => return,
+        },
+    };
+    let Ok(directory) = st3::recorder::directory(&state_dir) else {
+        return;
+    };
+    let Ok(path) = st3::recorder::prepend(&directory, std::env::var_os("PATH").as_deref()) else {
+        return;
+    };
+    // SAFETY: no other thread exists yet; the async runtime starts after this returns.
+    unsafe { std::env::set_var("PATH", path) };
+}
+
+#[tokio::main]
+async fn run_cli(cli: Cli) -> ExitCode {
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -2711,6 +2802,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Up(_) => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
         Command::Now(args) => run_now(&endpoint, config.person.as_deref(), args, cli.json).await,
+        Command::Usage(args) => run_usage(&immediate, args, cli.json).await,
         Command::Launch { command } => {
             run_launch(&client, &endpoint, command, &config.planner, cli.json).await
         }
@@ -2757,6 +2849,7 @@ async fn run(cli: Cli) -> Result<()> {
             .await
         }
         Command::Doctor(args) => run_doctor(&immediate, args, cli.json).await,
+        Command::Recorder { command } => run_recorder(command, &config, cli.json),
         Command::Repair { command } => run_repair(&client, command, cli.json).await,
         Command::Replication { command } => run_replication(&client, command, cli.json).await,
         Command::Fleet { command } => run_fleet(&endpoint, command, cli.json).await,
@@ -2829,6 +2922,7 @@ fn guard_mutating_cli_actor(
             AttentionCommand::Resolve(args) => Some(args.actor.as_str()),
             AttentionCommand::Withdraw(args) => Some(args.actor.as_str()),
             AttentionCommand::Approve(args) | AttentionCommand::Reject(args) => Some(args.actor.as_str()),
+            AttentionCommand::RequestChanges(args) => Some(args.actor.as_str()),
             _ => None,
         },
         Command::Launch { command } => match command {
@@ -2874,6 +2968,37 @@ fn run_claude_channel(command: ClaudeChannelCommand) -> Result<()> {
             st2::claude_channel::install_st3_policy().map(|_| ())
         }
         ClaudeChannelCommand::UninstallPolicy => st2::claude_channel::uninstall_st3_policy(),
+    }
+}
+
+fn run_recorder(command: RecorderCommand, config: &Config, json_output: bool) -> Result<()> {
+    match command {
+        RecorderCommand::Report(args) => {
+            anyhow::ensure!(args.hours > 0, "--hours must be greater than zero");
+            let hours = i64::try_from(args.hours).context("--hours is too large")?;
+            let window = chrono::Duration::try_hours(hours).context("--hours is too large")?;
+            let until = chrono::Utc::now();
+            let since = until
+                .checked_sub_signed(window)
+                .context("--hours is too large")?;
+            let logs = if args.logs.is_empty() {
+                let local = st3::recorder::log_path(&config.state_dir)?;
+                if local.exists() {
+                    vec![local]
+                } else {
+                    Vec::new()
+                }
+            } else {
+                args.logs
+            };
+            let report = st3::recorder_report::summarize(logs, since, until, args.top)?;
+            if json_output {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                print!("{}", st3::recorder_report::render(&report));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -2976,6 +3101,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         Some(pty_binary) => pty_binary,
         None => st_runtime::resolve_executable("pty", &login_environment)?,
     };
+    let recorder = install_recorder(&config, &login_environment);
     let state = AppState {
         store: store.clone(),
         notify: notify.clone(),
@@ -2999,6 +3125,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         config.socket.display().to_string(),
         notify.clone(),
         event_notify.clone(),
+        recorder.map(|installation| installation.directory),
     )?);
     tokio::spawn(reconciler.supervise());
     tokio::spawn(trim_local_observations(
@@ -3037,6 +3164,47 @@ async fn run_up(args: UpArgs) -> Result<()> {
         serve_unix(&client_gateway_socket, fabric_router(state)),
     )?;
     Ok(())
+}
+
+/// Links `git` and `gh` to this executable for the daemon and its members. The daemon still
+/// starts when it cannot; it then says so, and nothing is recorded.
+fn install_recorder(
+    config: &Config,
+    login_environment: &BTreeMap<String, String>,
+) -> Option<st3::recorder::Installation> {
+    let daemon_path = std::env::var_os("PATH").unwrap_or_default();
+    let login_path = login_environment
+        .get("PATH")
+        .map(std::ffi::OsString::from)
+        .unwrap_or_default();
+    let installed = std::env::current_exe()
+        .context("find the st3 executable")
+        .and_then(|executable| {
+            st3::recorder::install(
+                &config.state_dir,
+                &config.node,
+                &executable,
+                &[&daemon_path, &login_path],
+            )
+        });
+    match installed {
+        Ok(installation) if installation.programs.is_empty() => {
+            eprintln!("st: neither git nor gh is on PATH, so no calls are recorded");
+            Some(installation)
+        }
+        Ok(installation) => {
+            eprintln!(
+                "st: recording {} calls in {}",
+                installation.programs.join(" and "),
+                installation.log.display()
+            );
+            Some(installation)
+        }
+        Err(error) => {
+            eprintln!("st: not recording git and gh calls: {error:#}");
+            None
+        }
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -3412,6 +3580,15 @@ async fn run_mission_view(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        MissionViewCommand::Tree => {
+            let view: Value = client.get("/v1/client/missions-tree").await?;
+            if json_output {
+                print_value(&view, true)
+            } else {
+                print!("{}", render_missions_tree(&view));
+                Ok(())
+            }
+        }
         MissionViewCommand::Ls { all, cursor, limit } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
@@ -4051,11 +4228,7 @@ async fn run_pty(
                 "terminals stream",
             )?;
             let mut stream = generated_client(endpoint, Some(&person))?
-                .terminal_stream(
-                    &args.subject,
-                    args.incarnation.as_deref(),
-                    &args.capability,
-                )
+                .terminal_stream(&args.subject, args.incarnation.as_deref(), &args.capability)
                 .await?;
             let mut shown = 0_u64;
             while args.count.is_none_or(|count| shown < count) {
@@ -4484,6 +4657,9 @@ fn render_now_page(page: &ClientPage, continuation_command: &str) -> String {
     });
     working.page.next_cursor = None;
     let mut output = String::new();
+    if let Some(sync) = &page.sync {
+        output.push_str(&render_sync_notice(sync, now_ms()));
+    }
     output.push_str(&render_product_page(
         "NEEDS YOU",
         &needs_you,
@@ -4654,11 +4830,40 @@ fn print_product_page(
     if json_output {
         return print_value(response, true);
     }
+    if let Some(sync) = &response.value.sync {
+        print!("{}", render_sync_notice(sync, now_ms()));
+    }
     print!(
         "{}",
         render_product_page(title, &response.value, continuation_command)
     );
     Ok(())
+}
+
+/// A host catching up with a peer shows early history as current, so say so before the items.
+fn render_sync_notice(sync: &st3_client::SyncNotice, now: u128) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    for peer in &sync.peers {
+        let last_exchange = peer
+            .last_exchange_at
+            .as_deref()
+            .and_then(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+            .map(|at| {
+                format!(
+                    " · last exchange {}",
+                    relative_time(at.timestamp_millis().max(0) as u128, now)
+                )
+            })
+            .unwrap_or_default();
+        let _ = writeln!(output, "SYNCING  {}{last_exchange}", peer.summary());
+    }
+    let _ = writeln!(
+        output,
+        "  Until then, items below can be out of date. Progress: st3 replication status\n"
+    );
+    output
 }
 
 /// `target mission/fleet/typecase: cancelled 4h ago`
@@ -4933,6 +5138,77 @@ fn render_usage(usage: &st3_client::UsageSummary) -> String {
         Some(used) => format!("not reported · context {used} tokens"),
         None => "not reported".into(),
     }
+}
+
+async fn run_usage(client: &Client, args: UsageArgs, json_output: bool) -> Result<()> {
+    anyhow::ensure!(args.hours > 0, "usage hours must be positive");
+    let until = current_unix_ms()? as u64;
+    let since = until.saturating_sub(args.hours.saturating_mul(3_600_000));
+    let report: Value = client.get(&format!("/v1/usage?since_ms={since}&until_ms={until}")).await?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    print!("{}", render_usage_report(&report, args.hours, args.by));
+    Ok(())
+}
+
+fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let groups = only.map(|by| vec![by]).unwrap_or_else(|| {
+        vec![UsageBy::Agent, UsageBy::Mission, UsageBy::Model, UsageBy::Host]
+    });
+    for by in groups {
+        let mut totals = BTreeMap::<String, [u64; 5]>::new();
+        for row in report["rows"].as_array().into_iter().flatten() {
+            let dimension = match by {
+                UsageBy::Agent => "agent",
+                UsageBy::Mission => "mission_run",
+                UsageBy::Model => "model",
+                UsageBy::Host => "host",
+            };
+            let label = row[dimension]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("unknown");
+            let entry = totals.entry(label.to_owned()).or_default();
+            for (index, field) in [
+                "total_tokens",
+                "input_tokens",
+                "output_tokens",
+                "cache_write_tokens",
+                "cached_tokens",
+            ]
+            .iter()
+            .enumerate()
+            {
+                entry[index] = entry[index].saturating_add(row[*field].as_u64().unwrap_or(0));
+            }
+        }
+        let mut totals = totals.into_iter().collect::<Vec<_>>();
+        totals.sort_by(|left, right| right.1[0].cmp(&left.1[0]).then_with(|| left.0.cmp(&right.0)));
+        let by = match by {
+            UsageBy::Agent => "agent",
+            UsageBy::Mission => "mission",
+            UsageBy::Model => "model",
+            UsageBy::Host => "host",
+        };
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        let _ = writeln!(output, "USAGE  {} · {}h · by {by}", totals.len(), hours);
+        let _ = writeln!(output, "TOTAL  INPUT  OUTPUT  CACHE WRITE  CACHE READ  {by}");
+        for (name, values) in totals {
+            let _ = writeln!(
+                output,
+                "{}  {}  {}  {}  {}  {name}",
+                values[0], values[1], values[2], values[3], values[4]
+            );
+        }
+    }
+    output
 }
 
 fn print_activity_page(
@@ -5440,6 +5716,78 @@ async fn run_repair(client: &Client, command: RepairCommand, json_output: bool) 
     Ok(())
 }
 
+/// Each peer's line, then how far apart the two envelope sets are and how long catching up
+/// should take, in words.
+fn render_replication_peers(peers: &[ReplicationPeerStatus], now: u128) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    for peer in peers
+        .iter()
+        .filter(|peer| peer.sync.as_ref().is_some_and(|sync| sync.catching_up))
+    {
+        let sync = peer.sync.as_ref().expect("filtered on sync");
+        let _ = writeln!(
+            output,
+            "sync\tcatching up: {} has {} this node lacks, {}",
+            peer.peer,
+            envelope_count(sync.peer_only_envelopes),
+            catch_up_estimate(sync.estimated_catch_up_seconds)
+        );
+    }
+    for peer in peers {
+        let _ = writeln!(
+            output,
+            "peer\t{}\t{}\t{}",
+            peer.peer,
+            peer.status,
+            peer.last_error.as_deref().unwrap_or("")
+        );
+        if let Some(at) = peer.last_success_at_unix_ms {
+            let _ = writeln!(output, "  last exchange {}", relative_time(at, now));
+        } else {
+            let _ = writeln!(output, "  no exchange yet");
+        }
+        let Some(sync) = &peer.sync else {
+            let _ = writeln!(output, "  difference not measured yet");
+            continue;
+        };
+        if sync.peer_only_envelopes == 0 && sync.local_only_envelopes == 0 {
+            let _ = writeln!(
+                output,
+                "  in sync: neither side has an envelope the other lacks (measured {})",
+                relative_time(sync.measured_at_unix_ms, now)
+            );
+            continue;
+        }
+        let _ = writeln!(
+            output,
+            "  {} has {} this node lacks",
+            peer.peer,
+            envelope_count(sync.peer_only_envelopes)
+        );
+        let _ = writeln!(
+            output,
+            "  this node has {} {} lacks",
+            envelope_count(sync.local_only_envelopes),
+            peer.peer
+        );
+        if sync.peer_only_envelopes != 0 {
+            let rate = sync
+                .receive_rate_per_second
+                .map(|rate| format!("receiving {rate:.1} envelopes/s, "))
+                .unwrap_or_default();
+            let _ = writeln!(
+                output,
+                "  {rate}{} (measured {})",
+                catch_up_estimate(sync.estimated_catch_up_seconds),
+                relative_time(sync.measured_at_unix_ms, now)
+            );
+        }
+    }
+    output
+}
+
 async fn run_replication(
     client: &Client,
     command: ReplicationCommand,
@@ -5467,14 +5815,33 @@ async fn run_replication(
                 status.repaired_records
             );
             println!("unhealthy-projections\t{}", status.unhealthy_projections);
-            for peer in status.peers {
+            for projection in &status.unhealthy {
                 println!(
-                    "peer\t{}\t{}\t{}",
-                    peer.peer,
-                    peer.status,
-                    peer.last_error.as_deref().unwrap_or("")
+                    "unhealthy\t{}\t{}\t{}",
+                    projection.aggregate,
+                    projection.error_code.as_deref().unwrap_or(""),
+                    projection.error_message.as_deref().unwrap_or("")
                 );
             }
+            let timings = &status.timings;
+            println!(
+                "timings\t{} exchanges, {} envelopes received; ms: round-trip={} export={} snapshot={} receipt={} admission={} (verify={}) projection={} repair={} signing={} sqlite={} ({} commits, {} ms)",
+                timings.exchanges,
+                timings.envelopes_received,
+                timings.round_trip_ms,
+                timings.export_ms,
+                timings.snapshot_ms,
+                timings.receipt_ms,
+                timings.admission_ms,
+                timings.verify_ms,
+                timings.projection_ms,
+                timings.repair_ms,
+                timings.signing_ms,
+                timings.sqlite_ms,
+                timings.commits,
+                timings.commit_ms
+            );
+            print!("{}", render_replication_peers(&status.peers, now_ms()));
             Ok(())
         }
         ReplicationCommand::Invalid { all } => {
@@ -6363,6 +6730,152 @@ async fn run_agent_queue(
     Ok(())
 }
 
+fn render_missions_tree(response: &Value) -> String {
+    use std::fmt::Write as _;
+    let value = &response["value"];
+    let mut output = String::from("RUNNING MISSIONS\n");
+    let runs = value["runs"].as_array();
+    if runs.is_none_or(Vec::is_empty) {
+        output.push_str("  none\n");
+    }
+    for run in runs.into_iter().flatten() {
+        let steps = run["steps"].as_array();
+        let done = steps
+            .into_iter()
+            .flatten()
+            .filter(|step| step["state"] == "completed")
+            .count();
+        let active_step = steps
+            .into_iter()
+            .flatten()
+            .find(|step| step["state"] == "claimed")
+            .or_else(|| {
+                steps
+                    .into_iter()
+                    .flatten()
+                    .find(|step| step["state"] == "ready")
+            })
+            .and_then(|step| step["id"].as_str());
+        let active = steps
+            .into_iter()
+            .flatten()
+            .find(|step| step["id"].as_str() == active_step)
+            .and_then(|step| step["name"].as_str())
+            .unwrap_or("waiting");
+        let pending = steps
+            .into_iter()
+            .flatten()
+            .filter(|step| step["state"] != "completed" && step["id"].as_str() != active_step)
+            .filter_map(|step| step["name"].as_str())
+            .collect::<Vec<_>>();
+        let mission = run["mission"].as_str().unwrap_or("unknown");
+        let _ = writeln!(
+            output,
+            "  {mission}: {active} → {}  ({done} done)",
+            if pending.is_empty() {
+                "done".to_owned()
+            } else {
+                pending.join(" → ")
+            }
+        );
+    }
+    output.push_str("STANDING QUEUES\n");
+    let queues = value["standing_queues"].as_array();
+    if queues.is_none_or(Vec::is_empty) {
+        output.push_str("  none\n");
+    }
+    for queue in queues.into_iter().flatten() {
+        let id = queue["agent_id"].as_str().unwrap_or("unknown");
+        let current = queue["current_work_ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        let next = queue["next_work_id"].as_str().unwrap_or("none");
+        let waiting = queue["runs"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|run| run["state"] == "waiting")
+            .filter_map(|run| run["mission_run_id"].as_str())
+            .collect::<Vec<_>>();
+        let _ = writeln!(
+            output,
+            "  {id}: current {} · next {next} · waiting {}",
+            if current.is_empty() {
+                "none".to_owned()
+            } else {
+                current.join(", ")
+            },
+            if waiting.is_empty() {
+                "none".to_owned()
+            } else {
+                waiting.join(", ")
+            }
+        );
+    }
+    output.push_str("UNSTARTED MISSIONS\n");
+    let unstarted = value["unstarted_missions"].as_array();
+    if unstarted.is_none_or(Vec::is_empty) {
+        output.push_str("  none\n");
+    }
+    for mission in unstarted.into_iter().flatten() {
+        let suffix = if mission["state"] == "draft" {
+            " (draft)"
+        } else {
+            ""
+        };
+        let _ = writeln!(
+            output,
+            "  {}{suffix}",
+            mission["title"].as_str().unwrap_or("unknown")
+        );
+    }
+    output.push_str("AGENTS BY HOST\n");
+    let mut grouped = BTreeMap::<String, BTreeMap<String, Vec<&Value>>>::new();
+    for agent in value["agents"].as_array().into_iter().flatten() {
+        let host = agent["host_id"].as_str().unwrap_or("unknown").to_owned();
+        let kind = agent["seat_kind"].as_str().unwrap_or("standing").to_owned();
+        grouped
+            .entry(host)
+            .or_default()
+            .entry(kind)
+            .or_default()
+            .push(agent);
+    }
+    if grouped.is_empty() {
+        output.push_str("  none\n");
+    }
+    for (host, kinds) in grouped {
+        let _ = writeln!(output, "  {host}");
+        for kind in ["standing", "mission"] {
+            let Some(agents) = kinds.get(kind) else {
+                continue;
+            };
+            let _ = writeln!(output, "    {kind}");
+            for agent in agents {
+                let state = if agent["harness_state"] == "working" {
+                    "working"
+                } else if agent["state"] == "running" {
+                    "idle"
+                } else {
+                    "waiting"
+                };
+                let _ = writeln!(
+                    output,
+                    "      {}  {} / {} / {}  {state}",
+                    agent["name"].as_str().unwrap_or("unknown"),
+                    agent["driver"].as_str().unwrap_or("unknown"),
+                    agent["model"].as_str().unwrap_or("default"),
+                    agent["effort"].as_str().unwrap_or("default")
+                );
+            }
+        }
+    }
+    output
+}
+
 fn render_agent_queue(queue: &st3_client::AgentQueue) -> String {
     use std::fmt::Write as _;
 
@@ -6471,6 +6984,13 @@ fn render_client_agent(
     }
     if let Some(owner) = &agent.owner_run_id {
         let _ = writeln!(output, "MISSION      {owner}");
+    }
+    if let Some(usage) = &agent.usage {
+        let _ = writeln!(output, "USAGE        {}", render_usage(usage));
+        if usage.incarnation_count > 0 {
+            let _ = writeln!(output, "TOKENS       input {} · output {} · cache write {} · cache read {}",
+                usage.input_tokens, usage.output_tokens, usage.cache_write_tokens, usage.cached_tokens);
+        }
     }
     for current in &agent.current_work_ids {
         let _ = writeln!(output, "CURRENT WORK {current}");
@@ -7021,6 +7541,19 @@ async fn run_attention(
         AttentionCommand::Reject(args) => {
             run_review_decision(client, "rejected", args, json_output).await
         }
+        AttentionCommand::RequestChanges(args) => {
+            run_review_decision(
+                client,
+                "changes-requested",
+                ReviewArgs {
+                    target: args.target,
+                    reason: Some(args.reason),
+                    actor: args.actor,
+                },
+                json_output,
+            )
+            .await
+        }
     }
 }
 
@@ -7477,6 +8010,7 @@ fn current_local_pty_incarnation(actor: &str) -> Result<Option<String>> {
 
 async fn wait_for_agent_incarnation(client: &Client, actor: &str) -> Result<String> {
     let mut deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    let mut outage_logged = false;
     let has_local_pty_registry =
         std::env::var_os("PTY_ROOT").is_some_and(|value| !value.is_empty());
     loop {
@@ -7494,6 +8028,13 @@ async fn wait_for_agent_incarnation(client: &Client, actor: &str) -> Result<Stri
                 Ok(None) => {}
                 // A restarting daemon cannot answer yet; its outage does not use up the wait.
                 Err(error) if st3::client::daemon_unreachable(&error).is_some() => {
+                    if !outage_logged {
+                        let _ = write_driver_log(
+                            actor,
+                            "waiting for the runtime incarnation while the daemon restarts",
+                        );
+                        outage_logged = true;
+                    }
                     deadline = tokio::time::Instant::now() + Duration::from_secs(15);
                 }
                 Err(error) => return Err(error),
@@ -9004,7 +9545,7 @@ fn timeline_claim_fields(
     operation: st2::harness_timeline::Operation,
     runtime_incarnation: &str,
 ) -> BTreeMap<String, Value> {
-    BTreeMap::from([
+    let mut fields = BTreeMap::from([
         (
             "operation".into(),
             Value::String(operation.operation.clone()),
@@ -9025,7 +9566,11 @@ fn timeline_claim_fields(
             "observed_at_unix_ms".into(),
             Value::from(operation.observed_at_unix_ms),
         ),
-    ])
+    ]);
+    if fields["entry_type"] == "usage" && let Some(source_id) = operation.source_id {
+        fields.insert("source_id".into(), Value::String(source_id));
+    }
+    fields
 }
 
 async fn publish_harness_state(
@@ -9836,11 +10381,12 @@ async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Resu
     let work: Vec<StepRunView> = client
         .get(&format!("/v1/work?actor={}", urlencoding::encode(subject)))
         .await?;
+    let mut failure = None;
     for step in work
         .into_iter()
         .filter(|step| work_claim_has_active_harness(step, subject, harness))
     {
-        let _: StepRunView = client
+        let renewed: Result<StepRunView> = client
             .post(
                 &format!("/v1/work/renew/{}", urlencoding::encode(&step.subject)),
                 &WorkRequest {
@@ -9852,9 +10398,31 @@ async fn renew_claimed_work(client: &Client, subject: &str, minute: u64) -> Resu
                     idempotency_key: format!("native-renew:{}:{subject}:{minute}", step.subject),
                 },
             )
-            .await?;
+            .await;
+        match renewed {
+            Ok(_) => {}
+            // The claim moved on between reading the work and renewing it. That step no longer
+            // needs this lease, and the driver's other steps still do.
+            Err(error) if renewal_lost_its_claim(&error) => {
+                let _ = write_driver_log(
+                    subject,
+                    &format!("skip renewing {}: {error:#}", step.subject),
+                );
+            }
+            Err(error) => {
+                failure.get_or_insert(error);
+            }
+        }
     }
-    Ok(())
+    failure.map_or(Ok(()), Err)
+}
+
+/// Whether a renewal failed only because the step's claim ended or moved to another incarnation.
+fn renewal_lost_its_claim(error: &anyhow::Error) -> bool {
+    matches!(
+        st3::client::api_error_code(error),
+        Some("work-not-claimed" | "wrong-work-incarnation")
+    )
 }
 
 fn work_claim_has_active_harness(
@@ -9998,6 +10566,42 @@ async fn record_native_delivery_diagnostic(
     Ok(())
 }
 
+async fn report_unforwarded_message(
+    client: &Client,
+    subject: &str,
+    incarnation: &str,
+    transport: &str,
+    message: &str,
+    reason: &str,
+) -> Result<()> {
+    let _: ClaimRecord = client
+        .post(
+            "/v1/claims",
+            &ClaimInput {
+                subject: subject.into(),
+                kind: "harness.diagnostic".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("severity".into(), Value::String("warning".into())),
+                    ("status".into(), Value::String("degraded".into())),
+                    ("code".into(), Value::String("message-unforwarded".into())),
+                    (
+                        "reason".into(),
+                        Value::String(format!("{message} could not be forwarded: {reason}")),
+                    ),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!(
+                    "message-unforwarded:{subject}:{incarnation}:{transport}:{message}"
+                )),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn supervise_native_delivery(
     client: &Client,
@@ -10013,7 +10617,20 @@ async fn supervise_native_delivery(
         return;
     }
     match forward_projected_messages(client, subject, inbox, archive, transport, receipts).await {
-        Ok(()) => {
+        Ok(unforwarded) => {
+            // A message that cannot be forwarded is recorded once on its own and retried with the
+            // next poll. It never pauses delivery of the recipient's other messages.
+            for (message, reason) in unforwarded {
+                let _ = report_unforwarded_message(
+                    client,
+                    subject,
+                    incarnation,
+                    transport,
+                    &message,
+                    &reason,
+                )
+                .await;
+            }
             if supervisor.failures == 0 {
                 return;
             }
@@ -10087,6 +10704,8 @@ async fn supervise_native_delivery(
     }
 }
 
+/// Forward the recipient's queued messages into its native inbox. Each message is forwarded on
+/// its own; the ones that could not be forwarded are returned with their reasons.
 async fn forward_projected_messages(
     client: &Client,
     subject: &str,
@@ -10094,7 +10713,7 @@ async fn forward_projected_messages(
     archive: &Path,
     transport: &str,
     receipts: NativeDeliveryReceipts<'_>,
-) -> Result<()> {
+) -> Result<Vec<(String, String)>> {
     const TAG_PREFIX: &str = "st3-message:";
     let mut present = projected_message_files(inbox, archive)?;
     let mut consumed_by_recipient = BTreeSet::new();
@@ -10121,6 +10740,7 @@ async fn forward_projected_messages(
         } => st2::opencode_session::consumed_delivery_filenames(catalog_root, identity, runtime_id),
     }?;
     let mut cursor = None;
+    let mut failures = Vec::new();
     loop {
         let page = message_page(client, Some(subject), false, cursor.as_deref()).await?;
         for message in page.items {
@@ -10132,69 +10752,79 @@ async fn forward_projected_messages(
             if !matches!(message.status.as_str(), "sent" | "staged") {
                 continue;
             }
-            let filename = if let Some(filename) = present.get(&message.subject) {
-                filename.clone()
-            } else {
-                let content = if message.content.starts_with("doc/") {
-                    let value: Value = client
-                        .get(&format!(
-                            "/v1/documents/content?reference={}",
-                            urlencoding::encode(&message.content)
-                        ))
-                        .await?;
-                    let bytes = serde_json::from_value::<Vec<u8>>(
-                        value
-                            .get("bytes")
-                            .cloned()
-                            .context("document response lacks bytes")?,
-                    )?;
-                    String::from_utf8(bytes).context("message document is not UTF-8")?
+            // One message that cannot be forwarded, such as a document missing on this host, is
+            // reported without holding back the messages after it.
+            let message_subject = message.subject.clone();
+            let forwarded: Result<()> = async {
+                let filename = if let Some(filename) = present.get(&message.subject) {
+                    filename.clone()
                 } else {
-                    message.content.clone()
+                    let content = if message.content.starts_with("doc/") {
+                        let value: Value = client
+                            .get(&format!(
+                                "/v1/documents/content?reference={}",
+                                urlencoding::encode(&message.content)
+                            ))
+                            .await?;
+                        let bytes = serde_json::from_value::<Vec<u8>>(
+                            value
+                                .get("bytes")
+                                .cloned()
+                                .context("document response lacks bytes")?,
+                        )?;
+                        String::from_utf8(bytes).context("message document is not UTF-8")?
+                    } else {
+                        message.content.clone()
+                    };
+                    let mut tags = message.tags.clone();
+                    tags.push(format!("{TAG_PREFIX}{}", message.subject));
+                    tags.push(format!("{}{}", st2::ding::ST3_TO_TAG, message.to));
+                    tags.push(format!(
+                        "{}{}",
+                        st2::ding::ST3_SHA256_TAG,
+                        st2::ding::st3_body_sha256(&content)
+                    ));
+                    let filename = st2::message::send_to_inbox(
+                        inbox,
+                        &message.from,
+                        message.title.as_deref(),
+                        message.in_reply_to.as_deref(),
+                        &tags,
+                        &content,
+                    )?;
+                    present.insert(message.subject.clone(), filename.clone());
+                    filename
                 };
-                let mut tags = message.tags.clone();
-                tags.push(format!("{TAG_PREFIX}{}", message.subject));
-                tags.push(format!("{}{}", st2::ding::ST3_TO_TAG, message.to));
-                tags.push(format!(
-                    "{}{}",
-                    st2::ding::ST3_SHA256_TAG,
-                    st2::ding::st3_body_sha256(&content)
-                ));
-                let filename = st2::message::send_to_inbox(
-                    inbox,
-                    &message.from,
-                    message.title.as_deref(),
-                    message.in_reply_to.as_deref(),
-                    &tags,
-                    &content,
-                )?;
-                present.insert(message.subject.clone(), filename.clone());
-                filename
-            };
-            if message.status == "sent" {
-                stage_message(
+                if message.status == "sent" {
+                    stage_message(
+                        client,
+                        &message.subject,
+                        subject,
+                        transport,
+                        stage_runtime_id,
+                        format!("native-staged:{transport}:{subject}:{}", message.subject),
+                    )
+                    .await?;
+                }
+                // Receipt-backed transports advance graph delivery only after their durable ledger proves
+                // that the exact inbox file was consumed by a provider turn. Materialization alone is
+                // merely queued native delivery.
+                if !native_delivery_receipted(&consumed, &filename) {
+                    return Ok(());
+                }
+                deliver_message(
                     client,
                     &message.subject,
                     subject,
-                    transport,
-                    stage_runtime_id,
-                    format!("native-staged:{transport}:{subject}:{}", message.subject),
+                    format!("native-delivered:{transport}:{subject}:{}", message.subject),
                 )
                 .await?;
+                Ok(())
             }
-            // Receipt-backed transports advance graph delivery only after their durable ledger proves
-            // that the exact inbox file was consumed by a provider turn. Materialization alone is
-            // merely queued native delivery.
-            if !native_delivery_receipted(&consumed, &filename) {
-                continue;
+            .await;
+            if let Err(error) = forwarded {
+                failures.push((message_subject, format!("{error:#}")));
             }
-            deliver_message(
-                client,
-                &message.subject,
-                subject,
-                format!("native-delivered:{transport}:{subject}:{}", message.subject),
-            )
-            .await?;
         }
         match page.next_cursor {
             Some(next) => cursor = Some(next),
@@ -10222,7 +10852,7 @@ async fn forward_projected_messages(
         }
     }
     sync_consumed_projected_messages(inbox, archive, &consumed_by_recipient)?;
-    Ok(())
+    Ok(failures)
 }
 
 #[derive(Clone, Copy)]
@@ -10534,6 +11164,7 @@ mod tests {
             schema_digest: None,
             authority_digest: digest.map(str::to_owned),
             graph_digest: None,
+            sync: None,
         }
     }
 
@@ -10567,6 +11198,42 @@ mod tests {
 
         status.peers[1].authority_digest = Some("mine".into());
         assert_eq!(leave_confirmation(&status, None).unwrap(), Some("c".into()));
+    }
+
+    #[test]
+    fn missions_tree_fixture_renders_all_sections() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/missions-tree.json"))
+                .expect("valid missions tree fixture");
+        assert_eq!(
+            render_missions_tree(&fixture),
+            include_str!("../tests/fixtures/missions-tree.txt")
+        );
+        let cli = Cli::try_parse_from(["st", "missions", "tree", "--json"])
+            .expect("missions tree --json parses");
+        assert!(cli.json);
+        assert!(matches!(
+            cli.command,
+            Command::Missions {
+                command: MissionViewCommand::Tree
+            }
+        ));
+    }
+
+    #[test]
+    fn usage_report_ranks_each_fleet_group_by_spend() {
+        let report = json!({"rows": [
+            {"agent":"agent/small","mission_run":"mission-run/one","model":"model-a","host":"host/a","total_tokens":9,"input_tokens":2,"output_tokens":1,"cache_write_tokens":0,"cached_tokens":6},
+            {"agent":"agent/large","mission_run":"mission-run/two","model":"model-b","host":"host/b","total_tokens":30,"input_tokens":5,"output_tokens":2,"cache_write_tokens":3,"cached_tokens":20},
+            {"agent":"agent/large","mission_run":"mission-run/two","model":"model-b","host":"host/b","total_tokens":10,"input_tokens":2,"output_tokens":1,"cache_write_tokens":1,"cached_tokens":6},
+        ]});
+        let output = render_usage_report(&report, 24, None);
+        assert_eq!(output.matches("USAGE  ").count(), 4);
+        assert!(output.find("40  7  3  4  26  agent/large").unwrap()
+            < output.find("9  2  1  0  6  agent/small").unwrap());
+        assert!(output.contains("40  7  3  4  26  mission-run/two"));
+        assert!(output.contains("40  7  3  4  26  model-b"));
+        assert!(output.contains("40  7  3  4  26  host/b"));
     }
 
     #[test]
@@ -11316,7 +11983,106 @@ mod tests {
                 next_cursor: has_more.then(|| "cursor/next".into()),
                 cursor_expires_at: None,
             },
+            sync: None,
         }
+    }
+
+    #[test]
+    fn replication_status_says_which_side_holds_what_and_how_long_catching_up_takes() {
+        let now = 1_000_000;
+        let peer =
+            |name: &str, sync: Option<st3::model::ReplicationPeerSync>| ReplicationPeerStatus {
+                peer: name.into(),
+                status: "up".into(),
+                last_success_at_unix_ms: Some(now - 2_000),
+                last_error: None,
+                schema_digest: None,
+                authority_digest: None,
+                graph_digest: None,
+                sync,
+            };
+        let output = render_replication_peers(
+            &[
+                peer(
+                    "Silber",
+                    Some(st3::model::ReplicationPeerSync {
+                        peer_only_envelopes: 124_384,
+                        local_only_envelopes: 3,
+                        measured_at_unix_ms: now - 2_000,
+                        receive_rate_per_second: Some(142.5),
+                        catch_up_rate_per_second: Some(140.0),
+                        estimated_catch_up_seconds: Some(889),
+                        catching_up: true,
+                    }),
+                ),
+                peer(
+                    "Quiet",
+                    Some(st3::model::ReplicationPeerSync {
+                        measured_at_unix_ms: now,
+                        ..Default::default()
+                    }),
+                ),
+                peer("Fresh", None),
+            ],
+            now,
+        );
+        assert_eq!(
+            output,
+            "sync\tcatching up: Silber has 124,384 envelopes this node lacks, \
+             caught up in about 15m\n\
+             peer\tSilber\tup\t\n\
+             \x20 last exchange 2s ago\n\
+             \x20 Silber has 124,384 envelopes this node lacks\n\
+             \x20 this node has 3 envelopes Silber lacks\n\
+             \x20 receiving 142.5 envelopes/s, caught up in about 15m (measured 2s ago)\n\
+             peer\tQuiet\tup\t\n\
+             \x20 last exchange 2s ago\n\
+             \x20 in sync: neither side has an envelope the other lacks (measured now)\n\
+             peer\tFresh\tup\t\n\
+             \x20 last exchange 2s ago\n\
+             \x20 difference not measured yet\n"
+        );
+    }
+
+    #[test]
+    fn a_catching_up_page_leads_with_how_far_behind_this_host_is() {
+        let mut page = fixture_product_page(&["attention"], false);
+        page.sync = Some(st3_client::SyncNotice {
+            state: "catching-up".into(),
+            peers: vec![st3_client::SyncPeer {
+                host_id: "host/Silber".into(),
+                peer_only_envelopes: 1,
+                local_only_envelopes: 0,
+                last_exchange_at: Some("1970-01-01T00:16:38Z".into()),
+                estimated_catch_up_seconds: None,
+            }],
+        });
+        let output = render_now_page(&page, "st3 now --as person/nathan");
+        assert!(
+            output.starts_with(
+                "SYNCING  Silber has 1 envelope this host lacks · estimating time to catch up · \
+                 last exchange "
+            ),
+            "{output}"
+        );
+        assert!(
+            output.contains("items below can be out of date"),
+            "{output}"
+        );
+        assert_eq!(
+            render_sync_notice(page.sync.as_ref().unwrap(), 1_000_000),
+            "SYNCING  Silber has 1 envelope this host lacks · estimating time to catch up · \
+             last exchange 2s ago\n  Until then, items below can be out of date. \
+             Progress: st3 replication status\n\n"
+        );
+        assert_eq!(catch_up_estimate(Some(0)), "caught up");
+        assert_eq!(catch_up_estimate(Some(59)), "caught up in under a minute");
+        assert_eq!(catch_up_estimate(Some(3_601)), "caught up in about 1h 1m");
+        assert_eq!(catch_up_estimate(Some(90_000)), "caught up in about 1d 1h");
+        assert_eq!(envelope_count(1_234_567), "1,234,567 envelopes");
+
+        page.sync = None;
+        assert!(!render_now_page(&page, "st3 now").contains("SYNCING"));
     }
 
     #[test]
@@ -11391,6 +12157,7 @@ mod tests {
             reasons: vec!["requester-retired".into()],
             owner_generation: None,
             runtime_incarnation: None,
+            runtime_desired_revision: None,
         });
         let rendered = render_product_page("NOW", &page, "st now");
         assert!(
@@ -13266,6 +14033,122 @@ mission "review" state="ready" {
                 st2::ding::st3_body_sha256("FACT <b>QUARTZ</b>")
             )
         );
+    }
+
+    /// A renewal race, where the step's claim ended between reading the work and renewing it, is
+    /// not a reason to end the driver. Any other API error still is.
+    #[tokio::test]
+    async fn a_renewal_that_lost_its_claim_is_skipped_rather_than_ending_the_driver() {
+        use axum::{Router, http::StatusCode, response::IntoResponse as _, routing::post};
+
+        let app = Router::new()
+            .route(
+                "/v1/work/renew/step-run/lost",
+                post(|| async {
+                    (
+                        StatusCode::CONFLICT,
+                        axum::Json(serde_json::json!({
+                            "code": "work-not-claimed",
+                            "message": "the step is not claimed"
+                        })),
+                    )
+                        .into_response()
+                }),
+            )
+            .route(
+                "/v1/work/renew/step-run/broken",
+                post(|| async {
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        axum::Json(serde_json::json!({
+                            "code": "internal",
+                            "message": "the store failed"
+                        })),
+                    )
+                        .into_response()
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(Endpoint::Http(format!("http://{address}")));
+        let renew = |step: &'static str| {
+            let client = &client;
+            async move {
+                client
+                    .post::<_, Value>(
+                        &format!("/v1/work/renew/step-run/{step}"),
+                        &serde_json::json!({}),
+                    )
+                    .await
+                    .unwrap_err()
+            }
+        };
+        assert!(renewal_lost_its_claim(&renew("lost").await));
+        assert!(!renewal_lost_its_claim(&renew("broken").await));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn one_message_that_cannot_be_forwarded_does_not_hold_back_the_next() {
+        use axum::{Json, Router, routing::get};
+
+        let app = Router::new().route(
+            "/v1/messages/page",
+            get(|| async {
+                Json(serde_json::json!({
+                    "api_version": "st3.v1",
+                    "value": {
+                        "items": [
+                            {
+                                "subject": "message/missing", "from": "agent/sender",
+                                "to": "agent/test", "content": "doc/notes/missing@abc",
+                                "status": "staged", "created_index": 1
+                            },
+                            {
+                                "subject": "message/next", "from": "agent/sender",
+                                "to": "agent/test", "content": "the next message",
+                                "status": "staged", "created_index": 2
+                            }
+                        ],
+                        "has_more": false, "next_cursor": null, "limit": 100
+                    }
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let client = Client::new(Endpoint::Http(format!("http://{address}")));
+        let root = tempfile::tempdir().unwrap();
+        let inbox = root.path().join("inbox");
+        let archive = root.path().join("archive");
+
+        let unforwarded = forward_projected_messages(
+            &client,
+            "agent/test",
+            &inbox,
+            &archive,
+            "claude-channel",
+            NativeDeliveryReceipts::ClaudeChannel {
+                agent_dir: root.path(),
+                incarnation: "one",
+            },
+        )
+        .await
+        .unwrap();
+        server.abort();
+
+        assert_eq!(
+            unforwarded
+                .iter()
+                .map(|(message, _)| message.as_str())
+                .collect::<Vec<_>>(),
+            ["message/missing"]
+        );
+        let projected = st2::message::list_inbox(&inbox).unwrap();
+        assert_eq!(projected.len(), 1);
+        assert_eq!(projected[0].body, "the next message\n");
     }
 
     #[tokio::test]

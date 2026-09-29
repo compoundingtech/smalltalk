@@ -459,6 +459,13 @@ pub fn is_not_found(error: &anyhow::Error) -> bool {
         .is_some_and(|error| error.status == 404 || error.code == "not-found")
 }
 
+/// The code of the API error that an API call failed with, if it failed with one.
+pub fn api_error_code(error: &anyhow::Error) -> Option<&str> {
+    error
+        .downcast_ref::<ApiResponseError>()
+        .map(|error| error.code.as_str())
+}
+
 fn terminal_reconnect_is_refused(error: &anyhow::Error) -> bool {
     error
         .downcast_ref::<ApiResponseError>()
@@ -1450,6 +1457,15 @@ mod tests {
             stderr: slave.as_raw_fd(),
         };
 
+        // Drain the PTY while the client runs. On macOS, restoring termios can wait for
+        // pending output to drain; reading only after the client returns deadlocks it.
+        let output_reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            if let Err(error) = master.read_to_end(&mut output) {
+                assert_eq!(error.raw_os_error(), Some(libc::EIO));
+            }
+            output
+        });
         let exit = Client::unix(&socket)
             .proxy_terminal_resilient_with_io("agent/test", &attachment, io)
             .await
@@ -1462,10 +1478,7 @@ mod tests {
         assert!((2..=4).contains(&stream_attempts.load(Ordering::SeqCst)));
 
         drop(slave);
-        let mut output = Vec::new();
-        if let Err(error) = master.read_to_end(&mut output) {
-            assert_eq!(error.raw_os_error(), Some(libc::EIO));
-        }
+        let output = output_reader.join().unwrap();
         assert!(
             output
                 .windows(b"resumed after restart".len())
@@ -1539,6 +1552,14 @@ mod tests {
             stdout: slave.as_raw_fd(),
             stderr: slave.as_raw_fd(),
         };
+        // macOS can discard unread PTY output when the final slave descriptor closes.
+        let output_reader = std::thread::spawn(move || {
+            let mut output = Vec::new();
+            if let Err(error) = master.read_to_end(&mut output) {
+                assert_eq!(error.raw_os_error(), Some(libc::EIO));
+            }
+            output
+        });
         proxy_websocket_with_io("demo", websocket, io)
             .await
             .unwrap();
@@ -1551,13 +1572,18 @@ mod tests {
         assert_eq!(restored.c_iflag, original.c_iflag);
         assert_eq!(restored.c_oflag, original.c_oflag);
         assert_eq!(restored.c_cflag, original.c_cflag);
+        // macOS may set PENDIN while processing the queued PTY input. It is a kernel-owned
+        // pending-input bit, not a terminal mode changed by the attachment.
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            restored.c_lflag & !libc::PENDIN,
+            original.c_lflag & !libc::PENDIN
+        );
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(restored.c_lflag, original.c_lflag);
 
         drop(slave);
-        let mut output = Vec::new();
-        if let Err(error) = master.read_to_end(&mut output) {
-            assert_eq!(error.raw_os_error(), Some(libc::EIO));
-        }
+        let output = output_reader.join().unwrap();
         assert!(
             output
                 .windows(TERMINAL_SANITIZE.len())

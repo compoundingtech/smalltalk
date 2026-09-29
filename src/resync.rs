@@ -682,6 +682,10 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
             .map(|deadline| deadline.saturating_duration_since(Instant::now()))
             .min()
             .unwrap_or(Duration::from_secs(3600));
+        // macOS FSEvents may coalesce or drop a short-lived file change. Keep
+        // digest-based resync responsive even when no event reaches the worker.
+        #[cfg(target_os = "macos")]
+        let timeout = timeout.min(Duration::from_millis(500));
         match rx.recv_timeout(timeout) {
             Ok(Msg::WatchSet(refresh)) => worker.apply_watch_sets(refresh),
             Ok(Msg::Install(set, ack)) => {
@@ -700,7 +704,10 @@ fn worker_loop(root: PathBuf, this_host: String, rx: Receiver<Msg>, forward: Sen
                 outcome,
             }) => worker.record_publication(&bus_id, &label, outcome),
             Ok(Msg::Shutdown) => break,
-            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Timeout) => {
+                #[cfg(target_os = "macos")]
+                worker.rescan_all();
+            }
             Err(RecvTimeoutError::Disconnected) => break,
         }
         worker.flush_due(Instant::now());

@@ -5,6 +5,7 @@ use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
+use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
@@ -15,6 +16,7 @@ use sha2::{Digest as _, Sha256};
 
 const SPAWN_PUBLICATION_TIMEOUT: Duration = Duration::from_secs(5);
 const SPAWN_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const PTY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PtySpawnTimeoutPhase {
@@ -95,6 +97,7 @@ pub struct PtyRuntime {
     binary: String,
     root: PathBuf,
     spawn_timeout: Duration,
+    command_timeout: Duration,
     command_environment: Option<BTreeMap<String, String>>,
 }
 
@@ -116,6 +119,7 @@ impl PtyRuntime {
             binary: "pty".into(),
             root,
             spawn_timeout: SPAWN_PUBLICATION_TIMEOUT,
+            command_timeout: PTY_COMMAND_TIMEOUT,
             command_environment: None,
         }
     }
@@ -134,6 +138,12 @@ impl PtyRuntime {
     #[cfg(test)]
     fn with_spawn_timeout(mut self, timeout: Duration) -> Self {
         self.spawn_timeout = timeout;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_command_timeout(mut self, timeout: Duration) -> Self {
+        self.command_timeout = timeout;
         self
     }
 
@@ -257,7 +267,7 @@ impl PtyRuntime {
                 command.env_clear().envs(environment);
             }
             command.env("PTY_ROOT", &self.root);
-            let output = match command.output() {
+            let output = match output_within(command, self.command_timeout) {
                 Ok(output) => output,
                 Err(error) => {
                     let _ = std::fs::remove_file(&fence);
@@ -487,6 +497,22 @@ impl PtyRuntime {
             .map_err(|error| anyhow::anyhow!("remove PTY failed: {error}"))
     }
 
+    pub fn attach(&self, id: &str) -> Result<()> {
+        let mut command = Command::new(&self.binary);
+        if let Some(environment) = &self.command_environment {
+            command.env_clear().envs(environment);
+        }
+        let status = command
+            .env("PTY_ROOT", &self.root)
+            .args(["attach", id])
+            .stdin(Stdio::inherit())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .status()?;
+        anyhow::ensure!(status.success(), "PTY attach failed with {status}");
+        Ok(())
+    }
+
     pub fn send_line(&self, id: &str, text: &str) -> Result<()> {
         self.send_line_if(id, text, None)
     }
@@ -564,6 +590,30 @@ impl PtyRuntime {
 
     pub fn binary(&self) -> &str {
         &self.binary
+    }
+}
+
+/// A wedged PTY command must not stall the reconciler indefinitely.
+fn output_within(mut command: Command, timeout: Duration) -> Result<Output> {
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let pid = child.id();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(child.wait_with_output());
+    });
+    match receiver.recv_timeout(timeout) {
+        Ok(output) => Ok(output?),
+        Err(_) => {
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+            anyhow::bail!(
+                "the pty command did not finish within {}s",
+                timeout.as_secs()
+            )
+        }
     }
 }
 
@@ -757,6 +807,19 @@ exit 0
             None,
             &BTreeMap::new(),
         )
+    }
+
+    #[test]
+    fn a_pty_spawn_that_never_answers_times_out() {
+        let root = tempfile::tempdir().unwrap();
+        let binary = fake_pty(root.path(), "fake-pty-hung-run", "  exec sleep 60");
+        let runtime = PtyRuntime::new(root.path().join("registry"))
+            .with_binary(binary.to_string_lossy())
+            .with_command_timeout(Duration::from_millis(200));
+        let started = Instant::now();
+        let error = spawn_work(&runtime, root.path(), &BTreeMap::new()).unwrap_err();
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(error.to_string().contains("did not finish"), "{error:#}");
     }
 
     #[test]
