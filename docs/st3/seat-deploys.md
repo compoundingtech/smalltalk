@@ -38,8 +38,10 @@ signals, and calls `execve` on the new binary with its own arguments and the sta
 `ST3_DRIVER_RESUME` or `ST3_CHANNEL_RESUME`. `execve` keeps the PID, the parent and child
 relationships, the terminal, and every descriptor without close-on-exec. The new image reads the
 state back, installs its stop handlers, and then unblocks the signals. A stop that arrived in between
-was pending the whole time, so it ends the session the ordinary way. If `execve` fails, the process
-adopts its own session again and keeps running.
+was pending the whole time, so it ends the session the ordinary way. A stop that a driver's handler
+already caught on another thread is not pending, so the driver checks for one once the signals are
+blocked. If one arrived, it does not execute, and it adopts its provider again and stops it. If
+`execve` fails, the process adopts its own session again and keeps running.
 
 A driver releases its provider before it executes. The provider loop sees `DETACH`, returns the
 session instead of ending it, and writes no terminal record. The next image adopts it:

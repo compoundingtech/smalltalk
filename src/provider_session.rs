@@ -24,6 +24,12 @@ const STOP_GRACE: Duration = Duration::from_secs(5);
 
 pub(crate) static STOP: AtomicBool = AtomicBool::new(false);
 
+/// Whether a stop handler recorded a stop. A driver that released its provider to re-execute
+/// asks this once the stop signals are blocked, and adopts the provider again to stop it.
+pub fn stop_requested() -> bool {
+    STOP.load(Ordering::SeqCst)
+}
+
 /// Set by a driver that is about to re-execute itself into a replaced st binary. Every wrapper
 /// loop that sees it returns [`Detached`] with what the next image needs to adopt its provider,
 /// and leaves the provider, its terminal, and its observed record exactly as they are.

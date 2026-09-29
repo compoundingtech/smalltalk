@@ -10104,11 +10104,12 @@ impl DriverReplacement {
         );
         let error = match st2::reexec::write_state(state_root, "driver-resume", resume) {
             Ok(path) => {
-                let error = st2::reexec::exec(
+                let error = st2::reexec::exec_unless_stopped(
                     &binary,
                     st2::reexec::DRIVER_RESUME_ENV,
                     &path,
                     &resume.session.inherited_descriptors(),
+                    &st2::provider_session::stop_requested,
                 );
                 let _ = fs::remove_file(&path);
                 anyhow::Error::new(error).context(format!("executing {}", binary.display()))

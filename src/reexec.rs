@@ -362,8 +362,23 @@ pub fn unblock_stop_signals() {
 /// naming `state`. Returns only when `execve` fails, after restoring the signal mask and the
 /// close-on-exec flags.
 pub fn exec(binary: &Path, resume_env: &str, state: &Path, keep: &[RawFd]) -> io::Error {
+    exec_unless_stopped(binary, resume_env, state, keep, &|| false)
+}
+
+/// [`exec`] for a process whose stop handlers record a stop in a flag. Blocking the stop signals
+/// covers only the calling thread, and a handler on another thread may already have recorded a
+/// stop that the next image would never see. Once the signals are blocked, `stopped` is asked;
+/// when it reports a stop, the exec is abandoned with [`io::ErrorKind::Interrupted`] so this
+/// image can act on it.
+pub fn exec_unless_stopped(
+    binary: &Path,
+    resume_env: &str,
+    state: &Path,
+    keep: &[RawFd],
+    stopped: &dyn Fn() -> bool,
+) -> io::Error {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
-    exec_with_arguments(binary, &arguments, resume_env, state, keep)
+    exec_checked(binary, &arguments, resume_env, state, keep, stopped)
 }
 
 pub fn exec_with_arguments(
@@ -372,6 +387,17 @@ pub fn exec_with_arguments(
     resume_env: &str,
     state: &Path,
     keep: &[RawFd],
+) -> io::Error {
+    exec_checked(binary, arguments, resume_env, state, keep, &|| false)
+}
+
+fn exec_checked(
+    binary: &Path,
+    arguments: &[OsString],
+    resume_env: &str,
+    state: &Path,
+    keep: &[RawFd],
+    stopped: &dyn Fn() -> bool,
 ) -> io::Error {
     let Ok(program) = CString::new(binary.as_os_str().as_bytes()) else {
         return io::Error::new(io::ErrorKind::InvalidInput, "binary path contains NUL");
@@ -434,13 +460,19 @@ pub fn exec_with_arguments(
     let mut previous = unsafe { std::mem::zeroed::<libc::sigset_t>() };
     unsafe {
         libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut previous);
-        libc::execve(
-            program.as_ptr(),
-            argv_pointers.as_ptr(),
-            envp_pointers.as_ptr(),
-        );
     }
-    let error = io::Error::last_os_error();
+    let error = if stopped() {
+        io::Error::new(io::ErrorKind::Interrupted, "a stop arrived before the exec")
+    } else {
+        unsafe {
+            libc::execve(
+                program.as_ptr(),
+                argv_pointers.as_ptr(),
+                envp_pointers.as_ptr(),
+            );
+        }
+        io::Error::last_os_error()
+    };
     unsafe {
         libc::pthread_sigmask(libc::SIG_SETMASK, &previous, std::ptr::null_mut());
     }
@@ -725,6 +757,29 @@ mod tests {
             format!("{pid} first {} kept", state.display())
         );
         assert_eq!(lines.next().unwrap(), "through the kept descriptor");
+    }
+
+    #[test]
+    fn a_recorded_stop_abandons_the_exec_and_restores_the_signal_mask() {
+        let temp = tempfile::tempdir().unwrap();
+        let script = temp.path().join("next");
+        write_script(&script, "exit 0");
+        let state = temp.path().join("state.json");
+        fs::write(&state, b"{}").unwrap();
+        let (read, _write) = std::os::unix::net::UnixStream::pair().unwrap();
+        use std::os::unix::io::AsRawFd as _;
+        let fd = read.as_raw_fd();
+        let error = exec_unless_stopped(&script, DRIVER_RESUME_ENV, &state, &[fd], &|| true);
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0, "close-on-exec is restored");
+        let mut mask = unsafe { std::mem::zeroed::<libc::sigset_t>() };
+        unsafe {
+            libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut mask);
+        }
+        for signal in STOP_SIGNALS {
+            assert_eq!(unsafe { libc::sigismember(&mask, signal) }, 0);
+        }
     }
 
     /// Runs only inside [`exec_keeps_the_pid_arguments_environment_and_named_descriptors`].
