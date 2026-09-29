@@ -3,8 +3,7 @@ use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-#[path = "support/real_git.rs"]
-mod real_git;
+use crate::support::real_git;
 
 fn executable(path: &Path, body: &str) {
     fs::write(path, body).unwrap();
