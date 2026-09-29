@@ -3659,17 +3659,23 @@ pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
 }
 
 /// The local daemon binds a Unix peer to the harness identity inherited by that peer or one of
-/// its parents. Test servers and the paired gateway use the ordinary unbound listener.
-pub async fn serve_unix_bound(socket: &Path, app: Router) -> anyhow::Result<()> {
-    serve_unix_inner(socket, app, true).await
+/// its parents. `state_socket` gives clients without the daemon's runtime environment a stable
+/// address for the same listener. Test servers and the paired gateway use the unbound listener.
+pub async fn serve_unix_bound(
+    socket: &Path,
+    state_socket: &Path,
+    app: Router,
+) -> anyhow::Result<()> {
+    serve_unix_with_ancestor(socket, Some(state_socket), app, true, harness_ancestor).await
 }
 
 async fn serve_unix_inner(socket: &Path, app: Router, bind_harness: bool) -> anyhow::Result<()> {
-    serve_unix_with_ancestor(socket, app, bind_harness, harness_ancestor).await
+    serve_unix_with_ancestor(socket, None, app, bind_harness, harness_ancestor).await
 }
 
 async fn serve_unix_with_ancestor(
     socket: &Path,
+    state_socket: Option<&Path>,
     app: Router,
     bind_harness: bool,
     ancestor: fn(u32) -> Option<String>,
@@ -3685,6 +3691,9 @@ async fn serve_unix_with_ancestor(
     }
     let listener = UnixListener::bind(socket)?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
+    if let Some(state_socket) = state_socket {
+        publish_state_socket(socket, state_socket)?;
+    }
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
@@ -3736,6 +3745,27 @@ async fn serve_unix_with_ancestor(
                 .await;
         });
     }
+}
+/// Atomically replace only the discovery link, never the listener itself. On macOS (and when
+/// XDG_RUNTIME_DIR is absent) the default listener already lives at this state path.
+fn publish_state_socket(socket: &Path, state_socket: &Path) -> anyhow::Result<()> {
+    if socket == state_socket || fs::canonicalize(state_socket).ok() == fs::canonicalize(socket).ok()
+    {
+        return Ok(());
+    }
+    let parent = state_socket
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("state socket has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+    let temporary = state_socket.with_extension(format!("sock.{}.tmp", std::process::id()));
+    let _ = fs::remove_file(&temporary);
+    let target = fs::canonicalize(socket)?;
+    std::os::unix::fs::symlink(target, &temporary)?;
+    if let Err(error) = fs::rename(&temporary, state_socket) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -11398,7 +11428,7 @@ mod tests {
         let server_socket = socket.clone();
         let app = router(state(root.path()));
         let server = tokio::spawn(async move {
-            serve_unix_with_ancestor(&server_socket, app, true, slow_ancestor).await
+            serve_unix_with_ancestor(&server_socket, None, app, true, slow_ancestor).await
         });
         while !socket.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
