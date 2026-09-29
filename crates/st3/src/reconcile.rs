@@ -602,7 +602,14 @@ impl<R: RuntimeControl> Reconciler<R> {
         // start checks, since a panic or a restart can leave one open.
         let mut may_have_failed = true;
         loop {
-            match self.blocking(|this| this.next_reconcile_deadline()).await {
+            match self
+                .blocking(|this| {
+                    crate::profile::task("task reconcile-deadline", || {
+                        this.next_reconcile_deadline()
+                    })
+                })
+                .await
+            {
                 Some(deadline) => {
                     let delay = deadline_sleep_ms(deadline, now_ms(), quiet_pass_started);
                     tokio::select! {
@@ -618,7 +625,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let (changed, failed) = self
                     .blocking(move |this| {
                         let before = this.store.index().ok();
-                        let failed = match this.reconcile_once() {
+                        let failed = match crate::profile::task("task reconcile-pass", || {
+                            this.reconcile_once()
+                        }) {
                             Err(error) => {
                                 let _ = this.record_once(
                                     &format!("daemon/{}", this.host),
@@ -872,6 +881,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         subject: &str,
         item: impl FnOnce() -> Result<T>,
     ) -> Option<T> {
+        let _span = crate::profile::span(scope);
         let result = caught(|| {
             if let Some(reason) = self
                 .fault_injection
@@ -1193,8 +1203,10 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     pub fn reconcile_once(&self) -> Result<()> {
+        let desired_span = crate::profile::span("pass/desired");
         let mut desired = self.store.desired_subjects()?;
         let terminal_owned = self.store.terminal_owned_runtime_subjects()?;
+        drop(desired_span);
         for subject in &mut desired {
             if terminal_owned.contains(&subject.subject)
                 && subject
@@ -1205,7 +1217,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 subject.kind = "stop".into();
             }
         }
-        let ptys = match self.runtime.snapshot_ptys() {
+        let pty_span = crate::profile::span("pass/pty-snapshot");
+        let ptys = self.runtime.snapshot_ptys();
+        drop(pty_span);
+        let ptys = match ptys {
             Ok(snapshot) => Some(
                 snapshot
                     .into_iter()
@@ -1278,6 +1293,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .filter(|subject| !member_errors.contains_key(&subject.subject))
             .collect::<Vec<_>>();
         // A render panic faults this host's members; stops never render, so they still run.
+        let render_span = crate::profile::span("pass/render");
         let rendered = std::panic::catch_unwind(AssertUnwindSafe(|| {
             crate::render::apply_all(&self.store, &renderable, &self.host)
         }))
@@ -1345,11 +1361,18 @@ impl<R: RuntimeControl> Reconciler<R> {
             .filter(|member| member.host == self.host)
             .map(|member| member.workspace.as_str())
             .collect::<BTreeSet<_>>();
+        drop(render_span);
         let mut work_message_agents = Vec::new();
         let mut deferred_member_faults = BTreeMap::new();
         let mut diagnostic_errors = Vec::new();
         self.record_unreadable_members(&active, &mut diagnostic_errors);
+        let members_span = crate::profile::span("pass/members");
         for subject in &active {
+            let _member_span = crate::profile::span(if subject.kind == "stop" {
+                "pass/member stop"
+            } else {
+                "pass/member live"
+            });
             let owner = if let Some(member) = &subject.member {
                 Ok(Some(member.host.clone()))
             } else if subject.kind == "stop" {
@@ -1545,6 +1568,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 diagnostic_errors.push(format!("{}: {error:#}", subject.subject));
             }
         }
+        drop(members_span);
         // Each later stage runs on its own. A stage that fails records a fault on this daemon and
         // the stages after it still run, so no intake item can hold back mission evaluation, run
         // cleanup, or work delivery on this host.

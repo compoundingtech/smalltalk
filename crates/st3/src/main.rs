@@ -3419,22 +3419,30 @@ async fn run_up(args: UpArgs) -> Result<()> {
         "publishing this st binary's required lifecycle hook set before starting the daemon",
     )?;
     fs::create_dir_all(&config.state_dir)?;
-    let store = Arc::new(Store::open(
-        &config.state_dir.join("claims.sqlite3"),
-        &config.node,
-    )?);
+    st3::profile::init_from_env();
+    let store = Arc::new(st3::profile::task("startup open-store", || {
+        Store::open(&config.state_dir.join("claims.sqlite3"), &config.node)
+    })?);
     if let Some(fleet_id) = &config.fleet_id {
         store.bind_fleet(fleet_id)?;
     }
     // A member pins its anchor, applies its writer floor, and signs with its key before it
     // writes anything, so every local batch after this point is signed.
     st3::fleet::activate(&store, &config)?;
-    let admission = store.validate_replication_backlog()?;
-    store.apply_replication_repairs()?;
-    for run in store.settle_runs_for_canonical_replay()? {
+    let admission = st3::profile::task("startup validate-replication-backlog", || {
+        store.validate_replication_backlog()
+    })?;
+    st3::profile::task("startup apply-replication-repairs", || {
+        store.apply_replication_repairs()
+    })?;
+    for run in st3::profile::task("startup settle-runs", || {
+        store.settle_runs_for_canonical_replay()
+    })? {
         eprintln!("st: mission run `{run}` stays over as this node's graph showed it");
     }
-    let projected = store.project_replication_backlog()?;
+    let projected = st3::profile::task("startup project-replication-backlog", || {
+        store.project_replication_backlog()
+    })?;
     if !projected {
         eprintln!(
             "st: the replicated projection is stale; the daemon will use its last good graph"
@@ -3513,6 +3521,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
         recorder.map(|installation| installation.directory),
     )?);
     tokio::spawn(reconciler.supervise());
+    tokio::spawn(st3::profile::watch_runtime_lag());
     tokio::spawn(trim_local_observations(
         store.clone(),
         config.observations.clone(),
@@ -13725,11 +13734,13 @@ async fn trim_local_observations(store: Arc<Store>, observations: st3::config::O
         let store = store.clone();
         let max_per_subject_kind = observations.max_per_subject_kind;
         let trimmed = tokio::task::spawn_blocking(move || {
-            store.trim_local_observations(
-                now_ms().saturating_sub(u128::from(retention_ms)),
-                max_per_subject_kind,
-                LOCAL_OBSERVATION_TRIM_CHUNK,
-            )
+            st3::profile::task("task trim-local-observations", || {
+                store.trim_local_observations(
+                    now_ms().saturating_sub(u128::from(retention_ms)),
+                    max_per_subject_kind,
+                    LOCAL_OBSERVATION_TRIM_CHUNK,
+                )
+            })
         })
         .await;
         match trimmed {
@@ -13753,7 +13764,11 @@ async fn run_checkpoints(store: Arc<Store>, context: st3::store::CheckpointConte
             now_unix_ms: now_ms(),
             ..context.clone()
         };
-        match tokio::task::spawn_blocking(move || store.checkpoint_step(&context)).await {
+        match tokio::task::spawn_blocking(move || {
+            st3::profile::task("task checkpoint", || store.checkpoint_step(&context))
+        })
+        .await
+        {
             Ok(Ok(actions)) => {
                 for action in actions {
                     eprintln!(

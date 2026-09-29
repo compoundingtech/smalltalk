@@ -629,6 +629,8 @@ struct WriterConnection {
 struct WriterGuard<'a> {
     connection: MutexGuard<'a, Connection>,
     committed_index: &'a AtomicU64,
+    /// When profiling, when this thread took the writer.
+    acquired: Option<std::time::Instant>,
 }
 
 impl WriterConnection {
@@ -643,12 +645,15 @@ impl WriterConnection {
     /// open transaction rolls back as the panic unwinds. So a poisoned lock is recovered, rather
     /// than turning every later write into a panic while the daemon keeps running.
     fn write(&self) -> WriterGuard<'_> {
+        let wait = crate::profile::writer_waiting();
+        let connection = self
+            .connection
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         WriterGuard {
-            connection: self
-                .connection
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
+            connection,
             committed_index: &self.committed_index,
+            acquired: crate::profile::writer_acquired(wait),
         }
     }
 
@@ -677,6 +682,7 @@ impl Drop for WriterGuard<'_> {
         if let Ok(index) = current_index(&self.connection) {
             self.committed_index.store(index, Ordering::Release);
         }
+        crate::profile::writer_released(self.acquired.take());
     }
 }
 
@@ -828,6 +834,7 @@ impl ReadPool {
             };
         }
         let lane = self.lane();
+        let waiting = crate::profile::enabled().then(std::time::Instant::now);
         let mut connections = lane
             .connections
             .lock()
@@ -837,6 +844,9 @@ impl ReadPool {
                 .available
                 .wait(connections)
                 .unwrap_or_else(PoisonError::into_inner);
+        }
+        if let Some(waiting) = waiting {
+            crate::profile::read_waited(waiting.elapsed());
         }
         ReadGuard {
             lane,
@@ -1043,6 +1053,7 @@ static SQLITE_COMMITS: AtomicU64 = AtomicU64::new(0);
 static SQLITE_COMMIT_NANOS: AtomicU64 = AtomicU64::new(0);
 
 fn record_sqlite_time(statement: &str, duration: std::time::Duration) {
+    crate::profile::sql(statement, duration);
     SQLITE_NANOS.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
     if statement == "COMMIT" {
         SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);
@@ -2071,6 +2082,7 @@ impl Store {
         }
         let lane = self.readers.lane();
         {
+            let waiting = crate::profile::enabled().then(std::time::Instant::now);
             let mut pinned = lane
                 .pinned
                 .lock()
@@ -2082,6 +2094,9 @@ impl Store {
                     .unwrap_or_else(PoisonError::into_inner);
             }
             *pinned += 1;
+            if let Some(waiting) = waiting {
+                crate::profile::read_waited(waiting.elapsed());
+            }
         }
         let mut guard = self.readers.get();
         // Declared first so it drops last: on every exit it ends the transaction, releases the
@@ -8675,12 +8690,15 @@ impl Store {
         let subjects = subjects.into_iter().collect::<Vec<_>>();
         let chunk_size = subjects.len().div_ceil(READ_CONNECTIONS);
         let read_class = read_class();
+        let profile = crate::profile::current();
         let parts = std::thread::scope(|scope| {
             subjects
                 .chunks(chunk_size)
                 .map(|chunk| {
                     let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
+                    let profile = profile.clone();
                     scope.spawn(move || {
+                        let _entered = crate::profile::enter(profile.as_ref());
                         with_read_class(read_class, || {
                             self.status_at_view_for_names(
                                 None,
@@ -13066,6 +13084,8 @@ impl Store {
     /// Replay the graph from nothing now, as a heal does when two nodes project different graphs
     /// from the same claims.
     pub fn replay_replication_graph(&self) -> Result<()> {
+        crate::profile::note("projection: full replay for a heal");
+        let _replay = crate::profile::span("projection/heal-replay");
         let mut connection = self.connection.write();
         let _timing = time_stage(&self.replication_timers.projection);
         let transaction = connection.transaction()?;
@@ -13096,6 +13116,7 @@ impl Store {
             transaction
                 .execute_batch("SAVEPOINT project_incremental")
                 .map_err(internal)?;
+            let incremental = crate::profile::span("projection/incremental");
             let projected = match try_project_simple_replication_tx(&transaction) {
                 Ok(projected) => {
                     transaction
@@ -13103,7 +13124,8 @@ impl Store {
                         .map_err(internal)?;
                     projected
                 }
-                Err(_) => {
+                Err(error) => {
+                    crate::profile::note(&format!("replay: incremental failed: {}", error.code));
                     transaction
                         .execute_batch(
                             "ROLLBACK TO project_incremental; RELEASE project_incremental",
@@ -13112,10 +13134,15 @@ impl Store {
                     false
                 }
             };
+            drop(incremental);
             if !projected {
                 #[cfg(test)]
                 FULL_REPLAYS.with(|replays| replays.set(replays.get() + 1));
+                let _replay = crate::profile::span("projection/full-replay");
+                crate::profile::note("projection: full replay");
                 replay_graph_from_nothing_tx(&transaction)?;
+            } else {
+                crate::profile::note("projection: incremental");
             }
             reapply_local_work_lease_renewals_tx(&transaction)?;
             Ok(())
@@ -24093,6 +24120,12 @@ fn batch_order_key(batch_id: &str) -> Option<(String, u64)> {
 
 /// Advance from a healthy frontier when the new claims have unambiguous operation IDs and
 /// structural claims sort after everything projected, in the order the full replay uses.
+/// The incremental projection cannot extend the graph, for `reason`: count it when profiling.
+fn replay_needed(reason: String) -> bool {
+    crate::profile::note(&format!("replay: {reason}"));
+    false
+}
+
 fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bool, St3Error> {
     let health: Option<(String, u64)> = transaction
         .query_row(
@@ -24103,10 +24136,12 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
         .optional()
         .map_err(internal)?;
     let Some((status, frontier)) = health else {
-        return Ok(false);
+        return Ok(replay_needed("no projection health".into()));
     };
     if status != "healthy" || frontier > current_index_tx(transaction).map_err(internal)? {
-        return Ok(false);
+        return Ok(replay_needed(format!(
+            "projection {status} or frontier ahead"
+        )));
     }
     let mut statement = transaction
         .prepare(
@@ -24161,7 +24196,7 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
                 .collect::<Option<Vec<_>>>()
                 .and_then(|keys| keys.into_iter().max())
             else {
-                return Ok(false);
+                return Ok(replay_needed("projected batch has no order key".into()));
             };
             last_key = Some((accepted.parse().map_err(internal)?, writer, sequence));
         }
@@ -24190,15 +24225,30 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
             || (has_operation
                 && (claim.kind.starts_with("work.") || operation_parts(&claim.body).is_none()))
         {
-            return Ok(false);
+            let reason = if !Store::simple_replication_kind(&claim.kind) && !has_operation {
+                "kind not projected incrementally"
+            } else if claim.kind.starts_with("work.") && has_operation {
+                "work claim with an operation"
+            } else if operation_parts(&claim.body).is_none() && has_operation {
+                "operation without a digest"
+            } else {
+                "kind not projected incrementally"
+            };
+            return Ok(replay_needed(format!(
+                "{reason}: {} from {}",
+                claim.kind, claim.origin
+            )));
         }
         if !Store::simple_replication_kind(&claim.kind) {
             let Some((writer, sequence)) = batch_order_key(&claim.batch_id) else {
-                return Ok(false);
+                return Ok(replay_needed("claim batch has no order key".into()));
             };
             let key = (claim.accepted_at_unix_ms, writer, sequence);
             if last_key.as_ref().is_some_and(|last| key < *last) {
-                return Ok(false);
+                return Ok(replay_needed(format!(
+                    "structural claim sorts before the projection: {} from {}",
+                    claim.kind, claim.origin
+                )));
             }
             last_key = Some(key);
             let repaired: bool = transaction
@@ -24209,7 +24259,7 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
                 )
                 .map_err(internal)?;
             if repaired {
-                return Ok(false);
+                return Ok(replay_needed("repaired record".into()));
             }
             if claim.kind == "mission-run.created" {
                 let generation = claim
@@ -24233,7 +24283,7 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
                     )
                     .map_err(internal)?;
                 if prior_dependents {
-                    return Ok(false);
+                    return Ok(replay_needed("run created after its dependents".into()));
                 }
             }
             if claim.kind == "mission.published" {
@@ -24255,7 +24305,7 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
                     )
                     .map_err(internal)?;
                 if waiting_run {
-                    return Ok(false);
+                    return Ok(replay_needed("mission published with a waiting run".into()));
                 }
             }
         }
@@ -24271,7 +24321,10 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
             operation_tx(transaction, operation_id).map_err(internal)?
             && (stored_digest != request_digest || state != "active")
         {
-            return Ok(false);
+            return Ok(replay_needed(format!(
+                "operation conflict: {} from {}",
+                claim.kind, claim.origin
+            )));
         }
         register_operation_tx(transaction, claim).map_err(internal)?;
     }
@@ -24291,7 +24344,16 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
                 .and_then(|value: String| value.parse::<u128>().ok())
         };
         if previous.is_none_or(|value| claim.accepted_at_unix_ms <= value) {
-            return Ok(false);
+            return Ok(replay_needed(format!(
+                "work claim not newer than its step: {} from {}{}",
+                claim.kind,
+                claim.origin,
+                if previous.is_none() {
+                    " (no step row)"
+                } else {
+                    ""
+                }
+            )));
         }
         latest_work_by_subject.insert(&claim.subject, claim.accepted_at_unix_ms);
     }
