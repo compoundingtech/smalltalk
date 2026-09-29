@@ -158,7 +158,12 @@ fn sorted_keys(value: Value) -> Value {
         Value::Object(map) => {
             let mut entries: Vec<_> = map.into_iter().collect();
             entries.sort_by(|a, b| a.0.cmp(&b.0));
-            Value::Object(entries.into_iter().map(|(k, v)| (k, sorted_keys(v))).collect())
+            Value::Object(
+                entries
+                    .into_iter()
+                    .map(|(k, v)| (k, sorted_keys(v)))
+                    .collect(),
+            )
         }
         Value::Array(items) => Value::Array(items.into_iter().map(sorted_keys).collect()),
         other => other,
