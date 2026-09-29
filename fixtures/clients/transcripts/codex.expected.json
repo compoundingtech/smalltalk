@@ -1,0 +1,37 @@
+[
+  {
+    "body": {
+      "kind": "user",
+      "value": "Rotate the signing keys in harbor and report what still reads the old ones."
+    },
+    "id": "entry-8#0"
+  },
+  {
+    "body": {
+      "kind": "assistant",
+      "value": "Starting with an inventory of every key reader."
+    },
+    "id": "entry-9"
+  },
+  {
+    "body": {
+      "kind": "event",
+      "value": "the turn was interrupted"
+    },
+    "id": "entry-10#0"
+  },
+  {
+    "body": {
+      "kind": "user",
+      "value": "You run it as me"
+    },
+    "id": "entry-11#0"
+  },
+  {
+    "body": {
+      "kind": "assistant",
+      "value": "Thanks, I'll wait for the revision output."
+    },
+    "id": "entry-12"
+  }
+]

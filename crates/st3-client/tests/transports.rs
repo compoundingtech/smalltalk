@@ -24,13 +24,6 @@ use tokio::sync::{Notify, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
 fn state(root: &Path, name: &str) -> AppState {
-    let pty_binary = root.join(format!("{name}-fake-pty"));
-    std::fs::write(
-        &pty_binary,
-        "#!/bin/sh\nif [ \"$1\" = peek ]; then printf 'terminal ready\\n$ '; exit 0; fi\nexit 1\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&pty_binary, std::fs::Permissions::from_mode(0o700)).unwrap();
     AppState {
         store: Arc::new(Store::open_memory(name).unwrap()),
         notify: Arc::new(Notify::new()),
@@ -38,7 +31,7 @@ fn state(root: &Path, name: &str) -> AppState {
         node: name.into(),
         state_dir: root.to_path_buf(),
         pty_root: root.join("pty"),
-        pty_binary,
+        pty_binary: root.join("unused-pty"),
         fleet_id: None,
         configured_peers: Vec::new(),
         client_relay: None,

@@ -47,6 +47,33 @@ build. A source install also needs [`pty`](https://github.com/compoundingtech/pt
 Each seat runs a coding harness, so install and log in to at least one: Claude Code, Codex, omp,
 pi, or OpenCode. Log in as the same user that runs the daemon.
 
+### Home Manager
+
+Import `inputs.smalltalk.homeManagerModules.default` and configure the user service:
+
+```nix
+services.smalltalk = {
+  enable = true;
+  person = "person/ada";
+  declarations = {
+    seats = [ ./seat.kdl ];
+    missions = [ ./mission.kdl ];
+  };
+  # ptyPackage = inputs.pty.packages.${pkgs.system}.default;
+};
+```
+
+The module installs `st3`, writes `st3/config.toml`, and starts a systemd user
+service on Linux or a launchd agent on macOS. When declarations are provided,
+an additional oneshot service applies seat files and publishes mission files
+as `person`, retrying while the daemon starts. `declarationsApply.enable = false`
+disables this step. Reapplying is safe, but removing a file does **not** delete
+its previously published declaration until managed-set apply exists (#646).
+The optional `ptyPackage` replaces the bundled `pty` for both the daemon and
+seats, working around the executable-directory PATH precedence in #633.
+Linux user-manager lingering and macOS `st service permissions` remain host
+setup prerequisites. Fleet/replication setup is not managed by this module.
+
 ## Run the daemon
 
 Tell st who you are. Commands that act for a person read this, so you do not repeat `--as` on
@@ -83,6 +110,9 @@ st records every `git` and `gh` call it starts, including its own, in
 `~/.local/state/st3/recorder/commands.jsonl`, then runs the real program unchanged. A call by
 absolute path is not recorded. The [command recorder](docs/st3/command-recorder.md) describes the
 log.
+
+If the state directory has a long path, set `XDG_RUNTIME_DIR` to a shorter directory or pass
+`--socket` and `--client-gateway-socket` to `st up` so both Unix socket paths fit the OS limit.
 
 ## First commands
 
@@ -128,6 +158,15 @@ Apply it and look at it:
 st agents apply worker.kdl --as person/ada
 st agents show agent/example/worker
 st terminals peek agent/example/worker
+```
+
+Token spend across the fleet is available by agent, mission, model, or host. The period ends now:
+
+```sh
+st usage --hours 24 --by agent
+st usage --hours 24 --by mission
+st usage --hours 24 --by model
+st usage --hours 24 --by host
 ```
 
 The seat starts its harness in the workspace. Its first turn reads the generated
@@ -240,6 +279,8 @@ wake an imported Claude seat for new mission work or messages. Give mission work
 declare yourself.
 
 ## Where to go next
+
+Repository intake observes complete GitHub pull request and issue listings without using an agent turn. A subscription can name a review or triage mission without a revision suffix; each request starts that mission's current ready revision. The graph remembers each delivered pull request head and issue across intake and seat restarts, so the same item is not reviewed again. See [the intake example](examples/st3/github-intake.kdl) and [resource subscriptions](docs/st3/resource-subscriptions.md). Review workspaces belong on disk and are cleaned when the run finishes.
 
 - [Examples](examples/st3/README.md), indexed by task: a seat for each harness, seat queues,
   one mission across several seats, parallel fan-out, GitHub intake, and waiting for checks, a

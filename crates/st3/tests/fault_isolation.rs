@@ -126,10 +126,6 @@ impl RuntimeControl for Runtime {
         Ok(())
     }
 
-    fn attach(&self, _runtime_id: &str) -> Result<()> {
-        Ok(())
-    }
-
     fn screen(&self, _runtime_id: &str) -> Result<String> {
         Ok(String::new())
     }

@@ -56,6 +56,61 @@ const HEADER_MEMBER_SIGNATURE: &str = "x-st3-member-signature";
 const MEMBER_SIGNATURE_DOMAIN: &str = "st3-member-v1";
 pub(crate) const MAX_EXCHANGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// The HTTP content coding for large exchange bodies: zlib-wrapped deflate. A requester asks
+/// for it with `Accept-Encoding`, and a peer says with the same header in its answer that it
+/// takes it in requests. Signatures cover the uncompressed JSON, so an older build, which
+/// neither asks nor says, exchanges plain JSON as before.
+const EXCHANGE_ENCODING: &str = "deflate";
+
+/// Bodies smaller than this go uncompressed: a quiet exchange is a few kilobytes, while a page
+/// of envelopes is megabytes and deflates to about a third.
+const DEFLATE_MIN_BYTES: usize = 64 * 1024;
+
+fn deflate(body: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::ZlibEncoder::new(
+        Vec::with_capacity(body.len() / 3),
+        flate2::Compression::fast(),
+    );
+    encoder.write_all(body)?;
+    Ok(encoder.finish()?)
+}
+
+/// Inflate an exchange body, refusing one that would expand past `MAX_EXCHANGE_BYTES`.
+fn inflate(body: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut inflated = Vec::with_capacity(body.len() * 3);
+    flate2::read::ZlibDecoder::new(body)
+        .take(MAX_EXCHANGE_BYTES as u64 + 1)
+        .read_to_end(&mut inflated)
+        .context("inflate the exchange body")?;
+    anyhow::ensure!(
+        inflated.len() <= MAX_EXCHANGE_BYTES,
+        "the exchange body inflates past {MAX_EXCHANGE_BYTES} bytes"
+    );
+    Ok(inflated)
+}
+
+fn deflated(headers: &HeaderMap) -> bool {
+    headers
+        .get("content-encoding")
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(EXCHANGE_ENCODING.as_bytes()))
+}
+
+fn accepts_deflate(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("accept-encoding")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|coding| {
+            coding
+                .split(';')
+                .next()
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case(EXCHANGE_ENCODING))
+        })
+}
+
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
@@ -651,11 +706,14 @@ impl PeerBackend {
         }
     }
 
+    /// Hand an exchange to the main daemon. `round_trip` is how long this worker's request that
+    /// returned it took, when the exchange is a response.
     async fn receive(
         &self,
         peer: &str,
         fleet_id: &str,
         exchange: &ReplicationExchange,
+        round_trip: Option<Duration>,
     ) -> Result<ReplicationReceiveResponse> {
         match self {
             Self::Main(client) => {
@@ -666,12 +724,16 @@ impl PeerBackend {
                             peer: peer.to_owned(),
                             fleet_id: fleet_id.to_owned(),
                             exchange: exchange.clone(),
+                            round_trip_ms: round_trip.map(|duration| duration.as_millis() as u64),
                         },
                     )
                     .await
             }
             #[cfg(test)]
             Self::Local(store) => {
+                if let Some(round_trip) = round_trip {
+                    store.record_replication_round_trip(round_trip);
+                }
                 let receipt = store
                     .receive_replication_exchange(peer, fleet_id, exchange)
                     .map_err(anyhow::Error::msg)?;
@@ -1534,22 +1596,22 @@ async fn dial_peer(
         match exchange(&http, &backend, &node, &peer, &auth, &fleet, &main_socket).await {
             Ok(moved) => {
                 backoff = Duration::from_secs(1);
-                // A busy harness can write several observations while one exchange is in
-                // flight. Keep the first exchange immediate, then coalesce the resulting wake
-                // burst without disabling the 30-second retry path. The window stays short so a
-                // publish is startable on every peer within seconds.
-                let not_before = tokio::time::Instant::now() + REPLICATION_WAKE_COALESCE;
                 if moved {
-                    // One exchange carries a bounded batch. Keep going while envelopes still
-                    // move instead of leaving the rest of a backlog to the timer.
+                    // One exchange carries a bounded batch. Keep going at once while envelopes
+                    // still move instead of leaving the rest of a backlog to the timer.
                     notify.borrow_and_update();
                 } else {
+                    // A busy harness can write several observations while one exchange is in
+                    // flight. Keep the first exchange immediate, then coalesce the resulting
+                    // wake burst without disabling the 30-second retry path. The window stays
+                    // short so a publish is startable on every peer within seconds.
+                    let not_before = tokio::time::Instant::now() + REPLICATION_WAKE_COALESCE;
                     tokio::select! {
                         _ = notify.changed() => {}
                         _ = tokio::time::sleep(worker_interval(Duration::from_secs(30))) => {}
                     }
+                    tokio::time::sleep_until(not_before).await;
                 }
-                tokio::time::sleep_until(not_before).await;
             }
             Err(error) => {
                 if let Some(removed) = error.downcast_ref::<RemovedFromFleet>() {
@@ -1604,6 +1666,20 @@ async fn receive_exchange(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let body = if deflated(&headers) {
+        match inflate(&body) {
+            Ok(body) => Bytes::from(body),
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("replication request body: {error:#}"),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        body
+    };
     let sender = match state
         .auth
         .verify_sender(&headers, "POST", EXCHANGE_PATH, &body, None, None)
@@ -1629,7 +1705,7 @@ async fn receive_exchange(
             serde_json::from_slice(&body).context("decode the replication exchange")?;
         let received = state
             .backend
-            .receive(&relay, state.auth.fleet_id(), &request)
+            .receive(&relay, state.auth.fleet_id(), &request, None)
             .await?;
         if received.changed {
             wake_main(&state.main_socket).await;
@@ -1649,12 +1725,13 @@ async fn receive_exchange(
                 &request.signature_requests,
             )
             .await?;
-        signed_response(
+        let response = signed_response(
             &state,
             &request_digest,
             response.store_index,
             response.exchange,
-        )
+        )?;
+        deflate_response(response, accepts_deflate(&headers)).await
     }
     .await;
     match result {
@@ -1796,6 +1873,31 @@ fn signed_response_for<T: Serialize>(
     Ok(response)
 }
 
+/// Say that this node takes compressed requests, and compress a large signed response body
+/// for a requester that asked. The signature covers the uncompressed JSON.
+async fn deflate_response(response: Response, requested: bool) -> Result<Response> {
+    let (mut parts, body) = response.into_parts();
+    parts.headers.insert(
+        "accept-encoding",
+        HeaderValue::from_static(EXCHANGE_ENCODING),
+    );
+    let body = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .context("read the signed response body")?;
+    if !requested || body.len() < DEFLATE_MIN_BYTES {
+        return Ok(Response::from_parts(parts, axum::body::Body::from(body)));
+    }
+    parts.headers.insert(
+        "content-encoding",
+        HeaderValue::from_static(EXCHANGE_ENCODING),
+    );
+    parts.headers.remove("content-length");
+    Ok(Response::from_parts(
+        parts,
+        axum::body::Body::from(deflate(&body)?),
+    ))
+}
+
 fn signed_error_response(
     state: &PeerState,
     request_digest: &str,
@@ -1861,12 +1963,16 @@ async fn exchange(
         envelopes: Vec::new(),
         ..first
     };
-    let remote = post_signed(http, peer, node, auth, fleet, &query).await?;
+    let started = std::time::Instant::now();
+    let (remote, peer_inflates) = post_signed(http, peer, node, auth, fleet, &query, false).await?;
+    let round_trip = started.elapsed();
     let different = remote.inventory.digest != local_digest;
-    let pulled = !remote.envelopes.is_empty();
     let received = backend
-        .receive(&peer.name, auth.fleet_id(), &remote)
+        .receive(&peer.name, auth.fleet_id(), &remote, Some(round_trip))
         .await?;
+    // Progress means new envelopes stored on one side or the other. A peer that keeps sending,
+    // or keeps being sent, envelopes that are never stored must not keep the worker busy.
+    let pulled = received.receipt.received != 0;
     if received.changed {
         wake_main(main_socket).await;
     }
@@ -1884,12 +1990,17 @@ async fn exchange(
             )
             .await?
             .exchange;
-        pushed = !push.envelopes.is_empty();
-        let response = post_signed(http, peer, node, auth, fleet, &push).await?;
-        pulled_follow_up = !response.envelopes.is_empty();
+        let started = std::time::Instant::now();
+        // A peer that says it takes compressed requests gets a large push compressed.
+        let (response, _) =
+            post_signed(http, peer, node, auth, fleet, &push, peer_inflates).await?;
+        let round_trip = started.elapsed();
+        // The peer stores a push before it answers, so its inventory moved if the push landed.
+        pushed = !push.envelopes.is_empty() && response.inventory.digest != remote.inventory.digest;
         let received = backend
-            .receive(&peer.name, auth.fleet_id(), &response)
+            .receive(&peer.name, auth.fleet_id(), &response, Some(round_trip))
             .await?;
+        pulled_follow_up = received.receipt.received != 0;
         if received.changed {
             wake_main(main_socket).await;
         }
@@ -1897,6 +2008,8 @@ async fn exchange(
     Ok(pulled || pulled_follow_up || pushed)
 }
 
+/// Send one signed exchange, compressed when `compress` is set and the body is large, and return
+/// the peer's verified answer and whether the peer takes compressed requests.
 async fn post_signed(
     http: &reqwest::Client,
     peer: &PeerConfig,
@@ -1904,17 +2017,26 @@ async fn post_signed(
     auth: &FleetAuth,
     fleet: &FleetContext,
     exchange: &ReplicationExchange,
-) -> Result<ReplicationExchange> {
+    compress: bool,
+) -> Result<(ReplicationExchange, bool)> {
     let body = serde_json::to_vec(exchange)?;
     let request_digest = FleetAuth::body_digest(&body);
     let headers = auth.request_headers(node, &body)?;
     let endpoint = format!("{}{}", peer.url.trim_end_matches('/'), EXCHANGE_PATH);
     let started = std::time::Instant::now();
-    let response = http
+    let mut request = http
         .post(&endpoint)
         .headers(headers)
         .header("content-type", "application/json")
-        .body(body)
+        .header("accept-encoding", EXCHANGE_ENCODING);
+    request = if compress && body.len() >= DEFLATE_MIN_BYTES {
+        request
+            .header("content-encoding", EXCHANGE_ENCODING)
+            .body(deflate(&body)?)
+    } else {
+        request.body(body)
+    };
+    let response = request
         .send()
         .await
         .with_context(|| {
@@ -1937,6 +2059,11 @@ async fn post_signed(
             )
         })?
         .to_vec();
+    let bytes = if deflated(&headers) {
+        inflate(&bytes)?
+    } else {
+        bytes
+    };
     let responder = auth.verify_sender(
         &headers,
         "RESPONSE",
@@ -1981,7 +2108,7 @@ async fn post_signed(
         response.api_version == "st3.v1",
         "the peer API version differs"
     );
-    Ok(response.value)
+    Ok((response.value, accepts_deflate(&headers)))
 }
 
 async fn wake_main(socket: &Path) {
@@ -2665,6 +2792,118 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn exchange_bodies_deflate_and_refuse_a_body_that_inflates_too_far() {
+        let body = serde_json::to_vec(&serde_json::json!({"envelopes": vec!["same"; 1_000]})).unwrap();
+        let compressed = deflate(&body).unwrap();
+        assert!(compressed.len() * 10 < body.len());
+        assert_eq!(inflate(&compressed).unwrap(), body);
+
+        let bomb = deflate(&vec![0_u8; MAX_EXCHANGE_BYTES + 1]).unwrap();
+        assert!(bomb.len() < 1024 * 1024);
+        assert!(inflate(&bomb).is_err());
+        assert!(inflate(b"not deflate").is_err());
+
+        let mut headers = HeaderMap::new();
+        assert!(!accepts_deflate(&headers));
+        headers.insert("accept-encoding", HeaderValue::from_static("gzip, Deflate;q=0.5"));
+        assert!(accepts_deflate(&headers));
+        headers.insert("accept-encoding", HeaderValue::from_static("gzip, deflated"));
+        assert!(!accepts_deflate(&headers));
+    }
+
+    #[tokio::test]
+    async fn the_peer_route_deflates_only_for_a_requester_that_asks() {
+        let fleet = "1f91ca65-7793-48cc-866e-ac15690130e1";
+        let auth = FleetAuth::test(fleet, &[5; 32]);
+        // Enough envelopes that the answer to an empty inventory is worth compressing.
+        let target = Arc::new(Store::open_memory("target").unwrap());
+        target.bind_fleet(fleet).unwrap();
+        for index in 0..300 {
+            target
+                .append_claim(&ClaimInput {
+                    subject: format!("host/peer-{index}"),
+                    kind: "transport.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let state = PeerState {
+            backend: PeerBackend::Local(target),
+            node: "target".into(),
+            auth: auth.clone(),
+            fleet: FleetContext::legacy(BTreeSet::from(["source".into()])),
+            main_socket: PathBuf::from("/no/such/socket"),
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let exchange = ReplicationExchange {
+            peer: "source".into(),
+            fleet_id: fleet.into(),
+            schema_digest: st3_schema::registry().digest(),
+            authority_digest: String::new(),
+            graph_digest: String::new(),
+            inventory: ReplicationInventory::default(),
+            envelopes: Vec::new(),
+            signature_requests: Vec::new(),
+            signatures: Vec::new(),
+        };
+        let body = serde_json::to_vec(&exchange).unwrap();
+        let request_digest = FleetAuth::body_digest(&body);
+        // An older build sends plain JSON and does not ask for compression; a new one sends a
+        // compressed request once the peer has answered compressed, and always asks.
+        for (compress, ask) in [(false, false), (false, true), (true, true)] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(EXCHANGE_PATH)
+                .body(Body::from(if compress {
+                    deflate(&body).unwrap()
+                } else {
+                    body.clone()
+                }))
+                .unwrap();
+            request
+                .headers_mut()
+                .extend(auth.request_headers("source", &body).unwrap());
+            if compress {
+                request.headers_mut().insert(
+                    "content-encoding",
+                    HeaderValue::from_static(EXCHANGE_ENCODING),
+                );
+            }
+            if ask {
+                request.headers_mut().insert(
+                    "accept-encoding",
+                    HeaderValue::from_static(EXCHANGE_ENCODING),
+                );
+            }
+            let response = peer_router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let headers = response.headers().clone();
+            assert!(accepts_deflate(&headers), "a new build takes compressed requests");
+            assert_eq!(deflated(&headers), ask);
+            let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let response_body = if ask {
+                inflate(&response_body).unwrap()
+            } else {
+                response_body.to_vec()
+            };
+            assert!(response_body.len() >= DEFLATE_MIN_BYTES);
+            auth.verify(
+                &headers,
+                "RESPONSE",
+                EXCHANGE_PATH,
+                &response_body,
+                Some("target"),
+                Some(&request_digest),
+            )
+            .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn signed_peer_exchange_moves_new_authority_in_both_directions() {
         let fleet = "1f91ca65-7793-48cc-866e-ac15690130e1";
@@ -2726,7 +2965,7 @@ mod tests {
             url: format!("http://{address}"),
         };
         let http = replication_http_client();
-        exchange(
+        let pushed = exchange(
             &http,
             &PeerBackend::Local(source.clone()),
             "source",
@@ -2737,6 +2976,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(pushed, "the peer stored what this node pushed");
         assert!(
             target
                 .latest_claim("host/source", Some("transport.observed"))
@@ -2755,7 +2995,7 @@ mod tests {
                 idempotency_key: Some("target-up".into()),
             })
             .unwrap();
-        exchange(
+        let pulled = exchange(
             &http,
             &PeerBackend::Local(source.clone()),
             "source",
@@ -2766,6 +3006,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(pulled, "this node stored what the peer sent");
         assert!(
             source
                 .latest_claim("host/target", Some("transport.observed"))
@@ -2783,7 +3024,7 @@ mod tests {
             1,
             "the two-phase exchanges and later wakeup should reuse one TCP connection"
         );
-        exchange(
+        let moved = exchange(
             &replication_http_client(),
             &PeerBackend::Local(source.clone()),
             "source",
@@ -2794,6 +3035,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(!moved, "converged nodes store nothing, so the worker may rest");
         assert_eq!(
             connection_ports.lock().unwrap().len(),
             2,
@@ -2860,7 +3102,10 @@ mod tests {
             .export_replication_exchange(fleet, &ReplicationInventory::default())
             .unwrap();
         let backend = PeerBackend::Main(Client::unix(socket));
-        let received = backend.receive("source", fleet, &exchange).await.unwrap();
+        let received = backend
+            .receive("source", fleet, &exchange, None)
+            .await
+            .unwrap();
         assert!(received.changed);
         assert!(received.receipt.received > 0);
         let exported = backend
@@ -2906,7 +3151,10 @@ mod tests {
                 .len(),
             before + 1
         );
-        backend.receive("source", fleet, &exchange).await.unwrap();
+        backend
+            .receive("source", fleet, &exchange, None)
+            .await
+            .unwrap();
         let recovered = store
             .latest_claim("host/source", Some("transport.observed"))
             .unwrap()

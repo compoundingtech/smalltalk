@@ -127,6 +127,10 @@ resource claim.
 
 The refresh operation records `observer.refresh-requested`. Its matching `observer.observed` receipt completes the request.
 
+An observer whose revision met a permanent error, such as a rejected observation, is not polled again
+on that revision. A refresh request still polls it once, and the resulting `observer.state` carries
+the request's attempt, so the observer and its subscriptions can recover without a new revision.
+
 ## Provider contract
 
 A registered provider converts one locator into normalized resource fields.
@@ -151,6 +155,9 @@ The daemon keeps each next-check deadline and cursor in local scheduler memory. 
 
 The provider applies bounded retries and backoff. It records authentication, rate-limit, and transport failures on the observer subject.
 
+Each GitHub request times out after one minute, so a connection that never answers cannot hold its
+observer.
+
 An unchanged failure creates no new claim. A later success replaces the complete observer health state and clears the old failure reason.
 
 An observer checks its declared fields. Its effective field set also includes the union of its subscription fields.
@@ -161,14 +168,15 @@ st does not fetch once for each target. A subscription update can expand or redu
 
 The first successful observation establishes the baseline. It sends no update message and starts no mission.
 
-A mission delivery starts one exact mission revision with the observed resource as a run input.
+A mission delivery pins the observed resource claim as a run input. A bare mission name uses its
+current ready revision when the request starts; `MISSION@REVISION` keeps an exact revision.
 
 ```kdl
 subscription "new-ready-pull-requests" {
   observer "observer/repository"
   on "pull_requests"
   delivery "mission" {
-    mission "review/pull-request@REVISION"
+    mission "review/pull-request"
     resource "pull-request"
     workspace "/work/pull-request-reviews"
     requester "agent/fleet/repository/standing/owner"
@@ -176,7 +184,16 @@ subscription "new-ready-pull-requests" {
 }
 ```
 
-The repository provider creates one mission request for each newly discovered item. The run input pins that item's exact discovery claim.
+The repository provider creates one mission request for each newly discovered issue and each new
+ready pull request head. The run input pins that item's exact discovery claim. Requests for the
+same mission, stable local subscription name, item, and PR head are remembered across replacement
+intake runs; a title or state change at the same head cannot start another review. Distinct local
+subscription names can still start separate workflows. An issue number is triaged once per
+workflow. The subscription request carries a stable delivery key and the chosen run records its
+exact mission revision. An old request without a delivery key is matched by its pinned discovery
+claim. Before starting a PR review, the reconciler also checks whether a matching mission-run PR
+resource is already covered by that run's human review gate; if so, it cancels the redundant
+request with a reason naming the authoring run.
 
 The first listing that records a repository ID is a baseline for its collections. Earlier facts
 came from a first-page read, so the older items it adds were missed, not opened.
@@ -276,7 +293,8 @@ mission cancellation to stop it.
 - The first observation creates a baseline and no message.
 - An unchanged provider result creates no claim and no message.
 - A selected scalar field change creates one observation claim and one message.
-- Each new repository collection item creates one resource and one mission request.
+- Each new repository collection item creates one resource and one mission request; a new ready PR
+  head creates one more, and an unchanged head or issue does not replay across intake restarts.
 - A renamed locator and a first complete listing create no mission request.
 - One observation holds each request beyond its first five for a person.
 - A draft-to-ready transition creates one pull request resource and one mission request.

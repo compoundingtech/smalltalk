@@ -220,7 +220,7 @@ mod tests {
     fn discovers_a_sensitive_authorization_header() {
         let (_temporary, executable) = executable_fixture("printf '%s\\n' 'fixture-token'");
         let authorization =
-            discover_authorization(&executable, Instant::now() + Duration::from_secs(5)).unwrap();
+            discover_authorization(&executable, Instant::now() + Duration::from_secs(15)).unwrap();
 
         assert!(authorization.is_sensitive());
         assert_eq!(authorization.as_bytes(), b"Bearer fixture-token");

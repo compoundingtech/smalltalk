@@ -38,7 +38,7 @@ def run_case(binary: str, ending: str, endpoint: str | None = None) -> None:
         env["ST3_ENDPOINT"] = endpoint
     if ending == "panic":
         env["STUI_TEST_PANIC_AFTER_ENTER"] = "1"
-    proc = subprocess.Popen([binary], stdin=slave, stdout=slave, stderr=slave, env=env)
+    proc = subprocess.Popen([binary, "--old"], stdin=slave, stdout=slave, stderr=slave, env=env)
     os.close(slave)
     captured = bytearray()
 
@@ -143,7 +143,7 @@ def delayed_getter_case(binary: str) -> None:
 def hangup_case(binary: str) -> None:
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack("HHHH", 24, 80, 0, 0))
-    proc = subprocess.Popen([binary], stdin=slave, stdout=slave, stderr=slave,
+    proc = subprocess.Popen([binary, "--old"], stdin=slave, stdout=slave, stderr=slave,
                             env={**os.environ, "TERM": "xterm-256color"})
     os.close(slave)
     deadline = time.monotonic() + 3
@@ -178,7 +178,7 @@ def tmux_hangup_case(binary: str) -> None:
     base = [tmux, "-L", socket_name]
     subprocess.run(
         base + ["new-session", "-d", "-s", target,
-                f"exec env ST3_PERSON=person/nathan {shlex.quote(binary)}"],
+                f"exec env ST3_PERSON=person/nathan {shlex.quote(binary)} --old"],
         check=True, capture_output=True,
     )
     pid = int(subprocess.check_output(
