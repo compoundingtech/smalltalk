@@ -426,6 +426,10 @@ impl Config {
             "the privileged local socket and paired client gateway socket must be different"
         );
         anyhow::ensure!(
+            self.client_gateway_socket != state_socket(&self.state_dir),
+            "the paired client gateway socket must not replace the privileged state socket"
+        );
+        anyhow::ensure!(
             self.fleet_id.is_some() == self.shared_secret_file.is_some(),
             "fleet_id and shared_secret_file must be configured together"
         );
@@ -651,6 +655,15 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("different")
+        );
+        config.socket = "/tmp/st3-private.sock".into();
+        config.client_gateway_socket = state_socket(&config.state_dir);
+        assert!(
+            config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("privileged state socket")
         );
     }
 
