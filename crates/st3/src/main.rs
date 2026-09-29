@@ -95,6 +95,8 @@ enum Command {
     Up(UpArgs),
     /// Understand what needs action now.
     Now(NowArgs),
+    /// Show token spend over a period, with the largest spenders first.
+    Usage(UsageArgs),
     /// Inspect and control missions.
     Missions {
         #[command(subcommand)]
@@ -1839,6 +1841,24 @@ struct NowArgs {
     limit: usize,
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum UsageBy {
+    Agent,
+    Mission,
+    Model,
+    Host,
+}
+
+#[derive(Args)]
+struct UsageArgs {
+    /// Length of the period ending now.
+    #[arg(long, default_value_t = 24)]
+    hours: u64,
+    /// Show only this grouping; the default shows all four.
+    #[arg(long, value_enum)]
+    by: Option<UsageBy>,
+}
+
 #[derive(Args)]
 struct MachinesArgs {
     /// Include historical and discovered hosts beyond the current configured fleet.
@@ -2782,6 +2802,7 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Up(_) => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
         Command::Now(args) => run_now(&endpoint, config.person.as_deref(), args, cli.json).await,
+        Command::Usage(args) => run_usage(&immediate, args, cli.json).await,
         Command::Launch { command } => {
             run_launch(&client, &endpoint, command, &config.planner, cli.json).await
         }
@@ -5119,6 +5140,77 @@ fn render_usage(usage: &st3_client::UsageSummary) -> String {
     }
 }
 
+async fn run_usage(client: &Client, args: UsageArgs, json_output: bool) -> Result<()> {
+    anyhow::ensure!(args.hours > 0, "usage hours must be positive");
+    let until = current_unix_ms()? as u64;
+    let since = until.saturating_sub(args.hours.saturating_mul(3_600_000));
+    let report: Value = client.get(&format!("/v1/usage?since_ms={since}&until_ms={until}")).await?;
+    if json_output {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    print!("{}", render_usage_report(&report, args.hours, args.by));
+    Ok(())
+}
+
+fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let groups = only.map(|by| vec![by]).unwrap_or_else(|| {
+        vec![UsageBy::Agent, UsageBy::Mission, UsageBy::Model, UsageBy::Host]
+    });
+    for by in groups {
+        let mut totals = BTreeMap::<String, [u64; 5]>::new();
+        for row in report["rows"].as_array().into_iter().flatten() {
+            let dimension = match by {
+                UsageBy::Agent => "agent",
+                UsageBy::Mission => "mission_run",
+                UsageBy::Model => "model",
+                UsageBy::Host => "host",
+            };
+            let label = row[dimension]
+                .as_str()
+                .filter(|value| !value.is_empty())
+                .unwrap_or("unknown");
+            let entry = totals.entry(label.to_owned()).or_default();
+            for (index, field) in [
+                "total_tokens",
+                "input_tokens",
+                "output_tokens",
+                "cache_write_tokens",
+                "cached_tokens",
+            ]
+            .iter()
+            .enumerate()
+            {
+                entry[index] = entry[index].saturating_add(row[*field].as_u64().unwrap_or(0));
+            }
+        }
+        let mut totals = totals.into_iter().collect::<Vec<_>>();
+        totals.sort_by(|left, right| right.1[0].cmp(&left.1[0]).then_with(|| left.0.cmp(&right.0)));
+        let by = match by {
+            UsageBy::Agent => "agent",
+            UsageBy::Mission => "mission",
+            UsageBy::Model => "model",
+            UsageBy::Host => "host",
+        };
+        if !output.is_empty() {
+            output.push('\n');
+        }
+        let _ = writeln!(output, "USAGE  {} · {}h · by {by}", totals.len(), hours);
+        let _ = writeln!(output, "TOTAL  INPUT  OUTPUT  CACHE WRITE  CACHE READ  {by}");
+        for (name, values) in totals {
+            let _ = writeln!(
+                output,
+                "{}  {}  {}  {}  {}  {name}",
+                values[0], values[1], values[2], values[3], values[4]
+            );
+        }
+    }
+    output
+}
+
 fn print_activity_page(
     response: &ClientEnvelope<ClientEventPage>,
     json_output: bool,
@@ -6892,6 +6984,13 @@ fn render_client_agent(
     }
     if let Some(owner) = &agent.owner_run_id {
         let _ = writeln!(output, "MISSION      {owner}");
+    }
+    if let Some(usage) = &agent.usage {
+        let _ = writeln!(output, "USAGE        {}", render_usage(usage));
+        if usage.incarnation_count > 0 {
+            let _ = writeln!(output, "TOKENS       input {} · output {} · cache write {} · cache read {}",
+                usage.input_tokens, usage.output_tokens, usage.cache_write_tokens, usage.cached_tokens);
+        }
     }
     for current in &agent.current_work_ids {
         let _ = writeln!(output, "CURRENT WORK {current}");
@@ -9446,7 +9545,7 @@ fn timeline_claim_fields(
     operation: st2::harness_timeline::Operation,
     runtime_incarnation: &str,
 ) -> BTreeMap<String, Value> {
-    BTreeMap::from([
+    let mut fields = BTreeMap::from([
         (
             "operation".into(),
             Value::String(operation.operation.clone()),
@@ -9467,7 +9566,11 @@ fn timeline_claim_fields(
             "observed_at_unix_ms".into(),
             Value::from(operation.observed_at_unix_ms),
         ),
-    ])
+    ]);
+    if fields["entry_type"] == "usage" && let Some(source_id) = operation.source_id {
+        fields.insert("source_id".into(), Value::String(source_id));
+    }
+    fields
 }
 
 async fn publish_harness_state(
@@ -11115,6 +11218,22 @@ mod tests {
                 command: MissionViewCommand::Tree
             }
         ));
+    }
+
+    #[test]
+    fn usage_report_ranks_each_fleet_group_by_spend() {
+        let report = json!({"rows": [
+            {"agent":"agent/small","mission_run":"mission-run/one","model":"model-a","host":"host/a","total_tokens":9,"input_tokens":2,"output_tokens":1,"cache_write_tokens":0,"cached_tokens":6},
+            {"agent":"agent/large","mission_run":"mission-run/two","model":"model-b","host":"host/b","total_tokens":30,"input_tokens":5,"output_tokens":2,"cache_write_tokens":3,"cached_tokens":20},
+            {"agent":"agent/large","mission_run":"mission-run/two","model":"model-b","host":"host/b","total_tokens":10,"input_tokens":2,"output_tokens":1,"cache_write_tokens":1,"cached_tokens":6},
+        ]});
+        let output = render_usage_report(&report, 24, None);
+        assert_eq!(output.matches("USAGE  ").count(), 4);
+        assert!(output.find("40  7  3  4  26  agent/large").unwrap()
+            < output.find("9  2  1  0  6  agent/small").unwrap());
+        assert!(output.contains("40  7  3  4  26  mission-run/two"));
+        assert!(output.contains("40  7  3  4  26  model-b"));
+        assert!(output.contains("40  7  3  4  26  host/b"));
     }
 
     #[test]

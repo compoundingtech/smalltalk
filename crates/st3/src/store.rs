@@ -380,6 +380,26 @@ ON local_observations(dedupe_key) WHERE dedupe_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS local_observations_timeline_index
 ON local_observations(subject, json_extract(body, '$.fields.incarnation_id'), id)
 WHERE kind='harness.timeline';
+CREATE TABLE IF NOT EXISTS local_usage_totals (
+    subject TEXT NOT NULL,
+    incarnation_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    owner_run TEXT NOT NULL,
+    owner_step TEXT NOT NULL,
+    host TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    observed_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY(subject, incarnation_id, model, owner_run, owner_step, host)
+);
+CREATE TABLE IF NOT EXISTS local_usage_seen (
+    subject TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    PRIMARY KEY(subject, source_id)
+);
 -- The last replicated observation of each `latest` slot this node wrote, and the newest
 -- local observation of the slot that no replicated claim carries yet.
 CREATE TABLE IF NOT EXISTS local_latest_slots (
@@ -6831,6 +6851,72 @@ impl Store {
         Ok((published.unwrap_or(local), true))
     }
 
+    /// A replicated snapshot of the local response totals affected by one timeline entry.
+    /// The response itself stays in the local observation log.
+    pub fn usage_rollup_for_timeline(
+        &self,
+        observation: &ClaimRecord,
+    ) -> Result<Option<ClaimInput>> {
+        if observation.kind != "harness.timeline" {
+            return Ok(None);
+        }
+        let fields = &observation.body["fields"];
+        if fields["entry_type"] != "usage" || fields["body"]["semantics"] != "response" {
+            return Ok(None);
+        }
+        let incarnation = fields["incarnation_id"].as_str().unwrap_or("");
+        let model = fields["body"]["model"].as_str().unwrap_or("unknown");
+        let owner_run = fields["attribution"]["mission_run_id"]
+            .as_str()
+            .unwrap_or("");
+        let owner_step = fields["attribution"]["step_id"].as_str().unwrap_or("");
+        let host = fields["host"].as_str().unwrap_or(&self.origin);
+        let connection = self.readers.get();
+        let totals = connection.query_row(
+            "SELECT input_tokens, output_tokens, cache_write_tokens, cached_tokens, total_tokens, observed_at_unix_ms
+             FROM local_usage_totals WHERE subject=?1 AND incarnation_id=?2 AND model=?3 AND owner_run=?4 AND owner_step=?5 AND host=?6",
+            params![observation.subject, incarnation, model, owner_run, owner_step, host],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?, row.get::<_, u64>(2)?,
+                row.get::<_, u64>(3)?, row.get::<_, u64>(4)?, row.get::<_, u64>(5)?)),
+        ).optional()?;
+        let Some((
+            input_tokens,
+            output_tokens,
+            cache_write_tokens,
+            cached_tokens,
+            total_tokens,
+            observed_at,
+        )) = totals
+        else {
+            return Ok(None);
+        };
+        let fields = BTreeMap::from([
+            ("semantics".into(), Value::String("response_rollup".into())),
+            ("driver".into(), fields["driver"].clone()),
+            ("incarnation_id".into(), Value::String(incarnation.into())),
+            ("model".into(), Value::String(model.into())),
+            ("owner_run".into(), Value::String(owner_run.into())),
+            ("owner_step".into(), Value::String(owner_step.into())),
+            ("host".into(), Value::String(host.into())),
+            ("input_tokens".into(), Value::from(input_tokens)),
+            ("output_tokens".into(), Value::from(output_tokens)),
+            ("cache_write_tokens".into(), Value::from(cache_write_tokens)),
+            ("cached_tokens".into(), Value::from(cached_tokens)),
+            ("total_tokens".into(), Value::from(total_tokens)),
+            ("observed_at_unix_ms".into(), Value::from(observed_at)),
+        ]);
+        let digest = hex::encode(Sha256::digest(serde_json::to_vec(&fields)?));
+        Ok(Some(ClaimInput {
+            subject: observation.subject.clone(),
+            kind: "harness.usage".into(),
+            actor: Some(observation.subject.clone()),
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("usage-rollup:{}:{digest}", observation.subject)),
+        }))
+    }
+
     /// Local observations written after `after`, oldest first. The records carry the
     /// `store_index` of the claim each one follows.
     pub fn local_observations_after(&self, after: u64, limit: usize) -> Result<Vec<ClaimRecord>> {
@@ -9738,6 +9824,7 @@ impl Store {
         #[derive(Default)]
         struct Spend {
             cumulative: Option<CumulativeUsage>,
+            rollups: BTreeMap<String, (u64, u64, u64, u64, u64)>,
             response_total: u64,
             response_input: u64,
             response_output: u64,
@@ -9840,6 +9927,39 @@ impl Store {
                         group.cumulative = Some(candidate);
                     }
                 }
+                Some("response_rollup") => {
+                    let group = spend.entry(claim_incarnation.to_owned()).or_default();
+                    let key = ["model", "owner_run", "owner_step", "host"]
+                        .iter()
+                        .map(|key| fields.get(*key).and_then(Value::as_str).unwrap_or(""))
+                        .collect::<Vec<_>>()
+                        .join("\0");
+                    group.rollups.insert(
+                        key,
+                        (
+                            fields
+                                .get("total_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                            fields
+                                .get("input_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                            fields
+                                .get("output_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                            fields
+                                .get("cache_write_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                            fields
+                                .get("cached_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                        ),
+                    );
+                }
                 Some("response") => {
                     let Some(total) = fields.get("total_tokens").and_then(Value::as_u64) else {
                         continue;
@@ -9887,7 +10007,17 @@ impl Store {
         let mut has_cost = false;
         for group in spend.into_values() {
             summary.incarnation_count += 1;
-            if let Some((total, input, output, cached, group_cost, currency)) = group.cumulative {
+            if !group.rollups.is_empty() {
+                for (total, input, output, writes, reads) in group.rollups.into_values() {
+                    summary.total_tokens = summary.total_tokens.saturating_add(total);
+                    summary.input_tokens = summary.input_tokens.saturating_add(input);
+                    summary.output_tokens = summary.output_tokens.saturating_add(output);
+                    summary.cache_write_tokens = summary.cache_write_tokens.saturating_add(writes);
+                    summary.cached_tokens = summary.cached_tokens.saturating_add(reads);
+                }
+            } else if let Some((total, input, output, cached, group_cost, currency)) =
+                group.cumulative
+            {
                 summary.total_tokens = summary.total_tokens.saturating_add(total);
                 summary.input_tokens = summary.input_tokens.saturating_add(input);
                 summary.output_tokens = summary.output_tokens.saturating_add(output);
@@ -9911,6 +10041,93 @@ impl Store {
         }
         summary.cost = has_cost.then_some(cost);
         Ok(Some(summary))
+    }
+
+    /// Period spend from replicated cumulative snapshots. The snapshot immediately before the
+    /// start is the baseline, so a long-lived incarnation only contributes spend in the period.
+    pub fn usage_period_rows(&self, since_ms: u64, until_ms: u64) -> Result<Vec<Value>> {
+        #[derive(Clone, Copy, Default)]
+        struct Bucket {
+            at: u64,
+            index: u64,
+            total: u64,
+            input: u64,
+            output: u64,
+            writes: u64,
+            reads: u64,
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, store_index, body FROM claims WHERE kind='harness.usage'
+             AND json_extract(body, '$.fields.semantics')='response_rollup'
+             ORDER BY store_index",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut groups = BTreeMap::<
+            (String, String, String, String, String, String),
+            (Option<Bucket>, Option<Bucket>),
+        >::new();
+        for row in rows {
+            let (subject, index, body) = row?;
+            let body: Value = serde_json::from_str(&body)?;
+            let fields = &body["fields"];
+            let at = fields["observed_at_unix_ms"].as_u64().unwrap_or(0);
+            if at > until_ms {
+                continue;
+            }
+            let value = |name| fields[name].as_u64().unwrap_or(0);
+            let bucket = Bucket {
+                at,
+                index,
+                total: value("total_tokens"),
+                input: value("input_tokens"),
+                output: value("output_tokens"),
+                writes: value("cache_write_tokens"),
+                reads: value("cached_tokens"),
+            };
+            let text = |name| fields[name].as_str().unwrap_or("").to_owned();
+            let key = (
+                subject,
+                text("incarnation_id"),
+                text("model"),
+                text("owner_run"),
+                text("owner_step"),
+                text("host"),
+            );
+            let (baseline, latest) = groups.entry(key).or_default();
+            let target = if at <= since_ms { baseline } else { latest };
+            if target.is_none_or(|previous| (at, index) > (previous.at, previous.index)) {
+                *target = Some(bucket);
+            }
+        }
+        let mut result = Vec::new();
+        for ((agent, _incarnation, model, mission_run, step, host), (baseline, latest)) in groups {
+            let Some(latest) = latest else {
+                continue;
+            };
+            let baseline = baseline.unwrap_or_default();
+            let total = latest.total.saturating_sub(baseline.total);
+            if total == 0 {
+                continue;
+            }
+            result.push(json!({
+                "agent": agent, "mission_run": mission_run, "step": step,
+                "model": model, "host": host,
+                "total_tokens": total,
+                "input_tokens": latest.input.saturating_sub(baseline.input),
+                "output_tokens": latest.output.saturating_sub(baseline.output),
+                "cache_write_tokens": latest.writes.saturating_sub(baseline.writes),
+                "cached_tokens": latest.reads.saturating_sub(baseline.reads),
+            }));
+        }
+        result.sort_by(|a, b| b["total_tokens"].as_u64().cmp(&a["total_tokens"].as_u64()));
+        Ok(result)
     }
 
     pub fn claims_page(
@@ -13934,7 +14151,7 @@ fn insert_local_observation_tx(
     input: &ClaimInput,
     observed_at: u128,
 ) -> Result<(ClaimRecord, bool), St3Error> {
-    let body = json!({
+    let mut body = json!({
         "fields": &input.fields,
         "evidence": input.evidence,
     });
@@ -14008,6 +14225,103 @@ fn insert_local_observation_tx(
             |row| row.get(0),
         )
         .map_err(internal)?;
+    if input.kind == "harness.timeline"
+        && input.fields.get("entry_type").and_then(Value::as_str) == Some("usage")
+        && input.fields.get("operation").and_then(Value::as_str) == Some("append")
+        && input
+            .fields
+            .get("body")
+            .and_then(|body| body.get("semantics"))
+            .and_then(Value::as_str)
+            == Some("response")
+    {
+        let desired: Option<(Option<String>, Option<String>, Option<String>)> = transaction
+            .query_row(
+                "SELECT owner_run, owner_generation, owner_step FROM desired WHERE subject=?1",
+                [&input.subject],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        let incarnation = input
+            .fields
+            .get("incarnation_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let active_step: Option<(String, String, String)> = transaction
+            .query_row(
+                "SELECT subject, 'mission-run/' || run_id, 'run-generation/' || generation_id
+                 FROM step_runs WHERE lease_owner=?1 AND lease_incarnation=?2
+                   AND CAST(lease_expires_at_unix_ms AS INTEGER)>?3
+                   AND status IN ('claimed', 'working', 'submitted')
+                 ORDER BY updated_at_unix_ms DESC LIMIT 1",
+                params![input.subject, incarnation, observed_at as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        let owner_run = active_step
+            .as_ref()
+            .map(|item| item.1.as_str())
+            .or_else(|| desired.as_ref().and_then(|item| item.0.as_deref()))
+            .unwrap_or("");
+        let owner_step = active_step
+            .as_ref()
+            .map(|item| item.0.as_str())
+            .or_else(|| desired.as_ref().and_then(|item| item.2.as_deref()))
+            .unwrap_or("");
+        let owner_generation = active_step
+            .as_ref()
+            .map(|item| item.2.as_str())
+            .or_else(|| desired.as_ref().and_then(|item| item.1.as_deref()));
+        let usage = &input.fields["body"];
+        let model = usage
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let bucket = |key| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+        let input_tokens = bucket("input_tokens");
+        let output_tokens = bucket("output_tokens");
+        let cache_write_tokens = bucket("cache_write_tokens");
+        let cached_tokens = bucket("cached_tokens");
+        let total_tokens = bucket("total_tokens");
+        body["fields"]["attribution"] = json!({
+            "agent_id": input.subject,
+            "mission_run_id": if owner_run.is_empty() { None } else { Some(owner_run) },
+            "generation_id": owner_generation,
+            "step_id": if owner_step.is_empty() { None } else { Some(owner_step) },
+        });
+        body["fields"]["host"] = Value::String(origin.to_owned());
+        let source_id = input
+            .fields
+            .get("source_id")
+            .and_then(Value::as_str)
+            .or_else(|| input.fields.get("entry_id").and_then(Value::as_str))
+            .unwrap_or("");
+        let new_response = transaction
+            .execute(
+                "INSERT OR IGNORE INTO local_usage_seen(subject, source_id) VALUES (?1, ?2)",
+                params![input.subject, source_id],
+            )
+            .map_err(internal)?
+            != 0;
+        if new_response {
+            transaction.execute(
+                "INSERT INTO local_usage_totals(subject, incarnation_id, model, owner_run, owner_step, host,
+                    input_tokens, output_tokens, cache_write_tokens, cached_tokens, total_tokens, observed_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(subject, incarnation_id, model, owner_run, owner_step, host) DO UPDATE SET
+                    input_tokens=input_tokens+excluded.input_tokens,
+                    output_tokens=output_tokens+excluded.output_tokens,
+                    cache_write_tokens=cache_write_tokens+excluded.cache_write_tokens,
+                    cached_tokens=cached_tokens+excluded.cached_tokens,
+                    total_tokens=total_tokens+excluded.total_tokens,
+                    observed_at_unix_ms=excluded.observed_at_unix_ms",
+                params![input.subject, incarnation, model, owner_run, owner_step, origin,
+                    input_tokens, output_tokens, cache_write_tokens, cached_tokens, total_tokens, observed_at as i64],
+            ).map_err(internal)?;
+        }
+    }
     transaction
         .execute(
             "INSERT INTO local_observations(
@@ -33538,6 +33852,143 @@ mission "nested-work" state="ready" {
         assert_eq!(
             reopened.append_claim_outcome(&unnumbered).unwrap_err().code,
             "missing-claim-field"
+        );
+    }
+
+    #[test]
+    fn response_usage_stays_local_while_attributed_totals_replicate() {
+        let local = Store::open_memory("host-one").unwrap();
+        let subject = "agent/example.worker";
+        let seed = local
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("ready".into())),
+                    ("driver".into(), Value::String("claude".into())),
+                    ("incarnation_id".into(), Value::String("inc-one".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("usage-seed".into()),
+            })
+            .unwrap();
+        local.connection.lock().unwrap().execute(
+            "INSERT INTO desired(subject, kind, revision, claim_id, body, owner_run, owner_generation, owner_step)
+             VALUES (?1, 'agent', 'revision', ?2, '{}', 'mission-run/example', 'run-generation/example', 'step-run/example/record')",
+            params![subject, seed.id],
+        ).unwrap();
+        let record = |entry: &str, input: u64, output: u64, reads: u64, writes: u64| {
+            let mut claim = timeline_observation(subject, "inc-one", entry);
+            claim
+                .fields
+                .insert("entry_type".into(), Value::String("usage".into()));
+            claim
+                .fields
+                .insert("role".into(), Value::String("system".into()));
+            claim
+                .fields
+                .insert("driver".into(), Value::String("claude".into()));
+            claim.fields.insert(
+                "body".into(),
+                json!({
+                    "semantics": "response", "model": "claude-example", "turn_id": entry,
+                    "input_tokens": input, "output_tokens": output,
+                    "cached_tokens": reads, "cache_write_tokens": writes,
+                    "total_tokens": input + output + reads + writes,
+                }),
+            );
+            claim
+        };
+        let first = record("turn-a", 4, 2, 20, 3);
+        let (observation, appended) = local.append_claim_outcome(&first).unwrap();
+        assert!(appended);
+        assert_eq!(
+            observation.body["fields"]["attribution"]["mission_run_id"],
+            "mission-run/example"
+        );
+        assert_eq!(
+            observation.body["fields"]["attribution"]["step_id"],
+            "step-run/example/record"
+        );
+        let rollup = local
+            .usage_rollup_for_timeline(&observation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.fields["total_tokens"], 29);
+        assert_eq!(rollup.fields["host"], "host-one");
+        local.append_claim(&rollup).unwrap();
+        let baseline = rollup.fields["observed_at_unix_ms"].as_u64().unwrap();
+        let (repeated, appended) = local.append_claim_outcome(&first).unwrap();
+        assert!(!appended);
+        assert_eq!(
+            local
+                .usage_rollup_for_timeline(&repeated)
+                .unwrap()
+                .unwrap()
+                .fields["total_tokens"],
+            29
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut second = record("turn-b", 5, 1, 30, 0);
+        second
+            .fields
+            .insert("source_id".into(), Value::String("same-response".into()));
+        let (observation, appended) = local.append_claim_outcome(&second).unwrap();
+        assert!(appended);
+        let rollup = local
+            .usage_rollup_for_timeline(&observation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.fields["total_tokens"], 65);
+        local.append_claim(&rollup).unwrap();
+        let mut replay = second.clone();
+        replay
+            .fields
+            .insert("incarnation_id".into(), Value::String("inc-two".into()));
+        replay.idempotency_key = Some("replayed-after-restart".into());
+        let (second_replay, _) = local.append_claim_outcome(&replay).unwrap();
+        assert!(
+            local
+                .usage_rollup_for_timeline(&second_replay)
+                .unwrap()
+                .is_none()
+        );
+        let period = local
+            .usage_period_rows(baseline, baseline + 60_000)
+            .unwrap();
+        assert_eq!(period.len(), 1);
+        assert_eq!(period[0]["total_tokens"], 36);
+        assert_eq!(period[0]["cached_tokens"], 30);
+        assert_eq!(
+            local
+                .usage_summary_at(subject, None, None)
+                .unwrap()
+                .unwrap()
+                .total_tokens,
+            65
+        );
+
+        let peer = Store::open_memory("host-two").unwrap();
+        let exchange = exchange_from(&local, &ReplicationInventory::default());
+        receive_and_project(&peer, "host-one", &exchange);
+        assert!(
+            peer.timeline_claims_for_incarnation_at(subject, "inc-one", None, false, 10)
+                .unwrap()
+                .claims
+                .is_empty()
+        );
+        assert_eq!(
+            peer.usage_period_rows(baseline, baseline + 60_000).unwrap(),
+            period
+        );
+        assert_eq!(
+            peer.usage_summary_at(subject, None, None)
+                .unwrap()
+                .unwrap()
+                .total_tokens,
+            65
         );
     }
 
