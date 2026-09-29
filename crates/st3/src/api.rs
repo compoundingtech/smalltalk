@@ -993,18 +993,18 @@ fn client_page(
     })
 }
 
-/// A host catching up with a peer can show early history as current, so each page it serves
-/// says so and how far behind it is.
+/// A host catching up with a peer can show early history as current, and a host whose graph
+/// diverged from a peer's can show it wrong, so each page it serves says so and with whom.
 fn client_sync_notice(state: &AppState) -> Option<ClientSyncNotice> {
     // Naming the peers reads the fleet view, so skip it on the usual page read.
-    if !state.store.replication_catching_up() {
+    if !state.store.replication_catching_up() && !state.store.replication_diverged() {
         return None;
     }
     let peers = state
         .store
         .replication_peer_sync(&replication_peer_names(state))
         .into_iter()
-        .filter(|(_, sync)| sync.catching_up)
+        .filter(|(_, sync)| sync.catching_up || sync.diverged)
         .map(|(peer, sync)| ClientSyncPeer {
             host_id: client_host_id(&peer),
             peer_only_envelopes: sync.peer_only_envelopes,
@@ -1016,10 +1016,20 @@ fn client_sync_notice(state: &AppState) -> Option<ClientSyncNotice> {
                 .flatten()
                 .map(client_timestamp),
             estimated_catch_up_seconds: sync.estimated_catch_up_seconds,
+            diverged_since: sync
+                .diverged
+                .then_some(sync.graph_differs_since_unix_ms)
+                .flatten()
+                .map(client_timestamp),
         })
         .collect::<Vec<_>>();
+    let sync_state = if peers.iter().any(|peer| peer.diverged_since.is_some()) {
+        "diverged"
+    } else {
+        "catching-up"
+    };
     (!peers.is_empty()).then(|| ClientSyncNotice {
-        state: "catching-up".into(),
+        state: sync_state.into(),
         peers,
     })
 }
@@ -4030,7 +4040,13 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 .map(|peer| format!("{}={}", peer.peer, peer.status))
                 .collect::<Vec<_>>();
             let unresolved = replication.invalid_records + replication.unknown_records;
-            let status = if replication.unhealthy_projections != 0 {
+            let diverged = replication
+                .peers
+                .iter()
+                .filter(|peer| peer.sync.as_ref().is_some_and(|sync| sync.diverged))
+                .map(|peer| peer.peer.as_str())
+                .collect::<Vec<_>>();
+            let status = if replication.unhealthy_projections != 0 || !diverged.is_empty() {
                 "fail"
             } else if !unavailable.is_empty() || unresolved != 0 {
                 "warn"
@@ -4041,7 +4057,16 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 name: "replication".into(),
                 status: status.into(),
                 message: format!(
-                    "{} envelopes; {} unresolved records; {} unhealthy projections{}; peers {}",
+                    "{}{} envelopes; {} unresolved records; {} unhealthy projections{}; peers {}",
+                    if diverged.is_empty() {
+                        String::new()
+                    } else {
+                        format!(
+                            "graph diverged from {}: the same envelopes project a different \
+                             graph, which exchanges cannot fix (st replication status); ",
+                            diverged.join(", ")
+                        )
+                    },
                     replication.received_envelopes,
                     unresolved,
                     replication.unhealthy_projections,
