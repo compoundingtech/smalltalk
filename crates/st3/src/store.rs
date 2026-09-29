@@ -38,6 +38,14 @@ use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
 use crate::model::{SeatQueueMoveRequest, SeatQueueMoveView, SeatQueueRunView, SeatQueueView};
 use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
+mod checkpoint;
+
+pub use checkpoint::{
+    CheckpointPlanRequest, CheckpointPlanView, CheckpointProof, ClaimTombstone, DropCount,
+    DropPlan, EnvelopeKey, EnvelopeTombstone, SealedSet, checkpoint_cut, checkpoint_name,
+    newest_due_cut, rules_digest,
+};
+
 type StepStateRow = (String, bool, u32, String, String, String, String, String);
 type StepRetryRow = (String, u32, bool, String, String, String, String, String);
 type CumulativeUsage = (u64, u64, u64, u64, Option<f64>, Option<String>);
@@ -90,6 +98,8 @@ CREATE TABLE IF NOT EXISTS claims (
 CREATE INDEX IF NOT EXISTS claims_subject_index ON claims(subject, store_index);
 CREATE INDEX IF NOT EXISTS claims_kind_index ON claims(kind, store_index);
 CREATE INDEX IF NOT EXISTS claims_subject_kind_index ON claims(subject, kind, store_index);
+CREATE INDEX IF NOT EXISTS claims_subject_kind_accepted_index
+ON claims(subject, kind, length(accepted_at_unix_ms), accepted_at_unix_ms);
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
@@ -521,17 +531,59 @@ CREATE TABLE IF NOT EXISTS replica_envelope_holds (
     updated_at_unix_ms TEXT NOT NULL,
     PRIMARY KEY(writer, sequence, envelope_hash)
 );
+
+-- A dropped envelope's identity. See `store/checkpoint.rs`.
+CREATE TABLE IF NOT EXISTS checkpoint_envelopes (
+    writer TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    accepted_at_unix_ms INTEGER NOT NULL,
+    checkpoint TEXT NOT NULL,
+    PRIMARY KEY(writer, sequence, envelope_hash)
+);
+-- A dropped claim: what evidence checks, ancestry walks and idempotent retries still read.
+CREATE TABLE IF NOT EXISTS checkpoint_claims (
+    id TEXT PRIMARY KEY,
+    writer TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    actor TEXT,
+    predecessors TEXT NOT NULL,
+    operation_id TEXT,
+    request_digest TEXT,
+    accepted_at_unix_ms INTEGER NOT NULL,
+    checkpoint TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);
+CREATE INDEX IF NOT EXISTS checkpoint_claims_operation
+ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
 PRAGMA user_version = 13;
 "#;
 
 const READ_CONNECTIONS: usize = 4;
 
-const CLAIMS_FOR_SUBJECT: &str =
-    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-     FROM claims WHERE subject=?1 ORDER BY store_index";
-const CLAIMS_FOR_SUBJECT_KIND: &str =
-    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-     FROM claims WHERE subject=?1 AND kind=?2 ORDER BY store_index";
+/// Claims in canonical order: accepted time, then writer, batch sequence and position in the
+/// batch. Every node that holds the same claims orders them the same way, as the full replay does.
+/// `store_index` is arrival order, which differs from node to node, so a fold over one subject's
+/// history uses this order. Queries that use it join `batches` on `claims.batch_id`.
+const CANONICAL_ORDER: &str = "length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
+     batches.origin, batches.replica_sequence, claims.batch_id, claims.store_index";
+const CANONICAL_ORDER_DESC: &str = "length(claims.accepted_at_unix_ms) DESC,
+     claims.accepted_at_unix_ms DESC, batches.origin DESC, batches.replica_sequence DESC,
+     claims.batch_id DESC, claims.store_index DESC";
+const CLAIM_COLUMNS: &str = "claims.id, claims.store_index, claims.batch_id, claims.subject,
+     claims.kind, claims.origin, claims.actor, claims.body, claims.predecessors,
+     claims.accepted_at_unix_ms";
+
+fn claims_for_subject_query(kind: bool) -> String {
+    let kind = if kind { " AND claims.kind=?2" } else { "" };
+    format!(
+        "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1{kind} ORDER BY {CANONICAL_ORDER}"
+    )
+}
 
 struct WriterConnection {
     connection: Mutex<Connection>,
@@ -674,6 +726,10 @@ pub struct Store {
     /// This node's fleet member key. Set, it signs every envelope of this node's writer.
     member_key: std::sync::RwLock<Option<Arc<crate::fleet::MemberKey>>>,
     origin: String,
+    /// The database file, or the shared-memory URI of an in-memory store. A checkpoint proof
+    /// opens its own connection here to copy the store.
+    path: PathBuf,
+    shared_memory: bool,
 }
 
 const MESSAGE_CACHE_LIMIT: usize = 4096;
@@ -1632,6 +1688,8 @@ impl Store {
             last_replication_projection_unix_ms: AtomicU64::new(0),
             member_key: std::sync::RwLock::new(None),
             origin,
+            path: path.to_path_buf(),
+            shared_memory: false,
         })
     }
 
@@ -1679,6 +1737,8 @@ impl Store {
             last_replication_projection_unix_ms: AtomicU64::new(0),
             member_key: std::sync::RwLock::new(None),
             origin,
+            path: uri,
+            shared_memory: true,
         })
     }
 
@@ -8902,12 +8962,21 @@ impl Store {
         Ok(faults)
     }
 
+    /// The latest claim of a subject, or of one kind of it, in canonical order.
     pub fn latest_claim(&self, subject: &str, kind: Option<&str>) -> Result<Option<ClaimRecord>> {
         let connection = self.readers.get();
-        let query = "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-                     FROM claims WHERE subject=?1 AND (?2 IS NULL OR kind=?2) ORDER BY store_index DESC LIMIT 1";
+        let filter = if kind.is_some() {
+            " AND claims.kind=?2"
+        } else {
+            " AND ?2 IS NULL"
+        };
+        let query = format!(
+            "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1{filter} ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+        );
         connection
-            .query_row(query, params![subject, kind], claim_from_row)
+            .prepare_cached(&query)?
+            .query_row(params![subject, kind], claim_from_row)
             .optional()
             .map_err(Into::into)
     }
@@ -10309,11 +10378,11 @@ impl Store {
         // and the reconciler asks for one kind of each agent's claims on every pass.
         let rows = match kind {
             Some(kind) => connection
-                .prepare(CLAIMS_FOR_SUBJECT_KIND)?
+                .prepare_cached(&claims_for_subject_query(true))?
                 .query_map(params![subject, kind], claim_from_row)?
                 .collect::<Result<Vec<_>, _>>(),
             None => connection
-                .prepare(CLAIMS_FOR_SUBJECT)?
+                .prepare_cached(&claims_for_subject_query(false))?
                 .query_map([subject], claim_from_row)?
                 .collect::<Result<Vec<_>, _>>(),
         };
@@ -11136,21 +11205,29 @@ impl Store {
         snapshot_index: u64,
     ) -> Result<Option<u128>> {
         let connection = self.readers.get();
-        let previous: Option<u64> = connection.query_row(
-            "SELECT MAX(store_index) FROM claims WHERE subject=?1 AND kind='harness.observed'
-             AND json_extract(body, '$.fields.incarnation_id')=?2
-             AND json_extract(body, '$.fields.state')!='working' AND store_index<=?3",
-            params![agent, incarnation, snapshot_index],
-            |row| row.get(0),
-        )?;
-        let started: Option<String> = connection.query_row(
-            "SELECT accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind='harness.observed'
-             AND json_extract(body, '$.fields.incarnation_id')=?2
-             AND json_extract(body, '$.fields.state')='working'
-             AND store_index>?3 AND store_index<=?4 ORDER BY store_index LIMIT 1",
-            params![agent, incarnation, previous.unwrap_or(0), snapshot_index], |row| row.get(0),
-        ).optional()?;
-        Ok(started.and_then(|time| time.parse().ok()))
+        // The first `working` observation after the incarnation's last other state, in canonical
+        // order, so every node that holds the same claims agrees.
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT json_extract(claims.body, '$.fields.state'), claims.accepted_at_unix_ms
+             FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1 AND claims.kind='harness.observed'
+               AND json_extract(claims.body, '$.fields.incarnation_id')=?2
+               AND claims.store_index<=?3
+             ORDER BY {CANONICAL_ORDER}"
+        ))?;
+        let states = statement
+            .query_map(params![agent, incarnation, snapshot_index], |row| {
+                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let after = states
+            .iter()
+            .rposition(|(state, _)| state.as_deref().is_some_and(|state| state != "working"))
+            .map_or(0, |position| position + 1);
+        Ok(states[after..]
+            .iter()
+            .find(|(state, _)| state.as_deref() == Some("working"))
+            .and_then(|(_, time)| time.parse().ok()))
     }
 
     fn timeline_claim_rows_for_incarnation_at(
@@ -12376,20 +12453,25 @@ impl Store {
         // An inbound exchange is just as good evidence of reachability as an outbound one.
         // Keep the last success during a short missed-exchange window, so a failed dial on
         // one side cannot flap a peer that is still exchanging in the other direction.
-        let recent_exchange = self
-            .replication_peer_last_success(peer)?
-            .is_some_and(|last| now_ms().saturating_sub(last) < 90_000);
+        let last_success = self.replication_peer_last_success(peer)?;
+        let recent_exchange =
+            last_success.is_some_and(|last| now_ms().saturating_sub(last) < 90_000);
         if recent_exchange {
             return Ok(false);
         }
         // A peer may also have a fresh up observation without a matching peer-row success
         // (for example, after a worker restart). Its published status must get the same
-        // missed-exchange grace period or one outbound timeout reverses it immediately.
-        let recent_observation = self
-            .latest_claim(&format!("host/{peer}"), Some("transport.observed"))?
-            .filter(|claim| claim.origin == self.origin && claim.body["fields"]["status"] == "up")
-            .and_then(|claim| claim.body["fields"]["last_success_at"].as_u64())
-            .is_some_and(|last| now_ms().saturating_sub(u128::from(last)) < 90_000);
+        // missed-exchange grace period or one outbound timeout reverses it immediately. A row
+        // success, once recorded, is the newer evidence: every exchange updates it, while the
+        // observation changes only with the status.
+        let recent_observation = last_success.is_none()
+            && self
+                .latest_claim(&format!("host/{peer}"), Some("transport.observed"))?
+                .filter(|claim| {
+                    claim.origin == self.origin && claim.body["fields"]["status"] == "up"
+                })
+                .and_then(|claim| claim.body["fields"]["last_success_at"].as_u64())
+                .is_some_and(|last| now_ms().saturating_sub(u128::from(last)) < 90_000);
         if recent_observation {
             return Ok(false);
         }
@@ -15183,8 +15265,10 @@ fn latest_claim_of_kind_tx(
 ) -> Result<Option<ClaimRecord>, St3Error> {
     transaction
         .query_row(
-            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-             FROM claims WHERE subject=?1 AND kind=?2 ORDER BY store_index DESC LIMIT 1",
+            &format!(
+                "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
+                 WHERE claims.subject=?1 AND claims.kind=?2 ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+            ),
             params![subject, kind],
             claim_from_row,
         )
@@ -16343,10 +16427,25 @@ fn selected_actual_source_at(
     let Some((selected_id, _, selected_origin, _, selected_body)) = selected else {
         return Ok((None, None, false));
     };
-    let predecessors = rows
+    // A checkpoint may have dropped claims on the path from the selected claim to an older
+    // observation. Their tombstones keep the links, so the walk passes through them.
+    let dropped = connection
+        .prepare_cached("SELECT id, predecessors FROM checkpoint_claims WHERE subject=?1")?
+        .query_map([subject], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                serde_json::from_str::<Vec<String>>(&row.get::<_, String>(1)?).unwrap_or_default(),
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut predecessors = dropped
         .iter()
-        .map(|(id, _, _, predecessors, _)| (id.as_str(), predecessors.as_slice()))
+        .map(|(id, predecessors)| (id.as_str(), predecessors.as_slice()))
         .collect::<BTreeMap<_, _>>();
+    predecessors.extend(
+        rows.iter()
+            .map(|(id, _, _, predecessors, _)| (id.as_str(), predecessors.as_slice())),
+    );
     let descends_from = |ancestor: &str| {
         let mut pending = vec![selected_id.as_str()];
         let mut visited = BTreeSet::new();
@@ -16413,16 +16512,18 @@ fn latest_actual_at(
     at_index: Option<u64>,
 ) -> Result<Option<Value>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
-    let mut statement = connection.prepare(
-        "SELECT kind, body FROM claims
-         WHERE subject=?1
-           AND kind!='intent.desired'
-           AND kind NOT LIKE 'harness.%'
-           AND kind!='runtime.readiness-deadline-reached'
-           AND kind!='reconcile.fault'
-           AND store_index<=?2
-         ORDER BY store_index",
-    )?;
+    // Folded in canonical order, so two nodes holding the same claims agree however they
+    // received them.
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT claims.kind, claims.body FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1
+           AND claims.kind!='intent.desired'
+           AND claims.kind NOT LIKE 'harness.%'
+           AND claims.kind!='runtime.readiness-deadline-reached'
+           AND claims.kind!='reconcile.fault'
+           AND claims.store_index<=?2
+         ORDER BY {CANONICAL_ORDER}"
+    ))?;
     let rows = statement
         .query_map(params![subject, at_index], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -16464,13 +16565,15 @@ fn current_harness_at(
 ) -> Result<Option<crate::model::CurrentHarnessView>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     let runtime = connection
-        .query_row(
-            "SELECT store_index, body FROM claims
-             WHERE subject=?1 AND kind='runtime.observed' AND store_index<=?2
-             ORDER BY store_index DESC LIMIT 1",
-            params![subject, at_index],
-            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
-        )
+        .prepare_cached(&format!(
+            "SELECT claims.store_index, claims.body
+             FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1 AND claims.kind='runtime.observed' AND claims.store_index<=?2
+             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+        ))?
+        .query_row(params![subject, at_index], |row| {
+            Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+        })
         .optional()?;
     let Some((runtime_index, runtime_body)) = runtime else {
         return Ok(None);
@@ -16489,13 +16592,17 @@ fn current_harness_at(
     // activity can otherwise overwrite a one-off blocked observation. Fence the entire incarnation
     // instead.
     let prompt_rejection = connection
-        .query_row(
-            "SELECT id, accepted_at_unix_ms, json_extract(body, '$.fields.code') FROM claims
-             WHERE subject=?1 AND kind='harness.diagnostic' AND store_index<=?2
-               AND json_extract(body, '$.fields.code')
+        .prepare_cached(&format!(
+            "SELECT claims.id, claims.accepted_at_unix_ms, json_extract(claims.body, '$.fields.code')
+             FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1 AND claims.kind='harness.diagnostic'
+               AND claims.store_index<=?2
+               AND json_extract(claims.body, '$.fields.code')
                    IN ('provider-auth-expired', 'provider-auth-restored', 'provider-trust-prompt')
-               AND json_extract(body, '$.fields.incarnation_id')=?3
-             ORDER BY store_index DESC LIMIT 1",
+               AND json_extract(claims.body, '$.fields.incarnation_id')=?3
+             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+        ))?
+        .query_row(
             params![subject, at_index, incarnation_id],
             |row| {
                 Ok((
@@ -16530,11 +16637,14 @@ fn current_harness_at(
         }));
     }
 
-    let mut statement = connection.prepare(
-        "SELECT id, store_index, body, accepted_at_unix_ms FROM claims
-         WHERE subject=?1 AND kind='harness.observed' AND store_index<=?2
-         ORDER BY store_index DESC",
-    )?;
+    // Newest first in canonical order, so every node that holds the same claims shows the same
+    // harness state.
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT claims.id, claims.store_index, claims.body, claims.accepted_at_unix_ms
+         FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind='harness.observed' AND claims.store_index<=?2
+         ORDER BY {CANONICAL_ORDER_DESC}"
+    ))?;
     let rows = statement.query_map(params![subject, at_index], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -24280,9 +24390,12 @@ fn claim_descends_from(
         if !seen.insert(claim_id.clone()) {
             continue;
         }
+        // A checkpoint may have dropped a claim on the path; its tombstone keeps the links.
         let predecessors = transaction
             .query_row(
-                "SELECT predecessors FROM claims WHERE id=?1",
+                "SELECT predecessors FROM claims WHERE id=?1
+                 UNION ALL SELECT predecessors FROM checkpoint_claims WHERE id=?1
+                 LIMIT 1",
                 [&claim_id],
                 |row| row.get::<_, String>(0),
             )
@@ -25981,16 +26094,43 @@ fn step_execution_timing_at(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    let events = events
+        .into_iter()
+        .map(|(kind, body, accepted)| {
+            (
+                kind,
+                serde_json::from_str::<Value>(&body).unwrap_or(Value::Null),
+                accepted.parse::<u128>().unwrap_or(0),
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(fold_step_timing(
+        &events,
+        attempt,
+        snapshot_unix_ms,
+        currently_active,
+    ))
+}
+
+/// Fold a step's execution timing from its step and work events in canonical order: the active
+/// interval of `attempt` as of `snapshot_unix_ms`, and the time elapsed in earlier intervals.
+/// An interval closes when the next event arrives after its lease expiry. The checkpoint
+/// planner replays the same fold, so it keeps every renewal the answer depends on.
+pub(crate) fn fold_step_timing(
+    events: &[(String, Value, u128)],
+    attempt: u32,
+    snapshot_unix_ms: u128,
+    currently_active: bool,
+) -> (Option<u128>, u128) {
     let mut elapsed = 0_u128;
     let mut started = None;
     let mut lease_expires = None;
     for (kind, body, accepted) in events {
-        let accepted = accepted.parse::<u128>().unwrap_or(0);
+        let accepted = *accepted;
         if accepted > snapshot_unix_ms {
             break;
         }
-        let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
-        let fields = body.get("fields").unwrap_or(&body);
+        let fields = body.get("fields").unwrap_or(body);
         if kind.starts_with("work.")
             && fields.get("attempt").and_then(Value::as_u64) != Some(u64::from(attempt))
         {
@@ -26091,7 +26231,7 @@ fn step_execution_timing_at(
             started = None;
         }
     }
-    Ok((started, elapsed))
+    (started, elapsed)
 }
 
 fn apply_effective_step_state(
@@ -27385,6 +27525,26 @@ mod tests {
             )
             .unwrap();
         assert!(stale
+            .record_peer_failure("target", "down", "request timed out")
+            .unwrap());
+
+        // Once an exchange has recorded a success, that row is the evidence, since every
+        // exchange updates it. When it is old, a timeout goes through even though the newest
+        // observation, from this node, still looks fresh.
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO replication_peers(peer, status, last_success_at_unix_ms, updated_at_unix_ms)
+                 VALUES ('target', 'up', ?1, ?2)",
+                params![
+                    now_ms().saturating_sub(91_000).to_string(),
+                    now_ms().to_string()
+                ],
+            )
+            .unwrap();
+        assert!(store
             .record_peer_failure("target", "down", "request timed out")
             .unwrap());
     }
@@ -31715,6 +31875,142 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         assert_eq!(right_status.unknown_records, 1);
     }
 
+    /// One exchange carrying exactly `envelopes`, as a peer that holds only those would send it.
+    fn exchange_of(peer: &str, envelopes: Vec<ReplicaEnvelope>) -> ReplicationExchange {
+        ReplicationExchange {
+            peer: peer.into(),
+            fleet_id: TEST_FLEET.into(),
+            schema_digest: st3_schema::registry().digest(),
+            authority_digest: String::new(),
+            graph_digest: String::new(),
+            inventory: ReplicationInventory {
+                digest: String::new(),
+                envelopes: envelopes
+                    .iter()
+                    .map(|envelope| ReplicaEnvelopeId {
+                        writer: envelope.writer.clone(),
+                        sequence: envelope.sequence,
+                        hash: envelope.hash.clone(),
+                    })
+                    .collect(),
+                buckets: Vec::new(),
+                accepts: None,
+            },
+            envelopes,
+            signature_requests: Vec::new(),
+            signatures: Vec::new(),
+        }
+    }
+
+    /// Status, the harness view and the latest claim of a kind fold in canonical order. Two nodes
+    /// that hold the same claims therefore agree even when the claims reached them in different
+    /// orders, which a checkpoint relies on when it drops claims that a later one replaced.
+    #[test]
+    fn nodes_that_received_the_same_claims_in_different_orders_agree() {
+        let source = Store::open_memory("source").unwrap();
+        let agent = "agent/source.worker";
+        for (status, incarnation) in [
+            ("running", "inc-0"),
+            ("exited", "inc-0"),
+            ("running", "inc-1"),
+        ] {
+            source
+                .append_claim(&ClaimInput {
+                    subject: agent.into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String(status.into())),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("runtime:{status}:{incarnation}")),
+                })
+                .unwrap();
+        }
+        for (state, observed_at) in [("idle", 1_000), ("working", 2_000), ("idle", 3_000)] {
+            source
+                .append_claim_outcome(&harness_state(agent, state, observed_at))
+                .unwrap();
+        }
+        let envelopes = exchange_from(&source, &ReplicationInventory::default()).envelopes;
+        assert!(envelopes.len() >= 6);
+
+        let in_order = Store::open_memory("in-order").unwrap();
+        receive_and_project(
+            &in_order,
+            "source",
+            &exchange_of("source", envelopes.clone()),
+        );
+        // The other node admits every envelope in its own exchange, newest first, so its store
+        // indexes run backwards.
+        let reversed = Store::open_memory("reversed").unwrap();
+        for envelope in envelopes.iter().rev() {
+            receive_and_project(
+                &reversed,
+                "source",
+                &exchange_of("source", vec![envelope.clone()]),
+            );
+        }
+        let first = |store: &Store| {
+            store
+                .claims_for(agent, Some("runtime.observed"))
+                .unwrap()
+                .first()
+                .map(|claim| claim.store_index)
+        };
+        assert!(
+            first(&reversed) > first(&in_order),
+            "the reversed node must have admitted the oldest claim last"
+        );
+
+        for store in [&in_order, &reversed] {
+            let actual = store.latest_actual_value(agent).unwrap().unwrap();
+            assert_eq!(actual["status"], "running");
+            assert_eq!(actual["incarnation_id"], "inc-1");
+            let harness = store.current_harness(agent).unwrap().unwrap();
+            assert_eq!(harness.state, "idle");
+        }
+        assert_eq!(
+            in_order
+                .latest_claim(agent, Some("runtime.observed"))
+                .unwrap()
+                .unwrap()
+                .id,
+            reversed
+                .latest_claim(agent, Some("runtime.observed"))
+                .unwrap()
+                .unwrap()
+                .id,
+        );
+        let ids = |store: &Store| {
+            store
+                .claims_for(agent, None)
+                .unwrap()
+                .into_iter()
+                .map(|claim| claim.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&in_order), ids(&reversed));
+        assert_eq!(
+            in_order
+                .latest_claim(agent, Some("harness.observed"))
+                .unwrap()
+                .unwrap()
+                .body["fields"]["state"],
+            "idle"
+        );
+        assert_eq!(
+            reversed
+                .latest_claim(agent, Some("harness.observed"))
+                .unwrap()
+                .unwrap()
+                .body["fields"]["state"],
+            "idle"
+        );
+    }
+
     #[test]
     fn concurrent_graph_writes_converge_after_a_partition() {
         let left = Store::open_memory("left").unwrap();
@@ -32981,7 +33277,10 @@ version 2
         let store = Store::open_memory("node").unwrap();
         let connection = store.connection.lock().unwrap();
         let mut statement = connection
-            .prepare(&format!("EXPLAIN QUERY PLAN {CLAIMS_FOR_SUBJECT_KIND}"))
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                claims_for_subject_query(true)
+            ))
             .unwrap();
         let plan = statement
             .query_map(params!["agent/example", "harness.diagnostic"], |row| {
@@ -32992,7 +33291,8 @@ version 2
             .unwrap()
             .join("\n");
         assert!(
-            plan.contains("claims_subject_kind_index (subject=? AND kind=?)"),
+            plan.contains("claims_subject_kind_accepted_index (subject=? AND kind=?)")
+                || plan.contains("claims_subject_kind_index (subject=? AND kind=?)"),
             "one kind of a subject's claims must not read every claim of the subject:\n{plan}"
         );
         drop(statement);
