@@ -182,6 +182,29 @@ pub fn run_controlled_paths(
     .with_context(|| format!("running interactive Claude driver '{runtime_id}'"))
 }
 
+/// Resume supervising an interactive Claude provider a predecessor driver image launched through
+/// [`run_controlled_paths`] and released with [`crate::provider_session::Detached`].
+pub fn adopt_controlled_paths(
+    agent_dir: &Path,
+    identity: &str,
+    runtime_id: &str,
+    pid: u32,
+    session: &str,
+    seq: u64,
+) -> Result<()> {
+    let observer = SessionObserver::adopt(agent_dir, identity, "claude", runtime_id, session, seq);
+    crate::provider_session::adopt_provider(
+        "Claude",
+        &status::status_path(agent_dir),
+        pid,
+        status::STATUS_REFRESH,
+        PROVIDER_POLL,
+        &STOP,
+        Some(&observer),
+    )
+    .with_context(|| format!("supervising adopted interactive Claude driver '{runtime_id}'"))
+}
+
 fn requires_st2_channel(argv: &[String]) -> bool {
     argv.windows(2)
         .any(|pair| pair[0] == "--channels" && pair[1] == crate::claude_channel::CHANNEL)

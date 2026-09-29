@@ -198,8 +198,7 @@ impl Store {
                 if self.current_graph_digest()? == graph_digest {
                     return self.finish_heal(peer, true, None);
                 }
-                let differing =
-                    differing_ranges(&claim_ranges(&self.readers.get())?, &peer_ranges);
+                let differing = differing_ranges(&claim_ranges(&self.readers.get())?, &peer_ranges);
                 if !differing.is_empty() {
                     self.heal_session(peer, |session| {
                         session.report.ranges += differing.len() as u64;
@@ -275,18 +274,17 @@ impl Store {
                 let local_keys = local.iter().map(key).collect::<BTreeSet<_>>();
                 let peer_keys = peer_claims.iter().map(key).collect::<BTreeSet<_>>();
                 let envelope = |claim: &HealClaim| {
-                    claim
-                        .envelope_hash
-                        .as_ref()
-                        .map(|hash| ReplicaEnvelopeId {
-                            writer: claim.writer.clone(),
-                            sequence: claim.sequence,
-                            hash: hash.clone(),
-                        })
+                    claim.envelope_hash.as_ref().map(|hash| ReplicaEnvelopeId {
+                        writer: claim.writer.clone(),
+                        sequence: claim.sequence,
+                        hash: hash.clone(),
+                    })
                 };
                 let wanted = peer_claims
                     .iter()
-                    .filter(|claim| !local_keys.contains(&key(claim)) && claim.envelope_hash.is_some())
+                    .filter(|claim| {
+                        !local_keys.contains(&key(claim)) && claim.envelope_hash.is_some()
+                    })
                     .cloned()
                     .collect::<Vec<_>>();
                 let want = wanted
@@ -336,10 +334,14 @@ impl Store {
                 }
                 let mut reasons = Vec::new();
                 if let Some(missing) = missing {
-                    reasons.push(format!("this node cannot admit {missing} that {peer} projects"));
+                    reasons.push(format!(
+                        "this node cannot admit {missing} that {peer} projects"
+                    ));
                 }
                 if let Some(refused) = refused {
-                    reasons.push(format!("{peer} cannot admit {refused} that this node projects"));
+                    reasons.push(format!(
+                        "{peer} cannot admit {refused} that this node projects"
+                    ));
                 }
                 if refetched + admitted != 0 && rounds < HEAL_ROUND_LIMIT {
                     return Ok(ReplicationHealStep::Ask {
@@ -840,7 +842,10 @@ fn range_claims(connection: &Connection, range: &ClaimRange) -> Result<Vec<HealC
 }
 
 /// The digest of the claims this node projects about each subject within `ranges`.
-fn claim_subjects(connection: &Connection, ranges: &[ClaimRange]) -> Result<Vec<ClaimSubjectDigest>> {
+fn claim_subjects(
+    connection: &Connection,
+    ranges: &[ClaimRange],
+) -> Result<Vec<ClaimSubjectDigest>> {
     let mut subjects = Vec::new();
     for range in ranges {
         let mut by_subject = BTreeMap::<String, (u64, Sha256)>::new();
@@ -851,17 +856,15 @@ fn claim_subjects(connection: &Connection, ranges: &[ClaimRange]) -> Result<Vec<
             *count += 1;
             digest_claim(digest, claim.sequence, &claim.claim_id);
         }
-        subjects.extend(
-            by_subject
-                .into_iter()
-                .map(|(subject, (count, digest))| ClaimSubjectDigest {
-                    writer: range.writer.clone(),
-                    start: range.start,
-                    subject,
-                    count,
-                    digest: hex::encode(digest.finalize()),
-                }),
-        );
+        subjects.extend(by_subject.into_iter().map(|(subject, (count, digest))| {
+            ClaimSubjectDigest {
+                writer: range.writer.clone(),
+                start: range.start,
+                subject,
+                count,
+                digest: hex::encode(digest.finalize()),
+            }
+        }));
     }
     Ok(subjects)
 }
@@ -912,7 +915,11 @@ fn differing_subjects(local: &[ClaimSubjectDigest], peer: &[ClaimSubjectDigest])
             .iter()
             .map(|subject| {
                 (
-                    (subject.writer.clone(), subject.start, subject.subject.clone()),
+                    (
+                        subject.writer.clone(),
+                        subject.start,
+                        subject.subject.clone(),
+                    ),
                     subject.digest.clone(),
                 )
             })
