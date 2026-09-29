@@ -2705,6 +2705,14 @@ impl Store {
                     format!("mission `{mission_id}` does not exist"),
                 )
             })?;
+        if mission.state == MissionState::Retired {
+            return Err(St3Error::new(
+                "mission-retired",
+                format!(
+                    "mission `{mission_id}` is retired; publish a ready revision to start it again"
+                ),
+            ));
+        }
         if mission.state != MissionState::Ready {
             return Err(St3Error::new(
                 "mission-not-ready",
@@ -37747,7 +37755,7 @@ mission "takeover" state="ready" {
             .unwrap()
             .unwrap();
         assert_eq!(publication.actor.as_deref(), Some("person/operator"));
-        assert!(
+        assert_eq!(
             store
                 .create_mission_run(&MissionRunRequest {
                     mission: "takeover".into(),
@@ -37758,7 +37766,9 @@ mission "takeover" state="ready" {
                     inputs: BTreeMap::new(),
                     idempotency_key: "retired-run".into(),
                 })
-                .is_err(),
+                .unwrap_err()
+                .code,
+            "mission-retired",
             "a retired mission does not start"
         );
         assert_eq!(

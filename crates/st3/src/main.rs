@@ -4102,6 +4102,10 @@ async fn start_mission_run(
     )
     .await?;
     anyhow::ensure!(
+        mission.state != MissionState::Retired,
+        "mission `mission/{mission_id}` is retired; publish a ready revision to start it again"
+    );
+    anyhow::ensure!(
         mission.state == MissionState::Ready,
         "mission `mission/{mission_id}` is not ready"
     );
