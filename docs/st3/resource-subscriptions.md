@@ -169,6 +169,17 @@ The daemon keeps each next-check deadline and cursor in local scheduler memory. 
 
 The provider applies bounded retries and backoff. It records authentication, rate-limit, and transport failures on the observer subject.
 
+A rate-limited observer waits for the reset GitHub names and asks a person only when the limit
+outlasts that reset by a minute. A rejected token or a repository the token cannot read asks a
+person at once. Each item closes when the observer observes again.
+
+Every observer on every host shares the token's hourly GitHub budget, as do `gh` and CI. The daemon
+counts each GitHub request against the observer that sent it, and keeps the counts and the budget
+from GitHub's latest rate-limit headers in memory. `st doctor` shows the remaining budget, how much
+of the current window this host's observers spent, and each observer's requests in the last hour
+and since the daemon started. A 304 answer to a conditional request is free, so it is counted
+apart. Request counts are not resource facts: an unchanged listing records no claim.
+
 Each GitHub request times out after one minute, so a connection that never answers cannot hold its
 observer.
 

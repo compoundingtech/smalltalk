@@ -8784,7 +8784,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                     previous_facts: previous_facts.clone(),
                     every_ms: spec.every_ms,
                 };
-                match provider.observe(request).await {
+                let observed =
+                    crate::resource::spend_as(observer_subject.clone(), provider.observe(request))
+                        .await;
+                match observed {
                     Ok(mut observation) => {
                         if spec.provider == "github.repository" {
                             crate::resource::attach_pull_request_openers(
@@ -9944,15 +9947,15 @@ impl ObserverCondition {
         }
     }
 
-    /// The cause and the command that fixes it.
-    fn reason(&self, subject: &str) -> String {
+    /// The cause and the command that fixes it. `host` polls the observer.
+    fn reason(&self, subject: &str, host: &str) -> String {
         let closes = "This item closes when the observer observes again.";
         match self {
             Self::Access(reason) => format!(
                 "{subject} cannot observe its resource: {reason}. Give the daemon account's GitHub token access to the repository, with `gh auth login` or `gh auth refresh -h github.com -s repo` as that account. The observer tries again on its own. {closes}"
             ),
             Self::RateLimited { reason, .. } => format!(
-                "{subject} is still limited after the reset GitHub named: {reason}. Something else spends the shared GitHub budget; `st doctor` shows the requests each observer made. The observer waits for each reset on its own. {closes}"
+                "{subject} is still limited after the reset GitHub named: {reason}. Something else spends the GitHub budget that every host shares; `st doctor` on {host} shows how much of it remains, how much that host's observers spent, and each observer's requests. The observer waits for each reset on its own. {closes}"
             ),
             Self::Unreachable(reason) => format!(
                 "{subject} has failed to observe for over an hour: {reason}. Inspect it with `st subject {subject}`. {closes}"
@@ -10001,7 +10004,7 @@ fn request_observer_attention(
         &AttentionRequest {
             reviewer,
             title: condition.title().into(),
-            reason: condition.reason(subject),
+            reason: condition.reason(subject, store.origin()),
             severity: "error".into(),
             targets: vec![subject.into()],
             actor: RECONCILER_ACTOR.into(),
@@ -19401,7 +19404,9 @@ observer "repo" {
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "A GitHub rate limit outlasted its reset");
         assert!(
-            items[0].detail.contains("`st doctor`"),
+            items[0]
+                .detail
+                .contains(&format!("`st doctor` on {}", store.origin())),
             "{}",
             items[0].detail
         );
