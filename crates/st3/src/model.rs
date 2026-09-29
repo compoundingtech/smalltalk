@@ -6,6 +6,10 @@ use serde_json::Value;
 
 pub const MAX_EVAL_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug)]
 pub struct St3Error {
     pub code: &'static str,
@@ -377,6 +381,8 @@ impl Default for RetrySpec {
 pub struct StepSpec {
     pub id: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fresh_context: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2040,6 +2046,8 @@ pub struct StepRunView {
     pub run: String,
     pub generation: String,
     pub step: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fresh_context: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2091,6 +2099,13 @@ pub struct StepRunView {
     pub not_before_unix_ms: Option<u128>,
     pub created_at_unix_ms: u128,
     pub updated_at_unix_ms: u128,
+}
+
+pub fn fresh_context_operation(step: &StepRunView) -> String {
+    format!(
+        "fresh-context:{}:{}:{}",
+        step.subject, step.attempt, step.readiness_epoch
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]

@@ -1234,6 +1234,7 @@ mod tests {
             run: "mission-run/demo/run".into(),
             generation: "run-generation/demo-generation".into(),
             step: path.into(),
+            fresh_context: false,
             queue: None,
             queue_position: None,
             definition_hash: "definition-hash".into(),
