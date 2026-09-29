@@ -225,6 +225,8 @@ st agents tree --status running --enrich
 st agents show --help
 st agents queue --help
 st agents queue move --help
+st agents new --help
+st agents new example --host HOST --print-kdl
 st machines --help
 st machines
 ```
@@ -240,6 +242,10 @@ this as a mission question rather than an agent one. `agents queue move AGENT RU
 `--bottom`, `--before RUN`, or `--after RUN` is a person-authorized mutation; move only a run we
 agreed to reorder, then confirm the move is listed with its author and time and that a held step
 stayed held.
+
+`agents new --print-kdl` shows the seat declaration without applying it. Check that its workspace is
+a new directory below that host's home and that the harness defaults match the fleet's existing
+seats. Run it without `--print-kdl` only for an agent we agreed to start.
 
 ### 8. `terminals` — inspect and attach without shell nesting
 
@@ -257,7 +263,9 @@ st terminals signal --help
 ```
 
 Use a harmless live terminal for `peek`. Attach only when we have agreed which terminal; detach and
-verify the caller's screen, cursor, input mode, and shell prompt are restored. `send` and `signal`
+verify the caller's screen, cursor, input mode, and shell prompt are restored. Attach once to a
+terminal on this host and once to one on another fleet host: the remote attach goes through the
+client gateway as the configured person and should feel the same. `send` and `signal`
 are control mutations and are not aimed at arbitrary live work.
 
 ### 9. `import` — adopt native Codex, Claude, Pi, OMP, and OpenCode sessions

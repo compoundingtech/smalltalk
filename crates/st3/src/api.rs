@@ -502,7 +502,11 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/sessions/screen/{*subject}", get(screen_session))
         .route("/v1/sessions/attach/{*subject}", post(attach_session))
         .route("/v1/sessions/{subject}/attach", post(attach_session))
-        .route("/v1/sessions/terminal/{*subject}", get(terminal_session));
+        .route("/v1/sessions/terminal/{*subject}", get(terminal_session))
+        .route(
+            "/v1/hosts/{host}/agent-workspace",
+            get(host_agent_workspace),
+        );
     app.layer(from_fn_with_state(state.clone(), refuse_while_leaving))
         .layer(from_fn_with_state(
             (state.clone(), transport),
@@ -9826,6 +9830,60 @@ async fn attach_session(
         capability,
         expires_at_unix_ms,
     }))
+}
+
+#[derive(Deserialize)]
+struct AgentWorkspaceQuery {
+    identity: String,
+}
+
+/// The directory a host gives a new agent that names no workspace. Another host's home is only
+/// known there, so this relays to the owner under the caller's person, like a client read.
+async fn host_agent_workspace(
+    State(state): State<AppState>,
+    AxumPath(host): AxumPath<String>,
+    Query(query): Query<AgentWorkspaceQuery>,
+    headers: axum::http::HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    let host_id = client_host_id(host.strip_prefix("host/").unwrap_or(&host));
+    if host_id == client_host_id(&state.node) {
+        let workspace =
+            crate::config::default_agent_workspace(&query.identity).map_err(|error| {
+                ApiError::bad(St3Error::new("validation-failed", error.to_string()))
+            })?;
+        return Ok(Json(json!({ "host_id": host_id, "workspace": workspace })));
+    }
+    let person = headers
+        .get("x-st3-person")
+        .and_then(|value| value.to_str().ok())
+        .filter(|person| person.starts_with("person/") && person.matches('/').count() == 1)
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "missing-person",
+                format!("asking {host_id} for a workspace needs a concrete person"),
+            ))
+        })?;
+    let relay = state
+        .client_relay
+        .as_ref()
+        .filter(|relay| relay.has_peer(&host_id))
+        .ok_or_else(|| remote_unavailable(&host_id))?;
+    let value = relay
+        .read(
+            &host_id,
+            &crate::peer::ClientReadRequest {
+                authority_actor: person.into(),
+                request: crate::peer::ClientReadOperation::AgentWorkspace {
+                    identity: query.identity,
+                },
+            },
+        )
+        .await
+        .map_err(|error| remote_read_error(&host_id, error))?;
+    let workspace = value["workspace"]
+        .as_str()
+        .ok_or_else(|| ApiError::internal(format!("{host_id} returned no workspace")))?;
+    Ok(Json(json!({ "host_id": host_id, "workspace": workspace })))
 }
 
 async fn post_gate_result(
