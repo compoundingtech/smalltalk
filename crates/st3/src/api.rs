@@ -4462,7 +4462,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             driver_gaps.join("; ")
         },
     });
-    match state.store.replication_status(
+    match state.store.replication_status_sealed(
         state.fleet_id.is_some(),
         state.fleet_id.as_deref(),
         &replication_peer_names(state),
@@ -4564,7 +4564,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         Ok(Some(_)) => match (
             state
                 .store
-                .replication_status(true, state.fleet_id.as_deref(), &[]),
+                .replication_status_sealed(true, state.fleet_id.as_deref(), &[]),
             state.store.fleet_admission_residue(),
         ) {
             (Ok(holds), Ok(residue)) => {
@@ -11338,6 +11338,7 @@ mod tests {
             "/v1/client/now",
             "/v1/replication/status",
             "/v1/internal/fleet/membership",
+            "/v1/client/operations",
         ] {
             let started = Instant::now();
             let response =
