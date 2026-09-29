@@ -19,10 +19,11 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend};
 use st3_client::{
-    Client, Fence, LaunchReviseParameters, MessageSendParameters, Resource, TimelineEntry,
+    Client, Fence, LaunchReviseParameters, MessageSendParameters, Resource, TimelineBody,
+    TimelineEntry,
 };
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     io,
     sync::mpsc,
     time::{Duration, Instant},
@@ -56,8 +57,6 @@ struct Following {
 }
 
 enum Fetched {
-    Timeline(String, Vec<TimelineEntry>),
-    Messages(String, Vec<st3_client::Message>),
     Preview(String, Load<MissionPreview>),
     /// The message behind an unread-message item: sender, title and text.
     Body(String, String, Option<String>, String),
@@ -69,11 +68,7 @@ enum Fetched {
     Devices(Collection),
     /// A send finished: the pending token and st's message id, or why it failed.
     Sent(String, Result<Option<String>, String>),
-    Failed(String, String),
 }
-
-/// How long a conversation may go without a refetch when no event says it changed.
-const CONVERSATION_FALLBACK: Duration = Duration::from_secs(45);
 
 pub fn run(context: Context) -> Result<()> {
     let Context {
@@ -90,17 +85,15 @@ pub fn run(context: Context) -> Result<()> {
     // The attention window is already this person's; nothing else names the actor.
     model.actor = person.clone();
     let mut extras = Extras::default();
+    // Each conversation st has sent, kept after it closes so reopening it shows its last entries.
     let mut timelines: BTreeMap<String, Vec<TimelineEntry>> = BTreeMap::new();
-    let mut messages: BTreeMap<String, Vec<st3_client::Message>> = BTreeMap::new();
     let mut failed: BTreeMap<String, String> = BTreeMap::new();
-    let mut requested: BTreeMap<String, Instant> = BTreeMap::new();
-    let mut stale: HashSet<String> = HashSet::new();
+    // The agent or session whose conversation the feed holds.
+    let mut conversing: Option<String> = None;
     let mut preview_requested: HashSet<String> = HashSet::new();
     let mut body_requested: HashSet<String> = HashSet::new();
     // Messages sent from here, shown at once until st reports them back.
     let mut pending: Vec<Pending> = Vec::new();
-    // Conversations to refresh quickly because a reply is likely soon.
-    let mut hot: BTreeMap<String, Instant> = BTreeMap::new();
     let mut ui = Ui::new(adapt::world(&model, &person, &extras));
     ui.live = true;
 
@@ -115,8 +108,6 @@ pub fn run(context: Context) -> Result<()> {
     let mut terminal_runtimes: Option<Vec<String>> = None;
     // The tab shown on the last pass: opening a tab loads what only it needs.
     let mut shown_tab = usize::MAX;
-    // Each agent's last activity, so a change reloads its open conversation.
-    let mut activity: BTreeMap<String, Option<String>> = BTreeMap::new();
     let mut last_cache_save = Instant::now();
     // A closed terminal ends the loop: without this check a detached stui spins and keeps
     // polling the daemon forever.
@@ -149,22 +140,46 @@ pub fn run(context: Context) -> Result<()> {
                     match window {
                         Window::Attention => model.now = collection,
                         Window::Missions => model.missions = collection,
-                        Window::Agents => {
-                            model.agents = collection;
-                            // A conversation whose agent moved is due for a reload.
-                            for agent in model.agents() {
-                                let last = activity.insert(
-                                    agent.header.id.clone(),
-                                    agent.last_activity_at.clone(),
-                                );
-                                if last.is_some_and(|last| last != agent.last_activity_at) {
-                                    requested.remove(&agent.header.id);
-                                }
-                            }
-                        }
+                        Window::Agents => model.agents = collection,
                     }
                     extras.live = true;
                     extras.offline = None;
+                    changed = true;
+                }
+                feed::Update::Conversation {
+                    target,
+                    replace,
+                    items,
+                } => {
+                    failed.remove(&target);
+                    let entries = timelines.entry(target).or_default();
+                    if replace {
+                        *entries = items;
+                    } else {
+                        for item in items {
+                            match entries.iter_mut().find(|entry| entry.id == item.id) {
+                                Some(entry) => *entry = item,
+                                None => entries.push(item),
+                            }
+                        }
+                        entries.sort_by(|a, b| {
+                            a.timestamp
+                                .cmp(&b.timestamp)
+                                .then(a.sequence.cmp(&b.sequence))
+                        });
+                    }
+                    // A message sent from here is done once st shows it in the conversation.
+                    pending.retain(|pending| {
+                        pending.message_id.as_ref().is_none_or(|id| {
+                            !timelines.values().flatten().any(|entry| {
+                                matches!(&entry.body, TimelineBody::Message(message) if &message.message_id == id)
+                            })
+                        })
+                    });
+                    changed = true;
+                }
+                feed::Update::ConversationFailed { target, message } => {
+                    failed.insert(target, message);
                     changed = true;
                 }
                 feed::Update::WindowFailed(window, error) => {
@@ -226,20 +241,6 @@ pub fn run(context: Context) -> Result<()> {
         }
         while let Ok(result) = fetched.try_recv() {
             match result {
-                Fetched::Timeline(agent, entries) => {
-                    failed.remove(&agent);
-                    timelines.insert(agent, entries);
-                }
-                Fetched::Messages(agent, items) => {
-                    // A pending message is done once st reports its id back.
-                    pending.retain(|pending| {
-                        pending
-                            .message_id
-                            .as_ref()
-                            .is_none_or(|id| !items.iter().any(|message| &message.header.id == id))
-                    });
-                    messages.insert(agent, items);
-                }
                 Fetched::Sent(token, outcome) => {
                     if let Some(entry) = pending.iter_mut().find(|entry| entry.token == token) {
                         match outcome {
@@ -260,9 +261,6 @@ pub fn run(context: Context) -> Result<()> {
                 }
                 Fetched::Machines(machines) => model.machines = machines,
                 Fetched::Devices(devices) => model.devices = devices,
-                Fetched::Failed(agent, error) => {
-                    failed.insert(agent, error);
-                }
             }
             changed = true;
         }
@@ -323,28 +321,18 @@ pub fn run(context: Context) -> Result<()> {
                 });
             }
         }
-        if tab == 1
-            && let Some(agent) = selected.clone()
-        {
-            let session = session_for(&model, &agent);
-            let interval = if hot.get(&agent).is_some_and(|until| Instant::now() < *until) {
-                Duration::from_secs(3)
-            } else {
-                CONVERSATION_FALLBACK
-            };
-            let due = requested
-                .get(&agent)
-                .is_none_or(|at| at.elapsed() >= interval)
-                || session
-                    .as_ref()
-                    .is_some_and(|session| stale.contains(session));
-            if due {
-                requested.insert(agent.clone(), Instant::now());
-                if let Some(session) = &session {
-                    stale.remove(session);
-                }
-                fetch_conversation(&runtime, &client, &fetched_tx, agent, session);
-            }
+        // The selected agent's conversation rides the feed's socket while the Agents tab is
+        // open: st pushes each change, so nothing here reads it again on a timer.
+        let wanted = selected.clone().filter(|_| tab == 1);
+        if wanted != conversing {
+            let _ = commands.send(match &wanted {
+                Some(target) => Command::Converse {
+                    target: target.clone(),
+                },
+                None => Command::Unconverse,
+            });
+            conversing = wanted;
+            changed = true;
         }
         if tab == 0
             && let Some(id) = selected.clone()
@@ -493,8 +481,6 @@ pub fn run(context: Context) -> Result<()> {
                         message_id: None,
                         failed: None,
                     });
-                    hot.insert(agent.clone(), Instant::now() + Duration::from_secs(120));
-                    requested.remove(agent);
                     changed = true;
                     Some(token)
                 }
@@ -524,7 +510,7 @@ pub fn run(context: Context) -> Result<()> {
 
         if changed {
             extras.conversations =
-                conversations(&model, &person, &timelines, &messages, &failed, &requested);
+                conversations(&model, &person, &timelines, &failed, conversing.as_deref());
             for entry in &pending {
                 if let Some(Load::Ready(entries)) = extras.conversations.get_mut(&entry.agent) {
                     entries.push(super::view::Entry {
@@ -615,103 +601,44 @@ fn screen_lines(screen: &st3_client::TerminalScreen) -> Vec<ratatui::text::Line<
         .collect()
 }
 
-/// The session whose transcript is this agent's conversation.
-fn session_for(model: &Model, agent: &str) -> Option<String> {
-    if agent.starts_with("session/") {
-        return Some(agent.to_owned());
-    }
-    let declared = model
-        .agents()
-        .find(|candidate| candidate.header.id == agent)?;
-    declared.current_session_id.clone().or_else(|| {
-        model.sessions.items.iter().find_map(|item| match item {
-            Resource::Session(session)
-                if session.owner_id == agent && session.state == "running" =>
-            {
-                Some(session.header.id.clone())
-            }
-            _ => None,
-        })
-    })
-}
-
-fn fetch_conversation(
-    runtime: &tokio::runtime::Runtime,
-    client: &Client,
-    tx: &mpsc::Sender<Fetched>,
-    agent: String,
-    session: Option<String>,
-) {
-    if let Some(session) = session {
-        let client = client.clone();
-        let tx = tx.clone();
-        let agent = agent.clone();
-        runtime.spawn(async move {
-            let mut model = Model::default();
-            match model
-                .load_timeline_with_pages(&client, &session, model::MAX_PAGES)
-                .await
-            {
-                Ok(()) => {
-                    let _ = tx.send(Fetched::Timeline(agent, model.timeline));
-                }
-                Err(error) => {
-                    let _ = tx.send(Fetched::Failed(agent, error.to_string()));
-                }
-            }
-        });
-    }
-    if agent.starts_with("agent/") {
-        let client = client.clone();
-        let tx = tx.clone();
-        runtime.spawn(async move {
-            let mut model = Model::default();
-            if model.load_messages_for_peer(&client, &agent).await.is_ok() {
-                let items = model
-                    .messages
-                    .items
-                    .into_iter()
-                    .filter_map(|item| match item {
-                        Resource::Message(message) => Some(message),
-                        _ => None,
-                    })
-                    .collect();
-                let _ = tx.send(Fetched::Messages(agent, items));
-            }
-        });
-    }
-}
-
+/// Each conversation to draw: what st sent, and why it could not send more.
 fn conversations(
     model: &Model,
     person: &str,
     timelines: &BTreeMap<String, Vec<TimelineEntry>>,
-    messages: &BTreeMap<String, Vec<st3_client::Message>>,
     failed: &BTreeMap<String, String>,
-    requested: &BTreeMap<String, Instant>,
+    conversing: Option<&str>,
 ) -> BTreeMap<String, Load<Vec<super::view::Entry>>> {
     let mut out = BTreeMap::new();
     let names = adapt::names(model, person);
-    for agent in requested.keys() {
-        let timeline = timelines.get(agent);
-        let mail = messages.get(agent);
-        let load = match (timeline, mail) {
-            (None, None) => match failed.get(agent) {
-                Some(error) => Load::Failed(format!("Could not load this conversation: {error}")),
-                None if agent.starts_with("session/") || session_for(model, agent).is_some() => {
-                    Load::Loading
+    let targets = timelines
+        .keys()
+        .chain(failed.keys())
+        .map(String::as_str)
+        .chain(conversing)
+        .collect::<BTreeSet<_>>();
+    for target in targets {
+        let load = match (timelines.get(target), failed.get(target)) {
+            (Some(timeline), error) => {
+                let mut entries = adapt::conversation(timeline, &names);
+                // Never hide a failure behind what loaded before it.
+                if let Some(error) = error {
+                    entries.push(super::view::Entry {
+                        id: format!("failed:{target}"),
+                        at: String::new(),
+                        body: super::view::Body::Event(format!(
+                            "Could not load newer entries: {error}"
+                        )),
+                    });
                 }
-                None => Load::Failed(
-                    "This agent has no running session, so there is no transcript to show.".into(),
-                ),
-            },
-            _ => Load::Ready(adapt::conversation(
-                timeline.map(Vec::as_slice).unwrap_or(&[]),
-                mail.map(Vec::as_slice).unwrap_or(&[]),
-                &names,
-            )),
+                Load::Ready(entries)
+            }
+            (None, Some(error)) => {
+                Load::Failed(format!("Could not load this conversation: {error}"))
+            }
+            (None, None) => Load::Loading,
         };
-        out.insert(agent.clone(), load);
+        out.insert(target.to_owned(), load);
     }
     out
 }

@@ -1,14 +1,14 @@
 //! One socket to st for everything stui shows live.
 //!
-//! The feed holds one collection socket with the attention, missions and agents windows and,
-//! while a terminal is open, that terminal. st joins each row, so stui never joins lists itself
-//! or reads item by item. When the socket drops, the feed opens a new one, subscribes again,
-//! and attaches the open terminal again. Nothing here runs on a timer while connected: frames
-//! arrive only when something changed.
+//! The feed holds one collection socket with the attention, missions and agents windows, the
+//! open conversation, and, while a terminal is open, that terminal. st joins each row and each
+//! conversation, so stui never joins lists itself or reads item by item. When the socket drops,
+//! the feed opens a new one, subscribes again, and attaches the open terminal again. Nothing
+//! here runs on a timer while connected: frames arrive only when something changed.
 
 use st3_client::{
     Client, ClientError, CollectionEvent, CollectionStream, ErrorCode, Fence, Resource, Snapshot,
-    TargetParameters, TerminalScreen,
+    TargetParameters, TerminalScreen, TimelineEntry,
 };
 use std::collections::BTreeMap;
 use std::sync::mpsc;
@@ -30,6 +30,8 @@ const RETRY_DELAYS: [Duration; 5] = [
 
 /// The subscription ID of the open terminal.
 const TERMINAL: &str = "terminal";
+/// The subscription ID of the open conversation.
+const CONVERSATION: &str = "conversation";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Window {
@@ -68,6 +70,18 @@ pub enum Update {
     /// st refused a window; its last items stay.
     WindowFailed(Window, String),
     Terminal(TerminalUpdate),
+    /// The open conversation's entries. `replace` means these are its newest page and every
+    /// earlier entry is gone; otherwise they are new or revised entries, matched by ID.
+    Conversation {
+        target: String,
+        replace: bool,
+        items: Vec<TimelineEntry>,
+    },
+    /// st could not show the open conversation; the feed asks again after a backoff.
+    ConversationFailed {
+        target: String,
+        message: String,
+    },
 }
 
 #[derive(Debug)]
@@ -96,6 +110,19 @@ pub enum Command {
         runtime_ids: Vec<String>,
     },
     Unfollow,
+    /// Show this agent's or session's conversation, in place of any other.
+    Converse {
+        target: String,
+    },
+    Unconverse,
+}
+
+/// The conversation being shown.
+struct Conversing {
+    target: String,
+    /// When to subscribe again after a failure; `None` while subscribed.
+    retry_at: Option<Instant>,
+    failures: usize,
 }
 
 /// The terminal being followed.
@@ -118,6 +145,7 @@ pub async fn run(
 ) {
     let mut failures = 0_usize;
     let mut following: Option<Following> = None;
+    let mut conversing: Option<Conversing> = None;
     loop {
         let stream = match client.collection_stream().await {
             Ok(stream) => Some(stream),
@@ -135,6 +163,7 @@ pub async fn run(
                 &updates,
                 &mut commands,
                 &mut following,
+                &mut conversing,
                 &mut failures,
             )
             .await
@@ -150,6 +179,9 @@ pub async fn run(
                         let _ =
                             updates.send(Update::Terminal(TerminalUpdate::Reconnecting(reason)));
                     }
+                    if let Some(current) = conversing.as_mut() {
+                        current.retry_at = None;
+                    }
                 }
             }
         }
@@ -164,6 +196,10 @@ pub async fn run(
                 command = commands.recv() => match command {
                     None => return,
                     Some(Command::Unfollow) => following = None,
+                    Some(Command::Converse { target }) => {
+                        conversing = Some(Conversing { target, retry_at: None, failures: 0 });
+                    }
+                    Some(Command::Unconverse) => conversing = None,
                     Some(Command::Follow { runtime_ids }) => {
                         following = None;
                         match resolve(&client, &runtime_ids).await {
@@ -195,6 +231,7 @@ async fn connected(
     updates: &mpsc::Sender<Update>,
     commands: &mut channel::UnboundedReceiver<Command>,
     following: &mut Option<Following>,
+    conversing: &mut Option<Conversing>,
     failures: &mut usize,
 ) -> Ended {
     for window in Window::ALL {
@@ -205,6 +242,9 @@ async fn connected(
             return Ended::Dropped(error.to_string());
         }
     }
+    if let Err(error) = converse(stream, conversing).await {
+        return Ended::Dropped(error.to_string());
+    }
     let mut windows = BTreeMap::<Window, BTreeMap<String, Resource>>::new();
     if following.is_some() {
         match follow(client, stream, updates, following).await {
@@ -214,6 +254,7 @@ async fn connected(
     }
     loop {
         let retry_at = following.as_ref().and_then(|current| current.retry_at);
+        let converse_at = conversing.as_ref().and_then(|current| current.retry_at);
         tokio::select! {
             event = stream.next_event() => {
                 let event = match event {
@@ -250,6 +291,23 @@ async fn connected(
                             return Ended::Dropped(error.to_string());
                         }
                     }
+                    CollectionEvent::Conversation { id, replace, items, .. } => {
+                        let Some(current) = conversing.as_mut().filter(|_| id == CONVERSATION) else { continue };
+                        current.failures = 0;
+                        if updates.send(Update::Conversation { target: current.target.clone(), replace, items }).is_err() {
+                            return Ended::Closed;
+                        }
+                    }
+                    CollectionEvent::Error { id, message, .. } if id == CONVERSATION => {
+                        let Some(current) = conversing.as_mut() else { continue };
+                        // Anything may clear: the agent starts, its host comes back, its
+                        // history arrives. Ask again after a backoff.
+                        current.retry_at = Some(Instant::now() + RETRY_DELAYS[current.failures.min(RETRY_DELAYS.len() - 1)]);
+                        current.failures += 1;
+                        if updates.send(Update::ConversationFailed { target: current.target.clone(), message }).is_err() {
+                            return Ended::Closed;
+                        }
+                    }
                     CollectionEvent::Error { id, code, message } => {
                         if let Some(window) = Window::from_id(&id) {
                             if updates.send(Update::WindowFailed(window, message)).is_err() {
@@ -278,6 +336,20 @@ async fn connected(
                     return Ended::Closed;
                 }
                 Some(Command::Unfollow) => stop_following(client, stream, following).await,
+                Some(Command::Converse { target }) => {
+                    if conversing.as_ref().is_some_and(|current| current.target == target) {
+                        continue;
+                    }
+                    *conversing = Some(Conversing { target, retry_at: None, failures: 0 });
+                    if let Err(error) = converse(stream, conversing).await {
+                        return Ended::Dropped(error.to_string());
+                    }
+                }
+                Some(Command::Unconverse) => {
+                    if conversing.take().is_some() {
+                        let _ = stream.unsubscribe(CONVERSATION).await;
+                    }
+                }
                 Some(Command::Follow { runtime_ids }) => {
                     stop_following(client, stream, following).await;
                     match resolve(client, &runtime_ids).await {
@@ -297,6 +369,11 @@ async fn connected(
             },
             () = tokio::time::sleep_until(retry_at.unwrap_or_else(Instant::now)), if retry_at.is_some() => {
                 if let Err(error) = follow(client, stream, updates, following).await {
+                    return Ended::Dropped(error.to_string());
+                }
+            }
+            () = tokio::time::sleep_until(converse_at.unwrap_or_else(Instant::now)), if converse_at.is_some() => {
+                if let Err(error) = converse(stream, conversing).await {
                     return Ended::Dropped(error.to_string());
                 }
             }
@@ -423,6 +500,20 @@ async fn follow(
             Some(&attachment.runtime_incarnation),
             &capability,
         )
+        .await
+}
+
+/// Subscribe to the open conversation on this socket; a held subscription is replaced.
+async fn converse(
+    stream: &mut CollectionStream,
+    conversing: &mut Option<Conversing>,
+) -> Result<(), ClientError> {
+    let Some(current) = conversing.as_mut() else {
+        return Ok(());
+    };
+    current.retry_at = None;
+    stream
+        .subscribe_conversation(CONVERSATION, &current.target)
         .await
 }
 

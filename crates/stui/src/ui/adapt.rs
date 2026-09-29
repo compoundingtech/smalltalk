@@ -754,11 +754,9 @@ pub fn names(model: &Model, person: &str) -> BTreeMap<String, String> {
 }
 
 /// One conversation: the harness transcript and Small Talk messages, in time order.
-pub fn conversation(
-    timeline: &[TimelineEntry],
-    messages: &[st3_client::Message],
-    names: &BTreeMap<String, String>,
-) -> Vec<Entry> {
+/// Draw one conversation as st joined it: the harness's turns and the agent's Small Talk, in
+/// the order st sent them.
+pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>) -> Vec<Entry> {
     let name = |id: &str| -> String {
         names.get(id).cloned().unwrap_or_else(|| match id {
             "daemon/runtime" => "st".into(),
@@ -768,8 +766,47 @@ pub fn conversation(
     };
     let mut stamped: Vec<(String, Entry)> = Vec::new();
     let mut tools: BTreeMap<String, usize> = BTreeMap::new();
+    // A Small Talk message is two entries: who wrote to whom, then what they wrote.
+    let mut mail: Option<&st3_client::TimelineMessageBody> = None;
     for entry in timeline {
         let at = clock(&entry.timestamp);
+        if let TimelineBody::Message(message) = &entry.body {
+            mail = Some(message);
+            continue;
+        }
+        if let (Some(message), TimelineBody::Content(content)) = (mail.take(), &entry.body) {
+            let body = clean_message_text(content.text.as_deref().unwrap_or(""));
+            let from = message.from.as_deref().unwrap_or_default();
+            let body = if from == "daemon/runtime" {
+                // Step-ready pings are graph events, not conversation.
+                Body::Event(
+                    message
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| body.lines().next().unwrap_or("").to_owned()),
+                )
+            } else {
+                Body::Mail {
+                    from: name(from),
+                    to: name(message.to.as_deref().unwrap_or_default()),
+                    subject: message.title.clone().unwrap_or_default(),
+                    body: if body.is_empty() {
+                        "(notification)".into()
+                    } else {
+                        body
+                    },
+                }
+            };
+            stamped.push((
+                entry.timestamp.clone(),
+                Entry {
+                    id: message.message_id.clone(),
+                    at,
+                    body,
+                },
+            ));
+            continue;
+        }
         let body = match (&entry.role, &entry.body) {
             (TimelineRole::User | TimelineRole::System, TimelineBody::Content(content)) => {
                 // Harness markup becomes what it means; context blocks disappear.
@@ -855,42 +892,6 @@ pub fn conversation(
                 id: entry.id.clone(),
                 at,
                 body,
-            },
-        ));
-    }
-    for message in messages {
-        let body = clean_message_text(&message.content);
-        if message.from == "daemon/runtime" {
-            // Step-ready pings are graph events, not conversation.
-            let title = message
-                .title
-                .clone()
-                .unwrap_or_else(|| body.lines().next().unwrap_or("").to_owned());
-            stamped.push((
-                message.sent_at.clone(),
-                Entry {
-                    id: message.header.id.clone(),
-                    at: clock(&message.sent_at),
-                    body: Body::Event(title),
-                },
-            ));
-            continue;
-        }
-        stamped.push((
-            message.sent_at.clone(),
-            Entry {
-                id: message.header.id.clone(),
-                at: clock(&message.sent_at),
-                body: Body::Mail {
-                    from: name(&message.from),
-                    to: name(&message.to),
-                    subject: message.title.clone().unwrap_or_default(),
-                    body: if body.is_empty() {
-                        "(notification)".into()
-                    } else {
-                        body
-                    },
-                },
             },
         ));
     }
@@ -1141,9 +1142,48 @@ mod tests {
         "<timezone>",
     ];
 
+    #[test]
+    fn small_talk_in_the_timeline_draws_as_mail_and_step_pings_as_events() {
+        let timeline: Vec<TimelineEntry> = serde_json::from_value(serde_json::json!([
+            {"id":"e1","sequence":4,"revision":1,"timestamp":"2026-09-29T10:00:00Z","role":"user","type":"message","final":true,
+             "body":{"message_id":"message/one","from":"agent/fleet/harbor","to":"agent/fleet/cos","title":"A question"}},
+            {"id":"e2","sequence":5,"revision":1,"timestamp":"2026-09-29T10:00:00Z","role":"user","type":"content","final":true,
+             "body":{"media_type":"text/plain","text":"Can you look?"}},
+            {"id":"e3","sequence":8,"revision":1,"timestamp":"2026-09-29T10:01:00Z","role":"user","type":"message","final":true,
+             "body":{"message_id":"message/two","from":"daemon/runtime","to":"agent/fleet/cos","title":"Mission step ready: review"}},
+            {"id":"e4","sequence":9,"revision":1,"timestamp":"2026-09-29T10:01:00Z","role":"user","type":"content","final":true,
+             "body":{"media_type":"text/plain","text":"A mission step is ready."}},
+            {"id":"e5","sequence":12,"revision":1,"timestamp":"2026-09-29T10:02:00Z","role":"assistant","type":"content","final":true,
+             "body":{"media_type":"text/plain","text":"On it."}}
+        ]))
+        .unwrap();
+        let names = BTreeMap::from([("agent/fleet/cos".to_owned(), "COS".to_owned())]);
+        let entries = conversation(&timeline, &names);
+        assert_eq!(entries.len(), 3, "{entries:#?}");
+        match &entries[0].body {
+            Body::Mail {
+                from,
+                to,
+                subject,
+                body,
+            } => {
+                assert_eq!(to, "COS");
+                assert!(from.contains("harbor"), "{from}");
+                assert_eq!(subject, "A question");
+                assert_eq!(body, "Can you look?");
+            }
+            other => panic!("expected mail, got {other:?}"),
+        }
+        assert_eq!(entries[0].id, "message/one");
+        assert!(
+            matches!(&entries[1].body, Body::Event(title) if title == "Mission step ready: review")
+        );
+        assert!(matches!(&entries[2].body, Body::Assistant(text) if text == "On it."));
+    }
+
     fn rendered(fixture: &str) -> String {
         let timeline: Vec<TimelineEntry> = serde_json::from_str(fixture).unwrap();
-        let entries = conversation(&timeline, &[], &BTreeMap::new());
+        let entries = conversation(&timeline, &BTreeMap::new());
         let doc = super::super::conversation::Cache::default().render(
             &entries,
             100,
@@ -1268,7 +1308,7 @@ mod tests {
              "type": "tool_result", "body": {"call_id": "c", "status": "error", "media_type": "text/plain", "content": "1 failed"}}
         ]))
         .unwrap();
-        let entries = conversation(&timeline, &[], &BTreeMap::new());
+        let entries = conversation(&timeline, &BTreeMap::new());
         assert_eq!(entries.len(), 1);
         match &entries[0].body {
             Body::Tool {

@@ -121,7 +121,7 @@ pub fn words() -> Value {
 fn conversation_of(fixture: &str) -> Value {
     let timeline: Vec<st3_client::TimelineEntry> = serde_json::from_str(fixture).unwrap();
     let mut value =
-        serde_json::to_value(adapt::conversation(&timeline, &[], &Default::default())).unwrap();
+        serde_json::to_value(adapt::conversation(&timeline, &Default::default())).unwrap();
     for entry in value.as_array_mut().unwrap() {
         entry.as_object_mut().unwrap().remove("at");
     }
