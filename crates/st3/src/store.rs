@@ -13215,7 +13215,7 @@ impl Store {
                 .execute_batch("SAVEPOINT project_incremental")
                 .map_err(internal)?;
             let incremental = crate::profile::span("projection/incremental");
-            let projected = match try_project_simple_replication_tx(&transaction) {
+            let projected = match try_project_simple_replication_tx(&transaction, &self.origin) {
                 Ok(projected) => {
                     transaction
                         .execute_batch("RELEASE project_incremental")
@@ -13275,10 +13275,33 @@ impl Store {
     /// frontier. The incremental projector also handles selected structural and run claims from
     /// a healthy frontier. Keep the full replay for stale projections and ambiguous operation or
     /// renewal ordering.
+    ///
+    /// A kind belongs here only when a full replay does nothing with its claims but record their
+    /// event and operation, and no projection reads them while it builds the graph: then the
+    /// order they arrive in cannot change the graph. Lanes, runtime actions and subscription
+    /// intake write such claims every few minutes, and each one used to replay the whole graph
+    /// while holding the store's only writer.
     fn simple_replication_kind(kind: &str) -> bool {
         matches!(
             kind,
-            "attention.requested"
+            "lane.approved"
+                | "lane.joined"
+                | "lane.left"
+                | "lane.marked"
+                | "lane.moved"
+                | "runtime.action.deadline-reached"
+                | "runtime.action.failed"
+                | "runtime.action.requested"
+                | "runtime.action.succeeded"
+                | "subscription.mission-deferred"
+                | "subscription.mission-failed"
+                | "subscription.mission-request-cancelled"
+                | "subscription.mission-request-released"
+                | "subscription.mission-requested"
+                | "subscription.mission-started"
+                | "observer.refresh-requested"
+                | "publication.operation"
+                | "attention.requested"
                 | "gate.requested"
                 | "gate.result"
                 | "loop.state"
@@ -24632,7 +24655,10 @@ fn replay_needed(reason: String) -> bool {
     false
 }
 
-fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bool, St3Error> {
+fn try_project_simple_replication_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+) -> Result<bool, St3Error> {
     let health: Option<(String, u64)> = transaction
         .query_row(
             "SELECT status, last_good_store_index FROM projection_health WHERE aggregate='graph'",
@@ -24663,18 +24689,33 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
         .map_err(internal)?;
     drop(statement);
 
-    let mut work_claims = claims
+    // This node moved each step when it wrote its own work claim, and a quiet lease renewal can
+    // move the step on since without writing one. Such a claim is never newer than its step, and
+    // projecting it again could move the lease back, so only other writers' work claims project
+    // here. A seat renews its lease every few minutes; each renewal used to replay the graph.
+    let (local_work, mut work_claims): (Vec<_>, Vec<_>) = claims
         .iter()
         .filter(|claim| claim.kind.starts_with("work."))
-        .collect::<Vec<_>>();
+        .partition(|claim| claim.origin == origin);
     work_claims.sort_by_key(|claim| claim.accepted_at_unix_ms);
+    let mut local_work_key = None;
+    for claim in &local_work {
+        let Some((writer, sequence)) = batch_order_key(&claim.batch_id) else {
+            return Ok(replay_needed("claim batch has no order key".into()));
+        };
+        let key = (claim.accepted_at_unix_ms, writer, sequence);
+        if local_work_key.as_ref().is_none_or(|newest| key > *newest) {
+            local_work_key = Some(key);
+        }
+    }
     // The full replay orders claims by accepted time, then by batch writer and sequence. A
     // structural claim extends the projection only when it sorts after everything projected
     // so far; the claims of one batch share that key and keep their order within the batch.
     let mut last_key: Option<(u128, String, u64)> = None;
-    if claims
-        .iter()
-        .any(|claim| !Store::simple_replication_kind(&claim.kind))
+    if !local_work.is_empty()
+        || claims
+            .iter()
+            .any(|claim| !Store::simple_replication_kind(&claim.kind))
     {
         let last_accepted = transaction
             .query_row(
@@ -24706,6 +24747,15 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
             };
             last_key = Some((accepted.parse().map_err(internal)?, writer, sequence));
         }
+    }
+    // A local work claim that sorts before the projection was written out of the replay's order,
+    // after a claim this node had already projected; the full replay puts it back in order.
+    if let Some(key) = &local_work_key
+        && last_key.as_ref().is_some_and(|last| key < last)
+    {
+        return Ok(replay_needed(
+            "work claim sorts before the projection: local".into(),
+        ));
     }
     for claim in &claims {
         let has_operation = claim.body.get("_operation").is_some();
@@ -24750,7 +24800,11 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
                 return Ok(replay_needed("claim batch has no order key".into()));
             };
             let key = (claim.accepted_at_unix_ms, writer, sequence);
-            if last_key.as_ref().is_some_and(|last| key < *last) {
+            // A local work claim already moved its step, so another writer's structural claim
+            // that sorts before it needs the replay's order as well.
+            let before_local_work = claim.origin != origin
+                && local_work_key.as_ref().is_some_and(|newest| key < *newest);
+            if before_local_work || last_key.as_ref().is_some_and(|last| key < *last) {
                 return Ok(replay_needed(format!(
                     "structural claim sorts before the projection: {} from {}",
                     claim.kind, claim.origin
@@ -24891,7 +24945,7 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
     let mut run_updates = claims
         .iter()
         .filter(|claim| {
-            claim.kind.starts_with("work.")
+            (claim.kind.starts_with("work.") && claim.origin != origin)
                 || matches!(
                     claim.kind.as_str(),
                     "mission-run.state"
@@ -29854,7 +29908,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            assert!(try_project_simple_replication_tx(&transaction).unwrap());
+            assert!(try_project_simple_replication_tx(&transaction, &store.origin).unwrap());
             transaction.commit().unwrap();
             claim
         };
@@ -30276,7 +30330,7 @@ mod tests {
         {
             let mut connection = store.connection.lock().unwrap();
             let transaction = connection.transaction().unwrap();
-            assert!(try_project_simple_replication_tx(&transaction).unwrap());
+            assert!(try_project_simple_replication_tx(&transaction, &store.origin).unwrap());
             transaction.rollback().unwrap();
         }
         let before = store.connection.lock().unwrap().total_changes();
@@ -30446,7 +30500,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(!try_project_simple_replication_tx(&transaction).unwrap());
+        assert!(!try_project_simple_replication_tx(&transaction, &store.origin).unwrap());
     }
 
     #[test]
@@ -30469,7 +30523,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            assert!(try_project_simple_replication_tx(&transaction).unwrap());
+            assert!(try_project_simple_replication_tx(&transaction, &store.origin).unwrap());
             transaction.commit().unwrap();
         }
         assert!(store.operation_projection_drift().unwrap().is_empty());
@@ -30490,7 +30544,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            assert!(!try_project_simple_replication_tx(&transaction).unwrap());
+            assert!(!try_project_simple_replication_tx(&transaction, &store.origin).unwrap());
             transaction.commit().unwrap();
         }
         assert!(store.project_replication_backlog().unwrap());
@@ -33218,7 +33272,7 @@ version 2
                 let mut connection = controller.connection.lock().unwrap();
                 let transaction = connection.transaction().unwrap();
                 assert!(
-                    try_project_simple_replication_tx(&transaction).unwrap(),
+                    try_project_simple_replication_tx(&transaction, &controller.origin).unwrap(),
                     "a single routine work transition should use the bounded projection path"
                 );
                 transaction.rollback().unwrap();
@@ -33229,6 +33283,212 @@ version 2
             controller.step_run(&step).unwrap().unwrap().status,
             "verifying"
         );
+    }
+
+    /// A controller that publishes a one-step mission and a worker that projects its run, with
+    /// the step ready for the worker's agent.
+    fn replicated_step_pair() -> (Store, Store, String) {
+        let controller = Store::open_memory("controller").unwrap();
+        let kdl = r#"
+version 2
+
+  mission "lease-work" state="ready" {
+    goal "Complete mission lease-work."
+    step "work" { assigned-to "agent/worker.one" }
+  }
+
+"#;
+        let intent = parse_intent(kdl, "controller").unwrap();
+        let planned = controller
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        controller
+            .apply(&intent, &planned.subject_tokens, "lease-work-mission")
+            .unwrap();
+        let run = controller
+            .create_mission_run(&MissionRunRequest {
+                mission: "lease-work".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "lease-work-run".into(),
+            })
+            .unwrap();
+        let step = run.steps[0].subject.clone();
+        controller.set_step_state(&step, "ready", None).unwrap();
+        let worker = Store::open_memory("worker").unwrap();
+        receive_and_project(
+            &worker,
+            "controller",
+            &exchange_from(&controller, &ReplicationInventory::default()),
+        );
+        assert!(controller.project_replication_backlog().unwrap());
+        (controller, worker, step)
+    }
+
+    fn worker_work(worker: &Store, step: &str, action: &str, summary: Option<&str>, key: &str) {
+        worker
+            .work_action(
+                step,
+                action,
+                &WorkRequest {
+                    actor: Some("agent/worker.one".into()),
+                    incarnation: Some("worker-generation".into()),
+                    summary: summary.map(str::to_owned),
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: key.into(),
+                },
+            )
+            .unwrap();
+    }
+
+    /// Receive `source`'s new envelopes and project them, and say whether that replayed the
+    /// graph from nothing.
+    fn projection_replayed(target: &Store, relay: &str, source: &Store) -> bool {
+        let exchange = exchange_from(source, &target.replication_inventory().unwrap());
+        target
+            .receive_replication_exchange(relay, TEST_FLEET, &exchange)
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        target.apply_replication_repairs().unwrap();
+        FULL_REPLAYS.with(|replays| replays.set(0));
+        assert!(target.project_replication_backlog().unwrap());
+        FULL_REPLAYS.with(std::cell::Cell::get) > 0
+    }
+
+    /// A seat's own lease renewals, and the lane, runtime-action and intake claims its node writes,
+    /// were projected when they were written. Every one of them used to make the next peer
+    /// exchange replay the whole graph while holding the store's only writer. The exchange now
+    /// extends the graph, and the graph is the one a replay from nothing produces.
+    #[test]
+    fn local_renewals_and_event_claims_extend_the_graph_without_a_replay() {
+        let (controller, worker, step) = replicated_step_pair();
+        worker_work(&worker, &step, "claim", None, "lease-claim");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        worker_work(
+            &worker,
+            &step,
+            "renew",
+            Some("still working"),
+            "lease-renew",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        // A quiet renewal moves only the local lease and writes no claim.
+        worker_work(&worker, &step, "renew", None, "lease-quiet-renew");
+        {
+            let mut connection = worker.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            for (subject, kind, fields, operation) in [
+                (
+                    "lane/fleet/test/train",
+                    "lane.marked",
+                    json!({"entry": "mission-run/test-entry", "state": "waiting"}),
+                    Some("op/lane-mark"),
+                ),
+                (
+                    "agent/worker.one",
+                    "runtime.action.requested",
+                    json!({"action": "terminate"}),
+                    Some("op/action"),
+                ),
+                (
+                    "subscription/test/intake",
+                    "subscription.mission-requested",
+                    json!({
+                        "mission": "mission/test", "mission_revision": "revision",
+                        "resource": "resource/test", "resource_input": "source",
+                        "workspace": "/tmp/test", "discovery": "discovery-pending"
+                    }),
+                    None,
+                ),
+            ] {
+                let mut body = json!({"fields": fields});
+                if let Some(operation) = operation {
+                    body["_operation"] = json!({"id": operation, "request_digest": "digest"});
+                }
+                append_claim_tx(
+                    &transaction,
+                    &worker.origin,
+                    subject,
+                    kind,
+                    Some("agent/worker.one"),
+                    &body,
+                    &[],
+                    None,
+                )
+                .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        controller
+            .append_claim(&ClaimInput {
+                subject: "agent/controller.watch".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/controller.watch".into()),
+                fields: serde_json::from_value(json!({"state": "idle"})).unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("controller-heartbeat".into()),
+            })
+            .unwrap();
+
+        assert!(!projection_replayed(&worker, "controller", &controller));
+        let step_run = worker.step_run(&step).unwrap().unwrap();
+        assert_eq!(step_run.claimant.as_deref(), Some("agent/worker.one"));
+        let incremental = graph_digest_of(&worker);
+        worker.replay_replication_graph().unwrap();
+        assert_eq!(incremental, graph_digest_of(&worker));
+    }
+
+    /// Another writer's structural claim that sorts before a lease claim this node already
+    /// applied still replays the graph, so the step ends as the replay's order decides.
+    #[test]
+    fn a_peer_claim_older_than_a_local_lease_claim_still_replays() {
+        let (controller, worker, step) = replicated_step_pair();
+        controller
+            .set_step_state(&step, "cancelled", Some("the controller cancels it"))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        worker_work(&worker, &step, "claim", None, "late-claim");
+
+        assert!(projection_replayed(&worker, "controller", &controller));
+        assert!(!projection_replayed(&controller, "worker", &worker));
+        assert_eq!(graph_digest_of(&worker), graph_digest_of(&controller));
+    }
+
+    #[test]
+    fn lanes_runtime_actions_and_intake_extend_the_graph_incrementally() {
+        for kind in [
+            "lane.marked",
+            "lane.joined",
+            "runtime.action.requested",
+            "runtime.action.succeeded",
+            "subscription.mission-requested",
+            "subscription.mission-started",
+            "observer.refresh-requested",
+            "publication.operation",
+        ] {
+            assert!(Store::simple_replication_kind(kind), "{kind}");
+        }
+        // Projections read loop and attention claims, or rebuild from checkpoints and repairs.
+        for kind in [
+            "planning-session.started",
+            "loop.round-result",
+            "attention.resolved",
+            "checkpoint.sealed",
+            "record.repaired",
+        ] {
+            assert!(!Store::simple_replication_kind(kind), "{kind}");
+        }
     }
 
     #[test]

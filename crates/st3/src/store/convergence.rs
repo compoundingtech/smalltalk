@@ -139,10 +139,10 @@ fn mission_source(revision: usize) -> String {
 
 mission "sim" state="ready" {{
   goal "Converge revision {revision}."
-  step "prepare" {{ }}
-  step "check" {{ depends-on {{ step "prepare" completed }} }}
-  step "probe" {{ goal "Probe revision {revision}."; depends-on {{ step "prepare" completed }} }}
-  step "announce" {{ depends-on {{ step "check" completed }} }}
+  step "prepare" {{ assigned-to "agent/sim.worker" }}
+  step "check" {{ assigned-to "agent/sim.worker"; depends-on {{ step "prepare" completed }} }}
+  step "probe" {{ goal "Probe revision {revision}."; assigned-to "agent/sim.worker"; depends-on {{ step "prepare" completed }} }}
+  step "announce" {{ assigned-to "agent/sim.worker"; depends-on {{ step "check" completed }} }}
   finally {{ step "report" {{ agentless }} }}
 }}
 "#
@@ -278,7 +278,7 @@ impl Simulation {
                     return;
                 }
                 let step = run.steps[self.rng.below(run.steps.len())].subject.clone();
-                let action = self.rng.below(10);
+                let action = self.rng.below(15);
                 let status = *self.rng.pick(&[
                     "ready",
                     "working",
@@ -319,6 +319,89 @@ impl Simulation {
                                 &key,
                             )
                             .map(|_| format!("adopt into {}", run.id))
+                            .map_err(|error| error.to_string())
+                    }
+                    // A seat's lease work: its node applies each action to the step as it writes
+                    // it, and a quiet renewal moves only the local lease.
+                    10..=13 => {
+                        // A seat claims a ready step, then renews, reports on, submits or
+                        // releases a step it holds.
+                        let ready = run.steps.iter().find(|step| step.status == "ready");
+                        let held = run
+                            .steps
+                            .iter()
+                            .filter(|step| matches!(step.status.as_str(), "claimed" | "working"))
+                            .collect::<Vec<_>>();
+                        let (step, work) = match (ready, held.is_empty()) {
+                            (Some(ready), _) if held.is_empty() || self.rng.chance(50) => {
+                                (ready.subject.clone(), "claim")
+                            }
+                            (_, false) => (
+                                self.rng.pick(&held).subject.clone(),
+                                *self
+                                    .rng
+                                    .pick(&["renew", "renew", "progress", "complete", "release"]),
+                            ),
+                            _ => {
+                                // Nothing to lease yet: make the chosen step ready first.
+                                if let Err(error) =
+                                    store.set_step_state(&step, "ready", Some("a seat can take it"))
+                                {
+                                    self.log.push(format!("{name}: refused: {error}"));
+                                }
+                                (step, "claim")
+                            }
+                        };
+                        let summary = self
+                            .rng
+                            .chance(50)
+                            .then(|| format!("{work} by the simulation"));
+                        store
+                            .work_action(
+                                &step,
+                                work,
+                                &WorkRequest {
+                                    actor: Some("agent/sim.worker".into()),
+                                    incarnation: Some(format!("{name}-incarnation")),
+                                    summary,
+                                    reason: None,
+                                    evidence: Vec::new(),
+                                    idempotency_key: key,
+                                },
+                            )
+                            .map(|_| format!("{work} {step}"))
+                            .map_err(|error| error.to_string())
+                    }
+                    // Lane and intake claims: event-only kinds that extend the graph in any order.
+                    14 => {
+                        let (subject, kind, fields) = if self.rng.chance(50) {
+                            (
+                                "lane/sim/train".to_owned(),
+                                "lane.marked",
+                                json!({"entry": format!("mission-run/{}", run.id.trim_start_matches("mission-run/")), "state": "waiting"}),
+                            )
+                        } else {
+                            (
+                                "subscription/sim/intake".to_owned(),
+                                "subscription.mission-requested",
+                                json!({
+                                    "mission": "mission/sim", "mission_revision": "revision",
+                                    "resource": "resource/sim", "resource_input": "source",
+                                    "workspace": "/tmp", "discovery": key
+                                }),
+                            )
+                        };
+                        store
+                            .append_claim(&ClaimInput {
+                                subject: subject.clone(),
+                                kind: kind.into(),
+                                actor: None,
+                                fields: serde_json::from_value(fields).unwrap(),
+                                evidence: Vec::new(),
+                                expected_subject: None,
+                                idempotency_key: Some(key),
+                            })
+                            .map(|_| format!("{kind} {subject}"))
                             .map_err(|error| error.to_string())
                     }
                     _ => store
