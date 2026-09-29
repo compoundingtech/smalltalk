@@ -770,7 +770,8 @@ impl Store {
             let Some(request) = self.attention_request(&subject)? else {
                 continue;
             };
-            if request.status != "pending" {
+            // Requests replicate; each node withdraws only its own.
+            if request.status != "pending" || request.actor != checkpoint_actor(&self.origin) {
                 continue;
             }
             self.withdraw_attention(
