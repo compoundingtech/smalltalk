@@ -434,14 +434,13 @@ async fn observe_github_repository_at(
     } else {
         Vec::new()
     };
-    let mut facts = normalize_github_repository(
+    let facts = normalize_github_repository(
         request.previous_facts.as_ref(),
         repository_id,
         &pulls,
         &issues,
         &request.fields,
     )?;
-    facts["github_http_requests_since_start"] = Value::from(github_request_count(&request.locator));
     let cursor = Some(hex::encode(Sha256::digest(serde_json::to_vec(&facts)?)));
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -509,28 +508,224 @@ fn github_cache() -> &'static GithubCache {
     CACHE.get_or_init(|| tokio::sync::Mutex::new(HashMap::new()))
 }
 
-fn github_request_counts() -> &'static std::sync::Mutex<HashMap<String, u64>> {
-    static COUNTS: OnceLock<std::sync::Mutex<HashMap<String, u64>>> = OnceLock::new();
-    COUNTS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+tokio::task_local! {
+    /// The observer whose observation sends the GitHub requests in this task.
+    static GITHUB_SPENDER: String;
 }
 
-fn github_repository_key(url: &str) -> Option<String> {
-    let path = url.split("/repos/").nth(1)?;
-    let mut parts = path.split('/');
-    Some(format!(
-        "{}/{}",
-        parts.next()?,
-        parts.next()?.split('?').next()?
-    ))
+/// Count the GitHub requests `future` sends against `observer`.
+pub(crate) async fn spend_as<F: Future>(observer: String, future: F) -> F::Output {
+    GITHUB_SPENDER.scope(observer, future).await
 }
 
-fn github_request_count(repository: &str) -> u64 {
-    github_request_counts()
+/// Requests sent outside any observation.
+const GITHUB_UNATTRIBUTED: &str = "unattributed";
+const HOUR_MS: u128 = 3_600_000;
+
+/// What one observer sent to GitHub since the daemon started.
+#[derive(Default)]
+struct GithubSpend {
+    sent: u64,
+    not_modified: u64,
+    refused: u64,
+    last_sent_at_unix_ms: u128,
+    /// When each request of the last hour that GitHub counted was sent.
+    counted: std::collections::VecDeque<u128>,
+}
+
+/// The token's budget for one GitHub rate limit resource, as GitHub last reported it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GithubBudget {
+    pub resource: String,
+    pub limit: u64,
+    pub remaining: u64,
+    pub used: u64,
+    pub reset_at_unix_ms: u128,
+    pub reported_at_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GithubSpenderReport {
+    pub spender: String,
+    pub sent: u64,
+    pub not_modified: u64,
+    pub refused: u64,
+    pub counted_last_hour: u64,
+    pub last_sent_at_unix_ms: u128,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct GithubBudgetReport {
+    pub budget: GithubBudget,
+    /// Requests this host's observers sent in the budget's current window that GitHub counted.
+    pub counted_here: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct GithubUsageReport {
+    /// Most requests counted in the last hour first.
+    pub spenders: Vec<GithubSpenderReport>,
+    pub budgets: Vec<GithubBudgetReport>,
+}
+
+/// GitHub requests this daemon sent, by the observer that sent them, and the budget GitHub last
+/// reported. Every observer on every host shares the token's hourly budget. The counts stay in
+/// memory: a claim per request would cost more than it tells.
+#[derive(Default)]
+pub(crate) struct GithubUsage {
+    spenders: HashMap<String, GithubSpend>,
+    budgets: std::collections::BTreeMap<String, GithubBudget>,
+}
+
+impl GithubUsage {
+    /// Record one response. A 304 answers a conditional request, which GitHub does not count.
+    fn record(
+        &mut self,
+        spender: &str,
+        status: reqwest::StatusCode,
+        headers: &reqwest::header::HeaderMap,
+        now: u128,
+    ) {
+        let spend = self.spenders.entry(spender.to_owned()).or_default();
+        spend.sent += 1;
+        spend.last_sent_at_unix_ms = spend.last_sent_at_unix_ms.max(now);
+        if status == reqwest::StatusCode::NOT_MODIFIED {
+            spend.not_modified += 1;
+        } else {
+            spend.counted.push_back(now);
+        }
+        if matches!(
+            status,
+            reqwest::StatusCode::UNAUTHORIZED
+                | reqwest::StatusCode::FORBIDDEN
+                | reqwest::StatusCode::TOO_MANY_REQUESTS
+        ) {
+            spend.refused += 1;
+        }
+        while spend
+            .counted
+            .front()
+            .is_some_and(|sent_at| now.saturating_sub(*sent_at) > HOUR_MS)
+        {
+            spend.counted.pop_front();
+        }
+        let Some(budget) = github_budget(headers, now) else {
+            return;
+        };
+        // Concurrent responses arrive out of order. Within one window the lowest remaining
+        // count is the latest; a later reset starts a new window.
+        match self.budgets.get(&budget.resource) {
+            Some(known)
+                if known.reset_at_unix_ms > budget.reset_at_unix_ms
+                    || (known.reset_at_unix_ms == budget.reset_at_unix_ms
+                        && known.remaining < budget.remaining) => {}
+            _ => {
+                self.budgets.insert(budget.resource.clone(), budget);
+            }
+        }
+    }
+
+    fn report(&self, now: u128) -> GithubUsageReport {
+        let counted_since = |since: u128| {
+            self.spenders
+                .values()
+                .flat_map(|spend| spend.counted.iter())
+                .filter(|sent_at| **sent_at >= since && **sent_at <= now)
+                .count() as u64
+        };
+        let mut spenders = self
+            .spenders
+            .iter()
+            .map(|(spender, spend)| GithubSpenderReport {
+                spender: spender.clone(),
+                sent: spend.sent,
+                not_modified: spend.not_modified,
+                refused: spend.refused,
+                counted_last_hour: spend
+                    .counted
+                    .iter()
+                    .filter(|sent_at| now.saturating_sub(**sent_at) <= HOUR_MS)
+                    .count() as u64,
+                last_sent_at_unix_ms: spend.last_sent_at_unix_ms,
+            })
+            .collect::<Vec<_>>();
+        spenders.sort_by(|left, right| {
+            right
+                .counted_last_hour
+                .cmp(&left.counted_last_hour)
+                .then(right.sent.cmp(&left.sent))
+                .then(left.spender.cmp(&right.spender))
+        });
+        // Observers call the REST API, which spends the `core` budget.
+        let budgets = self
+            .budgets
+            .values()
+            .map(|budget| GithubBudgetReport {
+                budget: budget.clone(),
+                counted_here: if budget.resource == "core" {
+                    counted_since(budget.reset_at_unix_ms.saturating_sub(HOUR_MS))
+                } else {
+                    0
+                },
+            })
+            .collect();
+        GithubUsageReport { spenders, budgets }
+    }
+}
+
+fn github_budget(headers: &reqwest::header::HeaderMap, now: u128) -> Option<GithubBudget> {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+            .map(str::trim)
+    };
+    let number = |name: &str| header(name).and_then(|value| value.parse::<u64>().ok());
+    let limit = number("x-ratelimit-limit")?;
+    let remaining = number("x-ratelimit-remaining")?;
+    let reset_at_unix_ms = u128::from(number("x-ratelimit-reset")?).saturating_mul(1_000);
+    Some(GithubBudget {
+        resource: header("x-ratelimit-resource")
+            .filter(|value| !value.is_empty())
+            .unwrap_or("core")
+            .to_owned(),
+        limit,
+        remaining,
+        used: number("x-ratelimit-used").unwrap_or_else(|| limit.saturating_sub(remaining)),
+        reset_at_unix_ms,
+        reported_at_unix_ms: now,
+    })
+}
+
+fn github_usage() -> &'static std::sync::Mutex<GithubUsage> {
+    static USAGE: OnceLock<std::sync::Mutex<GithubUsage>> = OnceLock::new();
+    USAGE.get_or_init(Default::default)
+}
+
+/// GitHub requests this daemon sent by observer, and the budget GitHub last reported.
+pub(crate) fn github_usage_report() -> GithubUsageReport {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    github_usage()
         .lock()
-        .expect("GitHub count mutex poisoned")
-        .get(repository)
-        .copied()
-        .unwrap_or(0)
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .report(now)
+}
+
+fn record_github_response(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let spender = GITHUB_SPENDER
+        .try_with(Clone::clone)
+        .unwrap_or_else(|_| GITHUB_UNATTRIBUTED.to_owned());
+    github_usage()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .record(&spender, status, headers, now);
 }
 
 /// A URL is fetched at most once per cache interval on this host. A stale entry is revalidated
@@ -566,12 +761,7 @@ async fn github_json(
         request = request.header(reqwest::header::IF_NONE_MATCH, etag);
     }
     let response = request.send().await?;
-    if let Some(repository) = github_repository_key(&url) {
-        let mut counts = github_request_counts()
-            .lock()
-            .expect("GitHub count mutex poisoned");
-        *counts.entry(repository).or_default() += 1;
-    }
+    record_github_response(response.status(), response.headers());
     let response = github_response(response).await?;
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
         let payload = cached
@@ -1323,38 +1513,71 @@ mod tests {
             previous_facts: None,
             every_ms: None,
         };
-        let first = observe_github_repository_at(request.clone(), &base, Some("orchid-test-token"))
-            .await
-            .unwrap();
-        let second = observe_github_repository_at(
-            ObservationRequest {
-                cursor: first.cursor.clone(),
-                previous_facts: Some(first.facts.clone()),
-                ..request
-            },
-            &base,
-            Some("orchid-test-token"),
+        let spender = "observer/orchid-etag-listing".to_owned();
+        let first = spend_as(
+            spender.clone(),
+            observe_github_repository_at(request.clone(), &base, Some("orchid-test-token")),
+        )
+        .await
+        .unwrap();
+        let second = spend_as(
+            spender.clone(),
+            observe_github_repository_at(
+                ObservationRequest {
+                    cursor: first.cursor.clone(),
+                    previous_facts: Some(first.facts.clone()),
+                    ..request
+                },
+                &base,
+                Some("orchid-test-token"),
+            ),
         )
         .await
         .unwrap();
         assert_eq!(second.facts, first.facts);
         assert_eq!(second.facts["repository_id"], 7);
         tokio::time::sleep(Duration::from_millis(5)).await;
-        let third = observe_github_repository_at(
-            ObservationRequest {
-                cursor: second.cursor.clone(),
-                previous_facts: Some(second.facts.clone()),
-                provider: "github.repository".into(),
-                locator: "example/repo".into(),
-                fields: BTreeSet::from(["issues".into()]),
-                every_ms: Some(1),
-            },
-            &base,
-            Some("orchid-test-token"),
+        let third = spend_as(
+            spender.clone(),
+            observe_github_repository_at(
+                ObservationRequest {
+                    cursor: second.cursor.clone(),
+                    previous_facts: Some(second.facts.clone()),
+                    provider: "github.repository".into(),
+                    locator: "example/repo".into(),
+                    fields: BTreeSet::from(["issues".into()]),
+                    every_ms: Some(1),
+                },
+                &base,
+                Some("orchid-test-token"),
+            ),
         )
         .await
         .unwrap();
         assert_eq!(third.facts["issues"], second.facts["issues"]);
+        // Request counts are not facts: an unchanged listing records nothing new.
+        assert_eq!(third.facts, first.facts);
+        assert!(
+            first
+                .facts
+                .get("github_http_requests_since_start")
+                .is_none()
+        );
+        // The cached second poll sent nothing, and the revalidating third poll cost nothing.
+        let spent = github_usage_report()
+            .spenders
+            .into_iter()
+            .find(|report| report.spender == spender)
+            .expect("the observer's requests were counted");
+        assert_eq!(
+            (
+                spent.sent,
+                spent.not_modified,
+                spent.refused,
+                spent.counted_last_hour
+            ),
+            (4, 2, 0, 2)
+        );
         let requests = server
             .await
             .unwrap()
@@ -1424,6 +1647,112 @@ mod tests {
         headers.insert(reqwest::header::RETRY_AFTER, "120".parse().unwrap());
         headers.insert("x-ratelimit-reset", "1050".parse().unwrap());
         assert_eq!(github_retry_at(&headers, now), now + 120_000);
+    }
+
+    #[test]
+    fn github_usage_counts_each_observers_requests_against_the_latest_budget() {
+        use reqwest::StatusCode;
+        let now = 10_000_000_000_u128;
+        let reset = now + 1_800_000;
+        let budget = |remaining: u64, reset: u128| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert("x-ratelimit-limit", "5000".parse().unwrap());
+            headers.insert(
+                "x-ratelimit-remaining",
+                remaining.to_string().parse().unwrap(),
+            );
+            headers.insert(
+                "x-ratelimit-used",
+                (5000 - remaining).to_string().parse().unwrap(),
+            );
+            headers.insert(
+                "x-ratelimit-reset",
+                (reset / 1_000).to_string().parse().unwrap(),
+            );
+            headers.insert("x-ratelimit-resource", "core".parse().unwrap());
+            headers
+        };
+        let mut usage = GithubUsage::default();
+        // Two hours ago, before this budget window and outside the last hour.
+        usage.record(
+            "observer/orchid",
+            StatusCode::OK,
+            &budget(4990, now - 5_400_000),
+            now - 7_200_000,
+        );
+        usage.record(
+            "observer/orchid",
+            StatusCode::OK,
+            &budget(3990, reset),
+            now - 60_000,
+        );
+        usage.record(
+            "observer/orchid",
+            StatusCode::NOT_MODIFIED,
+            &budget(3990, reset),
+            now - 30_000,
+        );
+        // An earlier response of the same window that arrives late keeps the lower count.
+        usage.record(
+            "observer/lichen",
+            StatusCode::OK,
+            &budget(3995, reset),
+            now - 10_000,
+        );
+        usage.record(
+            "observer/lichen",
+            StatusCode::FORBIDDEN,
+            &reqwest::header::HeaderMap::new(),
+            now,
+        );
+
+        let report = usage.report(now);
+        assert_eq!(
+            report.spenders,
+            vec![
+                GithubSpenderReport {
+                    spender: "observer/lichen".into(),
+                    sent: 2,
+                    not_modified: 0,
+                    refused: 1,
+                    counted_last_hour: 2,
+                    last_sent_at_unix_ms: now,
+                },
+                GithubSpenderReport {
+                    spender: "observer/orchid".into(),
+                    sent: 3,
+                    not_modified: 1,
+                    refused: 0,
+                    counted_last_hour: 1,
+                    last_sent_at_unix_ms: now - 30_000,
+                },
+            ]
+        );
+        assert_eq!(
+            report.budgets,
+            vec![GithubBudgetReport {
+                budget: GithubBudget {
+                    resource: "core".into(),
+                    limit: 5000,
+                    remaining: 3990,
+                    used: 1010,
+                    reset_at_unix_ms: reset,
+                    reported_at_unix_ms: now - 30_000,
+                },
+                counted_here: 3,
+            }]
+        );
+
+        // A later reset starts a new window.
+        usage.record(
+            "observer/orchid",
+            StatusCode::OK,
+            &budget(4999, reset + 3_600_000),
+            now + 1_900_000,
+        );
+        let report = usage.report(now + 1_900_000);
+        assert_eq!(report.budgets[0].budget.remaining, 4999);
+        assert_eq!(report.budgets[0].counted_here, 1);
     }
 
     #[test]

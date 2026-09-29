@@ -63,10 +63,18 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         .iter()
         .filter(|mission| !matches!(mission.word, Word::Decision | Word::Done) && !mission.system)
         .count();
+    let diverged = model
+        .sync_notice()
+        .into_iter()
+        .flat_map(|sync| &sync.peers)
+        .filter(|peer| peer.diverged_since.is_some())
+        .map(|peer| peer.host_id.trim_start_matches("host/").to_owned())
+        .collect();
     World {
         person: person.to_owned(),
         host,
         link,
+        diverged,
         attention: loaded(model.now.snapshot.is_some(), attention),
         agents: loaded(model.agents.snapshot.is_some(), agents(model)),
         missions: loaded(

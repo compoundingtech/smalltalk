@@ -851,7 +851,7 @@
       "additionalProperties": false,
       "required": ["state", "peers"],
       "properties": {
-        "state": { "enum": ["catching-up"] },
+        "state": { "enum": ["catching-up", "diverged"] },
         "peers": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/SyncPeer" } }
       }
     },
@@ -864,7 +864,8 @@
         "peer_only_envelopes": { "type": "integer", "minimum": 0 },
         "local_only_envelopes": { "type": "integer", "minimum": 0 },
         "last_exchange_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
-        "estimated_catch_up_seconds": { "type": ["integer", "null"], "minimum": 0 }
+        "estimated_catch_up_seconds": { "type": ["integer", "null"], "minimum": 0 },
+        "diverged_since": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }
       }
     },
     "TimelineEntry": {
