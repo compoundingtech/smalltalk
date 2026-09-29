@@ -579,7 +579,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         // When the last pass began, and whether it changed nothing.
         let mut quiet_pass_started = None;
         loop {
-            match self.next_reconcile_deadline() {
+            match self.blocking(|this| this.next_reconcile_deadline()).await {
                 Some(deadline) => {
                     let delay = deadline_sleep_ms(deadline, now_ms(), quiet_pass_started);
                     tokio::select! {
@@ -591,22 +591,26 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             for pass in 0..64 {
                 let started = now_ms();
-                let before = self.store.index().ok();
-                if let Err(error) = self.reconcile_once() {
-                    let _ = self.record_once(
-                        &format!("daemon/{}", self.host),
-                        "daemon.diagnostic",
-                        BTreeMap::from([
-                            ("severity".into(), Value::String("error".into())),
-                            ("code".into(), Value::String("reconcile-failed".into())),
-                            ("status".into(), Value::String("unreachable".into())),
-                            ("reason".into(), Value::String(error.to_string())),
-                        ]),
-                    );
-                }
+                let changed = self
+                    .blocking(|this| {
+                        let before = this.store.index().ok();
+                        if let Err(error) = this.reconcile_once() {
+                            let _ = this.record_once(
+                                &format!("daemon/{}", this.host),
+                                "daemon.diagnostic",
+                                BTreeMap::from([
+                                    ("severity".into(), Value::String("error".into())),
+                                    ("code".into(), Value::String("reconcile-failed".into())),
+                                    ("status".into(), Value::String("unreachable".into())),
+                                    ("reason".into(), Value::String(error.to_string())),
+                                ]),
+                            );
+                        }
+                        before != this.store.index().ok()
+                    })
+                    .await;
                 self.event_notify
                     .send_modify(|generation| *generation = generation.saturating_add(1));
-                let changed = before != self.store.index().ok();
                 quiet_pass_started = (!changed).then_some(started);
                 if !changed {
                     break;
@@ -617,6 +621,20 @@ impl<R: RuntimeControl> Reconciler<R> {
                     tokio::task::yield_now().await;
                 }
             }
+        }
+    }
+
+    /// Run blocking reconciler work on the blocking pool. A pass reads and writes the store and
+    /// can wait for its writer; inline, that would hold an async worker that the API, timers and
+    /// health checks need. A panic resumes here, so the supervisor still restarts the reconciler.
+    async fn blocking<T: Send + 'static>(
+        self: &Arc<Self>,
+        work: impl FnOnce(&Self) -> T + Send + 'static,
+    ) -> T {
+        let this = self.clone();
+        match tokio::task::spawn_blocking(move || work(&this)).await {
+            Ok(value) => value,
+            Err(error) => std::panic::resume_unwind(error.into_panic()),
         }
     }
 
@@ -10797,6 +10815,40 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
             .unwrap();
     }
 
+    /// The in-memory store's connections share one cache. There a call that meets a pass of the
+    /// running reconciler loop, which runs on the blocking pool, fails at once with `database
+    /// table is locked`, where a daemon's file store would wait. A test beside the running loop
+    /// retries such a call.
+    fn beside_the_loop<T, E: std::fmt::Display>(mut call: impl FnMut() -> Result<T, E>) -> T {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            match call() {
+                Ok(value) => return value,
+                Err(error)
+                    if error.to_string().contains("database table is locked")
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
+
+    fn apply_source_beside_the_loop(store: &Store, source: &str, idempotency_key: &str) {
+        let intent = parse_intent(source, "node").unwrap();
+        let mission = beside_the_loop(|| {
+            store.mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+        });
+        beside_the_loop(|| store.apply(&intent, &mission.subject_tokens, idempotency_key));
+    }
+
     #[test]
     fn reads_claude_structured_token_usage() {
         let log = r#"{"type":"result","usage":{"input_tokens":120,"cache_creation_input_tokens":30,"cache_read_input_tokens":40,"output_tokens":10}}"#;
@@ -15889,15 +15941,13 @@ mission "scheduled-cycle" state="ready" {
             "version 2\nmission-run {:?} {{ cancellation \"operator-stop\" {{ reason \"the test ended\" }} }}\n",
             run.id
         );
-        apply_source(&store, &cancellation, "cancel-convergence-stop");
+        apply_source_beside_the_loop(&store, &cancellation, "cancel-convergence-stop");
         notify.notify_one();
 
         tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let current = store.mission_run(&run.id).unwrap().unwrap();
-                let cleaned = store
-                    .desired_subjects()
-                    .unwrap()
+                let current = beside_the_loop(|| store.mission_run(&run.id)).unwrap();
+                let cleaned = beside_the_loop(|| store.desired_subjects())
                     .iter()
                     .all(|desired| desired.owner_run.as_deref() != Some(run.subject.as_str()));
                 if current.status == "cancelled" && current.phase == "terminal" && cleaned {
@@ -15911,9 +15961,7 @@ mission "scheduled-cycle" state="ready" {
         task.abort();
 
         assert!(
-            store
-                .desired_subjects()
-                .unwrap()
+            beside_the_loop(|| store.desired_subjects())
                 .iter()
                 .all(|desired| desired.owner_run.as_deref() != Some(run.subject.as_str()))
         );
@@ -16005,7 +16053,7 @@ mission "scheduled-cycle" state="ready" {
             "version 2\nmission-run {:?} {{ cancellation \"operator-stop\" {{ reason \"the test ended\" }} }}\n",
             run.id
         );
-        apply_source(&store, &cancellation, "checkout-lifecycle-stop");
+        apply_source_beside_the_loop(&store, &cancellation, "checkout-lifecycle-stop");
         notify.notify_one();
         tokio::time::timeout(Duration::from_secs(10), async {
             while workspace.exists() {
@@ -16297,7 +16345,7 @@ mission "absent-stop" state="ready" {
 
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let current = store.mission_run(&run.id).unwrap().unwrap();
+                let current = beside_the_loop(|| store.mission_run(&run.id)).unwrap();
                 if current.status == "failed" && current.phase == "terminal" {
                     break;
                 }
@@ -16308,10 +16356,8 @@ mission "absent-stop" state="ready" {
         .expect("the daemon did not wake at the mission deadline");
         task.abort();
 
-        let verdict = store
-            .latest_claim(&run.subject, Some("eval.verdict"))
-            .unwrap()
-            .unwrap();
+        let verdict =
+            beside_the_loop(|| store.latest_claim(&run.subject, Some("eval.verdict"))).unwrap();
         assert_eq!(
             verdict
                 .body
@@ -16326,13 +16372,11 @@ mission "absent-stop" state="ready" {
                 .and_then(Value::as_str),
             Some("the mission timeout expired after 50ms")
         );
-        let child = store.mission_run(&child.id).unwrap().unwrap();
+        let child = beside_the_loop(|| store.mission_run(&child.id)).unwrap();
         assert_eq!(child.status, "cancelled");
         assert_eq!(child.phase, "terminal");
         assert!(
-            store
-                .desired_subjects()
-                .unwrap()
+            beside_the_loop(|| store.desired_subjects())
                 .iter()
                 .all(|desired| desired.owner_run.as_deref() != Some(run.subject.as_str()))
         );
