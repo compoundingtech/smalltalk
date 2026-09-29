@@ -3255,6 +3255,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
     st3::fleet::activate(&store, &config)?;
     let admission = store.validate_replication_backlog()?;
     store.apply_replication_repairs()?;
+    for run in store.settle_runs_for_canonical_replay()? {
+        eprintln!("st: mission run `{run}` stays over as this node's graph showed it");
+    }
     let projected = store.project_replication_backlog()?;
     if !projected {
         eprintln!(
