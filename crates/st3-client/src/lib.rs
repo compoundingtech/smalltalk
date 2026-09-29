@@ -7,7 +7,7 @@ pub use contract::*;
 pub use generated::*;
 
 use bytes::Bytes;
-use futures_util::StreamExt as _;
+use futures_util::{SinkExt as _, StreamExt as _};
 use http_body_util::{BodyExt as _, Full};
 use hyper::{Method, Request};
 use hyper_util::rt::TokioIo;
@@ -119,6 +119,56 @@ pub struct TerminalStream {
 pub struct ConversationStream {
     socket: TerminalSocket,
     limit: usize,
+}
+
+/// Multiplexed current-collection subscriptions on one connection.
+pub struct CollectionStream {
+    socket: TerminalSocket,
+    limit: usize,
+}
+
+impl CollectionStream {
+    pub async fn subscribe(
+        &mut self,
+        id: &str,
+        collection: &str,
+        limit: usize,
+        actor: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<(), ClientError> {
+        self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":collection, "limit":limit, "actor":actor, "status":status})).await
+    }
+    pub async fn unsubscribe(&mut self, id: &str) -> Result<(), ClientError> {
+        self.send(&serde_json::json!({"kind":"unsubscribe", "id":id}))
+            .await
+    }
+    async fn send(&mut self, command: &serde_json::Value) -> Result<(), ClientError> {
+        let payload = serde_json::to_string(command)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        match &mut self.socket {
+            TerminalSocket::Unix(socket) => socket.send(WsMessage::Text(payload.into())).await,
+            TerminalSocket::Remote(socket) => socket.send(WsMessage::Text(payload.into())).await,
+        }
+        .map_err(|error| ClientError::Transport(error.to_string()))
+    }
+    pub async fn next(&mut self) -> Result<Option<serde_json::Value>, ClientError> {
+        let payload = match &mut self.socket {
+            TerminalSocket::Unix(socket) => next_websocket_payload(socket, self.limit).await?,
+            TerminalSocket::Remote(socket) => next_websocket_payload(socket, self.limit).await?,
+        };
+        payload
+            .map(|bytes| {
+                serde_json::from_slice(&bytes)
+                    .map_err(|error| ClientError::Protocol(error.to_string()))
+            })
+            .transpose()
+    }
+    pub async fn close(mut self) {
+        let _ = match &mut self.socket {
+            TerminalSocket::Unix(socket) => socket.close(None).await,
+            TerminalSocket::Remote(socket) => socket.close(None).await,
+        };
+    }
 }
 
 impl ConversationStream {
@@ -1359,6 +1409,73 @@ impl Client {
         })
     }
 
+    pub async fn collection_stream(&self) -> Result<CollectionStream, ClientError> {
+        let path = "/v1/client/collections/stream";
+        let request_for = |base: &str| -> Result<Request<()>, ClientError> {
+            let mut request = websocket_request(
+                &format!("{base}{path}"),
+                self.credential.as_deref(),
+                self.local_person.as_deref(),
+                None,
+            )?;
+            request.headers_mut().insert(
+                hyper::header::SEC_WEBSOCKET_PROTOCOL,
+                hyper::header::HeaderValue::from_static("st3.client.collections.v0"),
+            );
+            Ok(request)
+        };
+        let socket = match &self.endpoint {
+            Endpoint::Unix(path) => {
+                let stream = tokio::time::timeout(
+                    STREAM_HANDSHAKE_DEADLINE,
+                    tokio::net::UnixStream::connect(path),
+                )
+                .await
+                .map_err(|_| {
+                    ClientError::Transport("collection stream connect deadline exceeded".into())
+                })?
+                .map_err(|error| unreachable_error(&path.display().to_string(), &error))?;
+                let (socket, response) = tokio::time::timeout(
+                    STREAM_HANDSHAKE_DEADLINE,
+                    tokio_tungstenite::client_async(request_for("ws://localhost")?, stream),
+                )
+                .await
+                .map_err(|_| {
+                    ClientError::Transport("collection stream handshake deadline exceeded".into())
+                })?
+                .map_err(|error| ClientError::Transport(error.to_string()))?;
+                validate_collection_subprotocol(&response)?;
+                TerminalSocket::Unix(socket)
+            }
+            Endpoint::FabricLoopback(base) => {
+                let websocket_base = if let Some(base) = base.strip_prefix("https://") {
+                    format!("wss://{base}")
+                } else if let Some(base) = base.strip_prefix("http://") {
+                    format!("ws://{base}")
+                } else {
+                    return Err(ClientError::Protocol(
+                        "Fabric loopback endpoint must use http or https".into(),
+                    ));
+                };
+                let (socket, response) = tokio::time::timeout(
+                    STREAM_HANDSHAKE_DEADLINE,
+                    connect_async(request_for(&websocket_base)?),
+                )
+                .await
+                .map_err(|_| {
+                    ClientError::Transport("collection stream handshake deadline exceeded".into())
+                })?
+                .map_err(|error| ClientError::Transport(error.to_string()))?;
+                validate_collection_subprotocol(&response)?;
+                TerminalSocket::Remote(socket)
+            }
+        };
+        Ok(CollectionStream {
+            socket,
+            limit: self.response_limit(),
+        })
+    }
+
     pub async fn conversation_stream(
         &self,
         session_id: &str,
@@ -1729,6 +1846,21 @@ fn validate_conversation_subprotocol(
     if selected != Some("st3.client.conversation.v0") {
         return Err(ClientError::Protocol(format!(
             "conversation WebSocket selected {selected:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_collection_subprotocol(
+    response: &tokio_tungstenite::tungstenite::handshake::client::Response,
+) -> Result<(), ClientError> {
+    let selected = response
+        .headers()
+        .get(hyper::header::SEC_WEBSOCKET_PROTOCOL)
+        .and_then(|value| value.to_str().ok());
+    if selected != Some("st3.client.collections.v0") {
+        return Err(ClientError::Protocol(format!(
+            "collection WebSocket selected {selected:?}"
         )));
     }
     Ok(())

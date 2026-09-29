@@ -5,8 +5,199 @@ use std::collections::BTreeSet;
 
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
+const COLLECTION_SUBPROTOCOL: &str = "st3.client.collections.v0";
 const TERMINAL_CAPABILITY_PROTOCOL_PREFIX: &str = "st3.cap.";
 const LOCAL_PERSON_HEADER: &str = "x-st3-person";
+
+// A client holds one socket for all its current collection views. A subscription
+// is a bounded window; history stays on the paged HTTP endpoints.
+#[derive(Clone, Deserialize)]
+struct CollectionSubscribe {
+    kind: String,
+    id: String,
+    #[serde(default)]
+    collection: String,
+    limit: Option<usize>,
+    person: Option<String>,
+    actor: Option<String>,
+    status: Option<String>,
+}
+
+struct CollectionSubscription {
+    request: CollectionSubscribe,
+    previous: BTreeMap<String, Value>,
+    order: Vec<String>,
+    has_more: bool,
+}
+
+pub(super) async fn collection_stream(
+    websocket: WebSocketUpgrade,
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    headers: HeaderMap,
+) -> Result<Response, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let protocols = headers
+        .get_all(SEC_WEBSOCKET_PROTOCOL)
+        .iter()
+        .filter_map(|header| header.to_str().ok())
+        .flat_map(|header| header.split(','))
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .collect::<Vec<_>>();
+    if protocols != [COLLECTION_SUBPROTOCOL] {
+        return Err(validation(
+            "the collection WebSocket requires exactly st3.client.collections.v0",
+        ));
+    }
+    Ok(websocket
+        .protocols([COLLECTION_SUBPROTOCOL])
+        .on_upgrade(move |socket| collection_stream_socket(socket, state, session)))
+}
+
+async fn collection_items(
+    state: &AppState,
+    session: &ClientSession,
+    request: &CollectionSubscribe,
+) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
+    if !matches!(
+        request.collection.as_str(),
+        "missions" | "attention" | "agents" | "work"
+    ) {
+        return Err(validation("unknown collection subscription"));
+    }
+    if request.status.is_some() && request.collection != "agents" {
+        return Err(validation("status filters are supported for agents only"));
+    }
+    let limit = request.limit.unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS);
+    if !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&limit) {
+        return Err(validation("collection limit must be 1 through 200"));
+    }
+    let person = if request.collection == "attention" {
+        person_filter(session, request.person.as_deref())?
+    } else {
+        None
+    };
+    let snapshot = new_client_snapshot(state);
+    let store = state.store.clone();
+    let index = snapshot.store_index;
+    let at = snapshot.created_at.clone();
+    let actor = request.actor.clone();
+    let status = request.status.clone();
+    let collection = request.collection.clone();
+    let (mut items, has_more) =
+        super::blocking_store(move || -> anyhow::Result<(Vec<Value>, bool)> {
+            let mut items = match collection.as_str() {
+                "missions" => {
+                    let mut ids =
+                        store.mission_collection_ids(false, 0, limit.saturating_add(1))?;
+                    let has_more = ids.len() > limit;
+                    ids.truncate(limit);
+                    return Ok((
+                        mission_resources_filtered(&store, index, false, None, Some(&ids))?,
+                        has_more,
+                    ));
+                }
+                "attention" => client_attention_resources(&store, person.as_deref(), false)?,
+                "agents" => client_agent_resources(&store, false, &at, index)?,
+                "work" => client_work_resources(
+                    &store,
+                    actor.as_deref(),
+                    false,
+                    store.projection_time_at(index)?,
+                    index,
+                )?,
+                _ => unreachable!(),
+            };
+            if let Some(status) = status {
+                items.retain(|item| item["state"].as_str() == Some(status.as_str()));
+            }
+            let has_more = items.len() > limit;
+            Ok((items, has_more))
+        })
+        .await?;
+    // A read that raced a commit must never pair newer rows with an older fence.
+    if state.store.index().map_err(ApiError::internal)? != index {
+        return Err(client_page_expired(
+            "collection changed during snapshot; resubscribe",
+        ));
+    }
+    items.truncate(limit);
+    Ok((snapshot, items, has_more))
+}
+
+async fn send_collection(socket: &mut WebSocket, value: Value) -> bool {
+    let Ok(payload) = serde_json::to_string(&value) else {
+        return false;
+    };
+    if payload.len() > CLIENT_MAX_RESPONSE_BYTES {
+        return false;
+    }
+    socket.send(WsMessage::Text(payload.into())).await.is_ok()
+}
+
+async fn collection_stream_socket(mut socket: WebSocket, state: AppState, session: ClientSession) {
+    // Subscribe before the first snapshot, so a commit while building it wakes
+    // the next loop and is reflected in a following change frame.
+    let mut changed = state.event_notify.subscribe();
+    let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
+    loop {
+        tokio::select! {
+            incoming = socket.recv() => {
+                let Some(Ok(message)) = incoming else { return; };
+                let WsMessage::Text(payload) = message else {
+                    if matches!(message, WsMessage::Close(_)) { return; }
+                    continue;
+                };
+                let Ok(request) = serde_json::from_str::<CollectionSubscribe>(&payload) else {
+                    if !send_collection(&mut socket, json!({"kind":"error", "message":"invalid collection command"})).await { return; }
+                    continue;
+                };
+                if request.kind == "unsubscribe" {
+                    subscriptions.remove(&request.id);
+                    continue;
+                }
+                if request.kind != "subscribe" || request.id.is_empty() || request.id.len() > 128 || subscriptions.len() >= 8 && !subscriptions.contains_key(&request.id) {
+                    if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "message":"invalid subscription or subscription limit exceeded"})).await { return; }
+                    continue;
+                }
+                match collection_items(&state, &session, &request).await {
+                    Ok((snapshot, items, has_more)) => {
+                        let order = items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned)).collect::<Vec<_>>();
+                        let previous = items.iter().filter_map(|item| Some((item["id"].as_str()?.to_owned(), item.clone()))).collect();
+                        if !send_collection(&mut socket, json!({"kind":"snapshot", "id":request.id, "collection":request.collection, "snapshot":snapshot, "items":items, "order":order, "has_more":has_more})).await { return; }
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { request, previous, order, has_more });
+                    }
+                    Err(error) => {
+                        if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "code":error.code, "message":error.message})).await { return; }
+                    }
+                }
+            }
+            result = changed.changed() => {
+                if result.is_err() { return; }
+                for subscription in subscriptions.values_mut() {
+                    let (snapshot, items, has_more) = match collection_items(&state, &session, &subscription.request).await {
+                        Ok(value) => value,
+                        Err(_) => {
+                            if !send_collection(&mut socket, json!({"kind":"resync", "id":subscription.request.id})).await { return; }
+                            continue;
+                        }
+                    };
+                    let order = items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned)).collect::<Vec<_>>();
+                    let current: BTreeMap<String, Value> = items.into_iter().filter_map(|item| Some((item["id"].as_str()?.to_owned(), item))).collect();
+                    let upserts = current.iter().filter(|(id, value)| subscription.previous.get(*id) != Some(*value)).map(|(_, value)| value.clone()).collect::<Vec<_>>();
+                    let removes = subscription.previous.keys().filter(|id| !current.contains_key(*id)).cloned().collect::<Vec<_>>();
+                    if !upserts.is_empty() || !removes.is_empty() || order != subscription.order || has_more != subscription.has_more {
+                        if !send_collection(&mut socket, json!({"kind":"changes", "id":subscription.request.id, "collection":subscription.request.collection, "snapshot":snapshot, "upserts":upserts, "removes":removes, "order":order, "has_more":has_more})).await { return; }
+                    }
+                    subscription.previous = current;
+                    subscription.order = order;
+                    subscription.has_more = has_more;
+                }
+            }
+        }
+    }
+}
 
 #[derive(Deserialize)]
 pub(super) struct ClientDocumentQuery {
@@ -439,29 +630,50 @@ fn mission_resources(
     history: bool,
     selected_id: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
+    mission_resources_filtered(store, snapshot_index, history, selected_id, None)
+}
+
+fn mission_resources_filtered(
+    store: &Store,
+    snapshot_index: u64,
+    history: bool,
+    selected_id: Option<&str>,
+    page_ids: Option<&[String]>,
+) -> anyhow::Result<Vec<Value>> {
     let attention = store.attention_items(None)?;
     let human_attention_runs = attention
         .iter()
         .filter_map(|item| item.mission_run.as_deref())
         .collect::<BTreeSet<_>>();
     let mut missions = BTreeMap::<String, Vec<MissionRunView>>::new();
-    for run in store.mission_run_headers()? {
+    let runs = if selected_id.is_some() {
+        store.mission_run_headers()?
+    } else if let Some(ids) = page_ids {
+        store.mission_run_summaries_for_missions(ids)?
+    } else {
+        store.mission_run_summaries()?
+    };
+    for run in runs {
         missions.entry(run.mission.clone()).or_default().push(run);
     }
-    let definitions = store
-        .mission_definitions()?
-        .into_iter()
-        .map(|definition| {
-            (
-                definition.mission.subject.clone(),
-                (definition.mission, definition.updated_at_unix_ms),
-            )
-        })
-        .collect::<BTreeMap<_, _>>();
+    let definitions = if let Some(ids) = page_ids {
+        store.mission_definitions_for_ids(ids)?
+    } else {
+        store.mission_definitions()?
+    }
+    .into_iter()
+    .map(|definition| {
+        (
+            definition.mission.subject.clone(),
+            (definition.mission, definition.updated_at_unix_ms),
+        )
+    })
+    .collect::<BTreeMap<_, _>>();
     for mission in definitions.keys() {
         missions.entry(mission.clone()).or_default();
     }
     let desired = store.desired_subjects()?;
+    let state_times = store.mission_run_state_times()?;
     let mut values = missions
         .into_iter()
         .filter(|(mission, _)| selected_id.is_none_or(|selected| mission == selected))
@@ -516,9 +728,13 @@ fn mission_resources(
             let run_details = runs
                 .iter()
                 .map(|header| {
-                    let run = store
-                        .mission_run(&header.id)?
-                        .unwrap_or_else(|| header.clone());
+                    let run = if selected_id.is_some() {
+                        store
+                            .mission_run(&header.id)?
+                            .unwrap_or_else(|| header.clone())
+                    } else {
+                        header.clone()
+                    };
                     let done = run
                         .steps
                         .iter()
@@ -571,10 +787,9 @@ fn mission_resources(
                         } else {
                             "system"
                         };
-                    let state_since = store
-                        .claims_for(&run.subject, Some("mission-run.state"))?
-                        .last()
-                        .map(|claim| claim.accepted_at_unix_ms)
+                    let state_since = state_times
+                        .get(&run.subject)
+                        .copied()
                         .unwrap_or(run.created_at_unix_ms);
                     let blocker =
                         run.steps.iter().find(|step| step.status == "blocked").map(
@@ -1239,16 +1454,98 @@ pub(super) async fn missions(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
     require_scope(&session, "read.projections")?;
-    if query.cursor.is_some() {
-        return client_page(&state, &snapshot, "missions", Vec::new(), &query).map(Json);
+    let requested_limit = query
+        .limit
+        .unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
+        .clamp(1, CLIENT_MAX_PAGE_ITEMS);
+    let (offset, limit, expires_at_unix_ms) = if let Some(encoded) = &query.cursor {
+        let cursor = decode_client_cursor(encoded)?;
+        if cursor.collection != "missions"
+            || cursor.snapshot.id != snapshot.id
+            || cursor.snapshot.store_index != snapshot.store_index
+            || cursor.history != query.history
+            || cursor.person != query.person
+            || cursor.actor != query.actor
+            || cursor.owner_run != query.owner_run
+            || cursor.status != query.status
+            || cursor.native_only != query.native_only
+            || cursor.items_digest != "sql-page"
+            || query
+                .limit
+                .is_some_and(|limit| limit.clamp(1, CLIENT_MAX_PAGE_ITEMS) != cursor.limit)
+        {
+            return Err(client_page_expired(
+                "the mission page cursor does not match this snapshot or filter",
+            ));
+        }
+        if client_now_ms() > cursor.expires_at_unix_ms {
+            return Err(client_page_expired("the mission page cursor expired"));
+        }
+        (cursor.offset, cursor.limit, cursor.expires_at_unix_ms)
+    } else {
+        (
+            0,
+            requested_limit,
+            client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS),
+        )
+    };
+    if state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
+        return Err(client_page_expired(
+            "the mission collection changed; restart pagination",
+        ));
     }
     let store = state.store.clone();
     let snapshot_index = snapshot.store_index;
     let history = query.history;
-    let items =
-        super::blocking_store(move || mission_resources(&store, snapshot_index, history, None))
-            .await?;
-    client_page(&state, &snapshot, "missions", items, &query).map(Json)
+    let (items, has_more) = super::blocking_store(move || {
+        let mut ids = store.mission_collection_ids(history, offset, limit.saturating_add(1))?;
+        let has_more = ids.len() > limit;
+        ids.truncate(limit);
+        let items = mission_resources_filtered(&store, snapshot_index, history, None, Some(&ids))?;
+        Ok::<_, anyhow::Error>((items, has_more))
+    })
+    .await?;
+    if state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
+        return Err(client_page_expired(
+            "the mission collection changed; restart pagination",
+        ));
+    }
+    let next_cursor = has_more
+        .then(|| {
+            encode_client_cursor(&ClientPageCursor {
+                snapshot: snapshot.clone(),
+                collection: "missions".into(),
+                offset: offset.saturating_add(items.len()),
+                limit,
+                history: query.history,
+                person: query.person.clone(),
+                actor: query.actor.clone(),
+                owner_run: query.owner_run.clone(),
+                status: query.status.clone(),
+                native_only: query.native_only,
+                items_digest: "sql-page".into(),
+                before_index: None,
+                expires_at_unix_ms,
+            })
+        })
+        .transpose()?;
+    Ok(Json(ClientResourcePage {
+        kind: "page".into(),
+        collection: "missions".into(),
+        filters: if history {
+            BTreeMap::from([("history".into(), "all".into())])
+        } else {
+            BTreeMap::new()
+        },
+        items,
+        page: ClientPageInfo {
+            limit,
+            has_more,
+            next_cursor,
+            cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
+        },
+        sync: client_sync_notice(&state),
+    }))
 }
 
 /// A single read of the projections used by mission show, agent tree, and seat queues.
