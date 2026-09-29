@@ -1021,6 +1021,7 @@ mod tests {
             }],
             planner: crate::model::PlannerSpec::default(),
             observations: crate::config::ObservationsConfig::default(),
+            checkpoint: crate::config::CheckpointConfig::default(),
             fleet: None,
         };
         let spec = ServiceSpec::new("/usr/bin/st3", config, 1024)?;
