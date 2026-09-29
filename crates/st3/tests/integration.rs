@@ -1,9 +1,8 @@
-//! Every integration test file in this directory is a module of this one test binary, so a
-//! test build links one binary instead of one per file: those links were most of what a
-//! build wrote. Cargo builds only the test targets the manifest names (`autotests = false`),
-//! so add a `mod NAME;` line here for a new file; `every_test_file_is_built` fails until then.
+//! Most integration test files share one binary so they link once rather than per file.
+//! Tests that mutate process-wide limits have separate test targets in Cargo.toml.
+//! Cargo builds only the targets the manifest names (`autotests = false`), so add a
+//! `mod NAME;` line here or an explicit test target for every new file.
 
-mod api_accept;
 mod client_v0_cli;
 mod client_v0_contract;
 mod command_recorder;
