@@ -15030,21 +15030,21 @@ version 2
         assert_eq!(filtered, json!([]));
 
         let subject = created["subject"].as_str().unwrap();
-        let wrong = serde_json::to_value(AttentionResolveRequest {
+        let agent = serde_json::to_value(AttentionResolveRequest {
             outcome: "resolved".into(),
             reason: None,
-            actor: "person/someone-else".into(),
-            idempotency_key: "api-attention-wrong".into(),
+            actor: "agent/fabric/other".into(),
+            idempotency_key: "api-attention-agent".into(),
         })
         .unwrap();
         let (status, rejected) = json_request(
             app.clone(),
             &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
-            wrong,
+            agent,
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
-        assert_eq!(rejected["code"], "wrong-attention-reviewer");
+        assert_eq!(rejected["code"], "attention-resolver-not-person");
 
         let resolution = serde_json::to_value(AttentionResolveRequest {
             outcome: "resolved".into(),

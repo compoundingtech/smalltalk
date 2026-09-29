@@ -710,9 +710,9 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
             .unwrap()
             .is_empty()
     );
-    // A person-scoped client cannot enumerate another person's private inbox. Use
-    // the read-only local projection to obtain the exact cross-person fence, then
-    // prove the named-person mutation is still rejected.
+    // A person-scoped client cannot enumerate another person's private inbox, but any
+    // person can close any item. Use the read-only local projection to obtain the exact
+    // cross-person fence, then prove the close is recorded as this client's person.
     let alex_page = read_only.attention_list(None, None, false).await.unwrap();
     let alex = alex_page
         .value
@@ -727,28 +727,40 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
             _ => None,
         })
         .unwrap();
-    assert!(
-        client
-            .attention_resolve(
-                "action/attention-resolve-cross-person",
-                "attention-resolve-cross-0001",
-                Fence {
-                    snapshot_id: alex_page.snapshot.id,
-                    subject_revisions: BTreeMap::from([(
-                        alex.header.id.clone(),
-                        alex.header.revision.clone(),
-                    )]),
-                    ..Fence::default()
-                },
-                AttentionResolveParameters {
-                    attention_id: alex.header.id.clone(),
-                    outcome: "resolved".into(),
-                    reason: None,
-                },
-            )
-            .await
-            .is_err(),
-        "person/nathan cannot resolve person/alex attention"
+    client
+        .attention_resolve(
+            "action/attention-resolve-cross-person",
+            "attention-resolve-cross-0001",
+            Fence {
+                snapshot_id: alex_page.snapshot.id,
+                subject_revisions: BTreeMap::from([(
+                    alex.header.id.clone(),
+                    alex.header.revision.clone(),
+                )]),
+                ..Fence::default()
+            },
+            AttentionResolveParameters {
+                attention_id: alex.header.id.clone(),
+                outcome: "resolved".into(),
+                reason: None,
+            },
+        )
+        .await
+        .expect("person/nathan closes person/alex attention");
+    let closed = state
+        .store
+        .latest_claim("attention/alex-client-proof", Some("attention.resolved"))
+        .unwrap()
+        .expect("the item was closed");
+    assert_eq!(closed.actor.as_deref(), Some("person/nathan"));
+    assert_eq!(
+        closed
+            .body
+            .pointer("/fields/outcome")
+            .and_then(|outcome| outcome.as_str()),
+        Some("resolved"),
+        "{}",
+        closed.body
     );
 
     let read_only_attachment = attach_terminal(&read_only, "unix-read-only").await;

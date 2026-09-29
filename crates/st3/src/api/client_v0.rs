@@ -5426,38 +5426,23 @@ async fn dispatch_action(
             Ok(vec![result.subject])
         }
         "attention.resolve" => {
+            // Any person can close any item; the store records who closed it.
             let target = parameter_string(p, "attention_id")?;
-            let attention = state
+            let known = state
                 .store
                 .attention_request(&target)
-                .map_err(ApiError::internal)?;
-            let reviewer = if let Some(attention) = attention {
-                attention.reviewer
-            } else if target.starts_with("attention/subscription-failure-") {
-                state
-                    .store
-                    .attention_items(Some(authority_actor))
-                    .map_err(ApiError::internal)?
-                    .into_iter()
-                    .find(|item| item.subject == target)
-                    .map(|item| {
-                        if item.person.is_empty() {
-                            authority_actor.clone()
-                        } else {
-                            item.person
-                        }
-                    })
-                    .ok_or_else(|| {
-                        ApiError::not_found(format!("attention `{target}` does not exist"))
-                    })?
-            } else {
+                .map_err(ApiError::internal)?
+                .is_some()
+                || (target.starts_with("attention/subscription-failure-")
+                    && state
+                        .store
+                        .attention_items(None)
+                        .map_err(ApiError::internal)?
+                        .iter()
+                        .any(|item| item.subject == target));
+            if !known {
                 return Err(ApiError::not_found(format!(
                     "attention `{target}` does not exist"
-                )));
-            };
-            if reviewer != *authority_actor {
-                return Err(forbidden(format!(
-                    "attention `{target}` belongs to another person"
                 )));
             }
             let result = resolve_attention(
