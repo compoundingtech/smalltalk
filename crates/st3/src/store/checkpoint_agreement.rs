@@ -7,8 +7,7 @@
 //! the same claims reaches the same answer, whatever order they arrived in.
 
 use super::checkpoint::{
-    CheckpointProof, DropPlan, SealedSet, checkpoint_name, newest_due_cut, rules_digest,
-    sealed_digest,
+    CheckpointProof, DropPlan, SealedIdentities, checkpoint_name, newest_due_cut, rules_digest,
 };
 use super::*;
 
@@ -452,7 +451,7 @@ impl Store {
         checkpoint: &str,
         cut_unix_ms: u128,
         state: &str,
-        sealed: &SealedSet,
+        sealed: &SealedIdentities,
         plan: Option<&DropPlan>,
     ) -> Result<()> {
         let connection = self.connection.write();
@@ -468,7 +467,7 @@ impl Store {
                 i64::try_from(cut_unix_ms)?,
                 state,
                 sealed.seal_rowid,
-                sealed_digest(sealed),
+                sealed.digest,
                 plan.map(|plan| plan.drop_digest.clone()),
                 i64::try_from(now_ms())?,
             ],
@@ -498,7 +497,12 @@ impl Store {
         Ok(())
     }
 
-    fn publish_seal(&self, checkpoint: &str, terms: &SealTerms, sealed: &SealedSet) -> Result<()> {
+    fn publish_seal(
+        &self,
+        checkpoint: &str,
+        terms: &SealTerms,
+        sealed: &SealedIdentities,
+    ) -> Result<()> {
         // The floor first: the seal itself, and everything after it, is dated at or after the
         // cut, even on a clock that runs days slow.
         self.record_checkpoint_state(checkpoint, terms.cut_unix_ms, "sealed", sealed, None)?;
@@ -509,7 +513,7 @@ impl Store {
                 ("cut_unix_ms".into(), json!(terms.cut_unix_ms)),
                 ("participants".into(), json!(terms.participants)),
                 ("sealed_digest".into(), json!(terms.sealed_digest)),
-                ("sealed_count".into(), json!(sealed.envelopes.len())),
+                ("sealed_count".into(), json!(sealed.count)),
                 ("rules_digest".into(), json!(terms.rules_digest)),
                 ("checkpoint_protocol".into(), json!(CHECKPOINT_PROTOCOL)),
                 ("build".into(), json!(checkpoint_build())),
@@ -579,11 +583,11 @@ impl Store {
         let verified = first_verifications(&claims, &checkpoint);
         let seals = newest_seals(&claims, &checkpoint);
         if !verified.contains_key(&self.origin) {
-            let sealed = self.checkpoint_sealed_set(cut)?;
+            let sealed = self.checkpoint_sealed_identities(cut, None)?;
             let terms = SealTerms {
                 cut_unix_ms: cut,
                 participants,
-                sealed_digest: sealed_digest(&sealed),
+                sealed_digest: sealed.digest.clone(),
                 rules_digest: rules_digest(),
             };
             if seals.get(&self.origin) != Some(&terms) {
@@ -660,7 +664,7 @@ impl Store {
             checkpoint,
             terms.cut_unix_ms,
             "verified",
-            &sealed,
+            &SealedIdentities::of(&sealed),
             Some(&plan),
         )?;
         self.publish_verification(checkpoint, terms, &plan, &proof)?;
@@ -812,11 +816,11 @@ impl Store {
                 .is_none_or(|stable| stable.terms.cut_unix_ms < cut))
         .then(|| -> Result<PendingCheckpointView> {
             let checkpoint = checkpoint_name(cut);
-            let sealed = self.checkpoint_sealed_set(cut)?;
+            let sealed = self.checkpoint_sealed_identities(cut, None)?;
             let terms = SealTerms {
                 cut_unix_ms: cut,
                 participants: participants.clone(),
-                sealed_digest: sealed_digest(&sealed),
+                sealed_digest: sealed.digest,
                 rules_digest: rules_digest(),
             };
             let seals = newest_seals(&claims, &checkpoint);
