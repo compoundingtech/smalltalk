@@ -119,6 +119,21 @@ pub(crate) fn render_mission_run(
         style.status(&selected.status),
         selected.phase
     );
+    if let Some(outcome) = &selected.outcome {
+        let previous = outcome
+            .previous_status
+            .as_deref()
+            .map(|previous| format!(" (was {previous})"))
+            .unwrap_or_default();
+        let _ = writeln!(
+            output,
+            "OUTCOME   {}{previous} · set by {} {}: {}",
+            style.status(&outcome.status),
+            outcome.actor,
+            relative_time(outcome.at_unix_ms, now_unix_ms),
+            outcome.reason
+        );
+    }
     let _ = writeln!(output, "REVISION  {}", selected.revision);
     let _ = writeln!(output, "GENERATION {}", selected.generation);
     let _ = writeln!(output, "WORKSPACE {}", selected.workspace);
@@ -1300,6 +1315,7 @@ mod tests {
             after: None,
             status: "running".into(),
             phase: "normal".into(),
+            outcome: None,
             created_at_unix_ms: 1_000,
             updated_at_unix_ms: 2_000,
             steps,
@@ -1604,6 +1620,29 @@ mod tests {
         let rendered =
             render_mission_run(&waiting, &[waiting.clone()], OutputStyle::plain(), 3_000);
         assert!(rendered.contains("AFTER     mission-run/demo/build · completed"));
+    }
+
+    #[test]
+    fn mission_run_shows_the_outcome_someone_set_and_why() {
+        let mut shipped = run("mission-run/demo/run", None, Vec::new());
+        shipped.status = "completed".into();
+        shipped.phase = "terminal".into();
+        shipped.outcome = Some(st3::model::MissionRunOutcomeView {
+            status: "completed".into(),
+            previous_status: Some("failed".into()),
+            reason: "the change shipped after its gate was fixed".into(),
+            actor: "person/tester".into(),
+            at_unix_ms: 1_000,
+        });
+
+        let rendered =
+            render_mission_run(&shipped, &[shipped.clone()], OutputStyle::plain(), 3_000);
+        assert!(
+            rendered.contains(
+                "OUTCOME   completed (was failed) · set by person/tester 2s ago: the change shipped after its gate was fixed"
+            ),
+            "{rendered}"
+        );
     }
 
     #[test]
