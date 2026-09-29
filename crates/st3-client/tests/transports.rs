@@ -14,11 +14,11 @@ use st3::api::AppState;
 use st3::model::{AttentionRequest, ClaimInput};
 use st3::store::Store;
 use st3_client::{
-    AttentionResolveParameters, Capabilities, Client, ClientError, Envelope, ErrorCode, Fence,
-    LaunchVariantParameters, PairingBegin, PairingComplete, Resource, TargetParameters,
-    TerminalAttachment, TerminalColor, TerminalInputMode, TerminalInputParameters,
-    TerminalResizeParameters, TerminalRun, TerminalScreen, TerminalStream, TimelineBody,
-    TimelineUsageSemantics,
+    AttentionResolveParameters, Capabilities, Client, ClientError, CollectionEvent, Envelope,
+    ErrorCode, Fence, LaunchVariantParameters, PairingBegin, PairingComplete, Resource,
+    TargetParameters, TerminalAttachment, TerminalColor, TerminalInputMode,
+    TerminalInputParameters, TerminalResizeParameters, TerminalRun, TerminalScreen, TerminalStream,
+    TimelineBody, TimelineUsageSemantics,
 };
 use tokio::sync::{Notify, watch};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
@@ -285,6 +285,203 @@ async fn terminal_stream_sends_changed_screens_and_nothing_while_idle() {
     server.abort();
 }
 
+/// The next collection event, or a panic naming what did not arrive.
+async fn next_collection_event(
+    stream: &mut st3_client::CollectionStream,
+    waiting_for: &str,
+) -> CollectionEvent {
+    tokio::time::timeout(Duration::from_secs(5), stream.next_event())
+        .await
+        .unwrap_or_else(|_| panic!("{waiting_for} did not arrive"))
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_terminal_rides_the_collection_socket_and_its_end_leaves_the_rest() {
+    let (_root, state, pty, client, server) =
+        serve_terminal_state("client-collection-terminal", 24, 80).await;
+    let attachment = attach_terminal(&client, "collection-terminal").await;
+    let mut stream = client.collection_stream().await.unwrap();
+    stream
+        .subscribe("agents", "agents", 20, None, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_collection_event(&mut stream, "the agents snapshot").await,
+        CollectionEvent::Snapshot { id, .. } if id == "agents"
+    ));
+    stream
+        .subscribe_terminal(
+            "screen",
+            &attachment.terminal_id,
+            Some("terminal-demo-runtime:i1"),
+            attachment.stream_capability.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+    let first = loop {
+        match next_collection_event(&mut stream, "the first screen").await {
+            CollectionEvent::Screen { id, screen } if id == "screen" => break screen,
+            // The attach and the observation behind it may still move the agents window.
+            CollectionEvent::Changes { id, .. } if id == "agents" => {}
+            other => panic!("expected the first screen, got {other:?}"),
+        }
+    };
+    assert_eq!(first.value.lines[0].text, "terminal ready");
+
+    // The capability is single use: a second subscription with it is refused on its own.
+    stream
+        .subscribe_terminal(
+            "again",
+            &attachment.terminal_id,
+            Some("terminal-demo-runtime:i1"),
+            attachment.stream_capability.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_collection_event(&mut stream, "the refused reuse").await,
+        CollectionEvent::Error { id, .. } if id == "again"
+    ));
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1_500), stream.next_event())
+            .await
+            .is_err(),
+        "an idle terminal and an unchanged collection must send nothing"
+    );
+
+    pty.write(b"\x1b[1;32mecho\x1b[0m hi");
+    let changed = match next_collection_event(&mut stream, "the changed screen").await {
+        CollectionEvent::Screen { id, screen } if id == "screen" => screen,
+        other => panic!("expected the changed screen, got {other:?}"),
+    };
+    assert_eq!(changed.value.lines[1].text, "$ echo hi");
+    assert_ne!(changed.value.revision, first.value.revision);
+
+    // A new incarnation ends the terminal subscription with stale-fence. The agents
+    // subscription on the same socket sees the observation and keeps going.
+    publish_terminal(&state, "terminal-demo-runtime:i2");
+    let mut ended = false;
+    let mut agents_changed = false;
+    while !(ended && agents_changed) {
+        match next_collection_event(&mut stream, "the stale-fence end and the agents change").await
+        {
+            CollectionEvent::Error { id, code, .. } if id == "screen" => {
+                assert_eq!(code, Some(ErrorCode::StaleFence));
+                ended = true;
+            }
+            CollectionEvent::Changes { id, .. } if id == "agents" => agents_changed = true,
+            other => panic!("unexpected frame after a new incarnation: {other:?}"),
+        }
+    }
+    pty.write(b"!");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1_000), stream.next_event())
+            .await
+            .is_err(),
+        "an ended terminal subscription must send nothing more"
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn an_agents_conversation_rides_the_collection_socket_with_its_small_talk() {
+    let (_root, state, _pty, client, server) =
+        serve_terminal_state("client-collection-conversation", 24, 80).await;
+    let mut stream = client.collection_stream().await.unwrap();
+    stream
+        .subscribe_conversation("chat", "agent/terminal-demo")
+        .await
+        .unwrap();
+    let session_id = match next_collection_event(&mut stream, "the conversation page").await {
+        CollectionEvent::Conversation {
+            id,
+            session_id,
+            replace: true,
+            ..
+        } if id == "chat" => session_id,
+        other => panic!("expected the conversation page, got {other:?}"),
+    };
+    assert!(session_id.starts_with("session/"), "{session_id}");
+
+    // Small Talk to the agent that names no session is part of its conversation: st joins it.
+    state
+        .store
+        .append_claim(&ClaimInput {
+            subject: "message/conversation-socket".into(),
+            kind: "message.sent".into(),
+            actor: Some("agent/terminal-peer".into()),
+            fields: BTreeMap::from([
+                ("from".into(), Value::String("agent/terminal-peer".into())),
+                ("to".into(), Value::String("agent/terminal-demo".into())),
+                ("content".into(), Value::String("hello from a peer".into())),
+                ("title".into(), Value::String("A question".into())),
+                ("status".into(), Value::String("sent".into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    let items = match next_collection_event(&mut stream, "the new message").await {
+        CollectionEvent::Conversation {
+            id,
+            replace: false,
+            items,
+            ..
+        } if id == "chat" => items,
+        other => panic!("expected the new message, got {other:?}"),
+    };
+    let header = items
+        .iter()
+        .find_map(|item| match &item.body {
+            st3_client::TimelineBody::Message(message) => Some(message),
+            _ => None,
+        })
+        .expect("the message header");
+    assert_eq!(header.from.as_deref(), Some("agent/terminal-peer"));
+    assert_eq!(header.to.as_deref(), Some("agent/terminal-demo"));
+    assert_eq!(header.title.as_deref(), Some("A question"));
+    assert!(items.iter().any(|item| matches!(
+        &item.body,
+        st3_client::TimelineBody::Content(content) if content.text.as_deref() == Some("hello from a peer")
+    )));
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1_500), stream.next_event())
+            .await
+            .is_err(),
+        "an idle conversation must send nothing"
+    );
+    stream.unsubscribe("chat").await.unwrap();
+    state
+        .store
+        .append_claim(&ClaimInput {
+            subject: "message/conversation-socket-later".into(),
+            kind: "message.sent".into(),
+            actor: Some("agent/terminal-peer".into()),
+            fields: BTreeMap::from([
+                ("from".into(), Value::String("agent/terminal-peer".into())),
+                ("to".into(), Value::String("agent/terminal-demo".into())),
+                ("content".into(), Value::String("after unsubscribe".into())),
+                ("status".into(), Value::String("sent".into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1_000), stream.next_event())
+            .await
+            .is_err(),
+        "an unsubscribed conversation must send nothing more"
+    );
+    server.abort();
+}
+
 #[tokio::test]
 async fn a_slow_terminal_client_gets_the_latest_screen_not_a_backlog() {
     const ROWS: usize = 100;
@@ -304,13 +501,14 @@ async fn a_slow_terminal_client_gets_the_latest_screen_not_a_backlog() {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     let mut received = Vec::new();
-    while let Ok(screen) = tokio::time::timeout(Duration::from_millis(1_500), stream.next()).await
-    {
+    while let Ok(screen) = tokio::time::timeout(Duration::from_millis(1_500), stream.next()).await {
         received.push(screen.unwrap().unwrap());
     }
     let last = received.last().expect("the latest screen arrives");
     assert!(
-        last.value.lines[0].text.starts_with(&format!("{:04}", CHANGES - 1)),
+        last.value.lines[0]
+            .text
+            .starts_with(&format!("{:04}", CHANGES - 1)),
         "the last screen must be the latest one: {:?}",
         &last.value.lines[0].text[..10]
     );
@@ -967,6 +1165,48 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
     assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
     let error: st3_client::ErrorEnvelope = denied.json().await.unwrap();
     assert_eq!(error.code, st3_client::ErrorCode::Forbidden);
+
+    // A phone's one socket: the paired gateway passes the collections subprotocol, holds a
+    // window, and carries a terminal on the same socket. A bad credential never opens it.
+    assert!(
+        Client::fabric_loopback(&base, "not-a-real-client-credential")
+            .collection_stream()
+            .await
+            .is_err()
+    );
+    let mut collections = client.collection_stream().await.unwrap();
+    collections
+        .subscribe("missions", "missions", 20, None, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_collection_event(&mut collections, "the paired missions snapshot").await,
+        CollectionEvent::Snapshot { id, .. } if id == "missions"
+    ));
+    let socket_attachment = attach_terminal(&client, "fabric-collection").await;
+    collections
+        .subscribe_terminal(
+            "screen",
+            &socket_attachment.terminal_id,
+            Some("terminal-demo-runtime:fabric-i1"),
+            socket_attachment.stream_capability.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+    loop {
+        match next_collection_event(&mut collections, "the paired terminal screen").await {
+            CollectionEvent::Screen { id, screen } if id == "screen" => {
+                assert_eq!(
+                    screen.value.runtime_incarnation,
+                    "terminal-demo-runtime:fabric-i1"
+                );
+                break;
+            }
+            CollectionEvent::Changes { id, .. } if id == "missions" => {}
+            other => panic!("expected the paired terminal screen, got {other:?}"),
+        }
+    }
+    drop(collections);
 
     let fabric_attachment = attach_terminal(&client, "fabric-first").await;
     let (_terminal_stream, terminal) =
