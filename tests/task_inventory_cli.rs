@@ -536,11 +536,14 @@ fn completed_single_agent_writer_abas_during_runtime_observation_are_incomplete(
         );
         let value: serde_json::Value = serde_json::from_slice(&inventory.stdout).unwrap();
         assert_eq!(value["complete"], false);
-        assert!(value["errors"].as_array().unwrap().iter().any(|error| {
-            error
-                .as_str()
-                .is_some_and(|error| error.contains("generation changed"))
-        }));
+        assert!(
+            value["errors"].as_array().unwrap().iter().any(|error| {
+                error
+                    .as_str()
+                    .is_some_and(|error| error.contains("generation changed"))
+            }),
+            "{writer}: {value:#}"
+        );
     }
 }
 
