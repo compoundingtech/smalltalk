@@ -926,6 +926,15 @@ the observer records an explicit authentication failure and sends no anonymous r
 Run `gh auth login` as the daemon account or export a token in its shell startup files;
 the next poll retries authentication.
 
+`st doctor` also has a `build-tools` check for hosts that build and gate this repository. It looks
+for `cargo`, `rustc`, `sccache`, `gh`, `git`, and `nix` on that captured PATH, plus `mold` on
+Linux, where the repository links with it. Then it builds and links a small crate offline
+with the same linker setting, giving the build 10 seconds. The check warns, and does not fail, with
+what is missing or the last lines of cargo's error, because a host that does not build can still
+run the graph. When cargo or rustc is missing, it does not try the build. Install what is missing,
+or export its directory from the daemon account's shell startup files; `st doctor` sees the
+change within a minute.
+
 An agent receives its own subject in both `ST3_SUBJECT` and `ST_AGENT`. A nested task receives its task subject in `ST3_SUBJECT` and its parent agent in `ST_AGENT`.
 
 An agentless `exec` or `terminal` receives `ST3_SUBJECT` and no `ST_AGENT`.
