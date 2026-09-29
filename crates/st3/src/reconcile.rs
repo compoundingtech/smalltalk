@@ -204,8 +204,10 @@ fn local_process_is_alive(_pid: u32) -> bool {
 
 impl RuntimeControl for NativeRuntime {
     fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
-        self.pty()?
-            .snapshot()?
+        let observations = self.pty()?.snapshot()?;
+        // A PTY server started before st moved servers out of their harness's scope moves here.
+        st_runtime::protect_servers(&observations);
+        observations
             .into_iter()
             .map(|item| {
                 let incarnation_id = match (&item.pid, &item.created_at) {

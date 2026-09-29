@@ -122,7 +122,7 @@ pub fn scope_unit(product: &str, task_id: &str) -> String {
     )
 }
 
-fn sanitize(value: &str) -> String {
+pub(crate) fn sanitize(value: &str) -> String {
     value
         .chars()
         .map(|character| {

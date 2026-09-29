@@ -3854,6 +3854,13 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
     let build_tools = environment.as_ref().ok().cloned().map(|environment| {
         tokio::task::spawn_blocking(move || crate::environment::check_build_tools(&environment))
     });
+    let pty_root = state.pty_root.clone();
+    let priority = tokio::task::spawn_blocking(move || {
+        let observations = st_runtime::PtyRuntime::new(pty_root)
+            .snapshot()
+            .unwrap_or_default();
+        st_runtime::priority_report(&observations)
+    });
     let token = crate::resource::github_token().await;
     let mut report = tokio::task::spawn_blocking(move || {
         crate::store::with_interactive_reads(|| doctor_report(&state))
@@ -3880,6 +3887,12 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
             status: "fail".into(),
             message: error.to_string(),
         },
+    });
+    let (status, message) = priority.await.map_err(ApiError::internal)?;
+    report.checks.push(DoctorCheck {
+        name: "priority".into(),
+        status: status.into(),
+        message,
     });
     report.checks.push(DoctorCheck {
         name: "github-observer-auth".into(),
