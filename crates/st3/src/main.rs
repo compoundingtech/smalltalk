@@ -6496,12 +6496,13 @@ async fn run_replication(
             println!("graph-digest\t{}", status.graph_digest);
             println!("envelopes\t{}", status.received_envelopes);
             println!(
-                "records\tvalid={} pending={} unknown={} invalid={} repaired={}",
+                "records\tvalid={} pending={} unknown={} invalid={} repaired={} checkpointed={}",
                 status.valid_records,
                 status.pending_records,
                 status.unknown_records,
                 status.invalid_records,
-                status.repaired_records
+                status.repaired_records,
+                status.checkpointed_envelopes
             );
             println!("unhealthy-projections\t{}", status.unhealthy_projections);
             for projection in &status.unhealthy {
