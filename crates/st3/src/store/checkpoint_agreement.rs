@@ -1910,6 +1910,11 @@ mod tests {
             assert_eq!(authority(node), authority(&alder), "{}", node.origin);
             assert_eq!(claim_ids(node), claim_ids(&alder), "{}", node.origin);
         }
+        // The older checkpoint's manifest lacks the newer drops, so no node adopts it now.
+        assert_eq!(
+            alder.adopt_checkpoint(&manifest).unwrap_err().code,
+            "checkpoint-superseded"
+        );
     }
 
     #[test]

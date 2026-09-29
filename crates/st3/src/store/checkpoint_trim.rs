@@ -321,6 +321,22 @@ impl Store {
         manifest: &CheckpointManifest,
     ) -> Result<Vec<CheckpointAction>, St3Error> {
         let claims = self.checkpoint_claims().map_err(internal)?;
+        // Adoption replaces every tombstone this node holds, so only the newest stable
+        // checkpoint may be adopted: an older manifest lacks the newer drops.
+        if stable_checkpoints(&claims)
+            .keys()
+            .next_back()
+            .is_some_and(|newest| *newest > manifest.cut_unix_ms)
+        {
+            return Err(St3Error::new(
+                "checkpoint-superseded",
+                format!(
+                    "`{}` is older than the newest stable checkpoint here; a node adopts only \
+                     the newest",
+                    manifest.checkpoint
+                ),
+            ));
+        }
         let certificates = certificates(&claims, &manifest.checkpoint);
         let Some(certificate) = chosen_certificate(&certificates) else {
             return Err(St3Error::new(
