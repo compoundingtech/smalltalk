@@ -146,8 +146,10 @@ host creates. The command prints the agent's subject, here `agent/builder.site`.
 the declaration without applying it, and `--description` says what the agent is for.
 
 Ctrl+\\ detaches and leaves the agent running. `st terminals attach agent/builder.site` attaches
-again later, from any machine in the fleet: a terminal on another host goes through the client
-gateway as your person, the same path the apps use.
+again later, from any machine in the fleet. A terminal on another host is attached PTY to PTY over
+Fabric when that host runs `st terminals expose-fabric` and grants your machine the protocol it
+prints; no st daemon carries the bytes. Otherwise it goes through the client gateway as your
+person, the same path the apps use.
 
 ## Declare a seat
 
@@ -190,11 +192,13 @@ st usage --hours 24 --by host
 ```
 
 The seat starts its harness in the workspace with no prompt. It stays idle, taking no turn, until
-a person types in its terminal or a message is posted to it. `st terminals attach
-agent/example/worker` opens its terminal from any fleet machine; Ctrl+\\ detaches without stopping
-it. On the seat's own host it connects straight to the PTY session, so a busy daemon cannot stall
-it. If the daemon does not answer within a second, st attaches to the seat's newest PTY session on
-that host without it and says so.
+a person types in its terminal or a message is posted to it. A seat you declare as
+`fleet/PROJECT/...` may also publish, start, and revise missions under `fleet/PROJECT/*`;
+`st agents show` prints that authority. `st terminals attach agent/example/worker` opens its
+terminal from any fleet machine; Ctrl+\\ detaches without stopping it. On the seat's own host it
+connects straight to the PTY session, so a busy daemon cannot stall it. If the daemon does not
+answer within a second, st attaches to the seat's newest PTY session on that host without it and
+says so.
 
 A running seat keeps its current process when you apply a changed declaration; the change takes
 effect the next time it starts. To use it now, stop the seat and apply again. `st agents stop

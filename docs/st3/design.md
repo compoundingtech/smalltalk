@@ -37,8 +37,9 @@ that represents a database transaction.
 
 `st launch preview` validates and renders a planner-authored launch candidate.
 `st missions publish FILE --as ACTOR` previews and then atomically applies exact authored mission
-KDL. Agents must already hold matching `mission-authority { publish ... }`; a declaration cannot
-self-grant that authority. A failed declaration rejects the complete publication.
+KDL. Agents must already hold matching `publish` authority, from `mission-authority` or the
+default of a person-declared `fleet/PROJECT/...` seat; a declaration cannot self-grant that
+authority. A failed declaration rejects the complete publication.
 
 Removing a prior declaration from a later file has no effect. A cancellation, stop, repair, or new
 desired declaration must state the change.

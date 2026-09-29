@@ -538,6 +538,26 @@ impl MissionAuthority {
     }
 }
 
+/// Where an agent's mission authority comes from.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MissionAuthoritySource {
+    /// The declaration's `mission-authority` block, or `mission-authority "none"`.
+    Declared,
+    /// A person-declared top-level seat `fleet/PROJECT/...` holds `fleet/PROJECT/*`.
+    Default,
+    /// Neither: a mission-scoped seat, a seat an agent declared, or a name outside `fleet/`.
+    None,
+}
+
+/// The mission authority an agent holds under its current declaration.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct EffectiveMissionAuthority {
+    pub source: MissionAuthoritySource,
+    #[serde(flatten)]
+    pub authority: MissionAuthority,
+}
+
 /// Seats whose queues an agent may reorder, granted by `queue-authority` in its declaration.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct QueueAuthority {

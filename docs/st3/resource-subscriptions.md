@@ -238,7 +238,7 @@ st missions cancel-request REQUEST --as person/operator --reason "an old issue r
 
 A released request starts like any pending request. A cancelled request never starts.
 
-An optional `requester` assigns run revision authority to one exact agent or person. The requester still needs its matching `mission-authority` rule.
+An optional `requester` assigns run revision authority to one exact agent or person. The requester still needs matching mission authority, from its `mission-authority` rules or the default of a person-declared `fleet/PROJECT/...` seat.
 
 A draft pull request does not create a resource. Its first ready observation creates one resource and one mission request.
 

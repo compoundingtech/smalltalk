@@ -493,7 +493,7 @@ async fn attach_local_terminal_with_io(terminal: &LocalTerminal, io: ClientIo) -
 /// before sending anything: the kernel names the process serving the socket, which must be the
 /// incarnation's PTY daemon, and the registry must record the incarnation's start time. A socket
 /// path proves nothing alone, since a replacement session binds the same path.
-async fn open_local_terminal(terminal: &LocalTerminal) -> Result<StdUnixStream> {
+pub(crate) async fn open_local_terminal(terminal: &LocalTerminal) -> Result<StdUnixStream> {
     let (stream, peer) =
         connect_pty_session(&terminal.pty_root, &terminal.runtime_id, &terminal.subject).await?;
     let created_at = pty_core::registry::read_metadata_in(&terminal.pty_root, &terminal.runtime_id)
@@ -743,7 +743,7 @@ pub async fn attach_socket_with_io(name: &str, stream: StdUnixStream, io: Client
     proxy_stream_with_io(name, stream, None, io).await
 }
 
-async fn proxy_stream_with_io(
+pub(crate) async fn proxy_stream_with_io(
     name: &str,
     stream: StdUnixStream,
     reconnect: Option<Reconnect>,
