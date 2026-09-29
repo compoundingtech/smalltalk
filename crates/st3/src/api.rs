@@ -439,6 +439,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/internal/replication/peer-failure",
             post(replication_peer_failure),
         )
+        .route(
+            "/v1/internal/replication/checkpoint",
+            post(replication_checkpoint_manifest),
+        )
         .route("/v1/internal/fleet/membership", get(fleet_membership_view))
         .route("/v1/internal/fleet/status", get(fleet_status))
         .route(
@@ -906,6 +910,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "invalid-lane-anchor"
         | "invalid-lane-state"
         | "invalid-lane-change" => "validation-failed".into(),
+        // A retry of a request whose claim a checkpoint dropped cannot be answered again.
+        "claim-checkpointed" => "idempotency-conflict".into(),
         _ => "internal".into(),
     }
 }
@@ -4550,6 +4556,17 @@ async fn replication_export(
     .await
 }
 
+/// One page of a checkpoint's manifest, for the replication worker to answer a peer with.
+async fn replication_checkpoint_manifest(
+    State(state): State<AppState>,
+    Json(request): Json<crate::store::CheckpointManifestRequest>,
+) -> Result<Json<crate::store::CheckpointManifestPage>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.checkpoint_manifest_page(&request))
+        .await
+        .map(Json)
+}
+
 async fn replication_receive(
     State(state): State<AppState>,
     Json(request): Json<ReplicationReceiveRequest>,
@@ -5055,6 +5072,7 @@ async fn refuse_while_leaving(
                 | "/v1/internal/replication/export"
                 | "/v1/internal/replication/receive"
                 | "/v1/internal/replication/peer-failure"
+                | "/v1/internal/replication/checkpoint"
                 | "/v1/internal/replication-wake"
         );
     if mutating && !allowed && state.store.fleet_leaving().unwrap_or(false) {
@@ -10052,11 +10070,10 @@ async fn post_gate_result(
         .validate_claim_input(&input)
         .map_err(ApiError::bad)?;
     for evidence in &input.evidence {
-        if state
+        if !state
             .store
-            .claim_by_id(evidence)
+            .evidence_exists(evidence)
             .map_err(ApiError::internal)?
-            .is_none()
         {
             return Err(ApiError::bad(St3Error::new(
                 "missing-evidence",
