@@ -1,0 +1,132 @@
+{
+  "agent": [
+    {
+      "glyph": "◆",
+      "id": "needs_you",
+      "name": "needs you"
+    },
+    {
+      "glyph": "✕",
+      "id": "fault",
+      "name": "broken"
+    },
+    {
+      "glyph": "⠋",
+      "id": "working",
+      "name": "working"
+    },
+    {
+      "glyph": "●",
+      "id": "idle",
+      "name": "idle"
+    },
+    {
+      "glyph": "◌",
+      "id": "starting",
+      "name": "starting"
+    },
+    {
+      "glyph": "○",
+      "id": "stopped",
+      "name": "stopped"
+    },
+    {
+      "glyph": "?",
+      "id": "unknown",
+      "name": "not managed"
+    }
+  ],
+  "mission": [
+    {
+      "explain": "a step is waiting for your answer",
+      "glyph": "◆",
+      "id": "decision",
+      "name": "needs you"
+    },
+    {
+      "explain": "a step has an owner who is not moving",
+      "glyph": "▲",
+      "id": "stalled",
+      "name": "stalled"
+    },
+    {
+      "explain": "a step is ready but its agent is stopped or broken",
+      "glyph": "◇",
+      "id": "unstaffed",
+      "name": "unstaffed"
+    },
+    {
+      "explain": "a step is ready; st has not said which agent takes it",
+      "glyph": "◇",
+      "id": "unclaimed",
+      "name": "unclaimed"
+    },
+    {
+      "explain": "a step is waiting its turn on a busy agent; nothing to do",
+      "glyph": "◌",
+      "id": "queued",
+      "name": "queued"
+    },
+    {
+      "explain": "an agent is doing a step now",
+      "glyph": "⠋",
+      "id": "working",
+      "name": "working"
+    },
+    {
+      "explain": "st keeps this open and starts other missions when something happens",
+      "glyph": "◉",
+      "id": "watching",
+      "name": "watching"
+    },
+    {
+      "explain": "waiting on something outside the fleet",
+      "glyph": "◐",
+      "id": "held",
+      "name": "held"
+    },
+    {
+      "explain": "running, with nothing ready",
+      "glyph": "●",
+      "id": "idle",
+      "name": "idle"
+    },
+    {
+      "explain": "every step finished",
+      "glyph": "✓",
+      "id": "done",
+      "name": "done"
+    },
+    {
+      "explain": "a step failed and nothing retried it",
+      "glyph": "✕",
+      "id": "failed",
+      "name": "failed"
+    }
+  ],
+  "tabs": [
+    "Home",
+    "Agents",
+    "Missions",
+    "Fleet",
+    "Worktrees"
+  ],
+  "tier": [
+    {
+      "id": "stopped",
+      "title": "somebody is stopped on you"
+    },
+    {
+      "id": "alert",
+      "title": "something broke"
+    },
+    {
+      "id": "today",
+      "title": "today"
+    },
+    {
+      "id": "later",
+      "title": "when there is time"
+    }
+  ]
+}
