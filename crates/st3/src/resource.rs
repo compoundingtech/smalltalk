@@ -1,6 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 use std::future::Future;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -627,6 +627,8 @@ pub(crate) fn normalize_github_repository(
                 "url": pull.get("html_url").cloned().unwrap_or(Value::Null),
                 "title": pull.get("title").cloned().unwrap_or(Value::Null),
                 "head": pull.pointer("/head/sha").cloned().unwrap_or(Value::Null),
+                "branch": pull.pointer("/head/ref").cloned().unwrap_or(Value::Null),
+                "author": pull.pointer("/user/login").cloned().unwrap_or(Value::Null),
                 "state": "open",
                 "draft": pull.get("draft").cloned().unwrap_or(Value::Bool(false)),
             });
@@ -672,6 +674,102 @@ pub(crate) fn normalize_github_repository(
         facts.insert("issues".into(), Value::Array(values));
     }
     Ok(Value::Object(facts))
+}
+
+/// An st agent on this host and the workspace it works in.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct AgentWorkspace {
+    pub(crate) agent: String,
+    pub(crate) run: Option<String>,
+    pub(crate) workspace: PathBuf,
+}
+
+/// Name the st agent that opened each ready pull request in a repository listing. Agents open
+/// pull requests with a shared GitHub identity, so the author login cannot name one. The branch
+/// can: when exactly one agent on this host has the pull request's branch checked out in its
+/// workspace as the pull request appears or moves to a new head, that agent is recorded as
+/// `opened_by` and its mission run as `opened_by_run`. A pull request keeps an opener once named,
+/// so a later checkout of the same branch by a reviewer or a fixer does not take it over.
+pub(crate) fn attach_pull_request_openers(
+    facts: &mut Value,
+    previous: Option<&Value>,
+    agents: &[AgentWorkspace],
+) {
+    let previous_items = previous
+        .and_then(|value| value.get("pull_requests"))
+        .and_then(Value::as_array);
+    let Some(items) = facts.get_mut("pull_requests").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let mut branches = None;
+    for item in items {
+        let prior = previous_items.and_then(|previous| {
+            previous
+                .iter()
+                .find(|old| old.get("number").is_some() && old.get("number") == item.get("number"))
+        });
+        if let Some(prior) = prior.filter(|prior| prior.get("opened_by").is_some()) {
+            for name in ["opened_by", "opened_by_run"] {
+                if let Some(value) = prior.get(name) {
+                    item[name] = value.clone();
+                }
+            }
+            continue;
+        }
+        let head = item.get("head").filter(|head| !head.is_null());
+        let resolvable = head.is_some()
+            && prior.is_none_or(|prior| prior.get("head") != item.get("head"))
+            && item.get("state").and_then(Value::as_str) == Some("open")
+            && item.get("draft").and_then(Value::as_bool) != Some(true);
+        let Some(branch) = item
+            .get("branch")
+            .and_then(Value::as_str)
+            .filter(|_| resolvable)
+        else {
+            continue;
+        };
+        let owners = branches
+            .get_or_insert_with(|| checked_out_branches(agents))
+            .get(branch);
+        if let Some([owner]) = owners.map(Vec::as_slice) {
+            item["opened_by"] = Value::String(owner.agent.clone());
+            if let Some(run) = &owner.run {
+                item["opened_by_run"] = Value::String(run.clone());
+            }
+        }
+    }
+}
+
+/// Each branch checked out in an agent workspace, with the agents that work there.
+fn checked_out_branches(agents: &[AgentWorkspace]) -> HashMap<String, Vec<&AgentWorkspace>> {
+    let mut branches = HashMap::<String, Vec<&AgentWorkspace>>::new();
+    for agent in agents {
+        if let Some(branch) = checked_out_branch(&agent.workspace) {
+            branches.entry(branch).or_default().push(agent);
+        }
+    }
+    branches
+}
+
+/// The branch that a Git working tree has checked out, read from its `HEAD` without starting
+/// Git. A linked worktree's `.git` file names its own Git directory.
+pub(crate) fn checked_out_branch(workspace: &Path) -> Option<String> {
+    let dot_git = workspace.join(".git");
+    let git_directory = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let pointer = std::fs::read_to_string(&dot_git).ok()?;
+        let target = PathBuf::from(pointer.strip_prefix("gitdir:")?.trim());
+        if target.is_absolute() {
+            target
+        } else {
+            workspace.join(target)
+        }
+    };
+    let head = std::fs::read_to_string(git_directory.join("HEAD")).ok()?;
+    head.trim()
+        .strip_prefix("ref: refs/heads/")
+        .map(str::to_owned)
 }
 
 fn observe_local_file(request: ObservationRequest) -> Result<ProviderObservation> {
@@ -1034,7 +1132,10 @@ mod tests {
             7,
             &[
                 json!({"number": 1, "draft": true, "title": "draft"}),
-                json!({"number": 2, "draft": false, "title": "ready", "head": {"sha": "abc"}}),
+                json!({
+                    "number": 2, "draft": false, "title": "ready",
+                    "head": {"sha": "abc", "ref": "agent/ready"}, "user": {"login": "octo"},
+                }),
             ],
             &[
                 json!({"number": 2, "title": "PR", "pull_request": {}}),
@@ -1045,6 +1146,8 @@ mod tests {
         .unwrap();
         assert_eq!(facts["pull_requests"].as_array().unwrap().len(), 1);
         assert_eq!(facts["pull_requests"][0]["number"], 2);
+        assert_eq!(facts["pull_requests"][0]["branch"], "agent/ready");
+        assert_eq!(facts["pull_requests"][0]["author"], "octo");
         assert_eq!(facts["issues"].as_array().unwrap().len(), 1);
         assert_eq!(facts["issues"][0]["number"], 3);
     }
@@ -1298,6 +1401,126 @@ mod tests {
                 r#"<https://api.github.com/repositories/7/issues?page=1>; rel="prev""#
             ),
             None
+        );
+    }
+
+    #[test]
+    fn a_workspace_names_the_branch_it_has_checked_out() {
+        use crate::checkout::test_support::{git, repository};
+        let root = tempfile::tempdir().unwrap();
+        let clone = repository(root.path());
+        let linked = root.path().join("linked");
+        git(
+            &clone,
+            &[
+                "worktree",
+                "add",
+                "--quiet",
+                "-b",
+                "agent/example",
+                &linked.to_string_lossy(),
+            ],
+        );
+        assert_eq!(checked_out_branch(&clone).as_deref(), Some("main"));
+        assert_eq!(
+            checked_out_branch(&linked).as_deref(),
+            Some("agent/example")
+        );
+        git(&linked, &["checkout", "--quiet", "--detach"]);
+        assert_eq!(checked_out_branch(&linked), None);
+        assert_eq!(checked_out_branch(&root.path().join("absent")), None);
+    }
+
+    #[test]
+    fn a_new_pull_request_names_the_one_agent_with_its_branch_checked_out() {
+        use crate::checkout::test_support::{git, repository};
+        let root = tempfile::tempdir().unwrap();
+        let clone = repository(root.path());
+        let worktree = |name: &str, branch: &str| {
+            let path = root.path().join(name);
+            git(
+                &clone,
+                &[
+                    "worktree",
+                    "add",
+                    "--quiet",
+                    "-b",
+                    branch,
+                    &path.to_string_lossy(),
+                ],
+            );
+            path
+        };
+        let agent = |name: &str, run: Option<&str>, workspace: PathBuf| AgentWorkspace {
+            agent: format!("agent/{name}"),
+            run: run.map(str::to_owned),
+            workspace,
+        };
+        let builder_workspace = worktree("builder", "agent/feature");
+        let shared_workspace = worktree("shared", "agent/shared");
+        let agents = vec![
+            agent("builder", Some("mission-run/feature"), builder_workspace),
+            agent("steward", None, clone.clone()),
+            agent("one", None, shared_workspace.clone()),
+            agent("two", None, shared_workspace),
+        ];
+        let pull = |number: u64, head: &str, branch: &str, state: &str, draft: bool| {
+            json!({
+                "number": number, "head": head, "branch": branch,
+                "state": state, "draft": draft, "author": "shared-login",
+            })
+        };
+        let mut facts = json!({"pull_requests": [
+            pull(1, "aaaa", "agent/feature", "open", false),
+            pull(2, "bbbb", "agent/shared", "open", false),
+            pull(3, "cccc", "agent/feature", "open", true),
+            pull(4, "dddd", "agent/feature", "closed", false),
+            pull(5, "eeee", "outside/branch", "open", false),
+        ]});
+        attach_pull_request_openers(&mut facts, None, &agents);
+        let items = facts["pull_requests"].as_array().unwrap();
+        assert_eq!(items[0]["opened_by"], "agent/builder");
+        assert_eq!(items[0]["opened_by_run"], "mission-run/feature");
+        for (index, why) in [
+            (1, "two agents share the branch"),
+            (2, "a draft is not reviewed yet"),
+            (3, "a closed pull request is not reviewed"),
+            (4, "no agent has the branch"),
+        ] {
+            assert!(items[index].get("opened_by").is_none(), "{why}");
+        }
+
+        // A named opener stays with its pull request, and an unnamed one is not named later at
+        // the same head, when another agent checks the branch out to fix or review it.
+        let previous = facts.clone();
+        let mut next = json!({"pull_requests": [
+            pull(1, "ffff", "agent/feature", "open", false),
+            pull(5, "eeee", "outside/branch", "open", false),
+        ]});
+        let fixer = agent(
+            "fixer",
+            Some("mission-run/fix"),
+            worktree("fixer", "outside/branch"),
+        );
+        let agents = vec![fixer.clone()];
+        attach_pull_request_openers(&mut next, Some(&previous), &agents);
+        assert_eq!(next["pull_requests"][0]["opened_by"], "agent/builder");
+        assert_eq!(
+            next["pull_requests"][0]["opened_by_run"],
+            "mission-run/feature"
+        );
+        assert!(next["pull_requests"][1].get("opened_by").is_none());
+
+        // The fixer that pushes a new head of an unnamed pull request is the agent that head
+        // belongs to.
+        let previous = next.clone();
+        let mut pushed =
+            json!({"pull_requests": [pull(5, "9999", "outside/branch", "open", false)]});
+        attach_pull_request_openers(&mut pushed, Some(&previous), &agents);
+        assert_eq!(pushed["pull_requests"][0]["opened_by"], "agent/fixer");
+        assert_eq!(
+            pushed["pull_requests"][0]["opened_by_run"],
+            "mission-run/fix"
         );
     }
 }
