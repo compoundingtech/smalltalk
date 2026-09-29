@@ -2,15 +2,11 @@ version 2
 
 // The finite missions that github-intake.kdl starts, one run for each new pull request or issue.
 //
-// Publish this file before github-intake.kdl, because a subscription names an exact revision.
-// Then read each mission's revision hash and copy it into github-intake.kdl in place of its zero
-// placeholder:
+// Publish this file before github-intake.kdl. The intake names these missions and each new
+// request starts their current ready revision:
 //
 //   st missions publish examples/st3/github-intake-work.kdl --as person/operator
-//   st missions ls --all --json | jq -r '.value.items[]
-//     | select(.id == "mission/example/app/review-pull-request") | .mission_revision'
-//
-// A later change to this file needs a new publish and a new intake revision.
+// A later review revision needs only a publish; future requests use it automatically.
 //
 // Each run receives the discovered item as its `source` input, pinned to the exact discovery
 // claim, so later changes to the pull request or issue do not change what the run reviews.
@@ -23,9 +19,24 @@ mission "example/app/review-pull-request" state="ready" {
 
   step "review" timeout="1h" {
     assigned-to "agent/example/worker"
-    goal "Review the pull request in ${input.source}: read the diff, run the affected tests, and note every defect with its file and line."
+    goal "Review the pull request in ${input.source}: read the diff, run the affected tests, and note every defect with its file and line. Put the checkout in ${ST_WORKSPACE}/checkout, set TMPDIR=${ST_WORKSPACE}/tmp and CARGO_TARGET_DIR=${ST_WORKSPACE}/target, and never use /tmp."
     goal "Store the full review with `st documents put`, and complete this step with a short verdict and the stored document reference."
     constraint "Do not comment on, approve, merge, or push to the pull request."
+  }
+
+  finally {
+    step "remove-review-files" {
+      agentless
+      exec "remove-review-files" {
+        host "local"
+        workspace "${ST_WORKSPACE}"
+        command "/bin/rm -rf -- checkout tmp target"
+        restart "never"
+      }
+      gate "review files were removed" {
+        field "exit_code" "exec/${ST_MISSION_RUN}/remove-review-files" "is" 0
+      }
+    }
   }
 }
 

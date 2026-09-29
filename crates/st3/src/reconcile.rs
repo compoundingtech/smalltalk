@@ -8122,30 +8122,44 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             let fields = request.body.get("fields").unwrap_or(&request.body);
             let field = |name: &str| fields.get(name).and_then(Value::as_str);
-            let (
-                Some(mission),
-                Some(revision),
-                Some(resource),
-                Some(discovery),
-                Some(input),
-                Some(root),
-            ) = (
+            let (Some(mission), Some(resource), Some(discovery), Some(input), Some(root)) = (
                 field("mission"),
-                field("mission_revision"),
                 field("resource"),
                 field("discovery"),
                 field("resource_input"),
                 field("workspace"),
-            )
-            else {
+            ) else {
                 self.fail_subscription_request(
                     item,
                     &request.id,
                     "invalid-request",
-                    "the request lacks a mission, revision, resource, discovery, input, or workspace",
+                    "the request lacks a mission, resource, discovery, input, or workspace",
                 )?;
                 continue;
             };
+            if resource.contains("/pull-request/") {
+                if let Some(owner) = self.store.authoring_review_owner(discovery)? {
+                    self.store.append_claim(&ClaimInput {
+                        subject: item.subject.clone(),
+                        kind: "subscription.mission-request-cancelled".into(),
+                        actor: None,
+                        fields: BTreeMap::from([
+                            ("request".into(), Value::String(request.id.clone())),
+                            (
+                                "reason".into(),
+                                Value::String(format!("{owner} owns the pull request review")),
+                            ),
+                        ]),
+                        evidence: vec![request.id.clone()],
+                        expected_subject: None,
+                        idempotency_key: Some(format!(
+                            "subscription-authoring-review:{}",
+                            request.id
+                        )),
+                    })?;
+                    continue;
+                }
+            }
             let requester = field("requester")
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("daemon/{}", self.host));
@@ -8153,7 +8167,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let workspace = Path::new(root).join(suffix).to_string_lossy().into_owned();
             let request_value = MissionRunRequest {
                 mission: mission.into(),
-                revision: Some(revision.into()),
+                revision: field("mission_revision").map(str::to_owned),
                 workspace,
                 requester: Some(requester),
                 mode: None,
@@ -19298,6 +19312,585 @@ mission "review" state="ready" {
   goal "Review one discovered item."
   step "review" { agentless }
 }"#;
+
+    #[test]
+    fn replacement_intake_does_not_request_an_already_delivered_head() {
+        let store = Store::open_memory("node").unwrap();
+        apply_source(&store, REDELIVERY_REVIEW_SOURCE, "review-mission");
+        let revision = store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        let watch = |name: &str| {
+            let source = format!(
+                r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+observer "repo" {{ resource "resource/repo"; provider "github.repository"; locator "example/repo"; field "pull_requests" }}
+subscription "reviews" {{
+  observer "observer/repo"
+  on "pull_requests"
+  delivery "mission" {{ mission "review@{revision}"; resource "source"; workspace "/srv/reviews" }}
+}}"#
+            );
+            apply_source(&store, &source, &format!("watch-{name}"));
+            let desired = store.desired_subjects().unwrap();
+            let observer_revision = store
+                .selected_desired_revision("observer/repo")
+                .unwrap()
+                .unwrap();
+            let subscription = desired
+                .iter()
+                .find(|item| item.subject == "subscription/reviews")
+                .unwrap();
+            (
+                observer_revision,
+                vec![(
+                    subscription.subject.clone(),
+                    crate::graph::subscription_spec(&subscription.desired).unwrap(),
+                )],
+            )
+        };
+        let (observer_revision, subscriptions) = watch("old");
+        let observe = |observer_revision: &str,
+                       subscriptions: &Vec<(String, crate::model::SubscriptionSpec)>,
+                       head: Option<&str>,
+                       state: &str| {
+            let pulls = head.map(|head| serde_json::json!([{"number": 4, "head": head, "state": state, "draft": false}])).unwrap_or_else(|| serde_json::json!([]));
+            store
+                .record_resource_observation(
+                    "observer/repo",
+                    observer_revision,
+                    None,
+                    "resource/repo",
+                    None,
+                    &serde_json::json!({"repository_id": 17, "pull_requests": pulls}),
+                    now_ms() + 60_000,
+                    subscriptions,
+                )
+                .unwrap();
+        };
+        let a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        observe(&observer_revision, &subscriptions, None, "open");
+        observe(&observer_revision, &subscriptions, Some(a), "open");
+        assert_eq!(
+            store
+                .claims_for(
+                    "subscription/reviews",
+                    Some("subscription.mission-requested")
+                )
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let (observer_revision, subscriptions) = watch("new");
+        observe(&observer_revision, &subscriptions, Some(a), "closed");
+        assert!(
+            store
+                .claims_for(
+                    "subscription/reviews",
+                    Some("subscription.mission-requested")
+                )
+                .unwrap()
+                .len()
+                == 1
+        );
+        observe(&observer_revision, &subscriptions, Some(b), "open");
+        assert_eq!(
+            store
+                .claims_for(
+                    "subscription/reviews",
+                    Some("subscription.mission-requested")
+                )
+                .unwrap()
+                .len(),
+            2
+        );
+        observe(&observer_revision, &subscriptions, Some(b), "closed");
+        assert_eq!(
+            store
+                .claims_for(
+                    "subscription/reviews",
+                    Some("subscription.mission-requested")
+                )
+                .unwrap()
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn run_scoped_intake_replacement_keeps_its_local_delivery_history() {
+        let store = Store::open_memory("node").unwrap();
+        apply_source(&store, REDELIVERY_REVIEW_SOURCE, "review");
+        let publish_watch = |run: &str| {
+            apply_source(
+                &store,
+                &format!(
+                    r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+observer "repo" {{ resource "resource/repo"; provider "github.repository"; locator "example/repo"; field "pull_requests" }}
+subscription "run/{run}/reviews" {{
+  observer "observer/repo"; on "pull_requests"
+  delivery "mission" {{ mission "review"; resource "source"; workspace "/srv/reviews" }}
+}}"#
+                ),
+                &format!("watch-{run}"),
+            );
+            let subject = format!("subscription/run/{run}/reviews");
+            let desired = store.desired_subjects().unwrap();
+            let spec = desired.iter().find(|item| item.subject == subject).unwrap();
+            let revision = store
+                .selected_desired_revision("observer/repo")
+                .unwrap()
+                .unwrap();
+            (
+                revision,
+                subject,
+                vec![(
+                    spec.subject.clone(),
+                    crate::graph::subscription_spec(&spec.desired).unwrap(),
+                )],
+            )
+        };
+        let observe = |revision: &str,
+                       subscriptions: &Vec<(String, crate::model::SubscriptionSpec)>,
+                       head: Option<&str>,
+                       state: &str| {
+            let pulls = head.map(|head| serde_json::json!([{"number": 4, "head": head, "state": state, "draft": false}])).unwrap_or_else(|| serde_json::json!([]));
+            store
+                .record_resource_observation(
+                    "observer/repo",
+                    revision,
+                    None,
+                    "resource/repo",
+                    None,
+                    &serde_json::json!({"repository_id": 17, "pull_requests": pulls}),
+                    now_ms() + 60_000,
+                    subscriptions,
+                )
+                .unwrap();
+        };
+        let a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let (revision, old_subject, subscriptions) = publish_watch("old");
+        observe(&revision, &subscriptions, None, "open");
+        observe(&revision, &subscriptions, Some(a), "open");
+        assert_eq!(
+            store
+                .claims_for(&old_subject, Some("subscription.mission-requested"))
+                .unwrap()
+                .len(),
+            1
+        );
+        let (revision, new_subject, subscriptions) = publish_watch("new");
+        observe(&revision, &subscriptions, Some(a), "closed");
+        assert!(
+            store
+                .claims_for(&new_subject, Some("subscription.mission-requested"))
+                .unwrap()
+                .is_empty()
+        );
+        observe(&revision, &subscriptions, Some(b), "open");
+        assert_eq!(
+            store
+                .claims_for(&new_subject, Some("subscription.mission-requested"))
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn persisted_intake_history_survives_reopen_for_heads_and_issues() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("intake.sqlite");
+        let a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let watch = |store: &Store, name: &str| {
+            apply_source(
+                store,
+                &format!(
+                    r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+observer "repo" {{ resource "resource/repo"; provider "github.repository"; locator "example/repo"; field "pull_requests"; field "issues" }}
+subscription "reviews" {{
+  observer "observer/repo"; on "pull_requests"
+  delivery "mission" {{ mission "review"; resource "source"; workspace "/srv/reviews" }}
+}}
+subscription "triage" {{
+  observer "observer/repo"; on "issues"
+  delivery "mission" {{ mission "triage"; resource "source"; workspace "/srv/triage" }}
+}}"#
+                ),
+                &format!("watch-{name}"),
+            );
+            let desired = store.desired_subjects().unwrap();
+            let subscriptions = desired
+                .iter()
+                .filter(|item| {
+                    item.subject == "subscription/reviews" || item.subject == "subscription/triage"
+                })
+                .map(|item| {
+                    (
+                        item.subject.clone(),
+                        crate::graph::subscription_spec(&item.desired).unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let revision = store
+                .selected_desired_revision("observer/repo")
+                .unwrap()
+                .unwrap();
+            (revision, subscriptions)
+        };
+        let observe = |store: &Store,
+                       revision: &str,
+                       subscriptions: &Vec<(String, crate::model::SubscriptionSpec)>,
+                       head: Option<&str>,
+                       issue_title: Option<&str>,
+                       state: &str| {
+            let pulls = head.map(|head| serde_json::json!([{"number": 4, "head": head, "state": state, "draft": false}])).unwrap_or_else(|| serde_json::json!([]));
+            let issues = issue_title
+                .map(|title| serde_json::json!([{"number": 5, "title": title}]))
+                .unwrap_or_else(|| serde_json::json!([]));
+            store.record_resource_observation("observer/repo", revision, None, "resource/repo", None,
+                &serde_json::json!({"repository_id": 17, "pull_requests": pulls, "issues": issues}), now_ms() + 60_000, subscriptions).unwrap();
+        };
+        {
+            let store = Store::open(&path, "node").unwrap();
+            apply_source(&store, REDELIVERY_REVIEW_SOURCE, "review");
+            apply_source(
+                &store,
+                &REDELIVERY_REVIEW_SOURCE.replace("mission \"review\"", "mission \"triage\""),
+                "triage",
+            );
+            let (revision, subscriptions) = watch(&store, "old");
+            observe(&store, &revision, &subscriptions, None, None, "open");
+            observe(
+                &store,
+                &revision,
+                &subscriptions,
+                Some(a),
+                Some("bug"),
+                "open",
+            );
+            assert_eq!(
+                store
+                    .claims_for(
+                        "subscription/reviews",
+                        Some("subscription.mission-requested")
+                    )
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                store
+                    .claims_for(
+                        "subscription/triage",
+                        Some("subscription.mission-requested")
+                    )
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+        {
+            let store = Store::open(&path, "node").unwrap();
+            let (revision, subscriptions) = watch(&store, "new");
+            observe(
+                &store,
+                &revision,
+                &subscriptions,
+                Some(a),
+                Some("edited bug"),
+                "closed",
+            );
+            assert!(
+                store
+                    .claims_for(
+                        "subscription/reviews",
+                        Some("subscription.mission-requested")
+                    )
+                    .unwrap()
+                    .len()
+                    == 1
+            );
+            assert!(
+                store
+                    .claims_for(
+                        "subscription/triage",
+                        Some("subscription.mission-requested")
+                    )
+                    .unwrap()
+                    .len()
+                    == 1
+            );
+            observe(
+                &store,
+                &revision,
+                &subscriptions,
+                Some(b),
+                Some("edited bug"),
+                "open",
+            );
+            assert_eq!(
+                store
+                    .claims_for(
+                        "subscription/reviews",
+                        Some("subscription.mission-requested")
+                    )
+                    .unwrap()
+                    .len(),
+                2
+            );
+            assert!(
+                store
+                    .claims_for(
+                        "subscription/triage",
+                        Some("subscription.mission-requested")
+                    )
+                    .unwrap()
+                    .len()
+                    == 1
+            );
+        }
+    }
+
+    #[test]
+    fn unpinned_intake_uses_the_review_revision_current_at_start() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, REDELIVERY_REVIEW_SOURCE, "review-one");
+        let first = store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        apply_source(
+            &store,
+            r#"version 2
+resource "repo" { kind "vcs.repository" }
+observer "repo" { resource "resource/repo"; provider "github.repository"; locator "example/repo"; field "pull_requests" }
+subscription "reviews" {
+  observer "observer/repo"
+  on "pull_requests"
+  delivery "mission" { mission "review"; resource "source"; workspace "/srv/reviews" }
+}"#,
+            "unpinned-watch",
+        );
+        let desired = store.desired_subjects().unwrap();
+        let subscription = desired
+            .iter()
+            .find(|item| item.subject == "subscription/reviews")
+            .unwrap();
+        let subscriptions = vec![(
+            subscription.subject.clone(),
+            crate::graph::subscription_spec(&subscription.desired).unwrap(),
+        )];
+        let observer_revision = store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap();
+        let observe = |pulls: Value| {
+            store
+                .record_resource_observation(
+                    "observer/repo",
+                    &observer_revision,
+                    None,
+                    "resource/repo",
+                    None,
+                    &serde_json::json!({"repository_id": 17, "pull_requests": pulls}),
+                    now_ms() + 60_000,
+                    &subscriptions,
+                )
+                .unwrap();
+        };
+        observe(serde_json::json!([]));
+        observe(
+            serde_json::json!([{"number": 4, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "state": "open", "draft": false}]),
+        );
+        let request = store
+            .claims_for(
+                "subscription/reviews",
+                Some("subscription.mission-requested"),
+            )
+            .unwrap();
+        assert_eq!(request.len(), 1);
+        assert!(
+            request[0]
+                .body
+                .pointer("/fields/mission_revision")
+                .is_none()
+        );
+
+        apply_source(
+            &store,
+            &REDELIVERY_REVIEW_SOURCE
+                .replace("Review one discovered item.", "Review the updated item."),
+            "review-two",
+        );
+        let current = store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        assert_ne!(first, current);
+        Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .reconcile_subscription_missions(&desired)
+        .unwrap();
+        let runs = store.active_mission_runs_for_mission("review").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].revision, current);
+    }
+
+    #[test]
+    fn intake_skips_a_pull_request_with_its_own_mission_review_gate() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, REDELIVERY_REVIEW_SOURCE, "intake-review");
+        apply_source(
+            &store,
+            r#"version 2
+mission "author" state="ready" {
+  goal "Open and approve one pull request."
+  step "open" {
+    agentless
+    produces { resource "mission-run/${ST_MISSION_RUN}/pull-request" { kind "vcs.pull-request" } }
+  }
+  step "approve" {
+    agentless
+    depends-on { step "open" completed }
+    gate "approve the exact pull request" type="human" {
+      reviewer "person/owner"
+      review "resource/mission-run/${ST_MISSION_RUN}/pull-request"
+    }
+  }
+}"#,
+            "author-mission",
+        );
+        let author = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "author".into(),
+                revision: None,
+                workspace: "/srv/author".into(),
+                requester: Some("person/owner".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "author-run".into(),
+            })
+            .unwrap();
+        let authored_resource = format!("resource/{}/pull-request", author.subject);
+        apply_source(
+            &store,
+            &format!(
+                "version 2\nresource \"{}/pull-request\" {{ kind \"vcs.pull-request\" }}",
+                author.subject
+            ),
+            "authored-resource",
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: authored_resource,
+                kind: "resource.observed".into(),
+                actor: Some("person/owner".into()),
+                fields: BTreeMap::from([
+                    ("kind".into(), Value::String("vcs.pull-request".into())),
+                    (
+                        "facts".into(),
+                        serde_json::json!({
+                            "repository": "resource/repo", "number": 4,
+                            "url": "https://example.test/repo/pull/4",
+                            "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                            "state": "open", "draft": false, "merged": false
+                        }),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("authored-pr".into()),
+            })
+            .unwrap();
+        apply_source(
+            &store,
+            r#"version 2
+resource "repo" { kind "vcs.repository" }
+observer "repo" { resource "resource/repo"; provider "github.repository"; locator "example/repo"; field "pull_requests" }
+subscription "reviews" {
+  observer "observer/repo"; on "pull_requests"
+  delivery "mission" { mission "review"; resource "source"; workspace "/srv/reviews" }
+}"#,
+            "intake-watch",
+        );
+        let desired = store.desired_subjects().unwrap();
+        let subscription = desired
+            .iter()
+            .find(|item| item.subject == "subscription/reviews")
+            .unwrap();
+        let subscriptions = vec![(
+            subscription.subject.clone(),
+            crate::graph::subscription_spec(&subscription.desired).unwrap(),
+        )];
+        let observer_revision = store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap();
+        for pulls in [
+            serde_json::json!([]),
+            serde_json::json!([{
+                "number": 4, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "html_url": "https://example.test/repo/pull/4", "url": "https://example.test/repo/pull/4",
+                "state": "open", "draft": false
+            }]),
+        ] {
+            store
+                .record_resource_observation(
+                    "observer/repo",
+                    &observer_revision,
+                    None,
+                    "resource/repo",
+                    None,
+                    &serde_json::json!({"repository_id": 17, "pull_requests": pulls}),
+                    now_ms() + 60_000,
+                    &subscriptions,
+                )
+                .unwrap();
+        }
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler
+            .reconcile_subscription_missions(&desired)
+            .unwrap();
+        assert!(
+            store
+                .active_mission_runs_for_mission("review")
+                .unwrap()
+                .is_empty()
+        );
+        let decisions = store
+            .claims_for(
+                "subscription/reviews",
+                Some("subscription.mission-request-cancelled"),
+            )
+            .unwrap();
+        assert_eq!(decisions.len(), 1);
+        assert!(
+            decisions[0].body["fields"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains(&author.subject)
+        );
+    }
 
     /// Declare one repository observer at `locator` and one issue-triage subscription.
     fn watch_repository(

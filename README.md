@@ -250,6 +250,8 @@ declare yourself.
 
 ## Where to go next
 
+Repository intake observes complete GitHub pull request and issue listings without using an agent turn. A subscription can name a review or triage mission without a revision suffix; each request starts that mission's current ready revision. The graph remembers each delivered pull request head and issue across intake and seat restarts, so the same item is not reviewed again. See [the intake example](examples/st3/github-intake.kdl) and [resource subscriptions](docs/st3/resource-subscriptions.md). Review workspaces belong on disk and are cleaned when the run finishes.
+
 - [Examples](examples/st3/README.md), indexed by task: a seat for each harness, seat queues,
   one mission across several seats, parallel fan-out, GitHub intake, and waiting for checks, a
   time, a person, or another agent.

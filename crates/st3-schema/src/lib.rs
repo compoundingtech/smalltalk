@@ -2529,11 +2529,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         ],
         "subscription.mission-requested" => &[
             ("mission", required_reference_to(&["mission"])),
-            ("mission_revision", required_string()),
+            ("mission_revision", string()),
             ("resource", required_reference_to(&["resource"])),
             ("resource_input", required_string()),
             ("workspace", required_string()),
             ("discovery", required_string()),
+            ("delivery_key", string()),
             ("requester", reference_to(&["agent", "person"])),
             ("held", boolean()),
         ],
