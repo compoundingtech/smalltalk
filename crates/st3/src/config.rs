@@ -172,9 +172,27 @@ pub struct Config {
     pub planner: PlannerSpec,
     /// The local observation log of this node.
     pub observations: ObservationsConfig,
+    /// Checkpoints that trim replicated history. Written only when it differs from the
+    /// default, so a config this build writes still loads in a build without checkpoints.
+    #[serde(skip_serializing_if = "CheckpointConfig::is_default")]
+    pub checkpoint: CheckpointConfig,
     /// `STATE/fleet/fleet.toml`, merged by `apply_fleet_file` after command-line overrides.
     #[serde(skip)]
     pub fleet: Option<FleetFile>,
+}
+
+/// Whether this node takes part in checkpoints. A node that does not never seals, and every
+/// participant must seal, so turning it off anywhere stops trimming for the whole fleet.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct CheckpointConfig {
+    pub enabled: bool,
+}
+
+impl CheckpointConfig {
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
 }
 
 /// Observations of `local` retention stay on the node that made them. The daemon trims
@@ -246,6 +264,7 @@ impl Default for Config {
             peers: Vec::new(),
             planner: PlannerSpec::default(),
             observations: ObservationsConfig::default(),
+            checkpoint: CheckpointConfig::default(),
             fleet: None,
         }
     }
@@ -554,6 +573,18 @@ mod tests {
         let mut config = exported.clone();
         config.observations.otlp.as_mut().unwrap().endpoint = "ftp://collector".into();
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn checkpoints_are_off_until_enabled_and_absent_from_a_written_default_config() {
+        let config = Config::default();
+        assert!(!config.checkpoint.enabled);
+        // An older build refuses unknown sections, so a default config never names it.
+        assert!(!toml::to_string(&config).unwrap().contains("checkpoint"));
+        let config: Config = toml::from_str("[checkpoint]\nenabled = true\n").unwrap();
+        assert!(config.checkpoint.enabled);
+        assert!(toml::to_string(&config).unwrap().contains("[checkpoint]"));
+        assert!(toml::from_str::<Config>("[checkpoint]\nenabled = true\nlag = 3\n").is_err());
     }
 
     #[test]
