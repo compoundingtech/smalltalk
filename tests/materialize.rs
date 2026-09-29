@@ -4,8 +4,7 @@ use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::Command;
 
-#[path = "support/real_git.rs"]
-mod real_git;
+use crate::support::real_git;
 
 use st2::materialize::{
     materialize_catalog, materialize_catalog_against, parse_plan, validate_agent,
