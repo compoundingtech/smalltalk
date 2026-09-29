@@ -626,10 +626,9 @@ async fn response_envelope(
             .map(|snapshot| snapshot.store_index)
             .unwrap_or_default()
     } else {
-        let store = state.store.clone();
-        blocking_store(move || store.index())
-            .await
-            .unwrap_or_default()
+        // index() is an atomic load. Health must not queue behind blocking
+        // handlers just to decorate its response.
+        state.store.index().unwrap_or_default()
     };
     let request_id = if client_request {
         format!("request/{}", new_request_id())
@@ -10301,6 +10300,40 @@ mod tests {
         holder.join().unwrap();
         let (status, _) = attach.await.unwrap();
         assert!(!status.is_success());
+    }
+
+    #[test]
+    fn health_response_does_not_queue_for_a_blocking_thread() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+            let root = tempfile::tempdir().unwrap();
+            let app = router(state(root.path()));
+            let started = Instant::now();
+            let response =
+                tokio::time::timeout(Duration::from_millis(250), get_request(app, "/v1/health"))
+                    .await;
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            assert!(
+                response.is_ok(),
+                "health waited {:?} for the busy blocking pool",
+                started.elapsed()
+            );
+            assert_eq!(response.unwrap().0, StatusCode::OK);
+        });
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
