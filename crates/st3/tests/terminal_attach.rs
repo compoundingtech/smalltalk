@@ -1,8 +1,8 @@
 #![cfg(unix)]
 //! `st terminals attach` reaches a terminal on this host through its PTY session, and a terminal
-//! behind an HTTP endpoint through the daemon's WebSocket. When the configured daemon is down or
-//! does not answer within a second, it attaches to the subject's newest PTY session on this host
-//! without st. A terminal another host owns is attached PTY to PTY over Fabric, through
+//! behind an HTTP endpoint through the daemon's WebSocket. When the daemon, at whichever endpoint,
+//! is down or does not answer within a second, it attaches to the subject's newest PTY session on
+//! this host without st. A terminal another host owns is attached PTY to PTY over Fabric, through
 //! `st terminals serve-fabric` on the owner, and through the client gateway only when Fabric
 //! cannot reach it. Each test owns a daemon, in process or stand-in, and a stand-in PTY session
 //! that reports which process attached to it.
@@ -230,7 +230,8 @@ fn recording_pty(root: &Path) -> PathBuf {
     bin
 }
 
-/// Run `st terminals attach` against `endpoint` with no terminal on stdin.
+/// Run `st terminals attach` against `endpoint` with no terminal on stdin. This host's PTY root
+/// is `ROOT/state/st3/pty`, as `ConfiguredRegistry` writes it.
 async fn attach(root: &Path, endpoint: &str) -> (Output, u32) {
     let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
     let mut command = std::process::Command::new(binary);
@@ -242,6 +243,8 @@ async fn attach(root: &Path, endpoint: &str) -> (Output, u32) {
         .env_remove("PTY_SESSION")
         .env_remove("ST3_ENDPOINT")
         .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_RUNTIME_DIR", root.join("run"))
         .env("PATH", recording_pty(root))
         .args(["--endpoint", endpoint, "terminals", "attach", SUBJECT])
         .stdin(Stdio::null())
@@ -445,20 +448,7 @@ async fn a_terminal_on_this_host_attaches_while_its_daemon_never_answers() {
     // a saturated disk does.
     let run = root.path().join("run");
     std::fs::create_dir_all(&run).unwrap();
-    let daemon = std::os::unix::net::UnixListener::bind(run.join("st3.sock")).unwrap();
-    daemon.set_nonblocking(true).unwrap();
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stopped = stop.clone();
-    let silent = std::thread::spawn(move || {
-        let mut held = Vec::new();
-        while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
-            match daemon.accept() {
-                Ok((stream, _)) => held.push(stream),
-                Err(_) => std::thread::sleep(Duration::from_millis(10)),
-            }
-        }
-        held.len()
-    });
+    let silent = SilentDaemon::unix(&run.join("st3.sock"));
     let registry = ConfiguredRegistry::new(root.path());
     let session = registry.serve(RUNTIME_ID, CREATED_AT);
 
@@ -476,11 +466,155 @@ async fn a_terminal_on_this_host_attaches_while_its_daemon_never_answers() {
     );
     let attached = session.join().unwrap().expect("the CLI attached");
     assert_eq!(attached.pid, Some(cli as i32));
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    assert!(
-        silent.join().unwrap() > 0,
-        "st must still ask its daemon first"
+    assert!(silent.stop() > 0, "st must still ask its daemon first");
+}
+
+/// A daemon that takes every connection and never answers.
+struct SilentDaemon {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    accepting: std::thread::JoinHandle<usize>,
+}
+
+impl SilentDaemon {
+    fn unix(socket: &Path) -> Self {
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        Self::serve(move || {
+            listener
+                .accept()
+                .map(|(stream, _)| Box::new(stream) as Box<dyn Send>)
+        })
+    }
+
+    /// One on a loopback TCP port, with its HTTP endpoint.
+    fn http() -> (Self, String) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let endpoint = format!("http://{}", listener.local_addr().unwrap());
+        let daemon = Self::serve(move || {
+            listener
+                .accept()
+                .map(|(stream, _)| Box::new(stream) as Box<dyn Send>)
+        });
+        (daemon, endpoint)
+    }
+
+    fn serve(mut accept: impl FnMut() -> std::io::Result<Box<dyn Send>> + Send + 'static) -> Self {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stopped = stop.clone();
+        let accepting = std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+                match accept() {
+                    Ok(stream) => held.push(stream),
+                    Err(_) => std::thread::sleep(Duration::from_millis(10)),
+                }
+            }
+            held.len()
+        });
+        Self { stop, accepting }
+    }
+
+    /// Stop accepting; returns how many connections it took.
+    fn stop(self) -> usize {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.accepting.join().unwrap()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminal_on_this_host_attaches_whatever_endpoint_never_answers() {
+    let root = tempfile::tempdir().unwrap();
+    // An explicit endpoint, not the configured daemon's socket, that never answers.
+    let socket = root.path().join("elsewhere.sock");
+    let unix = SilentDaemon::unix(&socket);
+    let (http, http_endpoint) = SilentDaemon::http();
+    let registry = ConfiguredRegistry::new(root.path());
+
+    for (daemon, endpoint) in [(unix, socket.display().to_string()), (http, http_endpoint)] {
+        let session = registry.serve(RUNTIME_ID, CREATED_AT);
+        let started = Instant::now();
+
+        let (output, cli) = attach(root.path(), &endpoint).await;
+
+        assert_attached(&output);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!(
+                "st daemon at {endpoint} did not answer within 1000 ms"
+            )) && stderr.contains("st was not consulted"),
+            "{stderr}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the attach waited {:?} for {endpoint}, which never answers",
+            started.elapsed()
+        );
+        let attached = session.join().unwrap().expect("the CLI attached");
+        assert_eq!(attached.pid, Some(cli as i32));
+        assert!(daemon.stop() > 0, "st must still ask {endpoint} first");
+        std::fs::remove_file(registry.pty_root.join(format!("{RUNTIME_ID}.sock"))).unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn waiting_on_a_daemon_that_does_not_answer_says_so() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("elsewhere.sock");
+    let daemon = SilentDaemon::unix(&socket);
+    // No PTY session of the subject runs on this host, so only the daemon can attach it.
+    ConfiguredRegistry::new(root.path());
+    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
+    let mut child = std::process::Command::new(binary)
+        .env_remove("ST_AGENT")
+        .env_remove("ST_MISSION_RUN")
+        .env_remove("PTY_SESSION")
+        .env_remove("ST3_ENDPOINT")
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_STATE_HOME", root.path().join("state"))
+        .env("XDG_RUNTIME_DIR", root.path().join("run"))
+        .env("PATH", recording_pty(root.path()))
+        .args([
+            "--endpoint",
+            socket.to_str().unwrap(),
+            "terminals",
+            "attach",
+            SUBJECT,
+        ])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stderr = child.stderr.take().unwrap();
+    let expected = format!(
+        "waiting for the st daemon at {}; no PTY session of `{SUBJECT}` runs under",
+        socket.display()
     );
+    let reading = std::thread::spawn(move || {
+        let mut seen = String::new();
+        let mut bytes = [0_u8; 1024];
+        while !seen.contains(&expected) {
+            match stderr.read(&mut bytes) {
+                Ok(0) | Err(_) => break,
+                Ok(count) => seen.push_str(&String::from_utf8_lossy(&bytes[..count])),
+            }
+        }
+        seen
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !reading.is_finished() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+    let seen = reading.join().unwrap();
+
+    assert!(
+        seen.contains("waiting for the st daemon at") && seen.contains("no PTY session of"),
+        "the attach must say what it is waiting for: {seen:?}"
+    );
+    assert!(daemon.stop() > 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

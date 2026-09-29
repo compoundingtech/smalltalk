@@ -3086,19 +3086,17 @@ async fn run(cli: Cli) -> Result<()> {
             command: PtyCommand::ExposeFabric(args),
         } => expose_fabric(&config, args).await,
         Command::Terminals { command } => {
-            // The configured daemon's PTY root, to attach its sessions when it cannot answer.
-            let pty_root = matches!(&endpoint, Endpoint::Unix(socket) if *socket == config.socket)
-                .then(|| {
-                    config
-                        .pty_root
-                        .clone()
-                        .unwrap_or_else(|| config.state_dir.join("pty"))
-                });
+            // This host's PTY root, whichever endpoint answers: a terminal whose session runs
+            // there is attached through it when that endpoint cannot answer in time.
+            let pty_root = config
+                .pty_root
+                .clone()
+                .unwrap_or_else(|| config.state_dir.join("pty"));
             run_pty(
                 &client,
                 &endpoint,
                 config.person.as_deref(),
-                pty_root.as_deref(),
+                Some(&pty_root),
                 command,
                 cli.json,
             )
@@ -4694,9 +4692,32 @@ fn render_terminal_screen(screen: &ClientTerminalScreen) -> String {
 /// on this host before it attaches to the newest one without the daemon.
 const LOCAL_ATTACH_CONSULT: Duration = Duration::from_secs(1);
 
+/// The daemon's answer to attaching one terminal.
+enum AttachAnswer {
+    /// A PTY session on this host that the daemon selected and this CLI connects to itself.
+    Local(st3::model::LocalTerminal),
+    /// The daemon's WebSocket bridge: an HTTP endpoint, or a daemon from before direct
+    /// attachment.
+    Bridge(Attachment),
+}
+
+/// Ask the daemon behind `client` how to attach `subject`.
+async fn consult_attach(client: &Client, subject: &str) -> Result<AttachAnswer> {
+    if let Some(terminal) = client.local_terminal(subject).await? {
+        return Ok(AttachAnswer::Local(terminal));
+    }
+    client
+        .post(
+            &format!("/v1/sessions/attach/{}", urlencoding::encode(subject)),
+            &AttachRequest::default(),
+        )
+        .await
+        .map(AttachAnswer::Bridge)
+}
+
 /// Attach this terminal to one terminal member. A terminal on this host is attached through its
 /// PTY session; one that another fleet host owns goes through the client gateway, the path paired
-/// clients use, as `person`.
+/// clients use, as `person`. `pty_root` is this host's PTY root, whichever endpoint answers.
 async fn attach_terminal(
     client: &Client,
     endpoint: &Endpoint,
@@ -4713,61 +4734,61 @@ async fn attach_terminal(
             "st terminals attach: already inside PTY session `{outer}`. Detach first with Ctrl+\\, or pass --force."
         );
     }
-    // The subject's running PTY sessions under the configured daemon's PTY root, read from the
-    // registry alone. When there are any, the daemon has a moment to choose one and refuse; a
-    // daemon that cannot answer that fast must not keep anyone from debugging this host.
+    // The subject's running PTY sessions on this host, read from the registry alone. When there
+    // are any, the daemon has a moment to choose one and refuse; a daemon that cannot answer that
+    // fast must not keep anyone from debugging this host.
     let local = pty_root
         .map(|root| (root, st3::client::tagged_pty_sessions(root, subject)))
         .filter(|(_, sessions)| !sessions.is_empty());
-    let lookup = client.local_terminal(subject);
-    let answer = match &local {
-        Some((root, sessions)) => match tokio::time::timeout(LOCAL_ATTACH_CONSULT, lookup).await {
-            Ok(answer) => answer,
-            Err(_) => {
+    let daemon = format!("st daemon at {}", endpoint_label(endpoint));
+    let mut consult = std::pin::pin!(consult_attach(client, subject));
+    let answer = match tokio::time::timeout(LOCAL_ATTACH_CONSULT, consult.as_mut()).await {
+        Ok(answer) => answer,
+        Err(_) => match (&local, pty_root) {
+            (Some((root, sessions)), _) => {
                 let waited = format!(
-                    "did not answer within {} ms",
+                    "the {daemon} did not answer within {} ms",
                     LOCAL_ATTACH_CONSULT.as_millis()
                 );
                 let code = attach_unconsulted(root, subject, sessions, &waited).await?;
                 return terminal_exit(code);
             }
+            (None, Some(root)) => {
+                eprintln!(
+                    "st terminals attach: waiting for the {daemon}; no PTY session of `{subject}` runs under {} to attach without it.",
+                    root.display()
+                );
+                consult.await
+            }
+            (None, None) => consult.await,
         },
-        None => lookup.await,
     };
     let code = match answer {
-        Ok(Some(terminal)) => st3::client::attach_local_terminal(&terminal).await?,
-        Ok(None) => {
-            // An HTTP endpoint, or a daemon from before direct attachment: its WebSocket bridge.
-            let attached: Result<Attachment> = client
-                .post(
-                    &format!("/v1/sessions/attach/{}", urlencoding::encode(subject)),
-                    &AttachRequest::default(),
-                )
-                .await;
-            match attached {
-                Ok(attachment) => {
-                    client
-                        .proxy_terminal_resilient(subject, &attachment)
-                        .await?
-                }
-                Err(error) if st3::client::api_error_code(&error) == Some("runtime-not-local") => {
-                    attach_remote_terminal(client, endpoint, person, subject, error).await?
-                }
-                Err(error) => return Err(error),
-            }
+        Ok(AttachAnswer::Local(terminal)) => st3::client::attach_local_terminal(&terminal).await?,
+        Ok(AttachAnswer::Bridge(attachment)) => {
+            client
+                .proxy_terminal_resilient(subject, &attachment)
+                .await?
         }
         Err(error) if st3::client::api_error_code(&error) == Some("runtime-not-local") => {
             attach_remote_terminal(client, endpoint, person, subject, error).await?
         }
         Err(error) => match &local {
             Some((root, sessions)) if st3::client::daemon_did_not_answer(&error) => {
-                let failed = format!("did not answer ({error:#})");
+                let failed = format!("the {daemon} did not answer ({error:#})");
                 attach_unconsulted(root, subject, sessions, &failed).await?
             }
             _ => return Err(error),
         },
     };
     terminal_exit(code)
+}
+
+fn endpoint_label(endpoint: &Endpoint) -> String {
+    match endpoint {
+        Endpoint::Unix(socket) => socket.display().to_string(),
+        Endpoint::Http(url) => url.clone(),
+    }
 }
 
 fn terminal_exit(code: i32) -> Result<()> {
@@ -4925,13 +4946,13 @@ async fn attach_unconsulted(
     pty_root: &Path,
     subject: &str,
     sessions: &[st3::client::TaggedPtySession],
-    daemon: &str,
+    why: &str,
 ) -> Result<i32> {
     let (newest, others) = sessions
         .split_first()
         .context("an attachment without st needs a PTY session")?;
     eprintln!(
-        "st terminals attach: the st daemon {daemon}, so st was not consulted. Attaching as the local user to PTY session `{}` of `{subject}` (started {}) under {}, without st's incarnation check.",
+        "st terminals attach: {why}, so st was not consulted. Attaching as the local user to PTY session `{}` of `{subject}` (started {}) under {}, without st's incarnation check.",
         newest.runtime_id,
         newest.created_at,
         pty_root.display()
@@ -6156,7 +6177,9 @@ async fn follow_conversation(
     json_output: bool,
 ) -> Result<()> {
     let mut stream = client.collection_stream().await?;
-    stream.subscribe_conversation("conversation", target).await?;
+    stream
+        .subscribe_conversation("conversation", target)
+        .await?;
     let mut seen = BTreeMap::new();
     loop {
         match stream.next_event().await? {
@@ -14148,7 +14171,10 @@ mod tests {
             .unwrap()
             .parse::<u64>()
             .unwrap();
-        assert!(after >= last_index, "the wait replayed existing events: {query}");
+        assert!(
+            after >= last_index,
+            "the wait replayed existing events: {query}"
+        );
         waiter.abort();
         server.abort();
     }
