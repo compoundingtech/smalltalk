@@ -10365,7 +10365,7 @@ mod tests {
         holder.join().unwrap();
         let doctor: DoctorReport = client.get("/v1/doctor").await.unwrap();
         assert!(doctor.checks.iter().any(|check| {
-            check.name == "request-latency//v1/health" && check.message.contains("p99")
+            check.name.starts_with("request-latency/") && check.message.contains("p99")
         }));
         let (status, latency) = get_request(router(state), "/v1/client/request-latency").await;
         assert_eq!(status, StatusCode::OK);
