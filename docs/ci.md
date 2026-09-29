@@ -9,9 +9,11 @@ before running `cargo test --workspace --locked` and
 `cargo clippy --workspace --all-targets --locked`. Linux also checks generated clients and
 runs the fleet compatibility test against the pinned older st3 baseline.
 
-On Linux, the workspace test build runs first and alone. Then the tests (under nextest, 8 at a
-time, longest first), Clippy, the generated client check and the fleet compatibility test run
-side by side, and the run fails if any of them fails.
+On Linux, the workspace test build runs first and alone, without debug information. Then the
+tests, Clippy, the generated client check and the fleet compatibility test run side by side, and
+the run fails if any of them fails. The tests run under nextest, 8 at a time, with the tests
+that take a minute or more started first. A failed test is retried twice, 30 seconds apart, and
+one that passes on a retry is reported as flaky rather than failing the run.
 
 st2's catalog, supervisor and end-to-end tests cover st2 code that st3 does not use: the
 `agent_author`, `catalog*`, `eval_run`, `resync` and `resource_profile_supervisor` modules and
@@ -27,7 +29,7 @@ without a passing one.
 `st/ci` is the Linux result from hetz and is the pull request merge check.
 `st/ci-macos` runs on Silber for `main` commits. To request a macOS run on a
 pull request, add the `macos-ci` label; the run starts after Linux succeeds.
-Linux runs use three host-local Cargo target lanes, while Silber reuses one target
+Linux runs use two host-local Cargo target lanes, while Silber reuses one target
 directory. Each run isolates `HOME` and XDG directories. Forked pull requests
 are excluded before any code from them runs on these machines. GitHub Actions handles tags
 and forks.
