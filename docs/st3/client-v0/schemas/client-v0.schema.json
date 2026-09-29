@@ -103,7 +103,7 @@
       "required": ["id", "kind", "revision", "updated_at"],
       "properties": {
         "id": { "$ref": "#/$defs/Id" },
-        "kind": { "enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "device", "operation", "history", "session"] },
+        "kind": { "enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "device", "operation", "history", "session"] },
         "revision": { "$ref": "#/$defs/Revision" },
         "updated_at": { "$ref": "#/$defs/Timestamp" }
       }
@@ -487,7 +487,42 @@
         "last_progress": { "type": ["string", "null"] },
         "blocker": { "type": ["object", "null"] },
         "after": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
-        "deadline": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }
+        "deadline": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "steps": { "oneOf": [{ "type": "array", "items": { "$ref": "#/$defs/MissionStep" } }, { "type": "null" }], "description": "The run's steps: for an open run or a mission's latest run, and for every run in a mission detail read." }
+      }
+    },
+    "MissionStep": {
+      "type": "object",
+      "required": ["id", "path", "state", "attempt", "since"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "path": { "type": "string" },
+        "title": { "type": ["string", "null"] },
+        "state": { "type": "string" },
+        "attempt": { "type": "integer", "minimum": 0 },
+        "assignee": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+        "claimant": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+        "agentless": { "type": "boolean" },
+        "since": { "$ref": "#/$defs/Timestamp" },
+        "last_progress": { "type": ["string", "null"] },
+        "blocked_reason": { "type": ["string", "null"] },
+        "blockers": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
+        "goals": { "type": "array", "items": { "type": "string" } },
+        "constraints": { "type": "array", "items": { "type": "string" } }
+      }
+    },
+    "WorkLabel": {
+      "type": "object",
+      "required": ["id", "mission_id", "mission_run_id", "path", "state", "since"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "mission_id": { "$ref": "#/$defs/Id" },
+        "mission_run_id": { "$ref": "#/$defs/Id" },
+        "path": { "type": "string" },
+        "title": { "type": ["string", "null"] },
+        "goal": { "type": ["string", "null"] },
+        "state": { "type": "string" },
+        "since": { "$ref": "#/$defs/Timestamp" }
       }
     },
     "Work": {
@@ -499,6 +534,7 @@
           "properties": {
             "kind": { "const": "work" },
             "gate_kind": { "enum": ["watch", "predicate", "command", "llm", "human", "mixed", "run", null] },
+            "mission_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }], "description": "The mission this work's run belongs to." },
             "mission_run_id": { "$ref": "#/$defs/Id" },
             "generation_id": { "$ref": "#/$defs/Id" },
             "definition_id": { "$ref": "#/$defs/Revision" },
@@ -546,6 +582,9 @@
             "next_work_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "upcoming_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "queued_work_count": { "type": "integer", "minimum": 0 },
+            "current_work": { "type": "array", "items": { "$ref": "#/$defs/WorkLabel" }, "description": "current_work_ids named for display, in the same order." },
+            "next_work": { "oneOf": [{ "$ref": "#/$defs/WorkLabel" }, { "type": "null" }] },
+            "upcoming_work": { "type": "array", "items": { "$ref": "#/$defs/WorkLabel" } },
             "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] },
             "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } },
             "delivery": { "oneOf": [{ "$ref": "#/$defs/AgentDelivery" }, { "type": "null" }], "description": "Whether the process that carries this local seat's messages is live and runs this daemon's st binary. Present only for a local native seat whose harness can take work; a stale path makes the agent `waiting`." }
@@ -677,6 +716,58 @@
           }
         }
       ]
+    },
+    "Lane": {
+      "allOf": [
+        { "$ref": "#/$defs/ResourceHeader" },
+        { "type": "object", "required": ["kind", "name", "mission_run_id", "mission_id", "entries_prefix", "approver_id", "state", "entries", "recent"],
+          "properties": {
+            "kind": { "const": "lane" },
+            "name": { "type": "string" },
+            "mission_run_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+            "mission_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+            "entries_prefix": { "type": ["string", "null"] },
+            "approver_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+            "state": { "enum": ["open", "closed"] },
+            "entries": { "type": "array", "items": { "$ref": "#/$defs/LaneEntry" } },
+            "recent": { "type": "array", "items": { "$ref": "#/$defs/LaneChange" } }
+          }
+        }
+      ]
+    },
+    "LaneEntry": {
+      "type": "object", "additionalProperties": false,
+      "required": ["entry_id", "label", "position", "state", "detail", "head", "marked_by_id", "marked_at", "joined_by_id", "joined_at", "join_reason", "approved_by_id", "approved_at"],
+      "properties": {
+        "entry_id": { "$ref": "#/$defs/Id" },
+        "label": { "type": "string" },
+        "position": { "type": "integer", "minimum": 1 },
+        "state": { "enum": ["waiting", "held", "ready", "running"] },
+        "detail": { "type": ["string", "null"] },
+        "head": { "type": ["string", "null"] },
+        "marked_by_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+        "marked_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
+        "joined_by_id": { "$ref": "#/$defs/Id" },
+        "joined_at": { "$ref": "#/$defs/Timestamp" },
+        "join_reason": { "type": ["string", "null"] },
+        "approved_by_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+        "approved_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] }
+      }
+    },
+    "LaneChange": {
+      "type": "object", "additionalProperties": false,
+      "required": ["change", "entry_id", "label", "actor_id", "at", "outcome", "placement", "anchor_id", "reason"],
+      "properties": {
+        "change": { "enum": ["joined", "left", "moved", "approved"] },
+        "entry_id": { "$ref": "#/$defs/Id" },
+        "label": { "type": "string" },
+        "actor_id": { "$ref": "#/$defs/Id" },
+        "at": { "$ref": "#/$defs/Timestamp" },
+        "outcome": { "oneOf": [{ "enum": ["completed", "removed"] }, { "type": "null" }] },
+        "placement": { "oneOf": [{ "enum": ["top", "bottom", "before", "after"] }, { "type": "null" }] },
+        "anchor_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
+        "reason": { "type": ["string", "null"] }
+      }
     },
     "ObserverSpec": {
       "type": "object", "additionalProperties": false,
@@ -833,6 +924,7 @@
         { "$ref": "#/$defs/Mission" }, { "$ref": "#/$defs/Work" },
         { "$ref": "#/$defs/Agent" }, { "$ref": "#/$defs/Runtime" },
         { "$ref": "#/$defs/Observer" }, { "$ref": "#/$defs/Subscription" },
+        { "$ref": "#/$defs/Lane" },
         { "$ref": "#/$defs/Machine" },
         { "$ref": "#/$defs/Device" },
         { "$ref": "#/$defs/Operation" }, { "$ref": "#/$defs/History" },
@@ -908,7 +1000,7 @@
     },
     "TimelineMessageBody": {
       "type": "object", "additionalProperties": false, "required": ["message_id"],
-      "properties": { "message_id": { "type": "string" }, "reply_to": { "type": "string" } }
+      "properties": { "message_id": { "type": "string" }, "reply_to": { "type": "string" }, "from": { "$ref": "#/$defs/Id" }, "to": { "$ref": "#/$defs/Id" }, "title": { "type": "string" } }
     },
     "TimelineContentBody": {
       "type": "object", "additionalProperties": false, "required": ["media_type"],
@@ -1070,7 +1162,7 @@
         "api_version": { "const": "st3.client.v0" },
         "id": { "$ref": "#/$defs/Id" },
         "type": {
-          "enum": ["attention.resolve", "review.approve", "review.reject", "review.request-changes", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.retry", "work.publish-mission", "agent.queue-move", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
+          "enum": ["attention.resolve", "review.approve", "review.reject", "review.request-changes", "message.send", "message.read", "message.close", "launch.create", "launch.revise", "launch.preview", "launch.approve", "launch.cancel", "mission.start", "mission.revise", "mission.approve-revision", "mission.cancel-revision", "mission.cancel", "session.import", "work.claim", "work.renew", "work.progress", "work.complete", "work.fail", "work.release", "work.retry", "work.publish-mission", "agent.queue-move", "lane.join", "lane.leave", "lane.move", "lane.mark", "lane.approve", "runtime.stop", "runtime.restart", "runtime.reset", "runtime.context-clear", "runtime.signal", "terminal.input", "terminal.resize", "terminal.attach", "terminal.detach", "pairing.revoke"]
         },
         "idempotency_key": { "type": "string", "minLength": 16, "maxLength": 256 },
         "fence": { "$ref": "#/$defs/Fence" },
@@ -1223,6 +1315,25 @@
                 "placement": { "enum": ["top", "bottom", "before", "after"] },
                 "anchor_run_id": { "$ref": "#/$defs/Id" },
                 "reason": { "type": "string" }
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "type": { "enum": ["lane.join", "lane.leave", "lane.move", "lane.mark", "lane.approve"] },
+            "parameters": {
+              "type": "object", "additionalProperties": false, "required": ["lane_id", "entry_id"],
+              "properties": {
+                "lane_id": { "$ref": "#/$defs/Id" },
+                "entry_id": { "$ref": "#/$defs/Id" },
+                "reason": { "type": "string" },
+                "outcome": { "enum": ["completed", "removed"] },
+                "placement": { "enum": ["top", "bottom", "before", "after"] },
+                "anchor_id": { "$ref": "#/$defs/Id" },
+                "state": { "enum": ["waiting", "held", "ready", "running"] },
+                "detail": { "type": "string" },
+                "head": { "type": "string" }
               }
             }
           }

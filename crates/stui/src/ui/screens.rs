@@ -10,7 +10,9 @@ use super::view::*;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
-pub const TABS: [&str; 5] = ["Home", "Agents", "Missions", "Fleet", "Worktrees"];
+/// The tabs everyone sees. Worktrees stays hidden until the graph models worktrees: its screens
+/// only have invented data to show (Nathan, 2026-09-28).
+pub const TABS: [&str; 4] = ["Home", "Agents", "Missions", "Fleet"];
 
 pub enum Item {
     Header {
@@ -93,6 +95,7 @@ pub fn word_style(word: Word, spinner: &'static str) -> (&'static str, Color) {
         Word::Idle => ("●", theme::IDLE),
         Word::Done => ("✓", theme::DONE),
         Word::Failed => ("✕", theme::FAULT),
+        Word::Cancelled => ("⊘", theme::QUIET),
     }
 }
 
@@ -113,7 +116,8 @@ fn attention_style(kind: &AttentionKind) -> (&'static str, Color) {
         AttentionKind::Review { .. }
         | AttentionKind::Feedback { .. }
         | AttentionKind::Launch { .. }
-        | AttentionKind::Revision { .. } => ("◆", theme::PERSON),
+        | AttentionKind::Revision { .. }
+        | AttentionKind::Request { .. } => ("◆", theme::PERSON),
         AttentionKind::Fault { .. } => ("✕", theme::FAULT),
         AttentionKind::Message { .. } => ("✉", theme::SAPPHIRE),
     }
@@ -696,6 +700,27 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             card.blank();
             if !confirm_row(&mut card, drafts, "Mark this fault resolved") {
                 card.buttons(&[("r", "Mark resolved", Hit::Key('r'), theme::GREEN)]);
+            }
+        }
+        AttentionKind::Request { from, question, .. } => {
+            card.line(Line::from(vec![
+                span("asks  ", theme::dim()),
+                span(from.clone(), theme::strong(theme::PERSON)),
+            ]));
+            card.blank();
+            card.lines(text::markdown(question, inner, theme::text()));
+            card.blank();
+            if drafts.editing || drafts.text.is_some_and(|text| !text.is_empty()) {
+                text_box(&mut card, &format!("answer {from}"), drafts, "", inner);
+                card.buttons(&[
+                    ("enter", "Send answer", Hit::Enter, theme::ACCENT),
+                    ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
+                ]);
+            } else if !confirm_row(&mut card, drafts, "Mark this request answered") {
+                card.buttons(&[
+                    ("c", "Answer", Hit::Key('c'), theme::ACCENT),
+                    ("r", "Mark answered", Hit::Key('r'), theme::GREEN),
+                ]);
             }
         }
         AttentionKind::Message { from, body } => {

@@ -1,4 +1,4 @@
-import type { Agent, Attention, Device, Mission, Work } from '../../clients/typescript/st3-client';
+import type { Agent, Attention, Device, Mission, MissionStep } from '../../clients/typescript/st3-client';
 
 // The daemon annotates every resource with its operational layer. It is not part of the
 // generated resource types, so read it at the UI boundary.
@@ -56,16 +56,46 @@ export function attentionKindLabel(kind: string): string {
   return kindLabels[kind as keyof typeof kindLabels] ?? titleCase(kind.replace(/-/g, ' '));
 }
 
-type QueueAgent = Pick<Agent, 'next_work_id' | 'upcoming_work_ids' | 'queued_work_count'>;
-type QueueWork = Pick<Work, 'id' | 'path' | 'state' | 'updated_at'>;
-export function queuedWorkSummary(agent: QueueAgent, work: QueueWork[], now = Date.now()): string | null {
-  if (!agent.next_work_id) return null;
-  const queued = new Set([agent.next_work_id, ...(agent.upcoming_work_ids ?? [])]);
-  const next = work.find(step => step.id === agent.next_work_id);
-  // A ready step's last update is when it became ready; that is how long it has waited.
-  const oldest = work.filter(step => queued.has(step.id) && step.state === 'ready').map(step => step.updated_at).sort()[0];
-  const name = next?.path.split('/').pop() ?? agent.next_work_id.split('/').pop();
-  return `Next: ${name} · ${agent.queued_work_count ?? queued.size} queued${oldest ? ` · oldest ready ${ago(oldest, now)}` : ''}`;
+function leaf(path: string): string { return path.split('/').pop() || path; }
+
+// st joins each agent's queue into its row: the step it works on, the next one, and the rest.
+type QueueAgent = Pick<Agent, 'next_work' | 'next_work_id' | 'upcoming_work' | 'queued_work_count'>;
+export function queuedWorkSummary(agent: QueueAgent, now = Date.now()): string | null {
+  const next = agent.next_work ?? null;
+  if (!next && !agent.next_work_id) return null;
+  const queued = [...(next ? [next] : []), ...(agent.upcoming_work ?? []).filter(step => step.id !== next?.id)];
+  // A ready step's `since` is when it became ready; that is how long it has waited.
+  const oldest = queued.filter(step => step.state === 'ready').map(step => step.since).sort()[0];
+  const name = next ? leaf(next.path) : leaf(agent.next_work_id!);
+  return `Next: ${name} · ${agent.queued_work_count ?? queued.length} queued${oldest ? ` · oldest ready ${ago(oldest, now)}` : ''}`;
+}
+
+export function currentWorkSummary(agent: Pick<Agent, 'current_work'>): string | null {
+  const current = agent.current_work?.[0];
+  return current ? `Current: ${current.title || leaf(current.path)} (${current.state})` : null;
+}
+
+// A mission row carries its runs with their steps: every open run, and the latest run.
+export function missionSteps(mission: Pick<Mission, 'run_details'>): MissionStep[] {
+  return (mission.run_details ?? []).flatMap(run => run.steps ?? []);
+}
+
+export const missionGroups = ['Blocked', 'Waiting', 'Running', 'Drafts', 'Archive'] as const;
+export type MissionGroup = typeof missionGroups[number];
+export function missionGroup(mission: Pick<Mission, 'run_details' | 'state'>): MissionGroup {
+  const states = missionSteps(mission).map(step => step.state);
+  if (states.includes('blocked')) return 'Blocked';
+  if (states.includes('waiting')) return 'Waiting';
+  if (mission.state === 'running' || mission.state === 'standing') return 'Running';
+  if (mission.state === 'ready' || mission.state === 'draft') return 'Drafts';
+  return 'Archive';
+}
+
+export function missionDetail(mission: Pick<Mission, 'run_details' | 'runs' | 'visualization'>): string {
+  const planned = mission.visualization?.nodes.filter(node => node.kind === 'step').length;
+  const steps = missionSteps(mission);
+  const current = steps.find(step => step.state === 'blocked') ?? steps.find(step => step.state === 'claimed' || step.state === 'ready') ?? steps[0];
+  return `${mission.runs.length} runs${planned === undefined ? '' : ` · ${planned} planned steps`}${current ? ` · ${current.path} (${current.state})` : ''}`;
 }
 
 type HealthAgent = Pick<Agent, 'state' | 'harness_state'>;
@@ -126,4 +156,11 @@ export function pingPresentation(text: string): { from: string | null; text: str
   const withoutReference = text.replace(/\s*\[id:[^\]\s]+\]\s*$/, '');
   const ping = /^\[PING\]\s+\S+\s+(\S+):\s+([\s\S]*)$/.exec(withoutReference);
   return ping ? { from: senderName(ping[1]), text: ping[2].trim() } : { from: null, text: withoutReference };
+}
+
+// st joins Small Talk to or from an agent into its conversation: who wrote to whom, and the title.
+export function smallTalkPresentation(body: unknown): { from: string; text: string } {
+  const message = (body && typeof body === 'object' ? body : {}) as { from?: unknown; to?: unknown; title?: unknown };
+  const name = (id: unknown) => typeof id === 'string' ? senderName(id) : 'someone';
+  return { from: `${name(message.from)} → ${name(message.to)}`, text: typeof message.title === 'string' && message.title.trim() ? message.title : 'Small Talk' };
 }

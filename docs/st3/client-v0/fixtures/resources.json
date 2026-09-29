@@ -80,6 +80,18 @@
     "owner_run_id": "mission-run/release", "owner_generation_id": "run-generation/release", "owner_step_id": "step-run/release/watch"
   },
   {
+    "id": "lane/release/train", "kind": "lane", "revision": "claim-lane-3", "updated_at": "2026-09-20T11:09:05Z",
+    "name": "train", "mission_run_id": "mission-run/release", "mission_id": "mission/release",
+    "entries_prefix": "resource/github/acme/app/ci/pull-request/", "approver_id": "person/nathan", "state": "open",
+    "entries": [
+      {"entry_id":"resource/github/acme/app/ci/pull-request/42","label":"42","position":1,"state":"running","detail":"testing 1f2e3d4 on st/ci","head":"1f2e3d4","marked_by_id":"agent/release-driver","marked_at":"2026-09-20T11:09:05Z","joined_by_id":"agent/release-agent","joined_at":"2026-09-20T11:00:00Z","join_reason":"green","approved_by_id":null,"approved_at":null},
+      {"entry_id":"resource/github/acme/app/ci/pull-request/45","label":"45","position":2,"state":"held","detail":"waiting for person/nathan to approve","head":"9a8b7c6","marked_by_id":"agent/release-driver","marked_at":"2026-09-20T11:09:04Z","joined_by_id":"person/visitor","joined_at":"2026-09-20T11:08:00Z","join_reason":null,"approved_by_id":null,"approved_at":null}
+    ],
+    "recent": [
+      {"change":"moved","entry_id":"resource/github/acme/app/ci/pull-request/43","label":"43","actor_id":"agent/release-driver","at":"2026-09-20T11:07:00Z","outcome":null,"placement":"bottom","anchor_id":null,"reason":"main moved during the run"}
+    ]
+  },
+  {
     "id": "machine/host-a", "kind": "machine", "revision": "mh5", "updated_at": "2026-09-20T11:09:10Z",
     "host_id": "host/host-a", "name": "host-a", "state": "local", "fleet_id": "fleet/release",
     "capacity": {"state":"unknown","reason":"no capacity observation"}, "occupancy": {"running_runtimes":1}, "projects": [],

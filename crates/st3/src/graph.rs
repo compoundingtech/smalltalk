@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 
 use crate::model::{
-    DesiredSubject, GateSpec, LaunchSpec, MemberKind, MemberLifecycle, MemberSpec,
+    DesiredSubject, GateSpec, LaneSpec, LaunchSpec, MemberKind, MemberLifecycle, MemberSpec,
     MissionRevisionOperation, MissionRunCreation, MissionRunDeclaration, NamedCancellation,
     NormalizedIntent, ObserverSpec, PlannerSpec, PlanningFeedbackOperation,
     PlanningSessionCreation, PlanningSessionDeclaration, QuantifiedFieldSpec,
@@ -21,6 +21,7 @@ const ROOT_NODES: &[&str] = &[
     "host",
     "doc",
     "resource",
+    "lane",
     "observer",
     "subscription",
     "person",
@@ -42,6 +43,7 @@ pub(crate) fn is_mission_declaration(name: &str) -> bool {
             | "host"
             | "doc"
             | "resource"
+            | "lane"
             | "observer"
             | "subscription"
             | "person"
@@ -418,7 +420,7 @@ fn parse_desired_node(
     if !context.allow_execution_root
         && matches!(
             kind,
-            "exec" | "pty" | "observer" | "subscription" | "schedule"
+            "exec" | "pty" | "lane" | "observer" | "subscription" | "schedule"
         )
     {
         return Err(St3Error::new(
@@ -1499,11 +1501,12 @@ fn parse_structure(node: &KdlNode, kind: &str, context: &mut ParseContext) -> Re
         }
         "message" => validate_message(node)?,
         "schedule" => validate_schedule(node)?,
+        "lane" => validate_lane(node)?,
         _ => unreachable!("the desired-state registry controls structure kinds"),
     }
     let subject = match kind {
         "doc" => format!("doc/{name}"),
-        "observer" | "subscription" | "schedule" if context.owner_run.is_some() => {
+        "lane" | "observer" | "subscription" | "schedule" if context.owner_run.is_some() => {
             format!(
                 "{kind}/{}/{}",
                 owner_run_id(context.owner_run.as_deref().unwrap_or_default()),
@@ -1606,7 +1609,7 @@ fn rewrite_owned_references(subjects: &mut BTreeMap<String, DesiredSubject>, run
         };
         if matches!(
             kind,
-            "agent" | "exec" | "pty" | "observer" | "subscription" | "schedule"
+            "agent" | "exec" | "pty" | "lane" | "observer" | "subscription" | "schedule"
         ) {
             aliases.insert(format!("{kind}/{local}"), subject.clone());
             if kind == "agent" {
@@ -3005,6 +3008,44 @@ fn validate_observer(node: &KdlNode) -> Result<(), St3Error> {
     Ok(())
 }
 
+/// A lane declares an optional entry prefix and an optional approver. Cleanup and revision
+/// retire it with `lane "NAME" { stop }`.
+fn validate_lane(node: &KdlNode) -> Result<(), St3Error> {
+    ensure_no_properties(node)?;
+    let Some(body) = node.children() else {
+        one_string(node)?;
+        return Ok(());
+    };
+    one_string_with_children(node)?;
+    if body.nodes().len() == 1 && body.nodes()[0].name().value() == "stop" {
+        ensure_bare(&body.nodes()[0])?;
+        return Ok(());
+    }
+    reject_unknown_children(body, &["entries", "approver"], "lane", "lane")?;
+    for child in ["entries", "approver"] {
+        unique_child(body, child)?;
+    }
+    if let Some(entries) = child_string(body, "entries")? {
+        if !entries.ends_with('/') {
+            return Err(St3Error::new(
+                "invalid-lane-entries",
+                "a lane's `entries` prefix must end with `/`",
+            ));
+        }
+        validate_full_subject(&format!("{entries}entry"))?;
+    }
+    if let Some(approver) = child_string(body, "approver")? {
+        validate_full_subject(&approver)?;
+        if !approver.starts_with("person/") {
+            return Err(St3Error::new(
+                "invalid-lane-approver",
+                "a lane's approver must be a `person/` subject",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn validate_subscription(node: &KdlNode) -> Result<(), St3Error> {
     ensure_no_properties(node)?;
     one_string_with_children(node)?;
@@ -3502,6 +3543,10 @@ pub(crate) fn validate_deferred_declaration(node: &KdlNode) -> Result<(), St3Err
     if node.name().value() == "env" {
         validate_string_map(node, true)?;
     }
+    // A lane has no run-time values, so a bad prefix or approver fails at publish, not at start.
+    if node.name().value() == "lane" {
+        return validate_lane(node);
+    }
     if let Some(children) = node.children() {
         for child in children.nodes() {
             validate_deferred_declaration(child)?;
@@ -3661,6 +3706,35 @@ pub fn observer_spec(value: &Value) -> Option<ObserverSpec> {
         every_ms: canonical_child_value(value, "every")
             .and_then(Value::as_str)
             .and_then(|value| parse_duration(value, true).ok()),
+        stopped: false,
+    })
+}
+
+/// The declared settings of a lane, or `stopped` once cleanup or a revision retired it.
+pub fn lane_spec(value: &Value) -> Option<LaneSpec> {
+    if value.get("name").and_then(Value::as_str) != Some("lane") {
+        return None;
+    }
+    let children = value
+        .get("children")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if children.len() == 1 && children[0].get("name").and_then(Value::as_str) == Some("stop") {
+        return Some(LaneSpec {
+            entries: None,
+            approver: None,
+            stopped: true,
+        });
+    }
+    let text = |name| {
+        canonical_child_value(value, name)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    Some(LaneSpec {
+        entries: text("entries"),
+        approver: text("approver"),
         stopped: false,
     })
 }
@@ -4704,6 +4778,66 @@ version 2
             parse_intent(&unknown_field, "node").unwrap_err().code,
             "unknown-child"
         );
+    }
+
+    #[test]
+    fn a_lane_is_a_mission_declaration_with_a_prefix_and_a_person_approver() {
+        let source = |lane: &str| {
+            format!(
+                r#"version 2
+mission "example/train" state="ready" {{
+  goal "Merge one at a time."
+  {lane}
+  step "drive" {{ agentless; gate "done" {{ field "done" "resource/example/done" "is" "true" }} }}
+}}
+"#
+            )
+        };
+        let valid = r#"lane "app" {
+    entries "resource/github/acme/app/ci/pull-request/"
+    approver "person/ada"
+  }"#;
+        let intent = parse_intent(&source(valid), "node").unwrap();
+        let declarations = intent.missions["example/train"]
+            .declarations_kdl
+            .clone()
+            .unwrap();
+        let run = parse_execution_intent(&declarations, "node", "train-run").unwrap();
+        let lane = &run.subjects["lane/train-run/app"];
+        assert_eq!(lane.kind, "lane");
+        assert_eq!(
+            lane_spec(&lane.desired),
+            Some(LaneSpec {
+                entries: Some("resource/github/acme/app/ci/pull-request/".into()),
+                approver: Some("person/ada".into()),
+                stopped: false,
+            })
+        );
+        parse_intent(&source(r#"lane "bare""#), "node").unwrap();
+
+        for (lane, code) in [
+            (
+                r#"lane "app" { entries "resource/github/acme/app/ci/pull-request" }"#,
+                "invalid-lane-entries",
+            ),
+            (
+                r#"lane "app" { approver "agent/example/driver" }"#,
+                "invalid-lane-approver",
+            ),
+            (r#"lane "app" { order "fifo" }"#, "unknown-child"),
+        ] {
+            assert_eq!(
+                parse_intent(&source(lane), "node").unwrap_err().code,
+                code,
+                "{lane}"
+            );
+        }
+        let in_step = source("").replace("step \"drive\" {", "step \"drive\" {\n    lane \"app\";");
+        assert_eq!(
+            parse_intent(&in_step, "node").unwrap_err().code,
+            "lane-inside-step"
+        );
+        assert!(parse_intent("version 2\nlane \"app\"", "node").is_err());
     }
 
     #[test]

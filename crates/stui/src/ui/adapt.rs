@@ -6,6 +6,7 @@
 use super::view::*;
 use crate::model::{Model, clean_message_text};
 use serde_json::Value;
+use st3_client::{MissionStep, WorkLabel};
 use st3_client::{TimelineBody, TimelineEntry, TimelineRole, TimelineToolStatus};
 use std::collections::BTreeMap;
 
@@ -37,6 +38,54 @@ fn loaded<T>(snapshot: bool, items: Vec<T>) -> Load<Vec<T>> {
     }
 }
 
+/// The host this stui talks to, from whichever window has loaded.
+fn gateway(model: &Model) -> Option<String> {
+    [&model.missions, &model.agents, &model.now, &model.sessions]
+        .into_iter()
+        .find_map(|collection| collection.snapshot.as_ref())
+        .map(|snapshot| snapshot.host_id.clone())
+}
+
+/// The steps st sent with a mission: its open runs' steps, or its latest run's when none is open.
+fn mission_steps(mission: &st3_client::Mission) -> Vec<&MissionStep> {
+    let finished = |status: &str| matches!(status, "completed" | "failed" | "cancelled");
+    let open = mission
+        .run_details
+        .iter()
+        .filter(|run| !finished(&run.status))
+        .collect::<Vec<_>>();
+    let runs = if open.is_empty() {
+        mission.run_details.last().into_iter().collect()
+    } else {
+        open
+    };
+    runs.into_iter()
+        .flat_map(|run| run.steps.iter().flatten())
+        .collect()
+}
+
+/// A step st sent with some mission, and that mission.
+fn find_step<'a>(model: &'a Model, id: &str) -> Option<(&'a st3_client::Mission, &'a MissionStep)> {
+    model.missions().find_map(|mission| {
+        mission
+            .run_details
+            .iter()
+            .flat_map(|run| run.steps.iter().flatten())
+            .find(|step| step.id == id)
+            .map(|step| (mission, step))
+    })
+}
+
+/// "Mission › step" for a step an agent holds or has queued, as st named it.
+fn label_text(model: &Model, label: &WorkLabel) -> String {
+    let mission = model
+        .missions()
+        .find(|mission| mission.header.id == label.mission_id)
+        .map(crate::mission_display_label)
+        .unwrap_or_else(|| short(&label.mission_id));
+    format!("{mission} › {}", label.path)
+}
+
 fn short(id: &str) -> String {
     id.trim_start_matches("mission/")
         .trim_start_matches("agent/")
@@ -51,17 +100,19 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
     } else {
         Link::Connecting
     };
-    let host = model
-        .sessions
-        .snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.host_id.trim_start_matches("host/").to_owned())
+    let host = gateway(model)
+        .map(|host| host.trim_start_matches("host/").to_owned())
         .unwrap_or_else(|| "this machine".into());
     let attention = attention(model, extras);
     let missions = missions(model);
     let quiet = missions
         .iter()
-        .filter(|mission| !matches!(mission.word, Word::Decision | Word::Done) && !mission.system)
+        .filter(|mission| {
+            !matches!(
+                mission.word,
+                Word::Decision | Word::Done | Word::Failed | Word::Cancelled
+            ) && !mission.system
+        })
         .count();
     let diverged = model
         .sync_notice()
@@ -77,10 +128,7 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         diverged,
         attention: loaded(model.now.snapshot.is_some(), attention),
         agents: loaded(model.agents.snapshot.is_some(), agents(model)),
-        missions: loaded(
-            model.missions.snapshot.is_some() && model.work.snapshot.is_some(),
-            missions,
-        ),
+        missions: loaded(model.missions.snapshot.is_some(), missions),
         machines: loaded(model.machines.snapshot.is_some(), machines(model)),
         worktrees: Load::Ready(super::demo::world().worktrees.items().to_vec()),
         devices: loaded(
@@ -109,12 +157,11 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
     model
         .attention()
         .map(|item| {
-            let step = item.step_run_id.as_ref().and_then(|id| {
-                model
-                    .work()
-                    .find(|work| &work.header.id == id)
-                    .map(|work| work.path.clone())
-            });
+            let step = item
+                .step_run_id
+                .as_ref()
+                .and_then(|id| find_step(model, id))
+                .map(|(_, step)| step.path.clone());
             let mission = item.mission_id.clone();
             let (tier, kind) = match item.attention_kind.as_str() {
                 "human-gate" => (
@@ -186,6 +233,25 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                         },
                     },
                 ),
+                // An agent stopped on the person: a request to answer, not a fault to clear.
+                "agent-request" => (
+                    Tier::Stopped,
+                    AttentionKind::Request {
+                        from: item
+                            .requester_id
+                            .as_deref()
+                            .map(|id| {
+                                model
+                                    .agents()
+                                    .find(|agent| agent.header.id == id)
+                                    .map(crate::agent_label)
+                                    .unwrap_or_else(|| short(id))
+                            })
+                            .unwrap_or_else(|| "An agent".into()),
+                        from_id: item.requester_id.clone().unwrap_or_default(),
+                        question: clean_message_text(&item.detail),
+                    },
+                ),
                 _ => (
                     if matches!(item.priority.as_str(), "critical" | "high") {
                         Tier::Alert
@@ -195,9 +261,6 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                     AttentionKind::Fault {
                         what: item.detail.clone(),
                         because: match item.priority.as_str() {
-                            _ if item.attention_kind == "agent-request" => {
-                                "an agent is asking you for help".into()
-                            }
                             "critical" => "marked critical".into(),
                             "high" => "marked high priority".into(),
                             _ => "raised for you".into(),
@@ -214,28 +277,21 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
             let agent = item
                 .step_run_id
                 .as_ref()
-                .and_then(|id| model.work().find(|work| &work.header.id == id))
-                .and_then(|work| work.claimant.clone())
+                .and_then(|id| find_step(model, id))
+                .and_then(|(_, step)| step.claimant.clone())
                 .or_else(|| {
-                    // The agents working in the mission, for a gate that has no claimant.
-                    item.mission_id
-                        .as_ref()
-                        .and_then(|mission| {
-                            model
-                                .missions()
-                                .find(|candidate| &candidate.header.id == mission)
-                                .and_then(|mission| {
-                                    model.agents().find(|agent| {
-                                        agent.current_work_ids.iter().any(|id| {
-                                            model.work().any(|work| {
-                                                &work.header.id == id
-                                                    && crate::mission_work_matches(mission, work)
-                                            })
-                                        })
-                                    })
-                                })
-                        })
-                        .map(|agent| agent.header.id.clone())
+                    // An agent working in the mission, for a gate that has no claimant.
+                    item.mission_id.as_ref().and_then(|mission| {
+                        model
+                            .agents()
+                            .find(|agent| {
+                                agent
+                                    .current_work
+                                    .iter()
+                                    .any(|work| &work.mission_id == mission)
+                            })
+                            .map(|agent| agent.header.id.clone())
+                    })
                 })
                 .or_else(|| {
                     item.source_id
@@ -245,6 +301,9 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                 .or_else(|| match &kind {
                     AttentionKind::Message { from, .. } if from.starts_with("agent/") => {
                         Some(from.clone())
+                    }
+                    AttentionKind::Request { from_id, .. } if from_id.starts_with("agent/") => {
+                        Some(from_id.clone())
                     }
                     _ => None,
                 });
@@ -261,12 +320,26 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                     (target.clone(), state)
                 })
                 .collect();
+            // Who raised it: the requester st names, else the agent the item is about. st's own
+            // machinery reads as st.
             let raised_by = item
-                .extra
-                .get("requester_id")
-                .or_else(|| item.extra.get("actor"))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+                .requester_id
+                .clone()
+                .or_else(|| {
+                    item.extra
+                        .get("actor")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .or_else(|| agent.clone())
+                .map(|who| match who.as_str() {
+                    "daemon/runtime" | "agent/st3/reconciler" => "st".to_owned(),
+                    _ => model
+                        .agents()
+                        .find(|candidate| candidate.header.id == who)
+                        .map(|candidate| format!("{} · {who}", crate::agent_label(candidate)))
+                        .unwrap_or(who),
+                });
             Attention {
                 id: item.header.id.clone(),
                 agent,
@@ -417,21 +490,13 @@ fn agents(model: &Model) -> Vec<Agent> {
                 ("stopped", _) => AgentState::Stopped,
                 _ => AgentState::Unknown,
             };
-            let host = model
-                .runtimes()
-                .find(|runtime| runtime.owner_id == agent.header.id)
-                .map(|runtime| runtime.owner_host_id.trim_start_matches("host/").to_owned())
+            let host = agent
+                .host_id
+                .as_deref()
+                .map(|host| host.trim_start_matches("host/").to_owned())
                 .unwrap_or_else(|| "?".into());
-            let work = agent
-                .current_work_ids
-                .first()
-                .and_then(|id| model.work().find(|work| &work.header.id == id));
-            let mission = work.and_then(|work| {
-                model
-                    .missions()
-                    .find(|mission| mission.runs.contains(&work.mission_run_id))
-                    .map(|mission| mission.header.id.clone())
-            });
+            // st names the step each agent holds and the ones queued for it.
+            let work = agent.current_work.first();
             Agent {
                 id: agent.header.id.clone(),
                 name: crate::agent_label(agent),
@@ -439,36 +504,32 @@ fn agents(model: &Model) -> Vec<Agent> {
                 state,
                 host,
                 worktree: None,
-                mission,
+                mission: work.map(|work| work.mission_id.clone()),
                 step: work.map(|work| work.path.clone()),
                 activity: age(&agent.header.updated_at),
                 unmanaged: false,
-                // The runtime list is bounded, so an agent's runtime may be missing from it;
-                // a running agent with a runtime is worth trying, and opening fetches it by id.
-                terminal: model.runtimes().any(|runtime| {
-                    runtime.owner_id == agent.header.id && runtime.terminal_id.is_some()
-                }) || (!agent.runtime_ids.is_empty()
-                    && !matches!(agent.state.as_str(), "stopped" | "failed")),
+                // A running agent with a runtime is worth trying; opening it finds the terminal.
+                terminal: !agent.runtime_ids.is_empty()
+                    && !matches!(agent.state.as_str(), "stopped" | "failed"),
                 parent: agent
                     .under
                     .first()
                     .map(|relation| relation.agent_id.clone()),
                 details: AgentDetails {
-                    goal: work
-                        .and_then(|work| work.goals.first().map(|goal| clean_message_text(goal))),
-                    claimed: work.map(|work| format!("{} ago", age(&work.header.updated_at))),
-                    next: agent.next_work_id.as_ref().map(|id| step_label(model, id)),
+                    goal: work.and_then(|work| work.goal.as_deref().map(clean_message_text)),
+                    claimed: work.map(|work| format!("{} ago", age(&work.since))),
+                    next: agent
+                        .next_work
+                        .as_ref()
+                        .map(|label| label_text(model, label)),
                     queue: agent
-                        .upcoming_work_ids
+                        .upcoming_work
                         .iter()
-                        .map(|id| step_label(model, id))
+                        .map(|label| label_text(model, label))
                         .collect(),
                     queued: agent.queued_work_count,
                     harness_state: agent.harness_state.clone(),
-                    runtime: model
-                        .runtimes()
-                        .find(|runtime| runtime.owner_id == agent.header.id)
-                        .map(|runtime| runtime.state.clone()),
+                    runtime: None,
                     fault: agent.fault.clone(),
                     under: agent.under.first().map(|relation| {
                         model
@@ -481,11 +542,8 @@ fn agents(model: &Model) -> Vec<Agent> {
             }
         })
         .collect::<Vec<_>>();
-    let gateway = model
-        .sessions
-        .snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.host_id.trim_start_matches("host/").to_owned())
+    let gateway = gateway(model)
+        .map(|host| host.trim_start_matches("host/").to_owned())
         .unwrap_or_default();
     agents.extend(model.undeclared_sessions().map(|session| {
         let driver = session.extra.get("driver").and_then(Value::as_str);
@@ -539,36 +597,28 @@ fn queued_for<'a>(model: &'a Model, work: &str) -> Option<&'a st3_client::Agent>
     })
 }
 
-/// "Mission › step" for a work id, or the id itself when st has not sent that work.
-fn step_label(model: &Model, id: &str) -> String {
-    model
-        .work()
-        .find(|work| work.header.id == id)
-        .map(|work| {
-            let mission = model
-                .missions()
-                .find(|mission| mission.runs.contains(&work.mission_run_id))
-                .map(crate::mission_display_label)
-                .unwrap_or_else(|| {
-                    work.mission_run_id
-                        .trim_start_matches("mission-run/")
-                        .to_owned()
-                });
-            format!("{mission} › {}", work.path)
-        })
-        .unwrap_or_else(|| id.trim_start_matches("step-run/").to_owned())
-}
-
 // ------------------------------------------------------------------- missions
+
+/// Who holds or will take a step: its claimant, else its assignee, named.
+fn step_owner(model: &Model, step: &MissionStep) -> Option<String> {
+    if step.agentless {
+        return Some("st".into());
+    }
+    let id = step.claimant.as_deref().or(step.assignee.as_deref())?;
+    Some(
+        model
+            .agents()
+            .find(|agent| agent.header.id == id)
+            .map(|agent| format!("{} · {id}", crate::agent_label(agent)))
+            .unwrap_or_else(|| id.to_owned()),
+    )
+}
 
 fn missions(model: &Model) -> Vec<Mission> {
     model
         .missions()
         .map(|mission| {
-            let work = model
-                .work()
-                .filter(|work| crate::mission_work_matches(mission, work))
-                .collect::<Vec<_>>();
+            let work = mission_steps(mission);
             let decision = model
                 .attention()
                 .find(|item| {
@@ -578,22 +628,26 @@ fn missions(model: &Model) -> Vec<Mission> {
                 .map(|item| item.header.id.clone());
             let states = work
                 .iter()
-                .map(|work| work.state.as_str())
+                .map(|step| step.state.as_str())
                 .collect::<Vec<_>>();
             let word = if decision.is_some() {
                 Word::Decision
             } else if mission.state == "blocked" || states.contains(&"blocked") {
                 Word::Stalled
-            } else if states.iter().any(|state| matches!(*state, "failed")) {
+            } else if mission.state == "failed"
+                || states.iter().any(|state| matches!(*state, "failed"))
+            {
                 Word::Failed
+            } else if mission.state == "cancelled" {
+                Word::Cancelled
             } else if !work.is_empty()
-                && work.iter().all(|work| {
-                    work.state == "completed"
-                        || (matches!(work.state.as_str(), "claimed" | "running")
-                            && crate::work_owner(model, work) == "Agentless step"
-                            && keeps_open(&work.path))
+                && work.iter().all(|step| {
+                    step.state == "completed"
+                        || (matches!(step.state.as_str(), "claimed" | "running")
+                            && step.agentless
+                            && keeps_open(&step.path))
                 })
-                && work.iter().any(|work| work.state != "completed")
+                && work.iter().any(|step| step.state != "completed")
             {
                 // Only st's own keep-open steps are running: an intake that watches.
                 Word::Watching
@@ -604,10 +658,10 @@ fn missions(model: &Model) -> Vec<Mission> {
                 Word::Working
             } else if let Some(ready) = work
                 .iter()
-                .find(|work| work.state == "ready" && work.claimant.is_none())
+                .find(|step| step.state == "ready" && step.claimant.is_none())
             {
                 // Who has this step queued decides whether a person is needed.
-                match queued_for(model, &ready.header.id) {
+                match queued_for(model, &ready.id) {
                     Some(agent)
                         if matches!(agent.state.as_str(), "failed" | "stopped")
                             || agent.fault.is_some() =>
@@ -629,8 +683,8 @@ fn missions(model: &Model) -> Vec<Mission> {
             };
             let steps = work
                 .iter()
-                .map(|work| {
-                    let state = match work.state.as_str() {
+                .map(|step| {
+                    let state = match step.state.as_str() {
                         "completed" => StepState::Done,
                         "claimed" | "running" => StepState::Working,
                         "ready" => StepState::Ready,
@@ -639,17 +693,16 @@ fn missions(model: &Model) -> Vec<Mission> {
                         "failed" => StepState::Failed,
                         _ => StepState::Pending,
                     };
-                    let owner = crate::work_owner(model, work);
-                    let note = if work.state == "ready" && work.claimant.is_none() {
-                        queued_for(model, &work.header.id).map(|agent| {
+                    let note = if step.state == "ready" && step.claimant.is_none() {
+                        queued_for(model, &step.id).map(|agent| {
                             let label = crate::agent_label(agent);
-                            match agent.current_work_ids.first() {
+                            match agent.current_work.first() {
                                 Some(current)
                                     if !matches!(agent.state.as_str(), "failed" | "stopped") =>
                                 {
                                     format!(
                                         "queued for {label}, which is busy with {}",
-                                        step_label(model, current)
+                                        label_text(model, current)
                                     )
                                 }
                                 _ => format!("queued for {label}, which is {}", agent.state),
@@ -659,39 +712,47 @@ fn missions(model: &Model) -> Vec<Mission> {
                         None
                     };
                     Step {
-                        name: work.path.clone(),
+                        name: step.path.clone(),
                         state,
-                        owner: match owner.as_str() {
-                            "" | "unassigned" => None,
-                            "Agentless step" => Some("st".into()),
-                            _ => Some(owner),
-                        },
-                        note: note.or_else(|| work.blocked_reason.clone()),
+                        owner: step_owner(model, step),
+                        note: note.or_else(|| step.blocked_reason.clone()),
                         after: vec![],
-                        age: age(&work.header.updated_at),
-                        goals: work
+                        age: age(&step.since),
+                        goals: step
                             .goals
                             .iter()
                             .map(|goal| clean_message_text(goal))
                             .collect(),
-                        constraints: work
+                        constraints: step
                             .constraints
                             .iter()
                             .map(|constraint| clean_message_text(constraint))
                             .collect(),
                         gates: vec![],
-                        attempt: work.attempt,
-                        blockers: work.blockers.clone(),
+                        attempt: step.attempt,
+                        blockers: step.blockers.clone(),
                     }
                 })
                 .collect::<Vec<_>>();
+            // Read a mission like a pipeline: what finished, what is happening, what is next.
+            // st says nothing about declaration order, so a later step must not sit above the
+            // one working now.
+            let mut steps = steps;
+            steps.sort_by_key(|step| match step.state {
+                StepState::Done => 0,
+                StepState::NeedsYou | StepState::Failed => 1,
+                StepState::Working => 2,
+                StepState::Ready => 3,
+                StepState::Waiting => 4,
+                StepState::Pending => 5,
+            });
             let agents = model
                 .agents()
                 .filter(|agent| {
                     agent
                         .current_work_ids
                         .iter()
-                        .any(|id| work.iter().any(|work| &work.header.id == id))
+                        .any(|id| work.iter().any(|step| &step.id == id))
                 })
                 .map(|agent| agent.header.id.clone())
                 .collect();
@@ -708,21 +769,23 @@ fn missions(model: &Model) -> Vec<Mission> {
                 decision,
                 worktree: None,
                 parent: None,
-                system: mission.header.id.starts_with("mission/__st3/"),
+                system: is_system_mission(&mission.header.id),
             }
         })
         .collect()
 }
 
+/// Plumbing the Missions tab folds away until `x` shows it: st's own loop rounds, and CI
+/// (a `ci` segment, as in `mission/fleet/smalltalk/ci/run`). The graph has no mark for this
+/// yet, so the name decides. What needs a person still reaches Home as attention.
+fn is_system_mission(id: &str) -> bool {
+    id.starts_with("mission/__st3/") || id.split('/').any(|segment| segment == "ci")
+}
+
 // ------------------------------------------------------------------- machines
 
 fn machines(model: &Model) -> Vec<Machine> {
-    let gateway = model
-        .sessions
-        .snapshot
-        .as_ref()
-        .map(|snapshot| snapshot.host_id.clone())
-        .unwrap_or_default();
+    let gateway = gateway(model).unwrap_or_default();
     model
         .machines()
         .map(|machine| Machine {
@@ -769,11 +832,9 @@ pub fn names(model: &Model, person: &str) -> BTreeMap<String, String> {
 }
 
 /// One conversation: the harness transcript and Small Talk messages, in time order.
-pub fn conversation(
-    timeline: &[TimelineEntry],
-    messages: &[st3_client::Message],
-    names: &BTreeMap<String, String>,
-) -> Vec<Entry> {
+/// Draw one conversation as st joined it: the harness's turns and the agent's Small Talk, in
+/// the order st sent them.
+pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>) -> Vec<Entry> {
     let name = |id: &str| -> String {
         names.get(id).cloned().unwrap_or_else(|| match id {
             "daemon/runtime" => "st".into(),
@@ -783,8 +844,57 @@ pub fn conversation(
     };
     let mut stamped: Vec<(String, Entry)> = Vec::new();
     let mut tools: BTreeMap<String, usize> = BTreeMap::new();
+    // A Small Talk message is two entries: who wrote to whom, then what they wrote. A
+    // harness transcript heads its own turns with message entries too; only a graph message,
+    // `message/…`, is Small Talk.
+    let mut mail: Option<&st3_client::TimelineMessageBody> = None;
     for entry in timeline {
         let at = clock(&entry.timestamp);
+        if let TimelineBody::Message(message) = &entry.body {
+            mail = message
+                .message_id
+                .starts_with("message/")
+                .then_some(message);
+            continue;
+        }
+        if let (Some(message), TimelineBody::Content(content)) = (mail.take(), &entry.body) {
+            let body = clean_message_text(content.text.as_deref().unwrap_or(""));
+            let from = message.from.as_deref().unwrap_or_default();
+            let body = if from == "daemon/runtime" {
+                // Step-ready pings are graph events, not conversation.
+                Body::Event(
+                    message
+                        .title
+                        .clone()
+                        .unwrap_or_else(|| body.lines().next().unwrap_or("").to_owned()),
+                )
+            } else {
+                // An older st sends neither side; say what it is rather than draw a blank.
+                let (from, to) = match (from, message.to.as_deref()) {
+                    ("", None) => ("Small Talk".to_owned(), String::new()),
+                    (from, to) => (name(from), name(to.unwrap_or_default())),
+                };
+                Body::Mail {
+                    from,
+                    to,
+                    subject: message.title.clone().unwrap_or_default(),
+                    body: if body.is_empty() {
+                        "(notification)".into()
+                    } else {
+                        body
+                    },
+                }
+            };
+            stamped.push((
+                entry.timestamp.clone(),
+                Entry {
+                    id: message.message_id.clone(),
+                    at,
+                    body,
+                },
+            ));
+            continue;
+        }
         let body = match (&entry.role, &entry.body) {
             (TimelineRole::User | TimelineRole::System, TimelineBody::Content(content)) => {
                 // Harness markup becomes what it means; context blocks disappear.
@@ -870,42 +980,6 @@ pub fn conversation(
                 id: entry.id.clone(),
                 at,
                 body,
-            },
-        ));
-    }
-    for message in messages {
-        let body = clean_message_text(&message.content);
-        if message.from == "daemon/runtime" {
-            // Step-ready pings are graph events, not conversation.
-            let title = message
-                .title
-                .clone()
-                .unwrap_or_else(|| body.lines().next().unwrap_or("").to_owned());
-            stamped.push((
-                message.sent_at.clone(),
-                Entry {
-                    id: message.header.id.clone(),
-                    at: clock(&message.sent_at),
-                    body: Body::Event(title),
-                },
-            ));
-            continue;
-        }
-        stamped.push((
-            message.sent_at.clone(),
-            Entry {
-                id: message.header.id.clone(),
-                at: clock(&message.sent_at),
-                body: Body::Mail {
-                    from: name(&message.from),
-                    to: name(&message.to),
-                    subject: message.title.clone().unwrap_or_default(),
-                    body: if body.is_empty() {
-                        "(notification)".into()
-                    } else {
-                        body
-                    },
-                },
             },
         ));
     }
@@ -1156,9 +1230,51 @@ mod tests {
         "<timezone>",
     ];
 
+    #[test]
+    fn small_talk_in_the_timeline_draws_as_mail_and_step_pings_as_events() {
+        let timeline: Vec<TimelineEntry> = serde_json::from_value(serde_json::json!([
+            {"id":"e1","sequence":4,"revision":1,"timestamp":"2026-09-29T10:00:00Z","role":"user","type":"message","final":true,
+             "body":{"message_id":"message/one","from":"agent/fleet/harbor","to":"agent/fleet/cos","title":"A question"}},
+            {"id":"e2","sequence":5,"revision":1,"timestamp":"2026-09-29T10:00:00Z","role":"user","type":"content","final":true,
+             "body":{"media_type":"text/plain","text":"Can you look?"}},
+            {"id":"e3","sequence":8,"revision":1,"timestamp":"2026-09-29T10:01:00Z","role":"user","type":"message","final":true,
+             "body":{"message_id":"message/two","from":"daemon/runtime","to":"agent/fleet/cos","title":"Mission step ready: review"}},
+            {"id":"e4","sequence":9,"revision":1,"timestamp":"2026-09-29T10:01:00Z","role":"user","type":"content","final":true,
+             "body":{"media_type":"text/plain","text":"A mission step is ready."}},
+            {"id":"e5a","sequence":11,"revision":1,"timestamp":"2026-09-29T10:02:00Z","role":"assistant","type":"message","final":true,
+             "body":{"message_id":"msg_harness_turn"}},
+            {"id":"e5","sequence":12,"revision":1,"timestamp":"2026-09-29T10:02:00Z","role":"assistant","type":"content","final":true,
+             "body":{"media_type":"text/plain","text":"On it."}}
+        ]))
+        .unwrap();
+        let names = BTreeMap::from([("agent/fleet/cos".to_owned(), "COS".to_owned())]);
+        let entries = conversation(&timeline, &names);
+        assert_eq!(entries.len(), 3, "{entries:#?}");
+        match &entries[0].body {
+            Body::Mail {
+                from,
+                to,
+                subject,
+                body,
+            } => {
+                assert_eq!(to, "COS");
+                assert!(from.contains("harbor"), "{from}");
+                assert_eq!(subject, "A question");
+                assert_eq!(body, "Can you look?");
+            }
+            other => panic!("expected mail, got {other:?}"),
+        }
+        assert_eq!(entries[0].id, "message/one");
+        assert!(
+            matches!(&entries[1].body, Body::Event(title) if title == "Mission step ready: review")
+        );
+        // A harness turn's own message header is not Small Talk.
+        assert!(matches!(&entries[2].body, Body::Assistant(text) if text == "On it."));
+    }
+
     fn rendered(fixture: &str) -> String {
         let timeline: Vec<TimelineEntry> = serde_json::from_str(fixture).unwrap();
-        let entries = conversation(&timeline, &[], &BTreeMap::new());
+        let entries = conversation(&timeline, &BTreeMap::new());
         let doc = super::super::conversation::Cache::default().render(
             &entries,
             100,
@@ -1283,7 +1399,7 @@ mod tests {
              "type": "tool_result", "body": {"call_id": "c", "status": "error", "media_type": "text/plain", "content": "1 failed"}}
         ]))
         .unwrap();
-        let entries = conversation(&timeline, &[], &BTreeMap::new());
+        let entries = conversation(&timeline, &BTreeMap::new());
         assert_eq!(entries.len(), 1);
         match &entries[0].body {
             Body::Tool {
@@ -1297,5 +1413,116 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    fn window(items: Vec<Value>) -> crate::model::Collection {
+        crate::model::Collection {
+            items: items
+                .into_iter()
+                .map(|item| serde_json::from_value(item).unwrap())
+                .collect(),
+            snapshot: Some(st3_client::Snapshot {
+                id: "snapshot/1".into(),
+                host_id: "host/harbor".into(),
+                store_index: 1,
+                projection_version: "1".into(),
+                created_at: "2026-09-29T10:00:00Z".into(),
+            }),
+            truncated: false,
+            sync: None,
+        }
+    }
+
+    #[test]
+    fn missions_and_agents_read_what_st_joined_without_work_or_runtime_lists() {
+        let step = |id: &str, path: &str, state: &str, claimant: Option<&str>| {
+            serde_json::json!({
+                "id": id, "path": path, "state": state, "attempt": 1,
+                "assignee": "agent/fleet/harbor/keeper", "claimant": claimant,
+                "since": "2026-09-29T09:58:00Z", "goals": [format!("Do {path}.")],
+                "constraints": [], "blockers": [],
+            })
+        };
+        let label = |id: &str, path: &str, state: &str| {
+            serde_json::json!({
+                "id": id, "mission_id": "mission/fleet/harbor/audit",
+                "mission_run_id": "mission-run/audit-1", "path": path,
+                "title": null, "goal": format!("Do {path}."), "state": state,
+                "since": "2026-09-29T09:58:00Z",
+            })
+        };
+        let run = |id: &str, status: &str, steps: Vec<Value>| {
+            serde_json::json!({
+                "id": id, "requester": "person/avery", "status": status, "phase": "normal",
+                "progress": {"done": 0, "total": steps.len()}, "current_steps": [],
+                "must_act": "agent", "state_since": "2026-09-29T09:58:00Z", "steps": steps,
+            })
+        };
+        let mut model = Model::default();
+        model.missions = window(vec![serde_json::json!({
+            "id": "mission/fleet/harbor/audit", "kind": "mission", "revision": "r1",
+            "updated_at": "2026-09-29T09:58:00Z", "title": "fleet/harbor/audit",
+            "state": "running", "mission_revision": "r1",
+            "runs": ["mission-run/audit-0", "mission-run/audit-1"],
+            "run_details": [
+                // A finished earlier run whose steps must not mix with the open one.
+                run("mission-run/audit-0", "completed", vec![step("step-run/old/scan", "scan", "completed", None)]),
+                run("mission-run/audit-1", "running", vec![
+                    step("step-run/audit-1/scan", "scan", "claimed", Some("agent/fleet/harbor/keeper")),
+                    step("step-run/audit-1/report", "report", "ready", None),
+                ]),
+            ],
+        })]);
+        model.agents = window(vec![serde_json::json!({
+            "id": "agent/fleet/harbor/keeper", "kind": "agent", "revision": "r2",
+            "updated_at": "2026-09-29T09:59:00Z", "name": "fleet/harbor/keeper",
+            "state": "running", "reachability": "local", "harness_state": "working",
+            "host_id": "host/lighthouse", "runtime_ids": ["runtime/keeper"],
+            "current_work_ids": ["step-run/audit-1/scan"],
+            "next_work_id": "step-run/audit-1/report",
+            "upcoming_work_ids": ["step-run/audit-1/report"], "queued_work_count": 1,
+            "current_work": [label("step-run/audit-1/scan", "scan", "claimed")],
+            "next_work": label("step-run/audit-1/report", "report", "ready"),
+            "upcoming_work": [label("step-run/audit-1/report", "report", "ready")],
+            "under": [],
+        })]);
+        assert!(model.work.items.is_empty() && model.runtimes.items.is_empty());
+        let world = world(&model, "person/avery", &Extras::default());
+
+        let Load::Ready(missions) = &world.missions else {
+            panic!("missions load from the missions window alone")
+        };
+        let mission = &missions[0];
+        assert_eq!(mission.word, Word::Working);
+        assert_eq!(
+            mission
+                .steps
+                .iter()
+                .map(|step| (step.name.as_str(), step.state))
+                .collect::<Vec<_>>(),
+            [("scan", StepState::Working), ("report", StepState::Ready)]
+        );
+        assert_eq!(mission.steps[0].goals, ["Do scan."]);
+        assert_eq!(mission.agents, ["agent/fleet/harbor/keeper"]);
+        assert_eq!(
+            mission.steps[1].note.as_deref(),
+            Some("queued for Keeper, which is busy with fleet/harbor · Audit › scan")
+        );
+
+        let Load::Ready(agents) = &world.agents else {
+            panic!("agents load from the agents window alone")
+        };
+        let agent = &agents[0];
+        assert_eq!(agent.host, "lighthouse");
+        assert!(agent.terminal);
+        assert_eq!(agent.mission.as_deref(), Some("mission/fleet/harbor/audit"));
+        assert_eq!(agent.step.as_deref(), Some("scan"));
+        assert_eq!(agent.details.goal.as_deref(), Some("Do scan."));
+        assert_eq!(
+            agent.details.next.as_deref(),
+            Some("fleet/harbor · Audit › report")
+        );
+        assert_eq!(agent.details.queue, ["fleet/harbor · Audit › report"]);
+        assert_eq!(world.host, "harbor");
     }
 }
