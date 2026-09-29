@@ -36,8 +36,8 @@ use crate::model::{
     GateResultRequest, HumanReviewView, IntentInput, LaunchApproveAndStartRequest,
     LaunchApproveAndStartView, LaunchDecisionAnswerRequest, LaunchDecisionOption,
     LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType, LaunchStartRequest,
-    MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendRequest, MessageView,
-    MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
+    LocalTerminal, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendRequest,
+    MessageView, MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
     MissionRevisionRequest, MissionRunRequest, MissionRunView, OperationalRepairApplyRequest,
     OperationalRepairPlan, OperationalRepairResult, PlannerSpec, PlanningApprovalRequest,
     PlanningCancelRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
@@ -498,6 +498,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/sessions/screen/{*subject}", get(screen_session))
         .route("/v1/sessions/attach/{*subject}", post(attach_session))
         .route("/v1/sessions/{subject}/attach", post(attach_session))
+        .route(
+            "/v1/sessions/local-terminal/{*subject}",
+            get(local_terminal),
+        )
         .route("/v1/sessions/terminal/{*subject}", get(terminal_session));
     app.layer(from_fn_with_state(state.clone(), refuse_while_leaving))
         .layer(from_fn_with_state(
@@ -9699,10 +9703,19 @@ async fn attach_session(
             "terminal attachment requires a terminal session",
         )));
     }
-    let (capability, expires_at_unix_ms) = state
-        .store
-        .issue_capability("terminal", &subject, Some(&session.incarnation_id), 30_000)
-        .map_err(ApiError::internal)?;
+    // Issuing a capability waits for the store writer, which a reconcile pass can hold for
+    // seconds; the wait must not hold a runtime worker.
+    let store = state.store.clone();
+    let (capability_subject, incarnation_id) = (subject.clone(), session.incarnation_id.clone());
+    let (capability, expires_at_unix_ms) = blocking_store(move || {
+        store.issue_capability(
+            "terminal",
+            &capability_subject,
+            Some(&incarnation_id),
+            30_000,
+        )
+    })
+    .await?;
     Ok(Json(Attachment {
         websocket_path: format!(
             "/v1/sessions/terminal/{}?capability={}",
@@ -9714,6 +9727,35 @@ async fn attach_session(
         incarnation_id: Some(session.incarnation_id),
         capability,
         expires_at_unix_ms,
+    }))
+}
+
+/// Name the PTY session of a running terminal on this host, so `st terminals attach` can connect
+/// to it directly. It checks what an attachment checks but issues no capability: it only reads,
+/// so it answers while a busy reconciler holds the writer, and the attach never waits for this
+/// daemon again. The caller proves the incarnation against the PTY itself before attaching.
+async fn local_terminal(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+) -> Result<Json<LocalTerminal>, ApiError> {
+    // A read can still wait on a saturated disk; it must not hold a runtime worker meanwhile.
+    let (lookup, lookup_subject) = (state.clone(), subject.clone());
+    let session = tokio::task::spawn_blocking(move || live_session(&lookup, &lookup_subject, None))
+        .await
+        .map_err(ApiError::internal)??;
+    if !session.terminal {
+        return Err(ApiError::bad(St3Error::new(
+            "unsupported-capability",
+            "terminal attachment requires a terminal session",
+        )));
+    }
+    // An isolated daemon may run with a relative PTY root; the client resolves nothing itself.
+    let pty_root = std::path::absolute(&state.pty_root).map_err(ApiError::internal)?;
+    Ok(Json(LocalTerminal {
+        subject,
+        runtime_id: session.runtime_id,
+        incarnation_id: session.incarnation_id,
+        pty_root,
     }))
 }
 
@@ -9832,10 +9874,9 @@ async fn terminal_session(
     AxumPath(subject): AxumPath<String>,
     Query(query): Query<TerminalQuery>,
 ) -> Result<Response, ApiError> {
-    let capability = state
-        .store
-        .consume_capability(&query.capability, "terminal")
-        .map_err(ApiError::bad)?;
+    let store = state.store.clone();
+    let secret = query.capability;
+    let capability = blocking_action(move || store.consume_capability(&secret, "terminal")).await?;
     if capability.used || capability.subject != subject {
         return Err(ApiError::bad(St3Error::new(
             "invalid-capability",
@@ -10577,6 +10618,127 @@ mod tests {
         assert_eq!(second["items"][0]["name"], "doc/late/target");
         assert_ne!(first["items"][0]["hash"], second["items"][0]["hash"]);
         assert_eq!(second["has_more"], false);
+    }
+
+    fn observe_terminal(store: &Store, subject: &str, incarnation: &str, terminal: bool) {
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("runtime_id".into(), Value::String("worker-runtime".into())),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ("status".into(), Value::String("running".into())),
+                    ("terminal".into(), Value::Bool(terminal)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+
+    /// Hetz, 2026-09-29: under CI load an attach waited behind the store writer until its
+    /// WebSocket handshake gave up. Naming a local terminal must not wait for the writer.
+    #[tokio::test]
+    async fn a_local_terminal_is_named_by_reads_alone_while_the_writer_is_busy() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        // An isolated daemon may be started with a relative PTY root.
+        state.pty_root = PathBuf::from("isolated/pty");
+        observe_terminal(
+            &state.store,
+            "agent/worker",
+            "4242:2026-09-29T08:00:00.000Z",
+            true,
+        );
+        let store = state.store.clone();
+        let index = store.index().unwrap();
+        let app = router(state);
+        let (held, holding) = std::sync::mpsc::channel();
+        let holder_store = store.clone();
+        let holder = std::thread::spawn(move || {
+            holder_store.hold_writer_for_test(|| {
+                held.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(1_500));
+            });
+        });
+        holding.recv().unwrap();
+
+        let started = std::time::Instant::now();
+        let (status, terminal) = get_request(app, "/v1/sessions/local-terminal/agent/worker").await;
+        let elapsed = started.elapsed();
+        holder.join().unwrap();
+
+        assert_eq!(status, StatusCode::OK, "{terminal}");
+        assert!(
+            elapsed < Duration::from_millis(750),
+            "naming a local terminal waited {elapsed:?} for the writer"
+        );
+        assert_eq!(terminal["subject"], "agent/worker");
+        assert_eq!(terminal["runtime_id"], "worker-runtime");
+        assert_eq!(terminal["incarnation_id"], "4242:2026-09-29T08:00:00.000Z");
+        assert_eq!(
+            terminal["pty_root"],
+            std::env::current_dir()
+                .unwrap()
+                .join("isolated/pty")
+                .display()
+                .to_string()
+        );
+        assert_eq!(store.index().unwrap(), index, "it must write nothing");
+    }
+
+    #[tokio::test]
+    async fn a_local_terminal_keeps_the_attachment_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        observe_terminal(
+            &state.store,
+            "agent/headless",
+            "1:2026-09-29T08:00:00.000Z",
+            false,
+        );
+        let owner = Store::open_memory("owner-node").unwrap();
+        observe_terminal(&owner, "agent/remote", "2:2026-09-29T08:00:00.000Z", true);
+        state
+            .store
+            .import_replication("owner-node", &owner.export_replication(0).unwrap())
+            .unwrap();
+        observe_terminal(
+            &state.store,
+            "agent/local",
+            "3:2026-09-29T08:00:00.000Z",
+            true,
+        );
+        // A paired client never learns a PTY path: the gateway serves only client v0.
+        let (status, refused) = get_request(
+            fabric_router(state.clone()),
+            "/v1/sessions/local-terminal/agent/local",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        let app = router(state);
+
+        let (status, refused) =
+            get_request(app.clone(), "/v1/sessions/local-terminal/agent/headless").await;
+        assert!(status.is_client_error(), "{refused}");
+        assert_eq!(refused["code"], "unsupported-capability");
+
+        let (status, refused) =
+            get_request(app.clone(), "/v1/sessions/local-terminal/agent/remote").await;
+        assert!(status.is_client_error(), "{refused}");
+        assert_eq!(refused["code"], "runtime-not-local");
+
+        // An unknown subject is refused exactly as its WebSocket attachment is.
+        let (status, refused) =
+            get_request(app.clone(), "/v1/sessions/local-terminal/agent/missing").await;
+        let (attach_status, attach_refused) =
+            json_request(app, "/v1/sessions/attach/agent/missing", json!({})).await;
+        assert!(status.is_client_error(), "{refused}");
+        assert_eq!(status, attach_status);
+        assert_eq!(refused["code"], attach_refused["code"], "{refused}");
     }
 
     #[tokio::test]

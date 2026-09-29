@@ -1709,6 +1709,10 @@ enum PtyCommand {
         limit: usize,
     },
     /// Attach this terminal interactively to one running terminal member.
+    ///
+    /// A terminal on this host is attached through its PTY session, fenced to the incarnation st
+    /// selected, so a busy daemon cannot block it. Through an HTTP endpoint the attach goes over
+    /// the daemon's WebSocket. Attaching never starts or restarts a session.
     Attach(PtyAttachArgs),
     /// Read one terminal's current screen without taking control.
     Peek(PtySubjectArgs),
@@ -2981,10 +2985,19 @@ async fn run(cli: Cli) -> Result<()> {
             run_lanes(&client, config.person.as_deref(), command, cli.json).await
         }
         Command::Terminals { command } => {
+            // The configured daemon's PTY root, to name its sessions when it cannot answer.
+            let pty_root = matches!(&endpoint, Endpoint::Unix(socket) if *socket == config.socket)
+                .then(|| {
+                    config
+                        .pty_root
+                        .clone()
+                        .unwrap_or_else(|| config.state_dir.join("pty"))
+                });
             run_pty(
                 &client,
                 &endpoint,
                 config.person.as_deref(),
+                pty_root.as_deref(),
                 command,
                 cli.json,
             )
@@ -4334,6 +4347,7 @@ async fn run_pty(
     client: &Client,
     endpoint: &Endpoint,
     configured_person: Option<&str>,
+    pty_root: Option<&Path>,
     command: PtyCommand,
     json_output: bool,
 ) -> Result<()> {
@@ -4356,7 +4370,7 @@ async fn run_pty(
         }
         PtyCommand::Attach(args) => {
             let subject = normalize_member_subject(&args.subject, "pty");
-            attach_terminal(client, &subject, args.force).await
+            attach_terminal(client, pty_root, &subject, args.force).await
         }
         PtyCommand::Peek(args) => {
             let subject = normalize_member_subject(&args.subject, "pty");
@@ -4565,7 +4579,12 @@ fn render_terminal_screen(screen: &ClientTerminalScreen) -> String {
     output
 }
 
-async fn attach_terminal(client: &Client, subject: &str, force: bool) -> Result<()> {
+async fn attach_terminal(
+    client: &Client,
+    pty_root: Option<&Path>,
+    subject: &str,
+    force: bool,
+) -> Result<()> {
     if !force
         && let Ok(outer) = std::env::var("PTY_SESSION")
         && !outer.is_empty()
@@ -4574,19 +4593,64 @@ async fn attach_terminal(client: &Client, subject: &str, force: bool) -> Result<
             "st terminals attach: already inside PTY session `{outer}`. Detach first with Ctrl+\\, or pass --force."
         );
     }
-    let attachment: Attachment = client
-        .post(
-            &format!("/v1/sessions/attach/{}", urlencoding::encode(subject)),
-            &AttachRequest::default(),
-        )
-        .await?;
-    let code = client
-        .proxy_terminal_resilient(subject, &attachment)
-        .await?;
+    // A terminal on this host is attached through its PTY session, so a daemon too busy to write
+    // cannot keep anyone from debugging. The WebSocket bridge is for a terminal elsewhere.
+    let local = match client.local_terminal(subject).await {
+        Ok(local) => local,
+        Err(error) => {
+            if let Some(pty_root) = pty_root
+                && st3::client::daemon_did_not_answer(&error)
+            {
+                print_unfenced_attach(pty_root, subject);
+            }
+            return Err(error);
+        }
+    };
+    let code = if let Some(terminal) = local {
+        st3::client::attach_local_terminal(&terminal).await?
+    } else {
+        let attachment: Attachment = client
+            .post(
+                &format!("/v1/sessions/attach/{}", urlencoding::encode(subject)),
+                &AttachRequest::default(),
+            )
+            .await?;
+        client
+            .proxy_terminal_resilient(subject, &attachment)
+            .await?
+    };
     if code == 0 {
         Ok(())
     } else {
         Err(CommandExit(code.clamp(1, 255) as u8).into())
+    }
+}
+
+/// Without its daemon, st cannot say which incarnation of `subject` it selected, so it does not
+/// attach. The PTY registry still names the subject's sessions on this host, and a person may
+/// choose one directly.
+fn print_unfenced_attach(pty_root: &Path, subject: &str) {
+    let sessions = st3::client::tagged_pty_sessions(pty_root, subject);
+    if sessions.is_empty() {
+        return;
+    }
+    eprintln!(
+        "st terminals attach: the st daemon did not answer, so st cannot confirm which incarnation of `{subject}` it selected and did not attach. To attach to a PTY session of `{subject}` on this host without that check:"
+    );
+    let root = pty_root.display().to_string();
+    let root = if root
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || b"/._-+=:@%,".contains(&byte))
+    {
+        root
+    } else {
+        format!("'{}'", root.replace('\'', r"'\''"))
+    };
+    for session in sessions {
+        eprintln!(
+            "  PTY_ROOT={root} pty attach --no-restart {}    # started {}",
+            session.runtime_id, session.created_at
+        );
     }
 }
 

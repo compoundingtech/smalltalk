@@ -171,7 +171,9 @@ st usage --hours 24 --by host
 
 The seat starts its harness in the workspace. Its first turn reads the generated
 `.st3/boot.md`, checks for work, and waits. `st terminals attach agent/example/worker` opens its
-terminal; Ctrl+\\ detaches without stopping it.
+terminal; Ctrl+\\ detaches without stopping it. On the seat's own host it connects straight to the
+PTY session, so a busy daemon cannot stall it. If the daemon does not answer at all, st does not
+attach and instead prints the `pty attach --no-restart` command for that session.
 
 A running seat keeps its current process when you apply a changed declaration; the change takes
 effect the next time it starts. To use it now, stop the seat and apply again. `st agents stop
