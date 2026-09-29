@@ -1193,7 +1193,7 @@ A step without an explicit or inherited selector is agentless.
 
 A duplicate pool member is invalid. Combining selector kinds in one mission or step is invalid.
 
-A missing eligible agent creates a preview warning. A step blocks only when none of its eligible agents exist in desired state.
+Publication refuses a selector that names an agent nothing declares; see [References that must resolve](#references-that-must-resolve). When a declared agent later goes away, a step blocks only when none of its eligible agents exist in desired state.
 
 ## Work commands
 
@@ -1471,6 +1471,29 @@ displays changes, and returns the approval hash.
 `st launch approve SESSION HASH --as person/NAME` applies that exact candidate without starting it.
 `st launch approve-and-launch` performs the approval and idempotent start as one product workflow.
 An authorized agent uses `st work publish-mission`, fenced to its claimed producing step.
+
+### References that must resolve
+
+`missions publish`, `agents apply`, a run revision, and `work publish-mission` refuse, with the code
+`unresolved-reference`, a publication that names something st cannot find:
+
+- a pinned mission revision that is not stored on this host, in `uses-mission`, a schedule's `work`,
+  or a subscription's `mission` delivery. When the pin is the ID of the claim that published a
+  revision, the refusal names the revision to pin instead;
+- a mission a subscription delivers to that has no published revision;
+- an agent that a work selector, agent grouping, message, or subscription names and nothing declares;
+- an observer a subscription names that nothing declares.
+
+The same publication, the graph, or the declarations of the run itself can declare the target. A
+reference that contains a value only a run knows, such as a mission input, is not checked.
+
+A publication that declares an agent on this host whose render would fail is refused with
+`render-refused`: an operation that would change a tracked file, two operations of one agent that
+write different content to one path, or content that disagrees with another agent's render of the
+same path.
+
+The preview lists each refusal as a blocker. `st doctor` lists the references already in the graph
+that no longer resolve in its `graph-references` check.
 
 `st missions start MISSION --as ACTOR` publishes one mission-run declaration for the current ready revision. Add `--follow` to follow the run until it becomes terminal.
 

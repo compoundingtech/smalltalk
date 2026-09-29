@@ -437,6 +437,91 @@ pub fn apply_all(
     results
 }
 
+/// What render would refuse for the members a publication declares on this host, before the
+/// publication is applied: an operation that would change a tracked file, operations of one
+/// member that disagree, or a member that would write other bytes to a path another member on
+/// this host writes. `current` is the graph's desired state; a publication subject replaces the
+/// current one of that name. A member on another host, or whose workspace does not exist yet, is
+/// checked when it renders.
+pub fn publication_refusals(
+    store: &Store,
+    publication: &[&DesiredSubject],
+    current: &[DesiredSubject],
+    host: &str,
+) -> Vec<String> {
+    let renders_here = |subject: &DesiredSubject| {
+        subject.kind != "stop"
+            && subject
+                .member
+                .as_ref()
+                .is_some_and(|member| member.host == host && Path::new(&member.workspace).is_dir())
+            && children(&subject.desired)
+                .iter()
+                .any(|child| name(child) == Some("render"))
+    };
+    let proposed = publication
+        .iter()
+        .copied()
+        .filter(|subject| renders_here(subject))
+        .collect::<Vec<_>>();
+    if proposed.is_empty() {
+        return Vec::new();
+    }
+    let mut refusals = Vec::new();
+    let mut plans = BTreeMap::new();
+    for subject in proposed {
+        match prepare_member(store, subject) {
+            Ok((writes, _)) => {
+                plans.insert(subject.subject.as_str(), (writes, true));
+            }
+            Err(error) => refusals.push(format!("{error:#}")),
+        }
+    }
+    for subject in current.iter().filter(|subject| {
+        renders_here(subject)
+            && !publication
+                .iter()
+                .any(|published| published.subject == subject.subject)
+    }) {
+        // A running member that cannot render is already faulted and reported; it writes nothing.
+        if let Ok((writes, _)) = prepare_member(store, subject) {
+            plans.insert(subject.subject.as_str(), (writes, false));
+        }
+    }
+    let mut owners = BTreeMap::<&Path, Vec<(&str, bool, &PlannedWrite)>>::new();
+    for (subject, (writes, proposed)) in &plans {
+        // Git exclude lines from several members are merged, so they never disagree.
+        for write in writes.iter().filter(|write| !write.append_lines) {
+            owners
+                .entry(&write.destination)
+                .or_default()
+                .push((subject, *proposed, write));
+        }
+    }
+    for (destination, owners) in owners {
+        for (subject, proposed, write) in &owners {
+            for (other, _, other_write) in &owners {
+                if *proposed
+                    && subject != other
+                    && (write.bytes != other_write.bytes || write.mode != other_write.mode)
+                {
+                    let mut pair = [*subject, *other];
+                    pair.sort();
+                    refusals.push(format!(
+                        "render owners {} and {} disagree about {}",
+                        pair[0],
+                        pair[1],
+                        destination.display()
+                    ));
+                }
+            }
+        }
+    }
+    refusals.sort();
+    refusals.dedup();
+    refusals
+}
+
 fn prepare_member(
     store: &Store,
     subject: &DesiredSubject,
