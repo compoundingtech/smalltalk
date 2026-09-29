@@ -920,7 +920,11 @@ the captured shell PATH. The active st executable directory is prepended for lau
 
 The daemon captures this environment at startup and refreshes it on use every 60 seconds,
 including shell configuration and exported credential changes. `st doctor` reports its PATH
-and whether GitHub observers have a token, without displaying credential values. Observers
+and whether GitHub observers have a token, without displaying credential values. Its
+`toolchain` check resolves `cargo`, `rustc`, `mold`, `sccache`, `gh`, `git` and `nix` on that
+PATH and links a throwaway crate with that environment (`cargo build --offline`, 10 second
+limit). It warns and names each missing tool or the build error. st itself needs none of them,
+but builders and CI do. `mold` is required only on Linux, where the repository links with it. Observers
 check `GH_TOKEN`, `GITHUB_TOKEN`, then `gh auth token` on every poll. If none supplies a token,
 the observer records an explicit authentication failure and sends no anonymous request.
 Run `gh auth login` as the daemon account or export a token in its shell startup files;

@@ -92,6 +92,11 @@ st service status
 st doctor --strict
 ```
 
+`st doctor` also warns when the login shell's PATH lacks the build tools (`cargo`, `rustc`,
+`mold` on Linux, `sccache`, `gh`, `git`, `nix`) or cannot link a small crate. A host that only
+runs st can ignore that `toolchain` warning; `--strict` treats it as a failure, so use plain
+`st doctor` there.
+
 Run `st service install` again after upgrading the binaries. It updates the installed definitions
 and restarts the services so they use the new executables.
 
