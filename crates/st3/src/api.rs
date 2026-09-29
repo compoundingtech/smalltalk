@@ -43,13 +43,14 @@ use crate::model::{
     PlannerSpec, PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
     PlanningProposalRequest, PlanningRevisionRequest, PlanningSessionStartRequest,
     PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ReplicaRecordView,
-    ReplicationExportRequest, ReplicationExportResponse, ReplicationPeerFailureRequest,
-    ReplicationReceiveRequest, ReplicationReceiveResponse, ReplicationRepairRequest,
-    ReplicationStatus, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
-    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
-    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
-    SessionSignalRequest, St3Error, StatusResponse, StepRunView, WorkRequest, WorkRetryRequest,
-    WorkWakeRequest,
+    ReplicationExportRequest, ReplicationExportResponse, ReplicationHealAnswer,
+    ReplicationHealAnswerRequest, ReplicationHealNextRequest, ReplicationHealStep,
+    ReplicationPeerFailureRequest, ReplicationReceiveRequest, ReplicationReceiveResponse,
+    ReplicationRepairRequest, ReplicationStatus, ReviewRequest, RevisionApprovalRequest,
+    RevisionCancelRequest, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
+    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
+    SessionLogChunk, SessionScreen, SessionSignalRequest, St3Error, StatusResponse, StepRunView,
+    WorkRequest, WorkRetryRequest, WorkWakeRequest,
 };
 use crate::store::Store;
 
@@ -445,6 +446,16 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/internal/replication/checkpoint",
             post(replication_checkpoint_manifest),
         )
+        .route(
+            "/v1/internal/replication/heal/answer",
+            post(replication_heal_answer)
+                .layer(DefaultBodyLimit::max(crate::peer::MAX_EXCHANGE_BYTES)),
+        )
+        .route(
+            "/v1/internal/replication/heal/next",
+            post(replication_heal_next)
+                .layer(DefaultBodyLimit::max(crate::peer::MAX_EXCHANGE_BYTES)),
+        )
         .route("/v1/internal/fleet/membership", get(fleet_membership_view))
         .route("/v1/internal/fleet/status", get(fleet_status))
         .route(
@@ -465,6 +476,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             post(fleet_publish_endpoints),
         )
         .route("/v1/internal/replication-wake", post(replication_wake))
+        .route(
+            crate::peer::CLIENT_READ_FORWARD_PATH,
+            post(forward_client_read).layer(DefaultBodyLimit::max(16_384)),
+        )
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*run}", get(get_eval))
         .route("/v1/mission-runs", get(list_mission_runs))
@@ -3177,6 +3192,7 @@ async fn client_sessions_detail(
                         &remote_host,
                         &crate::peer::ClientReadRequest {
                             authority_actor: session.authority_actor.clone(),
+                            relay: None,
                             request: crate::peer::ClientReadOperation::Timeline {
                                 session_id,
                                 limit: query.limit.unwrap_or(50).clamp(1, 200),
@@ -3204,6 +3220,33 @@ async fn client_sessions_detail(
         "session",
         &id,
     )
+}
+
+/// Carry on a client read a peer relayed to this node because it is on the way to the owner.
+/// The owner's refusal travels back as it was given; a missing route is `remote-unavailable`.
+async fn forward_client_read(
+    State(state): State<AppState>,
+    Json(request): Json<crate::peer::ClientReadRequest>,
+) -> Result<Json<Value>, ApiError> {
+    let target = request
+        .relay
+        .as_ref()
+        .map_or_else(String::new, |relay| relay.target.clone());
+    let relay = state
+        .client_relay
+        .as_ref()
+        .ok_or_else(|| remote_unavailable(&target))?;
+    relay.forward(&request).await.map(Json).map_err(|error| {
+        match error.downcast_ref::<crate::peer::ClientReadRejected>() {
+            Some(rejected) => ApiError {
+                status: StatusCode::from_u16(rejected.status).unwrap_or(StatusCode::CONFLICT),
+                code: rejected.code.clone(),
+                message: rejected.message.clone(),
+                details: Box::default(),
+            },
+            None => remote_unavailable(&target),
+        }
+    })
 }
 
 fn remote_unavailable(host: &str) -> ApiError {
@@ -3728,6 +3771,14 @@ async fn guard_bound_request(
         return Ok(request);
     }
     let path = request.uri().path();
+    // A forwarded client read carries a person's authority between fleet members. Only the
+    // replication worker, which runs in no harness, hands one over.
+    if path.starts_with(crate::peer::CLIENT_READ_FORWARD_PATH) {
+        return Err(ApiError::bad(St3Error::new(
+            "foreign-agent-actor",
+            format!("this harness is `{bound_agent}` and cannot forward a person's client read"),
+        )));
+    }
     if ![
         "/v1/intent/apply",
         "/v1/agent-queue-moves",
@@ -4326,7 +4377,14 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 .filter(|peer| peer.sync.as_ref().is_some_and(|sync| sync.diverged))
                 .map(|peer| peer.peer.as_str())
                 .collect::<Vec<_>>();
-            let status = if replication.unhealthy_projections != 0 || !diverged.is_empty() {
+            let first_sync_failed = replication
+                .first_sync
+                .as_ref()
+                .filter(|first| first.state == "failed");
+            let status = if replication.unhealthy_projections != 0
+                || !diverged.is_empty()
+                || first_sync_failed.is_some()
+            {
                 "fail"
             } else if !unavailable.is_empty() || unresolved != 0 {
                 "warn"
@@ -4337,7 +4395,15 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 name: "replication".into(),
                 status: status.into(),
                 message: format!(
-                    "{}{} envelopes; {} unresolved records; {} unhealthy projections{}; peers {}",
+                    "{}{}{} envelopes; {} unresolved records; {} unhealthy projections{}; peers {}",
+                    first_sync_failed
+                        .map(|first| format!(
+                            "the first sync with {} ended with a different graph, and a heal \
+                             did not fix it: {}; ",
+                            first.peer.as_deref().unwrap_or("a peer"),
+                            first.message.as_deref().unwrap_or("no reason recorded")
+                        ))
+                        .unwrap_or_default(),
                     if diverged.is_empty() {
                         String::new()
                     } else {
@@ -4615,10 +4681,12 @@ async fn replication_receive(
         if let Some(round_trip_ms) = request.round_trip_ms {
             store.record_replication_round_trip(Duration::from_millis(round_trip_ms));
         }
-        let receipt = store.receive_replication_exchange(
+        // Only the worker's own requests carry a round trip, and only they heal.
+        let receipt = store.receive_replication_exchange_asking(
             &request.peer,
             &request.fleet_id,
             &request.exchange,
+            request.round_trip_ms.is_some(),
         )?;
         if store
             .observes_transport_to(&request.peer)
@@ -4684,6 +4752,50 @@ async fn replication_receive(
             .send_modify(|generation| *generation = generation.saturating_add(1));
     }
     Ok(Json(response))
+}
+
+/// Answer a peer's heal question. A swap or a replay can change the graph.
+async fn replication_heal_answer(
+    State(state): State<AppState>,
+    Json(request): Json<ReplicationHealAnswerRequest>,
+) -> Result<Json<ReplicationHealAnswer>, ApiError> {
+    if state.fleet_id.as_deref() != Some(request.fleet_id.as_str()) {
+        return Err(ApiError::bad(St3Error::new(
+            "fleet-id-mismatch",
+            "the peer belongs to another fleet",
+        )));
+    }
+    let store = state.store.clone();
+    let (answer, changed) = blocking_store(move || {
+        let before = store.replication_status(false, None, &[])?.graph_digest;
+        let answer = store.heal_answer(&request.peer, &request.query)?;
+        let changed = store.replication_status(false, None, &[])?.graph_digest != before;
+        Ok((answer, changed))
+    })
+    .await?;
+    if changed {
+        signal_changed(&state);
+    }
+    Ok(Json(answer))
+}
+
+/// Compare a peer's heal answer with this node's claims and say what to ask next.
+async fn replication_heal_next(
+    State(state): State<AppState>,
+    Json(request): Json<ReplicationHealNextRequest>,
+) -> Result<Json<ReplicationHealStep>, ApiError> {
+    let store = state.store.clone();
+    let (step, changed) = blocking_store(move || {
+        let before = store.replication_status(false, None, &[])?.graph_digest;
+        let step = store.heal_next(&request.peer, request.answer)?;
+        let changed = store.replication_status(false, None, &[])?.graph_digest != before;
+        Ok((step, changed))
+    })
+    .await?;
+    if changed {
+        signal_changed(&state);
+    }
+    Ok(Json(step))
 }
 
 fn replication_receive_has_new_data(received: usize) -> bool {
@@ -5105,6 +5217,8 @@ async fn refuse_while_leaving(
                 | "/v1/internal/replication/export"
                 | "/v1/internal/replication/receive"
                 | "/v1/internal/replication/peer-failure"
+                | "/v1/internal/replication/heal/answer"
+                | "/v1/internal/replication/heal/next"
                 | "/v1/internal/replication/checkpoint"
                 | "/v1/internal/replication-wake"
         );
@@ -10111,13 +10225,14 @@ async fn host_agent_workspace(
     let relay = state
         .client_relay
         .as_ref()
-        .filter(|relay| relay.has_peer(&host_id))
+        .filter(|relay| relay.reaches(&host_id))
         .ok_or_else(|| remote_unavailable(&host_id))?;
     let value = relay
         .read(
             &host_id,
             &crate::peer::ClientReadRequest {
                 authority_actor: person.into(),
+                relay: None,
                 request: crate::peer::ClientReadOperation::AgentWorkspace {
                     identity: query.identity,
                 },

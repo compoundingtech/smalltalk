@@ -263,6 +263,13 @@ enum FleetCommand {
     Mode(FleetModeArgs),
     /// Show this node, the fleet's members, and open invites.
     Status,
+    /// Wait for this node's first sync to end, then check that it projects the same graph as
+    /// the peer it synced from. Fails when the graphs differ after a heal.
+    Wait {
+        /// How long to wait, like 90s or 30m.
+        #[arg(long, default_value = "30m")]
+        timeout: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -371,6 +378,9 @@ struct FleetJoinArgs {
     /// Do not stop, install, or start services; print the foreground commands instead.
     #[arg(long)]
     no_service: bool,
+    /// Return once the services start, instead of waiting for the first sync to end.
+    #[arg(long)]
+    no_wait: bool,
     #[command(flatten)]
     member: FleetMemberArgs,
 }
@@ -690,10 +700,44 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 println!(
                     "The st3 services now run as a fleet member; st fleet status shows the sync."
                 );
+                if !args.no_wait {
+                    match wait_for_first_sync(&client, Duration::from_secs(30 * 60), !json_output)
+                        .await?
+                    {
+                        // The join already printed its JSON; a failed first sync still fails.
+                        Some(first) if json_output => anyhow::ensure!(
+                            first.state == "verified",
+                            "{}",
+                            render_first_sync(&first, now_ms())
+                        ),
+                        Some(first) => report_first_sync(&first, false)?,
+                        None if json_output => {}
+                        None => println!(
+                            "This machine is a member and still syncing; st fleet wait waits for \
+                             the first sync to end and checks it."
+                        ),
+                    }
+                }
             } else if !json_output {
-                println!("Start st3 up and st3 replication-worker to begin syncing.");
+                println!(
+                    "Start st3 up and st3 replication-worker to begin syncing; st fleet wait \
+                     waits for the first sync to end and checks it."
+                );
             }
             Ok(())
+        }
+        FleetCommand::Wait { timeout } => {
+            let timeout = Duration::from_secs(parse_fleet_duration(&timeout)?);
+            let first = wait_for_first_sync(&client, timeout, !json_output)
+                .await?
+                .with_context(|| {
+                    format!(
+                        "the first sync has not ended after {} s; st replication status shows \
+                         how far it got",
+                        timeout.as_secs()
+                    )
+                })?;
+            report_first_sync(&first, json_output)
         }
         FleetCommand::Remove(args) => run_fleet_remove(&client, &config, args).await,
         FleetCommand::Migrate(args) => run_fleet_migrate(&client, &config, args).await,
@@ -3453,7 +3497,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
         pty_binary: pty_binary.clone(),
         fleet_id: config.fleet_id.clone(),
         configured_peers: config.peers.iter().map(|peer| peer.name.clone()).collect(),
-        client_relay: st3::peer::ClientRelay::from_config(&config)?,
+        client_relay: st3::peer::ClientRelay::from_config(&config)?
+            .map(|relay| relay.with_links(store.clone())),
         native_session_home: std::env::var_os("HOME").map(PathBuf::from),
         planner_default: config.planner.clone(),
     };
@@ -6562,6 +6607,159 @@ async fn run_repair(client: &Client, command: RepairCommand, json_output: bool) 
     Ok(())
 }
 
+/// Wait for this node's first sync to end, printing progress when `progress` is set. It ends at
+/// the first exchange at which this node holds the same envelopes as a peer; the two graphs must
+/// then match, at once or after a heal. Returns None when `timeout` passes first.
+async fn wait_for_first_sync(
+    client: &Client,
+    timeout: Duration,
+    progress: bool,
+) -> Result<Option<st3::model::ReplicationFirstSync>> {
+    let started = std::time::Instant::now();
+    let mut reported = None::<std::time::Instant>;
+    loop {
+        if let Ok(status) = client
+            .get::<ReplicationStatus>("/v1/replication/status")
+            .await
+        {
+            let first = status.first_sync.clone().context(
+                "this node has no first sync to wait for: it did not join with st fleet join",
+            )?;
+            match first.state.as_str() {
+                "verified" | "failed" => return Ok(Some(first)),
+                _ => {
+                    if progress
+                        && reported.is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
+                    {
+                        reported = Some(std::time::Instant::now());
+                        let behind = status
+                            .peers
+                            .iter()
+                            .filter_map(|peer| {
+                                let sync = peer.sync.as_ref()?;
+                                Some(format!(
+                                    "{} has {} this node lacks",
+                                    peer.peer,
+                                    envelope_count(sync.peer_only_envelopes)
+                                ))
+                            })
+                            .collect::<Vec<_>>();
+                        println!(
+                            "first sync: {} envelopes so far{}",
+                            status.received_envelopes,
+                            if behind.is_empty() {
+                                String::new()
+                            } else {
+                                format!("; {}", behind.join("; "))
+                            }
+                        );
+                    }
+                }
+            }
+        }
+        if started.elapsed() >= timeout {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Print how a first sync ended, and fail when its graphs still differ.
+fn report_first_sync(first: &st3::model::ReplicationFirstSync, json_output: bool) -> Result<()> {
+    if json_output {
+        print_value(first, true)?;
+        anyhow::ensure!(first.state == "verified", "the first sync failed");
+        return Ok(());
+    }
+    anyhow::ensure!(
+        first.state == "verified",
+        "{}\nThis node's views can be wrong. st replication status shows both graphs and the last \
+         heal; report it with st diagnostic.",
+        render_first_sync(first, now_ms())
+    );
+    println!("{}", render_first_sync(first, now_ms()));
+    Ok(())
+}
+
+/// This node's first sync in one line.
+fn render_first_sync(first: &st3::model::ReplicationFirstSync, now: u128) -> String {
+    let peer = first.peer.as_deref().unwrap_or("its peer");
+    let when = first
+        .ended_at_unix_ms
+        .map(|at| relative_time(at, now))
+        .unwrap_or_default();
+    let digests = format!(
+        "this node {}, {peer} {}",
+        short_digest(first.graph_digest.as_deref().unwrap_or("unknown")),
+        short_digest(first.peer_graph_digest.as_deref().unwrap_or("unknown"))
+    );
+    match first.state.as_str() {
+        "verified" => format!(
+            "first sync verified {when}: this node holds the same {} as {peer} and projects the same graph ({}){}",
+            envelope_count(first.envelopes.unwrap_or(0)),
+            short_digest(first.graph_digest.as_deref().unwrap_or("unknown")),
+            if first.healed { ", after a heal" } else { "" }
+        ),
+        "failed" => format!(
+            "first sync failed {when}: this node holds the same {} as {peer} but projects a different graph ({digests}), and a heal did not fix it: {}",
+            envelope_count(first.envelopes.unwrap_or(0)),
+            first.message.as_deref().unwrap_or("no reason recorded")
+        ),
+        _ => format!(
+            "first sync from {peer} since {}",
+            relative_time(first.started_at_unix_ms, now)
+        ),
+    }
+}
+
+/// The last heal with one peer in one line.
+fn render_heal(peer: &str, report: &st3::model::ReplicationHealReport, now: u128) -> String {
+    let mut moved = Vec::new();
+    if report.refetched != 0 {
+        moved.push(format!(
+            "admitted {} claims {peer} projects",
+            report.refetched
+        ));
+    }
+    if report.pushed != 0 {
+        moved.push(format!(
+            "{peer} admitted {} claims this node projects",
+            report.pushed
+        ));
+    }
+    if report.replayed {
+        moved.push("replayed this graph from nothing".into());
+    }
+    if report.peer_replayed {
+        moved.push(format!("{peer} replayed its graph from nothing"));
+    }
+    let moved = if moved.is_empty() {
+        String::new()
+    } else {
+        format!(": {}", moved.join(", "))
+    };
+    let narrowed = if report.ranges != 0 {
+        format!(
+            " ({} ranges and {} subjects differed)",
+            report.ranges, report.subjects
+        )
+    } else {
+        String::new()
+    };
+    if report.healed {
+        format!(
+            "healed {}{moved}{narrowed}; the graphs agree",
+            relative_time(report.at_unix_ms, now)
+        )
+    } else {
+        format!(
+            "heal {}{moved}{narrowed} left the graphs different: {}",
+            relative_time(report.at_unix_ms, now),
+            report.unresolved.as_deref().unwrap_or("no reason recorded")
+        )
+    }
+}
+
 /// Each peer's line, then how far apart the two envelope sets are and how long catching up
 /// should take, in words. Two nodes are in sync only when they hold the same envelopes and
 /// project the same graph from them.
@@ -6617,6 +6815,9 @@ fn render_replication_peers(
             let _ = writeln!(output, "  difference not measured yet");
             continue;
         };
+        if let Some(report) = &sync.heal {
+            let _ = writeln!(output, "  {}", render_heal(&peer.peer, report, now));
+        }
         let compared = sync
             .graph_compared_at_unix_ms
             .map(|at| relative_time(at, now))
@@ -6641,7 +6842,7 @@ fn render_replication_peers(
             if sync.diverged {
                 let _ = writeln!(
                     output,
-                    "  exchanges cannot fix this; views on one node are wrong until it is repaired"
+                    "  exchanges cannot fix this; the nodes heal by comparing the claims each projects, and views on one node are wrong until then"
                 );
             } else {
                 let _ = writeln!(
@@ -6731,6 +6932,9 @@ async fn run_replication(
                 status.checkpointed_envelopes
             );
             println!("unhealthy-projections\t{}", status.unhealthy_projections);
+            if let Some(first) = &status.first_sync {
+                println!("first-sync\t{}", render_first_sync(first, now_ms()));
+            }
             for projection in &status.unhealthy {
                 println!(
                     "unhealthy\t{}\t{}\t{}",
@@ -14763,7 +14967,7 @@ mod tests {
              \x20 last exchange 2s ago\n\
              \x20 diverged: the same envelopes project different graphs since 3m ago \
              (compared 1s ago; this node 111111111111, Laptop 222222222222)\n\
-             \x20 exchanges cannot fix this; views on one node are wrong until it is repaired\n\
+             \x20 exchanges cannot fix this; the nodes heal by comparing the claims each projects, and views on one node are wrong until then\n\
              peer\tFresh\tup\t\n\
              \x20 last exchange 2s ago\n\
              \x20 difference not measured yet\n"
