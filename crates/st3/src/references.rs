@@ -25,8 +25,8 @@ pub(crate) trait Graph {
     fn missing_revision(&self, mission: &str, revision: &str) -> Result<String, St3Error>;
 }
 
-/// The run a mission's declarations are checked under. Every mission in one publication shares
-/// it, so a step can select an agent that another step or the mission declares.
+/// The run a mission's declarations are checked under, so a step can select an agent that another
+/// step or the mission declares. Each mission is checked with only its own run's declarations.
 const PROOF_RUN: &str = "migration-proof";
 
 /// What a variable whose value only a run knows is replaced with. A reference that contains it
@@ -39,11 +39,6 @@ pub(crate) fn publication(
     graph: &impl Graph,
     host: &str,
 ) -> Result<Vec<String>, St3Error> {
-    let missions = intent.missions.values().collect::<Vec<_>>();
-    let scope = Scope {
-        run: run_declarations(&missions, host),
-        intent: Some(intent),
-    };
     let mut refusals = Vec::new();
     for desired in intent.subjects.values() {
         subject_references(
@@ -55,8 +50,14 @@ pub(crate) fn publication(
             &mut refusals,
         )?;
     }
-    for mission in missions {
-        mission_references(mission, &scope, graph, host, &mut refusals)?;
+    for run in runs(&intent.missions.values().collect::<Vec<_>>()) {
+        let scope = Scope {
+            run: run_declarations(&run, host),
+            intent: Some(intent),
+        };
+        for mission in run {
+            mission_references(mission, &scope, graph, host, &mut refusals)?;
+        }
     }
     refusals.sort();
     refusals.dedup();
@@ -73,35 +74,14 @@ pub(crate) fn graph(
     host: &str,
 ) -> Result<Vec<String>, St3Error> {
     let mut refusals = Vec::new();
-    let mut checked = BTreeSet::new();
-    let owners = missions
-        .iter()
-        .filter(|mission| !mission.id.starts_with("__st3/"))
-        .collect::<Vec<_>>();
-    for owner in owners {
-        let embedded = format!("__st3/{}/", owner.id);
-        let closure = missions
-            .iter()
-            .filter(|mission| mission.id == owner.id || mission.id.starts_with(&embedded))
-            .collect::<Vec<_>>();
+    for run in runs(&missions.iter().collect::<Vec<_>>()) {
         let scope = Scope {
-            run: run_declarations(&closure, host),
+            run: run_declarations(&run, host),
             intent: None,
         };
-        for mission in closure {
-            checked.insert(mission.id.as_str());
+        for mission in run {
             mission_references(mission, &scope, graph, host, &mut refusals)?;
         }
-    }
-    for mission in missions
-        .iter()
-        .filter(|mission| !checked.contains(mission.id.as_str()))
-    {
-        let scope = Scope {
-            run: run_declarations(&[mission], host),
-            intent: None,
-        };
-        mission_references(mission, &scope, graph, host, &mut refusals)?;
     }
     let scope = Scope {
         run: BTreeSet::new(),
@@ -113,6 +93,35 @@ pub(crate) fn graph(
     refusals.sort();
     refusals.dedup();
     Ok(refusals)
+}
+
+/// The missions whose declarations one run shares: each mission with the loop rounds embedded in
+/// it. Separate missions start separate runs, so one never resolves another's run-scoped
+/// declarations. An embedded mission without its owner is checked alone.
+fn runs<'a>(missions: &[&'a MissionSpec]) -> Vec<Vec<&'a MissionSpec>> {
+    let mut grouped = BTreeSet::new();
+    let mut runs = Vec::new();
+    for owner in missions
+        .iter()
+        .filter(|mission| !mission.id.starts_with("__st3/"))
+    {
+        let embedded = format!("__st3/{}/loop/", owner.id);
+        let run = missions
+            .iter()
+            .copied()
+            .filter(|mission| mission.id == owner.id || mission.id.contains(&embedded))
+            .collect::<Vec<_>>();
+        grouped.extend(run.iter().map(|mission| mission.id.as_str()));
+        runs.push(run);
+    }
+    runs.extend(
+        missions
+            .iter()
+            .copied()
+            .filter(|mission| !grouped.contains(mission.id.as_str()))
+            .map(|mission| vec![mission]),
+    );
+    runs
 }
 
 struct Scope<'a> {

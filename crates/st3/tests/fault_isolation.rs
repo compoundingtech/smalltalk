@@ -1297,3 +1297,49 @@ mission "healthy" state="ready" {
     source.rebuild_claim_projections().unwrap();
     expected(&source);
 }
+
+/// Two missions in one document start separate runs, so an agent one of them declares for its run
+/// never resolves the other's reference. Publication refuses the mission that declares nothing,
+/// and when such a mission was published before that check, its run waits while the other runs.
+#[test]
+fn another_missions_agent_never_resolves_a_missing_one() {
+    let host = Host::new();
+    let source = r#"version 2
+mission "unstaffed" state="ready" {
+  goal "Select a helper this mission never declares."
+  step "work" { assigned-to "agent/${ST_MISSION_RUN}/fleet.helper"; goal "Do the work." }
+}
+mission "staffed" state="ready" {
+  goal "Select the helper this mission declares."
+  agent "helper" { identity "fleet.helper"; workspace "${ST_WORKSPACE}"; command "sleep 600"; restart "never" }
+  step "work" { assigned-to "agent/${ST_MISSION_RUN}/fleet.helper"; goal "Do the work." }
+}"#;
+    let missing = "mission `mission/unstaffed` references missing eligible agent `agent/${ST_MISSION_RUN}/fleet.helper`";
+    assert_eq!(
+        host.store
+            .unresolved_references(&st3::parse_intent(source, HOST).unwrap())
+            .unwrap(),
+        [missing]
+    );
+
+    host.publish(source, "publish-before-the-check");
+    let unstaffed = host.start_mission("unstaffed", "unstaffed");
+    let staffed = host.start_mission("staffed", "staffed");
+    host.pass(2);
+    assert!(host.runtime.running(&host.worker(&staffed)));
+    assert!(
+        host.store
+            .desired_subjects_for_owner_run(&unstaffed.subject)
+            .unwrap()
+            .is_empty()
+    );
+    let step = host
+        .store
+        .mission_run(&unstaffed.id)
+        .unwrap()
+        .unwrap()
+        .steps[0]
+        .clone();
+    assert_eq!(step.claimant, None, "{step:?}");
+    assert_eq!(host.store.unresolved_graph_references().unwrap(), [missing]);
+}
