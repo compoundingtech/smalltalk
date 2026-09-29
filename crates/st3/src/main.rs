@@ -2070,6 +2070,19 @@ enum CheckpointCommand {
         #[arg(long)]
         cut: Option<String>,
     },
+    /// Show the newest stable checkpoint and who has sealed or verified the one being agreed.
+    Status,
+    /// Stop waiting for an unreachable writer. It fences nothing: what the writer wrote while
+    /// away still replicates when it returns, and its next seal ends the excusal.
+    Excuse {
+        /// The writer, as its node name.
+        writer: String,
+        #[arg(long)]
+        reason: String,
+        /// The person excusing it.
+        #[arg(long = "as")]
+        actor: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2931,7 +2944,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Doctor(args) => run_doctor(&immediate, args, cli.json).await,
         Command::Recorder { command } => run_recorder(command, &config, cli.json),
         Command::Repair { command } => run_repair(&client, command, cli.json).await,
-        Command::Replication { command } => run_replication(&client, command, cli.json).await,
+        Command::Replication { command } => {
+            run_replication(&client, &config, command, cli.json).await
+        }
         Command::Fleet { command } => run_fleet(&endpoint, command, cli.json).await,
         Command::Uninstall(args) => run_uninstall(&endpoint, args).await,
         Command::Service { command } => run_service(command, cli.json),
@@ -3217,6 +3232,20 @@ async fn run_up(args: UpArgs) -> Result<()> {
         store.clone(),
         config.observations.clone(),
     ));
+    if config.checkpoint.enabled {
+        tokio::spawn(run_checkpoints(
+            store.clone(),
+            st3::store::CheckpointContext {
+                now_unix_ms: 0,
+                configured_peers: config.peers.iter().map(|peer| peer.name.clone()).collect(),
+                scratch: config.state_dir.join("checkpoint"),
+                reviewer: config
+                    .person
+                    .clone()
+                    .unwrap_or_else(|| "person/operator".into()),
+            },
+        ));
+    }
     if let Some(otlp) = &config.observations.otlp {
         let exporter = st3::otlp::OtlpExporter::new(otlp, &config.node)?;
         eprintln!(
@@ -6044,6 +6073,7 @@ fn render_replication_peers(peers: &[ReplicationPeerStatus], now: u128) -> Strin
 
 async fn run_replication(
     client: &Client,
+    config: &Config,
     command: ReplicationCommand,
     json_output: bool,
 ) -> Result<()> {
@@ -6247,7 +6277,75 @@ async fn run_replication(
             print!("{}", render_checkpoint_plan(&plan));
             Ok(())
         }
+        ReplicationCommand::Checkpoint {
+            command: CheckpointCommand::Status,
+        } => {
+            let status: st3::store::CheckpointStatusView =
+                client.get("/v1/checkpoint/status").await?;
+            if json_output {
+                return print_value(&status, true);
+            }
+            print!("{}", render_checkpoint_status(&status));
+            Ok(())
+        }
+        ReplicationCommand::Checkpoint {
+            command:
+                CheckpointCommand::Excuse {
+                    writer,
+                    reason,
+                    actor,
+                },
+        } => {
+            let actor = fleet_person(actor, config)?;
+            let request = st3::store::CheckpointExcuseRequest {
+                writer,
+                reason,
+                actor,
+            };
+            let claim: st3::model::ClaimRecord =
+                client.post("/v1/checkpoint/excuse", &request).await?;
+            print_value(&claim, json_output)
+        }
     }
+}
+
+fn render_checkpoint_status(status: &st3::store::CheckpointStatusView) -> String {
+    let names = |names: &std::collections::BTreeSet<String>| {
+        if names.is_empty() {
+            "none".to_owned()
+        } else {
+            names.iter().cloned().collect::<Vec<_>>().join(", ")
+        }
+    };
+    let mut output = format!("CHECKPOINTS  {}\n", status.node);
+    match &status.newest_stable {
+        Some(stable) => output.push_str(&format!(
+            "stable        {} · {} participants\n",
+            stable.checkpoint,
+            stable.terms.participants.len()
+        )),
+        None => output.push_str("stable        none\n"),
+    }
+    output.push_str(&format!("participants  {}\n", names(&status.participants)));
+    if !status.excused.is_empty() {
+        output.push_str(&format!("excused       {}\n", names(&status.excused)));
+    }
+    if !status.left.is_empty() {
+        output.push_str(&format!("left          {}\n", names(&status.left)));
+    }
+    if let Some(pending) = &status.pending {
+        output.push_str(&format!("pending       {}\n", pending.checkpoint));
+        output.push_str(&format!("  sealed      {}\n", names(&pending.sealed)));
+        output.push_str(&format!("  unsealed    {}\n", names(&pending.unsealed)));
+        for (writer, difference) in &pending.disagreeing {
+            output.push_str(&format!("  differs     {writer}: {difference}\n"));
+        }
+        output.push_str(&format!("  verified    {}\n", names(&pending.verified)));
+        if !pending.verifications_agree {
+            output.push_str("  verifications disagree; see daemon diagnostics\n");
+        }
+    }
+    output
 }
 
 fn render_checkpoint_plan(plan: &st3::store::CheckpointPlanView) -> String {
@@ -11756,6 +11854,33 @@ async fn trim_local_observations(store: Arc<Store>, observations: st3::config::O
             Err(error) => eprintln!("st3: local observation trim stopped: {error}"),
         }
         tokio::time::sleep(LOCAL_OBSERVATION_TRIM_INTERVAL).await;
+    }
+}
+
+/// Seal and verify checkpoints every ten minutes. The proof copies the store and replays it, so
+/// it runs on a blocking thread, and a copy left by a crash is removed first.
+async fn run_checkpoints(store: Arc<Store>, context: st3::store::CheckpointContext) {
+    const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10 * 60);
+    let _ = std::fs::remove_dir_all(&context.scratch);
+    loop {
+        let store = store.clone();
+        let context = st3::store::CheckpointContext {
+            now_unix_ms: now_ms(),
+            ..context.clone()
+        };
+        match tokio::task::spawn_blocking(move || store.checkpoint_step(&context)).await {
+            Ok(Ok(actions)) => {
+                for action in actions {
+                    eprintln!(
+                        "st3: checkpoint {}",
+                        serde_json::to_string(&action).unwrap_or_default()
+                    );
+                }
+            }
+            Ok(Err(error)) => eprintln!("st3: checkpoint work failed: {error:#}"),
+            Err(error) => eprintln!("st3: checkpoint work stopped: {error}"),
+        }
+        tokio::time::sleep(CHECKPOINT_INTERVAL).await;
     }
 }
 
