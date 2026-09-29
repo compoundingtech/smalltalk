@@ -37820,6 +37820,108 @@ mission "takeover" state="ready" {
         }
     }
 
+    /// A retry that reopened a failed run, and an outcome a person set on a finished run, show
+    /// the same on a node that replays its claims from nothing, with the times the claims hold.
+    #[test]
+    fn a_reopened_run_and_a_set_outcome_survive_a_replay_from_nothing() {
+        let sync = |source: &Store, target: &Store| {
+            receive_and_project(
+                target,
+                "source",
+                &exchange_from(source, &target.replication_inventory().unwrap()),
+            );
+        };
+        // The newest envelope arrives before the older ones, so the target replays from nothing.
+        let replay = |source: &Store, target: &Store| {
+            let mut older = exchange_from(source, &target.replication_inventory().unwrap());
+            let newest = older.envelopes.split_off(older.envelopes.len() - 1);
+            FULL_REPLAYS.with(|replays| replays.set(0));
+            receive_and_project(
+                target,
+                "source",
+                &ReplicationExchange {
+                    envelopes: newest,
+                    ..older.clone()
+                },
+            );
+            receive_and_project(target, "source", &older);
+            assert!(
+                FULL_REPLAYS.with(std::cell::Cell::get) > 0,
+                "the target replays from nothing"
+            );
+        };
+        let shown = |store: &Store, run: &MissionRunView| {
+            let view = store.mission_run(&run.id).unwrap().unwrap();
+            let steps = view
+                .steps
+                .iter()
+                .map(|step| (step.step.clone(), step.status.clone(), step.attempt))
+                .collect::<Vec<_>>();
+            let since = store.mission_run_states().unwrap()[&run.subject].since_unix_ms;
+            (
+                view.status,
+                view.phase,
+                view.generation,
+                view.outcome,
+                steps,
+                since,
+            )
+        };
+
+        let source = Store::open_memory("source").unwrap();
+        let target = Store::open_memory("target").unwrap();
+        let failed = failed_takeover_run(&source, &["deploy-check"]);
+        sync(&source, &target);
+        let reopened = source
+            .retry_failed_step(
+                &takeover_step(&failed, "deploy-check").subject,
+                "person/operator",
+                "the deploy check host is back",
+                "retry-replayed",
+            )
+            .unwrap();
+        source
+            .set_step_state(
+                &takeover_step(&reopened, "deploy-check").subject,
+                "ready",
+                None,
+            )
+            .unwrap();
+        replay(&source, &target);
+        let expected = shown(&source, &failed);
+        assert_eq!(
+            (expected.0.as_str(), expected.1.as_str()),
+            ("running", "normal")
+        );
+        assert_eq!(expected.2, reopened.generation);
+        assert_eq!(shown(&target, &failed), expected);
+
+        let source = Store::open_memory("source").unwrap();
+        let target = Store::open_memory("target").unwrap();
+        let failed = failed_takeover_run(&source, &["deploy-check"]);
+        sync(&source, &target);
+        for (status, reason, key) in [
+            ("completed", "the deploy shipped", "outcome-completed"),
+            ("failed", "the deploy was rolled back", "outcome-failed"),
+            ("completed", "the deploy shipped again", "outcome-completed-again"),
+        ] {
+            source
+                .set_mission_run_outcome(&failed.subject, status, "person/operator", reason, key)
+                .unwrap();
+        }
+        replay(&source, &target);
+        let expected = shown(&source, &failed);
+        assert_eq!(
+            (expected.0.as_str(), expected.1.as_str()),
+            ("completed", "terminal")
+        );
+        assert_eq!(
+            expected.3.as_ref().map(|outcome| outcome.reason.as_str()),
+            Some("the deploy shipped again")
+        );
+        assert_eq!(shown(&target, &failed), expected);
+    }
+
     /// A node written by a build from before the claim-log diet upgrades in place, keeps
     /// writing, and syncs with a node that joins late. Both show the graph the old build showed.
     ///
