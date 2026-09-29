@@ -6875,6 +6875,29 @@ impl Store {
         })
     }
 
+    /// Every reference in a publication that resolves neither in the publication nor here: a
+    /// pinned mission revision that is not stored, or a mission, agent or observer that nothing
+    /// declares. The publication routes refuse them, and their previews list them as blockers.
+    pub fn unresolved_references(
+        &self,
+        intent: &NormalizedIntent,
+    ) -> Result<Vec<String>, St3Error> {
+        let connection = self.readers.get();
+        crate::references::publication(
+            intent,
+            &ReferenceGraph {
+                connection: &connection,
+            },
+            &self.origin,
+        )
+    }
+
+    /// Every reference in the ready missions, current declarations and active runs of the graph
+    /// that no longer resolves, for `st doctor`.
+    pub fn unresolved_graph_references(&self) -> Result<Vec<String>, St3Error> {
+        unresolved_graph_references(&self.readers.get(), &self.origin)
+    }
+
     pub fn apply(
         &self,
         intent: &NormalizedIntent,
@@ -14092,10 +14115,11 @@ fn prepare_mission_run_declaration(
                 .transpose()
                 .map_err(internal)?;
             match mission {
-                None => blockers.push(format!(
-                    "mission `mission/{}@{}` does not exist",
-                    creation.mission, creation.revision
-                )),
+                None => blockers.push(missing_mission_revision(
+                    connection,
+                    &creation.mission,
+                    &creation.revision,
+                )?),
                 Some(mission) if mission.state != MissionState::Ready => blockers.push(format!(
                     "mission `mission/{}` revision `{}` is not ready",
                     creation.mission, creation.revision
@@ -14158,8 +14182,9 @@ fn prepare_mission_run_declaration(
             .is_some();
         if !exists {
             blockers.push(format!(
-                "revision `{}` names missing mission `mission/{}@{}`",
-                revision.id, revision.mission, revision.revision
+                "revision `{}` names a mission that is not stored: {}",
+                revision.id,
+                missing_mission_revision(connection, &revision.mission, &revision.revision)?
             ));
         }
         match publication_operation_is_new(
@@ -14409,7 +14434,7 @@ fn create_declared_mission_run_tx(
     if exists {
         return Ok(Vec::new());
     }
-    let mission: MissionSpec = transaction
+    let mission: Option<MissionSpec> = transaction
         .query_row(
             "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
             params![creation.mission, creation.revision],
@@ -14419,16 +14444,13 @@ fn create_declared_mission_run_tx(
         .map_err(internal)?
         .map(|body| serde_json::from_str(&body))
         .transpose()
-        .map_err(internal)?
-        .ok_or_else(|| {
-            St3Error::new(
-                "missing-mission",
-                format!(
-                    "mission `mission/{}@{}` does not exist",
-                    creation.mission, creation.revision
-                ),
-            )
-        })?;
+        .map_err(internal)?;
+    let Some(mission) = mission else {
+        return Err(St3Error::new(
+            "missing-mission",
+            missing_mission_revision(transaction, &creation.mission, &creation.revision)?,
+        ));
+    };
     if mission.state != MissionState::Ready {
         return Err(St3Error::new(
             "mission-not-ready",
@@ -14714,14 +14736,25 @@ fn adopt_declared_mission_revision_tx(
         )
         .map_err(internal)
         .and_then(|body| serde_json::from_str(&body).map_err(internal))?;
-    let next: MissionSpec = transaction
+    let Some(next) = transaction
         .query_row(
             "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
             params![operation.mission, operation.revision],
             |row| row.get::<_, String>(0),
         )
-        .map_err(internal)
-        .and_then(|body| serde_json::from_str(&body).map_err(internal))?;
+        .optional()
+        .map_err(internal)?
+    else {
+        return Err(St3Error::new(
+            "missing-mission-revision",
+            format!(
+                "revision `{}` names a mission that is not stored: {}",
+                operation.id,
+                missing_mission_revision(transaction, &operation.mission, &operation.revision)?
+            ),
+        ));
+    };
+    let next: MissionSpec = serde_json::from_str(&next).map_err(internal)?;
     if next.state != MissionState::Ready {
         return Err(St3Error::new(
             "mission-revision-not-ready",
@@ -15716,6 +15749,173 @@ fn desired_revision(desired: &DesiredSubject) -> String {
     let mut desired = desired.clone();
     desired.desired = canonical_json_value(&desired.desired);
     canonical_hash(&desired).expect("desired subject serializes")
+}
+
+/// Every reference in the ready missions, current declarations and active runs of the graph
+/// that no longer resolves.
+fn unresolved_graph_references(
+    connection: &Connection,
+    origin: &str,
+) -> Result<Vec<String>, St3Error> {
+    let missions = {
+        let mut statement = connection
+            .prepare(
+                "SELECT r.body FROM mission_definitions d
+                     JOIN mission_revisions r ON r.mission_id=d.mission_id AND r.revision=d.revision
+                     WHERE d.state='ready'
+                     ORDER BY d.mission_id",
+            )
+            .map_err(internal)?;
+        let bodies = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(internal)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal)?;
+        // A definition this build cannot read is not a reference problem.
+        bodies
+            .iter()
+            .filter_map(|body| serde_json::from_str::<MissionSpec>(body).ok())
+            .collect::<Vec<_>>()
+    };
+    let desired = {
+        let mut statement = connection
+            .prepare(
+                "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
+                     FROM desired WHERE kind IN ('agent', 'subscription', 'schedule')
+                     ORDER BY subject",
+            )
+            .map_err(internal)?;
+        statement
+            .query_map([], desired_from_row)
+            .map_err(internal)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal)?
+    };
+    let mut unresolved = crate::references::graph(
+        &missions,
+        &desired,
+        &ReferenceGraph { connection },
+        origin,
+    )?;
+    let mut statement = connection
+        .prepare(
+            "SELECT r.id, r.mission_id, g.revision FROM mission_runs r
+                 LEFT JOIN run_generations g ON g.id=r.current_generation_id
+                 WHERE r.phase!='terminal'
+                   AND NOT EXISTS (
+                     SELECT 1 FROM mission_revisions m
+                     WHERE m.mission_id=r.mission_id AND m.revision=g.revision
+                   )
+                 ORDER BY r.id",
+        )
+        .map_err(internal)?;
+    let runs = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })
+        .map_err(internal)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal)?;
+    for (run, mission, revision) in runs {
+        unresolved.push(match revision {
+            Some(revision) => format!(
+                "mission run `mission-run/{run}` runs a mission that is not stored: {}",
+                missing_mission_revision(connection, &mission, &revision)?
+            ),
+            None => format!("mission run `mission-run/{run}` has no stored current generation"),
+        });
+    }
+    Ok(unresolved)
+}
+
+/// The store as the reference checks read it.
+struct ReferenceGraph<'a> {
+    connection: &'a Connection,
+}
+
+impl crate::references::Graph for ReferenceGraph<'_> {
+    fn declared(&self, subject: &str) -> Result<bool, St3Error> {
+        self.connection
+            .query_row("SELECT 1 FROM desired WHERE subject=?1", [subject], |_| {
+                Ok(())
+            })
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(internal)
+    }
+
+    fn mission_published(&self, mission: &str) -> Result<bool, St3Error> {
+        self.connection
+            .query_row(
+                "SELECT 1 FROM mission_revisions WHERE mission_id=?1 LIMIT 1",
+                [mission],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|row| row.is_some())
+            .map_err(internal)
+    }
+
+    fn mission_revision(
+        &self,
+        mission: &str,
+        revision: &str,
+    ) -> Result<Option<MissionSpec>, St3Error> {
+        self.connection
+            .query_row(
+                "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+                params![mission, revision],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal)?
+            .map(|body| serde_json::from_str(&body).map_err(internal))
+            .transpose()
+    }
+
+    fn missing_revision(&self, mission: &str, revision: &str) -> Result<String, St3Error> {
+        missing_mission_revision(self.connection, mission, revision)
+    }
+}
+
+/// Why `mission/MISSION@REVISION` is not stored here. A claim ID has the same shape as a mission
+/// revision, so when the pin is the ID of the claim that published a revision, this names the
+/// revision to pin instead.
+fn missing_mission_revision(
+    connection: &Connection,
+    mission: &str,
+    revision: &str,
+) -> Result<String, St3Error> {
+    let pin = format!("mission/{mission}@{revision}");
+    let published = connection
+        .query_row(
+            "SELECT mission_id, revision FROM mission_revisions WHERE claim_id=?1",
+            [revision],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(internal)?;
+    if let Some((published_mission, published_revision)) = published {
+        return Ok(format!(
+            "`{pin}` pins the ID of the claim that published `mission/{published_mission}@{published_revision}`, not a mission revision; pin `mission/{published_mission}@{published_revision}`"
+        ));
+    }
+    let claim = connection
+        .query_row("SELECT kind FROM claims WHERE id=?1", [revision], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(internal)?;
+    Ok(match claim {
+        Some(kind) => {
+            format!("`{pin}` pins the ID of a `{kind}` claim, not a mission revision")
+        }
+        None => format!("mission `{pin}` is not stored on this host"),
+    })
 }
 
 fn validate_documents(
@@ -23863,7 +24063,7 @@ fn predicate_value_matches(found: &Value, operator: &str, expected: &Value) -> b
     }
 }
 
-fn canonical_child_string(value: &Value, name: &str) -> Option<String> {
+pub(crate) fn canonical_child_string(value: &Value, name: &str) -> Option<String> {
     value
         .get("children")?
         .as_array()?
