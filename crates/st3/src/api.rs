@@ -595,6 +595,16 @@ async fn response_envelope(
         .get::<axum::extract::MatchedPath>()
         .map(|route| route.as_str().to_owned())
         .unwrap_or_else(|| "/unmatched".to_owned());
+    let profile = crate::profile::Op::start(
+        format!("{} {request_route}", request.method()),
+        Some(
+            request
+                .extensions()
+                .get::<crate::profile::Caller>()
+                .map(|caller| caller.0.clone())
+                .unwrap_or_else(|| "(tcp)".into()),
+        ),
+    );
     let client_request = request.uri().path().starts_with("/v1/client/");
     let fabric_boundary_error = (matches!(transport, ClientTransportBoundary::FabricLoopback)
         && !client_request
@@ -628,7 +638,9 @@ async fn response_envelope(
         *auth_request.headers_mut() = request.headers().clone();
         let auth_state = state.clone();
         let transport = transport.as_str();
+        let auth_profile = profile.clone();
         let admitted = tokio::task::spawn_blocking(move || {
+            let _entered = crate::profile::enter(auth_profile.as_ref());
             crate::store::with_read_class(read_class, || {
                 let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
                 let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
@@ -657,7 +669,12 @@ async fn response_envelope(
         (None, Ok(_)) if request_path == "/v1/health" => next.run(request).await,
         (None, Ok(_)) => {
             let runtime = tokio::runtime::Handle::current();
+            let handler_profile = profile.clone();
             match tokio::task::spawn_blocking(move || {
+                if let Some(profile) = &handler_profile {
+                    profile.queued();
+                }
+                let _entered = crate::profile::enter(handler_profile.as_ref());
                 crate::store::with_read_class(read_class, || runtime.block_on(next.run(request)))
             })
             .await
@@ -675,8 +692,12 @@ async fn response_envelope(
             .is_some_and(|value| value.starts_with("application/json"))
     {
         record_request_latency(&request_route, &request_path, started);
+        if let Some(profile) = profile {
+            profile.finish();
+        }
         return response;
     }
+    let enveloping = Instant::now();
     let status = response.status();
     let (mut parts, body) = response.into_parts();
     let raw = match to_bytes(body, usize::MAX).await {
@@ -747,6 +768,10 @@ async fn response_envelope(
     let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
     record_request_latency(&request_route, &request_path, started);
+    if let Some(profile) = profile {
+        profile.enveloped(enveloping.elapsed(), body.len());
+        profile.finish();
+    }
     Response::from_parts(parts, Body::from(body))
 }
 
@@ -3632,10 +3657,14 @@ where
         crate::store::ReadClass::Operational => crate::store::ReadClass::Operational,
         _ => crate::store::ReadClass::Interactive,
     };
-    tokio::task::spawn_blocking(move || crate::store::with_read_class(read_class, operation))
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(ApiError::internal)
+    let profile = crate::profile::current();
+    tokio::task::spawn_blocking(move || {
+        let _entered = crate::profile::enter(profile.as_ref());
+        crate::store::with_read_class(read_class, operation)
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::internal)
 }
 
 async fn blocking_action<T, F>(operation: F) -> Result<T, ApiError>
@@ -3648,10 +3677,14 @@ where
         crate::store::ReadClass::Operational => crate::store::ReadClass::Operational,
         _ => crate::store::ReadClass::Interactive,
     };
-    tokio::task::spawn_blocking(move || crate::store::with_read_class(read_class, operation))
-        .await
-        .map_err(ApiError::internal)?
-        .map_err(ApiError::bad)
+    let profile = crate::profile::current();
+    tokio::task::spawn_blocking(move || {
+        let _entered = crate::profile::enter(profile.as_ref());
+        crate::store::with_read_class(read_class, operation)
+    })
+    .await
+    .map_err(ApiError::internal)?
+    .map_err(ApiError::bad)
 }
 
 pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
@@ -3696,7 +3729,7 @@ async fn serve_unix_with_ancestor(
                 continue;
             }
         };
-        let peer_pid = if bind_harness {
+        let peer_pid = if bind_harness || crate::profile::enabled() {
             stream
                 .peer_cred()
                 .ok()
@@ -3709,18 +3742,26 @@ async fn serve_unix_with_ancestor(
         tokio::spawn(async move {
             // /proc ancestry may fault in pages on a loaded host. Keep that work
             // out of the accept loop so a slow lookup delays only this peer.
-            let bound_agent = match peer_pid {
-                Some(pid) => tokio::task::spawn_blocking(move || ancestor(pid))
-                    .await
-                    .ok()
-                    .flatten(),
-                None => None,
+            let (bound_agent, caller) = match peer_pid {
+                Some(pid) => tokio::task::spawn_blocking(move || {
+                    let bound_agent = bind_harness.then(|| ancestor(pid)).flatten();
+                    let caller = crate::profile::enabled()
+                        .then(|| crate::profile::Caller::of_peer(pid, bound_agent.as_deref()));
+                    (bound_agent, caller)
+                })
+                .await
+                .unwrap_or_default(),
+                None => (None, None),
             };
             let service = hyper::service::service_fn(move |request: Request<Incoming>| {
                 let app = app.clone();
                 let bound_agent = bound_agent.clone();
+                let caller = caller.clone();
                 async move {
-                    let request = request.map(Body::new);
+                    let mut request = request.map(Body::new);
+                    if let Some(caller) = caller {
+                        request.extensions_mut().insert(caller);
+                    }
                     let request = match guard_bound_request(request, bound_agent.as_deref()).await {
                         Ok(request) => request,
                         Err(error) => {
