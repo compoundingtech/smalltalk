@@ -21,6 +21,7 @@
 //!   ignored by git. A store at scale 10 takes about half an hour to generate and 20 GB.
 //! - `ST_BENCH_SECONDS` sets how long the fleet runs against each store. The default is 60.
 //! - `ST_BENCH_SEATS` sets how many seats poll and write. The default is 30.
+//! - `ST_BENCH_PEOPLE` sets how many people read at once. The default is 3.
 //! - `ST_BENCH_P99_MS` sets the read budget. The default is 200.
 //! - `ST_BENCH_RECONCILER=0` leaves out the reconciler, which otherwise runs as a host that owns
 //!   none of the store's members, so it starts, renders and signals nothing.
@@ -114,6 +115,7 @@ async fn person_facing_reads_answer_within_their_budget() {
     let settings = Settings {
         seconds: env_number("ST_BENCH_SECONDS", 60),
         seats: env_number("ST_BENCH_SEATS", 30),
+        people: env_number("ST_BENCH_PEOPLE", 3),
         budget: Duration::from_millis(env_number("ST_BENCH_P99_MS", 200)),
         reconciler: std::env::var("ST_BENCH_RECONCILER").map_or(true, |value| value != "0"),
     };
@@ -177,6 +179,7 @@ async fn person_facing_reads_answer_within_their_budget() {
 struct Settings {
     seconds: u64,
     seats: usize,
+    people: usize,
     budget: Duration,
     reconciler: bool,
 }
@@ -394,39 +397,59 @@ async fn bench(name: &str, source: &Path, settings: &Settings) -> Run {
         failed.clone(),
     )));
 
-    // A person reads one route after another, as someone moving through stui does.
-    let mut reads = BTreeMap::<String, Vec<Duration>>::new();
+    // People read one route after another, as someone moving through stui or the CLI does: a few
+    // of them at once, each starting at a different route, so a slow route cannot starve the
+    // others of samples.
     let deadline = Instant::now() + Duration::from_secs(settings.seconds);
-    let mut round = 0_usize;
-    while Instant::now() < deadline {
-        for (read, path) in READS {
-            let path = fill(path, &subjects, round);
-            let started = Instant::now();
-            let answer =
-                tokio::time::timeout(Duration::from_secs(60), client.get::<Value>(&path)).await;
-            match answer {
-                Ok(Ok(_)) => reads
-                    .entry((*read).into())
-                    .or_default()
-                    .push(started.elapsed()),
-                Ok(Err(error)) => {
-                    *failed
-                        .lock()
-                        .unwrap()
-                        .entry(format!("{read}: {}", short(&error)))
-                        .or_default() += 1
+    let mut people = Vec::new();
+    for person in 0..settings.people {
+        let (client, subjects, failed) = (client.clone(), subjects.clone(), failed.clone());
+        people.push(tokio::spawn(async move {
+            let mut reads = BTreeMap::<String, Vec<Duration>>::new();
+            let mut round = person;
+            while Instant::now() < deadline {
+                for offset in 0..READS.len() {
+                    let (read, path) = READS[(offset + person * READS.len() / 3) % READS.len()];
+                    let path = fill(path, &subjects, round);
+                    let started = Instant::now();
+                    let answer =
+                        tokio::time::timeout(Duration::from_secs(60), client.get::<Value>(&path))
+                            .await;
+                    match answer {
+                        Ok(Ok(_)) => reads
+                            .entry(read.into())
+                            .or_default()
+                            .push(started.elapsed()),
+                        Ok(Err(error)) => {
+                            *failed
+                                .lock()
+                                .unwrap()
+                                .entry(format!("{read}: {}", short(&error)))
+                                .or_default() += 1
+                        }
+                        Err(_) => {
+                            *failed
+                                .lock()
+                                .unwrap()
+                                .entry(format!("{read}: timed out"))
+                                .or_default() += 1
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        break;
+                    }
                 }
-                Err(_) => {
-                    *failed
-                        .lock()
-                        .unwrap()
-                        .entry(format!("{read}: timed out"))
-                        .or_default() += 1
-                }
+                round += 1;
+                tokio::time::sleep(Duration::from_millis(250)).await;
             }
+            reads
+        }));
+    }
+    let mut reads = BTreeMap::<String, Vec<Duration>>::new();
+    for person in people {
+        for (read, samples) in person.await.unwrap() {
+            reads.entry(read).or_default().extend(samples);
         }
-        round += 1;
-        tokio::time::sleep(Duration::from_millis(250)).await;
     }
     running.store(false, Ordering::Relaxed);
     for task in tasks {
