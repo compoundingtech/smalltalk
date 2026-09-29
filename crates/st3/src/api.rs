@@ -3665,6 +3665,23 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
             crate::resource::GITHUB_AUTH_REMEDY.into()
         },
     });
+    // Request samples are live operational telemetry. Keep them on /v1/doctor,
+    // outside the store-index-fenced operation projection built by doctor_report.
+    let mut routes = request_latency_snapshot();
+    routes.sort_by_key(|route| std::cmp::Reverse(route["p99_ms"].as_u64().unwrap_or_default()));
+    for route in routes.into_iter().take(10) {
+        report.checks.push(DoctorCheck {
+            name: format!(
+                "request-latency/{}",
+                route["route"].as_str().unwrap_or("unknown")
+            ),
+            status: "pass".into(),
+            message: format!(
+                "{} requests; recent p50 {} ms, p99 {} ms, max {} ms",
+                route["count"], route["p50_ms"], route["p99_ms"], route["max_ms"]
+            ),
+        });
+    }
     report.status = if report.checks.iter().any(|check| check.status == "fail") {
         "fail"
     } else if report.checks.iter().any(|check| check.status == "warn") {
@@ -4113,21 +4130,6 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             status: "fail".into(),
             message: error.to_string(),
         }),
-    }
-    let mut routes = request_latency_snapshot();
-    routes.sort_by_key(|route| std::cmp::Reverse(route["p99_ms"].as_u64().unwrap_or_default()));
-    for route in routes.into_iter().take(10) {
-        checks.push(DoctorCheck {
-            name: format!(
-                "request-latency/{}",
-                route["route"].as_str().unwrap_or("unknown")
-            ),
-            status: "pass".into(),
-            message: format!(
-                "{} requests; recent p50 {} ms, p99 {} ms, max {} ms",
-                route["count"], route["p50_ms"], route["p99_ms"], route["max_ms"]
-            ),
-        });
     }
     let report_status = if checks.iter().any(|check| check.status == "fail") {
         "fail"
