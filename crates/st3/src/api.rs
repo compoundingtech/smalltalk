@@ -8148,6 +8148,19 @@ async fn wake_work(
                 format!("assignee `{agent}` has no ready current harness"),
             ))
         })?;
+    if !state
+        .store
+        .fresh_context_ready(&step, agent, &harness.incarnation_id)
+        .map_err(ApiError::internal)?
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "fresh-context-pending",
+            format!(
+                "`{agent}` must start a fresh harness session before waking `{}`",
+                step.subject
+            ),
+        )));
+    }
     let attempt = step
         .wake
         .as_ref()

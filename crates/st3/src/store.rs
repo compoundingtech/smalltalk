@@ -4434,6 +4434,16 @@ impl Store {
         Ok(view)
     }
 
+    pub fn fresh_context_ready(
+        &self,
+        step: &StepRunView,
+        actor: &str,
+        incarnation: &str,
+    ) -> Result<bool> {
+        let connection = self.readers.get();
+        fresh_context_ready_tx(&connection, step, actor, incarnation).map_err(Into::into)
+    }
+
     pub fn work_action(
         &self,
         subject: &str,
@@ -4634,6 +4644,20 @@ impl Store {
                 ),
             )
             .with_detail("next_work_id", next));
+        }
+        if action == "claim" && current.status == "ready" {
+            let mut step = current.clone();
+            enrich_step_definition(&transaction, &mut step).map_err(internal)?;
+            if !fresh_context_ready_tx(&transaction, &step, &actor, requested_incarnation)
+                .map_err(internal)?
+            {
+                return Err(St3Error::new(
+                    "fresh-context-pending",
+                    format!(
+                        "`{actor}` must start a fresh harness session before claiming `{subject}`"
+                    ),
+                ));
+            }
         }
         let lease_valid = current
             .claim_expires_at_unix_ms
@@ -24379,6 +24403,7 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         run: format!("mission-run/{}", row.get::<_, String>(1)?),
         generation,
         step: row.get(2)?,
+        fresh_context: false,
         queue: None,
         queue_position: None,
         definition_hash: row.get(3)?,
@@ -24526,8 +24551,52 @@ fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> ru
         view.queue.clone_from(&step.queue);
         view.queue_position = step.queue_position;
         view.timeout_ms = step.timeout_ms;
+        view.fresh_context = step.fresh_context;
     }
     Ok(())
+}
+
+fn fresh_context_ready_tx(
+    connection: &Connection,
+    step: &StepRunView,
+    actor: &str,
+    incarnation: &str,
+) -> rusqlite::Result<bool> {
+    let member: Option<String> = connection
+        .query_row(
+            "SELECT member FROM desired WHERE subject=?1",
+            [actor],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let seat_fresh = member
+        .as_deref()
+        .and_then(|member| serde_json::from_str::<Value>(member).ok())
+        .is_some_and(|member| {
+            member
+                .pointer("/tags/st3.fresh_context")
+                .and_then(Value::as_str)
+                == Some("true")
+        });
+    if !step.fresh_context && !seat_fresh {
+        return Ok(true);
+    }
+    let operation = crate::model::fresh_context_operation(step);
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_observations
+         WHERE subject=?1 AND kind='runtime.action.succeeded'
+           AND json_extract(body, '$.fields.action')='fresh-context'
+           AND json_extract(body, '$.fields.operation')=?2
+           AND json_extract(body, '$.fields.incarnation_id')=?3)
+         OR EXISTS(SELECT 1 FROM claims
+         WHERE subject=?1 AND kind='runtime.action.succeeded'
+           AND json_extract(body, '$.fields.action')='fresh-context'
+           AND json_extract(body, '$.fields.operation')=?2
+           AND json_extract(body, '$.fields.incarnation_id')=?3)",
+        params![actor, operation, incarnation],
+        |row| row.get(0),
+    )
 }
 
 fn enrich_step_wake_at(
