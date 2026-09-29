@@ -14874,14 +14874,14 @@ mod tests {
             "--attach",
         ]);
         assert!(args.attach && args.actor.is_none() && args.workspace.is_none());
-        let kdl = agent_new_document(&args, "/home/avery/st/agents/site", true);
-        assert!(kdl.contains(r#"workspace "/home/avery/st/agents/site" create=#true"#));
+        let kdl = agent_new_document(&args, "/home/example/st/agents/site", true);
+        assert!(kdl.contains(r#"workspace "/home/example/st/agents/site" create=#true"#));
         let intent = st3::parse_intent(&kdl, "laptop").unwrap();
         let seat = &intent.subjects["agent/builder.site"];
         assert!(seat.owner_run.is_none());
         let member = seat.member.as_ref().unwrap();
         assert_eq!(member.host, "builder");
-        assert_eq!(member.workspace, "/home/avery/st/agents/site");
+        assert_eq!(member.workspace, "/home/example/st/agents/site");
         assert!(member.workspace_create);
         assert_eq!(member.driver.as_deref(), Some("claude"));
         assert_eq!(member.restart, st3::model::RestartType::Always);
@@ -14921,7 +14921,7 @@ mod tests {
     #[test]
     fn a_new_codex_agent_is_the_fleet_codex_seat() {
         let args = agent_new_args(&[
-            "fleet/example/codex",
+            "example/codex",
             "--harness",
             "codex",
             "--model",
@@ -14939,7 +14939,7 @@ mod tests {
         assert!(!kdl.contains("create="));
         assert!(!kdl.contains("host "));
         let intent = st3::parse_intent(&kdl, "laptop").unwrap();
-        let member = intent.subjects["agent/fleet/example/codex"]
+        let member = intent.subjects["agent/example/codex"]
             .member
             .as_ref()
             .unwrap();
