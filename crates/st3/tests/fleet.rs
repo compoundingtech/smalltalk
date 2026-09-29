@@ -193,11 +193,36 @@ impl Node {
             .unwrap();
         self.daemon = Some(daemon);
         let client = self.client();
-        wait_until(&format!("{} daemon starts", self.name), 30, || {
-            let client = client.clone();
-            async move { client.get::<Value>("/v1/health").await.is_ok() }
-        })
-        .await;
+        // The pinned compatibility build may be cold while other CI lanes compile.
+        // Give startup room for that load. Bound each health probe as well: a request
+        // stalled behind startup must not consume the whole startup deadline.
+        let deadline = Instant::now() + Duration::from_secs(150);
+        loop {
+            let health_error = match tokio::time::timeout(
+                Duration::from_secs(3),
+                client.get::<Value>("/v1/health"),
+            )
+            .await
+            {
+                Ok(Ok(_)) => break,
+                Ok(Err(error)) => error.to_string(),
+                Err(_) => "health request timed out after 3 seconds".into(),
+            };
+            if let Some(status) = self.daemon.as_mut().unwrap().try_wait().unwrap() {
+                panic!(
+                    "{} daemon exited with {status} (last health probe: {health_error}):\n{}",
+                    self.name,
+                    self.logs()
+                );
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting until {} daemon starts (last health probe: {health_error}):\n{}",
+                self.name,
+                self.logs()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
         let legacy = fs::read_to_string(self.root.join("config/st3/config.toml"))
             .is_ok_and(|config| config.contains("fleet_id"));
         if legacy || self.state_dir().join("fleet/fleet.toml").exists() {
@@ -1586,19 +1611,20 @@ async fn the_fabric_transport_works_through_the_worker_alone() {
     wait_for_notes(&b, &expected, 60, &[&a, &b]).await;
 
     let calls = fs::read_to_string(registry.join("calls")).unwrap();
-    for (node, peer) in [("a", "b"), ("b", "a")] {
+    for node in ["a", "b"] {
         assert!(
             calls.contains(&format!("{node}-fabric-id expose st3/fleet/"))
                 && calls.contains("--ephemeral"),
             "{node} did not expose itself ephemerally:\n{calls}"
         );
-        assert!(
-            calls.contains(&format!(
-                "{node}-fabric-id dial {peer}-fabric-id st3/fleet/"
-            )),
-            "{node} never dialed {peer} through Fabric:\n{calls}"
-        );
     }
+    // An exchange synchronizes both directions, so the first successful dial can
+    // drain both notes before the other worker has any reason to dial.
+    assert!(
+        calls.contains("a-fabric-id dial b-fabric-id st3/fleet/")
+            || calls.contains("b-fabric-id dial a-fabric-id st3/fleet/"),
+        "neither node dialed through Fabric:\n{calls}"
+    );
     let inbox = registry.join("home-b/inbox");
     assert!(
         walkdir::WalkDir::new(&inbox)
