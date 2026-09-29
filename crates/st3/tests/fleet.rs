@@ -523,10 +523,7 @@ async fn invite_and_join_sync_full_history() {
     let first = b.st_json(&["replication", "status"])["first_sync"].clone();
     assert_eq!(first["state"], "verified", "{first}");
     assert_eq!(first["healed"], false, "{first}");
-    assert_eq!(
-        first["graph_digest"], first["peer_graph_digest"],
-        "{first}"
-    );
+    assert_eq!(first["graph_digest"], first["peer_graph_digest"], "{first}");
     wait_for_notes(&b, &expected, 60, &[&a, &b]).await;
     b.wait_listening().await;
     b.note("b-0").await;
@@ -630,7 +627,10 @@ async fn members_with_the_same_envelopes_but_different_claims_report_divergence_
 
     let in_sync_graph = a.st_json(&["replication", "status"])["graph_digest"].clone();
     // Heals wait while the divergence is inspected.
-    let hold = ("ST3_REPLICATION_HEAL_AFTER_MS".to_owned(), "3600000".to_owned());
+    let hold = (
+        "ST3_REPLICATION_HEAL_AFTER_MS".to_owned(),
+        "3600000".to_owned(),
+    );
     a.env.push(hold.clone());
     a.restart().await;
     b.env.push(hold);
@@ -731,17 +731,20 @@ async fn members_with_the_same_envelopes_but_different_claims_report_divergence_
         })
         .collect::<Vec<_>>();
     assert!(
-        heals
-            .iter()
-            .any(|(_, heal)| heal["healed"] == true
-                && heal["refetched"].as_u64().unwrap_or(0) + heal["pushed"].as_u64().unwrap_or(0) > 0),
+        heals.iter().any(|(_, heal)| heal["healed"] == true
+            && heal["refetched"].as_u64().unwrap_or(0) + heal["pushed"].as_u64().unwrap_or(0) > 0),
         "{heals:?}"
     );
     let restored = b
         .claims()
         .await
         .into_iter()
-        .filter(|claim| claim["subject"].as_str().unwrap_or("").contains("divergence-probe"))
+        .filter(|claim| {
+            claim["subject"]
+                .as_str()
+                .unwrap_or("")
+                .contains("divergence-probe")
+        })
         .count();
     assert!(restored > 0, "b admitted the mission's claims again");
     for node in [&a, &b] {

@@ -29,11 +29,11 @@ use crate::model::{
     PlannedAction, PlannerSpec, PlanningCandidateView, PlanningPreviewView,
     PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView, ReplicaBatch,
     ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView, ReplicaRepairDeclaration,
-    ReplicationExchange, ReplicationHealReport, ReplicationInventory, ReplicationInventoryBucket, ReplicationPeerStatus,
-    ReplicationPeerSync, ReplicationReceipt, ReplicationStatus, ReplicationTimings,
-    ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover, RevisionProposalView,
-    RevisionSubmissionView, RunGenerationView, RuntimeResetOperation, St3Error, StatusResponse,
-    StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
+    ReplicationExchange, ReplicationHealReport, ReplicationInventory, ReplicationInventoryBucket,
+    ReplicationPeerStatus, ReplicationPeerSync, ReplicationReceipt, ReplicationStatus,
+    ReplicationTimings, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
+    RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
+    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
     SubscriptionRequestDecision, SubscriptionRequestView, SubscriptionSpec, UsageSummary,
     WorkRequest, WorkSelector, WorkWakeView,
 };
@@ -28787,8 +28787,8 @@ fn step_generation_is_current(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ReplicationHealAnswer, ReplicationHealQuery, ReplicationHealStep};
     use crate::graph::parse_test_intent as parse_intent;
+    use crate::model::{ReplicationHealAnswer, ReplicationHealQuery, ReplicationHealStep};
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
@@ -33516,7 +33516,10 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         assert!(report.healed, "{report:?}");
         assert_eq!((report.refetched, report.pushed), (lost, 0));
         assert_eq!(report.ranges, 1, "one writer range holds every claim");
-        assert!(report.subjects >= 1 && report.subjects <= lost, "{report:?}");
+        assert!(
+            report.subjects >= 1 && report.subjects <= lost,
+            "{report:?}"
+        );
         assert!(!report.replayed && !report.peer_replayed);
         assert_eq!(graph_digest_of(&replica), graph_digest_of(&source));
         let states = |store: &Store| {
@@ -33577,7 +33580,10 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         let diverged = start + REPLICATION_DIVERGED_AFTER_MS;
         progress.compare_graphs(false, diverged);
         assert!(progress.heal_due(diverged, false));
-        assert!(!progress.heal_due(diverged + 1, false), "one heal at a time");
+        assert!(
+            !progress.heal_due(diverged + 1, false),
+            "one heal at a time"
+        );
         // A heal that changed nothing waits twice as long before the next.
         progress.finish_heal(&ReplicationHealReport::default());
         assert!(!progress.heal_due(diverged + heal::HEAL_RETRY_MS, false));
@@ -33635,11 +33641,17 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         let inbound = newcomer
             .receive_replication_exchange("source", TEST_FLEET, &summary)
             .unwrap();
-        assert!(!inbound.heal, "an exchange the peer started leaves the heal to this node");
+        assert!(
+            !inbound.heal,
+            "an exchange the peer started leaves the heal to this node"
+        );
         let receipt = newcomer
             .receive_replication_exchange_asking("source", TEST_FLEET, &summary, true)
             .unwrap();
-        assert!(receipt.heal, "the end of a first sync does not wait to diverge");
+        assert!(
+            receipt.heal,
+            "the end of a first sync does not wait to diverge"
+        );
         let report = heal_between(&newcomer, "newcomer", &source, "source");
         assert!(report.healed && report.replayed, "{report:?}");
         let first = newcomer.first_sync().unwrap().unwrap();

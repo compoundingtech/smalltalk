@@ -1856,11 +1856,7 @@ async fn receive_exchange(
 }
 
 /// A peer's heal question, answered from this node's claims by the main daemon.
-async fn receive_heal(
-    State(state): State<PeerState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
+async fn receive_heal(State(state): State<PeerState>, headers: HeaderMap, body: Bytes) -> Response {
     let body = if deflated(&headers) {
         match inflate(&body) {
             Ok(body) => Bytes::from(body),
@@ -2373,7 +2369,17 @@ async fn post_signed(
     exchange: &ReplicationExchange,
     compress: bool,
 ) -> Result<(ReplicationExchange, bool)> {
-    post_signed_to(http, peer, node, auth, fleet, EXCHANGE_PATH, exchange, compress).await
+    post_signed_to(
+        http,
+        peer,
+        node,
+        auth,
+        fleet,
+        EXCHANGE_PATH,
+        exchange,
+        compress,
+    )
+    .await
 }
 
 /// Send one signed request to a peer path and return the peer's verified answer, as
@@ -3934,7 +3940,10 @@ mod tests {
                 break;
             }
         }
-        assert!(heal_now, "the first comparison of a first sync heals at once");
+        assert!(
+            heal_now,
+            "the first comparison of a first sync heals at once"
+        );
         heal(&backend, "target", &peer, &auth, &context, socket).await;
 
         let status = target

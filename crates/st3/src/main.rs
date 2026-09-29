@@ -701,8 +701,7 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                     "The st3 services now run as a fleet member; st fleet status shows the sync."
                 );
                 if !args.no_wait {
-                    wait_for_first_sync(&client, Duration::from_secs(30 * 60), json_output)
-                        .await?;
+                    wait_for_first_sync(&client, Duration::from_secs(30 * 60), json_output).await?;
                 }
             } else if !json_output {
                 println!(
@@ -6407,7 +6406,10 @@ async fn wait_for_first_sync(client: &Client, timeout: Duration, json_output: bo
     let started = std::time::Instant::now();
     let mut reported = None::<std::time::Instant>;
     loop {
-        if let Ok(status) = client.get::<ReplicationStatus>("/v1/replication/status").await {
+        if let Ok(status) = client
+            .get::<ReplicationStatus>("/v1/replication/status")
+            .await
+        {
             let first = status.first_sync.clone().context(
                 "this node has no first sync to wait for: it did not join with st fleet join",
             )?;
@@ -6502,10 +6504,16 @@ fn render_first_sync(first: &st3::model::ReplicationFirstSync, now: u128) -> Str
 fn render_heal(peer: &str, report: &st3::model::ReplicationHealReport, now: u128) -> String {
     let mut moved = Vec::new();
     if report.refetched != 0 {
-        moved.push(format!("admitted {} claims {peer} projects", report.refetched));
+        moved.push(format!(
+            "admitted {} claims {peer} projects",
+            report.refetched
+        ));
     }
     if report.pushed != 0 {
-        moved.push(format!("{peer} admitted {} claims this node projects", report.pushed));
+        moved.push(format!(
+            "{peer} admitted {} claims this node projects",
+            report.pushed
+        ));
     }
     if report.replayed {
         moved.push("replayed this graph from nothing".into());
