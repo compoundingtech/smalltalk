@@ -138,9 +138,37 @@ impl CollectionStream {
     ) -> Result<(), ClientError> {
         self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":collection, "limit":limit, "actor":actor, "status":status})).await
     }
+    /// Follow a terminal on this socket. `terminal.attach` returns the incarnation and the
+    /// single-use capability; screens then arrive as [`CollectionEvent::Screen`], the latest
+    /// only, and a `stale-fence` error ends only this subscription.
+    pub async fn subscribe_terminal(
+        &mut self,
+        id: &str,
+        terminal_id: &str,
+        incarnation: Option<&str>,
+        capability: &str,
+    ) -> Result<(), ClientError> {
+        self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":"terminal", "terminal":terminal_id, "incarnation":incarnation, "capability":capability})).await
+    }
+    /// Follow an agent's or a session's conversation: st joins its transcript and its Small
+    /// Talk and sends the newest page, then each change.
+    pub async fn subscribe_conversation(
+        &mut self,
+        id: &str,
+        conversation: &str,
+    ) -> Result<(), ClientError> {
+        self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":"conversation", "conversation":conversation})).await
+    }
     pub async fn unsubscribe(&mut self, id: &str) -> Result<(), ClientError> {
         self.send(&serde_json::json!({"kind":"unsubscribe", "id":id}))
             .await
+    }
+    /// The next frame, typed. `None` means the socket closed; subscribe again on a new one.
+    pub async fn next_event(&mut self) -> Result<Option<CollectionEvent>, ClientError> {
+        self.next()
+            .await?
+            .map(CollectionEvent::from_frame)
+            .transpose()
     }
     async fn send(&mut self, command: &serde_json::Value) -> Result<(), ClientError> {
         let payload = serde_json::to_string(command)
@@ -186,6 +214,110 @@ impl ConversationStream {
             TerminalSocket::Unix(socket) => socket.close(None).await,
             TerminalSocket::Remote(socket) => socket.close(None).await,
         };
+    }
+}
+
+/// One frame from a collection socket.
+#[derive(Debug)]
+pub enum CollectionEvent {
+    /// A subscription's first window, and the window again after a resubscribe.
+    Snapshot {
+        id: String,
+        snapshot: Snapshot,
+        items: Vec<Resource>,
+        order: Vec<String>,
+        has_more: bool,
+    },
+    /// What changed in the window since the last frame, with its complete new order.
+    Changes {
+        id: String,
+        snapshot: Snapshot,
+        upserts: Vec<Resource>,
+        removes: Vec<String>,
+        order: Vec<String>,
+        has_more: bool,
+    },
+    /// A terminal subscription's whole current screen; it replaces every earlier one.
+    Screen {
+        id: String,
+        screen: Box<Envelope<TerminalScreen>>,
+    },
+    /// A conversation's entries. `replace` means these are its newest page and every earlier
+    /// entry is gone; otherwise they are new or revised entries, matched by ID.
+    Conversation {
+        id: String,
+        session_id: String,
+        replace: bool,
+        items: Vec<TimelineEntry>,
+        has_more: bool,
+    },
+    /// Subscribe again: the server could not bring this subscription up to date.
+    Resync { id: String },
+    /// The subscription failed or ended; the socket and other subscriptions continue.
+    Error {
+        id: String,
+        code: Option<ErrorCode>,
+        message: String,
+    },
+}
+
+impl CollectionEvent {
+    fn from_frame(frame: serde_json::Value) -> Result<Self, ClientError> {
+        fn field<T: DeserializeOwned>(
+            frame: &serde_json::Value,
+            name: &str,
+        ) -> Result<T, ClientError> {
+            serde_json::from_value(frame.get(name).cloned().unwrap_or(serde_json::Value::Null))
+                .map_err(|error| {
+                    ClientError::Protocol(format!("collection frame `{name}`: {error}"))
+                })
+        }
+        let id = field::<String>(&frame, "id")?;
+        match frame.get("kind").and_then(serde_json::Value::as_str) {
+            Some("snapshot") => Ok(Self::Snapshot {
+                snapshot: field(&frame, "snapshot")?,
+                items: field(&frame, "items")?,
+                order: field(&frame, "order")?,
+                has_more: field(&frame, "has_more")?,
+                id,
+            }),
+            Some("changes") => Ok(Self::Changes {
+                snapshot: field(&frame, "snapshot")?,
+                upserts: field(&frame, "upserts")?,
+                removes: field(&frame, "removes")?,
+                order: field(&frame, "order")?,
+                has_more: field(&frame, "has_more")?,
+                id,
+            }),
+            Some("screen") => Ok(Self::Screen {
+                screen: Box::new(Envelope {
+                    api_version: API_VERSION.into(),
+                    request_id: String::new(),
+                    snapshot: field(&frame, "snapshot")?,
+                    value: field(&frame, "value")?,
+                }),
+                id,
+            }),
+            Some("conversation") => Ok(Self::Conversation {
+                session_id: field(&frame, "session_id")?,
+                replace: field(&frame, "replace")?,
+                items: field(&frame, "items")?,
+                has_more: field::<Option<bool>>(&frame, "has_more")?.unwrap_or(false),
+                id,
+            }),
+            Some("resync") => Ok(Self::Resync { id }),
+            Some("error") => Ok(Self::Error {
+                code: frame
+                    .get("code")
+                    .cloned()
+                    .and_then(|code| serde_json::from_value(code).ok()),
+                message: field::<Option<String>>(&frame, "message")?.unwrap_or_default(),
+                id,
+            }),
+            other => Err(ClientError::Protocol(format!(
+                "unknown collection frame kind {other:?}"
+            ))),
+        }
     }
 }
 
@@ -795,6 +927,17 @@ impl Client {
     pub async fn subscriptions_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("subscriptions", id).await
     }
+    pub async fn lanes_list(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal("lanes", cursor, limit, history).await
+    }
+    pub async fn lanes_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
+        self.resource_internal("lanes", id).await
+    }
     pub async fn terminals_list(
         &self,
         cursor: Option<&str>,
@@ -888,6 +1031,61 @@ impl Client {
         parameters: AttentionResolveParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
         let request = ActionRequest::attention_resolve(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn lane_approve(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: LaneChangeParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::lane_approve(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn lane_join(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: LaneChangeParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::lane_join(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn lane_leave(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: LaneChangeParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::lane_leave(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn lane_mark(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: LaneChangeParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::lane_mark(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn lane_move(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: LaneChangeParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::lane_move(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }

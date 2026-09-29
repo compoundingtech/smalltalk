@@ -116,6 +116,8 @@ fn operation_manifest_is_launch_only_and_covers_v0_resources_and_actions() {
         "runtimes.list",
         "observers.list",
         "subscriptions.list",
+        "lanes.list",
+        "lanes.get",
         "operations.list",
         "history.list",
         "sessions.list",
@@ -156,6 +158,11 @@ fn operation_manifest_is_launch_only_and_covers_v0_resources_and_actions() {
         "work.retry",
         "work.publish-mission",
         "agent.queue-move",
+        "lane.join",
+        "lane.leave",
+        "lane.move",
+        "lane.mark",
+        "lane.approve",
         "runtime.stop",
         "runtime.restart",
         "runtime.reset",
@@ -206,6 +213,7 @@ fn resource_fixture_covers_every_resource_kind_with_stable_unique_ids() {
         "launch-approval",
         "launch-decision",
         "launch-variant",
+        "lane",
         "machine",
         "message",
         "mission",
@@ -1628,14 +1636,15 @@ mission "client-action-demo" state="ready" {
             )
             .unwrap()
     );
+    // A cancelled run stays in the current view for a while, with its outcome.
     let (_, current_missions) = client_json(app.clone(), "/v1/client/missions").await;
-    assert!(
-        current_missions["value"]["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|item| item["id"] != "mission/client-action-demo")
-    );
+    let current = current_missions["value"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "mission/client-action-demo")
+        .expect("a just-cancelled mission stays in the current view");
+    assert_eq!(current["state"], "cancelled");
     let (_, mission_history) = client_json(app, "/v1/client/missions?history=true").await;
     let cancelled = mission_history["value"]["items"]
         .as_array()
@@ -2137,4 +2146,219 @@ mission "queued-work" state="ready" {
 
     let (status, missing) = client_json(app, "/v1/client/agent-queues/agent/absent-seat").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+}
+
+/// A runtime that starts nothing: a reconcile pass here only writes a run's own declarations.
+struct NoRuntime;
+
+impl st3::reconcile::RuntimeControl for NoRuntime {
+    fn snapshot_ptys(&self) -> anyhow::Result<Vec<st3::reconcile::RuntimeObservation>> {
+        Ok(Vec::new())
+    }
+    fn observe_exec(&self, _: &str) -> anyhow::Result<Option<st3::reconcile::RuntimeObservation>> {
+        Ok(None)
+    }
+    fn start(&self, _: &st3::model::MemberSpec) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn stop(&self, _: &str, _: bool, _: Option<&str>) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn kill(&self, _: &str, _: bool, _: Option<&str>) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn remove(&self, _: &str, _: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn screen(&self, _: &str) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+    fn send_key(&self, _: &str, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn read_exec_log(&self, _: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+}
+
+/// Run one reconcile pass as the store's own node, which writes each of its running missions'
+/// lane declarations.
+fn materialize_run_declarations(store: &Arc<Store>) {
+    st3::reconcile::Reconciler::new(
+        store.clone(),
+        Arc::new(NoRuntime),
+        "client-v0-baseline".into(),
+        Arc::new(Notify::new()),
+    )
+    .reconcile_once()
+    .unwrap();
+}
+
+#[tokio::test]
+async fn lanes_read_as_resources_and_people_change_them_through_actions() {
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let source = r#"
+version 2
+agent "lane-driver" { workspace "/tmp"; command "true" }
+mission "example/merge-train" state="ready" {
+  goal "Merge ready changes into main one at a time."
+  lane "app" {
+    entries "resource/github/acme/app/ci/pull-request/"
+    approver "person/ada"
+  }
+  step "drive" { assigned-to "agent/lane-driver" }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, "client-v0-baseline").unwrap();
+    let planned = state
+        .store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    state
+        .store
+        .apply(&intent, &planned.subject_tokens, "lane-missions")
+        .unwrap();
+    let run = state
+        .store
+        .create_mission_run(&st3::model::MissionRunRequest {
+            mission: "example/merge-train".into(),
+            revision: None,
+            workspace: root.path().display().to_string(),
+            requester: Some("person/requester".into()),
+            mode: Some("run".into()),
+            inputs: std::collections::BTreeMap::new(),
+            idempotency_key: "lane-run".into(),
+        })
+        .unwrap();
+    materialize_run_declarations(&state.store);
+    let lane = format!(
+        "lane/{}/app",
+        run.subject.strip_prefix("mission-run/").unwrap()
+    );
+    let entry = |number: &str| format!("resource/github/acme/app/ci/pull-request/{number}");
+    let app = st3::api::router(state.clone());
+
+    let (status, listed) = client_json(app.clone(), "/v1/client/lanes").await;
+    assert_eq!(status, StatusCode::OK, "{listed}");
+    assert_eq!(listed["value"]["collection"], "lanes");
+    let item = &listed["value"]["items"][0];
+    assert_eq!(item["id"], lane.as_str());
+    assert_eq!(item["kind"], "lane");
+    assert_eq!(item["name"], "app");
+    assert_eq!(item["mission_run_id"], run.subject.as_str());
+    assert_eq!(item["mission_id"], "mission/example/merge-train");
+    assert_eq!(item["approver_id"], "person/ada");
+    assert_eq!(item["state"], "open");
+    assert_eq!(item["revision"], "empty");
+    assert_eq!(item["entries"], serde_json::json!([]));
+
+    let (_, capabilities) =
+        client_json_person(app.clone(), "/v1/client/capabilities", "person/operator").await;
+    for action in [
+        "lane.join",
+        "lane.leave",
+        "lane.move",
+        "lane.mark",
+        "lane.approve",
+    ] {
+        assert!(
+            capabilities["value"]["capabilities"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|capability| capability["id"] == action && capability["state"] == "granted"),
+            "{action} is not granted"
+        );
+    }
+    // Each action fences on a fresh snapshot, as a client does after it reads.
+    let act = |person: &'static str, id: &'static str, kind: &'static str, parameters: Value| {
+        let app = app.clone();
+        async move {
+            let (_, capabilities) =
+                client_json_person(app.clone(), "/v1/client/capabilities", person).await;
+            let snapshot = capabilities["snapshot"]["id"].as_str().unwrap().to_owned();
+            let request = serde_json::json!({
+                "api_version": "st3.client.v0", "id": format!("action/{id}"), "type": kind,
+                "idempotency_key": format!("lane-action-{id}-0000000"),
+                "fence": { "snapshot_id": snapshot, "subject_revisions": {} },
+                "parameters": parameters
+            });
+            client_post_json_person(app, "/v1/client/actions", person, request).await
+        }
+    };
+    for (id, number) in [("join-42", "42"), ("join-43", "43")] {
+        let (status, result) = act(
+            "person/operator",
+            id,
+            "lane.join",
+            serde_json::json!({ "lane_id": lane, "entry_id": entry(number), "reason": "green" }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        assert_eq!(result["value"]["affected_ids"], serde_json::json!([lane]));
+    }
+    let (status, result) = act(
+        "person/operator",
+        "move-43",
+        "lane.move",
+        serde_json::json!({ "lane_id": lane, "entry_id": entry("43"), "placement": "before", "anchor_id": entry("42") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let (status, denied) = act(
+        "person/operator",
+        "approve-denied",
+        "lane.approve",
+        serde_json::json!({ "lane_id": lane, "entry_id": entry("42") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
+    assert_eq!(denied["code"], "forbidden", "{denied}");
+    let (status, result) = act(
+        "person/ada",
+        "approve-42",
+        "lane.approve",
+        serde_json::json!({ "lane_id": lane, "entry_id": entry("42") }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let (status, missing) = act(
+        "person/operator",
+        "mark-missing",
+        "lane.mark",
+        serde_json::json!({ "lane_id": lane, "entry_id": entry("99"), "state": "ready" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{missing}");
+    assert_eq!(missing["code"], "validation-failed", "{missing}");
+
+    let (status, detail) = client_json(app.clone(), &format!("/v1/client/lanes/{lane}")).await;
+    assert_eq!(status, StatusCode::OK, "{detail}");
+    let detail = &detail["value"];
+    let labels = detail["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry["label"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(labels, ["43", "42"]);
+    assert_eq!(detail["entries"][1]["approved_by_id"], "person/ada");
+    assert_eq!(detail["entries"][0]["joined_by_id"], "person/operator");
+    assert_eq!(detail["entries"][0]["state"], "waiting");
+    assert_eq!(detail["recent"][0]["change"], "approved");
+    assert_eq!(detail["recent"][1]["change"], "moved");
+    assert_eq!(detail["recent"][1]["anchor_id"], entry("42"));
+    assert_ne!(detail["revision"], "empty");
+    let typed: st3_client::Resource = serde_json::from_value(detail.clone()).unwrap();
+    assert!(matches!(typed, st3_client::Resource::Lane(_)), "{detail}");
+
+    let (status, absent) = client_json(app, "/v1/client/lanes/lane/absent/app").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{absent}");
 }

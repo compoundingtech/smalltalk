@@ -195,7 +195,10 @@ impl ApiError {
             | "stale-incarnation"
             | "stale-launch-preview"
             | "fleet-leaving" => StatusCode::CONFLICT,
-            "launch-review-not-authorized" | "wrong-message-recipient" => StatusCode::FORBIDDEN,
+            "launch-review-not-authorized" | "wrong-message-recipient" | "lane-approval-denied" => {
+                StatusCode::FORBIDDEN
+            }
+            "lane-not-found" => StatusCode::NOT_FOUND,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
@@ -293,6 +296,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/agents", get(client_agents))
         .route("/v1/client/agents/{*id}", get(client_agents_detail))
         .route("/v1/client/agent-queues/{*id}", get(client_v0::agent_queue))
+        .route("/v1/client/lanes", get(client_v0::lanes))
+        .route("/v1/client/lanes/{*id}", get(client_v0::lane_detail))
         .route("/v1/client/history", get(client_history))
         .route("/v1/client/history/{*id}", get(client_history_detail))
         .route("/v1/client/sessions", get(client_sessions))
@@ -486,6 +491,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/work/{action}/{*subject}", post(post_work_action))
         .route("/v1/gate-results", post(post_gate_result))
         .route("/v1/agent-queue-moves", post(move_agent_queue))
+        .route("/v1/lanes", get(list_lanes))
+        .route("/v1/lanes/{*lane}", get(get_lane))
+        .route("/v1/lane-changes", post(change_lane))
         .route("/v1/sessions", get(list_sessions))
         .route("/v1/sessions/{subject}/context/clear", post(clear_context))
         .route("/v1/sessions/{subject}/signal", post(signal_session))
@@ -851,12 +859,27 @@ fn client_error_code(code: Option<&str>) -> String {
         | "runtime-authority-indeterminate"
         | "remote-unavailable"
         | "internal" => code.unwrap_or("internal").to_owned(),
-        "launch-review-not-authorized" | "wrong-message-recipient" => "forbidden".into(),
+        "launch-review-not-authorized" | "wrong-message-recipient" | "lane-approval-denied" => {
+            "forbidden".into()
+        }
+        "lane-not-found" => "not-found".into(),
         "run-not-queued"
         | "missing-queue-anchor"
         | "unexpected-queue-anchor"
         | "invalid-queue-anchor"
-        | "invalid-queue-placement" => "validation-failed".into(),
+        | "invalid-queue-placement"
+        | "ambiguous-lane"
+        | "lane-closed"
+        | "entry-not-in-lane"
+        | "invalid-lane-actor"
+        | "invalid-lane-entry"
+        | "invalid-lane-outcome"
+        | "invalid-lane-placement"
+        | "missing-lane-anchor"
+        | "unexpected-lane-anchor"
+        | "invalid-lane-anchor"
+        | "invalid-lane-state"
+        | "invalid-lane-change" => "validation-failed".into(),
         _ => "internal".into(),
     }
 }
@@ -1259,6 +1282,14 @@ fn client_work_resources(
         .map(|(run, mission)| (run, mission.steps))
         .collect::<BTreeMap<_, _>>();
     let work_annotations = store.work_annotations(&work)?;
+    let run_missions = store.run_missions(
+        &work
+            .iter()
+            .map(|item| item.run.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+    )?;
     work.into_iter()
         .map(|work| {
             let operational = work_annotations
@@ -1328,6 +1359,7 @@ fn client_work_resources(
                 "kind": "work",
                 "revision": work.definition_hash,
                 "updated_at": client_timestamp(work.updated_at_unix_ms),
+                "mission_id": run_missions.get(&work.run),
                 "mission_run_id": work.run,
                 "generation_id": work.generation,
                 "definition_id": work.definition_hash,
@@ -1480,6 +1512,34 @@ fn client_agent_resources_uncached(
         .collect::<Vec<_>>();
     let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
     let member_faults = store.member_reconcile_faults_at(snapshot_index)?;
+    let queued_steps = work_queues
+        .values()
+        .flat_map(|queue| {
+            queue
+                .current_work_ids
+                .iter()
+                .chain(queue.next_work_id.iter())
+                .chain(queue.upcoming_work_ids.iter())
+                .cloned()
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let step_labels = store.step_labels(&queued_steps)?;
+    let label = |id: &String| {
+        step_labels.get(id).map(|step| {
+            json!({
+                "id": id,
+                "mission_id": step.mission,
+                "mission_run_id": step.run,
+                "path": step.path,
+                "title": step.title,
+                "goal": step.goal,
+                "state": step.status,
+                "since": client_timestamp(step.updated_at_unix_ms),
+            })
+        })
+    };
     let mut agents = status
         .subjects
         .into_iter()
@@ -1649,6 +1709,9 @@ fn client_agent_resources_uncached(
                 "next_work_id": queue.next_work_id,
                 "upcoming_work_ids": queue.upcoming_work_ids,
                 "queued_work_count": queue.queued_work_count,
+                "current_work": queue.current_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
+                "next_work": queue.next_work_id.as_ref().and_then(label),
+                "upcoming_work": queue.upcoming_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
                 "usage": usage,
                 "under": subject.under.into_iter().map(|relationship| json!({
                     "agent_id": relationship.agent,
@@ -3004,7 +3067,9 @@ async fn client_sessions_detail(
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
     if let Some(id) = id.strip_suffix("/timeline") {
-        let session_id = client_detail_id("session", id);
+        // An agent's timeline is its current session's: st resolves it, not the client.
+        let session_id = client_v0::conversation_session_id(&state, id)?;
+        let id = session_id.as_str();
         let managed = managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
             .map_err(ApiError::internal)?;
         if let Some((_, _, origin)) = managed {
@@ -3572,6 +3637,7 @@ async fn guard_bound_request(
     if ![
         "/v1/intent/apply",
         "/v1/agent-queue-moves",
+        "/v1/lane-changes",
         "/v1/work/",
         "/v1/attention",
         "/v1/launches",
@@ -8881,6 +8947,68 @@ async fn move_agent_queue(
     Ok(Json(claim))
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct LaneListQuery {
+    #[serde(default)]
+    all: bool,
+    #[serde(default)]
+    run: Option<String>,
+}
+
+/// Every open lane, every declared lane with `?all=true`, or the lanes of one `?run=`.
+async fn list_lanes(
+    State(state): State<AppState>,
+    Query(query): Query<LaneListQuery>,
+) -> Result<Json<Vec<crate::model::LaneView>>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || match query.run.as_deref() {
+        Some(run) => store.lanes_for_run(run),
+        None => store.lanes(query.all),
+    })
+    .await
+    .map(Json)
+}
+
+/// One lane by subject, `RUN/NAME`, run, mission, or unique name.
+async fn get_lane(
+    State(state): State<AppState>,
+    AxumPath(lane): AxumPath<String>,
+) -> Result<Json<crate::model::LaneView>, ApiError> {
+    let store = state.store.clone();
+    blocking_action(move || {
+        let subject = store.resolve_lane(&lane)?;
+        store
+            .lane(&subject)
+            .map_err(|error| St3Error::new("internal", error.to_string()))?
+            .ok_or_else(|| St3Error::new("lane-not-found", format!("no lane `{subject}`")))
+    })
+    .await
+    .map(Json)
+}
+
+/// Join, leave, move, mark, or approve one lane entry as a person or an agent. A harness can
+/// only act as its own seat; `guard_bound_request` checks that before this runs.
+async fn change_lane(
+    State(state): State<AppState>,
+    Json(mut request): Json<crate::model::LaneChangeRequest>,
+) -> Result<Json<crate::model::LaneChangeResponse>, ApiError> {
+    request.actor = match request.actor.trim() {
+        actor if actor.starts_with("person/") => actor.to_owned(),
+        actor => normalized_agent_actor(actor).ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "invalid-lane-actor",
+                "a lane change needs a person or agent actor",
+            ))
+        })?,
+    };
+    let store = state.store.clone();
+    let response = blocking_action(move || store.change_lane(&request)).await?;
+    if response.claim.is_some() {
+        signal_changed(&state);
+    }
+    Ok(Json(response))
+}
+
 fn normalized_agent_actor(actor: &str) -> Option<String> {
     if actor.starts_with("person/") || actor.starts_with("daemon/") || actor.starts_with("system/")
     {
@@ -13507,6 +13635,84 @@ mission "wake" state="ready" {
             "manual wakes must not use automatic attempts"
         );
         assert_eq!(wake.assignee_state, "idle");
+    }
+
+    #[test]
+    fn agents_name_their_queued_steps_and_missions_carry_open_run_steps() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let source = r#"
+version 2
+mission "labelled" state="ready" {
+  goal "Name steps where clients read them."
+  agent "worker" { workspace "/tmp"; harness "codex" {} }
+  step "first" { title "Say hello"; goal "Greet the fleet."; assigned-to "agent/${ST_MISSION_RUN}/worker" }
+  step "second" { goal "Wave goodbye."; depends-on "first"; assigned-to "agent/${ST_MISSION_RUN}/worker" }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "labelled-source")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "labelled".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "labelled-run".into(),
+            })
+            .unwrap();
+        materialize_run_agents(&state, &run);
+        let first = run
+            .steps
+            .iter()
+            .find(|step| step.step == "first")
+            .unwrap()
+            .subject
+            .clone();
+        store.set_step_state(&first, "ready", None).unwrap();
+        let index = store.index().unwrap();
+
+        let agents = client_agent_resources(&store, false, "snapshot", index).unwrap();
+        let next = &agents[0]["next_work"];
+        assert_eq!(next["id"], first);
+        assert_eq!(next["mission_id"], "mission/labelled");
+        assert_eq!(next["mission_run_id"], run.subject);
+        assert_eq!(next["path"], "first");
+        assert_eq!(next["title"], "Say hello");
+        assert_eq!(next["goal"], "Greet the fleet.");
+        assert_eq!(next["state"], "ready");
+        assert_eq!(agents[0]["upcoming_work"], json!([next]));
+        assert_eq!(agents[0]["current_work"], json!([]));
+
+        // The list carries the open run's steps, so a client never joins work to missions.
+        let missions = client_v0::mission_resources(&store, index, false, None).unwrap();
+        let steps = missions[0]["run_details"][0]["steps"].as_array().unwrap();
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| (
+                    step["path"].as_str().unwrap(),
+                    step["state"].as_str().unwrap()
+                ))
+                .collect::<Vec<_>>(),
+            [("first", "ready"), ("second", "pending")]
+        );
+        assert_eq!(steps[0]["goals"], json!(["Greet the fleet."]));
+        assert_eq!(steps[0]["assignee"], format!("agent/{}/worker", run.id));
     }
 
     #[test]

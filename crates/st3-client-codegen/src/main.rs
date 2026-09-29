@@ -455,6 +455,8 @@ fn validate_surfaces(
         "AgentQueue",
         "AgentQueueRun",
         "AgentQueueMove",
+        "LaneEntry",
+        "LaneChange",
         "TimelineEntry",
         "TimelinePage",
         "ConversationChanges",
