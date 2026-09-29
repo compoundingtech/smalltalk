@@ -770,10 +770,19 @@ fn nodes_that_sync_hold_the_same_envelopes_and_project_the_same_graph() {
                 .collect::<Vec<_>>()
         }
     };
-    let failures = seeds
-        .iter()
-        .filter_map(|seed| run(*seed, steps).err())
-        .collect::<Vec<_>>();
+    // Each run has its own nodes, so runs share nothing and go in parallel.
+    let failures = std::thread::scope(|scope| {
+        seeds
+            .iter()
+            .map(|seed| scope.spawn(move || run(*seed, steps)))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .filter_map(|run| match run.join() {
+                Ok(result) => result.err(),
+                Err(panic) => std::panic::resume_unwind(panic),
+            })
+            .collect::<Vec<_>>()
+    });
     assert!(
         failures.is_empty(),
         "{} of {} runs ended with different digests:\n\n{}",
