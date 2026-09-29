@@ -1,6 +1,7 @@
 use std::env;
 use std::fs;
 use std::net::SocketAddr;
+use std::os::unix::ffi::OsStrExt as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context as _, Result};
@@ -460,6 +461,23 @@ impl Config {
     }
 }
 
+/// The terminating NUL also occupies a byte in sockaddr_un.sun_path.
+#[cfg(target_os = "macos")]
+const SUN_PATH_BYTES: usize = 104;
+#[cfg(not(target_os = "macos"))]
+const SUN_PATH_BYTES: usize = 108;
+
+pub fn validate_unix_socket_path(socket: &Path, flag: &str) -> Result<()> {
+    let length = socket.as_os_str().as_bytes().len();
+    anyhow::ensure!(
+        length < SUN_PATH_BYTES,
+        "Unix socket path {} is {length} bytes; maximum is {} bytes (sun_path limit: {SUN_PATH_BYTES} bytes including NUL). Use {flag} or set XDG_RUNTIME_DIR to a shorter directory",
+        socket.display(),
+        SUN_PATH_BYTES - 1
+    );
+    Ok(())
+}
+
 fn xdg_dir(variable: &str, home_suffix: &str) -> PathBuf {
     env::var_os(variable).map(PathBuf::from).unwrap_or_else(|| {
         env::var_os("HOME")
@@ -483,6 +501,26 @@ fn host_name() -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn unix_socket_path_reports_byte_limit_and_override() {
+        let limit = SUN_PATH_BYTES - 1;
+        let prefix = "/tmp/";
+        let accepted = PathBuf::from(format!("{prefix}{}", "x".repeat(limit - prefix.len())));
+        validate_unix_socket_path(&accepted, "--socket").unwrap();
+        let one_byte_over = PathBuf::from(format!("{}x", accepted.display()));
+        assert!(validate_unix_socket_path(&one_byte_over, "--socket").is_err());
+
+        let rejected = PathBuf::from(format!("{}é", accepted.display()));
+        let error = validate_unix_socket_path(&rejected, "--client-gateway-socket")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(&rejected.display().to_string()), "{error}");
+        assert!(error.contains(&format!("{} bytes", limit + 2)), "{error}");
+        assert!(error.contains(&format!("sun_path limit: {SUN_PATH_BYTES}")), "{error}");
+        assert!(error.contains("--client-gateway-socket"), "{error}");
+        assert!(error.contains("XDG_RUNTIME_DIR"), "{error}");
+    }
 
     #[test]
     fn observation_retention_defaults_to_a_week_and_rejects_short_windows() {
