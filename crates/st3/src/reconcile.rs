@@ -22538,7 +22538,11 @@ agent "worker" { workspace "/tmp"; command "true"; restart "never" }
 agent "worker" { workspace "/tmp"; command "true"; restart "never" }
 mission "context" state="ready" {
   goal "Give the worker a clean step."
-  step "work" { assigned-to "agent/node.worker"; fresh-context }
+  step "work" {
+    assigned-to "agent/node.worker"
+    fresh-context
+    goal "Work from the fresh session."
+  }
 }"#,
             "fresh-context-source",
         );
@@ -22630,13 +22634,9 @@ mission "context" state="ready" {
             claim("old", "stale-claim").unwrap_err().code,
             "fresh-context-pending"
         );
-        assert_eq!(
-            claim("new", "new-claim")
-                .unwrap()
-                .claim_incarnation
-                .as_deref(),
-            Some("new")
-        );
+        let claimed = claim("new", "new-claim").unwrap();
+        assert_eq!(claimed.claim_incarnation.as_deref(), Some("new"));
+        assert_eq!(claimed.goals, ["Work from the fresh session."]);
     }
 
     #[test]
@@ -22645,7 +22645,7 @@ mission "context" state="ready" {
         apply_source(
             &store,
             r#"version 2
-agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+agent "worker" { workspace "/tmp"; harness "codex" { model "gpt-6-sol" }; restart "never" }
 mission "context-wake" state="ready" {
   goal "Wake a worker in a fresh session."
   step "work" { assigned-to "agent/node.worker"; fresh-context }
@@ -22717,6 +22717,17 @@ mission "context-wake" state="ready" {
             2,
             "fresh context overrides restart never"
         );
+        let launched = runtime.started_members.lock().unwrap();
+        let LaunchSpec::Argv(argv) = &launched.last().unwrap().launch else {
+            panic!("the replacement harness must have an argv launch");
+        };
+        assert!(argv.iter().any(|arg| arg == crate::boot::BOOT_PROMPT));
+        assert!(
+            !argv
+                .iter()
+                .any(|arg| arg == "--resume" || arg == "--continue")
+        );
+        drop(launched);
 
         *runtime.ptys.lock().unwrap() = vec![observed("new", "running")];
         ready("new");
