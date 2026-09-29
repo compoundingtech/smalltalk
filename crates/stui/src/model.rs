@@ -98,32 +98,49 @@ impl Model {
     }
 
     pub async fn reload(&mut self, client: &Client) -> Result<()> {
-        let (now, launches, missions, work, agents, sessions, runtimes, machines, devices) = tokio::try_join!(
+        // Each list loads on its own. On a busy fleet a multi-page read can keep failing while
+        // the graph moves; one such list must not hold every other screen at "Loading".
+        let current_work = |client| read_pages_mode(client, Kind::Work, false);
+        let (now, launches, missions, work, agents, sessions, runtimes, machines, devices) = tokio::join!(
             read_pages(client, Kind::Now),
             read_pages(client, Kind::Launches),
             read_pages(client, Kind::Missions),
-            read_pages(client, Kind::Work),
+            current_work(client),
             read_pages(client, Kind::Agents),
             read_pages(client, Kind::Sessions),
             read_pages(client, Kind::Runtimes),
             read_pages(client, Kind::Machines),
             read_pages(client, Kind::Devices),
-        )?;
-        (
-            self.now,
-            self.launches,
-            self.missions,
-            self.work,
-            self.agents,
-            self.sessions,
-            self.runtimes,
-            self.machines,
-            self.devices,
-        ) = (
-            now, launches, missions, work, agents, sessions, runtimes, machines, devices,
         );
-        self.last_work_history_refresh = Some(std::time::Instant::now());
-        self.status = "Connected".into();
+        let mut failed = Vec::new();
+        let mut first_error = None;
+        let mut apply = |kind: Kind, result: Result<Collection>, slot: &mut Collection| match result
+        {
+            Ok(collection) => *slot = collection,
+            Err(error) => {
+                failed.push(kind);
+                first_error.get_or_insert(error);
+            }
+        };
+        apply(Kind::Now, now, &mut self.now);
+        apply(Kind::Launches, launches, &mut self.launches);
+        apply(Kind::Missions, missions, &mut self.missions);
+        apply(Kind::Work, work, &mut self.work);
+        apply(Kind::Agents, agents, &mut self.agents);
+        apply(Kind::Sessions, sessions, &mut self.sessions);
+        apply(Kind::Runtimes, runtimes, &mut self.runtimes);
+        apply(Kind::Machines, machines, &mut self.machines);
+        apply(Kind::Devices, devices, &mut self.devices);
+        if failed.len() == 9 {
+            return Err(first_error.unwrap_or_else(|| anyhow::anyhow!("nothing loaded")));
+        }
+        // Retry only what failed, on the next sync; work history comes later and rarely.
+        self.pending_refresh.extend(failed.iter().copied());
+        self.status = if failed.is_empty() {
+            "Connected".into()
+        } else {
+            format!("Connected · still loading {}", failed.len())
+        };
         Ok(())
     }
 
@@ -192,9 +209,12 @@ impl Model {
                     .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(600));
             let collection = match read_pages_mode(client, kind, full_work_history).await {
                 Ok(collection) => collection,
-                Err(error) => {
-                    self.pending_refresh.extend(remaining);
-                    return Err(error);
+                Err(_) => {
+                    // Keep this list's last good copy and try it again on the next pass;
+                    // the other lists still refresh.
+                    remaining.remove(&kind);
+                    self.pending_refresh.insert(kind);
+                    continue;
                 }
             };
             remaining.remove(&kind);
