@@ -10,7 +10,8 @@ const TERMINAL_CAPABILITY_PROTOCOL_PREFIX: &str = "st3.cap.";
 const LOCAL_PERSON_HEADER: &str = "x-st3-person";
 
 // A client holds one socket for all its current collection views. A subscription
-// is a bounded window; history stays on the paged HTTP endpoints.
+// is a bounded window; history stays on the paged HTTP endpoints. A terminal is one
+// more subscription on the same socket: whole screens, the latest only.
 #[derive(Clone, Deserialize)]
 struct CollectionSubscribe {
     kind: String,
@@ -21,13 +22,35 @@ struct CollectionSubscribe {
     person: Option<String>,
     actor: Option<String>,
     status: Option<String>,
+    /// A terminal subscription names the terminal, the incarnation `terminal.attach` fenced,
+    /// and the single-use stream capability that attach returned.
+    terminal: Option<String>,
+    incarnation: Option<String>,
+    capability: Option<String>,
+    /// A conversation subscription names an agent or a session.
+    conversation: Option<String>,
 }
 
 struct CollectionSubscription {
     request: CollectionSubscribe,
+    /// Whether the client has this subscription's first snapshot.
+    delivered: bool,
     previous: BTreeMap<String, Value>,
     order: Vec<String>,
     has_more: bool,
+}
+
+const COLLECTION_MAX_SUBSCRIPTIONS: usize = 8;
+/// The least time between two rereads of a socket's held windows. A window read can take a
+/// few hundred milliseconds and the fleet commits about once a second, so rereading on every
+/// commit kept a daemon busy for as long as a client stayed connected. Commits in between are
+/// read together; a new subscription is still read at once.
+const COLLECTION_REREAD_INTERVAL: Duration = Duration::from_millis(1_500);
+
+/// Claims that no collection window shows: rereading for them only costs.
+fn collection_ignores(collection: &str, kind: &str) -> bool {
+    matches!(kind, "daemon.diagnostic" | "transport.observed")
+        || (kind == "harness.usage" && collection != "agents")
 }
 
 pub(super) async fn collection_stream(
@@ -55,6 +78,8 @@ pub(super) async fn collection_stream(
         .on_upgrade(move |socket| collection_stream_socket(socket, state, session)))
 }
 
+/// Read one bounded window. The whole read sees one SQLite snapshot, and the fence names
+/// that snapshot's index, so commits landing meanwhile never tear or delay it.
 async fn collection_items(
     state: &AppState,
     session: &ClientSession,
@@ -78,25 +103,23 @@ async fn collection_items(
     } else {
         None
     };
-    let snapshot = new_client_snapshot(state);
-    let store = state.store.clone();
-    let index = snapshot.store_index;
-    let at = snapshot.created_at.clone();
+    let state = state.clone();
     let actor = request.actor.clone();
     let status = request.status.clone();
     let collection = request.collection.clone();
-    let (mut items, has_more) =
-        super::blocking_store(move || -> anyhow::Result<(Vec<Value>, bool)> {
+    let (snapshot, mut items, has_more) = super::blocking_store(move || {
+        let store = state.store.clone();
+        store.read_snapshot(|index| {
+            let snapshot = client_snapshot_at(&state, index);
+            let at = snapshot.created_at.clone();
             let mut items = match collection.as_str() {
                 "missions" => {
                     let mut ids =
                         store.mission_collection_ids(false, 0, limit.saturating_add(1))?;
                     let has_more = ids.len() > limit;
                     ids.truncate(limit);
-                    return Ok((
-                        mission_resources_filtered(&store, index, false, None, Some(&ids))?,
-                        has_more,
-                    ));
+                    let items = mission_resources_filtered(&store, index, false, None, Some(&ids))?;
+                    return Ok((snapshot, items, has_more));
                 }
                 "attention" => client_attention_resources(&store, person.as_deref(), false)?,
                 "agents" => client_agent_resources(&store, false, &at, index)?,
@@ -113,15 +136,10 @@ async fn collection_items(
                 items.retain(|item| item["state"].as_str() == Some(status.as_str()));
             }
             let has_more = items.len() > limit;
-            Ok((items, has_more))
+            Ok((snapshot, items, has_more))
         })
-        .await?;
-    // A read that raced a commit must never pair newer rows with an older fence.
-    if state.store.index().map_err(ApiError::internal)? != index {
-        return Err(client_page_expired(
-            "collection changed during snapshot; resubscribe",
-        ));
-    }
+    })
+    .await?;
     items.truncate(limit);
     Ok((snapshot, items, has_more))
 }
@@ -136,64 +154,508 @@ async fn send_collection(socket: &mut WebSocket, value: Value) -> bool {
     socket.send(WsMessage::Text(payload.into())).await.is_ok()
 }
 
+enum Refreshed {
+    /// Up to date, whether or not anything was sent.
+    Current,
+    /// The subscription failed before its first snapshot and is gone.
+    Dropped,
+    /// The socket closed.
+    Closed,
+}
+
+/// Bring one subscription up to date from a fresh read: its snapshot first, then only what
+/// changed.
+async fn deliver_collection(
+    socket: &mut WebSocket,
+    subscription: &mut CollectionSubscription,
+    read: Result<(ClientSnapshot, Vec<Value>, bool), ApiError>,
+) -> Refreshed {
+    let request = &subscription.request;
+    let (snapshot, items, has_more) = match read {
+        Ok(read) => read,
+        Err(error) if !subscription.delivered => {
+            let sent = send_collection(socket, json!({"kind":"error", "id":request.id, "code":error.code, "message":error.message})).await;
+            return if sent {
+                Refreshed::Dropped
+            } else {
+                Refreshed::Closed
+            };
+        }
+        Err(_) => {
+            let sent = send_collection(socket, json!({"kind":"resync", "id":request.id})).await;
+            return if sent {
+                Refreshed::Current
+            } else {
+                Refreshed::Closed
+            };
+        }
+    };
+    let order = items
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let current: BTreeMap<String, Value> = items
+        .iter()
+        .filter_map(|item| Some((item["id"].as_str()?.to_owned(), item.clone())))
+        .collect();
+    let sent = if !subscription.delivered {
+        send_collection(socket, json!({"kind":"snapshot", "id":request.id, "collection":request.collection, "snapshot":snapshot, "items":items, "order":order, "has_more":has_more})).await
+    } else {
+        let upserts = current
+            .iter()
+            .filter(|(id, value)| subscription.previous.get(*id) != Some(*value))
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        let removes = subscription
+            .previous
+            .keys()
+            .filter(|id| !current.contains_key(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if upserts.is_empty()
+            && removes.is_empty()
+            && order == subscription.order
+            && has_more == subscription.has_more
+        {
+            true
+        } else {
+            send_collection(socket, json!({"kind":"changes", "id":request.id, "collection":request.collection, "snapshot":snapshot, "upserts":upserts, "removes":removes, "order":order, "has_more":has_more})).await
+        }
+    };
+    if !sent {
+        return Refreshed::Closed;
+    }
+    subscription.delivered = true;
+    subscription.previous = current;
+    subscription.order = order;
+    subscription.has_more = has_more;
+    Refreshed::Current
+}
+
+/// Wait for the next frame from any held terminal. `None` means its follower stopped.
+async fn next_terminal_frame(
+    terminals: &mut BTreeMap<String, watch::Receiver<TerminalFrame>>,
+) -> (String, Option<TerminalFrame>) {
+    let changes = terminals.iter_mut().map(|(id, receiver)| {
+        Box::pin(async move {
+            let frame = match receiver.changed().await {
+                Ok(()) => Some(receiver.borrow_and_update().clone()),
+                Err(_) => None,
+            };
+            (id.clone(), frame)
+        })
+    });
+    futures_util::future::select_all(changes).await.0
+}
+
+async fn open_terminal_subscription(
+    state: &AppState,
+    session: &ClientSession,
+    request: &CollectionSubscribe,
+) -> Result<watch::Receiver<TerminalFrame>, ApiError> {
+    let id = request
+        .terminal
+        .as_deref()
+        .map(|terminal| terminal.trim_start_matches("terminal/"))
+        .filter(|terminal| !terminal.is_empty())
+        .ok_or_else(|| validation("a terminal subscription names its terminal"))?
+        .to_owned();
+    let follow = {
+        let state = state.clone();
+        let session = session.clone();
+        let incarnation = request.incarnation.clone();
+        let capability = request.capability.clone();
+        tokio::task::spawn_blocking(move || {
+            prepare_terminal_follow(
+                &state,
+                &session,
+                &id,
+                incarnation.as_deref(),
+                capability.as_deref(),
+            )
+        })
+        .await
+        .map_err(ApiError::internal)??
+    };
+    let (sender, receiver) = watch::channel(TerminalFrame::Waiting);
+    let state = state.clone();
+    tokio::spawn(follow.run(state, TerminalSink::Subscription(sender)));
+    Ok(receiver)
+}
+
+/// Where a conversation is read: here, or on the host that owns its session.
+fn conversation_owner_host(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+) -> Result<Option<String>, ApiError> {
+    let remote = super::managed_session_owner_at(
+        &state.store,
+        new_client_snapshot(state).store_index,
+        session_id,
+    )
+    .map_err(ApiError::internal)?
+    .and_then(|(_, _, origin)| origin)
+    .filter(|origin| origin != state.store.origin())
+    .map(|origin| client_host_id(&origin));
+    if let Some(owner) = &remote {
+        if !session.authority_actor.starts_with("person/") {
+            return Err(forbidden("a remote conversation requires a concrete person"));
+        }
+        if state
+            .client_relay
+            .as_ref()
+            .is_none_or(|relay| !relay.has_peer(owner))
+        {
+            return Err(remote_unavailable(owner));
+        }
+    }
+    Ok(remote)
+}
+
+/// A conversation's newest page, read here or relayed from its owner.
+async fn conversation_page(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    remote: Option<&str>,
+) -> Result<Value, ApiError> {
+    const PAGE: usize = 200;
+    if let Some(owner) = remote {
+        let relay = state
+            .client_relay
+            .as_ref()
+            .ok_or_else(|| remote_unavailable(owner))?;
+        return relay
+            .read(
+                owner,
+                &crate::peer::ClientReadRequest {
+                    authority_actor: session.authority_actor.clone(),
+                    request: crate::peer::ClientReadOperation::Timeline {
+                        session_id: session_id.to_owned(),
+                        limit: PAGE,
+                        cursor: None,
+                    },
+                },
+            )
+            .await
+            .map_err(|error| remote_read_error(owner, error));
+    }
+    let (state, session, session_id) = (state.clone(), session.clone(), session_id.to_owned());
+    tokio::task::spawn_blocking(move || {
+        timeline_value(
+            &state,
+            &new_client_snapshot(&state),
+            &session,
+            &session_id,
+            &ClientListQuery {
+                limit: Some(PAGE),
+                ..Default::default()
+            },
+        )
+        .map(|page| page.0)
+    })
+    .await
+    .map_err(ApiError::internal)?
+}
+
+/// What changed in a conversation after `after`, waiting up to `wait_ms` for something to.
+async fn conversation_changes_value(
+    state: &AppState,
+    session: &ClientSession,
+    session_id: &str,
+    remote: Option<&str>,
+    after: Option<&str>,
+    wait_ms: u64,
+) -> Result<Value, ApiError> {
+    if let Some(owner) = remote {
+        let relay = state
+            .client_relay
+            .as_ref()
+            .ok_or_else(|| remote_unavailable(owner))?;
+        return relay
+            .read(
+                owner,
+                &crate::peer::ClientReadRequest {
+                    authority_actor: session.authority_actor.clone(),
+                    request: crate::peer::ClientReadOperation::ConversationChanges {
+                        session_id: session_id.to_owned(),
+                        after: after.map(str::to_owned),
+                        wait_ms,
+                    },
+                },
+            )
+            .await
+            .map_err(|error| remote_read_error(owner, error));
+    }
+    conversation_changes_local(state, session, session_id, after, wait_ms).await
+}
+
+/// Follow one conversation for a collection socket: its newest page, then each change, until
+/// the socket stops listening. A change the server can no longer replay sends the page again.
+async fn follow_conversation(
+    state: AppState,
+    session: ClientSession,
+    id: String,
+    session_id: String,
+    remote: Option<String>,
+    outbox: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
+) {
+    let remote = remote.as_deref();
+    let failed = |error: ApiError| {
+        json!({"kind":"error", "id":id, "collection":"conversation", "code":error.code, "message":error.message})
+    };
+    loop {
+        // The cursor first, so nothing that lands while the page is read is lost.
+        let start =
+            match conversation_changes_value(&state, &session, &session_id, remote, None, 0).await
+            {
+                Ok(start) => start,
+                Err(error) => {
+                    let _ = outbox.send((id.clone(), failed(error)));
+                    return;
+                }
+            };
+        let page = match conversation_page(&state, &session, &session_id, remote).await {
+            Ok(page) => page,
+            Err(error) => {
+                let _ = outbox.send((id.clone(), failed(error)));
+                return;
+            }
+        };
+        let mut frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":true, "items":page["items"], "has_more":page["page"]["has_more"]});
+        // A page of long tool output can outgrow one frame: keep its newest entries.
+        while frame_bytes(&frame) > CLIENT_MAX_RESPONSE_BYTES {
+            let Some(items) = frame["items"].as_array_mut().filter(|items| items.len() > 1)
+            else {
+                break;
+            };
+            let drop = items.len().div_ceil(4);
+            items.drain(..drop);
+            frame["has_more"] = Value::Bool(true);
+        }
+        if outbox.send((id.clone(), frame)).is_err() {
+            return;
+        }
+        let mut after = start["next_cursor"].as_str().map(str::to_owned);
+        loop {
+            match conversation_changes_value(
+                &state,
+                &session,
+                &session_id,
+                remote,
+                after.as_deref(),
+                10_000,
+            )
+            .await
+            {
+                Ok(changes) => {
+                    if changes["items"]
+                        .as_array()
+                        .is_some_and(|items| !items.is_empty())
+                    {
+                        let frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":false, "items":changes["items"]});
+                        // Too much changed for one frame: send the newest page instead.
+                        if frame_bytes(&frame) > CLIENT_MAX_RESPONSE_BYTES {
+                            break;
+                        }
+                        if outbox.send((id.clone(), frame)).is_err() {
+                            return;
+                        }
+                    }
+                    after = changes["next_cursor"].as_str().map(str::to_owned);
+                }
+                Err(error) if error.code == "cursor-gap" => break,
+                Err(error) => {
+                    let _ = outbox.send((id.clone(), failed(error)));
+                    return;
+                }
+            }
+            if outbox.is_closed() {
+                return;
+            }
+        }
+    }
+}
+
+fn frame_bytes(frame: &Value) -> usize {
+    serde_json::to_vec(frame).map_or(usize::MAX, |bytes| bytes.len())
+}
+
+/// The conversation followers a socket holds; they stop when it closes.
+#[derive(Default)]
+struct ConversationFollowers(BTreeMap<String, tokio::task::AbortHandle>);
+
+impl ConversationFollowers {
+    fn stop(&mut self, id: &str) {
+        if let Some(follower) = self.0.remove(id) {
+            follower.abort();
+        }
+    }
+}
+
+impl Drop for ConversationFollowers {
+    fn drop(&mut self) {
+        for follower in self.0.values() {
+            follower.abort();
+        }
+    }
+}
+
 async fn collection_stream_socket(mut socket: WebSocket, state: AppState, session: ClientSession) {
     // Subscribe before the first snapshot, so a commit while building it wakes
     // the next loop and is reflected in a following change frame.
     let mut changed = state.event_notify.subscribe();
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
+    let mut terminals = BTreeMap::<String, watch::Receiver<TerminalFrame>>::new();
+    let mut conversations = ConversationFollowers::default();
+    let (conversation_outbox, mut conversation_frames) =
+        tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
+    // The commits already weighed for a reread, whether one is due, and when the last ran.
+    let mut weighed = state.store.index().unwrap_or_default();
+    let mut reread_due = false;
+    let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
     loop {
+        // The subscriptions to read after this wake-up.
+        let mut refresh = Vec::<String>::new();
+        // A command already waiting goes first: under steady commits a commit wake is almost
+        // always ready too, and a fair pick could keep rereading the held windows while a new
+        // subscription waits. Otherwise every source gets a fair pick.
+        let waiting = futures_util::FutureExt::now_or_never(socket.recv());
+        let command_waiting = waiting.is_some();
         tokio::select! {
-            incoming = socket.recv() => {
-                let Some(Ok(message)) = incoming else { return; };
-                let WsMessage::Text(payload) = message else {
-                    if matches!(message, WsMessage::Close(_)) { return; }
-                    continue;
-                };
-                let Ok(request) = serde_json::from_str::<CollectionSubscribe>(&payload) else {
-                    if !send_collection(&mut socket, json!({"kind":"error", "message":"invalid collection command"})).await { return; }
-                    continue;
-                };
-                if request.kind == "unsubscribe" {
-                    subscriptions.remove(&request.id);
-                    continue;
-                }
-                if request.kind != "subscribe" || request.id.is_empty() || request.id.len() > 128 || subscriptions.len() >= 8 && !subscriptions.contains_key(&request.id) {
-                    if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "message":"invalid subscription or subscription limit exceeded"})).await { return; }
-                    continue;
-                }
-                match collection_items(&state, &session, &request).await {
-                    Ok((snapshot, items, has_more)) => {
-                        let order = items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned)).collect::<Vec<_>>();
-                        let previous = items.iter().filter_map(|item| Some((item["id"].as_str()?.to_owned(), item.clone()))).collect();
-                        if !send_collection(&mut socket, json!({"kind":"snapshot", "id":request.id, "collection":request.collection, "snapshot":snapshot, "items":items, "order":order, "has_more":has_more})).await { return; }
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { request, previous, order, has_more });
+            incoming = async { match waiting { Some(incoming) => incoming, None => socket.recv().await } } => {
+                // Take every command already waiting, so subscriptions sent together are read
+                // together below.
+                let mut next = Some(incoming);
+                while let Some(incoming) = next.take() {
+                    'command: {
+                        let Some(Ok(message)) = incoming else { return; };
+                        let WsMessage::Text(payload) = message else {
+                            if matches!(message, WsMessage::Close(_)) { return; }
+                            break 'command;
+                        };
+                        let Ok(request) = serde_json::from_str::<CollectionSubscribe>(&payload) else {
+                            if !send_collection(&mut socket, json!({"kind":"error", "message":"invalid collection command"})).await { return; }
+                            break 'command;
+                        };
+                        if request.kind == "unsubscribe" {
+                            subscriptions.remove(&request.id);
+                            terminals.remove(&request.id);
+                            conversations.stop(&request.id);
+                            break 'command;
+                        }
+                        let held = subscriptions.contains_key(&request.id) || terminals.contains_key(&request.id) || conversations.0.contains_key(&request.id);
+                        if request.kind != "subscribe" || request.id.is_empty() || request.id.len() > 128 || subscriptions.len() + terminals.len() + conversations.0.len() >= COLLECTION_MAX_SUBSCRIPTIONS && !held {
+                            if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "message":"invalid subscription or subscription limit exceeded"})).await { return; }
+                            break 'command;
+                        }
+                        // A subscription with a held ID replaces it.
+                        subscriptions.remove(&request.id);
+                        terminals.remove(&request.id);
+                        conversations.stop(&request.id);
+                        if request.collection == "conversation" {
+                            let target = request.conversation.as_deref().unwrap_or_default();
+                            let opened = conversation_session_id(&state, target).and_then(|session_id| {
+                                let remote = conversation_owner_host(&state, &session, &session_id)?;
+                                Ok((session_id, remote))
+                            });
+                            match opened {
+                                Ok((session_id, remote)) => {
+                                    let follower = tokio::spawn(follow_conversation(state.clone(), session.clone(), request.id.clone(), session_id, remote, conversation_outbox.clone()));
+                                    conversations.0.insert(request.id.clone(), follower.abort_handle());
+                                }
+                                Err(error) => {
+                                    if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "collection":"conversation", "code":error.code, "message":error.message})).await { return; }
+                                }
+                            }
+                            break 'command;
+                        }
+                        if request.collection == "terminal" {
+                            match open_terminal_subscription(&state, &session, &request).await {
+                                Ok(receiver) => {
+                                    terminals.insert(request.id.clone(), receiver);
+                                }
+                                Err(error) => {
+                                    if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "collection":"terminal", "code":error.code, "message":error.message})).await { return; }
+                                }
+                            }
+                            break 'command;
+                        }
+                        refresh.push(request.id.clone());
+                        subscriptions.insert(request.id.clone(), CollectionSubscription { request, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false });
+
                     }
-                    Err(error) => {
-                        if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "code":error.code, "message":error.message})).await { return; }
-                    }
+                    next = futures_util::FutureExt::now_or_never(socket.recv());
                 }
             }
-            result = changed.changed() => {
+            result = changed.changed(), if !command_waiting => {
                 if result.is_err() { return; }
-                for subscription in subscriptions.values_mut() {
-                    let (snapshot, items, has_more) = match collection_items(&state, &session, &subscription.request).await {
-                        Ok(value) => value,
-                        Err(_) => {
-                            if !send_collection(&mut socket, json!({"kind":"resync", "id":subscription.request.id})).await { return; }
-                            continue;
-                        }
-                    };
-                    let order = items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned)).collect::<Vec<_>>();
-                    let current: BTreeMap<String, Value> = items.into_iter().filter_map(|item| Some((item["id"].as_str()?.to_owned(), item))).collect();
-                    let upserts = current.iter().filter(|(id, value)| subscription.previous.get(*id) != Some(*value)).map(|(_, value)| value.clone()).collect::<Vec<_>>();
-                    let removes = subscription.previous.keys().filter(|id| !current.contains_key(*id)).cloned().collect::<Vec<_>>();
-                    if !upserts.is_empty() || !removes.is_empty() || order != subscription.order || has_more != subscription.has_more {
-                        if !send_collection(&mut socket, json!({"kind":"changes", "id":subscription.request.id, "collection":subscription.request.collection, "snapshot":snapshot, "upserts":upserts, "removes":removes, "order":order, "has_more":has_more})).await { return; }
-                    }
-                    subscription.previous = current;
-                    subscription.order = order;
-                    subscription.has_more = has_more;
+                // Weigh only the commits since the last look: a reread is due when one of them
+                // can change a held window.
+                let index = state.store.index().unwrap_or(weighed);
+                if index > weighed {
+                    let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims).unwrap_or_default();
+                    reread_due |= claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
+                        claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
+                    });
+                    weighed = index;
                 }
+                if !reread_due || last_reread.elapsed() < COLLECTION_REREAD_INTERVAL { continue; }
+                refresh.extend(subscriptions.keys().cloned());
+            }
+            () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && reread_due => {
+                refresh.extend(subscriptions.keys().cloned());
+            }
+            Some((id, frame)) = conversation_frames.recv(), if !command_waiting => {
+                // A follower stopped by unsubscribe may still have had a frame on the way.
+                if !conversations.0.contains_key(&id) { continue; }
+                if frame["kind"] == "error" { conversations.0.remove(&id); }
+                if !send_collection(&mut socket, frame).await { return; }
+                continue;
+            }
+            (id, frame) = next_terminal_frame(&mut terminals), if !command_waiting && !terminals.is_empty() => {
+                let message = match frame {
+                    Some(TerminalFrame::Waiting) => continue,
+                    Some(TerminalFrame::Screen(envelope)) => json!({"kind":"screen", "id":id, "collection":"terminal", "snapshot":envelope["snapshot"], "value":envelope["value"]}),
+                    Some(TerminalFrame::Ended(error)) => {
+                        terminals.remove(&id);
+                        json!({"kind":"error", "id":id, "collection":"terminal", "code":error["code"], "message":error["message"]})
+                    }
+                    None => {
+                        terminals.remove(&id);
+                        json!({"kind":"error", "id":id, "collection":"terminal", "code":"internal", "message":"the terminal stream stopped"})
+                    }
+                };
+                if !send_collection(&mut socket, message).await { return; }
+                continue;
+            }
+        }
+        if refresh.is_empty() {
+            continue;
+        }
+        if refresh.len() >= subscriptions.len() && !subscriptions.is_empty() {
+            reread_due = false;
+            last_reread = tokio::time::Instant::now();
+        }
+        // Read every due window at once, each in its own snapshot, then send them in order:
+        // one slow window never holds back the others' reads.
+        let reads = futures_util::future::join_all(refresh.into_iter().filter_map(|id| {
+            let request = subscriptions.get(&id)?.request.clone();
+            let (state, session) = (&state, &session);
+            Some(async move { (id, collection_items(state, session, &request).await) })
+        }))
+        .await;
+        for (id, read) in reads {
+            let Some(subscription) = subscriptions.get_mut(&id) else {
+                continue;
+            };
+            match deliver_collection(&mut socket, subscription, read).await {
+                Refreshed::Current => {}
+                Refreshed::Dropped => {
+                    subscriptions.remove(&id);
+                }
+                Refreshed::Closed => return,
             }
         }
     }
@@ -634,7 +1096,7 @@ fn mission_visualization(
     })))
 }
 
-fn mission_resources(
+pub(super) fn mission_resources(
     store: &Store,
     snapshot_index: u64,
     history: bool,
@@ -744,7 +1206,12 @@ fn mission_resources_filtered(
                 }
             };
             let historical = matches!(state, "completed" | "failed" | "cancelled" | "retired");
-            if !history && historical {
+            // A run that failed or was cancelled stays in the current view for a while.
+            let recently_ended = matches!(state, "failed" | "cancelled")
+                && latest.is_some_and(|run| {
+                    run.updated_at_unix_ms >= crate::store::recently_ended_since()
+                });
+            if !history && historical && !recently_ended {
                 return Ok(None);
             }
             let run_generations = runs
@@ -829,6 +1296,34 @@ fn mission_resources_filtered(
                         run.steps.iter().find(|step| step.status == "blocked").map(
                             |step| json!({"step": step.subject, "reason": step.blocked_reason}),
                         );
+                    // A mission carries the steps of its open runs and its latest run, and its
+                    // detail carries every run's steps, so a client never joins work to missions.
+                    let shows_steps = selected_id.is_some()
+                        || !matches!(run.status.as_str(), "completed" | "failed" | "cancelled")
+                        || latest.is_some_and(|latest| latest.subject == run.subject);
+                    let steps = shows_steps.then(|| {
+                        run.steps
+                            .iter()
+                            .map(|step| {
+                                json!({
+                                    "id": step.subject,
+                                    "path": step.step,
+                                    "title": step.title,
+                                    "state": step.status,
+                                    "attempt": step.attempt,
+                                    "assignee": step.assigned_to,
+                                    "claimant": step.claimant,
+                                    "agentless": step.agentless,
+                                    "since": client_timestamp(step.updated_at_unix_ms),
+                                    "last_progress": step.progress_summary,
+                                    "blocked_reason": step.blocked_reason,
+                                    "blockers": step.blockers,
+                                    "goals": step.goals,
+                                    "constraints": step.constraints,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    });
                     Ok::<Value, anyhow::Error>(json!({
                         "id": run.subject,
                         "generation_id": run.generation,
@@ -843,6 +1338,7 @@ fn mission_resources_filtered(
                         "blocker": blocker,
                         "after": run.after,
                         "deadline": run.deadline_at_unix_ms.map(client_timestamp),
+                        "steps": steps,
                     }))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -2166,6 +2662,85 @@ fn normalized_timeline_usage_body(
     Value::Object(body)
 }
 
+/// The Small Talk in one session's conversation: messages sent for this session, and messages
+/// to or from its agent that name no session, accepted while this incarnation was the agent's
+/// current one. st joins them into the timeline so every client shows the same conversation.
+fn session_messages(
+    state: &AppState,
+    owner: &str,
+    session_id: &str,
+    incarnation: Option<&str>,
+    before: Option<u64>,
+) -> Result<Vec<ClaimRecord>, ApiError> {
+    // The incarnation's life: from its first runtime observation to the next incarnation's.
+    let (mut started, mut ended) = (None::<u128>, None::<u128>);
+    if let Some(incarnation) = incarnation {
+        let observed = state
+            .store
+            .claims_for(owner, Some("runtime.observed"))
+            .map_err(ApiError::internal)?;
+        let of = |claim: &ClaimRecord| {
+            claim
+                .body
+                .pointer("/fields/incarnation_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        };
+        started = observed
+            .iter()
+            .filter(|claim| of(claim).as_deref() == Some(incarnation))
+            .map(|claim| claim.accepted_at_unix_ms)
+            .min();
+        if let Some(started) = started {
+            ended = observed
+                .iter()
+                .filter(|claim| {
+                    claim.accepted_at_unix_ms > started
+                        && of(claim).is_some_and(|other| other != incarnation)
+                })
+                .map(|claim| claim.accepted_at_unix_ms)
+                .min();
+        }
+    }
+    let mut messages = state
+        .store
+        .claims_for_kind_at("message.sent", before, true, 10_000)
+        .map_err(ApiError::internal)?
+        .claims;
+    messages.retain(|claim| {
+        let fields = claim.body.get("fields").unwrap_or(&claim.body);
+        let from = fields.get("from").and_then(Value::as_str);
+        let to = fields.get("to").and_then(Value::as_str);
+        if from != Some(owner) && to != Some(owner) {
+            return false;
+        }
+        match fields.get("session_id").and_then(Value::as_str) {
+            Some(message_session) => message_session == session_id,
+            None => {
+                started.is_none_or(|started| claim.accepted_at_unix_ms >= started)
+                    && ended.is_none_or(|ended| claim.accepted_at_unix_ms < ended)
+            }
+        }
+    });
+    Ok(messages)
+}
+
+/// A message's timeline body: who wrote to whom, about what, so a client can draw Small Talk
+/// apart from the harness's own turns.
+fn session_message_body(claim: &ClaimRecord) -> Value {
+    let fields = claim.body.get("fields").unwrap_or(&claim.body);
+    let mut body = json!({
+        "message_id": claim.subject,
+        "reply_to": fields.get("in_reply_to"),
+        "from": fields.get("from"),
+        "to": fields.get("to"),
+    });
+    if let Some(title) = fields.get("title").and_then(Value::as_str) {
+        body["title"] = Value::String(title.to_owned());
+    }
+    body
+}
+
 fn native_timeline_page(
     state: &AppState,
     snapshot: &ClientSnapshot,
@@ -2175,30 +2750,19 @@ fn native_timeline_page(
 ) -> Result<Json<Value>, ApiError> {
     let mut items =
         crate::external_sessions::normalized_timeline(external).map_err(ApiError::internal)?;
-    if let Some((owner, _, _)) =
+    if let Some((owner, incarnation, _)) =
         super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
             .map_err(ApiError::internal)?
     {
-        for claim in state
-            .store
-            .claims_for_kind_at(
-                "message.sent",
-                snapshot.store_index.checked_add(1),
-                true,
-                10_000,
-            )
-            .map_err(ApiError::internal)?
-            .claims
-        {
+        for claim in session_messages(
+            state,
+            &owner,
+            session_id,
+            incarnation.as_deref(),
+            snapshot.store_index.checked_add(1),
+        )? {
             let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            if fields.get("session_id").and_then(Value::as_str) != Some(session_id) {
-                continue;
-            }
             let from = fields.get("from").and_then(Value::as_str);
-            let to = fields.get("to").and_then(Value::as_str);
-            if from != Some(owner.as_str()) && to != Some(owner.as_str()) {
-                continue;
-            }
             let role = if from == Some(owner.as_str()) {
                 "assistant"
             } else {
@@ -2207,7 +2771,7 @@ fn native_timeline_page(
             let stamp = client_timestamp(claim.accepted_at_unix_ms);
             let digest = hex::encode(Sha256::digest(claim.id.as_bytes()));
             let base = claim.store_index.saturating_mul(4);
-            items.push(json!({"id":format!("timeline-entry/{}/{}-message", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base, "revision":1, "timestamp":stamp, "role":role, "type":"message", "final":true, "body":{"message_id":claim.subject,"reply_to":fields.get("in_reply_to")}}));
+            items.push(json!({"id":format!("timeline-entry/{}/{}-message", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base, "revision":1, "timestamp":stamp, "role":role, "type":"message", "final":true, "body":session_message_body(&claim)}));
             items.push(json!({"id":format!("timeline-entry/{}/{}-content", session_id.trim_start_matches("session/"), &digest[..16]), "sequence":base+1, "revision":1, "timestamp":stamp, "role":role, "type":"content", "final":true, "body":{"media_type":"text/plain","text":fields.get("content").and_then(Value::as_str).unwrap_or_default()}}));
         }
         items.sort_by(|a, b| {
@@ -2502,11 +3066,7 @@ pub(super) fn timeline_value(
         .claims;
     owner_claims.reverse();
     owner_claims.retain(|claim| claim.kind != "harness.timeline");
-    let mut message_claims = state
-        .store
-        .claims_for_kind_at("message.sent", before, true, 10_000)
-        .map_err(ApiError::internal)?
-        .claims;
+    let mut message_claims = session_messages(state, owner, &session_id, incarnation, before)?;
     message_claims.reverse();
     let mut claims = timeline_claims;
     claims.extend(owner_claims);
@@ -2724,14 +3284,8 @@ pub(super) fn timeline_value(
             continue;
         }
         if claim.kind == "message.sent" {
-            if fields.get("session_id").and_then(Value::as_str) != Some(session_id.as_str()) {
-                continue;
-            }
+            // Only session_messages put a message here.
             let from = fields.get("from").and_then(Value::as_str);
-            let to = fields.get("to").and_then(Value::as_str);
-            if from != Some(owner) && to != Some(owner) {
-                continue;
-            }
             let role = if from == Some(owner) {
                 "assistant"
             } else {
@@ -2740,10 +3294,7 @@ pub(super) fn timeline_value(
             items.push(json!({
                 "id": entry_id(&claim, "message"), "sequence": base_sequence,
                 "revision": 1, "timestamp": timestamp, "role": role, "type": "message",
-                "final": true, "body": {
-                    "message_id": claim.subject,
-                    "reply_to": fields.get("in_reply_to")
-                }
+                "final": true, "body": session_message_body(&claim)
             }));
             items.push(json!({
                 "id": entry_id(&claim, "content"), "sequence": base_sequence + 1,
@@ -2798,7 +3349,7 @@ fn conversation_cursor(
     )
 }
 
-fn conversation_session_id(state: &AppState, id: &str) -> Result<String, ApiError> {
+pub(super) fn conversation_session_id(state: &AppState, id: &str) -> Result<String, ApiError> {
     if id.starts_with("agent/") {
         let status = state
             .store
@@ -2969,7 +3520,10 @@ fn conversation_read_now(
         {
             let fields = claim.body.get("fields").unwrap_or(&claim.body);
             if claim.store_index > store_index
-                && fields.get("session_id").and_then(Value::as_str) == Some(session_id)
+                && fields
+                    .get("session_id")
+                    .and_then(Value::as_str)
+                    .is_none_or(|message_session| message_session == session_id)
                 && owner.as_deref().is_some_and(|owner| {
                     fields.get("from").and_then(Value::as_str) == Some(owner)
                         || fields.get("to").and_then(Value::as_str) == Some(owner)
@@ -3063,6 +3617,103 @@ fn conversation_read_now(
     )
 }
 
+/// What a conversation read last saw, so a wake-up can tell cheaply whether anything that
+/// concerns the conversation changed: a claim about its agent, Small Talk to or from it, a local
+/// timeline entry, or its native transcript file.
+struct ConversationMark {
+    owner: Option<String>,
+    transcript: Option<std::path::PathBuf>,
+    store_index: u64,
+    local_position: u64,
+    transcript_seen: Option<(u64, std::time::SystemTime)>,
+}
+
+fn transcript_seen(path: Option<&std::path::Path>) -> Option<(u64, std::time::SystemTime)> {
+    let metadata = std::fs::metadata(path?).ok()?;
+    Some((metadata.len(), metadata.modified().ok()?))
+}
+
+impl ConversationMark {
+    fn new(state: &AppState, session_id: &str) -> Result<Self, ApiError> {
+        let index = state.store.index().map_err(ApiError::internal)?;
+        let managed = super::managed_session_owner_at(&state.store, index, session_id)
+            .map_err(ApiError::internal)?;
+        let (owner, incarnation) = managed
+            .map(|(owner, incarnation, _)| (Some(owner), incarnation))
+            .unwrap_or_default();
+        // Resolve the transcript once: finding it walks the harness's session directories.
+        let transcript = match (&owner, &incarnation) {
+            (Some(owner), Some(incarnation)) => match managed_codex_transcript(state, owner, incarnation)? {
+                Some(external) => Some(external),
+                None => match managed_claude_transcript(state, owner, incarnation)? {
+                    Some(external) => Some(external),
+                    None => managed_omp_transcript(state, owner, incarnation)?,
+                },
+            },
+            _ => crate::external_sessions::find(state.native_session_home.as_deref(), session_id)
+                .map_err(ApiError::internal)?,
+        }
+        .map(|external| external.transcript);
+        Ok(Self {
+            transcript_seen: transcript_seen(transcript.as_deref()),
+            transcript,
+            owner,
+            store_index: index,
+            local_position: local_latest_position(state)?,
+        })
+    }
+
+    /// Whether anything that concerns the conversation changed since the last look.
+    fn changed(&mut self, state: &AppState) -> Result<bool, ApiError> {
+        let mut changed = false;
+        let index = state.store.index().map_err(ApiError::internal)?;
+        if index > self.store_index {
+            let claims = state
+                .store
+                .claims_page(None, None, self.store_index, index.checked_add(1), false, 10_000)
+                .map_err(ApiError::internal)?
+                .claims;
+            // A burst too large to scan is treated as a change.
+            changed |= claims.len() >= 10_000
+                || claims.iter().any(|claim| {
+                    let fields = claim.body.get("fields").unwrap_or(&claim.body);
+                    Some(claim.subject.as_str()) == self.owner.as_deref()
+                        || (claim.kind == "message.sent"
+                            && ["from", "to"].iter().any(|side| {
+                                fields.get(*side).and_then(Value::as_str) == self.owner.as_deref()
+                            }))
+                });
+            self.store_index = index;
+        }
+        let local = local_latest_position(state)?;
+        if local > self.local_position {
+            changed |= state
+                .store
+                .local_observations_after(self.local_position, 10_000)
+                .map_err(ApiError::internal)?
+                .iter()
+                .any(|claim| Some(claim.subject.as_str()) == self.owner.as_deref());
+            self.local_position = local;
+        }
+        let seen = transcript_seen(self.transcript.as_deref());
+        if seen != self.transcript_seen {
+            changed = true;
+            self.transcript_seen = seen;
+        }
+        Ok(changed)
+    }
+}
+
+fn local_latest_position(state: &AppState) -> Result<u64, ApiError> {
+    Ok(state
+        .store
+        .local_observations_tail(1)
+        .map_err(ApiError::internal)?
+        .first()
+        .and_then(crate::store::local_observation_position)
+        .unwrap_or(0))
+}
+
 async fn conversation_changes_local(
     state: &AppState,
     session: &ClientSession,
@@ -3072,6 +3723,7 @@ async fn conversation_changes_local(
 ) -> Result<Value, ApiError> {
     let mut changed = state.event_notify.subscribe();
     let deadline = tokio::time::Instant::now() + Duration::from_millis(wait_ms.min(30_000));
+    let mut mark = ConversationMark::new(state, session_id)?;
     loop {
         let value = conversation_read_now(state, session, session_id, after)?;
         if !value["items"]
@@ -3082,9 +3734,31 @@ async fn conversation_changes_local(
         {
             return Ok(value);
         }
-        let pause = Duration::from_millis(250)
-            .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
-        tokio::select! { _ = changed.changed() => {}, _ = tokio::time::sleep(pause) => {} }
+        // Read again only when something that concerns this conversation changed: a full read
+        // parses the whole transcript, and the fleet commits many times a second.
+        loop {
+            let pause = Duration::from_millis(250)
+                .min(deadline.saturating_duration_since(tokio::time::Instant::now()));
+            tokio::select! { _ = changed.changed() => {}, _ = tokio::time::sleep(pause) => {} }
+            if mark.changed(state)? {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                // Nothing concerned it: move the cursor past what was checked without a read.
+                let mut value = value;
+                if let Some(cursor) = value["next_cursor"].as_str() {
+                    let (_, _, native) = conversation_position(state, session_id, cursor)?;
+                    value["next_cursor"] = Value::String(conversation_cursor(
+                        state,
+                        session_id,
+                        mark.store_index,
+                        mark.local_position,
+                        native,
+                    ));
+                }
+                return Ok(value);
+            }
+        }
     }
 }
 
@@ -4033,7 +4707,6 @@ pub(super) async fn terminal_stream(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     require_scope(&session, "terminal.read")?;
-    let subject = terminal_subject(&id);
     let protocols = headers
         .get_all(SEC_WEBSOCKET_PROTOCOL)
         .iter()
@@ -4065,9 +4738,64 @@ pub(super) async fn terminal_stream(
             details: Box::default(),
         });
     }
-    let live = match query.incarnation.as_deref() {
-        Some(incarnation) => remote_terminal_live_session(&state, &subject, incarnation)?,
-        None => terminal_live_session(&state, &subject, None)?,
+    let follow = prepare_terminal_follow(
+        &state,
+        &session,
+        &id,
+        query.incarnation.as_deref(),
+        stream_capability,
+    )?;
+    Ok(websocket
+        .protocols([TERMINAL_SUBPROTOCOL])
+        .on_upgrade(move |socket| follow.run(state, TerminalSink::Socket(Box::new(socket)))))
+}
+
+/// A terminal viewer, checked and holding its consumed attachment, ready to follow.
+enum TerminalFollow {
+    Local {
+        id: String,
+        incarnation: String,
+    },
+    Remote {
+        id: String,
+        owner: String,
+        authority_actor: String,
+        incarnation: String,
+    },
+}
+
+impl TerminalFollow {
+    async fn run(self, state: AppState, sink: TerminalSink) {
+        match self {
+            Self::Local { id, incarnation } => {
+                terminal_stream_socket(sink, state, id, incarnation).await;
+            }
+            Self::Remote {
+                id,
+                owner,
+                authority_actor,
+                incarnation,
+            } => {
+                remote_terminal_stream_socket(sink, state, id, owner, authority_actor, incarnation)
+                    .await;
+            }
+        }
+    }
+}
+
+/// Check a viewer's right to follow a terminal and consume its single-use attachment.
+fn prepare_terminal_follow(
+    state: &AppState,
+    session: &ClientSession,
+    id: &str,
+    incarnation: Option<&str>,
+    capability: Option<&str>,
+) -> Result<TerminalFollow, ApiError> {
+    require_scope(session, "terminal.read")?;
+    let subject = terminal_subject(id);
+    let live = match incarnation {
+        Some(incarnation) => remote_terminal_live_session(state, &subject, incarnation)?,
+        None => terminal_live_session(state, &subject, None)?,
     };
     if !live.terminal {
         return Err(validation(
@@ -4081,40 +4809,100 @@ pub(super) async fn terminal_stream(
             "remote terminal stream requires a concrete person",
         ));
     }
-    let expected_incarnation = live.incarnation_id;
     consume_terminal_attachment(
-        &state,
-        &session,
-        &client_detail_id("terminal", &id),
-        &expected_incarnation,
-        stream_capability,
+        state,
+        session,
+        &client_detail_id("terminal", id),
+        &live.incarnation_id,
+        capability,
     )?;
-    if live.owner_host_id != client_host_id(&state.node) {
-        let owner = live.owner_host_id;
-        let authority_actor = session.authority_actor;
-        return Ok(websocket
-            .protocols([TERMINAL_SUBPROTOCOL])
-            .on_upgrade(move |socket| {
-                remote_terminal_stream_socket(
-                    socket,
-                    state,
-                    id,
-                    owner,
-                    authority_actor,
-                    expected_incarnation,
-                )
-            }));
+    Ok(if live.owner_host_id != client_host_id(&state.node) {
+        TerminalFollow::Remote {
+            id: id.to_owned(),
+            owner: live.owner_host_id,
+            authority_actor: session.authority_actor.clone(),
+            incarnation: live.incarnation_id,
+        }
+    } else {
+        TerminalFollow::Local {
+            id: id.to_owned(),
+            incarnation: live.incarnation_id,
+        }
+    })
+}
+
+/// The latest thing a terminal subscription has to say: whole screens replace each other, so
+/// a slow client skips to the newest one.
+#[derive(Clone)]
+enum TerminalFrame {
+    Waiting,
+    /// A screen envelope, as the dedicated terminal socket sends it.
+    Screen(Value),
+    /// The error envelope that ended the stream.
+    Ended(Value),
+}
+
+/// Where a followed terminal's screens go: its own WebSocket, or one subscription on a
+/// client's collection socket.
+enum TerminalSink {
+    Socket(Box<WebSocket>),
+    Subscription(watch::Sender<TerminalFrame>),
+}
+
+impl TerminalSink {
+    async fn send(&mut self, value: &Value) -> bool {
+        match self {
+            Self::Socket(socket) => send_terminal_stream_value(socket, value).await,
+            Self::Subscription(sender) => {
+                serde_json::to_vec(value)
+                    .is_ok_and(|bytes| bytes.len() <= CLIENT_MAX_RESPONSE_BYTES)
+                    && sender.send(TerminalFrame::Screen(value.clone())).is_ok()
+            }
+        }
     }
-    Ok(websocket
-        .protocols([TERMINAL_SUBPROTOCOL])
-        .on_upgrade(move |socket| terminal_stream_socket(socket, state, id, expected_incarnation)))
+
+    async fn close(&mut self, code: u16, reason: &str) {
+        match self {
+            Self::Socket(socket) => close_terminal_stream(socket, code, reason).await,
+            Self::Subscription(sender) => {
+                sender.send_replace(TerminalFrame::Ended(terminal_stream_error(
+                    &ApiError::internal(reason),
+                )));
+            }
+        }
+    }
+
+    /// End with one error: an error envelope and a close frame, or the subscription's end.
+    async fn fail(&mut self, error: &ApiError) {
+        match self {
+            Self::Socket(socket) => close_terminal_stream_with_error(socket, error).await,
+            Self::Subscription(sender) => {
+                sender.send_replace(TerminalFrame::Ended(terminal_stream_error(error)));
+            }
+        }
+    }
+
+    /// Resolves once nobody watches any more.
+    async fn gone(&mut self) {
+        match self {
+            Self::Socket(socket) => loop {
+                if matches!(
+                    socket.recv().await,
+                    None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))
+                ) {
+                    return;
+                }
+            },
+            Self::Subscription(sender) => sender.closed().await,
+        }
+    }
 }
 
 /// Relay a terminal another host owns. Each owner long poll returns as soon as the owner
 /// publishes a screen whose revision differs from the last one sent, so an idle terminal
 /// costs one request per relay wait and sends the client nothing.
 async fn remote_terminal_stream_socket(
-    mut socket: WebSocket,
+    mut sink: TerminalSink,
     state: AppState,
     id: String,
     owner: String,
@@ -4122,7 +4910,7 @@ async fn remote_terminal_stream_socket(
     incarnation: String,
 ) {
     let Some(relay) = state.client_relay.as_ref() else {
-        close_terminal_stream(&mut socket, 1012, "terminal owner unavailable").await;
+        sink.close(1012, "terminal owner unavailable").await;
         return;
     };
     let terminal_id = client_detail_id("terminal", &id);
@@ -4144,15 +4932,9 @@ async fn remote_terminal_stream_socket(
         };
         let read = relay.read(&owner, &request);
         tokio::pin!(read);
-        let read = loop {
-            tokio::select! {
-                read = &mut read => break read,
-                message = socket.recv() => {
-                    if matches!(message, None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))) {
-                        return;
-                    }
-                }
-            }
+        let read = tokio::select! {
+            read = &mut read => read,
+            () = sink.gone() => return,
         };
         let screen = match read {
             Ok(screen) => screen,
@@ -4163,38 +4945,29 @@ async fn remote_terminal_stream_socket(
                     tokio::time::sleep(Duration::from_millis(500 * u64::from(failures))).await;
                     continue;
                 }
-                close_terminal_stream_with_error(&mut socket, &error).await;
+                sink.fail(&error).await;
                 return;
             }
         };
         failures = 0;
         if screen["runtime_incarnation"].as_str() != Some(incarnation.as_str()) {
-            close_terminal_stream_with_error(
-                &mut socket,
-                &stale("the terminal incarnation fence is stale"),
-            )
-            .await;
+            sink.fail(&stale("the terminal incarnation fence is stale"))
+                .await;
             return;
         }
         let Some(revision) = screen["revision"].as_str().map(str::to_owned) else {
-            close_terminal_stream_with_error(
-                &mut socket,
-                &ApiError::internal("the terminal owner does not publish screen revisions"),
-            )
+            sink.fail(&ApiError::internal(
+                "the terminal owner does not publish screen revisions",
+            ))
             .await;
             return;
         };
         if sent.as_deref() == Some(revision.as_str()) {
             continue;
         }
-        if !send_terminal_stream_value(&mut socket, &terminal_stream_envelope(&state, screen)).await
-        {
-            close_terminal_stream(
-                &mut socket,
-                1009,
-                "terminal screen exceeds the client limit",
-            )
-            .await;
+        if !sink.send(&terminal_stream_envelope(&state, screen)).await {
+            sink.close(1009, "terminal screen exceeds the client limit")
+                .await;
             return;
         }
         sent = Some(revision);
@@ -4706,7 +5479,7 @@ async fn close_terminal_stream_with_error(socket: &mut WebSocket, error: &ApiErr
 /// later message is a newer screen that replaces it. The shared watcher publishes changes at a
 /// capped rate, and a viewer busy sending reads only the latest screen when it is ready.
 async fn terminal_stream_socket(
-    mut socket: WebSocket,
+    mut sink: TerminalSink,
     state: AppState,
     id: String,
     expected_incarnation: String,
@@ -4715,7 +5488,7 @@ async fn terminal_stream_socket(
     let live = match terminal_live_session(&state, &subject, Some(&expected_incarnation)) {
         Ok(live) => live,
         Err(error) => {
-            close_terminal_stream_with_error(&mut socket, &error).await;
+            sink.fail(&error).await;
             return;
         }
     };
@@ -4727,15 +5500,12 @@ async fn terminal_stream_socket(
     let mut screen = match terminal_view::next_screen(&mut screens, None, first).await {
         Ok(Some(screen)) => Some(screen),
         Ok(None) => {
-            close_terminal_stream_with_error(
-                &mut socket,
-                &ApiError::internal("the terminal screen did not arrive"),
-            )
-            .await;
+            sink.fail(&ApiError::internal("the terminal screen did not arrive"))
+                .await;
             return;
         }
         Err(end) => {
-            close_terminal_stream_with_error(&mut socket, &terminal_view_error(end)).await;
+            sink.fail(&terminal_view_error(end)).await;
             return;
         }
     };
@@ -4747,9 +5517,7 @@ async fn terminal_stream_socket(
             screen = tokio::select! {
                 changed = screens.changed() => {
                     if changed.is_err() {
-                        close_terminal_stream_with_error(
-                            &mut socket,
-                            &terminal_view_error(terminal_view::ViewEnd::Exited),
+                        sink.fail(&terminal_view_error(terminal_view::ViewEnd::Exited),
                         )
                         .await;
                         return;
@@ -4758,7 +5526,7 @@ async fn terminal_stream_socket(
                     match latest {
                         terminal_view::ViewState::Screen(screen) => Some(screen),
                         terminal_view::ViewState::Ended(end) => {
-                            close_terminal_stream_with_error(&mut socket, &terminal_view_error(end))
+                            sink.fail(&terminal_view_error(end))
                                 .await;
                             return;
                         }
@@ -4780,17 +5548,12 @@ async fn terminal_stream_socket(
                     if let Err(error) =
                         terminal_live_session(&state, &subject, Some(&expected_incarnation))
                     {
-                        close_terminal_stream_with_error(&mut socket, &error).await;
+                        sink.fail(&error).await;
                         return;
                     }
                     None
                 }
-                message = socket.recv() => {
-                    if matches!(message, None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))) {
-                        return;
-                    }
-                    None
-                }
+                () = sink.gone() => return,
             };
         }
         let Some(screen) = screen.take() else {
@@ -4800,22 +5563,14 @@ async fn terminal_stream_socket(
             continue;
         }
         let Ok(next_sequence) = state.store.index() else {
-            close_terminal_stream_with_error(
-                &mut socket,
-                &ApiError::internal("the store index is unavailable"),
-            )
-            .await;
+            sink.fail(&ApiError::internal("the store index is unavailable"))
+                .await;
             return;
         };
         let value = screen.value(&terminal_id, &live.incarnation_id, next_sequence);
-        if !send_terminal_stream_value(&mut socket, &terminal_stream_envelope(&state, value)).await
-        {
-            close_terminal_stream(
-                &mut socket,
-                1009,
-                "terminal screen exceeds the client limit",
-            )
-            .await;
+        if !sink.send(&terminal_stream_envelope(&state, value)).await {
+            sink.close(1009, "terminal screen exceeds the client limit")
+                .await;
             return;
         }
         sent = Some(screen.revision().to_owned());
@@ -7966,7 +8721,92 @@ mission "example/zero-run" state="ready" {
             .iter()
             .filter_map(|item| item["body"]["text"].as_str())
             .collect::<Vec<_>>();
-        assert_eq!(text, vec!["current composer message"]);
+        // A message that names no session belongs to the session current when it arrived; one
+        // that names an older session does not.
+        assert_eq!(
+            text,
+            vec!["generic legacy message", "current composer message"]
+        );
+
+        // The agent's own Small Talk joins its conversation, saying who wrote to whom.
+        let _ = accept_message(
+            &state,
+            MessageSendRequest {
+                idempotency_key: "session-message-outgoing".into(),
+                from: subject.into(),
+                to: "agent/session-message-peer".into(),
+                content: "outgoing small talk".into(),
+                title: Some("A question".into()),
+                in_reply_to: None,
+                tags: Vec::new(),
+            },
+            None,
+        )
+        .unwrap();
+        let timeline = timeline_value(
+            &state,
+            &new_client_snapshot(&state),
+            &client_session,
+            &session_id,
+            &ClientListQuery::default(),
+        )
+        .unwrap()
+        .0;
+        let items = timeline["items"].as_array().unwrap();
+        let outgoing = items
+            .iter()
+            .position(|item| item["body"]["text"] == "outgoing small talk")
+            .expect("the agent's own message is in its conversation");
+        let header = &items[outgoing - 1];
+        assert_eq!(header["type"], "message");
+        assert_eq!(header["role"], "assistant");
+        assert_eq!(header["body"]["from"], subject);
+        assert_eq!(header["body"]["to"], "agent/session-message-peer");
+        assert_eq!(header["body"]["title"], "A question");
+
+        // A new incarnation starts a new conversation: earlier Small Talk stays with the old one.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String("running".into())),
+                    (
+                        "runtime_id".into(),
+                        Value::String("session-message-runtime".into()),
+                    ),
+                    (
+                        "incarnation_id".into(),
+                        Value::String("session-message-runtime:i3".into()),
+                    ),
+                    ("terminal".into(), Value::Bool(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("session-message-runtime-i3".into()),
+            })
+            .unwrap();
+        let next_session = super::managed_session_id(subject, "session-message-runtime:i3");
+        let next = timeline_value(
+            &state,
+            &new_client_snapshot(&state),
+            &client_session,
+            &next_session,
+            &ClientListQuery::default(),
+        )
+        .unwrap()
+        .0;
+        assert!(
+            next["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|item| item["body"]["text"].is_null()),
+            "{next:#}"
+        );
     }
 
     #[test]
