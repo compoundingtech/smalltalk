@@ -2541,6 +2541,9 @@ pub struct ReplicationStatus {
     /// Envelopes held because no incarnation of their writer holds their sequence.
     #[serde(default)]
     pub fenced_envelopes: u64,
+    /// Envelopes a checkpoint dropped here. Their identities stay in the inventory.
+    #[serde(default)]
+    pub checkpointed_envelopes: u64,
     pub unhealthy_projections: u64,
     /// Each unhealthy projection, such as one replicated claim this build could not project.
     #[serde(default)]

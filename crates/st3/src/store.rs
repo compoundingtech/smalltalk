@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::cell::Cell;
 use std::fs;
 use std::ops::{Deref, DerefMut};
@@ -54,9 +54,11 @@ pub use checkpoint_agreement::{
 };
 use checkpoint_agreement::write_time;
 pub use checkpoint::{
-    CheckpointPlanRequest, CheckpointPlanView, CheckpointProof, ClaimTombstone, DropCount,
-    DropPlan, EnvelopeKey, EnvelopeTombstone, SealedSet, checkpoint_cut, checkpoint_name,
-    newest_due_cut, rules_digest,
+    CHECKPOINT_MANIFEST_PAGE_LIMIT, CheckpointManifest, CheckpointManifestCursor,
+    CheckpointManifestPage, CheckpointManifestRequest, CheckpointPlanRequest, CheckpointPlanView,
+    CheckpointProof, ClaimTombstone, DropCount, DropPlan, EnvelopeKey, EnvelopeTombstone,
+    SealedSet, checkpoint_cut, checkpoint_name, drop_digest, newest_due_cut, rules_digest,
+    verify_checkpoint_manifest,
 };
 
 type StepStateRow = (String, bool, u32, String, String, String, String, String);
@@ -674,21 +676,37 @@ impl Drop for WriterGuard<'_> {
     }
 }
 
-thread_local! {
-    static INTERACTIVE_READ: Cell<bool> = const { Cell::new(false) };
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadClass {
+    Background,
+    Interactive,
+    Operational,
+    Critical,
 }
 
-pub(crate) fn with_interactive_reads<T>(read: impl FnOnce() -> T) -> T {
-    INTERACTIVE_READ.with(|flag| {
-        struct Restore<'a>(&'a Cell<bool>, bool);
+thread_local! {
+    static READ_CLASS: Cell<ReadClass> = const { Cell::new(ReadClass::Background) };
+}
+
+pub(crate) fn read_class() -> ReadClass {
+    READ_CLASS.with(Cell::get)
+}
+
+pub(crate) fn with_read_class<T>(class: ReadClass, read: impl FnOnce() -> T) -> T {
+    READ_CLASS.with(|flag| {
+        struct Restore<'a>(&'a Cell<ReadClass>, ReadClass);
         impl Drop for Restore<'_> {
             fn drop(&mut self) {
                 self.0.set(self.1);
             }
         }
-        let _restore = Restore(flag, flag.replace(true));
+        let _restore = Restore(flag, flag.replace(class));
         read()
     })
+}
+
+pub(crate) fn with_interactive_reads<T>(read: impl FnOnce() -> T) -> T {
+    with_read_class(ReadClass::Interactive, read)
 }
 
 struct ReadLane {
@@ -714,6 +732,8 @@ impl ReadLane {
 struct ReadPool {
     background: ReadLane,
     interactive: ReadLane,
+    operational: ReadLane,
+    critical: ReadLane,
 }
 
 struct ReadGuard<'a> {
@@ -762,15 +782,27 @@ impl Drop for PinnedRead<'_> {
 }
 
 impl ReadPool {
-    fn new(background: Vec<Connection>, interactive: Vec<Connection>) -> Self {
+    fn new(
+        background: Vec<Connection>,
+        interactive: Vec<Connection>,
+        operational: Vec<Connection>,
+        critical: Vec<Connection>,
+    ) -> Self {
         Self {
             background: ReadLane::new(background),
             interactive: ReadLane::new(interactive),
+            operational: ReadLane::new(operational),
+            critical: ReadLane::new(critical),
         }
     }
 
     fn lane(&self) -> &ReadLane {
-        INTERACTIVE_READ.with(|flag| if flag.get() { &self.interactive } else { &self.background })
+        match read_class() {
+            ReadClass::Background => &self.background,
+            ReadClass::Interactive => &self.interactive,
+            ReadClass::Operational => &self.operational,
+            ReadClass::Critical => &self.critical,
+        }
     }
 
     fn key(&self) -> usize {
@@ -938,6 +970,19 @@ impl Store {
         let _writer = self.connection.write();
         hold();
     }
+
+    pub(crate) fn hold_write_transaction_for_test(&self, hold: impl FnOnce()) {
+        let mut writer = self.connection.write();
+        let transaction = writer.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('test-write-stall', '1')",
+                [],
+            )
+            .unwrap();
+        hold();
+        transaction.rollback().unwrap();
+    }
 }
 
 #[derive(Clone)]
@@ -945,6 +990,10 @@ struct ReplicationSnapshot {
     store_index: u64,
     replica_generation: u64,
     max_envelope_rowid: i64,
+    /// Rows in `replica_envelopes` and `checkpoint_envelopes` when this snapshot was built. A
+    /// snapshot extends its predecessor only when both moved exactly by the new envelopes.
+    envelope_rows: usize,
+    tombstone_rows: usize,
     inventory: CompactReplicationInventory,
     buckets: Vec<ReplicationInventoryBucket>,
     /// The inventory digest state before each range in `buckets`.
@@ -1102,6 +1151,11 @@ struct CompactReplicationInventory {
     irregular_hashes: Vec<String>,
     /// In `ReplicaEnvelopeId` order: writer, sequence, then hash text.
     envelopes: Vec<CompactEnvelopeId>,
+    /// Identities a checkpoint dropped. They are listed and digested like the others, so peers
+    /// see the same inventory, but their payloads are gone and never sent. An envelope hash
+    /// commits to its writer and sequence, so the hash alone names the identity.
+    payloadless: HashSet<[u8; 32]>,
+    payloadless_irregular: BTreeSet<ReplicaEnvelopeId>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1123,6 +1177,30 @@ impl CompactReplicationInventory {
         }
         inventory.refresh_digest();
         inventory
+    }
+
+    /// Whether this node still holds the envelope's payload, so it can send it.
+    fn has_payload(&self, envelope: &CompactEnvelopeId) -> bool {
+        if envelope.irregular == 0 {
+            !self.payloadless.contains(&envelope.hash)
+        } else {
+            !self
+                .payloadless_irregular
+                .contains(&self.identity(envelope))
+        }
+    }
+
+    /// Mark the identity last pushed as one whose payload a checkpoint dropped.
+    fn mark_last_payloadless(&mut self) {
+        let Some(envelope) = self.envelopes.last().copied() else {
+            return;
+        };
+        if envelope.irregular == 0 {
+            self.payloadless.insert(envelope.hash);
+        } else {
+            let identity = self.identity(&envelope);
+            self.payloadless_irregular.insert(identity);
+        }
     }
 
     /// Append an identity that sorts after every held one. The digest is left for the caller.
@@ -1812,6 +1890,16 @@ fn open_read_connections(path: &Path, shared_memory: bool) -> Result<Vec<Connect
         .collect()
 }
 
+fn claims_page_query(subject: bool, descending: bool) -> String {
+    let subject_filter = if subject { "subject=?3 AND " } else { "" };
+    let order = if descending { "DESC" } else { "ASC" };
+    format!(
+        "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+         FROM claims WHERE {subject_filter}store_index>?1 AND (?2 IS NULL OR store_index<?2)
+         ORDER BY store_index {order} LIMIT ?4"
+    )
+}
+
 impl Store {
     pub fn open(path: &Path, origin: impl Into<String>) -> Result<Self> {
         let origin = origin.into();
@@ -1840,6 +1928,8 @@ impl Store {
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
         let readers = ReadPool::new(
+            open_read_connections(path, false)?,
+            open_read_connections(path, false)?,
             open_read_connections(path, false)?,
             open_read_connections(path, false)?,
         );
@@ -1893,6 +1983,8 @@ impl Store {
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
         let readers = ReadPool::new(
+            open_read_connections(&uri, true)?,
+            open_read_connections(&uri, true)?,
             open_read_connections(&uri, true)?,
             open_read_connections(&uri, true)?,
         );
@@ -7467,13 +7559,14 @@ impl Store {
                 .map(|claim| (claim, false))
                 .ok_or_else(|| St3Error::new("internal", "the operation claim is missing"));
         }
+        if let Some((operation_id, request_digest)) = &operation {
+            checkpointed_operation_outcome(&connection, operation_id, request_digest)?;
+        }
         let transaction = connection.transaction().map_err(internal)?;
         for evidence in &input.evidence {
-            let exists = transaction
-                .query_row("SELECT 1 FROM claims WHERE id=?1", [evidence], |_| Ok(()))
-                .optional()
-                .map_err(internal)?
-                .is_some();
+            // Evidence may cite a claim that a checkpoint has since dropped.
+            let exists =
+                checkpoint::claim_or_tombstone_exists(&transaction, evidence).map_err(internal)?;
             if !exists {
                 return Err(St3Error::new(
                     "missing-evidence",
@@ -8243,19 +8336,22 @@ impl Store {
         // each worker holds one snapshot connection for its slice, then merge in subject order.
         let subjects = subjects.into_iter().collect::<Vec<_>>();
         let chunk_size = subjects.len().div_ceil(READ_CONNECTIONS);
+        let read_class = read_class();
         let parts = std::thread::scope(|scope| {
             subjects
                 .chunks(chunk_size)
                 .map(|chunk| {
                     let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
                     scope.spawn(move || {
-                        self.status_at_view_for_names(
-                            None,
-                            None,
-                            Some(store_index),
-                            include_history,
-                            Some(names),
-                        )
+                        with_read_class(read_class, || {
+                            self.status_at_view_for_names(
+                                None,
+                                None,
+                                Some(store_index),
+                                include_history,
+                                Some(names),
+                            )
+                        })
                     })
                 })
                 .collect::<Vec<_>>()
@@ -11242,14 +11338,19 @@ impl Store {
         limit: usize,
     ) -> Result<ClaimsPage> {
         let connection = self.readers.get();
-        let order = if descending { "DESC" } else { "ASC" };
-        let query = format!(
-            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-             FROM claims WHERE store_index>?1 AND (?2 IS NULL OR store_index<?2) AND (?3 IS NULL OR subject=?3) ORDER BY store_index {order}"
-        );
+        let query = claims_page_query(subject.is_some(), descending);
         let mut statement = connection.prepare(&query)?;
-        let rows =
-            statement.query_map(params![after_index, before_index, subject], claim_from_row)?;
+        // The owner filter is evaluated per subject below. Other pages can stop
+        // in SQLite at one row past the requested bound, before decoding bodies.
+        let scan_limit = if owner_run.is_some() {
+            i64::MAX
+        } else {
+            i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)
+        };
+        let rows = statement.query_map(
+            params![after_index, before_index, subject, scan_limit],
+            claim_from_row,
+        )?;
         let mut claims = Vec::new();
         for row in rows {
             let claim = row?;
@@ -11827,6 +11928,9 @@ impl Store {
     fn replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
         let store_index = self.index()?;
         let replica_generation = self.replica_generation.load(Ordering::Acquire);
+        // The store index never moves back, so deleting the newest claim leaves it unchanged.
+        // The graph generation moves with every change to a digested table.
+        let current_graph_generation = graph_generation(&self.readers.get())?;
         if let Some(snapshot) = self
             .replication_snapshot
             .lock()
@@ -11835,6 +11939,7 @@ impl Store {
             .filter(|snapshot| {
                 snapshot.store_index == store_index
                     && snapshot.replica_generation == replica_generation
+                    && snapshot.graph_generation == current_graph_generation
             })
             .cloned()
         {
@@ -11870,6 +11975,10 @@ impl Store {
             connection.query_row("SELECT COUNT(*) FROM replica_envelopes", [], |row| {
                 row.get(0)
             })?;
+        let tombstone_count: usize =
+            connection.query_row("SELECT COUNT(*) FROM checkpoint_envelopes", [], |row| {
+                row.get(0)
+            })?;
         let full = |connection: &Connection| -> Result<_> {
             let (inventory, max_rowid) = full_compact_replication_inventory(connection)?;
             let buckets = inventory.buckets();
@@ -11893,7 +12002,9 @@ impl Store {
                         ))
                     })?
                     .collect::<Result<Vec<_>, _>>()?;
-                if envelope_count == previous.inventory.envelopes.len() + additions.len() {
+                if envelope_count == previous.envelope_rows + additions.len()
+                    && tombstone_count == previous.tombstone_rows
+                {
                     let mut max_rowid = previous.max_envelope_rowid;
                     // Most snapshots are owned only by this cache. Move their inventory
                     // into the successor so a graph write does not allocate and free
@@ -11964,6 +12075,8 @@ impl Store {
             store_index: current_index(&connection)?,
             replica_generation: self.replica_generation.load(Ordering::Acquire),
             max_envelope_rowid,
+            envelope_rows: envelope_count,
+            tombstone_rows: tombstone_count,
             inventory,
             buckets,
             digest_prefixes,
@@ -12073,6 +12186,7 @@ impl Store {
             inventory
                 .envelopes
                 .iter()
+                .filter(|envelope| inventory.has_payload(envelope))
                 .map(|envelope| inventory.identity(envelope))
                 .filter(|identity| !known.contains(identity))
                 .take(replication_page_limit(remote))
@@ -12105,6 +12219,8 @@ impl Store {
         let connection = self.readers.get();
         let mut envelopes = Vec::with_capacity(missing.len());
         for identity in missing {
+            // A trim can delete the payload after the snapshot listed the identity. The
+            // tombstone stays in the inventory and the peer never needs the envelope.
             let envelope = connection.query_row(
                 "SELECT envelopes.previous_hash, envelopes.accepted_at_unix_ms, envelopes.payload,
                         (SELECT member_key FROM replica_envelope_signatures AS signatures
@@ -12133,7 +12249,11 @@ impl Store {
                         signature: row.get(4)?,
                     })
                 },
-            )?;
+            )
+            .optional()?;
+            let Some(envelope) = envelope else {
+                continue;
+            };
             envelopes.push(envelope);
         }
         Ok(envelopes)
@@ -12165,6 +12285,18 @@ impl Store {
         let mut signatures = 0;
         let now = now_ms().to_string();
         for envelope in &input.envelopes {
+            // A checkpoint dropped this envelope here. Its tombstone already stands for it.
+            if checkpoint::envelope_tombstoned(
+                &transaction,
+                &envelope.writer,
+                envelope.sequence,
+                &envelope.hash,
+            )
+            .map_err(internal)?
+            {
+                duplicate += 1;
+                continue;
+            }
             if let (Some(member_key), Some(signature)) = (&envelope.member_key, &envelope.signature)
             {
                 signatures += store_envelope_signature_tx(
@@ -12204,6 +12336,16 @@ impl Store {
             }
         }
         for signature in &input.signatures {
+            if checkpoint::envelope_tombstoned(
+                &transaction,
+                &signature.writer,
+                signature.sequence,
+                &signature.hash,
+            )
+            .map_err(internal)?
+            {
+                continue;
+            }
             signatures += store_envelope_signature_tx(
                 &transaction,
                 fleet_id,
@@ -13073,6 +13215,11 @@ impl Store {
             )?,
             fenced_envelopes: connection.query_row(
                 "SELECT COUNT(*) FROM replica_envelope_holds WHERE reason='fenced'",
+                [],
+                |row| row.get(0),
+            )?,
+            checkpointed_envelopes: connection.query_row(
+                "SELECT COUNT(*) FROM checkpoint_envelopes",
                 [],
                 |row| row.get(0),
             )?,
@@ -15457,11 +15604,9 @@ fn insert_local_observation_tx(
                         .map_err(internal)?
                         .is_some()
             }
-            None => transaction
-                .query_row("SELECT 1 FROM claims WHERE id=?1", [evidence], |_| Ok(()))
-                .optional()
-                .map_err(internal)?
-                .is_some(),
+            None => {
+                checkpoint::claim_or_tombstone_exists(transaction, evidence).map_err(internal)?
+            }
         };
         if !exists {
             return Err(St3Error::new(
@@ -15470,13 +15615,7 @@ fn insert_local_observation_tx(
             ));
         }
     }
-    let after_store_index: u64 = transaction
-        .query_row(
-            "SELECT COALESCE(MAX(store_index), 0) FROM claims",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(internal)?;
+    let after_store_index = current_index(transaction).map_err(internal)?;
     if input.kind == "harness.timeline"
         && input.fields.get("entry_type").and_then(Value::as_str) == Some("usage")
         && input.fields.get("operation").and_then(Value::as_str) == Some("append")
@@ -16051,6 +16190,42 @@ fn operation_tx(
         .map_err(Into::into)
 }
 
+/// Refuse to write a claim for an operation whose claims a checkpoint dropped. A retry of the
+/// same request learns the original claim ID; a different request is refused as an
+/// idempotency mismatch or conflict, as it would be while the claim was stored.
+fn checkpointed_operation_outcome(
+    connection: &Connection,
+    operation_id: &str,
+    request_digest: &str,
+) -> Result<(), St3Error> {
+    let dropped = checkpoint::checkpointed_operation(connection, operation_id).map_err(internal)?;
+    let Some((stored_digest, claim_id)) = dropped.first() else {
+        return Ok(());
+    };
+    if dropped.iter().any(|(digest, _)| digest != stored_digest) {
+        return Err(St3Error::new(
+            "idempotency-conflict",
+            "the replicated operation has conflicting requests",
+        )
+        .with_detail("operation_id", operation_id.to_owned()));
+    }
+    if stored_digest != request_digest {
+        return Err(St3Error::new(
+            "idempotency-mismatch",
+            "the idempotency key already identifies a different request",
+        )
+        .with_detail("operation_id", operation_id.to_owned())
+        .with_detail("stored_digest", stored_digest.clone())
+        .with_detail("request_digest", request_digest.to_owned()));
+    }
+    Err(St3Error::new(
+        "claim-checkpointed",
+        "this request was already recorded, and a checkpoint has since dropped its claim",
+    )
+    .with_detail("operation_id", operation_id.to_owned())
+    .with_detail("claim_id", claim_id.clone()))
+}
+
 fn renew_nested_ancestor_leases_tx(
     transaction: &Transaction<'_>,
     generation: &str,
@@ -16107,17 +16282,34 @@ fn expected_operations(
         .query_map([], claim_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
     let mut grouped = BTreeMap::<String, Vec<(String, String)>>::new();
+    let mut stored = BTreeSet::new();
     for claim in claims {
         if let Some((operation_id, request_digest)) = operation_parts(&claim.body) {
             grouped
                 .entry(operation_id.to_owned())
                 .or_default()
-                .push((request_digest.to_owned(), claim.id));
+                .push((request_digest.to_owned(), claim.id.clone()));
+            stored.insert(claim.id);
+        }
+    }
+    // Claims a checkpoint dropped still decide an operation's digest and state. An operation
+    // left with no stored claim has no row, since the row must name a stored claim; a retry
+    // finds its tombstones instead.
+    let mut dropped = BTreeMap::<String, Vec<(String, String)>>::new();
+    for (operation_id, request_digest, claim_id) in checkpoint::checkpointed_operations(connection)?
+    {
+        if !stored.contains(&claim_id) {
+            dropped
+                .entry(operation_id)
+                .or_default()
+                .push((request_digest, claim_id));
         }
     }
     Ok(grouped
         .into_iter()
-        .map(|(operation_id, mut claims)| {
+        .map(|(operation_id, stored_claims)| {
+            let mut claims = stored_claims.clone();
+            claims.extend(dropped.remove(&operation_id).unwrap_or_default());
             claims.sort();
             let request_digest = claims[0].0.clone();
             let state = if claims.iter().all(|(digest, _)| digest == &request_digest) {
@@ -16125,12 +16317,13 @@ fn expected_operations(
             } else {
                 "conflict"
             };
-            let canonical_claim_id = claims
+            let canonical_claim_id = stored_claims
                 .iter()
                 .filter(|(digest, _)| digest == &request_digest)
                 .map(|(_, claim)| claim)
                 .min()
-                .expect("an operation has at least one claim")
+                .or_else(|| stored_claims.iter().map(|(_, claim)| claim).min())
+                .expect("an operation has at least one stored claim")
                 .clone();
             (
                 operation_id,
@@ -16291,11 +16484,26 @@ fn register_operation_tx(transaction: &Transaction<'_>, claim: &ClaimRecord) -> 
     let current = operation_tx(transaction, operation_id)?;
     match current {
         None => {
+            // A checkpoint may have dropped earlier claims of this operation. They still count,
+            // as `expected_operations` counts them: this claim is then not the first, and a
+            // different request digest is a conflict.
+            let dropped = checkpoint::checkpointed_operation(transaction, operation_id)?;
+            let conflict = dropped.iter().any(|(digest, _)| digest != request_digest);
+            let stored_digest = dropped
+                .first()
+                .map(|(digest, _)| digest.as_str())
+                .filter(|digest| *digest < request_digest)
+                .unwrap_or(request_digest);
             transaction.execute(
-                "INSERT INTO operations(id, request_digest, canonical_claim_id, state) VALUES (?1, ?2, ?3, 'active')",
-                params![operation_id, request_digest, claim.id],
+                "INSERT INTO operations(id, request_digest, canonical_claim_id, state) VALUES (?1, ?2, ?3, ?4)",
+                params![
+                    operation_id,
+                    stored_digest,
+                    claim.id,
+                    if conflict { "conflict" } else { "active" }
+                ],
             )?;
-            Ok(true)
+            Ok(dropped.is_empty())
         }
         Some((stored_digest, canonical, state)) if stored_digest == request_digest => {
             if claim.id < canonical {
@@ -16643,10 +16851,16 @@ fn latest_claim_id_tx(transaction: &Transaction<'_>, subject: &str) -> Result<Op
         .map_err(Into::into)
 }
 
+/// The committed index: the highest store index ever assigned. A checkpoint deletes claims,
+/// possibly the newest, so this reads the `AUTOINCREMENT` high water rather than the newest
+/// remaining claim, and never moves backwards.
 fn current_index(connection: &Connection) -> Result<u64> {
     connection
         .query_row(
-            "SELECT COALESCE(MAX(store_index), 0) FROM claims",
+            "SELECT MAX(
+                 COALESCE((SELECT MAX(store_index) FROM claims), 0),
+                 COALESCE((SELECT seq FROM sqlite_sequence WHERE name='claims'), 0)
+             )",
             [],
             |row| row.get(0),
         )
@@ -16666,13 +16880,7 @@ fn replica_heads(connection: &Connection) -> Result<BTreeMap<String, u64>> {
 }
 
 fn current_index_tx(transaction: &Transaction<'_>) -> Result<u64> {
-    transaction
-        .query_row(
-            "SELECT COALESCE(MAX(store_index), 0) FROM claims",
-            [],
-            |row| row.get(0),
-        )
-        .map_err(Into::into)
+    current_index(transaction)
 }
 
 fn selected_index(current: u64, requested: Option<u64>) -> Result<u64, St3Error> {
@@ -18427,11 +18635,7 @@ fn operational_repair_plan_tx(
     connection: &Connection,
     snapshot_unix_ms: u128,
 ) -> Result<OperationalRepairPlan> {
-    let snapshot_index = connection.query_row(
-        "SELECT COALESCE(MAX(store_index), 0) FROM claims",
-        [],
-        |row| row.get::<_, u64>(0),
-    )?;
+    let snapshot_index = current_index(connection)?;
     let mut items = Vec::new();
     let mut covered_descendant_steps = BTreeSet::new();
 
@@ -19642,6 +19846,25 @@ impl Store {
         ))
     }
 
+    /// Read the already admitted membership for client projections. Seeding a
+    /// replication snapshot can take the writer lock and must stay out of a
+    /// person's read request while replication is busy.
+    pub fn fleet_view_for_client(&self) -> Result<crate::fleet::FleetView> {
+        let member_key = self
+            .member_key
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|key| key.public().to_owned());
+        let connection = self.readers.get();
+        Ok(crate::fleet::FleetView::from_membership(
+            &fleet_membership_tx_with_local_signer(
+                &connection,
+                member_key.as_deref().map(|key| (self.origin.as_str(), key)),
+            )?,
+        ))
+    }
+
     /// Sign every envelope of this node's writer that has no signature by its member key,
     /// optionally only those added after one `replica_envelopes` row.
     fn sign_own_envelopes_tx(
@@ -19825,6 +20048,19 @@ fn fleet_meta(connection: &Connection, key: &str) -> Result<Option<String>> {
         .optional()?)
 }
 
+/// The highest sequence this node holds of a writer, counting envelopes a checkpoint dropped.
+fn writer_high_water(connection: &Connection, writer: &str) -> Result<Option<u64>> {
+    Ok(connection.query_row(
+        "SELECT MAX(sequence) FROM (
+             SELECT MAX(sequence) AS sequence FROM replica_envelopes WHERE writer=?1
+             UNION ALL
+             SELECT MAX(sequence) FROM checkpoint_envelopes WHERE writer=?1
+         )",
+        [writer],
+        |row| row.get(0),
+    )?)
+}
+
 fn max_envelope_rowid(connection: &Connection) -> Result<i64> {
     connection
         .query_row(
@@ -19838,6 +20074,13 @@ fn max_envelope_rowid(connection: &Connection) -> Result<i64> {
 /// Fold the admitted `fleet.*` claims from the pinned anchor. A store without an anchor has an
 /// empty membership, in which every writer is legacy.
 fn fleet_membership_tx(connection: &Connection) -> Result<crate::fleet::Membership> {
+    fleet_membership_tx_with_local_signer(connection, None)
+}
+
+fn fleet_membership_tx_with_local_signer(
+    connection: &Connection,
+    local_signer: Option<(&str, &str)>,
+) -> Result<crate::fleet::Membership> {
     let Some(anchor) = fleet_meta(connection, "fleet_anchor_key")? else {
         return Ok(crate::fleet::Membership::default());
     };
@@ -19869,7 +20112,7 @@ fn fleet_membership_tx(connection: &Connection) -> Result<crate::fleet::Membersh
     )?;
     let mut claims: Vec<crate::fleet::FleetClaim> = Vec::with_capacity(rows.len());
     for (id, kind, subject, body, writer, sequence, envelope_hash) in rows {
-        let signers = match &envelope_hash {
+        let mut signers = match &envelope_hash {
             Some(hash) => signers_statement
                 .query_map(params![writer, sequence, hash], |row| {
                     row.get::<_, String>(0)
@@ -19877,6 +20120,15 @@ fn fleet_membership_tx(connection: &Connection) -> Result<crate::fleet::Membersh
                 .collect::<Result<BTreeSet<_>, _>>()?,
             None => BTreeSet::new(),
         };
+        // A locally appended batch has not been seeded into an envelope yet.
+        // Its eventual signature uses this node's key; include it in the client
+        // view without doing that write while a request is being served.
+        if envelope_hash.is_none()
+            && let Some((local_origin, key)) = local_signer
+            && writer == local_origin
+        {
+            signers.insert(key.to_owned());
+        }
         if let Some(existing) = claims.iter_mut().find(|claim| claim.id == id) {
             existing.signers.extend(signers);
             continue;
@@ -20204,15 +20456,11 @@ impl Store {
             }
             MemberState::NotMember => vec![None],
         };
-        let high_water: u64 = {
+        let high_water = {
             let connection = self.readers.get();
-            connection
-                .query_row(
-                    "SELECT COALESCE(MAX(sequence), 0) FROM replica_envelopes WHERE writer=?1",
-                    [name],
-                    |row| row.get(0),
-                )
+            writer_high_water(&connection, name)
                 .map_err(internal)?
+                .unwrap_or(0)
         };
         if keys == [None] && high_water == 0 {
             return Err(St3Error::new(
@@ -20552,11 +20800,7 @@ impl Store {
             });
         }
         let connection = self.readers.get();
-        let held: Option<u64> = connection.query_row(
-            "SELECT MAX(sequence) FROM replica_envelopes WHERE writer=?1",
-            [name],
-            |row| row.get(0),
-        )?;
+        let held = writer_high_water(&connection, name)?;
         let claimed: bool = connection.query_row(
             &format!(
                 "SELECT EXISTS(SELECT 1 FROM claims WHERE subject=?1 AND kind IN ({FLEET_CLAIM_KINDS}))"
@@ -21421,13 +21665,21 @@ fn full_replication_inventory_rows(
     Ok((envelopes, max_rowid))
 }
 
-/// Read every envelope identity straight into compact form, without a public copy.
+/// Read every envelope identity this node holds straight into compact form, without a public
+/// copy: the envelopes it stores and those a checkpoint dropped, which it keeps as tombstones.
 fn full_compact_replication_inventory(
     connection: &Connection,
 ) -> Result<(CompactReplicationInventory, i64)> {
     let mut statement = connection.prepare(
-        "SELECT rowid, writer, sequence, envelope_hash FROM replica_envelopes
-         ORDER BY writer, sequence, envelope_hash",
+        "SELECT rowid, writer, sequence, envelope_hash, 1 FROM replica_envelopes
+         UNION ALL
+         SELECT 0, writer, sequence, envelope_hash, 0 FROM checkpoint_envelopes AS dropped
+         WHERE NOT EXISTS (
+             SELECT 1 FROM replica_envelopes AS held
+             WHERE held.writer=dropped.writer AND held.sequence=dropped.sequence
+               AND held.envelope_hash=dropped.envelope_hash
+         )
+         ORDER BY 2, 3, 4",
     )?;
     let mut rows = statement.query([])?;
     let mut inventory = CompactReplicationInventory::default();
@@ -21439,6 +21691,9 @@ fn full_compact_replication_inventory(
             sequence: row.get(2)?,
             hash: row.get(3)?,
         });
+        if row.get::<_, i64>(4)? == 0 {
+            inventory.mark_last_payloadless();
+        }
     }
     inventory.refresh_digest();
     Ok((inventory, max_rowid))
@@ -21539,6 +21794,7 @@ fn compact_replication_difference(
             missing.extend(
                 local
                     .iter()
+                    .filter(|envelope| inventory.has_payload(envelope))
                     .take(room)
                     .map(|envelope| inventory.identity(envelope)),
             );
@@ -21547,7 +21803,8 @@ fn compact_replication_difference(
         if theirs.digest == bucket.digest {
             continue;
         }
-        let local = inventory.identities(local);
+        let compact = local;
+        let local = inventory.identities(compact);
         if !listing_full && (listed.is_empty() || listed.len() + local.len() <= listing_limit) {
             listed.extend_from_slice(&local);
         } else {
@@ -21566,9 +21823,13 @@ fn compact_replication_difference(
             continue;
         }
         missing.extend(
-            local
-                .into_iter()
-                .filter(|identity| known.binary_search(&identity).is_err())
+            compact
+                .iter()
+                .zip(local)
+                .filter(|(envelope, identity)| {
+                    inventory.has_payload(envelope) && known.binary_search(&identity).is_err()
+                })
+                .map(|(_, identity)| identity)
                 .take(room),
         );
     }
@@ -23114,7 +23375,14 @@ fn validate_and_admit_envelope_tx(
         outcome.verify += started.elapsed();
         match classification {
             Ok(ReplicatedClaimAdmission::Valid) => {
-                let inserted = transaction
+                // A checkpoint dropped this claim here, and another envelope carries it again.
+                // A node that still held it would ignore the copy as already stored.
+                let inserted = if checkpoint::claim_tombstoned(transaction, &claim.id)
+                    .map_err(internal)?
+                {
+                    0
+                } else {
+                    transaction
                     .execute(
                         "INSERT OR IGNORE INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms)
                          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -23130,7 +23398,8 @@ fn validate_and_admit_envelope_tx(
                             claim.accepted_at_unix_ms.to_string(),
                         ],
                     )
-                    .map_err(internal)?;
+                    .map_err(internal)?
+                };
                 transaction
                     .execute(
                         "INSERT INTO replica_records(
@@ -28038,6 +28307,33 @@ mod tests {
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    #[test]
+    fn subject_claim_pages_seek_the_subject_index() {
+        let store = Store::open_memory("node").unwrap();
+        store.claims_page(None, None, 0, None, false, 1).unwrap();
+        store
+            .claims_page(Some("agent/target"), None, 0, None, false, 1)
+            .unwrap();
+        let connection = store.readers.get();
+        for descending in [false, true] {
+            let query = format!("EXPLAIN QUERY PLAN {}", claims_page_query(true, descending));
+            let plan = connection
+                .prepare(&query)
+                .unwrap()
+                .query_map(params![0, None::<u64>, "agent/target", 2], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("; ");
+            assert!(
+                plan.contains("claims_subject_index"),
+                "a subject page must not scan the whole graph: {plan}"
+            );
+        }
+    }
 
     #[test]
     fn a_pinned_read_sees_one_snapshot_while_commits_land() {

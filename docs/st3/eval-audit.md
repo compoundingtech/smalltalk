@@ -15,6 +15,7 @@ This table records the purpose and the prompt boundary for every st eval.
 | `cross-harness-message-wake` | Keep. It proves real PTY/TUI Codex, Claude, Pi, and OMP harnesses wake both during startup and from exact idle through native message delivery, coordinate in pairs, and use no terminal-input fallback without disclosing that held-out check. |
 | `crash-escalation` | Keep. It proves bounded restart failure and graph diagnostics. |
 | `fork-in-the-road` | Keep. It proves parallel work and an explicit join. |
+| `graceful-messaging` | Keep. Its runner starts real Claude, Codex, and omp seats (pi and OpenCode when installed) on an isolated daemon, replaces the binary and restarts the daemon as a deploy does, and proves each seat reads a new message within ten seconds on the same provider process, driver PID, and incarnation, with its driver and channel on the new binary and st reporting the delivery path as current. |
 | `ghost-bug` | Keep. It proves a multi-agent investigation with graph products. |
 | `license-mit` | Keep. It proves delegated implementation and verification. |
 | `local-file-refresh` | Keep. It proves explicit local file observation. |
