@@ -921,7 +921,7 @@
         # derivation. Boot the shipped daemon to prove its own receipt carries the
         # flake's source order rather than build.rs's missing-git fallback.
         checks.st3-hook-build-stamp = pkgs.runCommand "st3-hook-build-stamp-${version}" {
-          nativeBuildInputs = [ pkgs.curl pkgs.jq ];
+          nativeBuildInputs = [ pkgs.curl pkgs.jq st3 ];
         } ''
           export HOME=$(mktemp -d)
           export XDG_CONFIG_HOME="$HOME/config"
