@@ -63,37 +63,41 @@ root="$(mktemp -d /tmp/nbe.XXXXXX)"
 socket="$root/st3.sock"
 st3() { ST3_ENDPOINT="$socket" ST3_DAEMON_WAIT="${ST3_DAEMON_WAIT:-60}" "$root/bin/st3" "$@"; }
 
-# transcript HARNESS: the seat's native transcript path, or nothing while it has none.
-transcript() {
-  local slug thread
+# transcripts HARNESS: every native transcript file the seat has written, one per line. A restart
+# can resume the same file or start another, so the checks count across all of them.
+transcripts() {
+  local slug leaf
   case $1 in
     claude)
       slug="$(printf '%s' "$root/ws/claude" | sed 's|[^A-Za-z0-9]|-|g')"
-      ls -t "$HOME/.claude/projects/$slug"/*.jsonl 2>/dev/null | head -1 || true
+      ls "$HOME/.claude/projects/$slug"/*.jsonl 2>/dev/null || true
       ;;
     codex)
-      thread="$(find "$root/state/drivers" -path '*/state/binding.json' -exec cat {} \; 2>/dev/null \
-        | jq -r '.threadId // .thread_id // empty' | head -1)"
-      [[ -n $thread ]] && find "$HOME/.codex/sessions" -type f -name "*$thread*.jsonl" 2>/dev/null | head -1
+      find "$HOME/.codex/sessions" -type f -name '*.jsonl' -newer "$root/config.toml" 2>/dev/null \
+        | xargs -r grep -l -F "\"cwd\":\"$root/ws/codex\"" 2>/dev/null || true
       ;;
     omp | pi)
-      find "$root/state/drivers" -path "*nb.$1*" -path '*/provider-sessions/*.jsonl' -type f 2>/dev/null | head -1
+      # The driver keeps each seat's state under the first 16 hex digits of its identity's SHA-256.
+      leaf="$(printf '%s' "nb.$1" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)"
+      find "$root/state/drivers" -path "*/$leaf/provider-sessions/*.jsonl" -type f 2>/dev/null || true
       ;;
   esac
-  return 0
 }
 
-# turn_entries HARNESS: the number of user and assistant entries in the seat's transcript.
+# turn_entries HARNESS: the number of user and assistant entries across the seat's transcripts.
 turn_entries() {
-  local file
-  file="$(transcript "$1")"
-  [[ -n $file && -f $file ]] || { echo 0; return; }
-  jq -c 'select(
-      (.type == "user" or .type == "assistant")
-      or (.type == "response_item" and .payload.type == "message" and (.payload.role == "user" or .payload.role == "assistant"))
-      or (.type == "event_msg" and (.payload.type == "user_message" or .payload.type == "agent_message"))
-      or (.type == "message" and (.message.role == "user" or .message.role == "assistant"))
-    )' "$file" 2>/dev/null | wc -l
+  local file total=0 count
+  while IFS= read -r file; do
+    [[ -n $file && -f $file ]] || continue
+    count="$(jq -c 'select(
+        (.type == "user" or .type == "assistant")
+        or (.type == "response_item" and .payload.type == "message" and (.payload.role == "user" or .payload.role == "assistant"))
+        or (.type == "event_msg" and (.payload.type == "user_message" or .payload.type == "agent_message"))
+        or (.type == "message" and (.message.role == "user" or .message.role == "assistant"))
+      )' "$file" 2>/dev/null | wc -l)"
+    total=$((total + count))
+  done < <(transcripts "$1")
+  echo "$total"
 }
 
 # working_since HARNESS MS: how many times st observed the seat working at or after MS.
@@ -131,10 +135,14 @@ wait_idle() {
 }
 
 cleanup() {
-  local harness file
+  local harness file n
   for harness in "${harnesses[@]}"; do
-    file="$(transcript "$harness")"
-    [[ -n $file && -f $file ]] && cp "$file" "$out/evidence/$harness-transcript.jsonl"
+    n=0
+    while IFS= read -r file; do
+      [[ -n $file && -f $file ]] || continue
+      n=$((n + 1))
+      cp "$file" "$out/evidence/$harness-transcript-$n.jsonl"
+    done < <(transcripts "$harness")
     st3 subject history "agent/nb.$harness" --json --limit 100 >"$out/evidence/$harness-history.jsonl" 2>/dev/null || true
   done
   cp "$root/daemon.log" "$out/evidence/" 2>/dev/null || true
@@ -237,7 +245,7 @@ while ((SECONDS < deadline)); do
   st3 conversations ls person/eval --json >"$root/inbox.json" 2>/dev/null || echo '[]' >"$root/inbox.json"
   for harness in "${harnesses[@]}"; do
     step_state[$harness]="$(jq -r --arg step "$harness" \
-      '[.. | objects | select(.path? == $step and (.state? | type) == "string") | .state] | first // "unknown"' \
+      '[.steps[]? | select(.step == $step) | .status] | first // "unknown"' \
       "$root/run.json" 2>/dev/null || echo unknown)"
     replied[$harness]="$(jq -r --arg from "agent/nb.$harness" --arg parent "${message[$harness]}" \
       'map(select(.from == $from and .in_reply_to == $parent)) | length' "$root/inbox.json")"
