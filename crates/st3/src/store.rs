@@ -9609,14 +9609,18 @@ impl Store {
                             .rsplit('/')
                             .next()
                             .expect("a subscription subject has a local name");
-                        let delivery_key = canonical_hash(&(
-                            mission,
-                            delivery_scope,
-                            repository_identity,
-                            kind,
-                            number,
-                            head,
-                        ))
+                        let delivery_key = if uses_collection {
+                            canonical_hash(&(
+                                mission,
+                                delivery_scope,
+                                repository_identity,
+                                kind,
+                                number,
+                                head,
+                            ))
+                        } else {
+                            canonical_hash(&(subscription_subject, &discovery))
+                        }
                         .map_err(internal)?;
                         if uses_collection
                             && collection_delivery_was_requested_tx(
