@@ -39,6 +39,14 @@ use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
 use crate::model::{SeatQueueMoveRequest, SeatQueueMoveView, SeatQueueRunView, SeatQueueView};
 use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
+mod checkpoint;
+
+pub use checkpoint::{
+    CheckpointPlanRequest, CheckpointPlanView, CheckpointProof, ClaimTombstone, DropCount,
+    DropPlan, EnvelopeKey, EnvelopeTombstone, SealedSet, checkpoint_cut, checkpoint_name,
+    newest_due_cut, rules_digest,
+};
+
 type StepStateRow = (String, bool, u32, String, String, String, String, String);
 type StepRetryRow = (String, u32, bool, String, String, String, String, String);
 type CumulativeUsage = (u64, u64, u64, u64, Option<f64>, Option<String>);
@@ -524,6 +532,34 @@ CREATE TABLE IF NOT EXISTS replica_envelope_holds (
     updated_at_unix_ms TEXT NOT NULL,
     PRIMARY KEY(writer, sequence, envelope_hash)
 );
+
+-- A dropped envelope's identity. See `store/checkpoint.rs`.
+CREATE TABLE IF NOT EXISTS checkpoint_envelopes (
+    writer TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    accepted_at_unix_ms INTEGER NOT NULL,
+    checkpoint TEXT NOT NULL,
+    PRIMARY KEY(writer, sequence, envelope_hash)
+);
+-- A dropped claim: what evidence checks, ancestry walks and idempotent retries still read.
+CREATE TABLE IF NOT EXISTS checkpoint_claims (
+    id TEXT PRIMARY KEY,
+    writer TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    actor TEXT,
+    predecessors TEXT NOT NULL,
+    operation_id TEXT,
+    request_digest TEXT,
+    accepted_at_unix_ms INTEGER NOT NULL,
+    checkpoint TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);
+CREATE INDEX IF NOT EXISTS checkpoint_claims_operation
+ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
 PRAGMA user_version = 13;
 "#;
 
@@ -714,6 +750,10 @@ pub struct Store {
     /// This node's fleet member key. Set, it signs every envelope of this node's writer.
     member_key: std::sync::RwLock<Option<Arc<crate::fleet::MemberKey>>>,
     origin: String,
+    /// The database file, or the shared-memory URI of an in-memory store. A checkpoint proof
+    /// opens its own connection here to copy the store.
+    path: PathBuf,
+    shared_memory: bool,
 }
 
 const MESSAGE_CACHE_LIMIT: usize = 4096;
@@ -1679,6 +1719,8 @@ impl Store {
             last_replication_projection_unix_ms: AtomicU64::new(0),
             member_key: std::sync::RwLock::new(None),
             origin,
+            path: path.to_path_buf(),
+            shared_memory: false,
         })
     }
 
@@ -1729,6 +1771,8 @@ impl Store {
             last_replication_projection_unix_ms: AtomicU64::new(0),
             member_key: std::sync::RwLock::new(None),
             origin,
+            path: uri,
+            shared_memory: true,
         })
     }
 
@@ -16417,10 +16461,25 @@ fn selected_actual_source_at(
     let Some((selected_id, _, selected_origin, _, selected_body)) = selected else {
         return Ok((None, None, false));
     };
-    let predecessors = rows
+    // A checkpoint may have dropped claims on the path from the selected claim to an older
+    // observation. Their tombstones keep the links, so the walk passes through them.
+    let dropped = connection
+        .prepare_cached("SELECT id, predecessors FROM checkpoint_claims WHERE subject=?1")?
+        .query_map([subject], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                serde_json::from_str::<Vec<String>>(&row.get::<_, String>(1)?).unwrap_or_default(),
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut predecessors = dropped
         .iter()
-        .map(|(id, _, _, predecessors, _)| (id.as_str(), predecessors.as_slice()))
+        .map(|(id, predecessors)| (id.as_str(), predecessors.as_slice()))
         .collect::<BTreeMap<_, _>>();
+    predecessors.extend(
+        rows.iter()
+            .map(|(id, _, _, predecessors, _)| (id.as_str(), predecessors.as_slice())),
+    );
     let descends_from = |ancestor: &str| {
         let mut pending = vec![selected_id.as_str()];
         let mut visited = BTreeSet::new();
@@ -24365,9 +24424,12 @@ fn claim_descends_from(
         if !seen.insert(claim_id.clone()) {
             continue;
         }
+        // A checkpoint may have dropped a claim on the path; its tombstone keeps the links.
         let predecessors = transaction
             .query_row(
-                "SELECT predecessors FROM claims WHERE id=?1",
+                "SELECT predecessors FROM claims WHERE id=?1
+                 UNION ALL SELECT predecessors FROM checkpoint_claims WHERE id=?1
+                 LIMIT 1",
                 [&claim_id],
                 |row| row.get::<_, String>(0),
             )
@@ -26066,16 +26128,43 @@ fn step_execution_timing_at(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    let events = events
+        .into_iter()
+        .map(|(kind, body, accepted)| {
+            (
+                kind,
+                serde_json::from_str::<Value>(&body).unwrap_or(Value::Null),
+                accepted.parse::<u128>().unwrap_or(0),
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(fold_step_timing(
+        &events,
+        attempt,
+        snapshot_unix_ms,
+        currently_active,
+    ))
+}
+
+/// Fold a step's execution timing from its step and work events in canonical order: the active
+/// interval of `attempt` as of `snapshot_unix_ms`, and the time elapsed in earlier intervals.
+/// An interval closes when the next event arrives after its lease expiry. The checkpoint
+/// planner replays the same fold, so it keeps every renewal the answer depends on.
+pub(crate) fn fold_step_timing(
+    events: &[(String, Value, u128)],
+    attempt: u32,
+    snapshot_unix_ms: u128,
+    currently_active: bool,
+) -> (Option<u128>, u128) {
     let mut elapsed = 0_u128;
     let mut started = None;
     let mut lease_expires = None;
     for (kind, body, accepted) in events {
-        let accepted = accepted.parse::<u128>().unwrap_or(0);
+        let accepted = *accepted;
         if accepted > snapshot_unix_ms {
             break;
         }
-        let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
-        let fields = body.get("fields").unwrap_or(&body);
+        let fields = body.get("fields").unwrap_or(body);
         if kind.starts_with("work.")
             && fields.get("attempt").and_then(Value::as_u64) != Some(u64::from(attempt))
         {
@@ -26176,7 +26265,7 @@ fn step_execution_timing_at(
             started = None;
         }
     }
-    Ok((started, elapsed))
+    (started, elapsed)
 }
 
 fn apply_effective_step_state(
