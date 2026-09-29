@@ -9,5 +9,5 @@ The graph stores both message receipts.
 
 The held-out gates check isolation, review content, the verdict, the security finding, and graph products.
 
-Validate its graph contract with `cargo test -p st3 --test examples`; paid live orchestration uses
+Validate its graph contract with `cargo test -p st3 --test integration examples::`; paid live orchestration uses
 the repository's internal eval controller, not the public CLI.

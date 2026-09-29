@@ -25,9 +25,9 @@
 //! On a failure the suite prints the seed and the schedule. To explore further:
 //!
 //! ```sh
-//! cargo test -p st3 --test convergence                                # the fixed seeds
-//! CONVERGENCE_SEED=42 cargo test -p st3 --test convergence -- --ignored --nocapture one_seed
-//! CONVERGENCE_RUNS=200 cargo test -p st3 --test convergence -- --ignored --nocapture explore
+//! cargo test -p st3 --test integration convergence::                   # the fixed seeds
+//! CONVERGENCE_SEED=42 cargo test -p st3 --test integration -- --ignored --nocapture convergence::one_seed
+//! CONVERGENCE_RUNS=200 cargo test -p st3 --test integration -- --ignored --nocapture convergence::explore
 //! ```
 //!
 //! Stores run in this process, each in its own file, and exchange through the same export and

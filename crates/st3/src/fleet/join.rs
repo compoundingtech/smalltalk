@@ -387,6 +387,10 @@ pub async fn join(options: &JoinOptions) -> Result<Joined> {
         removed: None,
     }
     .save(state_dir)?;
+    // A new member's first sync ends by checking that it projects the same graph as a peer.
+    if !code.migrate {
+        Store::open(&state_dir.join("claims.sqlite3"), &name)?.begin_first_sync(&sealed.sponsor)?;
+    }
     write_private(
         &checkpoint_path(state_dir),
         &serde_json::to_vec(&Checkpoint {

@@ -4,7 +4,7 @@ Each KDL file here is a complete, runnable example. Its header comment says what
 commands that run it. Every file passes the normative st parser in the test suite:
 
 ```sh
-cargo test -p st3 --test examples
+cargo test -p st3 --test integration examples::
 ```
 
 All names, repositories, paths, and people are invented. Replace them before you use an example.
@@ -120,8 +120,7 @@ recurring bad pattern is to hit that wall, assume a capability disappeared, and 
 the exact subcommand. Keep this failure-first shape when editing them; turning them into
 field-by-field reference pages would erase their purpose.
 
-Mission goals and constraints describe the work. The generated `.st3/boot.md` describes how every
-agent uses st. Do not copy universal boot instructions into a harness prompt or a mission
-constraint.
+Mission goals and constraints describe the work. The skill that `st skill` prints describes how
+every agent uses st; do not copy it into a mission constraint. A harness takes no prompt.
 
 Keep durable seat and mission KDL in a Git repository, even when a planner authored it.

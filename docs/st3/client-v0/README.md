@@ -144,6 +144,7 @@ the stable `id` ascending. No locale-sensitive ordering is permitted.
 | Work | `/work`, `/work/{id}` | ready first, readiness epoch, path, ID |
 | Agents | `/agents`, `/agents/{id}` | presentation name, ID |
 | Runtimes | `/runtimes`, `/runtimes/{id}` | owning agent, runtime kind, ID |
+| Lanes | `/lanes`, `/lanes/{id}` | open lanes first, ID |
 | Operations | `/operations`, `/operations/{id}` | severity descending, component, ID |
 | History | `/history`, `/history/{id}` | occurred time descending, store index descending, ID |
 | Sessions | `/sessions`, `/sessions/{id}` | updated time descending, ID |
@@ -155,6 +156,12 @@ not-yet-received envelope resolves. The notice lists each peer that holds more e
 replication exchange carries, with `peer_only_envelopes` (held by the peer, missing here),
 `local_only_envelopes`, `last_exchange_at`, and `estimated_catch_up_seconds` (null until a rate is
 measured). Clients show the notice above the page. The page omits it once the host has caught up.
+
+The notice's `state` is `diverged` instead while the host's graph has diverged from a peer's: both
+hold the same envelopes but project different graphs from them, so the page can be wrong, not just
+early, and more exchanges will not fix it. Each diverged peer carries `diverged_since`; a notice can
+list catching-up peers beside it. Clients say so prominently (stui's header shows `⚠ diverged`)
+until the page omits the notice.
 
 IDs are stable opaque strings with a type prefix. Renames change labels, not IDs. A detail response
 uses the same representation as its list item plus its documented detail fields. Deletion is
@@ -182,6 +189,12 @@ at most five items each. Ready work follows the agent's seat queue: mission runs
 then step creation time and subject ID inside one run. These fields describe the queue and do not
 imply that an active claim is making progress.
 
+`mission_authority` lists the missions the agent may publish, start, and revise, as exact mission
+IDs or terminal `/*` namespaces. Its `source` is `declared` when the declaration carries
+`mission-authority`, `default` for a person-declared top-level seat `fleet/PROJECT/...` (which
+holds `fleet/PROJECT/*`), and `none` otherwise. It is `null` for an agent with no current
+declaration.
+
 `GET /v1/client/agent-queues/{agent_id}` returns one `AgentQueue` value for a seat: its
 `current_work_ids`, its `next_work_id`, each queued mission run in order with `position`, `state`
 (`claimed`, `ready`, or `waiting`), the run's own state, its join time, and its claimed, ready, and
@@ -189,6 +202,15 @@ waiting step IDs, and then the recent moves, newest first, with `move_count` for
 Each move names its run, placement, optional anchor run, actor, optional reason, and time. A run
 joins the queue when it first has a step assigned to the seat and leaves when it is terminal. An
 unknown agent returns `not-found`.
+
+A lane is one ordered line of entries that a mission run works through front first, such as a merge
+train of pull requests. `/v1/client/lanes` lists open lanes; `history=true` adds lanes whose run
+ended. Each `Lane` resource names its `mission_run_id`, `mission_id`, optional `entries_prefix`
+and `approver_id`, and `state` (`open` or `closed`). `entries` are in lane order: each has its
+`entry_id`, a short `label` without the prefix, `position`, the status the run recorded (`waiting`,
+`held`, `ready`, or `running`) with its `detail`, exact `head`, marker, and time, who joined it and
+when, and who approved it. `recent` lists joins, leaves, moves, and approvals, newest first. The
+`st missions tree` view carries the open lanes as `lanes`. [Lanes](../lanes.md) explains the model.
 
 Observer and subscription lists and details are available at `/v1/client/observers` and
 `/v1/client/subscriptions`. Each resource includes its normalized specification, current state,
@@ -277,6 +299,7 @@ The v0 action discriminators are:
 | Sessions | `session.import` | exact native-session revision; an exact running-process fingerprint is revalidated server-side |
 | Work | `work.claim`, `work.renew`, `work.progress`, `work.complete`, `work.fail`, `work.release`, `work.retry`, `work.publish-mission` | generation, definition, attempt, readiness epoch, and claimant incarnation after claim |
 | Seat queues | `agent.queue-move` | snapshot; the run and any anchor run must be queued for the seat |
+| Lanes | `lane.join`, `lane.leave`, `lane.move`, `lane.mark`, `lane.approve` | snapshot; the lane must be open and a named entry or anchor must be in it |
 | Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation; stop, restart, and reset also require `runtime_desired_revision` from the runtime resource |
 | Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation and terminal sequence |
 | Pairing | `pairing.begin`, `pairing.complete`, `pairing.revoke` | pairing/device revision where applicable |
@@ -292,6 +315,14 @@ submits the runtime resource ID as `target_id` and copies its `incarnation_id` a
 `after`), `anchor_run_id` for `before` and `after`, and an optional `reason`. It records one
 `agent.queue.moved` claim with the session's person as actor. It never changes a step the seat
 already holds. A run or anchor that is not queued for the seat returns `validation-failed`.
+
+The lane actions take `lane_id` and `entry_id`. `lane.join` and `lane.approve` take an optional
+`reason`; `lane.leave` takes an optional `outcome` (`completed` or `removed`, default `removed`) and
+`reason`; `lane.move` takes `placement` and, for `before` and `after`, `anchor_id`; `lane.mark` takes
+`state` and optional `detail` and `head`. Each records one `lane.*` claim with the session's person
+as actor, and affects the lane's ID. A join of an entry already in the lane records nothing. Only
+the lane's `approver_id` can approve (`forbidden` otherwise). An entry or anchor that is not in the
+lane, or a closed lane, returns `validation-failed`.
 
 An accepted action returns one stable operation ID and status. `202 accepted` means the command is
 durable, not complete; clients follow operation events or read `/operations/{id}`. Result objects
@@ -356,8 +387,36 @@ offers the same bounded change read for clients that cannot open WebSockets.
 
 Terminal access is a client protocol, not raw PTY ownership. The server sends screens, never PTY
 bytes: each screen is complete and replaces every earlier one, so nothing is replayed and a client
-that falls behind skips to the latest screen. Interactive attach from a terminal (`pty attach`,
-`st terminals attach`) is a different, privileged path that passes raw bytes.
+that falls behind skips to the latest screen. Interactive attach from a terminal on the owning host
+(`pty attach`, `st terminals attach`) is a different, privileged path that passes raw bytes. On that
+host, `st terminals attach` reads the PTY session from the local daemon
+(`GET /v1/sessions/local-terminal/{subject}`, which writes nothing) and connects to that session
+itself. Before it sends a byte, the socket's kernel-reported peer and the PTY record must match the
+runtime incarnation. Through an HTTP endpoint, or with a daemon that lacks that route, it uses the
+daemon's WebSocket bridge with a single-use capability. The Fabric-loopback gateway refuses the
+local-terminal route, as it refuses every route outside `/v1/client/`. When the subject has a
+running PTY session under this host's configured PTY root and the daemon, at whichever `--endpoint`
+was given, does not answer within a second, the CLI attaches to the newest of those sessions without
+it, as the local user. It prints that st was not consulted, and the kernel-reported peer must still
+be the PTY daemon the registry records. With no such session it says, after that second, which
+daemon it is still waiting for.
+
+`st terminals attach` to a terminal on another fleet host first tries the same raw path over Fabric,
+as the configured person. The CLI checks that the gateway grants that person `terminal.read` and
+`terminal.control`, and reads the owner, PTY session, and runtime incarnation from its local daemon.
+It then dials the owner's Fabric NodeID, which the owner's member record advertises or, in a
+config-peer fleet, the one trusted Fabric peer with the owner's name, ignoring case. The protocol is
+`st3/pty/FLEET_ID`, which `st terminals expose-fabric` has the owner's Fabric serve by running
+`st terminals serve-fabric --stdio` for each tunnel, so no st daemon on either host takes part. The
+CLI sends one line, the `pty remote-serve` route line plus the subject and incarnation:
+`{"op":"route","name":RUNTIME_ID,"subject":SUBJECT,"incarnation":INCARNATION}`. The owner refuses
+a name that is not one file under its PTY root and a session that is not tagged as the subject's.
+It refuses a session whose kernel-reported socket peer and PTY record do not match the incarnation.
+Otherwise it answers `{"ok":true}` and splices the tunnel to the session socket. After a lost
+tunnel the CLI dials again with the same incarnation until the owner refuses. When Fabric cannot
+reach the owner or the owner refuses, the CLI says why and falls back to this protocol. It paints
+each screen into the local terminal and sends keystrokes and size changes as `terminal.input` (raw
+mode) and `terminal.resize` actions.
 
 `terminal.attach` returns a short-lived, single-use stream capability and URL bound to the
 authenticated session, terminal, and runtime incarnation; `terminal.detach` idempotently invalidates
@@ -396,6 +455,17 @@ A gateway relays a terminal that another host owns through bounded owner long po
 revision differs from `after`, or the current screen after `wait_ms` (at most 30000). The owner
 follows its PTY and answers the moment the screen changes; an idle remote terminal costs one relay
 request per 10-second wait and still sends the client nothing.
+
+The owner does not have to be the gateway's peer. Every read of another host's conversation or
+terminal, and every terminal control, goes to the owner directly when the gateway can dial it, and
+otherwise to the peer nearest the owner by the fleet's replicated transport observations. When no
+node has observed the owner, each peer is tried in turn. Each node on the way forwards the read the
+same way, at most four times and never through a node it already passed, and relays the owner's
+answer or refusal back unchanged. Every hop checks that its sender is a fleet member, and the owner
+applies its own grants to the person the read carries. A laptop peered only with a desktop
+therefore reads a conversation on a server that only the desktop dials. Each hop waits longer than
+the next one, so a long poll's answer is never cut short on its way back. A read that no peer can
+carry fails with `remote-unavailable`.
 
 Read-only terminal scope permits screens but rejects input and resize. Screen payloads obey
 negotiated byte limits: at most 200 lines and 4096 bytes of text per line, with explicit

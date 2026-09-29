@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { agentHeaderDetail, agentHealth, ago, attentionActionLabel, attentionHeadline, attentionKindLabel, deviceDetail, deviceTitle, missionLabels, pingPresentation, queuedWorkSummary } from './presentation.ts';
+import { agentHeaderDetail, agentHealth, ago, attentionActionLabel, attentionHeadline, attentionKindLabel, currentWorkSummary, deviceDetail, deviceTitle, missionDetail, missionGroup, missionLabels, missionSteps, pingPresentation, queuedWorkSummary, smallTalkPresentation } from './presentation.ts';
 
 const now = Date.parse('2026-09-25T08:25:00Z');
 
@@ -10,12 +10,38 @@ assert.deepEqual(attentionHeadline({ count: 0, loaded: true, error: 'forbidden: 
 assert.deepEqual(attentionHeadline({ count: 0, loaded: false }), { text: 'Attention has not loaded yet.', warning: true });
 assert.deepEqual(attentionHeadline({ count: 3, loaded: true, error: 'offline' }), { text: '3 actionable items from the last load · refresh failed: offline', warning: true });
 
-// (2) Queued work shows how long the next step has been waiting.
-const pty = { id: 'agent/fleet/pty-rust/standing/hetz.pty-rust', name: 'fleet/pty-rust/standing/hetz.pty-rust', next_work_id: 'step-run/78cb/route', upcoming_work_ids: ['step-run/78cb/route'], queued_work_count: 1 };
-const work = [{ id: 'step-run/78cb/route', path: 'route', state: 'ready', updated_at: '2026-09-24T11:56:00Z' }];
-assert.equal(queuedWorkSummary(pty, work, now), 'Next: route · 1 queued · oldest ready 20h');
-assert.equal(queuedWorkSummary({ ...pty, next_work_id: null, queued_work_count: 0 }, work, now), null);
-assert.equal(queuedWorkSummary(pty, [], now), 'Next: route · 1 queued');
+// (2) Queued work shows how long the next step has been waiting, from the queue st joined into the
+// agent's row: no work list is read.
+const route = { id: 'step-run/78cb/route', mission_id: 'mission/fleet/pty-rust/route', mission_run_id: 'mission-run/78cb', path: 'route', state: 'ready', since: '2026-09-24T11:56:00Z', goal: 'Route output' };
+const pty = { id: 'agent/fleet/pty-rust/standing/hetz.pty-rust', name: 'fleet/pty-rust/standing/hetz.pty-rust', next_work_id: route.id, next_work: route, upcoming_work: [route], queued_work_count: 1 };
+assert.equal(queuedWorkSummary(pty, now), 'Next: route · 1 queued · oldest ready 20h');
+assert.equal(queuedWorkSummary({ ...pty, next_work_id: null, next_work: null, upcoming_work: [], queued_work_count: 0 }, now), null);
+assert.equal(queuedWorkSummary({ ...pty, next_work: { ...route, state: 'blocked' }, upcoming_work: [] }, now), 'Next: route · 1 queued');
+// An older st without joined labels still names the next step by its ID.
+assert.equal(queuedWorkSummary({ next_work_id: 'step-run/78cb/route', queued_work_count: 2 }, now), 'Next: route · 2 queued');
+assert.equal(currentWorkSummary({ current_work: [{ ...route, path: 'review/diff', title: null, state: 'claimed' }] }), 'Current: diff (claimed)');
+assert.equal(currentWorkSummary({ current_work: [{ ...route, title: 'Route output', state: 'claimed' }] }), 'Current: Route output (claimed)');
+assert.equal(currentWorkSummary({}), null);
+
+// Control groups and describes missions from the steps st joined into each run: no work list.
+const step = (path, state) => ({ id: `step-run/9f/${path}`, path, state, attempt: 1, since: '2026-09-25T08:00:00Z' });
+const release = { id: 'mission/fleet/app/release', title: 'fleet/app/release', state: 'running', runs: ['mission-run/9f'], visualization: { nodes: [{ kind: 'step' }, { kind: 'step' }, { kind: 'group' }], groups: [] }, run_details: [{ id: 'mission-run/9f', steps: [step('build', 'completed'), step('review', 'claimed')] }] };
+assert.deepEqual(missionSteps(release).map(s => s.path), ['build', 'review']);
+assert.equal(missionGroup(release), 'Running');
+assert.equal(missionDetail(release), '1 runs · 2 planned steps · review (claimed)');
+const stuck = { ...release, run_details: [{ id: 'mission-run/9f', steps: [step('build', 'claimed'), step('sign', 'blocked')] }] };
+assert.equal(missionGroup(stuck), 'Blocked');
+assert.equal(missionDetail(stuck), '1 runs · 2 planned steps · sign (blocked)');
+assert.equal(missionGroup({ ...release, run_details: [{ id: 'mission-run/9f', steps: [step('approve', 'waiting')] }] }), 'Waiting');
+assert.equal(missionGroup({ ...release, state: 'completed', run_details: [{ id: 'mission-run/9f', steps: null }] }), 'Archive');
+assert.equal(missionGroup({ state: 'draft' }), 'Drafts');
+assert.equal(missionDetail({ runs: [], run_details: [] }), '0 runs');
+const shipped = { runs: ['mission-run/9f'], run_details: [{ id: 'mission-run/9f', steps: [step('gate', 'failed')], outcome: { status: 'completed', previous_status: 'failed', actor: 'person/avery', reason: 'it merged after the gate was fixed', at: '2026-09-25T08:20:00Z' } }] };
+assert.equal(missionDetail(shipped), '1 runs · gate (failed) · set completed (was failed) by person/avery: it merged after the gate was fixed');
+
+// Small Talk st joined into a conversation shows who wrote to whom and its title.
+assert.deepEqual(smallTalkPresentation({ message_id: 'message/1', from: 'agent/fleet/cos/standing/cos', to: 'person/nathan', title: 'Release is ready' }), { from: 'COS → nathan', text: 'Release is ready' });
+assert.deepEqual(smallTalkPresentation({ message_id: 'message/2', from: 'agent/fleet/app' }), { from: 'App → someone', text: 'Small Talk' });
 assert.equal(ago('2026-09-25T08:24:30Z', now), '30s');
 assert.equal(ago('2026-09-25T07:25:00Z', now), '1h');
 assert.equal(ago('2026-09-22T08:25:00Z', now), '3d');

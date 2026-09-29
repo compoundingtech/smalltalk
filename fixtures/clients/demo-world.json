@@ -960,6 +960,7 @@
       }
     ]
   },
+  "diverged": [],
   "host": "lark",
   "link": "live",
   "machines": {
@@ -1033,6 +1034,7 @@
         "host": "harbor",
         "id": "mission/fleet/atlas/store-move",
         "kdl": "version 2\n\nmission \"fleet/atlas/store-move\" state=\"ready\" {\n  goal \"Move every row to the new store without losing a value.\"\n  goal \"Prove the two stores agree before anything cuts over.\"\n  goal \"Leave the old store readable until a person says otherwise.\"\n  constraint \"Never write to the old store.\"\n\n  step \"snapshot\" { assigned-to \"agent/fleet/atlas/builder\" }\n  step \"convert\" {\n    assigned-to \"agent/fleet/atlas/builder\"\n    depends-on { step \"snapshot\" completed }\n    gate \"conversion-check\" { exec \"atlas-cli check --converted\" }\n  }\n  step \"compare\" {\n    assigned-to \"agent/fleet/atlas/builder\"\n    depends-on { step \"convert\" completed }\n  }\n  step \"cut-over\" {\n    agentless\n    depends-on { step \"compare\" completed }\n    gate \"cut-over-review\" type=\"human\" {\n      reviewer \"person/robin\"\n      question \"The row counts agree and the contract check passed. Cut over?\"\n      review \"doc/atlas/compare-report\"\n    }\n  }\n  step \"cleanup\" {\n    assigned-to \"agent/fleet/atlas/builder\"\n    depends-on { step \"cut-over\" completed }\n  }\n}\n",
+        "outcome": null,
         "parent": null,
         "steps": [
           {
@@ -1150,6 +1152,7 @@
         "host": "harbor",
         "id": "mission/fleet/site/pricing-page",
         "kdl": null,
+        "outcome": null,
         "parent": null,
         "steps": [
           {
@@ -1206,6 +1209,7 @@
         "host": "harbor",
         "id": "mission/fleet/release/weekly",
         "kdl": null,
+        "outcome": null,
         "parent": null,
         "steps": [
           {
@@ -1283,6 +1287,7 @@
         "host": "harbor",
         "id": "mission/fleet/harbor/pull-request-review",
         "kdl": null,
+        "outcome": null,
         "parent": null,
         "steps": [
           {
@@ -1339,6 +1344,7 @@
         "host": "harbor",
         "id": "mission/fleet/rekey",
         "kdl": null,
+        "outcome": null,
         "parent": null,
         "steps": [
           {
@@ -1414,6 +1420,7 @@
         "host": "harbor",
         "id": "mission/fleet/docs/handbook",
         "kdl": null,
+        "outcome": null,
         "parent": null,
         "steps": [
           {
@@ -1449,6 +1456,7 @@
         "host": "harbor",
         "id": "mission/fleet/atlas/nightly",
         "kdl": null,
+        "outcome": null,
         "parent": null,
         "steps": [
           {

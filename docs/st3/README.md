@@ -12,7 +12,11 @@ Use these documents for implementation details:
 - [Fleet replication](replication.md) defines convergence, inspection, and repair.
 - [Agent seat queues](seat-queue.md) explains how each seat orders its mission runs and how moves
   are recorded and replicated.
+- [Lanes](lanes.md) defines the ordered lanes a mission run works through, such as the merge
+  train, and `st lanes`.
 - [Resource subscriptions](resource-subscriptions.md) defines observers and automatic intake.
+- [Seats across deploys](seat-deploys.md) explains how a running seat's driver and channels follow
+  a replaced st binary without ending the provider session, and how st reports a stale message path.
 - [Command recorder](command-recorder.md) explains how every `git` and `gh` call st starts is
   recorded, the log format, and what the recorder cannot see.
 - [Agent migration](agent-migration.md) defines isolated rehearsal, cutover, and rollback.
@@ -35,3 +39,13 @@ Use these documents for implementation details:
 
 The [examples](../../examples/st3/README.md) show small, tested mission patterns. Use the evals for
 failure proof, not as introductory examples.
+
+## Observe, don't instruct
+
+st observes agents and does not instruct them. It learns what an agent does from driver hooks and
+harness events: sessions, turns, plan mode, subagents, tool calls, usage, and what a seat is blocked
+on. It never asks an agent to report on itself and never tells an agent how to behave. A seat starts
+idle with no prompt and takes no turn until a person types or a message is posted. Work reaches it
+as a message that names a ready step, and the step's goals and constraints say what the work is.
+st's only other text for agents is the skill that `st skill` prints, which describes how to use st
+and sets no rules of conduct. Keep this rule when changing drivers, messages, or the skill.

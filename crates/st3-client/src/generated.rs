@@ -127,15 +127,22 @@ pub struct Page {
     pub items: Vec<Resource>,
     pub page: PageInfo,
     /// Present while this host is catching up with a peer, so the page can show early history
-    /// as current.
+    /// as current, and while its graph has diverged from a peer's, so the page can be wrong.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncNotice>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct SyncNotice {
+    /// `diverged` when any peer has diverged, else `catching-up`.
     pub state: String,
     pub peers: Vec<SyncPeer>,
+}
+
+impl SyncNotice {
+    pub fn diverged(&self) -> bool {
+        self.state == "diverged"
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -149,14 +156,22 @@ pub struct SyncPeer {
     pub last_exchange_at: Option<String>,
     #[serde(default)]
     pub estimated_catch_up_seconds: Option<u64>,
+    /// Since when this host and the peer hold the same envelopes but project different graphs.
+    /// More exchanges cannot fix that, so this host's pages can be wrong until it is repaired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diverged_since: Option<String>,
 }
 
 impl SyncPeer {
-    /// `Silber has 124,384 envelopes this host lacks · caught up in about 14m`
+    /// `Silber has 124,384 envelopes this host lacks · caught up in about 14m`, or
+    /// `Silber projects a different graph from the same envelopes` once they diverged.
     pub fn summary(&self) -> String {
+        let host = self.host_id.strip_prefix("host/").unwrap_or(&self.host_id);
+        if self.diverged_since.is_some() {
+            return format!("{host} projects a different graph from the same envelopes");
+        }
         format!(
-            "{} has {} this host lacks · {}",
-            self.host_id.strip_prefix("host/").unwrap_or(&self.host_id),
+            "{host} has {} this host lacks · {}",
             envelope_count(self.peer_only_envelopes),
             catch_up_estimate(self.estimated_catch_up_seconds)
         )
@@ -560,10 +575,65 @@ pub struct MissionRunSummary {
     pub current_steps: Vec<Value>,
     pub must_act: String,
     pub state_since: String,
+    /// The outcome a person or an authorized agent set after the run finished.
+    #[serde(default)]
+    pub outcome: Option<MissionRunOutcome>,
     pub last_progress: Option<String>,
     pub blocker: Option<Value>,
     pub after: Option<String>,
     pub deadline: Option<String>,
+    /// The run's steps: for an open run or a mission's latest run, and every run in a detail read.
+    #[serde(default)]
+    pub steps: Option<Vec<MissionStep>>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MissionRunOutcome {
+    pub status: String,
+    #[serde(default)]
+    pub previous_status: Option<String>,
+    pub reason: String,
+    pub actor: String,
+    pub at: String,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct MissionStep {
+    pub id: String,
+    pub path: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub state: String,
+    pub attempt: u32,
+    #[serde(default)]
+    pub assignee: Option<String>,
+    #[serde(default)]
+    pub claimant: Option<String>,
+    #[serde(default)]
+    pub agentless: bool,
+    pub since: String,
+    #[serde(default)]
+    pub last_progress: Option<String>,
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    #[serde(default)]
+    pub goals: Vec<String>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+}
+/// A step named for display: its mission, run, path, title and first goal.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct WorkLabel {
+    pub id: String,
+    pub mission_id: String,
+    pub mission_run_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub goal: Option<String>,
+    pub state: String,
+    pub since: String,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Work {
@@ -571,6 +641,9 @@ pub struct Work {
     pub header: ResourceHeader,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+    /// The mission this work's run belongs to.
+    #[serde(default)]
+    pub mission_id: Option<String>,
     pub mission_run_id: String,
     pub generation_id: String,
     pub definition_id: String,
@@ -635,10 +708,45 @@ pub struct Agent {
     pub upcoming_work_ids: Vec<String>,
     #[serde(default)]
     pub queued_work_count: u64,
+    /// `current_work_ids` named for display, in the same order.
+    #[serde(default)]
+    pub current_work: Vec<WorkLabel>,
+    #[serde(default)]
+    pub next_work: Option<WorkLabel>,
+    #[serde(default)]
+    pub upcoming_work: Vec<WorkLabel>,
     #[serde(default)]
     pub usage: Option<UsageSummary>,
     #[serde(default)]
+    pub mission_authority: Option<AgentMissionAuthority>,
+    #[serde(default)]
     pub under: Vec<AgentRelationship>,
+    #[serde(default)]
+    pub delivery: Option<AgentDelivery>,
+}
+/// Whether the process that carries a local seat's messages is live and current.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentDelivery {
+    pub state: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub polled_seconds_ago: Option<u64>,
+    #[serde(default)]
+    pub transport: Option<String>,
+}
+/// The missions an agent may publish, start, and revise, and where that authority comes from:
+/// `declared` (its `mission-authority`), `default` (a person-declared top-level seat
+/// `fleet/PROJECT/...` holds `fleet/PROJECT/*`), or `none`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentMissionAuthority {
+    pub source: String,
+    #[serde(default)]
+    pub publish: Vec<String>,
+    #[serde(default)]
+    pub start: Vec<String>,
+    #[serde(default)]
+    pub revise: Vec<String>,
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -739,6 +847,54 @@ pub struct Subscription {
     pub owner_run_id: Option<String>,
     pub owner_generation_id: Option<String>,
     pub owner_step_id: Option<String>,
+}
+/// One ordered lane a mission run works through front first, such as a merge train.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Lane {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+    pub name: String,
+    pub mission_run_id: Option<String>,
+    pub mission_id: Option<String>,
+    pub entries_prefix: Option<String>,
+    pub approver_id: Option<String>,
+    /// `open` while its run is active, else `closed`.
+    pub state: String,
+    pub entries: Vec<LaneEntry>,
+    pub recent: Vec<LaneChange>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct LaneEntry {
+    pub entry_id: String,
+    /// The entry without the lane's prefix, such as a pull request number.
+    pub label: String,
+    pub position: u32,
+    /// `waiting`, `held`, `ready`, or `running`.
+    pub state: String,
+    pub detail: Option<String>,
+    pub head: Option<String>,
+    pub marked_by_id: Option<String>,
+    pub marked_at: Option<String>,
+    pub joined_by_id: String,
+    pub joined_at: String,
+    pub join_reason: Option<String>,
+    pub approved_by_id: Option<String>,
+    pub approved_at: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct LaneChange {
+    /// `joined`, `left`, `moved`, or `approved`.
+    pub change: String,
+    pub entry_id: String,
+    pub label: String,
+    pub actor_id: String,
+    pub at: String,
+    pub outcome: Option<String>,
+    pub placement: Option<AgentQueuePlacement>,
+    pub anchor_id: Option<String>,
+    pub reason: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ObserverSpec {
@@ -869,6 +1025,7 @@ pub enum Resource {
     Runtime(Runtime),
     Observer(Observer),
     Subscription(Subscription),
+    Lane(Lane),
     Machine(Machine),
     Device(Device),
     Operation(Operation),
@@ -891,6 +1048,7 @@ impl Resource {
             Self::Runtime(v) => &v.header,
             Self::Observer(v) => &v.header,
             Self::Subscription(v) => &v.header,
+            Self::Lane(v) => &v.header,
             Self::Machine(v) => &v.header,
             Self::Device(v) => &v.header,
             Self::Operation(v) => &v.header,
@@ -1085,6 +1243,12 @@ pub struct TimelineMessageBody {
     pub message_id: String,
     #[serde(default)]
     pub reply_to: Option<String>,
+    #[serde(default)]
+    pub from: Option<String>,
+    #[serde(default)]
+    pub to: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1337,6 +1501,16 @@ pub enum ActionType {
     WorkPublishMission,
     #[serde(rename = "agent.queue-move")]
     AgentQueueMove,
+    #[serde(rename = "lane.join")]
+    LaneJoin,
+    #[serde(rename = "lane.leave")]
+    LaneLeave,
+    #[serde(rename = "lane.move")]
+    LaneMove,
+    #[serde(rename = "lane.mark")]
+    LaneMark,
+    #[serde(rename = "lane.approve")]
+    LaneApprove,
     #[serde(rename = "runtime.stop")]
     RuntimeStop,
     #[serde(rename = "runtime.restart")]
@@ -1414,6 +1588,76 @@ impl ActionRequest {
         Self::new(
             id,
             ActionType::AttentionResolve,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn lane_approve(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: LaneChangeParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::LaneApprove,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn lane_join(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: LaneChangeParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::LaneJoin,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn lane_leave(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: LaneChangeParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::LaneLeave,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn lane_mark(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: LaneChangeParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::LaneMark,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn lane_move(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: LaneChangeParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::LaneMove,
             idempotency_key,
             fence,
             &parameters,
@@ -2016,6 +2260,28 @@ pub struct AgentQueueMoveParameters {
     pub anchor_run_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+}
+
+/// One lane change. `lane.move` needs `placement` (and `anchor_id` before or after another
+/// entry), `lane.mark` needs `state`, and `lane.leave` takes an optional `outcome`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct LaneChangeParameters {
+    pub lane_id: String,
+    pub entry_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub placement: Option<AgentQueuePlacement>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub anchor_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

@@ -16,7 +16,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
 #[cfg(test)]
 use crate::model::ApiResponse;
-use crate::model::{ApiErrorResponse, AttachRequest, Attachment};
+use crate::model::{ApiErrorResponse, AttachRequest, Attachment, LocalTerminal};
 
 #[derive(Clone, Debug)]
 pub enum Endpoint {
@@ -154,6 +154,10 @@ pub fn daemon_unreachable(error: &anyhow::Error) -> Option<&DaemonUnreachable> {
         .chain()
         .find_map(|cause| cause.downcast_ref::<DaemonUnreachable>())
 }
+
+/// A PTY session accepts in its own process, so this only bounds a session that stopped
+/// accepting; it never waits for the st daemon.
+const LOCAL_TERMINAL_CONNECT: Duration = Duration::from_secs(3);
 
 #[derive(Clone, Copy)]
 struct ClientDeadlines {
@@ -334,6 +338,27 @@ impl Client {
         Ok(response)
     }
 
+    /// The running terminal `subject` when this client's daemon runs on this host and owns it,
+    /// read without any graph write. `None` leaves the attach to the WebSocket: an HTTP endpoint
+    /// can be another host, and a daemon from before direct attachment has no such route.
+    pub async fn local_terminal(&self, subject: &str) -> Result<Option<LocalTerminal>> {
+        if !matches!(self.endpoint, Endpoint::Unix(_)) {
+            return Ok(None);
+        }
+        match self
+            .get(&format!(
+                "/v1/sessions/local-terminal/{}",
+                urlencoding::encode(subject)
+            ))
+            .await
+        {
+            Ok(terminal) => Ok(Some(terminal)),
+            // A missing subject fails the WebSocket attach with the same answer.
+            Err(error) if http_status(&error) == Some(404) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     pub async fn proxy_terminal(&self, name: &str, path: &str) -> Result<i32> {
         let stream = self.open_terminal_bridge(path).await?;
         proxy_stream_with_io(name, stream, None, ClientIo::default()).await
@@ -452,6 +477,136 @@ impl Client {
     }
 }
 
+/// Attach this terminal straight to a PTY session on this host. Nothing goes through the st
+/// daemon, so a busy daemon cannot stall or end the attachment. It never starts or restarts the
+/// session: when the session ends, the attachment ends.
+pub async fn attach_local_terminal(terminal: &LocalTerminal) -> Result<i32> {
+    attach_local_terminal_with_io(terminal, ClientIo::default()).await
+}
+
+async fn attach_local_terminal_with_io(terminal: &LocalTerminal, io: ClientIo) -> Result<i32> {
+    let stream = open_local_terminal(terminal).await?;
+    proxy_stream_with_io(&terminal.runtime_id, stream, None, io).await
+}
+
+/// Connect to the terminal's PTY socket and prove it serves the incarnation the graph selected
+/// before sending anything: the kernel names the process serving the socket, which must be the
+/// incarnation's PTY daemon, and the registry must record the incarnation's start time. A socket
+/// path proves nothing alone, since a replacement session binds the same path.
+pub(crate) async fn open_local_terminal(terminal: &LocalTerminal) -> Result<StdUnixStream> {
+    let (stream, peer) =
+        connect_pty_session(&terminal.pty_root, &terminal.runtime_id, &terminal.subject).await?;
+    let created_at = pty_core::registry::read_metadata_in(&terminal.pty_root, &terminal.runtime_id)
+        .map(|metadata| metadata.created_at)
+        .with_context(|| {
+            format!(
+                "terminal `{}` has no PTY record in {}",
+                terminal.subject,
+                terminal.pty_root.display()
+            )
+        })?;
+    let incarnation = format!("{peer}:{created_at}");
+    anyhow::ensure!(
+        incarnation == terminal.incarnation_id,
+        "terminal `{}` changed incarnation: st selected `{}`, but its PTY is `{incarnation}`",
+        terminal.subject,
+        terminal.incarnation_id
+    );
+    Ok(stream)
+}
+
+/// Connect to PTY session `runtime_id` under `pty_root`, returning the stream and the pid the
+/// kernel reports for the process serving it. Nothing is sent.
+async fn connect_pty_session(
+    pty_root: &Path,
+    runtime_id: &str,
+    subject: &str,
+) -> Result<(StdUnixStream, i32)> {
+    let socket = pty_root.join(format!("{runtime_id}.sock"));
+    let stream = tokio::time::timeout(
+        LOCAL_TERMINAL_CONNECT,
+        tokio::net::UnixStream::connect(&socket),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "terminal `{subject}` did not accept a connection at {} within {} ms",
+            socket.display(),
+            LOCAL_TERMINAL_CONNECT.as_millis()
+        )
+    })?
+    .with_context(|| format!("connect to terminal `{subject}` at {}", socket.display()))?
+    .into_std()?;
+    stream.set_nonblocking(false)?;
+    let peer = pty_core::unix_peer::credentials(&stream).with_context(|| {
+        format!(
+            "identify the process serving terminal `{subject}` at {}",
+            socket.display()
+        )
+    })?;
+    Ok((stream, peer.pid))
+}
+
+/// Attach this terminal straight to a PTY session that only the PTY registry named, for when the
+/// st daemon cannot say which incarnation it selected. The kernel must still name the session's
+/// live PTY daemon, as the registry records it, as the process serving the socket, so a session
+/// replaced after the registry was read receives nothing. It never starts or restarts anything.
+pub async fn attach_unconsulted_terminal(
+    pty_root: &Path,
+    subject: &str,
+    session: &TaggedPtySession,
+) -> Result<i32> {
+    attach_unconsulted_terminal_with_io(pty_root, subject, session, ClientIo::default()).await
+}
+
+async fn attach_unconsulted_terminal_with_io(
+    pty_root: &Path,
+    subject: &str,
+    session: &TaggedPtySession,
+    io: ClientIo,
+) -> Result<i32> {
+    let (stream, peer) = connect_pty_session(pty_root, &session.runtime_id, subject).await?;
+    anyhow::ensure!(
+        peer == session.pid,
+        "PTY session `{}` of `{subject}` changed: its registry names PTY daemon {}, but process {peer} serves it",
+        session.runtime_id,
+        session.pid
+    );
+    proxy_stream_with_io(&session.runtime_id, stream, None, io).await
+}
+
+/// A running PTY session under a PTY root that is tagged as one st subject's terminal.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TaggedPtySession {
+    pub runtime_id: String,
+    pub created_at: String,
+    /// The session's live PTY daemon, as the registry records it.
+    pub pid: i32,
+}
+
+/// The running PTY sessions under `pty_root` tagged as `subject`'s, newest first, read from the
+/// PTY registry alone. Only the daemon knows which incarnation it selected; without it, the
+/// newest session is the best guess.
+pub fn tagged_pty_sessions(pty_root: &Path, subject: &str) -> Vec<TaggedPtySession> {
+    let mut sessions: Vec<_> =
+        pty_core::registry::list_sessions_in(pty_root, &pty_core::registry::ListOptions::default())
+            .into_iter()
+            .filter(pty_core::registry::SessionInfo::is_running)
+            .filter_map(|session| {
+                let pid = session.pid?;
+                let metadata = session.metadata?;
+                let tagged = metadata.tags.as_ref()?.get("st3.subject")? == subject;
+                tagged.then_some(TaggedPtySession {
+                    runtime_id: session.name,
+                    created_at: metadata.created_at,
+                    pid,
+                })
+            })
+            .collect();
+    sessions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    sessions
+}
+
 /// Whether an API call failed because the requested subject does not exist on this host.
 pub fn is_not_found(error: &anyhow::Error) -> bool {
     error
@@ -459,11 +614,30 @@ pub fn is_not_found(error: &anyhow::Error) -> bool {
         .is_some_and(|error| error.status == 404 || error.code == "not-found")
 }
 
+/// The HTTP status an API call failed with, including an answer without an error body.
+pub fn http_status(error: &anyhow::Error) -> Option<u16> {
+    error
+        .downcast_ref::<ApiResponseError>()
+        .map(|error| error.status)
+        .or_else(|| {
+            error
+                .downcast_ref::<UnexpectedResponse>()
+                .map(|error| error.status)
+        })
+}
+
 /// The code of the API error that an API call failed with, if it failed with one.
 pub fn api_error_code(error: &anyhow::Error) -> Option<&str> {
     error
         .downcast_ref::<ApiResponseError>()
         .map(|error| error.code.as_str())
+}
+
+/// The status, code, and message of the API error that an API call failed with, if it did.
+pub fn api_error_parts(error: &anyhow::Error) -> Option<(u16, &str, &str)> {
+    error
+        .downcast_ref::<ApiResponseError>()
+        .map(|error| (error.status, error.code.as_str(), error.message.as_str()))
 }
 
 fn terminal_reconnect_is_refused(error: &anyhow::Error) -> bool {
@@ -504,6 +678,21 @@ impl fmt::Display for ApiResponseError {
 }
 
 impl std::error::Error for ApiResponseError {}
+
+/// A failed answer without an st error body, such as an unknown route on an older daemon.
+#[derive(Debug)]
+struct UnexpectedResponse {
+    status: u16,
+    body: String,
+}
+
+impl fmt::Display for UnexpectedResponse {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "st API returned {}: {}", self.status, self.body)
+    }
+}
+
+impl std::error::Error for UnexpectedResponse {}
 
 fn terminal_request(url: &str) -> Result<tokio_tungstenite::tungstenite::http::Request<()>> {
     let mut request = url.into_client_request()?;
@@ -556,7 +745,12 @@ where
     Ok(client_stream)
 }
 
-async fn proxy_stream_with_io(
+/// Run the interactive attach client over a socket that already speaks the PTY session protocol.
+pub async fn attach_socket_with_io(name: &str, stream: StdUnixStream, io: ClientIo) -> Result<i32> {
+    proxy_stream_with_io(name, stream, None, io).await
+}
+
+pub(crate) async fn proxy_stream_with_io(
     name: &str,
     stream: StdUnixStream,
     reconnect: Option<Reconnect>,
@@ -723,8 +917,13 @@ fn request_deadline(path: &str, deadlines: ClientDeadlines) -> Duration {
     if path.starts_with("/v1/internal/replication/export")
         || path.starts_with("/v1/internal/replication/receive")
         || path.starts_with("/v1/internal/replication/checkpoint")
+        || path.starts_with(crate::peer::CLIENT_READ_FORWARD_PATH)
     {
+        // A forwarded client read is bounded by the relay's own per-hop timeouts.
         deadlines.bulk
+    } else if path.starts_with("/v1/internal/replication/heal/") {
+        // A heal can replay the graph from nothing, 41 seconds on a 2 GB store.
+        Duration::from_secs(10 * 60)
     } else if path.starts_with("/v1/checkpoint/plan") || path.starts_with("/v1/checkpoint/status")
     {
         // A dry run copies the store and replays it twice; status reads what is sealed.
@@ -768,10 +967,43 @@ fn http_send_error(base: &str, url: &str, error: reqwest::Error) -> anyhow::Erro
 }
 
 fn deadline_error(endpoint: &str, phase: &str, deadline: Duration) -> anyhow::Error {
-    anyhow::anyhow!(
-        "st API endpoint `{endpoint}` exceeded the {phase} limit of {} ms; the service may be busy or unavailable, retry the command",
-        deadline.as_millis()
-    )
+    DaemonDeadline {
+        endpoint: endpoint.to_owned(),
+        phase: phase.to_owned(),
+        deadline,
+    }
+    .into()
+}
+
+/// The daemon took a request but did not answer it in time.
+#[derive(Debug)]
+struct DaemonDeadline {
+    endpoint: String,
+    phase: String,
+    deadline: Duration,
+}
+
+impl fmt::Display for DaemonDeadline {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "st API endpoint `{}` exceeded the {} limit of {} ms; the service may be busy or unavailable, retry the command",
+            self.endpoint,
+            self.phase,
+            self.deadline.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for DaemonDeadline {}
+
+/// Whether an API call failed because the daemon did not answer: it was unreachable, or it took
+/// the request and ran out of time. A refusal is an answer.
+pub fn daemon_did_not_answer(error: &anyhow::Error) -> bool {
+    daemon_unreachable(error).is_some()
+        || error
+            .chain()
+            .any(|cause| cause.downcast_ref::<DaemonDeadline>().is_some())
 }
 
 fn decode_chunked(bytes: &[u8]) -> Result<Vec<u8>> {
@@ -820,10 +1052,11 @@ fn api_error(status: u16, bytes: &[u8]) -> anyhow::Error {
         }
         return anyhow::anyhow!("st API returned {status}: {message}");
     }
-    anyhow::anyhow!(
-        "st API returned {status}: {}",
-        String::from_utf8_lossy(bytes).trim()
-    )
+    UnexpectedResponse {
+        status,
+        body: String::from_utf8_lossy(bytes).trim().to_owned(),
+    }
+    .into()
 }
 
 fn decode_api_response<O: DeserializeOwned>(bytes: &[u8]) -> Result<O> {
@@ -1651,5 +1884,237 @@ mod tests {
                 Some("st3.terminal.v1".into())
             ))
         );
+    }
+
+    /// A stand-in PTY session at `ROOT/RUNTIME.sock` with its registry record. It answers an
+    /// ATTACH with a screen and an exit the way a `pty` daemon does, and returns every byte its
+    /// one client sent.
+    fn pty_session(
+        root: &Path,
+        runtime_id: &str,
+        created_at: &str,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        use std::io::{Read as _, Write as _};
+        std::fs::create_dir_all(root).unwrap();
+        std::fs::write(
+            root.join(format!("{runtime_id}.json")),
+            json!({ "createdAt": created_at }).to_string(),
+        )
+        .unwrap();
+        let listener =
+            std::os::unix::net::UnixListener::bind(root.join(format!("{runtime_id}.sock")))
+                .unwrap();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut received = Vec::new();
+            let mut reader = pty_core::protocol::PacketReader::new();
+            let mut bytes = [0_u8; 4096];
+            loop {
+                let count = stream.read(&mut bytes).unwrap_or(0);
+                if count == 0 {
+                    return received;
+                }
+                received.extend_from_slice(&bytes[..count]);
+                let packets = reader.feed(&bytes[..count]).unwrap();
+                if packets
+                    .iter()
+                    .any(|packet| packet.type_ == pty_core::protocol::MessageType::Attach)
+                {
+                    stream
+                        .write_all(&pty_core::protocol::encode_screen(b"straight from the pty"))
+                        .unwrap();
+                    stream
+                        .write_all(&pty_core::protocol::encode_exit(0))
+                        .unwrap();
+                }
+            }
+        })
+    }
+
+    /// Client descriptors without a terminal: no input, and output kept in a file. The files
+    /// must outlive the attach.
+    fn silent_io() -> (ClientIo, std::fs::File, std::fs::File) {
+        use std::os::fd::AsRawFd as _;
+        let input = std::fs::File::open("/dev/null").unwrap();
+        let output = tempfile::tempfile().unwrap();
+        let io = ClientIo {
+            stdin: input.as_raw_fd(),
+            stdout: output.as_raw_fd(),
+            stderr: output.as_raw_fd(),
+        };
+        (io, input, output)
+    }
+
+    #[tokio::test]
+    async fn a_local_terminal_attaches_to_its_pty_session_without_the_daemon() {
+        use std::io::{Read as _, Seek as _};
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("pty");
+        let session = pty_session(&root, "worker", "2026-09-29T08:00:00.000Z");
+        let terminal = LocalTerminal {
+            subject: "agent/worker".into(),
+            runtime_id: "worker".into(),
+            // The stand-in session is served by this process.
+            incarnation_id: format!("{}:2026-09-29T08:00:00.000Z", std::process::id()),
+            pty_root: root,
+        };
+        let (io, _input, mut output) = silent_io();
+
+        let exit = attach_local_terminal_with_io(&terminal, io).await.unwrap();
+
+        assert_eq!(exit, 0);
+        let received = session.join().unwrap();
+        let packets = pty_core::protocol::PacketReader::new()
+            .feed(&received)
+            .unwrap();
+        assert_eq!(
+            packets.first().map(|packet| packet.type_),
+            Some(pty_core::protocol::MessageType::Attach),
+            "the client must open with ATTACH: {received:?}"
+        );
+        let mut shown = String::new();
+        output.rewind().unwrap();
+        output.read_to_string(&mut shown).unwrap();
+        assert!(shown.contains("straight from the pty"), "{shown:?}");
+    }
+
+    #[tokio::test]
+    async fn a_local_attach_sends_nothing_to_a_pty_session_of_another_incarnation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("pty");
+        // The session was replaced after st observed it: same path, new start.
+        let session = pty_session(&root, "worker", "2026-09-29T09:30:00.000Z");
+        let terminal = LocalTerminal {
+            subject: "agent/worker".into(),
+            runtime_id: "worker".into(),
+            incarnation_id: format!("{}:2026-09-29T08:00:00.000Z", std::process::id()),
+            pty_root: root,
+        };
+        let (io, _input, _output) = silent_io();
+
+        let error = attach_local_terminal_with_io(&terminal, io)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("changed incarnation"), "{error}");
+        assert!(
+            session.join().unwrap().is_empty(),
+            "a fenced-out session must receive nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attach_without_st_reaches_the_pty_session_its_registry_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("pty");
+        let session = pty_session(&root, "worker", "2026-09-29T08:00:00.000Z");
+        let tagged = TaggedPtySession {
+            runtime_id: "worker".into(),
+            created_at: "2026-09-29T08:00:00.000Z".into(),
+            // The stand-in session is served by this process.
+            pid: std::process::id() as i32,
+        };
+        let (io, _input, _output) = silent_io();
+
+        let exit = attach_unconsulted_terminal_with_io(&root, "agent/worker", &tagged, io)
+            .await
+            .unwrap();
+
+        assert_eq!(exit, 0);
+        assert!(!session.join().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_attach_without_st_sends_nothing_to_a_socket_another_process_serves() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("pty");
+        let session = pty_session(&root, "worker", "2026-09-29T08:00:00.000Z");
+        // The registry named another PTY daemon; a replacement now serves the same path.
+        let tagged = TaggedPtySession {
+            runtime_id: "worker".into(),
+            created_at: "2026-09-29T08:00:00.000Z".into(),
+            pid: std::process::id() as i32 + 1,
+        };
+        let (io, _input, _output) = silent_io();
+
+        let error = attach_unconsulted_terminal_with_io(&root, "agent/worker", &tagged, io)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("changed"), "{error}");
+        assert!(
+            session.join().unwrap().is_empty(),
+            "a session the registry did not name must receive nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_local_daemon_that_knows_the_route_names_a_local_terminal() {
+        let remote = Client::new(Endpoint::Http("http://127.0.0.1:9".into()));
+        assert!(
+            remote
+                .local_terminal("agent/worker")
+                .await
+                .unwrap()
+                .is_none(),
+            "an HTTP endpoint can be another host, so its terminals use the WebSocket"
+        );
+
+        let directory = tempfile::tempdir().unwrap();
+        let older = directory.path().join("older.sock");
+        let server_socket = older.clone();
+        let server = tokio::spawn(async move {
+            crate::api::serve_unix(&server_socket, Router::new())
+                .await
+                .unwrap();
+        });
+        for _ in 0..100 {
+            if older.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert!(
+            Client::unix(&older)
+                .local_terminal("agent/worker")
+                .await
+                .unwrap()
+                .is_none(),
+            "a daemon without the route leaves the attach to the WebSocket"
+        );
+        server.abort();
+
+        let elsewhere = directory.path().join("elsewhere.sock");
+        let server_socket = elsewhere.clone();
+        let app = Router::new().route(
+            "/v1/sessions/local-terminal/{*subject}",
+            get(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({
+                        "code": "runtime-not-local",
+                        "message": "subject `agent/worker` is owned by `host/other`",
+                        "details": {}
+                    })),
+                )
+            }),
+        );
+        let server = tokio::spawn(async move {
+            crate::api::serve_unix(&server_socket, app).await.unwrap();
+        });
+        for _ in 0..100 {
+            if elsewhere.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let error = Client::unix(&elsewhere)
+            .local_terminal("agent/worker")
+            .await
+            .unwrap_err();
+        assert_eq!(api_error_code(&error), Some("runtime-not-local"));
+        server.abort();
     }
 }

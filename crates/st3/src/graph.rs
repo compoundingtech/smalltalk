@@ -5,7 +5,7 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest as _, Sha256};
 
 use crate::model::{
-    DesiredSubject, GateSpec, LaunchSpec, MemberKind, MemberLifecycle, MemberSpec,
+    DesiredSubject, GateSpec, LaneSpec, LaunchSpec, MemberKind, MemberLifecycle, MemberSpec,
     MissionRevisionOperation, MissionRunCreation, MissionRunDeclaration, NamedCancellation,
     NormalizedIntent, ObserverSpec, PlannerSpec, PlanningFeedbackOperation,
     PlanningSessionCreation, PlanningSessionDeclaration, QuantifiedFieldSpec,
@@ -21,6 +21,7 @@ const ROOT_NODES: &[&str] = &[
     "host",
     "doc",
     "resource",
+    "lane",
     "observer",
     "subscription",
     "person",
@@ -42,6 +43,7 @@ pub(crate) fn is_mission_declaration(name: &str) -> bool {
             | "host"
             | "doc"
             | "resource"
+            | "lane"
             | "observer"
             | "subscription"
             | "person"
@@ -418,7 +420,7 @@ fn parse_desired_node(
     if !context.allow_execution_root
         && matches!(
             kind,
-            "exec" | "pty" | "observer" | "subscription" | "schedule"
+            "exec" | "pty" | "lane" | "observer" | "subscription" | "schedule"
         )
     {
         return Err(St3Error::new(
@@ -1119,20 +1121,6 @@ fn parse_planning_session_declaration(
             if let Some(effort) = &creation.planner.effort {
                 harness_body.nodes_mut().push(string_node("effort", effort));
             }
-            let target_context = creation.target_run.as_ref().map_or_else(String::new, |run| {
-                format!(
-                    " Inspect the current target with `st --json missions show {run}` before you revise it. The target generation is `{}`.",
-                    creation.target_generation.as_deref().unwrap_or_default()
-                )
-            });
-            harness_body.nodes_mut().push(string_node(
-                "prompt",
-                &format!(
-                    "You are the durable {} planner for launch `{id}`. Read `{}` with `st documents get`.{target_context} Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{}` and its state must be ready. Submit it with `st launch submit {id} --variant default --markdown MARKDOWN_FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay ready for feedback until approval or cancellation.",
-                    creation.planner.provider,
-                    creation.request, creation.mission
-                ),
-            ));
             let arguments: &[&str] = match creation.planner.provider.as_str() {
                 "codex" => &[
                     "--dangerously-bypass-approvals-and-sandbox",
@@ -1161,6 +1149,21 @@ fn parse_planning_session_declaration(
         parse_stop(&stop, context)?;
     }
     Ok(())
+}
+
+/// What a declared launch asks its planner to do. A seat takes no startup prompt, so this reaches
+/// the planner as the launch request message that starts its first turn.
+pub fn planning_planner_request(id: &str, creation: &PlanningSessionCreation) -> String {
+    let target_context = creation.target_run.as_ref().map_or_else(String::new, |run| {
+        format!(
+            " Inspect the current target with `st --json missions show {run}` before you revise it. The target generation is `{}`.",
+            creation.target_generation.as_deref().unwrap_or_default()
+        )
+    });
+    format!(
+        "You are the durable {} planner for launch `{id}`. Read `{}` with `st documents get`.{target_context} Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{}` and its state must be ready. Submit it with `st launch submit {id} --variant default --markdown MARKDOWN_FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay ready for feedback until approval or cancellation.",
+        creation.planner.provider, creation.request, creation.mission
+    )
 }
 
 fn string_node(name: &str, value: &str) -> KdlNode {
@@ -1499,11 +1502,12 @@ fn parse_structure(node: &KdlNode, kind: &str, context: &mut ParseContext) -> Re
         }
         "message" => validate_message(node)?,
         "schedule" => validate_schedule(node)?,
+        "lane" => validate_lane(node)?,
         _ => unreachable!("the desired-state registry controls structure kinds"),
     }
     let subject = match kind {
         "doc" => format!("doc/{name}"),
-        "observer" | "subscription" | "schedule" if context.owner_run.is_some() => {
+        "lane" | "observer" | "subscription" | "schedule" if context.owner_run.is_some() => {
             format!(
                 "{kind}/{}/{}",
                 owner_run_id(context.owner_run.as_deref().unwrap_or_default()),
@@ -1606,7 +1610,7 @@ fn rewrite_owned_references(subjects: &mut BTreeMap<String, DesiredSubject>, run
         };
         if matches!(
             kind,
-            "agent" | "exec" | "pty" | "observer" | "subscription" | "schedule"
+            "agent" | "exec" | "pty" | "lane" | "observer" | "subscription" | "schedule"
         ) {
             aliases.insert(format!("{kind}/{local}"), subject.clone());
             if kind == "agent" {
@@ -2115,7 +2119,6 @@ fn driver_member(
             format!("harness `{name}` has no body"),
         )
     })?;
-    let prompt = crate::boot::compose_prompt(child_string(children, "prompt")?.as_deref());
     let model = child_string(children, "model")?;
     let effort = child_string(children, "effort")?;
     let extra = child_strings(children, "args")?.unwrap_or_default();
@@ -2154,11 +2157,9 @@ fn driver_member(
             _ => provider.extend(["--effort".into(), effort]),
         }
     }
+    // No startup prompt: a started or restarted seat takes no turn until a person types or a
+    // graph message is posted. Work reaches an idle seat as a posted message naming the step.
     provider.extend(extra);
-    match name.as_str() {
-        "opencode" => provider.extend(["--prompt".into(), prompt]),
-        _ => provider.push(prompt),
-    }
     let mut wrapper = vec![
         "st3".into(),
         "driver".into(),
@@ -2430,7 +2431,9 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
     ] {
         unique_child(document, child)?;
     }
-    if let Some(authority) = unique_child(document, "mission-authority")? {
+    if let Some(authority) = unique_child(document, "mission-authority")?
+        && !declares_no_mission_authority(authority)?
+    {
         validate_authority_block(
             authority,
             AuthorityBlock {
@@ -2606,6 +2609,23 @@ fn validate_queue_authority_pattern(pattern: &str) -> Result<(), St3Error> {
     validate_name(seat, false).map_err(|_| invalid())
 }
 
+/// Whether `mission-authority "none"` withholds all mission authority, including the default
+/// of a top-level project seat. Any other value is refused; a block of rules is not a value.
+fn declares_no_mission_authority(authority: &KdlNode) -> Result<bool, St3Error> {
+    if authority.entries().is_empty() {
+        return Ok(false);
+    }
+    ensure_no_properties(authority)?;
+    if one_string(authority)? == "none" {
+        Ok(true)
+    } else {
+        Err(St3Error::new(
+            "invalid-mission-authority",
+            "mission authority needs a block of rules or the value \"none\"",
+        ))
+    }
+}
+
 /// One kind of authority an agent declaration can grant: a block of `VERB "PATTERN"` rules.
 struct AuthorityBlock {
     name: &'static str,
@@ -2698,6 +2718,61 @@ pub fn agent_mission_authority(desired: &Value) -> crate::model::MissionAuthorit
         }
     }
     authority
+}
+
+/// The mission authority a current agent declaration holds. A `mission-authority` block, or
+/// `mission-authority "none"`, is the whole grant. Without one, a top-level seat named
+/// `fleet/PROJECT` or `fleet/PROJECT/...` may publish, start and revise missions under
+/// `fleet/PROJECT/*` while its current declaration is a person's. A mission-scoped seat, or a seat
+/// whose declaration an agent wrote, holds nothing by default: declaring a seat never lends an
+/// agent authority it lacks.
+pub fn effective_agent_mission_authority(
+    desired: &crate::model::DesiredSubject,
+    declared_by_agent: bool,
+) -> crate::model::EffectiveMissionAuthority {
+    use crate::model::{EffectiveMissionAuthority, MissionAuthority, MissionAuthoritySource};
+
+    let none = EffectiveMissionAuthority {
+        source: MissionAuthoritySource::None,
+        authority: MissionAuthority::default(),
+    };
+    if desired.kind != "agent" {
+        return none;
+    }
+    let declared = desired
+        .desired
+        .get("children")
+        .and_then(Value::as_array)
+        .is_some_and(|children| {
+            children
+                .iter()
+                .any(|child| child.get("name").and_then(Value::as_str) == Some("mission-authority"))
+        });
+    if declared {
+        return EffectiveMissionAuthority {
+            source: MissionAuthoritySource::Declared,
+            authority: agent_mission_authority(&desired.desired),
+        };
+    }
+    let project = desired
+        .subject
+        .strip_prefix("agent/fleet/")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|project| !project.is_empty());
+    match project {
+        Some(project) if desired.owner_run.is_none() && !declared_by_agent => {
+            let namespace = vec![format!("fleet/{project}/*")];
+            EffectiveMissionAuthority {
+                source: MissionAuthoritySource::Default,
+                authority: MissionAuthority {
+                    publish: namespace.clone(),
+                    start: namespace.clone(),
+                    revise: namespace,
+                },
+            }
+        }
+        _ => none,
+    }
 }
 
 pub fn agent_queue_authority(desired: &Value) -> crate::model::QueueAuthority {
@@ -2817,11 +2892,23 @@ fn validate_driver(node: &KdlNode) -> Result<(), St3Error> {
         )
     })?;
     let allowed: &[&str] = match provider.as_str() {
-        "claude" => &["model", "effort", "dev-channels", "prompt", "args"],
-        "codex" | "pi" | "omp" => &["model", "effort", "prompt", "args"],
-        "opencode" => &["model", "prompt", "args"],
+        "claude" => &["model", "effort", "dev-channels", "args"],
+        "codex" | "pi" | "omp" => &["model", "effort", "args"],
+        "opencode" => &["model", "args"],
         _ => return Err(St3Error::new("unknown-driver", "unknown typed driver")),
     };
+    if body
+        .nodes()
+        .iter()
+        .any(|child| child.name().value() == "prompt")
+    {
+        return Err(St3Error::new(
+            "harness-prompt-removed",
+            format!(
+                "harness `{provider}` cannot take a prompt: a seat starts idle and takes no turn until a person types or a message is posted; put the instruction in a step goal or send the seat a message"
+            ),
+        ));
+    }
     reject_unknown_children(body, allowed, "harness", &provider)?;
     for child in allowed {
         unique_child(body, child)?;
@@ -3001,6 +3088,44 @@ fn validate_observer(node: &KdlNode) -> Result<(), St3Error> {
     }
     if let Some(every) = child_string(body, "every")? {
         parse_duration(&every, true)?;
+    }
+    Ok(())
+}
+
+/// A lane declares an optional entry prefix and an optional approver. Cleanup and revision
+/// retire it with `lane "NAME" { stop }`.
+fn validate_lane(node: &KdlNode) -> Result<(), St3Error> {
+    ensure_no_properties(node)?;
+    let Some(body) = node.children() else {
+        one_string(node)?;
+        return Ok(());
+    };
+    one_string_with_children(node)?;
+    if body.nodes().len() == 1 && body.nodes()[0].name().value() == "stop" {
+        ensure_bare(&body.nodes()[0])?;
+        return Ok(());
+    }
+    reject_unknown_children(body, &["entries", "approver"], "lane", "lane")?;
+    for child in ["entries", "approver"] {
+        unique_child(body, child)?;
+    }
+    if let Some(entries) = child_string(body, "entries")? {
+        if !entries.ends_with('/') {
+            return Err(St3Error::new(
+                "invalid-lane-entries",
+                "a lane's `entries` prefix must end with `/`",
+            ));
+        }
+        validate_full_subject(&format!("{entries}entry"))?;
+    }
+    if let Some(approver) = child_string(body, "approver")? {
+        validate_full_subject(&approver)?;
+        if !approver.starts_with("person/") {
+            return Err(St3Error::new(
+                "invalid-lane-approver",
+                "a lane's approver must be a `person/` subject",
+            ));
+        }
     }
     Ok(())
 }
@@ -3502,6 +3627,10 @@ pub(crate) fn validate_deferred_declaration(node: &KdlNode) -> Result<(), St3Err
     if node.name().value() == "env" {
         validate_string_map(node, true)?;
     }
+    // A lane has no run-time values, so a bad prefix or approver fails at publish, not at start.
+    if node.name().value() == "lane" {
+        return validate_lane(node);
+    }
     if let Some(children) = node.children() {
         for child in children.nodes() {
             validate_deferred_declaration(child)?;
@@ -3661,6 +3790,35 @@ pub fn observer_spec(value: &Value) -> Option<ObserverSpec> {
         every_ms: canonical_child_value(value, "every")
             .and_then(Value::as_str)
             .and_then(|value| parse_duration(value, true).ok()),
+        stopped: false,
+    })
+}
+
+/// The declared settings of a lane, or `stopped` once cleanup or a revision retired it.
+pub fn lane_spec(value: &Value) -> Option<LaneSpec> {
+    if value.get("name").and_then(Value::as_str) != Some("lane") {
+        return None;
+    }
+    let children = value
+        .get("children")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    if children.len() == 1 && children[0].get("name").and_then(Value::as_str) == Some("stop") {
+        return Some(LaneSpec {
+            entries: None,
+            approver: None,
+            stopped: true,
+        });
+    }
+    let text = |name| {
+        canonical_child_value(value, name)
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+    };
+    Some(LaneSpec {
+        entries: text("entries"),
+        approver: text("approver"),
         stopped: false,
     })
 }
@@ -4707,6 +4865,66 @@ version 2
     }
 
     #[test]
+    fn a_lane_is_a_mission_declaration_with_a_prefix_and_a_person_approver() {
+        let source = |lane: &str| {
+            format!(
+                r#"version 2
+mission "example/train" state="ready" {{
+  goal "Merge one at a time."
+  {lane}
+  step "drive" {{ agentless; gate "done" {{ field "done" "resource/example/done" "is" "true" }} }}
+}}
+"#
+            )
+        };
+        let valid = r#"lane "app" {
+    entries "resource/github/acme/app/ci/pull-request/"
+    approver "person/ada"
+  }"#;
+        let intent = parse_intent(&source(valid), "node").unwrap();
+        let declarations = intent.missions["example/train"]
+            .declarations_kdl
+            .clone()
+            .unwrap();
+        let run = parse_execution_intent(&declarations, "node", "train-run").unwrap();
+        let lane = &run.subjects["lane/train-run/app"];
+        assert_eq!(lane.kind, "lane");
+        assert_eq!(
+            lane_spec(&lane.desired),
+            Some(LaneSpec {
+                entries: Some("resource/github/acme/app/ci/pull-request/".into()),
+                approver: Some("person/ada".into()),
+                stopped: false,
+            })
+        );
+        parse_intent(&source(r#"lane "bare""#), "node").unwrap();
+
+        for (lane, code) in [
+            (
+                r#"lane "app" { entries "resource/github/acme/app/ci/pull-request" }"#,
+                "invalid-lane-entries",
+            ),
+            (
+                r#"lane "app" { approver "agent/example/driver" }"#,
+                "invalid-lane-approver",
+            ),
+            (r#"lane "app" { order "fifo" }"#, "unknown-child"),
+        ] {
+            assert_eq!(
+                parse_intent(&source(lane), "node").unwrap_err().code,
+                code,
+                "{lane}"
+            );
+        }
+        let in_step = source("").replace("step \"drive\" {", "step \"drive\" {\n    lane \"app\";");
+        assert_eq!(
+            parse_intent(&in_step, "node").unwrap_err().code,
+            "lane-inside-step"
+        );
+        assert!(parse_intent("version 2\nlane \"app\"", "node").is_err());
+    }
+
+    #[test]
     fn rejects_st2_document_versions() {
         for source in [
             " agent \"worker\" { command \"true\" } ",
@@ -4731,9 +4949,7 @@ version 2
   agent "worker" {
     workspace "/work"
     restart "never"
-    harness "claude" {
-      prompt "Work on the task."
-    }
+    harness "claude" {}
   }
 
 "#,
@@ -4840,9 +5056,7 @@ version 2
 
   agent "worker" {
     workspace "/work"
-    harness "claude" {
-      prompt "Work on the task."
-    }
+    harness "claude" {}
   }
 
 "#,
@@ -4880,9 +5094,9 @@ version 2
 
     #[test]
     fn model_free_provider_contracts_build_exact_native_argv() {
-        for (provider, extra, prefix) in [
+        for (provider, extra, expected) in [
             ("pi", "effort \"high\"", vec!["pi", "--thinking", "high"]),
-            ("opencode", "", vec!["opencode", "--prompt"]),
+            ("opencode", "", vec!["opencode"]),
             (
                 "omp",
                 "effort \"medium\"",
@@ -4896,7 +5110,6 @@ version 2
     workspace "/work"
     harness {provider:?} {{
       {extra}
-      prompt "Do the work."
     }}
   }}
 "#,
@@ -4909,19 +5122,13 @@ version 2
             let LaunchSpec::Argv(argv) = &member.launch else {
                 panic!("the typed provider did not build argv");
             };
-            let expected_prompt = crate::boot::compose_prompt(Some("Do the work."));
-            let mut expected = prefix;
-            expected.push(&expected_prompt);
-            assert!(
-                argv.windows(expected.len())
-                    .any(|window| window == expected),
-                "{provider}: {argv:?}"
-            );
+            let provider_argv = &argv[argv.iter().position(|arg| arg == "--").unwrap() + 1..];
+            assert_eq!(provider_argv, expected.as_slice(), "{provider}");
         }
     }
 
     #[test]
-    fn a_harness_without_an_authored_prompt_uses_the_boot_prompt() {
+    fn a_seat_starts_without_a_prompt_and_an_authored_prompt_is_refused() {
         for provider in ["claude", "codex", "pi", "omp", "opencode"] {
             let intent = parse_test_intent(
                 &format!(
@@ -4937,11 +5144,21 @@ version 2
             let LaunchSpec::Argv(argv) = &member.launch else {
                 panic!("the {provider} driver did not build argv");
             };
-            assert_eq!(
-                argv.last().map(String::as_str),
-                Some(crate::boot::BOOT_PROMPT),
+            assert!(
+                !argv
+                    .iter()
+                    .any(|arg| arg.contains("boot.md") || arg == "--prompt"),
                 "{provider}: {argv:?}"
             );
+
+            let error = parse_test_intent(
+                &format!(
+                    "version 2\nagent \"worker\" {{ workspace \"/work\"; harness {provider:?} {{ prompt \"Do the work.\" }} }}\n"
+                ),
+                "node",
+            )
+            .unwrap_err();
+            assert_eq!(error.code, "harness-prompt-removed", "{provider}");
         }
     }
 
@@ -5119,13 +5336,13 @@ version 2
   agent "lead" {
     workspace "/work"
     under "worker" reason="the worker supplies a specialist view"
-    harness "codex" { prompt "Coordinate only when needed." }
+    harness "codex" {}
   }
   agent "worker" {
     workspace "/work"
     under "lead" reason="the lead combines the result"
     under "missing"
-    harness "codex" { prompt "Do the assigned work." }
+    harness "codex" {}
   }
 
 "#;
@@ -5341,17 +5558,24 @@ planning-session "planning/release/revise" {{
         let planner_subject = planning_planner_subject("planning-session/planning/release/revise");
         let planner = &intent.subjects[&planner_subject];
         let desired = serde_json::to_string(&planner.desired).unwrap();
+        assert!(!desired.contains("prompt"), "{desired}");
+        // The planner starts idle; its instructions arrive as the launch request message.
+        let creation = intent.planning_sessions["planning-session/planning/release/revise"]
+            .creation
+            .as_ref()
+            .unwrap();
+        let request = planning_planner_request("planning/release/revise", creation);
         assert!(
-            desired.contains("st launch submit planning/release/revise"),
-            "{desired}"
+            request.contains("st launch submit planning/release/revise"),
+            "{request}"
         );
         assert!(
-            desired.contains("st --json missions show mission-run/release/live"),
-            "{desired}"
+            request.contains("st --json missions show mission-run/release/live"),
+            "{request}"
         );
         assert!(
-            desired.contains("run-generation/release/live/2"),
-            "{desired}"
+            request.contains("run-generation/release/live/2"),
+            "{request}"
         );
     }
 

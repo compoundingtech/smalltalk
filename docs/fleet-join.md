@@ -394,7 +394,7 @@ keeps clock skew out of authentication.
 
 ```text
 st fleet join [CODE | - | --code-file PATH | --fabric-inbox] [--name NAME] [--dial-out]
-              [--via auto|tailscale|fabric|URL] [--no-service] [--wait DURATION] [--as PERSON]
+              [--via auto|tailscale|fabric|URL] [--no-service] [--no-wait] [--as PERSON]
 ```
 
 With no `CODE`, `join` prompts for it without echo. `-` reads it from standard input.
@@ -429,10 +429,15 @@ continues from the last completed step:
 6. **Start.** Install or refresh the services (`--no-service` prints the two foreground commands
    instead). The daemon binds the store to the fleet ID and applies the writer floor before it
    writes anything. Checkpoint `started`.
-7. **Sync.** Wait until the sponsor reports this member up and the authority digests match, and
-   print progress (`received 12,480 envelopes; 3 exchanges left`). `--wait` defaults to 10
-   minutes. If it runs out, `join` says the machine is a member and still syncing, and exits 0.
-   Checkpoint `synced`.
+7. **Sync.** Wait for the first sync to end, and print progress (`first sync: 12,480 envelopes
+   so far; sponsor has 3,120 this node lacks`). It ends at the first exchange at which this
+   machine holds the same envelopes as a peer. That exchange also checks that both project the
+   same graph, and a difference heals at once (see
+   [Fleet replication](st3/replication.md#first-sync)). A first sync that still differs after
+   the heal fails `join` with both graph digests and the reason. The wait lasts up to 30 minutes;
+   if it runs out, `join` says the machine is a member and still syncing, and exits 0.
+   `--no-wait` returns once the services start. `st fleet wait [--timeout 30m]` waits for the
+   first sync later and fails if it failed.
 
 Until its first exchange brings the membership claims, the new member knows only the sponsor. It
 checks the sponsor's responses against the key from the handshake, which `join.json` keeps. It
@@ -826,8 +831,9 @@ it asks first.
 2. Stop owned runtimes, as `st service reset` does.
 3. Remove the services (`st service uninstall`).
 4. Remove the Fabric exposure (`fabric unexpose PROTOCOL`), if this node made one.
-5. For each workspace of a seat declared on this host, remove the files `render.rs` generated under
-   `.st3/` and the Git exclude lines it added. The list comes from the local graph before step 7.
+5. For each workspace of a seat declared on this host, remove the Git exclude lines `render.rs`
+   added. st no longer writes `.st3/` there, and the daemon removes one that an older release
+   wrote. The list comes from the local graph before step 7.
 6. Remove the st3 Claude channel marketplace and plugin registration.
 7. Delete `$XDG_STATE_HOME/st3`, `$XDG_CONFIG_HOME/st3`, `$XDG_DATA_HOME/st3`, and the sockets in
    `$XDG_RUNTIME_DIR`.
@@ -1412,8 +1418,8 @@ differences, found while building it or raised by intake reviews:
 - **`st fleet remove` does not look at seats.** It removes the member and revokes its invites;
   seats declared on that host stay declared and resume if a machine joins again under the name.
   Stop them first with `st3 agents stop`. `--stop-seats` is not built.
-- **`st uninstall` leaves two things for later:** the generated `.st3/` files in seat workspaces
-  and the st3 Claude channel registration. The isolated tests have no seats; both need the seat
+- **`st uninstall` leaves two things for later:** the Git exclude lines in seat workspaces and
+  the st3 Claude channel registration. The isolated tests have no seats; both need the seat
   declarations read before the state directory goes. It prints what needs root. `--no-service`
   keeps it (and every other fleet command that has the flag) away from service managers, which
   macOS does not isolate by `HOME`.

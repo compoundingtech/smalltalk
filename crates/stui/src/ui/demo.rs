@@ -66,6 +66,7 @@ pub fn world() -> World {
         person: s("person/robin"),
         host: s("lark"),
         link: Link::Live,
+        diverged: Vec::new(),
         attention: Load::Ready(attention()),
         agents: Load::Ready(agents()),
         missions: Load::Ready(missions()),
@@ -98,6 +99,7 @@ pub fn loading() -> World {
         person: s("person/robin"),
         host: s("lark"),
         link: Link::Connecting,
+        diverged: Vec::new(),
         attention: Load::Loading,
         agents: Load::Loading,
         missions: Load::Loading,
@@ -644,6 +646,7 @@ fn all_missions() -> Vec<Mission> {
             parent: None,
             system: false,
             kdl: Some(s(ATLAS_KDL)),
+            outcome: None,
         },
         Mission {
             id: s("mission/fleet/site/pricing-page"),
@@ -676,6 +679,7 @@ fn all_missions() -> Vec<Mission> {
             parent: None,
             system: false,
             kdl: None,
+            outcome: None,
         },
         Mission {
             id: s("mission/fleet/release/weekly"),
@@ -716,6 +720,7 @@ fn all_missions() -> Vec<Mission> {
             parent: None,
             system: false,
             kdl: None,
+            outcome: None,
         },
         Mission {
             id: s("mission/fleet/harbor/pull-request-review"),
@@ -748,6 +753,7 @@ fn all_missions() -> Vec<Mission> {
             parent: None,
             system: false,
             kdl: None,
+            outcome: None,
         },
         Mission {
             id: s("mission/fleet/rekey"),
@@ -790,6 +796,7 @@ fn all_missions() -> Vec<Mission> {
             parent: None,
             system: false,
             kdl: None,
+            outcome: None,
         },
         Mission {
             id: s("mission/fleet/docs/handbook"),
@@ -814,6 +821,7 @@ fn all_missions() -> Vec<Mission> {
             parent: None,
             system: false,
             kdl: None,
+            outcome: None,
         },
         Mission {
             id: s("mission/fleet/atlas/nightly"),
@@ -846,6 +854,7 @@ fn all_missions() -> Vec<Mission> {
             parent: None,
             system: false,
             kdl: None,
+            outcome: None,
         },
     ]
 }

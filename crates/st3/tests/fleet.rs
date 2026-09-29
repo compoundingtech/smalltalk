@@ -517,6 +517,13 @@ async fn invite_and_join_sync_full_history() {
     }
 
     let b = joined(root.path(), &a, "b", &[]).await;
+    // A newcomer's first sync ends by checking that it projects its sponsor's graph.
+    let waited = b.st_ok(&["fleet", "wait", "--timeout", "90s"]);
+    assert!(waited.contains("first sync verified"), "{waited}");
+    let first = b.st_json(&["replication", "status"])["first_sync"].clone();
+    assert_eq!(first["state"], "verified", "{first}");
+    assert_eq!(first["healed"], false, "{first}");
+    assert_eq!(first["graph_digest"], first["peer_graph_digest"], "{first}");
     wait_for_notes(&b, &expected, 60, &[&a, &b]).await;
     b.wait_listening().await;
     b.note("b-0").await;
@@ -565,6 +572,192 @@ async fn invite_and_join_sync_full_history() {
                 node.name
             );
         }
+    }
+}
+
+/// The `sync` object `st replication status` reports for `peer`, or null.
+fn peer_sync(node: &Node, peer: &str) -> Value {
+    node.st_json(&["replication", "status"])["peers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|status| status["peer"] == peer)
+        .map(|status| status["sync"].clone())
+        .unwrap_or(Value::Null)
+}
+
+/// Two members can hold the same envelopes and still project different graphs, as when one of
+/// them lost claims it had admitted. No exchange fixes that, so neither may call the pair in
+/// sync: replication status says diverged, doctor fails, and every client page carries it.
+/// Then they heal: they find the claims one lacks and admit their envelopes again.
+#[tokio::test(flavor = "multi_thread")]
+async fn members_with_the_same_envelopes_but_different_claims_report_divergence_and_heal() {
+    let root = tempfile::tempdir().unwrap();
+    let mut a = anchor(root.path(), "a").await;
+    let mut b = joined(root.path(), &a, "b", &[]).await;
+    let mission = root.path().join("probe.kdl");
+    fs::write(
+        &mission,
+        "version 2\nmission \"divergence-probe\" state=\"ready\" {\n  \
+         goal \"Give both graphs a row that one member can lose.\"\n  \
+         step \"only\" { agentless }\n}\n",
+    )
+    .unwrap();
+    a.st_ok(&[
+        "missions",
+        "publish",
+        mission.to_str().unwrap(),
+        "--as",
+        PERSON,
+    ]);
+    wait_until(
+        "both members hold the mission and call the pair in sync",
+        90,
+        || async {
+            a.st_json(&["replication", "status"])["graph_digest"]
+                == b.st_json(&["replication", "status"])["graph_digest"]
+                && [(&a, "b"), (&b, "a")].iter().all(|(node, peer)| {
+                    node.st_ok(&["replication", "status"])
+                        .contains("in sync: the same envelopes and the same graph")
+                        && peer_sync(node, peer)["graph_compared_at_unix_ms"].is_number()
+                })
+        },
+    )
+    .await;
+
+    let in_sync_graph = a.st_json(&["replication", "status"])["graph_digest"].clone();
+    // Heals wait while the divergence is inspected.
+    let hold = (
+        "ST3_REPLICATION_HEAL_AFTER_MS".to_owned(),
+        "3600000".to_owned(),
+    );
+    a.env.push(hold.clone());
+    a.restart().await;
+    b.env.push(hold);
+
+    // B loses the mission's claims but keeps their envelopes, so both inventories still match.
+    b.stop();
+    {
+        let store = rusqlite::Connection::open(b.state_dir().join("claims.sqlite3")).unwrap();
+        let dropped = store
+            .execute(
+                "DELETE FROM mission_definitions WHERE mission_id LIKE '%divergence-probe%'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(dropped, 1, "b projected the mission");
+        store
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 DELETE FROM claims WHERE subject LIKE '%divergence-probe%';",
+            )
+            .unwrap();
+    }
+    b.start().await;
+
+    wait_until("both members report the divergence", 180, || async {
+        peer_sync(&a, "b")["diverged"] == true && peer_sync(&b, "a")["diverged"] == true
+    })
+    .await;
+    for (node, peer) in [(&a, "b"), (&b, "a")] {
+        let status = node.st_ok(&["replication", "status"]);
+        assert!(
+            status.contains(&format!(
+                "sync\tdiverged: {peer} holds the same envelopes but projects a different graph"
+            )),
+            "{status}"
+        );
+        assert!(!status.contains("in sync"), "{status}");
+        let doctor = node.st(&["--json", "doctor"]);
+        assert!(!doctor.status.success(), "{} doctor passed", node.name);
+        let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "replication")
+            .cloned()
+            .unwrap();
+        assert_eq!(check["status"], "fail", "{check}");
+        assert!(
+            check["message"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("graph diverged from {peer}")),
+            "{check}"
+        );
+        let page = node.st_json(&["machines"]);
+        assert_eq!(page["value"]["sync"]["state"], "diverged", "{page}");
+        assert_eq!(
+            page["value"]["sync"]["peers"][0]["host_id"],
+            format!("host/{peer}")
+        );
+        assert!(page["value"]["sync"]["peers"][0]["diverged_since"].is_string());
+        let machines = node.st_ok(&["machines"]);
+        assert!(
+            machines.starts_with(&format!(
+                "DIVERGED  {peer} projects a different graph from the same envelopes"
+            )),
+            "{machines}"
+        );
+    }
+
+    // Without the hold, the members heal soon after they find the graphs different.
+    for node in [&mut a, &mut b] {
+        node.env = vec![(
+            "ST3_REPLICATION_HEAL_AFTER_MS".to_owned(),
+            "1000".to_owned(),
+        )];
+        node.restart().await;
+    }
+    wait_until("the members heal", 120, || async {
+        a.st_json(&["replication", "status"])["graph_digest"]
+            == b.st_json(&["replication", "status"])["graph_digest"]
+            && [(&a, "b"), (&b, "a")]
+                .iter()
+                .all(|(node, peer)| peer_sync(node, peer)["diverged"] != true)
+    })
+    .await;
+    assert_eq!(
+        b.st_json(&["replication", "status"])["graph_digest"],
+        in_sync_graph,
+        "b projects the graph both showed before it lost the claims"
+    );
+    let heals = [(&a, "b"), (&b, "a")]
+        .iter()
+        .filter_map(|(node, peer)| {
+            let heal = peer_sync(node, peer)["heal"].clone();
+            (!heal.is_null()).then_some((node.name.clone(), heal))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        heals.iter().any(|(_, heal)| heal["healed"] == true
+            && heal["refetched"].as_u64().unwrap_or(0) + heal["pushed"].as_u64().unwrap_or(0) > 0),
+        "{heals:?}"
+    );
+    let restored = b
+        .claims()
+        .await
+        .into_iter()
+        .filter(|claim| {
+            claim["subject"]
+                .as_str()
+                .unwrap_or("")
+                .contains("divergence-probe")
+        })
+        .count();
+    assert!(restored > 0, "b admitted the mission's claims again");
+    for node in [&a, &b] {
+        let doctor = node.st(&["--json", "doctor"]);
+        let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "replication")
+            .cloned()
+            .unwrap();
+        assert_ne!(check["status"], "fail", "{check}");
     }
 }
 
@@ -950,7 +1143,8 @@ async fn leave_drains_everything_before_it_leaves() {
     b.wait_listening().await;
     a.stop();
     let mut expected = BTreeSet::new();
-    // More than one exchange carries, written while the anchor is away.
+    // Written while the anchor is away, and more than an older peer's exchange carries (512),
+    // so the anchor comes back catching up and defers projecting what it receives.
     for index in 0..700 {
         b.note(&format!("b-{index}")).await;
         expected.insert(format!("custom/fleet-test/b-{index}"));

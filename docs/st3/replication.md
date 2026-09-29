@@ -121,6 +121,23 @@ Reducers use causal ancestry where it exists. They use stable claim data as the 
 
 Terminal revision proposal states do not regress during replay. Local rules still allow only one pending proposal for a mission run.
 
+A full replay starts from nothing, as a node that joins late does. It clears the graph tables,
+replays every claim in canonical order (accepted time, writer, batch sequence, position in the
+batch), and then applies local lease renewals again. Replaying over the rows an earlier projection
+left behind made the graph depend on how that projection ran: it could apply a run's old terminal
+state over the revision that reopened the run, so two nodes holding the same claims showed
+different graphs. A rule that reads other claims finds them by subject, never by the batch it
+arrived in, since a writer may put related claims in separate batches. The replay reads every
+claim before it projects any, so a claim that fails to project is quarantined without ending the
+replay.
+
+The first start of a build with this rule replays from nothing once. A run that this node created
+could show as over in its old graph while its claims say it runs. Starting that work again long
+after anyone expected it would surprise people, so the node writes the claims that end the run as
+its graph showed it, and says so at startup. It does this only while no peer claim on the run
+waits to be projected, since such a claim may have reopened the run for real. Runs that other
+nodes created are theirs to settle.
+
 ## Inspection and repair
 
 Use these commands:
@@ -164,13 +181,84 @@ Each store stage counts only the time it holds the store's write connection, so 
 not count another's wait. Round trips are this node's own requests to its peers, including the
 peer's work to answer them. SQLite time is every statement the daemon ran; each commit waits for
 a disk flush. `/v1/replication/status` carries the same numbers as `timings`.
-`crates/st3/tests/first_sync.rs` uses them to profile an empty node syncing from a peer; `cargo test --release -p st3 --test first_sync -- --nocapture` runs it.
+`crates/st3/tests/first_sync.rs` uses them to profile an empty node syncing from a peer; `cargo test --release -p st3 --test integration first_sync:: -- --nocapture` runs it.
 
 A node is catching up while a peer measured in the last five minutes holds more envelopes than one
 exchange carries. During that time its projections can show early history as current: a request
 that a later envelope resolves still looks open. Every client page then carries a `sync` notice,
 `st now` and the other product commands print a `SYNCING` line before their items, and stui shows
 `⟳ Syncing` with the same line.
+
+Two nodes are in sync only when they hold the same envelopes and project the same graph from
+them. Each exchange at which both nodes hold the same envelopes compares their graph digests; an
+exchange that stores new envelopes, or meets a deferred projection, compares nothing. The same
+envelopes must project the same graph, so a difference that outlasts a minute, longer than a peer
+takes to project what it stored, means the graphs diverged: for example, one node's projection
+followed a rule that a replay from nothing does not, or lost claims it had admitted while keeping
+their envelopes. Exchanges cannot fix that, so the status view leads with it:
+
+```text
+sync	diverged: node-b holds the same envelopes but projects a different graph, since 3m ago
+peer	node-b	up
+  last exchange 2s ago
+  diverged: the same envelopes project different graphs since 3m ago (compared 2s ago; this node 0f3a9c21d4e8, node-b 7b21e05c9a44)
+  exchanges cannot fix this; the nodes heal by comparing the claims each projects, and views on one node are wrong until then
+```
+
+While any peer has diverged, `st doctor` fails its replication check, every client page carries a
+`sync` notice in the `diverged` state, `st now` and the other product commands print a `DIVERGED`
+line, and stui's header shows `⚠ diverged`. A shorter difference shows as `graphs differ` and fails
+nothing. A comparison stands until the next exchange at which both nodes hold the same envelopes;
+the first one that finds equal graphs clears it. Like the envelope difference, comparisons live in
+memory and the first exchanges after a restart rebuild them.
+
+### Heal
+
+Diverged nodes heal without a person and without a reset. When the replication worker's own
+exchange with a peer finds the graphs still different after a minute, the worker starts a heal
+over the signed peer route `/v1/peer/heal`. The node that dials asks the questions, and the main
+daemon on each side answers from the claims it projects:
+
+1. **Ranges.** The digest of the claims each node projects from each writer range (the same
+   bucket ranges the envelope inventory uses).
+2. **Subjects.** For each range that differs, the digest of its claims about each subject.
+3. **Claims.** For each subject that differs, the claims themselves and the envelopes that carry
+   them.
+4. **Swap.** Each side sends the envelopes that carry claims the other lacks. The receiver checks
+   each envelope against its hash and admits it again through the usual validation, repair, and
+   projection. Claims move in both directions in one swap, and a heal repeats the narrowing while
+   swaps still move claims.
+
+When both nodes project the same claims but different graphs, their projections differ, and a
+replay from nothing decides the graph: first the asking node replays its own, then it asks the
+peer to replay. A replay holds the store for as long as it takes (about 40 seconds on a 2 GB
+store), so a node replays for heals at most once every 10 minutes, and backs off to once a day
+after replays that did not make the graphs agree. A heal that changed nothing waits twice as long
+before the next, up to an hour. A peer on a build without the heal route answers with an unsigned
+404, and the heal reports that.
+
+`st replication status` shows the last heal with each peer:
+
+```text
+peer	node-b	up
+  last exchange 2s ago
+  in sync: the same envelopes and the same graph (measured now)
+  healed 1m ago: admitted 14 claims node-b projects (1 ranges and 3 subjects differed); the graphs agree
+```
+
+A heal that could not make the graphs agree says why, for example `node-b cannot admit 2 claims:
+2 unknown (unknown-claim-kind) that this node projects`, and the pair stays `diverged` until a
+later heal succeeds.
+
+### First sync
+
+A machine that joins with `st fleet join` records a first sync. It ends at the first exchange at
+which the new machine holds the same envelopes as a peer. That exchange compares the two graph
+digests at once, without the minute a running node allows a peer to finish projecting, and a
+difference starts a heal immediately. The first sync is then `verified`, possibly after a heal,
+or `failed` with the heal's reason. `join` waits for it by default and fails when it fails;
+`st fleet wait` waits for it later. A failed first sync fails `st doctor`'s replication check,
+and `st replication status` prints it as a `first-sync` line with both digests.
 
 Repair publishes a new claim. It does not delete or change the bad record.
 

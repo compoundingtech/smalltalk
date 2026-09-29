@@ -68,10 +68,13 @@ st missions show mission-run/64bcc9227e0166a571e09117d35c572e
 st missions publish --help
 st missions start --help
 st missions cancel --help
+st missions outcome --help
+st missions retire --help
 ```
 
-`ls` and `show` are live reads. Publication, start, and cancel are reviewed through help here and
-are mutation-tested only in the disposable fixture run.
+`ls` and `show` are live reads. Publication, start, cancel, setting a finished run's outcome, and
+retirement are reviewed through help here and are mutation-tested only in the disposable fixture
+run.
 
 ### 3. `work` — the truthful queue and worker lifecycle
 
@@ -225,6 +228,8 @@ st agents tree --status running --enrich
 st agents show --help
 st agents queue --help
 st agents queue move --help
+st agents new --help
+st agents new example --host HOST --print-kdl
 st machines --help
 st machines
 ```
@@ -232,6 +237,8 @@ st machines
 Copy an agent ID into `show`. Check tree nesting, durable seats versus mission-owned agents, current
 runtime, host, work, conversation, stale state, and whether stopped history stays out of the default.
 For a working agent, check that `show` names its current step and its last progress summary.
+Check that `AUTHORITY` lists `fleet/PROJECT/*` with `(default)` for a durable seat a person
+declared under `fleet/`, and `no missions` for a mission-owned agent.
 
 Copy a durable seat into `agents queue`. Check that the current claim comes first, then each queued
 mission run in order with `claimed`, `ready`, or `waiting`, and that `NEXT WORK` matches
@@ -240,6 +247,10 @@ this as a mission question rather than an agent one. `agents queue move AGENT RU
 `--bottom`, `--before RUN`, or `--after RUN` is a person-authorized mutation; move only a run we
 agreed to reorder, then confirm the move is listed with its author and time and that a held step
 stayed held.
+
+`agents new --print-kdl` shows the seat declaration without applying it. Check that its workspace is
+a new directory below that host's home and that the harness defaults match the fleet's existing
+seats. Run it without `--print-kdl` only for an agent we agreed to start.
 
 ### 8. `terminals` — inspect and attach without shell nesting
 
@@ -257,7 +268,9 @@ st terminals signal --help
 ```
 
 Use a harmless live terminal for `peek`. Attach only when we have agreed which terminal; detach and
-verify the caller's screen, cursor, input mode, and shell prompt are restored. `send` and `signal`
+verify the caller's screen, cursor, input mode, and shell prompt are restored. Attach once to a
+terminal on this host and once to one on another fleet host: the remote attach goes through the
+client gateway as the configured person and should feel the same. `send` and `signal`
 are control mutations and are not aimed at arbitrary live work.
 
 ### 9. `import` — adopt native Codex, Claude, Pi, OMP, and OpenCode sessions
@@ -441,7 +454,20 @@ st diagnostic --help
 This is agent-only and mutating, so the live human tour reviews help and the already automated
 failure tests rather than publishing a fake fault.
 
-### 19. `completions` — shell discoverability
+### 19. `skill` — how an agent seat uses st
+
+Why: an agent seat starts with no prompt, so the only st text an agent sees is the skill its driver
+installs. It must match the binary that serves the commands it names.
+
+```sh
+st skill
+st skill install --help
+```
+
+Check that the skill describes st without rules of conduct, that its description applies only when
+`ST_AGENT` is set, and that `install` names each harness directory it writes.
+
+### 20. `completions` — shell discoverability
 
 Why: generated completion keeps the large but intentional command surface navigable.
 

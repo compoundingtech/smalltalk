@@ -1,4 +1,5 @@
 mod cache;
+mod feed;
 mod model;
 mod tree;
 mod ui;
@@ -449,8 +450,11 @@ impl App {
                 chunks[0],
             );
         } else {
-            let syncing = self.model.sync_notice().is_some();
-            let connection = if self.live_ready && syncing {
+            let sync = self.model.sync_notice();
+            let diverged = sync.is_some_and(st3_client::SyncNotice::diverged);
+            let connection = if self.live_ready && diverged {
+                "⚠ Diverged"
+            } else if self.live_ready && sync.is_some() {
                 "⟳ Syncing"
             } else if self.live_ready {
                 "● Online"
@@ -519,7 +523,9 @@ impl App {
                 self.select_control.get(),
             );
             frame.render_widget(
-                Paragraph::new(state).style(Style::default().fg(if self.live_ready && !syncing {
+                Paragraph::new(state).style(Style::default().fg(if self.live_ready && diverged {
+                    Color::Red
+                } else if self.live_ready && sync.is_none() {
                     Color::Green
                 } else {
                     Color::Yellow
@@ -720,12 +726,19 @@ impl App {
             lines.push(String::new());
         }
         if let Some(sync) = self.model.sync_notice() {
-            lines.extend(
-                sync.peers
-                    .iter()
-                    .map(|peer| format!("SYNCING  {}", peer.summary())),
-            );
-            lines.push("Until this host catches up, what you see here can be out of date.".into());
+            lines.extend(sync.peers.iter().map(|peer| {
+                let label = if peer.diverged_since.is_some() {
+                    "DIVERGED"
+                } else {
+                    "SYNCING"
+                };
+                format!("{label}  {}", peer.summary())
+            }));
+            lines.push(if sync.diverged() {
+                "Exchanges cannot fix this, so what you see here can be wrong.".into()
+            } else {
+                "Until this host catches up, what you see here can be out of date.".into()
+            });
             lines.push(String::new());
         }
         if let Some(result) = &self.action_result {
@@ -2593,6 +2606,26 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    // The new screens are the default: one socket, pushed changes, no polling. `--old` keeps
+    // the previous screens and their event-polling sync for a while.
+    if !args.iter().any(|arg| arg == "--old") {
+        let cached = cache_path
+            .as_deref()
+            .zip(person.as_deref())
+            .and_then(|(path, actor)| cache::load(path, actor));
+        let (updates, incoming) = mpsc::channel::<feed::Update>();
+        let (commands, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        runtime.spawn(feed::run(client.clone(), updates, command_receiver));
+        return ui::live::run(ui::live::Context {
+            client,
+            runtime,
+            incoming,
+            commands,
+            person: person.unwrap_or_default(),
+            cache_path,
+            cached,
+        });
+    }
     let (updates, incoming) = mpsc::channel::<Update>();
     let background_client = client.clone();
     let background_updates = updates.clone();
@@ -2721,20 +2754,6 @@ fn main() -> Result<()> {
             }
         }
     });
-    // The new screens are the default; `--old` keeps the previous ones for a while.
-    if !args.iter().any(|arg| arg == "--old") {
-        let cached = cache_path
-            .as_deref()
-            .zip(person.as_deref())
-            .and_then(|(path, actor)| cache::load(path, actor));
-        return ui::live::run(ui::live::Context {
-            client,
-            runtime,
-            incoming,
-            person: person.unwrap_or_default(),
-            cached,
-        });
-    }
     let mut app = App::new(Model::default());
     app.model.status = "Loading…".into();
     let mut guard = TerminalGuard::enter()?;
@@ -3915,6 +3934,7 @@ mod tests {
                 local_only_envelopes: 3,
                 last_exchange_at: None,
                 estimated_catch_up_seconds: Some(840),
+                diverged_since: None,
             }],
         };
         let mut model = Model::default();
