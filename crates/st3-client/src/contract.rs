@@ -63,7 +63,6 @@ pub const READ_OPERATIONS: &[(&str, &str)] = &[
     ("work.list", "/v1/client/work"),
     ("work.get", "/v1/client/work/{id}"),
     ("agents.list", "/v1/client/agents"),
-    ("request-latency.list", "/v1/client/request-latency"),
     ("agents.get", "/v1/client/agents/{id}"),
     ("agent-queue.get", "/v1/client/agent-queues/{id}"),
     ("runtimes.list", "/v1/client/runtimes"),
