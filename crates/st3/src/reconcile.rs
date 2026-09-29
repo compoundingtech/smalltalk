@@ -8095,6 +8095,39 @@ impl<R: RuntimeControl> Reconciler<R> {
         let mut held = BTreeMap::<String, usize>::new();
         let mut waiting = Vec::new();
         for request in requests {
+            // A review waiting for capacity or a person reviews only the current head of an open
+            // pull request.
+            let pull_request = request
+                .body
+                .pointer("/fields/resource")
+                .and_then(Value::as_str)
+                .filter(|resource| resource.contains("/pull-request/"))
+                .zip(
+                    request
+                        .body
+                        .pointer("/fields/discovery")
+                        .and_then(Value::as_str),
+                );
+            if let Some((resource, discovery)) = pull_request
+                && let Some(reason) = self.store.stale_pull_request_request(resource, discovery)?
+            {
+                self.store.append_claim(&ClaimInput {
+                    subject: item.subject.clone(),
+                    kind: "subscription.mission-request-cancelled".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("request".into(), Value::String(request.id.clone())),
+                        ("reason".into(), Value::String(reason)),
+                    ]),
+                    evidence: vec![request.id.clone()],
+                    expected_subject: None,
+                    idempotency_key: Some(format!(
+                        "subscription-stale-pull-request:{}",
+                        request.id
+                    )),
+                })?;
+                continue;
+            }
             if is_held(&request) && !released.contains(&request.id) {
                 let observation = request
                     .body
@@ -8353,9 +8386,31 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .push((subject, subscription));
             }
         }
+        // A repository listing names the agent on this host that opened each new pull request.
+        let agent_workspaces = Arc::new(
+            desired
+                .iter()
+                .filter(|item| item.kind == "agent")
+                .filter_map(|item| {
+                    let member = item.member.as_ref()?;
+                    let workspace = PathBuf::from(&member.workspace);
+                    (member.host == self.host && workspace.is_absolute()).then(|| {
+                        crate::resource::AgentWorkspace {
+                            agent: item.subject.clone(),
+                            run: item.owner_run.clone(),
+                            workspace,
+                        }
+                    })
+                })
+                .collect::<Vec<_>>(),
+        );
         for observer in desired.iter().filter(|item| item.kind == "observer") {
             self.isolate("observer", &observer.subject, || {
-                self.reconcile_resource_observer(observer, &subscriptions_by_resource)
+                self.reconcile_resource_observer(
+                    observer,
+                    &subscriptions_by_resource,
+                    &agent_workspaces,
+                )
             });
         }
         Ok(())
@@ -8366,6 +8421,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         &self,
         observer: &DesiredSubject,
         subscriptions_by_resource: &HashMap<String, Vec<(String, SubscriptionSpec)>>,
+        agent_workspaces: &Arc<Vec<crate::resource::AgentWorkspace>>,
     ) -> Result<()> {
         let Some(mut spec) = crate::graph::observer_spec(&observer.desired) else {
             return Ok(());
@@ -8494,6 +8550,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             });
+        let agent_workspaces = agent_workspaces.clone();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let delay = next_check.saturating_sub(now_ms()).min(u64::MAX as u128) as u64;
@@ -8517,11 +8574,18 @@ impl<R: RuntimeControl> Reconciler<R> {
                     locator: spec.locator.clone(),
                     fields: spec.fields.iter().cloned().collect(),
                     cursor,
-                    previous_facts,
+                    previous_facts: previous_facts.clone(),
                     every_ms: spec.every_ms,
                 };
                 match provider.observe(request).await {
                     Ok(mut observation) => {
+                        if spec.provider == "github.repository" {
+                            crate::resource::attach_pull_request_openers(
+                                &mut observation.facts,
+                                previous_facts.as_ref(),
+                                &agent_workspaces,
+                            );
+                        }
                         if let Some(every_ms) = spec.every_ms {
                             observation.next_check_unix_ms =
                                 now_ms().saturating_add(every_ms as u128);
@@ -19204,7 +19268,7 @@ subscription "reviews" {{
                 None,
                 "resource/repo",
                 Some("two"),
-                &serde_json::json!({"pull_requests": [{"number": 7}]}),
+                &serde_json::json!({"pull_requests": [{"number": 7, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}]}),
                 now_ms() + 60_000,
                 &subscriptions,
             )
@@ -19406,6 +19470,242 @@ subscription "reviews" {{
                 .unwrap()
                 .len(),
             2
+        );
+    }
+
+    /// The pty-rust intake of 2026-09-29: a replacement intake run observed a listing whose
+    /// items gained a per-item state that the older build had not recorded. Items merged weeks
+    /// earlier read as changed, and their heads were reviewed and routed to a person.
+    #[test]
+    fn a_replacement_intake_over_older_history_reviews_only_new_open_heads() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, REDELIVERY_REVIEW_SOURCE, "review");
+        let publish_watch = |run: &str| {
+            apply_source(
+                &store,
+                &format!(
+                    r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+observer "repo" {{ resource "resource/repo"; provider "github.repository"; locator "example/repo"; field "pull_requests" }}
+subscription "run/{run}/reviews" {{
+  observer "observer/repo"; on "pull_requests"
+  delivery "mission" {{ mission "review"; resource "source"; workspace "/srv/reviews" }}
+}}"#
+                ),
+                &format!("watch-{run}"),
+            );
+            let subject = format!("subscription/run/{run}/reviews");
+            let desired = store.desired_subjects().unwrap();
+            let spec = desired.iter().find(|item| item.subject == subject).unwrap();
+            let revision = store
+                .selected_desired_revision("observer/repo")
+                .unwrap()
+                .unwrap();
+            (
+                revision,
+                subject,
+                vec![(
+                    spec.subject.clone(),
+                    crate::graph::subscription_spec(&spec.desired).unwrap(),
+                )],
+            )
+        };
+        let observe = |revision: &str,
+                       subscriptions: &Vec<(String, crate::model::SubscriptionSpec)>,
+                       pulls: Value| {
+            store
+                .record_resource_observation(
+                    "observer/repo",
+                    revision,
+                    None,
+                    "resource/repo",
+                    None,
+                    &serde_json::json!({"repository_id": 17, "pull_requests": pulls}),
+                    now_ms() + 60_000,
+                    subscriptions,
+                )
+                .unwrap()
+        };
+        let requested = |subject: &str| {
+            store
+                .claims_for(subject, Some("subscription.mission-requested"))
+                .unwrap()
+                .into_iter()
+                .map(|claim| {
+                    claim.body["fields"]["resource"]
+                        .as_str()
+                        .unwrap()
+                        .to_owned()
+                })
+                .collect::<Vec<_>>()
+        };
+        let head = |letter: char| letter.to_string().repeat(40);
+
+        // The older build listed items without a state and kept every item it had seen.
+        let (revision, old_subject, subscriptions) = publish_watch("old");
+        let old_listing = serde_json::json!([
+            {"number": 24, "head": head('a')},
+            {"number": 25, "head": head('b')},
+            {"number": 73, "head": head('c')},
+            {"number": 75, "head": head('d')},
+        ]);
+        observe(&revision, &subscriptions, old_listing);
+        // Before item claims carried `head_sha`, #24 was requested without a delivery key; its
+        // item claim cites the listing that named its head.
+        let listing = store
+            .claims_for("resource/repo", Some("resource.observed"))
+            .unwrap()
+            .pop()
+            .unwrap();
+        let legacy_item = store
+            .append_claim(&ClaimInput {
+                subject: "resource/repo/pull-request/24".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("kind".into(), Value::String("vcs.pull-request".into())),
+                    (
+                        "facts".into(),
+                        serde_json::json!({
+                            "repository": "resource/repo", "number": 24,
+                            "state": "open", "draft": false, "merged": false,
+                        }),
+                    ),
+                ]),
+                evidence: vec![listing.id],
+                expected_subject: None,
+                idempotency_key: Some("legacy-item".into()),
+            })
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: old_subject.clone(),
+                kind: "subscription.mission-requested".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("mission".into(), Value::String("mission/review".into())),
+                    (
+                        "resource".into(),
+                        Value::String("resource/repo/pull-request/24".into()),
+                    ),
+                    ("resource_input".into(), Value::String("source".into())),
+                    ("workspace".into(), Value::String("/srv/reviews".into())),
+                    ("discovery".into(), Value::String(legacy_item.id)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("legacy-request".into()),
+            })
+            .unwrap();
+
+        // A new intake run starts over that history, and the newer build lists a state for each
+        // item. Merged and closed items stay in the listing as closed.
+        let (revision, new_subject, subscriptions) = publish_watch("new");
+        observe(
+            &revision,
+            &subscriptions,
+            serde_json::json!([
+                {"number": 24, "head": head('a'), "state": "closed", "draft": false},
+                {"number": 25, "head": head('b'), "state": "closed", "draft": false},
+                {"number": 73, "head": head('c'), "state": "open", "draft": false},
+                {"number": 75, "head": head('e'), "state": "open", "draft": false},
+                {"number": 99, "head": head('f'), "state": "open", "draft": false},
+                {"number": 100, "head": head('g'), "state": "open", "draft": true},
+            ]),
+        );
+        assert_eq!(
+            requested(&new_subject),
+            [
+                "resource/repo/pull-request/75",
+                "resource/repo/pull-request/99"
+            ],
+            "only a new head of an open, ready pull request is reviewed"
+        );
+        assert_eq!(
+            store
+                .latest_actual_value("resource/repo/pull-request/24")
+                .unwrap()
+                .unwrap()["facts"]["state"],
+            "closed",
+            "the item resource still follows the closure"
+        );
+
+        // #24 reopens as a draft and becomes ready at the head the legacy request reviewed.
+        for draft in [true, false] {
+            observe(
+                &revision,
+                &subscriptions,
+                serde_json::json!([
+                    {"number": 24, "head": head('a'), "state": "open", "draft": draft},
+                    {"number": 25, "head": head('b'), "state": "closed", "draft": false},
+                    {"number": 73, "head": head('c'), "state": "open", "draft": false},
+                    {"number": 75, "head": head('e'), "state": "open", "draft": false},
+                    {"number": 99, "head": head('f'), "state": "open", "draft": false},
+                    {"number": 100, "head": head('g'), "state": "open", "draft": true},
+                ]),
+            );
+        }
+        assert_eq!(requested(&new_subject).len(), 2);
+
+        // Before the requests start, #75 moves to a newer head and #99 closes.
+        observe(
+            &revision,
+            &subscriptions,
+            serde_json::json!([
+                {"number": 24, "head": head('a'), "state": "open", "draft": false},
+                {"number": 25, "head": head('b'), "state": "closed", "draft": false},
+                {"number": 73, "head": head('c'), "state": "open", "draft": false},
+                {"number": 75, "head": head('h'), "state": "open", "draft": false},
+                {"number": 99, "head": head('f'), "state": "closed", "draft": false},
+                {"number": 100, "head": head('g'), "state": "open", "draft": true},
+            ]),
+        );
+        assert_eq!(
+            requested(&new_subject),
+            [
+                "resource/repo/pull-request/75",
+                "resource/repo/pull-request/99",
+                "resource/repo/pull-request/75",
+            ]
+        );
+        let desired = store.desired_subjects().unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler
+            .reconcile_subscription_missions(&desired)
+            .unwrap();
+        let started = store
+            .claims_for(&new_subject, Some("subscription.mission-started"))
+            .unwrap();
+        assert_eq!(started.len(), 1, "only the current head of #75 is reviewed");
+        let run = started[0].body["fields"]["mission_run"].as_str().unwrap();
+        let run = store.mission_run(run).unwrap().unwrap();
+        let pinned = store
+            .claim_by_id(run.inputs["source"].claim_id.as_deref().unwrap())
+            .unwrap()
+            .unwrap();
+        assert_eq!(pinned.body["fields"]["facts"]["head_sha"], head('h'));
+        let mut reasons = store
+            .claims_for(&new_subject, Some("subscription.mission-request-cancelled"))
+            .unwrap()
+            .into_iter()
+            .map(|claim| claim.body["fields"]["reason"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>();
+        reasons.sort();
+        assert_eq!(
+            reasons,
+            [
+                format!(
+                    "pull request #75 moved from head {} to {}",
+                    head('e')[..12].to_owned(),
+                    head('h')[..12].to_owned()
+                ),
+                "pull request #99 is closed".to_owned(),
+            ]
         );
     }
 
@@ -19850,6 +20150,14 @@ subscription "reviews" {
                 )
                 .unwrap();
         }
+        assert_eq!(
+            store
+                .latest_actual_value("resource/repo/pull-request/4")
+                .unwrap()
+                .unwrap()["facts"]["opened_by_run"],
+            author.subject.as_str(),
+            "the pull request names the run that published its resource"
+        );
         let reconciler = Reconciler::new(
             store.clone(),
             Arc::new(FakeRuntime::default()),
