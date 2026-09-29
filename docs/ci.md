@@ -40,9 +40,9 @@ The `main` ruleset refuses to merge a pull request into `main` unless `st/ci` su
 pull request's exact head and that head is up to date with `main`. Nobody can bypass it.
 Merging one pull request therefore makes every other open pull request behind `main`.
 
-To merge, update the branch with `main` (`gh pr update-branch NUMBER`, or merge `main` yourself),
-wait for `st/ci` on the new head, and merge while the pull request is still not behind. Merge
-one pull request at a time.
+The [merge train](#merge-train) does this for you, one pull request at a time. To merge by hand,
+update the branch with `main` (`gh pr update-branch NUMBER`, or merge `main` yourself), wait for
+`st/ci` on the new head, and merge while the pull request is still not behind.
 
 - A head that is behind `main` is refused even when `st/ci` succeeded on it. `gh pr merge` says
   "the head branch is not up to date with the base branch"; the REST API says `Required status
@@ -56,6 +56,39 @@ one pull request at a time.
   the fork.
 - `st/ci` runs as the `agent/fleet/smalltalk-ci` seat. If it stops, no pull request can merge
   until CI runs again; change the `main` ruleset only for that.
+
+## Merge train
+
+The merge train is a [lane](st3/lanes.md) named `smalltalk`, owned by the
+`fleet/smalltalk/train` mission (`smalltalk-train.kdl` and `smalltalk-train.sh` in the same
+missions directory). When a pull request is ready to merge, join it:
+
+```sh
+st lanes join smalltalk NUMBER
+st lanes show smalltalk
+```
+
+An agent joins as its own seat; a person joins with `--as person/NAME` or the configured person.
+The train's driver works through the lane front first:
+
+1. It marks each pull request. A draft, a pull request that does not merge cleanly with `main`,
+   and a head without a passing `st/ci` are `waiting`. A pull request from outside the fleet is
+   `held` until the lane's approver runs `st lanes approve smalltalk NUMBER`. A pull request
+   whose own head passed `st/ci` is `ready`. A closed, merged, or forked pull request leaves.
+2. It takes the first `ready` pull request, and only that one. If its head is behind `main`, it
+   merges `main` into the branch on GitHub (the same as `gh pr update-branch`), and the new
+   head's `st/ci` run waits in the short queue that `main` runs use.
+3. It merges when `st/ci` passed on that exact head and the head still contains `main`. When
+   `main` moved first, `st/ci` failed, or someone pushed during the run, the pull request goes
+   to the back of the lane, and the driver takes the next one.
+
+A pull request stays in the lane until it merges or you run `st lanes leave smalltalk NUMBER`.
+After a failure, push a fix; the pull request becomes `ready` again when `st/ci` passes on the
+new head. The train pushes a merge of `main` onto your branch, so pull before you push again.
+
+Other pull requests keep getting `st/ci` on their own heads. Merging by hand still works, and
+the train treats a pull request merged that way as done; a hand merge while the train is
+testing its car only sends that car to the back.
 
 ## Inspect a failure
 
