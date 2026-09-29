@@ -452,7 +452,20 @@ st diagnostic --help
 This is agent-only and mutating, so the live human tour reviews help and the already automated
 failure tests rather than publishing a fake fault.
 
-### 19. `completions` — shell discoverability
+### 19. `skill` — how an agent seat uses st
+
+Why: an agent seat starts with no prompt, so the only st text an agent sees is the skill its driver
+installs. It must match the binary that serves the commands it names.
+
+```sh
+st skill
+st skill install --help
+```
+
+Check that the skill describes st without rules of conduct, that its description applies only when
+`ST_AGENT` is set, and that `install` names each harness directory it writes.
+
+### 20. `completions` — shell discoverability
 
 Why: generated completion keeps the large but intentional command surface navigable.
 

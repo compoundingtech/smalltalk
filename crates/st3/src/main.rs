@@ -53,8 +53,9 @@ mod presentation;
 
 use presentation::{
     OutputStyle, follow_snapshot, glance, mission_run_signature, relative_time,
-    render_attention_show, render_generation, render_generations, render_human_value,
-    render_mission_run, render_revision_proposal, render_step_run, shell_argument,
+    render_attention_show, render_generation, render_generations, render_host_facts,
+    render_human_value, render_mission_run, render_revision_proposal, render_step_run,
+    shell_argument,
 };
 
 #[derive(Parser)]
@@ -209,6 +210,8 @@ enum Command {
     },
     /// Generate one shell completion script.
     Completions(CompletionsArgs),
+    /// Print the st agent skill bundled in this binary, or install it for each harness.
+    Skill(SkillArgs),
     #[command(hide = true)]
     ReplicationWorker(ReplicationWorkerArgs),
     #[command(hide = true)]
@@ -2380,8 +2383,6 @@ struct AgentStartArgs {
     model: Option<String>,
     #[arg(long)]
     effort: Option<String>,
-    #[arg(long)]
-    prompt: Option<String>,
     #[arg(long = "arg")]
     arguments: Vec<String>,
     #[arg(long = "as", value_parser = parse_publication_actor)]
@@ -2873,6 +2874,21 @@ struct DriverArgs {
 }
 
 #[derive(Args)]
+struct SkillArgs {
+    #[command(subcommand)]
+    command: Option<SkillCommand>,
+}
+
+#[derive(Subcommand)]
+enum SkillCommand {
+    /// Write the skill where each named harness loads user skills; no name installs it for all.
+    Install {
+        #[arg(value_parser = clap::builder::PossibleValuesParser::new(st3::skill::HARNESSES))]
+        harness: Vec<String>,
+    },
+}
+
+#[derive(Args)]
 struct CompletionsArgs {
     #[arg(value_enum)]
     shell: CompletionShell,
@@ -2995,6 +3011,9 @@ async fn run(cli: Cli) -> Result<()> {
     if let Command::Up(args) = cli.command {
         return run_up(args).await;
     }
+    if let Command::Skill(args) = cli.command {
+        return run_skill(args);
+    }
     if let Command::ReplicationWorker(args) = cli.command {
         let mut config = Config::load_unvalidated(args.config.as_deref())?;
         if let Some(value) = args.node {
@@ -3034,6 +3053,7 @@ async fn run(cli: Cli) -> Result<()> {
     let immediate = Client::new(endpoint.clone());
     match cli.command {
         Command::Up(_) => unreachable!(),
+        Command::Skill(_) => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
         Command::Now(args) => run_now(&endpoint, config.person.as_deref(), args, cli.json).await,
         Command::Usage(args) => run_usage(&immediate, args, cli.json).await,
@@ -3210,6 +3230,26 @@ fn guard_mutating_cli_actor(
         }
         if let Some(message) = foreign_agent_actor(actor, Some(own), mission_run) {
             anyhow::bail!(message);
+        }
+    }
+    Ok(())
+}
+
+fn run_skill(args: SkillArgs) -> Result<()> {
+    let Some(SkillCommand::Install { harness }) = args.command else {
+        print!("{}", st3::skill::SKILL);
+        return Ok(());
+    };
+    let harnesses = if harness.is_empty() {
+        st3::skill::HARNESSES.map(str::to_owned).to_vec()
+    } else {
+        harness
+    };
+    let mut installed = BTreeSet::new();
+    for harness in &harnesses {
+        let path = st3::skill::install(harness)?;
+        if installed.insert(path.clone()) {
+            println!("{}", path.display());
         }
     }
     Ok(())
@@ -7321,11 +7361,6 @@ fn agent_start_document(args: &AgentStartArgs) -> Result<String> {
             .nodes_mut()
             .push(kdl_node("effort", [effort.as_str()]));
     }
-    if let Some(prompt) = &args.prompt {
-        harness_body
-            .nodes_mut()
-            .push(kdl_node("prompt", [prompt.as_str()]));
-    }
     if !args.arguments.is_empty() {
         let mut arguments = KdlNode::new("args");
         arguments
@@ -7372,7 +7407,7 @@ fn agent_new_document(args: &AgentNewArgs, workspace: &str, create_workspace: bo
             environment.set_children(variables);
             body.nodes_mut().push(environment);
             body.nodes_mut().push(render_node(&[
-                kdl_node("git-exclude", [".st3/", ".claude/"]),
+                kdl_node("git-exclude", [".claude/"]),
                 kdl_node(
                     "json-upsert",
                     [".claude/settings.local.json", CLAUDE_SEAT_SETTINGS],
@@ -7384,14 +7419,10 @@ fn agent_new_document(args: &AgentNewArgs, workspace: &str, create_workspace: bo
                 CLAUDE_SEAT_SETTINGS,
             ]
         }
-        "codex" => {
-            body.nodes_mut()
-                .push(render_node(&[kdl_node("git-exclude", [".st3/"])]));
-            &[
-                "--dangerously-bypass-approvals-and-sandbox",
-                "--dangerously-bypass-hook-trust",
-            ]
-        }
+        "codex" => &[
+            "--dangerously-bypass-approvals-and-sandbox",
+            "--dangerously-bypass-hook-trust",
+        ],
         _ => &[],
     };
     let mut harness = kdl_node("harness", [args.harness.as_str()]);
@@ -9457,11 +9488,46 @@ async fn post_work(
                 "{}",
                 render_step_run(&response, OutputStyle::stdout(), current_unix_ms()?)
             );
+            if let Some((node, documents)) = host_facts(client).await {
+                print!(
+                    "{}",
+                    render_host_facts(&node, &documents, OutputStyle::stdout())
+                );
+            }
         } else {
             println!("{}\t{}", response.status, response.subject);
         }
         Ok(())
     }
+}
+
+/// This machine's host documents, which a claim prints because they describe where the claimed
+/// work runs. A lookup that fails prints nothing: the claim itself has already succeeded.
+async fn host_facts(client: &Client) -> Option<(String, Vec<(String, String)>)> {
+    let health: Value = client.get("/v1/health").await.ok()?;
+    let node = health.get("node")?.as_str()?.to_owned();
+    let status: StatusResponse = client
+        .get(&format!(
+            "/v1/status?subject={}",
+            urlencoding::encode(&format!("host/{node}"))
+        ))
+        .await
+        .ok()?;
+    let desired = status.subjects.first()?.desired.clone()?;
+    let mut documents = Vec::new();
+    for reference in desired
+        .get("children")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|child| child.get("name").and_then(Value::as_str) == Some("document"))
+        .filter_map(|child| child.pointer("/arguments/0").and_then(Value::as_str))
+    {
+        let (name, hash) = reference.rsplit_once('@')?;
+        let bytes = document_bytes(client, name, hash).await.ok()?;
+        documents.push((reference.to_owned(), String::from_utf8(bytes).ok()?));
+    }
+    Some((node, documents))
 }
 
 async fn current_agent_incarnation(client: &Client, actor: &str) -> Result<Option<String>> {
@@ -10346,18 +10412,29 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
         .subject
         .as_deref()
         .context("the driver has no subject")?;
-    if matches!(
-        args.driver.as_str(),
-        "claude" | "codex" | "pi" | "omp" | "opencode"
-    ) && let Some(state) = st2::reexec::resume_path(st2::reexec::DRIVER_RESUME_ENV)
-    {
-        return resume_native_driver(client, subject, &args.driver, args.argv, &state).await;
-    }
-    if args.driver == "codex" {
-        return run_codex_native(client, subject, args.argv).await;
-    }
-    if matches!(args.driver.as_str(), "claude" | "pi" | "omp" | "opencode") {
-        return run_st2_native_driver(client, subject, &args.driver, args.argv).await;
+    if st3::skill::HARNESSES.contains(&args.driver.as_str()) {
+        // A seat starts idle: a declaration stored before st dropped the startup prompt still
+        // carries it, and it would start a turn nobody asked for.
+        let mut argv = args.argv;
+        st3::boot::strip_legacy_prompt(&args.driver, &mut argv);
+        // Install the skill from this binary, so it describes the commands this driver serves.
+        // A seat without it still runs; the failure is logged beside the driver's other warnings.
+        if let Err(error) = st3::skill::install(&args.driver) {
+            let _ = write_driver_log(
+                subject,
+                &format!(
+                    "could not install the st skill for {}: {error:#}",
+                    args.driver
+                ),
+            );
+        }
+        if let Some(state) = st2::reexec::resume_path(st2::reexec::DRIVER_RESUME_ENV) {
+            return resume_native_driver(client, subject, &args.driver, argv, &state).await;
+        }
+        if args.driver == "codex" {
+            return run_codex_native(client, subject, argv).await;
+        }
+        return run_st2_native_driver(client, subject, &args.driver, argv).await;
     }
     let (program, arguments) = args.argv.split_first().context("driver argv is empty")?;
     let mut child = tokio::process::Command::new(program)
@@ -11494,14 +11571,16 @@ fn pi_family_message_frame(message: &st3::model::MessageView, body: &str, identi
     })
 }
 
-/// Session-start context for pi-family seats. It restates the st boot contract only: st has no
-/// availability or busy status, so st2 status vocabulary sends the model searching for commands
-/// that do not exist before it claims ready work. It also names the seat, because omp's Python
-/// tool runs with a filtered environment that drops `ST_AGENT` and `ST3_BIN`; a model that probes
-/// there first must not infer its identity from the fleet listing.
-fn pi_family_session_ritual(subject: &str) -> String {
+/// Session-start context for a pi-family seat: only the seat's saved context, which the extension
+/// adds without starting a turn. st adds no instructions of its own, so a new seat stays idle until
+/// a person types or a message is posted.
+fn pi_family_session_context(identity: &str, context: &str) -> String {
+    if context.trim().is_empty() {
+        return String::new();
+    }
     format!(
-        "Follow .st3/boot.md now. You are `{subject}`; your shell tool also has it as `$ST_AGENT` and the st executable as `$ST3_BIN`. Read and archive handled graph messages, then list, claim, do, and finish your ready st work."
+        "<context source=\"st3/context/now.md\" agent=\"{identity}\">\n{}\n</context>",
+        context.trim_end()
     )
 }
 
@@ -11540,15 +11619,7 @@ async fn run_pi_channel(
             })
             .await?
             .unwrap_or_default();
-            let ritual = pi_family_session_ritual(subject);
-            let session_context = if context.trim().is_empty() {
-                ritual
-            } else {
-                format!(
-                    "<context source=\"st3/context/now.md\" agent=\"{identity}\">\n{}\n</context>\n\n{ritual}",
-                    context.trim_end()
-                )
-            };
+            let session_context = pi_family_session_context(identity, &context);
             stdout
                 .write_all(
                     format!(
@@ -13572,6 +13643,28 @@ mod tests {
     }
 
     #[test]
+    fn a_claim_prints_each_host_document_under_its_reference() {
+        let documents = [(
+            "doc/hosts/example@abc".to_owned(),
+            "# Example host\n\n- Services run through systemd.\n".to_owned(),
+        )];
+        assert_eq!(
+            render_host_facts("example", &documents, OutputStyle::plain()),
+            "\nHOST  example\n  doc/hosts/example@abc\n    # Example host\n\n    - Services run through systemd.\n"
+        );
+        assert_eq!(render_host_facts("example", &[], OutputStyle::plain()), "");
+    }
+
+    #[test]
+    fn pi_family_session_context_carries_saved_context_and_no_instructions() {
+        assert_eq!(pi_family_session_context("fleet/example/omp", " \n"), "");
+        assert_eq!(
+            pi_family_session_context("fleet/example/omp", "Resume the release notes.\n"),
+            "<context source=\"st3/context/now.md\" agent=\"fleet/example/omp\">\nResume the release notes.\n</context>"
+        );
+    }
+
+    #[test]
     fn a_pi_family_channel_carries_its_frames_across_a_replacement() {
         let mut state = PiChannelResume {
             incarnation: "1:one".into(),
@@ -13649,20 +13742,6 @@ mod tests {
         let codex: Value =
             serde_json::from_str(&native_delivery_report("app-server", None)).unwrap();
         assert!(codex.get("channel").is_none());
-    }
-
-    #[test]
-    fn pi_family_session_ritual_uses_only_the_st3_boot_contract() {
-        let ritual = pi_family_session_ritual("agent/fleet/example/omp");
-        assert!(ritual.contains("You are `agent/fleet/example/omp`"));
-        let ritual = ritual.to_ascii_lowercase();
-        assert!(ritual.contains(".st3/boot.md"));
-        for st2_vocabulary in ["status", "available", "busy", "st2"] {
-            assert!(
-                !ritual.contains(st2_vocabulary),
-                "the pi-family session ritual mentions `{st2_vocabulary}`"
-            );
-        }
     }
 
     #[test]
@@ -15861,10 +15940,7 @@ mod tests {
             .iter()
             .find(|child| child["name"] == "render")
             .unwrap();
-        assert_eq!(
-            render["children"][0]["arguments"],
-            json!([".st3/", ".claude/"])
-        );
+        assert_eq!(render["children"][0]["arguments"], json!([".claude/"]));
         assert_eq!(
             render["children"][1]["arguments"],
             json!([".claude/settings.local.json", CLAUDE_SEAT_SETTINGS])
@@ -15913,7 +15989,7 @@ mod tests {
                 "{expected} is missing from {joined}"
             );
         }
-        assert!(kdl.contains(r#"git-exclude ".st3/""#) && !kdl.contains(".claude/"));
+        assert!(!kdl.contains("render") && !kdl.contains(".st3"));
     }
 
     #[test]

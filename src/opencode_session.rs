@@ -1072,8 +1072,33 @@ impl EventMachine {
 
 /// The most recently updated session id from `GET /session`, or the last listed when the entries
 /// carry no readable update time. `None` while the seat's TUI has not created a session yet.
-fn newest_listed_session(client: &Client) -> Option<String> {
+/// The session waiting mail goes into when none has been seen: the newest listed one, or, when
+/// the server lists none, a new one. st starts a seat with no prompt, so no session exists until
+/// a person types or mail arrives. The new session is also selected in the TUI, so a person
+/// attached to the seat sees the turn the mail starts. A listing that fails creates nothing.
+fn delivery_session(client: &Client) -> Option<String> {
     let listed = client.get_json("/session").ok()?;
+    if let Some(newest) = newest_session(&listed) {
+        return Some(newest);
+    }
+    if !listed.as_array().is_some_and(Vec::is_empty) {
+        return None;
+    }
+    let (status, body) = client.request("POST", "/session", Some(&json!({}))).ok()?;
+    if !(200..300).contains(&status) {
+        return None;
+    }
+    let created = serde_json::from_slice::<Value>(&body)
+        .ok()?
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_string)?;
+    // Selecting only changes what the TUI shows; delivery does not depend on it.
+    let _ = client.post_json("/tui/select-session", &json!({ "sessionID": created }));
+    Some(created)
+}
+
+fn newest_session(listed: &Value) -> Option<String> {
     let sessions = listed.as_array()?;
     sessions
         .iter()
@@ -1548,8 +1573,9 @@ impl Delivery {
                 // A session that settled before this observer connected is invisible to both the
                 // event stream and `/session/status` (idle sessions are omitted), so a pending
                 // delivery would otherwise stall forever. With work waiting, recover the binding
-                // from the session listing — retried every pump pass until a session exists.
-                let Some(recovered) = newest_listed_session(client) else {
+                // from the session listing, or create the seat's first session when it lists
+                // none — retried every pump pass until one is bound.
+                let Some(recovered) = delivery_session(client) else {
                     return Ok(());
                 };
                 self.saw_session(&recovered);
@@ -2072,11 +2098,23 @@ mod tests {
         /// When set, both pending-ask listings answer 500: the ask seed fails.
         ask_error: Arc<AtomicBool>,
         /// Session ids `GET /session` lists (idle sessions appear here and nowhere else).
+        /// `POST /session` adds `ses_created`.
         listed_sessions: Arc<Mutex<Vec<String>>>,
+        /// Every session id `POST /tui/select-session` asked the TUI to show.
+        selected_sessions: Arc<Mutex<Vec<String>>>,
         /// When set, /session/status serves this raw body instead of an object.
         status_body: Arc<Mutex<Option<String>>>,
         /// When set, /permission serves this raw body instead of the pending ids.
         ask_body: Arc<Mutex<Option<String>>>,
+    }
+
+    /// A loopback port nothing listens on: every request to it fails to connect.
+    fn unused_port() -> u16 {
+        TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
     }
 
     fn spawn_fake_server() -> FakeServer {
@@ -2092,6 +2130,7 @@ mod tests {
         let ask_error = Arc::new(AtomicBool::new(false));
         let ask_body = Arc::new(Mutex::new(None::<String>));
         let listed_sessions = Arc::new(Mutex::new(Vec::<String>::new()));
+        let selected_sessions = Arc::new(Mutex::new(Vec::<String>::new()));
         let status_body = Arc::new(Mutex::new(None::<String>));
         let (posts_t, durable_t, accept_t) = (posts.clone(), durable.clone(), accept_posts.clone());
         let (read_back_t, status_err_t, pending_t, questions_t, ask_err_t, listed_t, status_body_t) = (
@@ -2104,6 +2143,7 @@ mod tests {
             status_body.clone(),
         );
         let ask_body_t = ask_body.clone();
+        let selected_t = selected_sessions.clone();
         thread::spawn(move || {
             for stream in listener.incoming() {
                 let Ok(stream) = stream else { break };
@@ -2160,6 +2200,17 @@ mod tests {
                     }
                 } else if method == "GET" && (path == "/session" || path == "/config/providers") {
                     200
+                } else if method == "POST" && path == "/session" {
+                    listed_t.lock().unwrap().push("ses_created".to_string());
+                    200
+                } else if method == "POST" && path == "/tui/select-session" {
+                    if let Some(id) = serde_json::from_slice::<Value>(&body)
+                        .ok()
+                        .and_then(|value| value.get("sessionID")?.as_str().map(str::to_string))
+                    {
+                        selected_t.lock().unwrap().push(id);
+                    }
+                    200
                 } else if method == "GET" && path == "/session/status" {
                     if status_err_t.load(Ordering::SeqCst) {
                         500
@@ -2175,7 +2226,9 @@ mod tests {
                 } else {
                     404
                 };
-                let body = if method == "GET" && path == "/session" {
+                let body = if method == "POST" && path == "/session" {
+                    r#"{"id":"ses_created"}"#.to_string()
+                } else if method == "GET" && path == "/session" {
                     let ids = listed_t.lock().unwrap();
                     serde_json::to_string(
                         &ids.iter()
@@ -2235,6 +2288,7 @@ mod tests {
             pending_questions,
             ask_error,
             listed_sessions,
+            selected_sessions,
             status_body,
             ask_body,
         }
@@ -2538,7 +2592,7 @@ mod tests {
     }
 
     #[test]
-    fn dnd_suppresses_delivery_and_a_missing_target_session_waits() {
+    fn dnd_suppresses_delivery_and_waiting_mail_opens_the_first_session() {
         let tmp = tempfile::tempdir().unwrap();
         let server = spawn_fake_server();
         let client = Client::new(server.port, "pw");
@@ -2550,13 +2604,33 @@ mod tests {
         delivery.pump(&client);
         assert!(server.posts.lock().unwrap().is_empty());
 
+        // A seat starts with no prompt, so no session exists yet. Waiting mail creates the first
+        // one, shows it in the TUI, and goes into it.
         status::set_state(&status::status_path(&agent_dir), status::State::Available).unwrap();
         delivery.target_session = None;
         delivery.pump(&client);
-        assert!(
-            server.posts.lock().unwrap().is_empty(),
-            "no session yet: wait, never create"
+        assert_eq!(delivery.target_session.as_deref(), Some("ses_created"));
+        assert_eq!(
+            server.selected_sessions.lock().unwrap().as_slice(),
+            ["ses_created"]
         );
+        assert_eq!(server.posts.lock().unwrap().len(), 1);
+        assert_eq!(
+            server.listed_sessions.lock().unwrap().as_slice(),
+            ["ses_created"],
+            "exactly one session is created"
+        );
+    }
+
+    #[test]
+    fn a_failed_session_listing_creates_no_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let client = Client::new(unused_port(), "pw");
+        let state_path = tmp.path().join("state/delivery-ledger.json");
+        let (mut delivery, _) = delivery_fixture(tmp.path(), state_path);
+        delivery.target_session = None;
+        delivery.pump(&client);
+        assert_eq!(delivery.target_session, None);
     }
 
     /// T5: an unrecognized future `session.status` word is no evidence at all — counting it as
@@ -2586,19 +2660,22 @@ mod tests {
         let (mut delivery, _filename) = delivery_fixture(tmp.path(), state_path);
         delivery.target_session = None;
 
-        // No listing yet: nothing to bind, nothing sent — and no wedge, it simply retries.
-        delivery.pump(&client);
-        assert!(server.posts.lock().unwrap().is_empty());
-
-        // The idle session exists only in the listing; the next pass binds and delivers.
+        // The idle session exists only in the listing; the pass binds it and delivers, and
+        // creates no second session.
         server
             .listed_sessions
             .lock()
             .unwrap()
             .push("ses_settled".to_string());
         delivery.pump(&client);
+        assert_eq!(delivery.target_session.as_deref(), Some("ses_settled"));
         let posts = server.posts.lock().unwrap();
         assert_eq!(posts.len(), 1, "delivery bound to the recovered session");
+        assert_eq!(
+            server.listed_sessions.lock().unwrap().as_slice(),
+            ["ses_settled"]
+        );
+        assert!(server.selected_sessions.lock().unwrap().is_empty());
     }
 
     /// W8-4: the seed is atomic against the LIVE machine — a mid-seed failure leaves no
