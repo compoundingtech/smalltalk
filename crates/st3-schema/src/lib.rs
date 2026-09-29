@@ -602,6 +602,12 @@ fn build_registry() -> Registry {
             false,
         ),
         ("host", "host/NAME", "A graph host.", false),
+        (
+            "lane",
+            "lane/RUN/LOCAL_ID",
+            "A mission-run lane: an ordered line of entries its run works through front first.",
+            false,
+        ),
         ("message", "message/ID", "A Small Talk message.", true),
         (
             "observer",
@@ -938,6 +944,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
                 "doc",
                 "exec",
                 "host",
+                "lane",
                 "message",
                 "observer",
                 "mission",
@@ -1343,6 +1350,51 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             Cardinality::Append,
             Some("agents"),
             true,
+            &[],
+        ),
+        (
+            "lane.approved",
+            &["lane"],
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Append,
+            Some("lanes"),
+            false,
+            &[],
+        ),
+        (
+            "lane.joined",
+            &["lane"],
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Append,
+            Some("lanes"),
+            false,
+            &[],
+        ),
+        (
+            "lane.left",
+            &["lane"],
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Append,
+            Some("lanes"),
+            false,
+            &[],
+        ),
+        (
+            "lane.marked",
+            &["lane"],
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Append,
+            Some("lanes"),
+            false,
+            &[],
+        ),
+        (
+            "lane.moved",
+            &["lane"],
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Append,
+            Some("lanes"),
+            false,
             &[],
         ),
         (
@@ -2079,6 +2131,31 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("mode", integer()),
             ("reason", string()),
         ],
+        "lane.joined" => &[("entry", required_reference()), ("reason", string())],
+        "lane.left" => &[
+            ("entry", required_reference()),
+            ("outcome", required_enum(&["completed", "removed"])),
+            ("reason", string()),
+        ],
+        "lane.moved" => &[
+            ("entry", required_reference()),
+            (
+                "placement",
+                required_enum(&["top", "bottom", "before", "after"]),
+            ),
+            ("anchor", reference()),
+            ("reason", string()),
+        ],
+        "lane.marked" => &[
+            ("entry", required_reference()),
+            (
+                "state",
+                required_enum(&["waiting", "held", "ready", "running"]),
+            ),
+            ("detail", string()),
+            ("head", string()),
+        ],
+        "lane.approved" => &[("entry", required_reference()), ("reason", string())],
         "agent.queue.moved" => &[
             ("run", required_reference_to(&["mission-run"])),
             (
@@ -2705,6 +2782,12 @@ fn reference() -> FieldSpec {
         ..field(ValueType::SubjectReference)
     }
 }
+fn required_reference() -> FieldSpec {
+    FieldSpec {
+        required: true,
+        ..reference()
+    }
+}
 fn required_reference_to(families: &[&str]) -> FieldSpec {
     FieldSpec {
         required: true,
@@ -2813,6 +2896,7 @@ mod tests {
                 "fleet-invite",
                 "gate-operation",
                 "host",
+                "lane",
                 "loop-run",
                 "message",
                 "mission",
@@ -2900,6 +2984,11 @@ mod tests {
                 "harness.timeline",
                 "harness.usage",
                 "intent.desired",
+                "lane.approved",
+                "lane.joined",
+                "lane.left",
+                "lane.marked",
+                "lane.moved",
                 "loop.round-dispatch",
                 "loop.round-result",
                 "loop.state",
@@ -3123,6 +3212,11 @@ mod tests {
             [
                 "attention.requested",
                 "attention.resolved",
+                "lane.approved",
+                "lane.joined",
+                "lane.left",
+                "lane.marked",
+                "lane.moved",
                 "message.closed",
                 "message.read",
                 "planning-session.candidate-submitted",

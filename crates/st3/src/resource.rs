@@ -17,6 +17,9 @@ pub struct ObservationRequest {
     pub cursor: Option<String>,
     pub previous_facts: Option<Value>,
     pub every_ms: Option<u64>,
+    /// A declared refresh asked for this observation. It revalidates with GitHub instead of
+    /// reusing a cached response; a conditional request costs nothing when nothing changed.
+    pub refresh: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -485,6 +488,9 @@ fn github_next_page(link: &str) -> Option<String> {
 const GITHUB_CACHE_FOR: Duration = Duration::from_secs(300);
 
 fn github_cache_for(request: &ObservationRequest) -> Duration {
+    if request.refresh {
+        return Duration::ZERO;
+    }
     request
         .every_ms
         .map(Duration::from_millis)
@@ -1249,6 +1255,7 @@ mod tests {
             cursor: None,
             previous_facts: None,
             every_ms: None,
+            refresh: false,
         };
         for token in [None, Some(""), Some(" ")] {
             let error = observe_github_repository_at(request.clone(), &base, token)
@@ -1291,6 +1298,7 @@ mod tests {
                 cursor: None,
                 previous_facts: None,
                 every_ms: None,
+                refresh: false,
             })
             .await
             .unwrap();
@@ -1365,6 +1373,7 @@ mod tests {
                 cursor: None,
                 previous_facts: None,
                 every_ms: None,
+                refresh: false,
             })
             .await
             .unwrap();
@@ -1386,6 +1395,7 @@ mod tests {
                 cursor: None,
                 previous_facts: None,
                 every_ms: None,
+                refresh: false,
             })
             .await
             .unwrap();
@@ -1454,6 +1464,7 @@ mod tests {
             cursor: None,
             previous_facts: None,
             every_ms: None,
+            refresh: false,
         };
         let observed = tokio::time::timeout(
             Duration::from_secs(10),
@@ -1471,8 +1482,8 @@ mod tests {
         let base = format!("http://{}", listener.local_addr().unwrap());
         let server = tokio::spawn(async move {
             let mut requests = Vec::new();
-            // Two observers share a poll; a later poll revalidates both URLs.
-            for index in 0..4 {
+            // Two observers share a poll; a later poll and a refresh revalidate both URLs.
+            for index in 0..6 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let mut request = Vec::new();
                 loop {
@@ -1512,6 +1523,7 @@ mod tests {
             cursor: None,
             previous_facts: None,
             every_ms: None,
+            refresh: false,
         };
         let spender = "observer/orchid-etag-listing".to_owned();
         let first = spend_as(
@@ -1547,6 +1559,7 @@ mod tests {
                     locator: "example/repo".into(),
                     fields: BTreeSet::from(["issues".into()]),
                     every_ms: Some(1),
+                    refresh: false,
                 },
                 &base,
                 Some("orchid-test-token"),
@@ -1578,6 +1591,22 @@ mod tests {
             ),
             (4, 2, 0, 2)
         );
+        let refreshed = observe_github_repository_at(
+            ObservationRequest {
+                cursor: third.cursor.clone(),
+                previous_facts: Some(third.facts.clone()),
+                provider: "github.repository".into(),
+                locator: "example/repo".into(),
+                fields: BTreeSet::from(["issues".into()]),
+                every_ms: None,
+                refresh: true,
+            },
+            &base,
+            Some("orchid-test-token"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(refreshed.facts["issues"], third.facts["issues"]);
         let requests = server
             .await
             .unwrap()
@@ -1595,6 +1624,11 @@ mod tests {
         assert!(!requests[1].contains("if-none-match"));
         assert!(requests[2].contains("if-none-match: \"repo-v1\""));
         assert!(requests[3].contains("if-none-match: \"issues-v1\""));
+        assert!(
+            requests[4].contains("if-none-match: \"repo-v1\""),
+            "a refresh inside the cache window still asks GitHub"
+        );
+        assert!(requests[5].contains("if-none-match: \"issues-v1\""));
     }
 
     #[tokio::test]
@@ -1628,6 +1662,7 @@ mod tests {
                     cursor: None,
                     previous_facts: None,
                     every_ms: None,
+                    refresh: false,
                 },
                 &base,
                 Some("orchid-test-token"),

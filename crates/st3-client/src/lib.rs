@@ -795,6 +795,17 @@ impl Client {
     pub async fn subscriptions_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("subscriptions", id).await
     }
+    pub async fn lanes_list(
+        &self,
+        cursor: Option<&str>,
+        limit: Option<usize>,
+        history: bool,
+    ) -> Result<Envelope<Page>, ClientError> {
+        self.list_internal("lanes", cursor, limit, history).await
+    }
+    pub async fn lanes_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
+        self.resource_internal("lanes", id).await
+    }
     pub async fn terminals_list(
         &self,
         cursor: Option<&str>,
@@ -888,6 +899,61 @@ impl Client {
         parameters: AttentionResolveParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
         let request = ActionRequest::attention_resolve(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn lane_approve(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: LaneChangeParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::lane_approve(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn lane_join(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: LaneChangeParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::lane_join(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn lane_leave(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: LaneChangeParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::lane_leave(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn lane_mark(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: LaneChangeParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::lane_mark(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn lane_move(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: LaneChangeParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::lane_move(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }

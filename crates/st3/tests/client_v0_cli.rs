@@ -1416,3 +1416,450 @@ mission "queued-alias-work" state="ready" {
 
     server.abort();
 }
+
+/// A runtime that starts nothing: a reconcile pass here only writes a run's own declarations.
+struct NoRuntime;
+
+impl st3::reconcile::RuntimeControl for NoRuntime {
+    fn snapshot_ptys(&self) -> anyhow::Result<Vec<st3::reconcile::RuntimeObservation>> {
+        Ok(Vec::new())
+    }
+    fn observe_exec(&self, _: &str) -> anyhow::Result<Option<st3::reconcile::RuntimeObservation>> {
+        Ok(None)
+    }
+    fn start(&self, _: &st3::model::MemberSpec) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn stop(&self, _: &str, _: bool, _: Option<&str>) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn kill(&self, _: &str, _: bool, _: Option<&str>) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn remove(&self, _: &str, _: bool) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn screen(&self, _: &str) -> anyhow::Result<String> {
+        Ok(String::new())
+    }
+    fn send_key(&self, _: &str, _: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn read_exec_log(&self, _: &str) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+}
+
+/// Run one reconcile pass as the store's own node, which writes each of its running missions'
+/// lane declarations.
+fn materialize_run_declarations(store: &Arc<Store>) {
+    st3::reconcile::Reconciler::new(
+        store.clone(),
+        Arc::new(NoRuntime),
+        "client-v0-cli".into(),
+        Arc::new(Notify::new()),
+    )
+    .reconcile_once()
+    .unwrap();
+}
+
+async fn run_lane_cli(
+    socket: &Path,
+    config_home: &Path,
+    agent: Option<&str>,
+    json: bool,
+    args: &[&str],
+) -> Output {
+    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
+    let socket = socket.to_path_buf();
+    let config_home = config_home.to_path_buf();
+    let agent = agent.map(str::to_owned);
+    let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+    tokio::task::spawn_blocking(move || {
+        let mut command = std::process::Command::new(binary);
+        command
+            .env_remove("ST_AGENT")
+            .env_remove("ST_MISSION_RUN")
+            .env("XDG_CONFIG_HOME", config_home)
+            .arg("--endpoint")
+            .arg(socket);
+        if let Some(agent) = agent {
+            command.env("ST_AGENT", agent);
+        }
+        if json {
+            command.arg("--json");
+        }
+        command.args(args).output().unwrap()
+    })
+    .await
+    .unwrap()
+}
+
+fn lane_order(lane: &Value) -> Vec<String> {
+    lane["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| {
+            entry["entry"]
+                .as_str()
+                .unwrap()
+                .rsplit('/')
+                .next()
+                .unwrap()
+                .to_owned()
+        })
+        .collect()
+}
+
+fn failure(output: &Output) -> String {
+    assert!(
+        !output.status.success(),
+        "expected a refusal, got {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    String::from_utf8_lossy(&output.stderr).into_owned()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn lanes_cli_keeps_one_ordered_lane_that_people_and_agents_change() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let config_home = root.path().join("config");
+    std::fs::create_dir_all(config_home.join("st3")).unwrap();
+    std::fs::write(
+        config_home.join("st3/config.toml"),
+        "person = \"person/config-operator\"\n",
+    )
+    .unwrap();
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let source = r#"version 2
+agent "lane-driver" { workspace "/tmp"; command "true" }
+mission "example/merge-train" state="ready" {
+  goal "Merge ready changes into main one at a time."
+  lane "app" {
+    entries "resource/github/acme/app/ci/pull-request/"
+    approver "person/ada"
+  }
+  step "drive" { assigned-to "agent/lane-driver" }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, "client-v0-cli").unwrap();
+    let planned = store
+        .mission(
+            &intent,
+            IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    store
+        .apply(&intent, &planned.subject_tokens, "cli-lane-mission")
+        .unwrap();
+    let run = store
+        .create_mission_run(&MissionRunRequest {
+            mission: "example/merge-train".into(),
+            revision: None,
+            workspace: "/tmp".into(),
+            requester: Some("person/requester".into()),
+            mode: Some("run".into()),
+            inputs: BTreeMap::new(),
+            idempotency_key: "cli-lane-run".into(),
+        })
+        .unwrap();
+    materialize_run_declarations(&store);
+    let lane = format!(
+        "lane/{}/app",
+        run.subject.strip_prefix("mission-run/").unwrap()
+    );
+    let prefix = "resource/github/acme/app/ci/pull-request/";
+
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(socket.exists(), "client-v0 test socket did not appear");
+    let cli = |agent: Option<&'static str>, json: bool, args: Vec<String>| {
+        let socket = socket.clone();
+        let config_home = config_home.clone();
+        async move {
+            let args = args.iter().map(String::as_str).collect::<Vec<_>>();
+            run_lane_cli(&socket, &config_home, agent, json, &args).await
+        }
+    };
+    let args = |args: &[&str]| args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+
+    // The run's declaration made one open lane that `ls` lists and a short name finds.
+    let listed = cli(None, false, args(&["lanes", "ls"])).await;
+    let listed = String::from_utf8(listed.stdout).unwrap();
+    assert!(listed.starts_with("LANES  1\n"), "{listed}");
+    assert!(
+        listed.contains(&format!("  {lane}  0 entries\n")),
+        "{listed}"
+    );
+
+    // A person joins with the configured identity, an agent names itself, and a repeated join
+    // records nothing.
+    let joined = value(
+        &cli(
+            None,
+            true,
+            args(&["lanes", "join", "app", "42", "--reason", "green"]),
+        )
+        .await,
+    );
+    assert!(joined["claim"]["id"].is_string(), "{joined}");
+    assert_eq!(joined["lane"]["subject"], lane);
+    assert_eq!(joined["lane"]["entries"][0]["entry"], format!("{prefix}42"));
+    assert_eq!(
+        joined["lane"]["entries"][0]["joined_by"],
+        "person/config-operator"
+    );
+    assert_eq!(joined["lane"]["entries"][0]["state"], "waiting");
+    let joined = value(
+        &cli(
+            None,
+            true,
+            args(&["lanes", "join", &lane, "#43", "--as", "agent/lane-worker"]),
+        )
+        .await,
+    );
+    assert_eq!(lane_order(&joined["lane"]), ["42", "43"]);
+    let again = value(&cli(None, true, args(&["lanes", "join", "app", "42"])).await);
+    assert!(again["claim"].is_null(), "{again}");
+    assert_eq!(lane_order(&again["lane"]), ["42", "43"]);
+
+    // A harness joins as its own seat without naming it, and cannot borrow a person.
+    let harness = value(
+        &cli(
+            Some("agent/lane-harness"),
+            true,
+            args(&["lanes", "join", "app", "44"]),
+        )
+        .await,
+    );
+    assert_eq!(
+        harness["lane"]["entries"][2]["joined_by"],
+        "agent/lane-harness"
+    );
+    let borrowed = failure(
+        &cli(
+            Some("agent/lane-harness"),
+            true,
+            args(&["lanes", "approve", "app", "43", "--as", "person/ada"]),
+        )
+        .await,
+    );
+    assert!(
+        borrowed.contains("cannot act as `person/ada`"),
+        "{borrowed}"
+    );
+
+    // Moves in each placement; a move that names an entry outside the lane is refused.
+    let moved = value(&cli(None, true, args(&["lanes", "move", "app", "44", "--top"])).await);
+    assert_eq!(lane_order(&moved["lane"]), ["44", "42", "43"]);
+    let moved = value(
+        &cli(
+            None,
+            true,
+            args(&["lanes", "move", "app", "43", "--before", "44"]),
+        )
+        .await,
+    );
+    assert_eq!(lane_order(&moved["lane"]), ["43", "44", "42"]);
+    let moved = value(
+        &cli(
+            None,
+            true,
+            args(&[
+                "lanes",
+                "move",
+                "app",
+                "43",
+                "--bottom",
+                "--reason",
+                "main moved",
+            ]),
+        )
+        .await,
+    );
+    assert_eq!(lane_order(&moved["lane"]), ["44", "42", "43"]);
+    let missing = failure(
+        &cli(
+            None,
+            true,
+            args(&["lanes", "move", "app", "42", "--after", "99"]),
+        )
+        .await,
+    );
+    assert!(
+        missing.contains(&format!("`{prefix}99` is not in")),
+        "{missing}"
+    );
+    let outside = failure(
+        &cli(
+            None,
+            true,
+            args(&["lanes", "join", "app", "resource/other/1"]),
+        )
+        .await,
+    );
+    assert!(
+        outside.contains(&format!("start with `{prefix}`")),
+        "{outside}"
+    );
+
+    // The run records a status on the exact head it applies to.
+    let marked = value(
+        &cli(
+            None,
+            true,
+            args(&[
+                "lanes",
+                "mark",
+                "app",
+                "42",
+                "--state",
+                "running",
+                "--detail",
+                "testing 1f2e3d4",
+                "--head",
+                "1f2e3d4",
+                "--as",
+                "agent/lane-driver",
+            ]),
+        )
+        .await,
+    );
+    let entry = &marked["lane"]["entries"][1];
+    assert_eq!(entry["state"], "running");
+    assert_eq!(entry["detail"], "testing 1f2e3d4");
+    assert_eq!(entry["head"], "1f2e3d4");
+    assert_eq!(entry["marked_by"], "agent/lane-driver");
+
+    // Only the declared approver approves.
+    let denied = failure(&cli(None, true, args(&["lanes", "approve", "app", "43"])).await);
+    assert!(denied.contains("only person/ada approves"), "{denied}");
+    let approved = value(
+        &cli(
+            None,
+            true,
+            args(&["lanes", "approve", "app", "43", "--as", "person/ada"]),
+        )
+        .await,
+    );
+    assert_eq!(approved["lane"]["entries"][2]["approved_by"], "person/ada");
+
+    // An entry leaves with an outcome; a rejoin goes to the back without its old approval.
+    let left = value(
+        &cli(
+            None,
+            true,
+            args(&[
+                "lanes",
+                "leave",
+                "app",
+                "43",
+                "--outcome",
+                "completed",
+                "--reason",
+                "merged",
+            ]),
+        )
+        .await,
+    );
+    assert_eq!(lane_order(&left["lane"]), ["44", "42"]);
+    let rejoined = value(&cli(None, true, args(&["lanes", "join", "app", "43"])).await);
+    assert_eq!(lane_order(&rejoined["lane"]), ["44", "42", "43"]);
+    assert!(rejoined["lane"]["entries"][2]["approved_by"].is_null());
+
+    // The human view lists entries in order and history newest first.
+    let shown = cli(None, false, args(&["lanes", "show", &run.subject])).await;
+    assert!(
+        shown.status.success(),
+        "{}",
+        String::from_utf8_lossy(&shown.stderr)
+    );
+    let shown = String::from_utf8(shown.stdout).unwrap();
+    assert!(
+        shown.starts_with(&format!("LANE      {lane}\nRUN       {}\n", run.subject)),
+        "{shown}"
+    );
+    assert!(
+        shown.contains(&format!(
+            "ENTRIES   {prefix}\nAPPROVER  person/ada\nQUEUE     3\n"
+        )),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("  1. 44  waiting  joined by agent/lane-harness "),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("  2. 42  running  testing 1f2e3d4  joined by person/config-operator "),
+        "{shown}"
+    );
+    assert!(
+        shown.contains("  3. 43  waiting  joined by person/config-operator "),
+        "{shown}"
+    );
+    let recent = shown.split("RECENT\n").nth(1).unwrap();
+    assert!(
+        recent.starts_with("  joined 43 by person/config-operator "),
+        "{shown}"
+    );
+    assert!(
+        recent.contains("  43 left (completed) by person/config-operator "),
+        "{shown}"
+    );
+    assert!(recent.contains(": merged\n"), "{shown}");
+    assert!(
+        recent.contains("  moved 43 to the bottom by person/config-operator "),
+        "{shown}"
+    );
+    assert!(recent.contains("  approved 43 by person/ada "), "{shown}");
+
+    // Mission views show the lane the run owns.
+    let mission = cli(None, false, args(&["missions", "show", &run.subject])).await;
+    let mission = String::from_utf8(mission.stdout).unwrap();
+    assert!(
+        mission.contains(&format!("\nLANES\n  {lane}  3 entries\n    1. 44  waiting")),
+        "{mission}"
+    );
+    let tree = value(&cli(None, true, args(&["missions", "tree"])).await);
+    assert_eq!(tree["value"]["lanes"][0]["id"], lane, "{tree}");
+    assert_eq!(
+        tree["value"]["lanes"][0]["entries"][1]["label"], "42",
+        "{tree}"
+    );
+    let tree = cli(None, false, args(&["missions", "tree"])).await;
+    let tree = String::from_utf8(tree.stdout).unwrap();
+    assert!(
+        tree.contains(&format!(
+            "LANES\n  {lane}  3 entries · front 44 waiting\nUNSTARTED MISSIONS\n"
+        )),
+        "{tree}"
+    );
+
+    // A lane closes with its run: it leaves the list and refuses changes.
+    store
+        .set_mission_run_state(&run.subject, "completed", "terminal", Some("done"))
+        .unwrap();
+    let open = value(&cli(None, true, args(&["lanes", "ls"])).await);
+    assert_eq!(open.as_array().unwrap().len(), 0, "{open}");
+    let all = value(&cli(None, true, args(&["lanes", "ls", "--all"])).await);
+    assert_eq!(all[0]["open"], false, "{all}");
+    let closed = failure(&cli(None, true, args(&["lanes", "join", &lane, "45"])).await);
+    assert!(closed.contains("is closed"), "{closed}");
+
+    server.abort();
+}
