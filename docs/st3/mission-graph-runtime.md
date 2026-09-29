@@ -1223,8 +1223,10 @@ Typed harnesses always run their real interactive TUI in a PTY. Claude always lo
 channel. Use `exec {}` for non-interactive provider commands.
 
 Use `st agents apply FILE --as person/NAME` for authored KDL or `st agents start ...` as a
-convenience. `--print-kdl` prints the exact declaration. `st agents stop SUBJECT` publishes an
-explicit root stop.
+convenience. `st agents new NAME --host HOST --attach` declares a new seat with the fleet's
+harness defaults, waits until its harness is ready, and attaches from any fleet host.
+`--print-kdl` prints the exact declaration. `st agents stop SUBJECT` publishes an explicit root
+stop.
 
 A mission run does not stop because a controller deletes its runtime. The graph must publish cancellation.
 

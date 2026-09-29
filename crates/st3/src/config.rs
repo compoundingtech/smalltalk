@@ -478,6 +478,25 @@ pub fn validate_unix_socket_path(socket: &Path, flag: &str) -> Result<()> {
     Ok(())
 }
 
+/// Where `st agents new` puts an agent that names no workspace: a new directory for the agent
+/// below this account's home, `~/st/agents/IDENTITY`. The host that runs the agent answers, so
+/// the path is right for that host's home.
+pub fn default_agent_workspace(identity: &str) -> Result<PathBuf> {
+    let identity = identity.strip_prefix("agent/").unwrap_or(identity);
+    anyhow::ensure!(
+        !identity.is_empty()
+            && identity
+                .split('/')
+                .all(|part| !part.is_empty() && part != "." && part != ".."),
+        "agent identity `{identity}` cannot name a workspace directory"
+    );
+    let home = env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| home.is_absolute())
+        .context("HOME is not set to an absolute directory")?;
+    Ok(home.join("st/agents").join(identity))
+}
+
 fn xdg_dir(variable: &str, home_suffix: &str) -> PathBuf {
     env::var_os(variable).map(PathBuf::from).unwrap_or_else(|| {
         env::var_os("HOME")
