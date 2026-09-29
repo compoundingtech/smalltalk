@@ -1176,7 +1176,7 @@ fn mission_resources_filtered(
             usage_by_run.entry(run).or_default().push(usage);
         }
     }
-    let state_times = store.mission_run_state_times()?;
+    let run_states = store.mission_run_states()?;
     let mut values = missions
         .into_iter()
         .filter(|(mission, _)| selected_id.is_none_or(|selected| mission == selected))
@@ -1200,6 +1200,10 @@ fn mission_resources_filtered(
                 "running"
             } else if runs.iter().any(|run| run.status == "standing") {
                 "standing"
+            } else if definition.is_some_and(|(definition, _)| {
+                definition.state == crate::model::MissionState::Retired
+            }) {
+                "retired"
             } else {
                 match latest
                     .expect("a nonempty run list has a latest run")
@@ -1295,10 +1299,23 @@ fn mission_resources_filtered(
                         } else {
                             "system"
                         };
-                    let state_since = state_times
-                        .get(&run.subject)
-                        .copied()
+                    let run_state = run_states.get(&run.subject);
+                    let state_since = run_state
+                        .map(|state| state.since_unix_ms)
                         .unwrap_or(run.created_at_unix_ms);
+                    // An outcome counts only while the run is still over.
+                    let outcome = run_state
+                        .and_then(|state| state.outcome.as_ref())
+                        .filter(|_| run.phase == "terminal")
+                        .map(|outcome| {
+                            json!({
+                                "status": outcome.status,
+                                "previous_status": outcome.previous_status,
+                                "reason": outcome.reason,
+                                "actor": outcome.actor,
+                                "at": client_timestamp(outcome.at_unix_ms),
+                            })
+                        });
                     let blocker =
                         run.steps.iter().find(|step| step.status == "blocked").map(
                             |step| json!({"step": step.subject, "reason": step.blocked_reason}),
@@ -1341,6 +1358,7 @@ fn mission_resources_filtered(
                         "current_steps": current_steps,
                         "must_act": must_act,
                         "state_since": client_timestamp(state_since),
+                        "outcome": outcome,
                         "last_progress": last_progress,
                         "blocker": blocker,
                         "after": run.after,
@@ -7706,7 +7724,7 @@ mission "example/looped" state="ready" {
                 .unwrap()
         };
         let first = start("first");
-        start("second");
+        let second = start("second");
         state
             .store
             .set_mission_run_state(&first.id, "cancelled", "terminal", Some("no longer needed"))
@@ -7745,6 +7763,65 @@ mission "example/looped" state="ready" {
         assert_eq!(current_run["progress"]["total"], 1);
         assert_eq!(current_run["current_steps"].as_array().unwrap().len(), 0);
         assert!(current_run["state_since"].is_string());
+        assert!(current_run["outcome"].is_null());
+
+        state
+            .store
+            .set_mission_run_outcome(
+                &first.subject,
+                "completed",
+                "person/operator",
+                "its work shipped before it was cancelled",
+                "looped-first-outcome",
+            )
+            .unwrap();
+        let current =
+            mission_resources(&state.store, state.store.index().unwrap(), false, None).unwrap();
+        let looped = current
+            .iter()
+            .find(|value| value["id"] == "mission/example/looped")
+            .unwrap();
+        let finished = looped["run_details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|run| run["id"] == first.subject)
+            .unwrap();
+        assert_eq!(finished["status"], "completed");
+        assert_eq!(finished["must_act"], "nobody");
+        assert_eq!(finished["outcome"]["status"], "completed");
+        assert_eq!(finished["outcome"]["previous_status"], "cancelled");
+        assert_eq!(finished["outcome"]["actor"], "person/operator");
+        assert_eq!(
+            finished["outcome"]["reason"],
+            "its work shipped before it was cancelled"
+        );
+        assert_eq!(finished["state_since"], finished["outcome"]["at"]);
+
+        // Retired once no run is open, the mission leaves the current view at once, even with
+        // a run that ended moments ago, and its history names it retired.
+        state
+            .store
+            .set_mission_run_state(&second.id, "failed", "terminal", Some("a check failed"))
+            .unwrap();
+        state
+            .store
+            .retire_mission("example/looped", "person/operator", "retire-looped")
+            .unwrap();
+        let current =
+            mission_resources(&state.store, state.store.index().unwrap(), false, None).unwrap();
+        assert!(
+            current
+                .iter()
+                .all(|value| value["id"] != "mission/example/looped")
+        );
+        let history =
+            mission_resources(&state.store, state.store.index().unwrap(), true, None).unwrap();
+        let retired = history
+            .iter()
+            .find(|value| value["id"] == "mission/example/looped")
+            .unwrap();
+        assert_eq!(retired["state"], "retired");
     }
 
     #[test]

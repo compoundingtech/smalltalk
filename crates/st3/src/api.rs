@@ -38,17 +38,18 @@ use crate::model::{
     LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType, LaunchStartRequest,
     LocalTerminal, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendRequest,
     MessageView, MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
-    MissionRevisionRequest, MissionRunRequest, MissionRunView, OperationalRepairApplyRequest,
-    OperationalRepairPlan, OperationalRepairResult, PlannerSpec, PlanningApprovalRequest,
-    PlanningCancelRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
-    PlanningRevisionRequest, PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest,
-    QuickAgentResponse, ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse,
-    ReplicationPeerFailureRequest, ReplicationReceiveRequest, ReplicationReceiveResponse,
-    ReplicationRepairRequest, ReplicationStatus, ReviewRequest, RevisionApprovalRequest,
-    RevisionCancelRequest, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
-    RunGenerationView, SessionControlResponse, SessionInputMode, SessionInputRequest,
-    SessionLogChunk, SessionScreen, SessionSignalRequest, St3Error, StatusResponse, StepRunView,
-    WorkRequest, WorkRetryRequest, WorkWakeRequest,
+    MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest, MissionRunRequest,
+    MissionRunView, OperationalRepairApplyRequest, OperationalRepairPlan, OperationalRepairResult,
+    PlannerSpec, PlanningApprovalRequest, PlanningCancelRequest, PlanningCandidateSubmitRequest,
+    PlanningProposalRequest, PlanningRevisionRequest, PlanningSessionStartRequest,
+    PlanningSessionView, QuickAgentRequest, QuickAgentResponse, ReplicaRecordView,
+    ReplicationExportRequest, ReplicationExportResponse, ReplicationPeerFailureRequest,
+    ReplicationReceiveRequest, ReplicationReceiveResponse, ReplicationRepairRequest,
+    ReplicationStatus, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
+    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
+    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionLogChunk, SessionScreen,
+    SessionSignalRequest, St3Error, StatusResponse, StepRunView, WorkRequest, WorkRetryRequest,
+    WorkWakeRequest,
 };
 use crate::store::Store;
 
@@ -356,6 +357,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/intent/mission", post(mission))
         .route("/v1/intent/apply", post(apply))
         .route("/v1/missions/{id}", get(get_mission))
+        .route("/v1/missions/{id}/retire", post(retire_mission))
         .route("/v1/launches/{id}", get(get_planning_session))
         .route("/v1/launches/{id}/submit", post(submit_planning_candidate))
         .route(
@@ -439,6 +441,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/internal/replication/peer-failure",
             post(replication_peer_failure),
         )
+        .route(
+            "/v1/internal/replication/checkpoint",
+            post(replication_checkpoint_manifest),
+        )
         .route("/v1/internal/fleet/membership", get(fleet_membership_view))
         .route("/v1/internal/fleet/status", get(fleet_status))
         .route(
@@ -471,6 +477,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             get(get_run_revision_proposal),
         )
         .route("/v1/mission-runs/{run}/revision", post(revise_mission_run))
+        .route(
+            "/v1/mission-runs/{run}/outcome",
+            post(set_mission_run_outcome),
+        )
         .route("/v1/mission-runs/{run}", get(get_mission_run))
         .route("/v1/run-generations/{generation}", get(get_run_generation))
         .route(
@@ -906,6 +916,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "invalid-lane-anchor"
         | "invalid-lane-state"
         | "invalid-lane-change" => "validation-failed".into(),
+        // A retry of a request whose claim a checkpoint dropped cannot be answered again.
+        "claim-checkpointed" => "idempotency-conflict".into(),
         _ => "internal".into(),
     }
 }
@@ -3717,6 +3729,8 @@ async fn guard_bound_request(
     ]
     .iter()
     .any(|prefix| path.starts_with(prefix))
+        && !(path.starts_with("/v1/mission-runs/") && path.ends_with("/outcome"))
+        && !(path.starts_with("/v1/missions/") && path.ends_with("/retire"))
     {
         return Ok(request);
     }
@@ -4550,6 +4564,17 @@ async fn replication_export(
     .await
 }
 
+/// One page of a checkpoint's manifest, for the replication worker to answer a peer with.
+async fn replication_checkpoint_manifest(
+    State(state): State<AppState>,
+    Json(request): Json<crate::store::CheckpointManifestRequest>,
+) -> Result<Json<crate::store::CheckpointManifestPage>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.checkpoint_manifest_page(&request))
+        .await
+        .map(Json)
+}
+
 async fn replication_receive(
     State(state): State<AppState>,
     Json(request): Json<ReplicationReceiveRequest>,
@@ -5055,6 +5080,7 @@ async fn refuse_while_leaving(
                 | "/v1/internal/replication/export"
                 | "/v1/internal/replication/receive"
                 | "/v1/internal/replication/peer-failure"
+                | "/v1/internal/replication/checkpoint"
                 | "/v1/internal/replication-wake"
         );
     if mutating && !allowed && state.store.fleet_leaving().unwrap_or(false) {
@@ -8712,6 +8738,72 @@ async fn retry_work(
     Ok(Json(retried))
 }
 
+/// A person, or an agent that requested the run or holds revise authority over its mission,
+/// sets a finished run's outcome.
+async fn set_mission_run_outcome(
+    State(state): State<AppState>,
+    AxumPath(run): AxumPath<String>,
+    Json(request): Json<MissionRunOutcomeRequest>,
+) -> Result<Json<MissionRunView>, ApiError> {
+    if let Some(cached) = state
+        .store
+        .cached_idempotency_response::<MissionRunView>(&request.idempotency_key)
+        .map_err(ApiError::internal)?
+    {
+        return Ok(Json(cached));
+    }
+    let actor = person_or_agent_actor(&request.actor, "run-outcome-authority-denied")?;
+    let current = state
+        .store
+        .mission_run(&run)
+        .map_err(ApiError::internal)?
+        .ok_or_else(|| ApiError::not_found(format!("mission run `{run}` does not exist")))?;
+    if current.requester != actor {
+        require_agent_mission_authority(&state, &actor, "revise", &current.mission)?;
+    }
+    let store = state.store.clone();
+    let outcome = blocking_action(move || {
+        store.set_mission_run_outcome(
+            &current.subject,
+            &request.status,
+            &actor,
+            &request.reason,
+            &request.idempotency_key,
+        )
+    })
+    .await?;
+    signal_changed(&state);
+    Ok(Json(outcome))
+}
+
+/// A person, or an agent with publish authority over the mission, retires it.
+async fn retire_mission(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(request): Json<MissionRetireRequest>,
+) -> Result<Json<crate::model::MissionSpec>, ApiError> {
+    let actor = person_or_agent_actor(&request.actor, "mission-retire-authority-denied")?;
+    require_agent_mission_authority(&state, &actor, "publish", &id)?;
+    let store = state.store.clone();
+    let retired =
+        blocking_action(move || store.retire_mission(&id, &actor, &request.idempotency_key))
+            .await?;
+    signal_changed(&state);
+    Ok(Json(retired))
+}
+
+fn person_or_agent_actor(actor: &str, code: &'static str) -> Result<String, ApiError> {
+    if actor.starts_with("person/") {
+        return Ok(actor.to_owned());
+    }
+    normalized_agent_actor(actor).ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            code,
+            format!("`{actor}` is neither a person nor an agent"),
+        ))
+    })
+}
+
 async fn publish_work_mission(
     State(state): State<AppState>,
     AxumPath(subject): AxumPath<String>,
@@ -10050,11 +10142,10 @@ async fn post_gate_result(
         .validate_claim_input(&input)
         .map_err(ApiError::bad)?;
     for evidence in &input.evidence {
-        if state
+        if !state
             .store
-            .claim_by_id(evidence)
+            .evidence_exists(evidence)
             .map_err(ApiError::internal)?
-            .is_none()
         {
             return Err(ApiError::bad(St3Error::new(
                 "missing-evidence",
@@ -10272,6 +10363,8 @@ mod tests {
         for path in [
             "/v1/agent-queue-moves",
             "/v1/work/revision/approve/proposal",
+            "/v1/mission-runs/fleet%2Fdemo%2F1/outcome",
+            "/v1/missions/fleet%2Fdemo/retire",
         ] {
             for actor in ["agent/peer", "person/operator"] {
                 let request = Request::builder()
@@ -14434,6 +14527,120 @@ version 2
     }
 
     #[tokio::test]
+    async fn a_run_outcome_and_a_retirement_need_a_person_or_mission_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"
+version 2
+
+  mission "shipped" state="ready" {
+    goal "Ship one change."
+    agent "sup" {
+      workspace "."
+      command "true"
+      mission-authority { revise "shipped" }
+    }
+    agent "worker" { workspace "."; command "true" }
+    step "ship" { goal "Ship the change." }
+  }
+
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &planned.subject_tokens, "shipped-mission")
+            .unwrap();
+        let run = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "shipped".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "shipped-run".into(),
+            })
+            .unwrap();
+        materialize_run_agents(&state, &run);
+        state
+            .store
+            .set_mission_run_state(&run.id, "failed", "terminal", Some("a gate failed"))
+            .unwrap();
+        let outcome = |actor: String, key: &str| {
+            serde_json::to_value(MissionRunOutcomeRequest {
+                actor,
+                status: "completed".into(),
+                reason: "the change shipped after the gate was fixed".into(),
+                idempotency_key: key.into(),
+            })
+            .unwrap()
+        };
+        let path = format!(
+            "/v1/mission-runs/{}/outcome",
+            urlencoding::encode(&run.subject)
+        );
+
+        let (status, denied) = json_request(
+            router(state.clone()),
+            &path,
+            outcome(format!("agent/{}/worker", run.id), "outcome-worker"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{denied}");
+        assert_eq!(denied["code"], "mission-authority-denied");
+
+        let (status, completed) = json_request(
+            router(state.clone()),
+            &path,
+            outcome(format!("agent/{}/sup", run.id), "outcome-sup"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{completed}");
+        assert_eq!(completed["status"], "completed");
+        assert_eq!(completed["outcome"]["previous_status"], "failed");
+        assert_eq!(
+            completed["outcome"]["actor"],
+            format!("agent/{}/sup", run.id)
+        );
+
+        let retire = |actor: String, key: &str| {
+            serde_json::to_value(MissionRetireRequest {
+                actor,
+                idempotency_key: key.into(),
+            })
+            .unwrap()
+        };
+        let path = format!("/v1/missions/{}/retire", urlencoding::encode("shipped"));
+        let (status, denied) = json_request(
+            router(state.clone()),
+            &path,
+            retire(format!("agent/{}/sup", run.id), "retire-sup"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{denied}");
+        assert_eq!(denied["code"], "mission-authority-denied");
+        let (status, retired) = json_request(
+            router(state.clone()),
+            &path,
+            retire("person/test".into(), "retire-person"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{retired}");
+        assert_eq!(retired["state"], "retired");
+    }
+
+    #[tokio::test]
     async fn a_run_revision_accepts_a_loop_round_embedded_mission() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
@@ -15812,6 +16019,34 @@ version 2
         let (_, still_pending) = get_request(app.clone(), "/v1/reviews").await;
         assert_eq!(still_pending.as_array().unwrap().len(), 2);
 
+        // A newer build asks the mission gate again as a new operation. The reviewer sees one
+        // review, aged from the first request, and the decision answers the request the gate
+        // now waits on.
+        let mut again_fields = request_fields(
+            run.subject.clone(),
+            run.revision.clone(),
+            "gate-operation/review-api/mission-again",
+        );
+        again_fields.insert("mode".into(), Value::String("approve".into()));
+        let mission_again = store
+            .append_claim(&ClaimInput {
+                subject: "gate-operation/review-api/mission-again".into(),
+                kind: "gate.requested".into(),
+                actor: None,
+                fields: again_fields,
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("mission-review-again".into()),
+            })
+            .unwrap();
+        let (_, asked_again) = get_request(app.clone(), "/v1/reviews").await;
+        assert_eq!(asked_again.as_array().unwrap().len(), 2, "{asked_again}");
+        assert_eq!(asked_again[1]["request"], mission_again.id);
+        assert_eq!(
+            asked_again[1]["requested_at_unix_ms"],
+            json!(mission_request.accepted_at_unix_ms)
+        );
+
         let body = |actor: &str| {
             serde_json::to_value(ReviewRequest {
                 decision: "approved".into(),
@@ -15839,8 +16074,9 @@ version 2
         assert_eq!(status, StatusCode::OK, "{accepted_mission}");
         assert_eq!(
             accepted_mission["body"]["fields"]["request"],
-            mission_request.id
+            mission_again.id
         );
+        assert_eq!(accepted_mission["subject"], mission_again.subject);
         assert_eq!(accepted_mission["body"]["fields"]["verdict"], "pass");
 
         let missing_reason = serde_json::to_value(ReviewRequest {

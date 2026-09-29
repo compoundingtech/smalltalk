@@ -3281,7 +3281,12 @@ fn capture_tree(source: &Path, destination: &Path, mode: CaptureMode) -> Result<
         source_root.display()
     );
     capture_dir_capability(&source, destination, destination, mode)?;
-    sync_tree_dirs(destination)
+    // A prepared catalog is captured into a temporary directory that is only projected and
+    // then removed, so it needs no sync. A bundle is published from where it was captured.
+    match mode {
+        CaptureMode::AgentBundle => sync_tree_dirs(destination),
+        CaptureMode::PreparedCatalog => Ok(()),
+    }
 }
 
 #[cfg(debug_assertions)]
@@ -3401,7 +3406,9 @@ fn capture_dir_capability(
                 .mode(if executable { 0o755 } else { 0o644 })
                 .open(&target)?;
             std::io::copy(&mut input, &mut output)?;
-            output.sync_all()?;
+            if mode == CaptureMode::AgentBundle {
+                output.sync_all()?;
+            }
         } else {
             anyhow::bail!(
                 "source tree contains a symlink or special entry: {}",

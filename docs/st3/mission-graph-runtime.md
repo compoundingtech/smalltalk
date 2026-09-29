@@ -213,6 +213,18 @@ A completion dependency cannot reference a final step.
 Omitting `completion` means `all-steps-exhausted`. Long-lived harness availability is modeled by a
 top-level agent seat, not by omission on a mission.
 
+A mission that should no longer start leaves every list when it is retired:
+
+```sh
+st missions retire mission/MISSION_ID --as person/operator
+```
+
+Retirement publishes the current definition again with `state="retired"`, naming who retired it.
+The mission leaves `st missions ls`, `st missions tree` and every client, and cannot start. Its
+revisions and runs stay in its history (`st missions ls --all`, `st missions show`). A person, or an
+agent with `publish` authority for the mission, can retire it once no run of it is active. Publishing
+a ready revision brings it back.
+
 ## Run ownership and concurrency
 
 A mission run owns the execution state declared inside that run. A top-level `agent` is instead a
@@ -719,6 +731,9 @@ gate "the release is approved" type="human" {
 A human gate requires a full `person/...` reviewer. The question and repeated review targets are optional.
 
 st creates one `gate.requested` claim for the exact mission or step revision and attempt. A review decision must match that request.
+A newer st build can word the same gate's request differently and ask again for the same attempt.
+The reviewer then sees one review: the newest request, which is the one the gate waits on, aged
+from the first request, on every node.
 
 `st attention ls --as person/NAME` shows the selected person's pending KDL human gates together
 with their other current decisions and faults.
@@ -819,10 +834,24 @@ While its run is active, the step starts its next attempt in place. When that st
 reason its root run failed, the retry reopens the run in a successor generation of the same
 revision. Completed normal work carries forward. The failed step starts its next attempt. Work that
 the failure cancelled and every final step start again. The old generation becomes superseded.
+The run's state claims record who reopened it and why, and its state dates from the reopening.
 
 A failed run does not reopen when several steps failed, when work was cancelled for a reason other
 than the failure, when a mission gate or the mission timeout failed it, when it is a nested or eval
 run, or when its mission deadline has passed. Revise the run instead to restart several failed steps.
+
+A finished root run can show another outcome than the one st recorded, for example when its work
+shipped after a gate failed. A person, the agent that requested the run, or an agent with `revise`
+authority for its mission sets it with a reason:
+
+```sh
+st missions outcome RUN completed --reason "the change merged after the gate was fixed" --as person/operator
+```
+
+The outcome is `completed`, `failed`, or `cancelled`. The run keeps its steps as they ended. Its
+latest state claim records the new outcome, who set it, and why; `st missions show` prints it with
+the outcome it replaced, and every client shows it on every node. An active run is cancelled with
+`st missions cancel` instead, and nested and eval runs keep their outcome.
 
 The `completion` frontier selects when st checks mission products and gates. st then enters the final phase when one exists.
 

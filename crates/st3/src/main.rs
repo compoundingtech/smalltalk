@@ -24,15 +24,15 @@ use st3::model::{
     LaunchDecisionOption, LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType,
     LaunchStartRequest, MessageLifecycleRequest, MessagePage, MessageSendRequest, MessageView,
     MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
-    MissionRevisionRequest, MissionRunView, MissionState, OperationalRepairApplyRequest,
-    OperationalRepairPlan, OperationalRepairResult, PlannerSpec, PlanningApprovalRequest,
-    PlanningCandidateSubmitRequest, PlanningProposalRequest, PlanningSessionView,
-    ReplicaRecordView, ReplicationPeerStatus, ReplicationRepairRequest, ReplicationStatus,
-    ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest, RevisionProposalView,
-    RevisionSubmissionView, RunGenerationView, SessionControlResponse, SessionInputMode,
-    SessionInputRequest, SessionScreen, SessionSignalRequest, StatusResponse, StepRunView,
-    SubscriptionRequestDecision, SubscriptionRequestView, WorkRequest, WorkRetryRequest,
-    WorkWakeRequest,
+    MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest, MissionRunView,
+    MissionSpec, MissionState, OperationalRepairApplyRequest, OperationalRepairPlan,
+    OperationalRepairResult, PlannerSpec, PlanningApprovalRequest, PlanningCandidateSubmitRequest,
+    PlanningProposalRequest, PlanningSessionView, ReplicaRecordView, ReplicationPeerStatus,
+    ReplicationRepairRequest, ReplicationStatus, ReviewRequest, RevisionApprovalRequest,
+    RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
+    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionScreen,
+    SessionSignalRequest, StatusResponse, StepRunView, SubscriptionRequestDecision,
+    SubscriptionRequestView, WorkRequest, WorkRetryRequest, WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -1477,6 +1477,10 @@ enum MissionViewCommand {
     Start(MissionRunStartArgs),
     /// Cancel one exact running mission and stop its owned work and runtimes.
     Cancel(MissionCancelArgs),
+    /// Set a finished run's outcome to completed, failed, or cancelled, with a reason.
+    Outcome(MissionOutcomeArgs),
+    /// Retire a mission so it leaves the lists and cannot start; publishing it again brings it back.
+    Retire(MissionRetireArgs),
     /// Show one seat's current claim and its queued mission runs in order; same as `st agents queue AGENT`.
     Queued {
         /// Exact seat subject or its identity without the `agent/` prefix.
@@ -1550,6 +1554,30 @@ struct MissionCancelArgs {
     reason: String,
     /// Concrete human authority carried over the trusted local Unix boundary.
     #[arg(long = "as", value_parser = parse_person_subject)]
+    actor: String,
+}
+
+#[derive(Args)]
+struct MissionOutcomeArgs {
+    /// Exact mission-run subject of a finished run.
+    mission_run: String,
+    /// The outcome the run should show.
+    #[arg(value_parser = ["completed", "failed", "cancelled"])]
+    status: String,
+    /// Why the run has this outcome, for example that its work shipped after a gate failed.
+    #[arg(long)]
+    reason: String,
+    /// A person, or an agent that requested the run or may revise its mission.
+    #[arg(long = "as", value_parser = parse_publication_actor)]
+    actor: String,
+}
+
+#[derive(Args)]
+struct MissionRetireArgs {
+    /// Mission to retire, such as `mission/fleet/demo/deploy`.
+    mission: String,
+    /// A person, or an agent that may publish the mission.
+    #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
 }
 
@@ -3131,6 +3159,8 @@ fn guard_mutating_cli_actor(
             MissionViewCommand::Publish(args) => Some(args.actor.as_str()),
             MissionViewCommand::Start(args) => Some(args.actor.as_str()),
             MissionViewCommand::Cancel(args) => Some(args.actor.as_str()),
+            MissionViewCommand::Outcome(args) => Some(args.actor.as_str()),
+            MissionViewCommand::Retire(args) => Some(args.actor.as_str()),
             _ => None,
         },
         Command::Agents { command } => match command {
@@ -3964,6 +3994,10 @@ async fn run_mission_view(
         MissionViewCommand::Cancel(args) => {
             cancel_mission_run(client, endpoint, args, json_output).await
         }
+        MissionViewCommand::Outcome(args) => {
+            set_mission_run_outcome(client, args, json_output).await
+        }
+        MissionViewCommand::Retire(args) => retire_mission(client, args, json_output).await,
         MissionViewCommand::Queued { agent } => {
             show_agent_queue(endpoint, &agent, json_output).await
         }
@@ -4063,6 +4097,63 @@ async fn cancel_mission_run(
     print_client_value(&response, json_output)
 }
 
+async fn set_mission_run_outcome(
+    client: &Client,
+    args: MissionOutcomeArgs,
+    json_output: bool,
+) -> Result<()> {
+    let id = args
+        .mission_run
+        .strip_prefix("mission-run/")
+        .unwrap_or(&args.mission_run);
+    let subject = format!("mission-run/{id}");
+    let nonce = uuid::Uuid::now_v7().simple().to_string();
+    let run: MissionRunView = client
+        .post(
+            &format!("/v1/mission-runs/{}/outcome", urlencoding::encode(&subject)),
+            &MissionRunOutcomeRequest {
+                actor: args.actor,
+                status: args.status,
+                reason: args.reason,
+                idempotency_key: format!("mission-outcome:{subject}:{nonce}"),
+            },
+        )
+        .await?;
+    if json_output {
+        print_value(&run, true)
+    } else {
+        println!("{} is now {}", run.subject, run.status);
+        Ok(())
+    }
+}
+
+async fn retire_mission(client: &Client, args: MissionRetireArgs, json_output: bool) -> Result<()> {
+    let id = args
+        .mission
+        .strip_prefix("mission/")
+        .unwrap_or(&args.mission);
+    let mission = format!("mission/{id}");
+    let nonce = uuid::Uuid::now_v7().simple().to_string();
+    let retired: MissionSpec = client
+        .post(
+            &format!("/v1/missions/{}/retire", urlencoding::encode(id)),
+            &MissionRetireRequest {
+                actor: args.actor,
+                idempotency_key: format!("mission-retire:{mission}:{nonce}"),
+            },
+        )
+        .await?;
+    if json_output {
+        print_value(&retired, true)
+    } else {
+        println!(
+            "{} is retired at revision {}",
+            retired.subject, retired.revision
+        );
+        Ok(())
+    }
+}
+
 async fn start_mission_run(
     client: &Client,
     args: MissionRunStartArgs,
@@ -4079,6 +4170,10 @@ async fn start_mission_run(
         MISSION_ARRIVAL_WAIT,
     )
     .await?;
+    anyhow::ensure!(
+        mission.state != MissionState::Retired,
+        "mission `mission/{mission_id}` is retired; publish a ready revision to start it again"
+    );
     anyhow::ensure!(
         mission.state == MissionState::Ready,
         "mission `mission/{mission_id}` is not ready"
@@ -6441,12 +6536,13 @@ async fn run_replication(
             println!("graph-digest\t{}", status.graph_digest);
             println!("envelopes\t{}", status.received_envelopes);
             println!(
-                "records\tvalid={} pending={} unknown={} invalid={} repaired={}",
+                "records\tvalid={} pending={} unknown={} invalid={} repaired={} checkpointed={}",
                 status.valid_records,
                 status.pending_records,
                 status.unknown_records,
                 status.invalid_records,
-                status.repaired_records
+                status.repaired_records,
+                status.checkpointed_envelopes
             );
             println!("unhealthy-projections\t{}", status.unhealthy_projections);
             for projection in &status.unhealthy {
