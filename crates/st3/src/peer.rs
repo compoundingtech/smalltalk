@@ -30,8 +30,10 @@ use crate::fleet::transport::{
 use crate::fleet::{Acceptance, FleetView, MemberKey, Refusal, Sender, verify_signature};
 use crate::model::{
     ApiResponse, ReplicaEnvelopeId, ReplicationExchange, ReplicationExportRequest,
-    ReplicationExportResponse, ReplicationInventory, ReplicationPeerFailureRequest,
-    ReplicationReceiveRequest, ReplicationReceiveResponse,
+    ReplicationExportResponse, ReplicationHealAnswer, ReplicationHealAnswerRequest,
+    ReplicationHealNextRequest, ReplicationHealQuery, ReplicationHealRequest, ReplicationHealStep,
+    ReplicationInventory, ReplicationPeerFailureRequest, ReplicationReceiveRequest,
+    ReplicationReceiveResponse,
 };
 use crate::store::Store;
 use crate::store::{CheckpointManifest, CheckpointManifestPage, CheckpointManifestRequest};
@@ -44,6 +46,12 @@ const CHECKPOINT_PATH: &str = "/v1/peer/checkpoint";
 const REPLICATION_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
 const REPLICATION_WAKE_COALESCE: Duration = Duration::from_secs(1);
 const CLIENT_READ_PATH: &str = "/v1/peer/client-read";
+const HEAL_PATH: &str = "/v1/peer/heal";
+/// A heal question can make the peer replay its graph from nothing, which takes 41 seconds on a
+/// 2 GB store and longer under load.
+const HEAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Questions one heal asks before it gives up until the next.
+const HEAL_QUESTION_LIMIT: usize = 48;
 const JOIN_PATH: &str = "/v1/fleet/join";
 const MAX_JOIN_BYTES: usize = 4096;
 const MAX_CLIENT_READ_BYTES: usize = 1_048_576;
@@ -240,6 +248,7 @@ impl FleetAuth {
         hex::encode(mac.finalize().into_bytes())
     }
 
+    #[cfg(test)]
     fn request_headers(&self, node: &str, body: &[u8]) -> Result<HeaderMap> {
         self.request_headers_for(EXCHANGE_PATH, node, body)
     }
@@ -990,7 +999,12 @@ impl PeerBackend {
                     store.record_replication_round_trip(round_trip);
                 }
                 let receipt = store
-                    .receive_replication_exchange(peer, fleet_id, exchange)
+                    .receive_replication_exchange_asking(
+                        peer,
+                        fleet_id,
+                        exchange,
+                        round_trip.is_some(),
+                    )
                     .map_err(anyhow::Error::msg)?;
                 store.record_transport_observation(peer, "up", None, None)?;
                 let admission = store.validate_replication_backlog()?;
@@ -1002,6 +1016,54 @@ impl PeerBackend {
                     store_index: store.index()?,
                 })
             }
+        }
+    }
+
+    /// Answer a peer's heal question from this node's claims.
+    async fn heal_answer(
+        &self,
+        peer: &str,
+        fleet_id: &str,
+        query: &ReplicationHealQuery,
+    ) -> Result<ReplicationHealAnswer> {
+        match self {
+            Self::Main(client) => {
+                client
+                    .post(
+                        "/v1/internal/replication/heal/answer",
+                        &ReplicationHealAnswerRequest {
+                            peer: peer.to_owned(),
+                            fleet_id: fleet_id.to_owned(),
+                            query: query.clone(),
+                        },
+                    )
+                    .await
+            }
+            #[cfg(test)]
+            Self::Local(store) => store.heal_answer(peer, query),
+        }
+    }
+
+    /// Compare a peer's heal answer with this node's claims and learn what to ask next.
+    async fn heal_next(
+        &self,
+        peer: &str,
+        answer: ReplicationHealAnswer,
+    ) -> Result<ReplicationHealStep> {
+        match self {
+            Self::Main(client) => {
+                client
+                    .post(
+                        "/v1/internal/replication/heal/next",
+                        &ReplicationHealNextRequest {
+                            peer: peer.to_owned(),
+                            answer,
+                        },
+                    )
+                    .await
+            }
+            #[cfg(test)]
+            Self::Local(store) => store.heal_next(peer, answer),
         }
     }
 
@@ -1491,6 +1553,7 @@ async fn keep_fleet_view_current(
 fn peer_router(state: PeerState) -> Router {
     Router::new()
         .route(EXCHANGE_PATH, post(receive_exchange))
+        .route(HEAL_PATH, post(receive_heal))
         .route(
             CHECKPOINT_PATH,
             post(receive_checkpoint_request).layer(DefaultBodyLimit::max(16_384)),
@@ -1911,8 +1974,11 @@ async fn dial_peer(
             url,
         };
         match exchange(&http, &backend, &node, &peer, &auth, &fleet, &main_socket).await {
-            Ok(moved) => {
+            Ok((moved, heal_now)) => {
                 backoff = Duration::from_secs(1);
+                if heal_now {
+                    heal(&backend, &node, &peer, &auth, &fleet, &main_socket).await;
+                }
                 if moved {
                     // One exchange carries a bounded batch. Keep going at once while envelopes
                     // still move instead of leaving the rest of a backlog to the timer.
@@ -2066,6 +2132,74 @@ async fn receive_exchange(
             .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, message).into_response())
         }
     }
+}
+
+/// A peer's heal question, answered from this node's claims by the main daemon.
+async fn receive_heal(State(state): State<PeerState>, headers: HeaderMap, body: Bytes) -> Response {
+    let body = if deflated(&headers) {
+        match inflate(&body) {
+            Ok(body) => Bytes::from(body),
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("heal request body: {error:#}"),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        body
+    };
+    let sender = match state
+        .auth
+        .verify_sender(&headers, "POST", HEAL_PATH, &body, None, None)
+    {
+        Ok(sender) => sender,
+        Err(error) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                format!("heal authentication failed: {error:#}"),
+            )
+                .into_response();
+        }
+    };
+    let request_digest = FleetAuth::body_digest(&body);
+    if let Err(refusal) = state.fleet.accept(&sender) {
+        return signed_refusal(&state, &request_digest, &refusal)
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    let result = async {
+        let request: ReplicationHealRequest =
+            serde_json::from_slice(&body).context("decode the heal request")?;
+        anyhow::ensure!(
+            request.fleet_id == state.auth.fleet_id(),
+            "the peer belongs to another fleet"
+        );
+        let answer = state
+            .backend
+            .heal_answer(&sender.name, state.auth.fleet_id(), &request.query)
+            .await?;
+        if matches!(
+            answer,
+            ReplicationHealAnswer::Swapped { .. } | ReplicationHealAnswer::Replayed { .. }
+        ) {
+            wake_main(&state.main_socket).await;
+        }
+        let response = signed_response_for(&state, HEAL_PATH, &request_digest, 0, answer)?;
+        deflate_response(response, accepts_deflate(&headers)).await
+    }
+    .await;
+    result.unwrap_or_else(|error| {
+        signed_error_response_for(
+            &state,
+            HEAL_PATH,
+            &request_digest,
+            0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("heal request failed: {error:#}"),
+        )
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    })
 }
 
 /// Answer a member or config peer with one page of a checkpoint's manifest. It is authenticated
@@ -2406,7 +2540,7 @@ async fn exchange(
     auth: &FleetAuth,
     fleet: &FleetContext,
     main_socket: &Path,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     let first = backend
         .export(auth.fleet_id(), &ReplicationInventory::default(), true, &[])
         .await?
@@ -2426,6 +2560,7 @@ async fn exchange(
     // Progress means new envelopes stored on one side or the other. A peer that keeps sending,
     // or keeps being sent, envelopes that are never stored must not keep the worker busy.
     let pulled = received.receipt.received != 0;
+    let mut heal_now = received.receipt.heal;
     if received.changed {
         wake_main(main_socket).await;
     }
@@ -2454,11 +2589,52 @@ async fn exchange(
             .receive(&peer.name, auth.fleet_id(), &response, Some(round_trip))
             .await?;
         pulled_follow_up = received.receipt.received != 0;
+        heal_now |= received.receipt.heal;
         if received.changed {
             wake_main(main_socket).await;
         }
     }
-    Ok(pulled || pulled_follow_up || pushed)
+    Ok((pulled || pulled_follow_up || pushed, heal_now))
+}
+
+/// Heal with one peer: carry each question the main daemon asks to the peer, and each answer
+/// back, until the main daemon reports the heal. A peer that cannot be asked ends the heal with
+/// the reason, which the main daemon reports.
+async fn heal(
+    backend: &PeerBackend,
+    node: &str,
+    peer: &PeerConfig,
+    auth: &FleetAuth,
+    fleet: &FleetContext,
+    main_socket: &Path,
+) {
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(HEAL_TIMEOUT)
+        .build()
+        .expect("the heal HTTP client configuration is valid");
+    let mut query = ReplicationHealQuery::Ranges;
+    for _ in 0..HEAL_QUESTION_LIMIT {
+        let request = ReplicationHealRequest {
+            fleet_id: auth.fleet_id().to_owned(),
+            query,
+        };
+        let answer = match post_signed_to::<_, ReplicationHealAnswer>(
+            &http, peer, node, auth, fleet, HEAL_PATH, &request, true,
+        )
+        .await
+        {
+            Ok((answer, _)) => answer,
+            Err(error) => ReplicationHealAnswer::Failed {
+                message: format!("{} could not answer: {error:#}", peer.name),
+            },
+        };
+        match backend.heal_next(&peer.name, answer).await {
+            Ok(ReplicationHealStep::Ask { query: next }) => query = next,
+            Ok(ReplicationHealStep::Done { .. }) | Err(_) => break,
+        }
+    }
+    wake_main(main_socket).await;
 }
 
 /// Send one signed exchange, compressed when `compress` is set and the body is large, and return
@@ -2472,10 +2648,36 @@ async fn post_signed(
     exchange: &ReplicationExchange,
     compress: bool,
 ) -> Result<(ReplicationExchange, bool)> {
-    let body = serde_json::to_vec(exchange)?;
+    post_signed_to(
+        http,
+        peer,
+        node,
+        auth,
+        fleet,
+        EXCHANGE_PATH,
+        exchange,
+        compress,
+    )
+    .await
+}
+
+/// Send one signed request to a peer path and return the peer's verified answer, as
+/// `post_signed` does for an exchange.
+#[allow(clippy::too_many_arguments)]
+async fn post_signed_to<B: Serialize, R: serde::de::DeserializeOwned>(
+    http: &reqwest::Client,
+    peer: &PeerConfig,
+    node: &str,
+    auth: &FleetAuth,
+    fleet: &FleetContext,
+    path: &str,
+    request: &B,
+    compress: bool,
+) -> Result<(R, bool)> {
+    let body = serde_json::to_vec(request)?;
     let request_digest = FleetAuth::body_digest(&body);
-    let headers = auth.request_headers(node, &body)?;
-    let endpoint = format!("{}{}", peer.url.trim_end_matches('/'), EXCHANGE_PATH);
+    let headers = auth.request_headers_for(path, node, &body)?;
+    let endpoint = format!("{}{}", peer.url.trim_end_matches('/'), path);
     let started = std::time::Instant::now();
     let mut request = http
         .post(&endpoint)
@@ -2512,6 +2714,10 @@ async fn post_signed(
             )
         })?
         .to_vec();
+    // A build older than a path answers an unsigned 404.
+    if status == StatusCode::NOT_FOUND && headers.get(HEADER_SIGNATURE).is_none() {
+        anyhow::bail!("peer {} runs a build without `{path}`", peer.name);
+    }
     let bytes = if deflated(&headers) {
         inflate(&bytes)?
     } else {
@@ -2520,7 +2726,7 @@ async fn post_signed(
     let responder = auth.verify_sender(
         &headers,
         "RESPONSE",
-        EXCHANGE_PATH,
+        path,
         &bytes,
         Some(&peer.name),
         Some(&request_digest),
@@ -2555,7 +2761,7 @@ async fn post_signed(
             String::from_utf8_lossy(&bytes)
         );
     }
-    let response: ApiResponse<ReplicationExchange> =
+    let response: ApiResponse<R> =
         serde_json::from_slice(&bytes).context("decode the signed peer response")?;
     anyhow::ensure!(
         response.api_version == "st3.v1",
@@ -4269,7 +4475,8 @@ mod tests {
             Path::new("/no/such/socket"),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(pushed, "the peer stored what this node pushed");
         assert!(
             target
@@ -4299,7 +4506,8 @@ mod tests {
             Path::new("/no/such/socket"),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(pulled, "this node stored what the peer sent");
         assert!(
             source
@@ -4328,7 +4536,8 @@ mod tests {
             Path::new("/no/such/socket"),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(!moved, "converged nodes store nothing, so the worker may rest");
         assert_eq!(
             connection_ports.lock().unwrap().len(),
@@ -4343,6 +4552,118 @@ mod tests {
             .unwrap();
         assert!(converged.inventory.envelopes.is_empty());
         assert!(converged.envelopes.is_empty());
+        server.abort();
+    }
+
+    /// A first sync that ends with different graphs heals at once over the signed heal route:
+    /// the node that lost claims asks the peer that holds them and admits their envelopes again.
+    #[tokio::test]
+    async fn a_first_sync_heals_a_node_that_lost_claims_over_the_signed_route() {
+        let fleet = "1f91ca65-7793-48cc-866e-ac15690130e1";
+        let auth = FleetAuth::test(fleet, &[6; 32]);
+        let root = tempfile::tempdir().unwrap();
+        let target_path = root.path().join("target.sqlite3");
+        let source = Arc::new(Store::open_memory("source").unwrap());
+        let target = Arc::new(Store::open(&target_path, "target").unwrap());
+        source.bind_fleet(fleet).unwrap();
+        target.bind_fleet(fleet).unwrap();
+        target.begin_first_sync("source").unwrap();
+        let intent = crate::graph::parse_test_intent(
+            "version 2\n exec \"work\" { command \"true\"; restart \"never\" } ",
+            "source",
+        )
+        .unwrap();
+        let preview = source
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: "work".into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        source
+            .apply(&intent, &preview.subject_tokens, "work")
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = PeerState {
+            backend: PeerBackend::Local(source.clone()),
+            node: "source".into(),
+            auth: auth.clone(),
+            fleet: FleetContext::legacy(BTreeSet::from(["target".into()])),
+            main_socket: PathBuf::from("/no/such/socket"),
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, peer_router(state)).await });
+        let peer = PeerConfig {
+            name: "source".into(),
+            url: format!("http://{address}"),
+        };
+        let backend = PeerBackend::Local(target.clone());
+        let context = FleetContext::legacy(BTreeSet::from(["source".into()]));
+        let socket = Path::new("/no/such/socket");
+        let http = replication_http_client();
+        // The target stores the source's envelopes, which compares nothing yet.
+        target
+            .receive_replication_exchange(
+                "source",
+                fleet,
+                &source
+                    .export_replication_exchange(fleet, &target.replication_inventory().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        target.project_replication_backlog().unwrap();
+        assert_eq!(target.first_sync().unwrap().unwrap().state, "syncing");
+
+        // The target loses the desired claim but keeps its envelope, before its first sync ends.
+        {
+            let connection = rusqlite::Connection::open(&target_path).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA foreign_keys=OFF;
+                     DELETE FROM claims WHERE kind='intent.desired';",
+                )
+                .unwrap();
+        }
+        target.replay_replication_graph().unwrap();
+        let graph = |store: &Store| {
+            store
+                .replication_status(true, Some(fleet), &[])
+                .unwrap()
+                .graph_digest
+        };
+        assert_ne!(graph(&target), graph(&source));
+
+        // Transport observations move for an exchange or two before the envelopes match.
+        let mut heal_now = false;
+        for _ in 0..4 {
+            heal_now = exchange(&http, &backend, "target", &peer, &auth, &context, socket)
+                .await
+                .unwrap()
+                .1;
+            if heal_now {
+                break;
+            }
+        }
+        assert!(
+            heal_now,
+            "the first comparison of a first sync heals at once"
+        );
+        heal(&backend, "target", &peer, &auth, &context, socket).await;
+
+        let status = target
+            .replication_status(true, Some(fleet), &["source".into()])
+            .unwrap();
+        let report = status.peers[0].sync.as_ref().unwrap().heal.clone().unwrap();
+        assert!(report.healed, "{report:?}");
+        assert_eq!(graph(&target), graph(&source));
+        assert_eq!((report.refetched, report.pushed), (1, 0));
+        let first = status.first_sync.unwrap();
+        assert_eq!((first.state.as_str(), first.healed), ("verified", true));
         server.abort();
     }
 
