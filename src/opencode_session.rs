@@ -38,7 +38,8 @@ use crate::driver_diagnostic::{
 };
 use crate::harness_state::{self, Activity, Ask, BlockedOn, InputBuffer, Observation, Writer};
 use crate::provider_session::{
-    PROVIDER_POLL, STOP, completed_provider, describe_exit, install_signal_handler,
+    DETACH, Detached, DetachedSession, PROVIDER_POLL, ProviderProcess, STOP, completed_provider,
+    describe_exit, install_signal_handler,
 };
 use crate::{delivery_ledger, ding, harness_context, harness_version, message, status};
 
@@ -146,7 +147,7 @@ pub fn run(
         let mut diagnostics = DiagnosticPublisher::new(
             &agent_dir,
             DiagnosticDriver::OpenCode,
-            producer_version,
+            producer_version.clone(),
             support,
         );
         if let Some(reason) = version_failure {
@@ -185,9 +186,16 @@ pub fn run(
             },
             delivery: Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id),
             diagnostics,
+            adoption: Adoption {
+                port,
+                password: password.clone(),
+                session,
+                seq,
+                producer_version,
+            },
         }
     };
-    let mut child = match spawn_provider(&argv, &password) {
+    let child = match spawn_provider(&argv, &password) {
         Ok(child) => child,
         Err(error) => {
             // The claim already replaced whatever the predecessor left; returning through `?`
@@ -203,7 +211,65 @@ pub fn run(
         }
     };
 
-    run_session(session, &mut child, &agent_dir)
+    run_session(session, &mut ProviderProcess::Spawned(child), &agent_dir)
+}
+
+/// Resume supervising an OpenCode provider a predecessor driver image launched through [`run`] and
+/// released for adoption. The server keeps its port and password, so this image reconnects to the
+/// same session, reseeds observed state from it, and continues delivery from the durable ledger.
+#[allow(clippy::too_many_arguments)]
+pub fn adopt(
+    catalog_root: &Path,
+    identity: String,
+    runtime_id: String,
+    pid: u32,
+    session: String,
+    seq: u64,
+    port: u16,
+    password: String,
+    version_ok: bool,
+    producer_version: Option<String>,
+) -> Result<()> {
+    let this_host = crate::run::detect_host();
+    let agent_dir = message::resolve_declared_dir(catalog_root, &identity, &this_host)?
+        .with_context(|| format!("opencode driver agent '{identity}' is not declared"))?;
+    let support = match (&producer_version, version_ok) {
+        (_, true) => DiagnosticSupport::Supported,
+        (Some(_), false) => DiagnosticSupport::Unsupported,
+        (None, false) => DiagnosticSupport::Unknown,
+    };
+    let session_state = Session {
+        client: Client::new(port, &password),
+        version_ok,
+        status_path: status::status_path(&agent_dir),
+        writer: Writer::new(
+            &agent_dir,
+            identity.clone(),
+            "opencode",
+            Some(runtime_id.clone()),
+        )
+        .with_ownership(session.clone(), seq),
+        context: ContextProducer::new(&agent_dir, &identity, &session).ok(),
+        delivery: Delivery::new(catalog_root, &agent_dir, &this_host, &identity, &runtime_id),
+        diagnostics: DiagnosticPublisher::new(
+            &agent_dir,
+            DiagnosticDriver::OpenCode,
+            producer_version.clone(),
+            support,
+        ),
+        adoption: Adoption {
+            port,
+            password,
+            session,
+            seq,
+            producer_version,
+        },
+    };
+    run_session(
+        session_state,
+        &mut ProviderProcess::adopted(pid),
+        &agent_dir,
+    )
 }
 
 // ---- wrapper session loop --------------------------------------------------------------------
@@ -218,9 +284,19 @@ struct Session {
     context: Option<ContextProducer>,
     delivery: Delivery,
     diagnostics: DiagnosticPublisher,
+    adoption: Adoption,
 }
 
-fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Result<()> {
+/// What a replacement driver image needs to reattach to this exact server and session.
+struct Adoption {
+    port: u16,
+    password: String,
+    session: String,
+    seq: u64,
+    producer_version: Option<String>,
+}
+
+fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Path) -> Result<()> {
     let (wake_tx, wake_rx) = mpsc::channel();
     let _watcher = crate::watch::watch_delivery_inputs(agent_dir, wake_tx);
     let (event_tx, event_rx) = mpsc::channel();
@@ -253,6 +329,23 @@ fn run_session(mut session: Session, child: &mut Child, agent_dir: &Path) -> Res
                 let _ = session.writer.ended(describe_exit(*exit));
             }
             break reaped.map(|_| ());
+        }
+        if DETACH.load(Ordering::SeqCst) && !matches!(child.try_wait(), Ok(Some(_))) {
+            // The server, its session, and the observed record stay exactly as they are; the next
+            // driver image reconnects to the same port and reseeds.
+            sse_stop.store(true, Ordering::SeqCst);
+            return Err(Detached {
+                session: DetachedSession::OpenCode {
+                    pid: child.id(),
+                    session: session.adoption.session.clone(),
+                    seq: session.adoption.seq,
+                    port: session.adoption.port,
+                    password: session.adoption.password.clone(),
+                    version_ok: session.version_ok,
+                    producer_version: session.adoption.producer_version.clone(),
+                },
+            }
+            .into());
         }
         match child.try_wait() {
             Ok(Some(exit)) => {
@@ -433,7 +526,7 @@ fn spawn_provider(argv: &[String], password: &str) -> Result<Child> {
         .with_context(|| format!("starting opencode provider {program}"))
 }
 
-fn stop_provider_group(child: &mut Child) -> Result<Option<ExitStatus>> {
+fn stop_provider_group(child: &mut ProviderProcess) -> Result<Option<ExitStatus>> {
     let process_group = unsafe { libc::getpgrp() };
     anyhow::ensure!(
         process_group > 1,

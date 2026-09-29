@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# Run the graceful messaging eval once. One fresh isolated daemon starts a seat for every named
+# harness. When each seat is idle, the eval replaces the daemon's st binary and restarts the
+# daemon the way a deploy does: install first, then restart. It then sends each seat one message
+# and requires that the seat reads it within ten seconds, on the same provider process and the
+# same runtime incarnation, with its driver and channel running the replacement binary.
+#
+# Usage: run ST3_BIN OUT HARNESS...
+#   HARNESS is claude, codex, omp, pi, or opencode.
+#
+# The replacement is ST3_BIN itself with a marker appended, so it is a different file with
+# different contents. Set GM_SWAP_BIN to replace the binary with another build instead.
+# GM_MODEL_<HARNESS> overrides a seat's model. GM_READ_DEADLINE_SECONDS (default 10) is the pass
+# bound; the eval keeps observing for GM_OBSERVE_SECONDS (default 90) to report late reads.
+#
+# Run it outside any st seat: the isolated daemon binds a caller to the nearest ST_AGENT among
+# its ancestors, and this eval acts as a person.
+#
+# OUT/result.json holds the verdict and one record per seat. OUT/evidence/ keeps the agent cards,
+# process snapshots, message traces, the driver log, and the daemon log.
+set -Eeuo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+repo="$(cd "$here/../.." && pwd)"
+source "$repo/scripts/st3-seat-queue-perf/daemon.sh"
+candidate="$(readlink -f "$1")"
+swap_source="$(readlink -f "${GM_SWAP_BIN:-$1}")"
+mkdir -p "$2/evidence"
+out="$(cd "$2" && pwd)"
+shift 2
+harnesses=("$@")
+((${#harnesses[@]} > 0)) || { echo "name at least one harness: claude, codex, omp, pi or opencode" >&2; exit 2; }
+read_deadline_ms=$(( ${GM_READ_DEADLINE_SECONDS:-10} * 1000 ))
+observe_seconds=${GM_OBSERVE_SECONDS:-90}
+ready_seconds=${GM_READY_DEADLINE_SECONDS:-300}
+
+harness_block() {
+  local model
+  case $1 in
+    claude)
+      model=${GM_MODEL_CLAUDE:-haiku}
+      printf '  harness "claude" {\n    model "%s"\n    args "--permission-mode" "bypassPermissions"\n  }\n' "$model" ;;
+    codex)
+      model=${GM_MODEL_CODEX:-gpt-6-luna}
+      printf '  harness "codex" {\n    model "%s"\n    effort "low"\n    args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"\n  }\n' "$model" ;;
+    omp)
+      model=${GM_MODEL_OMP:-openai-codex/gpt-5.6-luna}
+      printf '  harness "omp" {\n    model "%s"\n    effort "low"\n  }\n' "$model" ;;
+    pi)
+      model=${GM_MODEL_PI:-openai-codex/gpt-5.6-luna}
+      printf '  harness "pi" {\n    model "%s"\n    effort "low"\n  }\n' "$model" ;;
+    opencode)
+      model=${GM_MODEL_OPENCODE:-openai/gpt-5.6-luna}
+      printf '  harness "opencode" {\n    model "%s"\n  }\n' "$model" ;;
+    *) echo "unknown harness $1: use claude, codex, omp, pi or opencode" >&2; return 2 ;;
+  esac
+}
+
+now_ms() {
+  local micros=${EPOCHREALTIME/./}
+  printf '%s\n' "$((micros / 1000))"
+}
+
+root="$(mktemp -d /tmp/gme.XXXXXX)"
+socket="$root/st3.sock"
+st3() { ST3_ENDPOINT="$socket" ST3_DAEMON_WAIT="${ST3_DAEMON_WAIT:-60}" "$root/bin/st3" "$@"; }
+# transcripts: copy each seat's native transcript before the isolated root is removed.
+transcripts() {
+  local harness file session thread slug
+  for harness in "${harnesses[@]}"; do
+    file=""
+    case $harness in
+      claude)
+        slug="$(printf '%s' "$root/ws/claude" | sed 's|[^A-Za-z0-9]|-|g')"
+        file="$(ls -t "$HOME/.claude/projects/$slug"/*.jsonl 2>/dev/null | head -1 || true)"
+        ;;
+      codex)
+        thread="$(find "$root/state/drivers" -path '*/state/binding.json' -exec cat {} \; 2>/dev/null \
+          | jq -r '.threadId // .thread_id // empty' | head -1)"
+        [[ -n $thread ]] && file="$(find "$HOME/.codex/sessions" -type f -name "*$thread*.jsonl" 2>/dev/null | head -1)"
+        ;;
+      omp | pi)
+        file="$(find "$root/state/drivers" -path '*/provider-sessions/*.jsonl' -type f 2>/dev/null \
+          | xargs -r grep -l "gm.$harness" 2>/dev/null | head -1)"
+        [[ -n $file ]] || file="$(find "$root/state/drivers" -path '*/provider-sessions/*.jsonl' -type f 2>/dev/null | head -1)"
+        ;;
+    esac
+    if [[ -n $file && -f $file ]]; then
+      cp "$file" "$out/evidence/$harness-transcript.jsonl"
+    fi
+  done
+}
+
+cleanup() {
+  transcripts || true
+  cp "$root/daemon.log" "$out/evidence/" 2>/dev/null || true
+  cp "$root/xdg-state/st3/driver-api-warnings.log" "$out/evidence/driver.log" 2>/dev/null || true
+  perf_stop_daemon "$root" >/dev/null 2>&1 || true
+  rm -rf "$root"
+}
+trap cleanup EXIT
+
+login_path="$(perf_login_path)"
+mkdir -p "$root/bin" "$root/state" "$root/pty" "$root/xdg-state" "$root/ws"
+start_daemon() {
+  # The user service manager, when there is one, gives each seat its own scope, so a daemon
+  # restart leaves the seats running exactly as a deployed daemon does.
+  env -i HOME="$HOME" USER="$USER" LOGNAME="$USER" SHELL="$SHELL" LANG="${LANG:-C.UTF-8}" \
+    PATH="$root/bin:$login_path" XDG_STATE_HOME="$root/xdg-state" \
+    ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} \
+    ${DBUS_SESSION_BUS_ADDRESS:+DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"} \
+    setsid "$root/bin/st3" up --config "$root/config.toml" --pty-root "$root/pty" \
+    >>"$root/daemon.log" 2>&1 </dev/null &
+  echo $! >"$root/daemon.pid"
+  local _
+  for _ in $(seq 1 300); do
+    ST3_DAEMON_WAIT=0 st3 conversations ls person/eval --json >/dev/null 2>&1 && return 0
+    sleep 0.2
+  done
+  echo "the eval daemon under $root did not answer" >&2
+  return 1
+}
+cp "$candidate" "$root/bin/st3"
+cat >"$root/config.toml" <<TOML
+node = "gmnode"
+person = "person/eval"
+state_dir = "$root/state"
+socket = "$socket"
+client_gateway_socket = "$root/client.sock"
+TOML
+start_daemon
+
+{
+  echo 'version 2'
+  for harness in "${harnesses[@]}"; do
+    mkdir -p "$root/ws/$harness"
+    printf 'agent "gm.%s" {\n  workspace "%s"\n  restart "never"\n' "$harness" "$root/ws/$harness"
+    harness_block "$harness"
+    printf '}\n'
+  done
+} >"$root/seats.kdl"
+cp "$root/seats.kdl" "$out/evidence/seats.kdl"
+st3 agents apply "$root/seats.kdl" --as person/eval >"$out/evidence/apply.txt"
+
+agent_json() { st3 agents show "agent/gm.$1" --json 2>/dev/null || echo '{}'; }
+
+# processes HARNESS: the seat's driver, its provider children, and its channel, as JSON.
+processes() {
+  local harness=$1 proc pid cmd environ exe parent
+  local -a rows=()
+  for proc in /proc/[0-9]*; do
+    pid="${proc#/proc/}"
+    environ="$( { tr '\0' '\n' <"$proc/environ"; } 2>/dev/null)" || continue
+    grep -qxF "ST_AGENT=agent/gm.$harness" <<<"$environ" || continue
+    cmd="$( { tr '\0' ' ' <"$proc/cmdline"; } 2>/dev/null)" || continue
+    exe="$(readlink "$proc/exe" 2>/dev/null || true)"
+    parent="$(awk '/^PPid:/ {print $2}' "$proc/status" 2>/dev/null || true)"
+    rows+=("$(jq -cn --arg pid "$pid" --arg ppid "$parent" --arg cmd "$cmd" --arg exe "$exe" \
+      '{pid: ($pid|tonumber), ppid: ($ppid|tonumber), cmd: $cmd, exe: $exe}')")
+  done
+  printf '%s\n' "${rows[@]}" | jq -s --arg harness "$harness" '
+    (map(select(.cmd | test(" driver " + $harness + " "))) | first) as $driver
+    | {
+        driver: $driver,
+        providers: (if $driver == null then [] else map(select(.ppid == $driver.pid and (.cmd | test(" driver ") | not))) end),
+        channels: map(select(.cmd | test(" driver (claude-mcp|pi-channel|omp-channel)")))
+      }'
+}
+
+# Wait until every seat's harness is idle after its boot turn.
+deadline=$((SECONDS + ready_seconds))
+for harness in "${harnesses[@]}"; do
+  until jq -e '.value.state == "running" and .value.harness_state == "idle"' <<<"$(agent_json "$harness")" >/dev/null; do
+    if ((SECONDS >= deadline)); then
+      agent_json "$harness" >"$out/evidence/$harness-not-ready.json"
+      echo "the $harness seat did not become idle within ${ready_seconds}s" >&2
+      exit 1
+    fi
+    sleep 1
+  done
+done
+# Channels start after the provider; give each seat a moment to open its channel.
+sleep 3
+for harness in "${harnesses[@]}"; do
+  agent_json "$harness" >"$out/evidence/$harness-before.json"
+  processes "$harness" >"$out/evidence/$harness-processes-before.json"
+done
+
+# The deploy: install the replacement at the same path, then restart the daemon.
+cp "$swap_source" "$root/bin/st3.next"
+printf '\ngraceful-messaging replacement %s\n' "$(now_ms)" >>"$root/bin/st3.next"
+chmod 0755 "$root/bin/st3.next"
+mv -f "$root/bin/st3.next" "$root/bin/st3"
+swapped_at=$(now_ms)
+kill -TERM "$(cat "$root/daemon.pid")"
+for _ in $(seq 1 100); do kill -0 "$(cat "$root/daemon.pid")" 2>/dev/null || break; sleep 0.2; done
+start_daemon
+restarted_at=$(now_ms)
+
+declare -A subjects sent_at
+for harness in "${harnesses[@]}"; do
+  sent_at[$harness]=$(now_ms)
+  subjects[$harness]="$(st3 conversations send "agent/gm.$harness" --from person/eval \
+    --subject "Graceful messaging check" \
+    --body "Reply to this message with the single word PONG." --json | jq -er .subject)"
+done
+
+declare -A read_at
+observe_until=$(( $(now_ms) + observe_seconds * 1000 ))
+while (( $(now_ms) < observe_until )); do
+  pending=0
+  for harness in "${harnesses[@]}"; do
+    [[ -n ${read_at[$harness]:-} ]] && continue
+    status="$(curl -sS --unix-socket "$socket" \
+      "http://localhost/v1/messages/read/$(jq -rn --arg s "${subjects[$harness]}" '$s|@uri')" 2>/dev/null \
+      | jq -r '.value.status // empty' 2>/dev/null || true)"
+    if [[ $status == read || $status == closed ]]; then
+      read_at[$harness]=$(now_ms)
+    else
+      pending=1
+    fi
+  done
+  ((pending)) || break
+  sleep 0.2
+done
+
+verdict=pass
+records=()
+for harness in "${harnesses[@]}"; do
+  before="$out/evidence/$harness-before.json"
+  after="$out/evidence/$harness-after.json"
+  agent_json "$harness" >"$after"
+  processes "$harness" >"$out/evidence/$harness-processes-after.json"
+  st3 trace show "${subjects[$harness]}" --json --limit 100 >"$out/evidence/$harness-message-trace.jsonl" 2>/dev/null || true
+  # The graph's own read time is authoritative; the poll time bounds it from above.
+  graph_read="$(jq -s 'map(select(.kind == "message.read")) | first | .accepted_at_unix_ms // empty' \
+    "$out/evidence/$harness-message-trace.jsonl" 2>/dev/null || true)"
+  read_ms=""
+  if [[ -n $graph_read ]]; then
+    read_ms=$(( graph_read - ${sent_at[$harness]} ))
+  elif [[ -n ${read_at[$harness]:-} ]]; then
+    read_ms=$(( ${read_at[$harness]} - ${sent_at[$harness]} ))
+  fi
+  record="$(jq -n \
+    --arg harness "$harness" \
+    --arg subject "${subjects[$harness]}" \
+    --arg read_ms "$read_ms" \
+    --argjson deadline "$read_deadline_ms" \
+    --slurpfile before "$before" --slurpfile after "$after" \
+    --slurpfile pb "$out/evidence/$harness-processes-before.json" \
+    --slurpfile pa "$out/evidence/$harness-processes-after.json" '
+    ($before[0].value) as $b | ($after[0].value) as $a | $pb[0] as $pb | $pa[0] as $pa
+    | {
+        harness: $harness,
+        message: $subject,
+        read_ms: (if $read_ms == "" then null else ($read_ms|tonumber) end),
+        incarnation_before: $b.incarnation_id,
+        incarnation_after: $a.incarnation_id,
+        state_after: $a.state,
+        harness_state_after: $a.harness_state,
+        delivery_after: $a.delivery,
+        driver_pid_before: $pb.driver.pid,
+        driver_pid_after: $pa.driver.pid,
+        driver_exe_after: $pa.driver.exe,
+        provider_pids_before: ($pb.providers | map(.pid)),
+        provider_pids_after: ($pa.providers | map(.pid)),
+        channel_exes_after: ($pa.channels | map(.exe))
+      }
+    | .failures = ([
+        (if .read_ms == null then "the message was not read" elif .read_ms > $deadline then "the message was read after \(.read_ms) ms" else empty end),
+        (if .incarnation_before == null or .incarnation_before != .incarnation_after then "the runtime incarnation changed" else empty end),
+        (if .driver_pid_before == null or .driver_pid_before != .driver_pid_after then "the driver process changed" else empty end),
+        (if (.provider_pids_before | length) == 0 or .provider_pids_before != .provider_pids_after then "the provider process changed" else empty end),
+        (if (.driver_exe_after // "" | endswith("(deleted)")) then "the driver still runs the replaced binary" else empty end),
+        (if any(.channel_exes_after[]; endswith("(deleted)")) then "a channel still runs the replaced binary" else empty end),
+        (if .delivery_after.state != "current" then "st reports the delivery path as \(.delivery_after.state // "unreported")" else empty end)
+      ])
+    | .verdict = (if (.failures | length) == 0 then "pass" else "fail" end)')"
+  records+=("$record")
+  [[ $(jq -r .verdict <<<"$record") == pass ]] || verdict=fail
+done
+
+printf '%s\n' "${records[@]}" | jq -s \
+  --arg verdict "$verdict" \
+  --arg candidate "$candidate" \
+  --arg candidate_sha "$(sha256sum "$candidate" | cut -d' ' -f1)" \
+  --arg swap "$swap_source" \
+  --argjson swapped "$swapped_at" --argjson restarted "$restarted_at" \
+  --argjson deadline "$read_deadline_ms" \
+  '{verdict: $verdict, candidate: $candidate, candidate_sha256: $candidate_sha, replacement_source: $swap,
+    read_deadline_ms: $deadline, swapped_at_unix_ms: $swapped, daemon_answered_at_unix_ms: $restarted,
+    seats: .}' >"$out/result.json"
+jq -r '.seats[] | "\(.harness)\t\(.verdict)\t\(.read_ms // "unread") ms\t\(.failures | join("; "))"' "$out/result.json"
+echo "verdict: $verdict"
+[[ $verdict == pass ]]

@@ -5287,6 +5287,49 @@ fn dropping_a_process_group_owner_reaps_the_group_and_socket() {
 }
 
 #[test]
+fn a_released_process_group_survives_until_its_adopter_cleans_it_up() {
+    let temporary = tempfile::tempdir().unwrap();
+    let socket_path = temporary.path().join("app-server.sock");
+    let _listener = UnixListener::bind(&socket_path).unwrap();
+    let mut command = Command::new("/bin/sh");
+    command
+        .arg("-c")
+        .arg("sleep 60")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let launcher = spawn_process_group(&mut command, Some(&socket_path)).unwrap();
+    let launcher_pid = launcher.id() as i32;
+    let released = launcher.release().expect("a group with a watchdog pipe");
+    // Released means no Rust value owns the group any more: nothing was killed or removed.
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(process_can_retain_cleanup_resources(launcher_pid));
+    assert!(socket_path.exists());
+
+    let adopted = unsafe {
+        OwnedProcessGroup::adopt(
+            released.server_pid,
+            released.watchdog_pid,
+            released.owner_write_fd,
+            socket_path.clone(),
+        )
+    };
+    assert_eq!(adopted.id() as i32, launcher_pid);
+    drop(adopted);
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while (process_can_retain_cleanup_resources(launcher_pid) || socket_path.exists())
+        && Instant::now() < deadline
+    {
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        !process_can_retain_cleanup_resources(launcher_pid),
+        "the adopted app-server survived its adopter's cleanup"
+    );
+    assert!(!socket_path.exists());
+}
+
+#[test]
 fn a_live_socket_refuses_a_second_control_owner() {
     let temporary = tempfile::tempdir().unwrap();
     let socket_path = temporary.path().join("app-server.sock");

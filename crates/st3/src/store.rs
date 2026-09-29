@@ -674,21 +674,37 @@ impl Drop for WriterGuard<'_> {
     }
 }
 
-thread_local! {
-    static INTERACTIVE_READ: Cell<bool> = const { Cell::new(false) };
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadClass {
+    Background,
+    Interactive,
+    Operational,
+    Critical,
 }
 
-pub(crate) fn with_interactive_reads<T>(read: impl FnOnce() -> T) -> T {
-    INTERACTIVE_READ.with(|flag| {
-        struct Restore<'a>(&'a Cell<bool>, bool);
+thread_local! {
+    static READ_CLASS: Cell<ReadClass> = const { Cell::new(ReadClass::Background) };
+}
+
+pub(crate) fn read_class() -> ReadClass {
+    READ_CLASS.with(Cell::get)
+}
+
+pub(crate) fn with_read_class<T>(class: ReadClass, read: impl FnOnce() -> T) -> T {
+    READ_CLASS.with(|flag| {
+        struct Restore<'a>(&'a Cell<ReadClass>, ReadClass);
         impl Drop for Restore<'_> {
             fn drop(&mut self) {
                 self.0.set(self.1);
             }
         }
-        let _restore = Restore(flag, flag.replace(true));
+        let _restore = Restore(flag, flag.replace(class));
         read()
     })
+}
+
+pub(crate) fn with_interactive_reads<T>(read: impl FnOnce() -> T) -> T {
+    with_read_class(ReadClass::Interactive, read)
 }
 
 struct ReadLane {
@@ -714,6 +730,8 @@ impl ReadLane {
 struct ReadPool {
     background: ReadLane,
     interactive: ReadLane,
+    operational: ReadLane,
+    critical: ReadLane,
 }
 
 struct ReadGuard<'a> {
@@ -762,15 +780,27 @@ impl Drop for PinnedRead<'_> {
 }
 
 impl ReadPool {
-    fn new(background: Vec<Connection>, interactive: Vec<Connection>) -> Self {
+    fn new(
+        background: Vec<Connection>,
+        interactive: Vec<Connection>,
+        operational: Vec<Connection>,
+        critical: Vec<Connection>,
+    ) -> Self {
         Self {
             background: ReadLane::new(background),
             interactive: ReadLane::new(interactive),
+            operational: ReadLane::new(operational),
+            critical: ReadLane::new(critical),
         }
     }
 
     fn lane(&self) -> &ReadLane {
-        INTERACTIVE_READ.with(|flag| if flag.get() { &self.interactive } else { &self.background })
+        match read_class() {
+            ReadClass::Background => &self.background,
+            ReadClass::Interactive => &self.interactive,
+            ReadClass::Operational => &self.operational,
+            ReadClass::Critical => &self.critical,
+        }
     }
 
     fn key(&self) -> usize {
@@ -937,6 +967,19 @@ impl Store {
     pub(crate) fn hold_writer_for_test(&self, hold: impl FnOnce()) {
         let _writer = self.connection.write();
         hold();
+    }
+
+    pub(crate) fn hold_write_transaction_for_test(&self, hold: impl FnOnce()) {
+        let mut writer = self.connection.write();
+        let transaction = writer.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('test-write-stall', '1')",
+                [],
+            )
+            .unwrap();
+        hold();
+        transaction.rollback().unwrap();
     }
 }
 
@@ -1812,6 +1855,16 @@ fn open_read_connections(path: &Path, shared_memory: bool) -> Result<Vec<Connect
         .collect()
 }
 
+fn claims_page_query(subject: bool, descending: bool) -> String {
+    let subject_filter = if subject { "subject=?3 AND " } else { "" };
+    let order = if descending { "DESC" } else { "ASC" };
+    format!(
+        "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+         FROM claims WHERE {subject_filter}store_index>?1 AND (?2 IS NULL OR store_index<?2)
+         ORDER BY store_index {order} LIMIT ?4"
+    )
+}
+
 impl Store {
     pub fn open(path: &Path, origin: impl Into<String>) -> Result<Self> {
         let origin = origin.into();
@@ -1840,6 +1893,8 @@ impl Store {
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
         let readers = ReadPool::new(
+            open_read_connections(path, false)?,
+            open_read_connections(path, false)?,
             open_read_connections(path, false)?,
             open_read_connections(path, false)?,
         );
@@ -1893,6 +1948,8 @@ impl Store {
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
         let readers = ReadPool::new(
+            open_read_connections(&uri, true)?,
+            open_read_connections(&uri, true)?,
             open_read_connections(&uri, true)?,
             open_read_connections(&uri, true)?,
         );
@@ -8243,19 +8300,22 @@ impl Store {
         // each worker holds one snapshot connection for its slice, then merge in subject order.
         let subjects = subjects.into_iter().collect::<Vec<_>>();
         let chunk_size = subjects.len().div_ceil(READ_CONNECTIONS);
+        let read_class = read_class();
         let parts = std::thread::scope(|scope| {
             subjects
                 .chunks(chunk_size)
                 .map(|chunk| {
                     let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
                     scope.spawn(move || {
-                        self.status_at_view_for_names(
-                            None,
-                            None,
-                            Some(store_index),
-                            include_history,
-                            Some(names),
-                        )
+                        with_read_class(read_class, || {
+                            self.status_at_view_for_names(
+                                None,
+                                None,
+                                Some(store_index),
+                                include_history,
+                                Some(names),
+                            )
+                        })
                     })
                 })
                 .collect::<Vec<_>>()
@@ -11242,14 +11302,19 @@ impl Store {
         limit: usize,
     ) -> Result<ClaimsPage> {
         let connection = self.readers.get();
-        let order = if descending { "DESC" } else { "ASC" };
-        let query = format!(
-            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-             FROM claims WHERE store_index>?1 AND (?2 IS NULL OR store_index<?2) AND (?3 IS NULL OR subject=?3) ORDER BY store_index {order}"
-        );
+        let query = claims_page_query(subject.is_some(), descending);
         let mut statement = connection.prepare(&query)?;
-        let rows =
-            statement.query_map(params![after_index, before_index, subject], claim_from_row)?;
+        // The owner filter is evaluated per subject below. Other pages can stop
+        // in SQLite at one row past the requested bound, before decoding bodies.
+        let scan_limit = if owner_run.is_some() {
+            i64::MAX
+        } else {
+            i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)
+        };
+        let rows = statement.query_map(
+            params![after_index, before_index, subject, scan_limit],
+            claim_from_row,
+        )?;
         let mut claims = Vec::new();
         for row in rows {
             let claim = row?;
@@ -19666,6 +19731,25 @@ impl Store {
         ))
     }
 
+    /// Read the already admitted membership for client projections. Seeding a
+    /// replication snapshot can take the writer lock and must stay out of a
+    /// person's read request while replication is busy.
+    pub fn fleet_view_for_client(&self) -> Result<crate::fleet::FleetView> {
+        let member_key = self
+            .member_key
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|key| key.public().to_owned());
+        let connection = self.readers.get();
+        Ok(crate::fleet::FleetView::from_membership(
+            &fleet_membership_tx_with_local_signer(
+                &connection,
+                member_key.as_deref().map(|key| (self.origin.as_str(), key)),
+            )?,
+        ))
+    }
+
     /// Sign every envelope of this node's writer that has no signature by its member key,
     /// optionally only those added after one `replica_envelopes` row.
     fn sign_own_envelopes_tx(
@@ -19862,6 +19946,13 @@ fn max_envelope_rowid(connection: &Connection) -> Result<i64> {
 /// Fold the admitted `fleet.*` claims from the pinned anchor. A store without an anchor has an
 /// empty membership, in which every writer is legacy.
 fn fleet_membership_tx(connection: &Connection) -> Result<crate::fleet::Membership> {
+    fleet_membership_tx_with_local_signer(connection, None)
+}
+
+fn fleet_membership_tx_with_local_signer(
+    connection: &Connection,
+    local_signer: Option<(&str, &str)>,
+) -> Result<crate::fleet::Membership> {
     let Some(anchor) = fleet_meta(connection, "fleet_anchor_key")? else {
         return Ok(crate::fleet::Membership::default());
     };
@@ -19893,7 +19984,7 @@ fn fleet_membership_tx(connection: &Connection) -> Result<crate::fleet::Membersh
     )?;
     let mut claims: Vec<crate::fleet::FleetClaim> = Vec::with_capacity(rows.len());
     for (id, kind, subject, body, writer, sequence, envelope_hash) in rows {
-        let signers = match &envelope_hash {
+        let mut signers = match &envelope_hash {
             Some(hash) => signers_statement
                 .query_map(params![writer, sequence, hash], |row| {
                     row.get::<_, String>(0)
@@ -19901,6 +19992,15 @@ fn fleet_membership_tx(connection: &Connection) -> Result<crate::fleet::Membersh
                 .collect::<Result<BTreeSet<_>, _>>()?,
             None => BTreeSet::new(),
         };
+        // A locally appended batch has not been seeded into an envelope yet.
+        // Its eventual signature uses this node's key; include it in the client
+        // view without doing that write while a request is being served.
+        if envelope_hash.is_none()
+            && let Some((local_origin, key)) = local_signer
+            && writer == local_origin
+        {
+            signers.insert(key.to_owned());
+        }
         if let Some(existing) = claims.iter_mut().find(|claim| claim.id == id) {
             existing.signers.extend(signers);
             continue;
@@ -28062,6 +28162,33 @@ mod tests {
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    #[test]
+    fn subject_claim_pages_seek_the_subject_index() {
+        let store = Store::open_memory("node").unwrap();
+        store.claims_page(None, None, 0, None, false, 1).unwrap();
+        store
+            .claims_page(Some("agent/target"), None, 0, None, false, 1)
+            .unwrap();
+        let connection = store.readers.get();
+        for descending in [false, true] {
+            let query = format!("EXPLAIN QUERY PLAN {}", claims_page_query(true, descending));
+            let plan = connection
+                .prepare(&query)
+                .unwrap()
+                .query_map(params![0, None::<u64>, "agent/target", 2], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("; ");
+            assert!(
+                plan.contains("claims_subject_index"),
+                "a subject page must not scan the whole graph: {plan}"
+            );
+        }
+    }
 
     #[test]
     fn a_pinned_read_sees_one_snapshot_while_commits_land() {

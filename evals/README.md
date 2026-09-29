@@ -46,6 +46,7 @@ The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 acti
 | Automatic GitHub Intake | Not supported | `st3/automatic-github-intake` |
 | Codex compaction message delivery | Not supported | `st3/codex-compaction-message-delivery` |
 | Native session import | Not supported | `st3/native-session-import` |
+| Graceful messaging | Not supported | `st3/graceful-messaging` |
 
 The License MIT, Restart continuity, and Claude Skill Inheritance pairs use Claude Sonnet in both runtimes.
 
@@ -57,7 +58,7 @@ Mission Inputs, Local File Refresh, and Constraint Inheritance are also model-fr
 
 Run Generation Revision starts one Codex planner through the launch API.
 
-The st3 corpus has 44 active evals. Twenty-two are model-free, and twenty-two use at least one model.
+The st3 corpus has 45 active evals. Twenty-two are model-free, and twenty-three use at least one model.
 
 Each eval KDL starts with a document version. A missing version means version zero.
 
@@ -100,9 +101,14 @@ The seat counts include every native agent seat. The LLM judge counts are separa
 | st3 | Automatic GitHub Intake | Codex × 1 | None |
 | st3 | Codex compaction message delivery | Codex × 1 | None |
 | st3 | Native session import | Claude × 1, Codex × 1, Pi × 1, OMP × 1, OpenCode × 1 (raw, then imported) | None |
+| st3 | Graceful messaging | One seat for each harness its runner names: Claude, Codex, OMP, Pi, OpenCode | None |
 
 The paired and st3-only corpus has 14 Claude seats, 43 Codex seats, two Pi seats, two OMP seats,
 and one OpenCode seat. It also has three Codex LLM judges.
+
+Graceful messaging is not in those seat counts: `scripts/st3-graceful-messaging-eval/run` chooses
+its seats at run time, and its committed reports name them. It needs no eval KDL, because it restarts
+and replaces its own daemon.
 
 Seat queue is counted with its default Claude seat. `scripts/st3-seat-queue-eval/run` can put Codex
 `gpt-6-luna` or omp `openai-codex/gpt-5.6-luna` in that seat instead. Its chief agent is a
