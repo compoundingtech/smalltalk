@@ -8393,21 +8393,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                     let delay_ms =
                         1_000_u128.saturating_mul(1_u128 << attempt.saturating_sub(1).min(6));
                     let not_before = now_ms().saturating_add(delay_ms);
-                    self.store.append_claim(&ClaimInput {
-                        subject: item.subject.clone(),
-                        kind: "subscription.mission-deferred".into(),
-                        actor: None,
-                        fields: BTreeMap::from([
-                            ("request".into(), Value::String(request.id.clone())),
-                            ("not_before_unix_ms".into(), Value::from(not_before as u64)),
-                        ]),
-                        evidence: vec![request.id.clone()],
-                        expected_subject: None,
-                        idempotency_key: Some(format!(
-                            "subscription-mission-deferred:{}:{attempt}",
-                            request.id
-                        )),
-                    })?;
+                    self.store.record_subscription_mission_deferral(
+                        &item.subject,
+                        &request.id,
+                        not_before,
+                        attempt,
+                    )?;
                     continue;
                 }
                 // The request stays pending and starts once replication delivers what it names.
@@ -20181,12 +20172,18 @@ subscription "reviews" {{
             .expect("the repository discovery creates one pull request resource")
             .id;
         assert_ne!(item_claim, changed_claim);
+        let request = store
+            .pending_subscription_mission_requests("subscription/reviews")
+            .unwrap()
+            .pop()
+            .unwrap();
         let reconciler = Reconciler::new(
             store.clone(),
             Arc::new(FakeRuntime::default()),
             "node".into(),
             Arc::new(Notify::new()),
         );
+        let before_deferral = store.index().unwrap();
         reconciler
             .reconcile_subscription_missions(&desired)
             .unwrap();
@@ -20197,31 +20194,22 @@ subscription "reviews" {{
                 .is_empty(),
             "capacity must leave the event pending"
         );
-        let deferred = store
-            .claims_for(
-                "subscription/reviews",
-                Some("subscription.mission-deferred"),
-            )
+        assert_eq!(store.index().unwrap(), before_deferral);
+        let (deadline, attempts) = store
+            .subscription_mission_deferral("subscription/reviews", &request.id)
+            .unwrap()
             .unwrap();
-        assert_eq!(deferred.len(), 1);
-        assert!(
-            deferred[0].body["fields"]["not_before_unix_ms"]
-                .as_u64()
-                .unwrap()
-                > now_ms() as u64
-        );
+        assert_eq!(attempts, 1);
+        assert!(deadline > now_ms());
         reconciler
             .reconcile_subscription_missions(&desired)
             .unwrap();
         assert_eq!(
             store
-                .claims_for(
-                    "subscription/reviews",
-                    Some("subscription.mission-deferred")
-                )
+                .subscription_mission_deferral("subscription/reviews", &request.id)
                 .unwrap()
-                .len(),
-            1
+                .unwrap(),
+            (deadline, 1)
         );
         for _ in 0..5 {
             reconciler.evaluate_mission_runs().unwrap();
