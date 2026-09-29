@@ -1,7 +1,9 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -589,6 +591,41 @@ struct ReadPool {
 struct ReadGuard<'a> {
     pool: &'a ReadPool,
     connection: Option<Connection>,
+    /// The connection `Store::read_snapshot` pinned for this thread, shared by every read in it.
+    pinned: Option<Rc<Connection>>,
+}
+
+thread_local! {
+    /// While `Store::read_snapshot` runs on this thread: the pool it pinned a connection from,
+    /// and that connection, held inside one read transaction.
+    static PINNED_READER: RefCell<Option<(usize, Rc<Connection>)>> = const { RefCell::new(None) };
+}
+
+/// Ends a pinned read on every exit path, panics included.
+struct PinnedRead<'a> {
+    pool: &'a ReadPool,
+    connection: Option<Rc<Connection>>,
+}
+
+impl Drop for PinnedRead<'_> {
+    fn drop(&mut self) {
+        PINNED_READER.with(|slot| slot.borrow_mut().take());
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        let _ = connection.execute_batch("COMMIT");
+        // Every guard lent from the pin is gone by now; if one escaped, the pool loses that
+        // connection rather than sharing it.
+        if let Ok(connection) = Rc::try_unwrap(connection) {
+            let mut connections = self
+                .pool
+                .connections
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            connections.push(connection);
+            self.pool.available.notify_one();
+        }
+    }
 }
 
 impl ReadPool {
@@ -599,7 +636,24 @@ impl ReadPool {
         }
     }
 
+    fn key(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
     fn get(&self) -> ReadGuard<'_> {
+        let pinned = PINNED_READER.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|(pool, _)| *pool == self.key())
+                .map(|(_, connection)| connection.clone())
+        });
+        if pinned.is_some() {
+            return ReadGuard {
+                pool: self,
+                connection: None,
+                pinned,
+            };
+        }
         let mut connections = self
             .connections
             .lock()
@@ -613,6 +667,7 @@ impl ReadPool {
         ReadGuard {
             pool: self,
             connection: connections.pop(),
+            pinned: None,
         }
     }
 }
@@ -621,24 +676,25 @@ impl Deref for ReadGuard<'_> {
     type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
-        self.connection
-            .as_ref()
+        self.pinned
+            .as_deref()
+            .or(self.connection.as_ref())
             .expect("a read guard always has a connection")
     }
 }
 
 impl Drop for ReadGuard<'_> {
     fn drop(&mut self) {
+        // A pinned connection goes back when its snapshot ends, not here.
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
         let mut connections = self
             .pool
             .connections
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        connections.push(
-            self.connection
-                .take()
-                .expect("a read guard always returns its connection"),
-        );
+        connections.push(connection);
         self.pool.available.notify_one();
     }
 }
@@ -1689,6 +1745,37 @@ impl Store {
 
     pub fn index(&self) -> Result<u64> {
         Ok(self.committed_index.load(Ordering::Acquire))
+    }
+
+    /// Run `read` with every read this thread makes through the store seeing one SQLite
+    /// snapshot, and give it that snapshot's store index. Rows read inside always match the
+    /// index, however many commits land meanwhile. A nested call joins the outer snapshot.
+    pub fn read_snapshot<T>(&self, read: impl FnOnce(u64) -> Result<T>) -> Result<T> {
+        let key = self.readers.key();
+        if PINNED_READER.with(|slot| slot.borrow().as_ref().is_some_and(|(pool, _)| *pool == key))
+        {
+            let index = current_index(&self.readers.get())?;
+            return read(index);
+        }
+        let mut guard = self.readers.get();
+        // Declared first so it drops last: on every exit it ends the transaction and returns
+        // the connection to the pool.
+        let pinned = PinnedRead {
+            pool: &self.readers,
+            connection: Some(Rc::new(
+                guard
+                    .connection
+                    .take()
+                    .expect("an unpinned read guard holds a pooled connection"),
+            )),
+        };
+        drop(guard);
+        let connection = pinned.connection.clone().expect("the pin holds its connection");
+        connection.execute_batch("BEGIN")?;
+        // The first read starts the snapshot; every later read in `read` sees the same one.
+        let index = current_index(&connection)?;
+        PINNED_READER.with(|slot| *slot.borrow_mut() = Some((key, connection)));
+        read(index)
     }
 
     /// Diagnostic claims on the daemon cannot change agent cards. Ignore them when deciding
@@ -27131,6 +27218,52 @@ mod tests {
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    #[test]
+    fn a_pinned_read_sees_one_snapshot_while_commits_land() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("state.sqlite3"), "node").unwrap();
+        let observe = |n: u64| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "resource/pinned".into(),
+                    kind: "resource.observed".into(),
+                    actor: Some("person/avery".into()),
+                    fields: BTreeMap::from([
+                        ("kind".into(), Value::String("human.review".into())),
+                        ("reason".into(), Value::String(format!("change {n}"))),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        observe(0);
+        let before = store.index().unwrap();
+        let seen = store
+            .read_snapshot(|index| {
+                assert_eq!(index, before);
+                // A commit lands in the middle of the read. The writer sees it; the read does not.
+                observe(1);
+                assert!(store.index().unwrap() > index);
+                let claims = store.claims_for("resource/pinned", None)?.len();
+                let nested = store.read_snapshot(|nested| {
+                    Ok((nested, store.claims_for("resource/pinned", None)?.len()))
+                })?;
+                assert_eq!(nested, (index, claims), "a nested read joins the outer snapshot");
+                Ok(claims)
+            })
+            .unwrap();
+        assert_eq!(seen, 1);
+        assert_eq!(store.claims_for("resource/pinned", None).unwrap().len(), 2);
+        // Every pinned connection went back to the pool, even after a failed read.
+        for _ in 0..32 {
+            let _ = store.read_snapshot(|_| -> Result<()> { anyhow::bail!("a failed read") });
+            store.read_snapshot(|_| Ok(())).unwrap();
+        }
+        assert_eq!(store.claims_for("resource/pinned", None).unwrap().len(), 2);
+    }
 
     #[test]
     fn persistent_store_uses_bounded_sqlite_page_caches() {

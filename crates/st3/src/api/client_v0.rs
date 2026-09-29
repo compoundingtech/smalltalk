@@ -39,11 +39,6 @@ struct CollectionSubscription {
 }
 
 const COLLECTION_MAX_SUBSCRIPTIONS: usize = 8;
-/// A read that a commit raced is read again this many times before the subscription waits.
-const COLLECTION_SNAPSHOT_ATTEMPTS: usize = 3;
-/// A subscription whose reads kept racing commits reads again after this long, even when no
-/// further change arrives. A race is never the client's problem.
-const COLLECTION_RACE_RETRY: Duration = Duration::from_millis(250);
 
 pub(super) async fn collection_stream(
     websocket: WebSocketUpgrade,
@@ -70,13 +65,13 @@ pub(super) async fn collection_stream(
         .on_upgrade(move |socket| collection_stream_socket(socket, state, session)))
 }
 
-/// Read one bounded window. `None` means a commit landed while it was read; the rows could
-/// be newer than the snapshot, so they are never sent.
-async fn collection_items_once(
+/// Read one bounded window. The whole read sees one SQLite snapshot, and the fence names
+/// that snapshot's index, so commits landing meanwhile never tear or delay it.
+async fn collection_items(
     state: &AppState,
     session: &ClientSession,
     request: &CollectionSubscribe,
-) -> Result<Option<(ClientSnapshot, Vec<Value>, bool)>, ApiError> {
+) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
     if !matches!(
         request.collection.as_str(),
         "missions" | "attention" | "agents" | "work"
@@ -95,25 +90,24 @@ async fn collection_items_once(
     } else {
         None
     };
-    let snapshot = new_client_snapshot(state);
-    let store = state.store.clone();
-    let index = snapshot.store_index;
-    let at = snapshot.created_at.clone();
+    let state = state.clone();
     let actor = request.actor.clone();
     let status = request.status.clone();
     let collection = request.collection.clone();
-    let (mut items, has_more) =
-        super::blocking_store(move || -> anyhow::Result<(Vec<Value>, bool)> {
+    let (snapshot, mut items, has_more) = super::blocking_store(move || {
+        let store = state.store.clone();
+        store.read_snapshot(|index| {
+            let snapshot = client_snapshot_at(&state, index);
+            let at = snapshot.created_at.clone();
             let mut items = match collection.as_str() {
                 "missions" => {
                     let mut ids =
                         store.mission_collection_ids(false, 0, limit.saturating_add(1))?;
                     let has_more = ids.len() > limit;
                     ids.truncate(limit);
-                    return Ok((
-                        mission_resources_filtered(&store, index, false, None, Some(&ids))?,
-                        has_more,
-                    ));
+                    let items =
+                        mission_resources_filtered(&store, index, false, None, Some(&ids))?;
+                    return Ok((snapshot, items, has_more));
                 }
                 "attention" => client_attention_resources(&store, person.as_deref(), false)?,
                 "agents" => client_agent_resources(&store, false, &at, index)?,
@@ -130,28 +124,12 @@ async fn collection_items_once(
                 items.retain(|item| item["state"].as_str() == Some(status.as_str()));
             }
             let has_more = items.len() > limit;
-            Ok((items, has_more))
+            Ok((snapshot, items, has_more))
         })
-        .await?;
-    // A read that raced a commit must never pair newer rows with an older fence.
-    if state.store.index().map_err(ApiError::internal)? != index {
-        return Ok(None);
-    }
+    })
+    .await?;
     items.truncate(limit);
-    Ok(Some((snapshot, items, has_more)))
-}
-
-async fn collection_items(
-    state: &AppState,
-    session: &ClientSession,
-    request: &CollectionSubscribe,
-) -> Result<Option<(ClientSnapshot, Vec<Value>, bool)>, ApiError> {
-    for _ in 0..COLLECTION_SNAPSHOT_ATTEMPTS {
-        if let Some(read) = collection_items_once(state, session, request).await? {
-            return Ok(Some(read));
-        }
-    }
-    Ok(None)
+    Ok((snapshot, items, has_more))
 }
 
 async fn send_collection(socket: &mut WebSocket, value: Value) -> bool {
@@ -167,8 +145,6 @@ async fn send_collection(socket: &mut WebSocket, value: Value) -> bool {
 enum Refreshed {
     /// Up to date, whether or not anything was sent.
     Current,
-    /// Every read raced a commit; read again soon.
-    Raced,
     /// The subscription failed before its first snapshot and is gone.
     Dropped,
     /// The socket closed.
@@ -184,8 +160,7 @@ async fn refresh_collection(
 ) -> Refreshed {
     let request = &subscription.request;
     let (snapshot, items, has_more) = match collection_items(state, session, request).await {
-        Ok(Some(read)) => read,
-        Ok(None) => return Refreshed::Raced,
+        Ok(read) => read,
         Err(error) if !subscription.delivered => {
             let sent = send_collection(socket, json!({"kind":"error", "id":request.id, "code":error.code, "message":error.message})).await;
             return if sent {
@@ -302,7 +277,6 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
     let mut changed = state.event_notify.subscribe();
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
     let mut terminals = BTreeMap::<String, watch::Receiver<TerminalFrame>>::new();
-    let mut retry_at = None::<tokio::time::Instant>;
     loop {
         // The subscriptions to read after this wake-up.
         let mut refresh = Vec::<String>::new();
@@ -348,9 +322,6 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
                 if result.is_err() { return; }
                 refresh.extend(subscriptions.keys().cloned());
             }
-            _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry_at.is_some() => {
-                refresh.extend(subscriptions.keys().cloned());
-            }
             (id, frame) = next_terminal_frame(&mut terminals), if !terminals.is_empty() => {
                 let message = match frame {
                     Some(TerminalFrame::Waiting) => continue,
@@ -371,16 +342,12 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
         if refresh.is_empty() {
             continue;
         }
-        retry_at = None;
         for id in refresh {
             let Some(subscription) = subscriptions.get_mut(&id) else {
                 continue;
             };
             match refresh_collection(&mut socket, &state, &session, subscription).await {
                 Refreshed::Current => {}
-                Refreshed::Raced => {
-                    retry_at = Some(tokio::time::Instant::now() + COLLECTION_RACE_RETRY);
-                }
                 Refreshed::Dropped => {
                     subscriptions.remove(&id);
                 }

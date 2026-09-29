@@ -30,9 +30,10 @@ run's steps in a mission detail read. An agent names its queue in
 `current_work`, `next_work`, and `upcoming_work`: each step's mission, run,
 path, title, first goal, and state. A work row names its `mission_id`.
 
-A snapshot never pairs rows with an older fence. When a commit lands while a
-window is read, the server reads it again, and after repeated races it waits
-briefly and tries once more; the client never sees the race.
+Each window is read inside one SQLite snapshot, and its fence names that
+snapshot's store index, so rows always match their fence. Commits that land
+while a window is read neither tear it nor delay it; they arrive in the next
+`changes` frame.
 
 An `error` frame reports an invalid subscription. A `resync` frame tells the
 client to subscribe again. If the socket closes, including during a daemon
