@@ -26,10 +26,11 @@ pub struct ProviderObservation {
     pub next_check_unix_ms: u128,
 }
 
+/// GitHub refused a request until a known time: a primary or secondary rate limit. It clears
+/// on its own at `retry_at_unix_ms`.
 #[derive(Debug)]
 pub struct ProviderRateLimit {
     pub retry_at_unix_ms: u128,
-    pub unauthenticated: bool,
     pub status: u16,
 }
 
@@ -41,6 +42,7 @@ impl std::fmt::Display for ProviderRateLimit {
 
 impl std::error::Error for ProviderRateLimit {}
 
+/// GitHub rejected the token itself. Nothing changes until a person signs in again.
 #[derive(Debug)]
 pub struct ProviderUnauthenticated {
     pub status: u16,
@@ -50,13 +52,34 @@ impl std::fmt::Display for ProviderUnauthenticated {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "GitHub HTTP {} without authentication",
+            "GitHub HTTP {} rejected the token's credentials",
             self.status
         )
     }
 }
 
 impl std::error::Error for ProviderUnauthenticated {}
+
+/// GitHub refused a request for a reason other than a rate limit, such as a token without access
+/// to the repository or an organization's SSO policy. Nothing changes until a person grants
+/// access.
+#[derive(Debug)]
+pub struct ProviderForbidden {
+    pub status: u16,
+    pub message: String,
+}
+
+impl std::fmt::Display for ProviderForbidden {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "GitHub HTTP {} forbidden", self.status)?;
+        if !self.message.is_empty() {
+            write!(formatter, ": {}", self.message)?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for ProviderForbidden {}
 
 fn github_retry_at(headers: &reqwest::header::HeaderMap, now: u128) -> u128 {
     let retry_after = headers
@@ -85,29 +108,84 @@ fn github_retry_at(headers: &reqwest::header::HeaderMap, now: u128) -> u128 {
         .unwrap_or_else(|| now.saturating_add(15 * 60_000))
 }
 
-fn github_response(
-    response: reqwest::Response,
-    unauthenticated: bool,
-) -> Result<reqwest::Response> {
-    let status = response.status();
-    if status == reqwest::StatusCode::FORBIDDEN || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+/// How GitHub refused a request. A 429, or a 403 that exhausted the primary budget
+/// (`x-ratelimit-remaining: 0`), names a retry time (`retry-after`) or says so in its message, is
+/// a rate limit. Any other 403 is a permission failure, and a 401 is a rejected token.
+enum GithubRefusal {
+    RateLimit,
+    Forbidden(String),
+    Unauthenticated,
+}
+
+fn github_refusal(
+    status: reqwest::StatusCode,
+    headers: &reqwest::header::HeaderMap,
+    body: &str,
+) -> Option<GithubRefusal> {
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        return Some(GithubRefusal::RateLimit);
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Some(GithubRefusal::Unauthenticated);
+    }
+    if status != reqwest::StatusCode::FORBIDDEN {
+        return None;
+    }
+    let exhausted = headers
+        .get("x-ratelimit-remaining")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.trim() == "0");
+    let message = serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("message")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| body.chars().take(200).collect());
+    if exhausted
+        || headers.contains_key(reqwest::header::RETRY_AFTER)
+        || message.to_ascii_lowercase().contains("rate limit")
     {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        bail!(ProviderRateLimit {
-            retry_at_unix_ms: github_retry_at(response.headers(), now),
-            unauthenticated,
+        Some(GithubRefusal::RateLimit)
+    } else {
+        Some(GithubRefusal::Forbidden(message.trim().to_owned()))
+    }
+}
+
+async fn github_response(response: reqwest::Response) -> Result<reqwest::Response> {
+    let status = response.status();
+    if !matches!(
+        status,
+        reqwest::StatusCode::FORBIDDEN
+            | reqwest::StatusCode::TOO_MANY_REQUESTS
+            | reqwest::StatusCode::UNAUTHORIZED
+    ) {
+        return Ok(response.error_for_status()?);
+    }
+    let headers = response.headers().clone();
+    let body = response.text().await.unwrap_or_default();
+    match github_refusal(status, &headers, &body) {
+        Some(GithubRefusal::RateLimit) => {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            bail!(ProviderRateLimit {
+                retry_at_unix_ms: github_retry_at(&headers, now),
+                status: status.as_u16(),
+            })
+        }
+        Some(GithubRefusal::Forbidden(message)) => bail!(ProviderForbidden {
             status: status.as_u16(),
-        });
-    }
-    if unauthenticated && status == reqwest::StatusCode::NOT_FOUND {
-        bail!(ProviderUnauthenticated {
+            message,
+        }),
+        Some(GithubRefusal::Unauthenticated) => bail!(ProviderUnauthenticated {
             status: status.as_u16()
-        });
+        }),
+        None => bail!("GitHub HTTP {status}"),
     }
-    Ok(response.error_for_status()?)
 }
 
 /// A hung connection must end, or its observer would never be polled again.
@@ -494,7 +572,7 @@ async fn github_json(
             .expect("GitHub count mutex poisoned");
         *counts.entry(repository).or_default() += 1;
     }
-    let response = github_response(response, false)?;
+    let response = github_response(response).await?;
     if response.status() == reqwest::StatusCode::NOT_MODIFIED {
         let payload = cached
             .as_mut()
@@ -1346,6 +1424,73 @@ mod tests {
         headers.insert(reqwest::header::RETRY_AFTER, "120".parse().unwrap());
         headers.insert("x-ratelimit-reset", "1050".parse().unwrap());
         assert_eq!(github_retry_at(&headers, now), now + 120_000);
+    }
+
+    #[test]
+    fn a_permission_403_is_not_a_rate_limit() {
+        use reqwest::StatusCode;
+        let headers = |pairs: &[(&'static str, &str)]| {
+            let mut headers = reqwest::header::HeaderMap::new();
+            for (name, value) in pairs {
+                headers.insert(*name, value.parse().unwrap());
+            }
+            headers
+        };
+        let refusal = |status, pairs: &[(&'static str, &str)], body: &str| {
+            github_refusal(status, &headers(pairs), body)
+        };
+        // The primary budget is spent.
+        assert!(matches!(
+            refusal(
+                StatusCode::FORBIDDEN,
+                &[
+                    ("x-ratelimit-remaining", "0"),
+                    ("x-ratelimit-reset", "1050")
+                ],
+                r#"{"message": "API rate limit exceeded for user ID 1."}"#,
+            ),
+            Some(GithubRefusal::RateLimit)
+        ));
+        // A secondary limit names a retry time or says so.
+        assert!(matches!(
+            refusal(StatusCode::FORBIDDEN, &[("retry-after", "60")], "{}"),
+            Some(GithubRefusal::RateLimit)
+        ));
+        assert!(matches!(
+            refusal(
+                StatusCode::FORBIDDEN,
+                &[("x-ratelimit-remaining", "4000")],
+                r#"{"message": "You have exceeded a secondary rate limit."}"#,
+            ),
+            Some(GithubRefusal::RateLimit)
+        ));
+        assert!(matches!(
+            refusal(StatusCode::TOO_MANY_REQUESTS, &[], ""),
+            Some(GithubRefusal::RateLimit)
+        ));
+        // A token without access, or an SSO policy, waits for a person instead.
+        match refusal(
+            StatusCode::FORBIDDEN,
+            &[("x-ratelimit-remaining", "4999")],
+            r#"{"message": "Resource protected by organization SAML enforcement."}"#,
+        ) {
+            Some(GithubRefusal::Forbidden(message)) => {
+                assert_eq!(
+                    message,
+                    "Resource protected by organization SAML enforcement."
+                );
+            }
+            _ => panic!("a permission 403 was taken for a rate limit"),
+        }
+        assert!(matches!(
+            refusal(
+                StatusCode::UNAUTHORIZED,
+                &[],
+                r#"{"message": "Bad credentials"}"#
+            ),
+            Some(GithubRefusal::Unauthenticated)
+        ));
+        assert!(refusal(StatusCode::NOT_FOUND, &[], "").is_none());
     }
 
     #[test]

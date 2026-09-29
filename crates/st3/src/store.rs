@@ -4079,6 +4079,29 @@ impl Store {
         Ok(faults)
     }
 
+    /// The latest fault claim on `subject` in `scope`, while that fault is open.
+    pub fn open_reconcile_fault_claim(
+        &self,
+        subject: &str,
+        scope: &str,
+    ) -> Result<Option<ClaimRecord>> {
+        let connection = self.readers.get();
+        let claim = connection
+            .query_row(
+                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                        predecessors, accepted_at_unix_ms
+                 FROM claims WHERE subject=?1 AND kind='reconcile.fault'
+                   AND origin=?2 AND json_extract(body, '$.fields.scope')=?3
+                 ORDER BY store_index DESC LIMIT 1",
+                params![subject, self.origin, scope],
+                claim_from_row,
+            )
+            .optional()?;
+        Ok(claim.filter(|claim| {
+            claim.body.pointer("/fields/status").and_then(Value::as_str) == Some("faulted")
+        }))
+    }
+
     /// The reason for an open fault on `subject` in `scope`, if the latest record is a fault.
     pub fn reconcile_fault(&self, subject: &str, scope: &str) -> Result<Option<String>> {
         let connection = self.readers.get();
