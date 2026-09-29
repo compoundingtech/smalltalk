@@ -731,6 +731,9 @@ gate "the release is approved" type="human" {
 A human gate requires a full `person/...` reviewer. The question and repeated review targets are optional.
 
 st creates one `gate.requested` claim for the exact mission or step revision and attempt. A review decision must match that request.
+A newer st build can word the same gate's request differently and ask again for the same attempt.
+The reviewer then sees one review: the newest request, which is the one the gate waits on, aged
+from the first request, on every node.
 
 `st attention ls --as person/NAME` shows the selected person's pending KDL human gates together
 with their other current decisions and faults.
@@ -831,6 +834,7 @@ While its run is active, the step starts its next attempt in place. When that st
 reason its root run failed, the retry reopens the run in a successor generation of the same
 revision. Completed normal work carries forward. The failed step starts its next attempt. Work that
 the failure cancelled and every final step start again. The old generation becomes superseded.
+The run's state claims record who reopened it and why, and its state dates from the reopening.
 
 A failed run does not reopen when several steps failed, when work was cancelled for a reason other
 than the failure, when a mission gate or the mission timeout failed it, when it is a nested or eval

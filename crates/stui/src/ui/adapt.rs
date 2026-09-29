@@ -64,6 +64,23 @@ fn mission_steps(mission: &st3_client::Mission) -> Vec<&MissionStep> {
         .collect()
 }
 
+/// Who set the outcome of the mission's finished latest run, from what, and why.
+fn run_outcome(mission: &st3_client::Mission) -> Option<String> {
+    let outcome = mission.run_details.last()?.outcome.as_ref()?;
+    let was = outcome
+        .previous_status
+        .as_deref()
+        .map(|previous| format!(" (was {previous})"))
+        .unwrap_or_default();
+    Some(format!(
+        "{}{was} · set by {} {} ago: {}",
+        outcome.status,
+        outcome.actor,
+        age(&outcome.at),
+        clean_message_text(&outcome.reason)
+    ))
+}
+
 /// A step st sent with some mission, and that mission.
 fn find_step<'a>(model: &'a Model, id: &str) -> Option<(&'a st3_client::Mission, &'a MissionStep)> {
     model.missions().find_map(|mission| {
@@ -625,6 +642,9 @@ fn missions(model: &Model) -> Vec<Mission> {
                 Word::Decision
             } else if mission.state == "blocked" || states.contains(&"blocked") {
                 Word::Stalled
+            } else if mission.state == "completed" {
+                // A run someone set to completed keeps the steps that failed.
+                Word::Done
             } else if mission.state == "failed"
                 || states.iter().any(|state| matches!(*state, "failed"))
             {
@@ -757,6 +777,7 @@ fn missions(model: &Model) -> Vec<Mission> {
                 steps,
                 agents,
                 kdl: None,
+                outcome: run_outcome(mission),
                 decision,
                 worktree: None,
                 parent: None,
@@ -1422,6 +1443,42 @@ mod tests {
             truncated: false,
             sync: None,
         }
+    }
+
+    #[test]
+    fn a_run_set_to_completed_reads_done_and_says_who_set_it_and_why() {
+        let mut model = Model::default();
+        model.missions = window(vec![serde_json::json!({
+            "id": "mission/fleet/harbor/ship", "kind": "mission", "revision": "r1",
+            "updated_at": "2026-09-29T09:58:00Z", "title": "fleet/harbor/ship",
+            "state": "completed", "mission_revision": "r1",
+            "runs": ["mission-run/ship-1"],
+            "run_details": [{
+                "id": "mission-run/ship-1", "requester": "person/avery", "status": "completed",
+                "phase": "terminal", "progress": {"done": 1, "total": 2}, "current_steps": [],
+                "must_act": "nobody", "state_since": "2026-09-29T09:58:00Z",
+                "outcome": {
+                    "status": "completed", "previous_status": "failed",
+                    "reason": "the change merged after its gate was fixed",
+                    "actor": "person/avery", "at": "2026-09-29T09:58:00Z",
+                },
+                "steps": [{
+                    "id": "step-run/ship-1/gate", "path": "gate", "state": "failed", "attempt": 1,
+                    "since": "2026-09-29T09:50:00Z", "goals": [], "constraints": [], "blockers": [],
+                }],
+            }],
+        })]);
+        let world = world(&model, "person/avery", &Extras::default());
+        let Load::Ready(missions) = &world.missions else {
+            panic!("missions load from the missions window alone")
+        };
+        assert_eq!(missions[0].word, Word::Done);
+        let outcome = missions[0].outcome.as_deref().expect("the outcome shows");
+        assert!(
+            outcome.starts_with("completed (was failed) · set by person/avery ")
+                && outcome.ends_with(" ago: the change merged after its gate was fixed"),
+            "{outcome}"
+        );
     }
 
     #[test]

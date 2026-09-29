@@ -2270,11 +2270,14 @@ impl Store {
                AND (?1 OR CASE
                    WHEN COALESCE(run_states.running,0)>0 THEN 'running'
                    WHEN COALESCE(run_states.standing,0)>0 THEN 'standing'
+                   WHEN def.state='retired' THEN 'retired'
                    WHEN latest.status IS NOT NULL THEN latest.status
                    ELSE def.state END NOT IN ('completed','failed','cancelled','retired')
                    -- A run that failed or was cancelled stays in view for a while with its
-                   -- outcome, instead of vanishing the moment it ends.
+                   -- outcome, instead of vanishing the moment it ends, unless its mission
+                   -- was retired.
                    OR (latest.status IN ('failed','cancelled')
+                       AND COALESCE(def.state,'')<>'retired'
                        AND COALESCE(run_states.running,0)=0 AND COALESCE(run_states.standing,0)=0
                        AND CAST(latest.updated_at_unix_ms AS INTEGER)>=?4))
              ORDER BY CAST(COALESCE(latest.updated_at_unix_ms,published.accepted_at_unix_ms) AS INTEGER) DESC,
@@ -4448,6 +4451,25 @@ impl Store {
             None,
         )
         .map_err(internal)?;
+        if reopening {
+            // The run's own state history says who reopened it, when, and why.
+            append_claim_tx(
+                &transaction,
+                &self.origin,
+                &current.subject,
+                "mission-run.state",
+                Some(&actor),
+                &json!({"fields": {
+                    "status": "running",
+                    "phase": "normal",
+                    "previous_phase": current.phase,
+                    "reason": reason,
+                }}),
+                &[],
+                None,
+            )
+            .map_err(internal)?;
+        }
         if let Some(proposal) = proposal {
             let changed = transaction
                 .execute(
@@ -4625,6 +4647,7 @@ impl Store {
         })? {
             let (subject, at, actor, status, phase, previous_phase, reason) = row?;
             let at = at.parse().unwrap_or_default();
+            // `mission-run.state` claims are durable, so the claim before is the state replaced.
             let previous_status = states.get(&subject).and_then(|state| state.status.clone());
             let outcome = (phase.as_deref() == Some("terminal")
                 && previous_phase.as_deref() == Some("terminal"))
@@ -10123,10 +10146,13 @@ impl Store {
                 message.to.starts_with("person/")
                     && matches!(message.status.as_str(), "sent" | "delivered")
             }) {
+                // The message's first claim in canonical order, so every node that holds it
+                // shows the same wait.
                 let requested_at_unix_ms = connection.query_row(
                     "SELECT accepted_at_unix_ms FROM claims
                      WHERE subject=?1
-                     ORDER BY store_index LIMIT 1",
+                     ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms, store_index
+                     LIMIT 1",
                     [&message.subject],
                     |row| row.get::<_, String>(0),
                 )?;
@@ -17664,10 +17690,27 @@ fn pending_human_reviews_tx(
             .query_map([reviewer], claim_from_row)?
             .collect::<Result<Vec<_>, _>>()?
     };
-    let mut reviews = Vec::new();
+    // A build that words a gate's request differently asks the same gate again. The reviewer
+    // answers the newest request, which is the one the gate waits on, and has waited since the
+    // first.
+    let mut reviews: Vec<HumanReviewView> = Vec::new();
     for request in requests {
-        if let Some(review) = current_human_review(connection, request)? {
-            reviews.push(review);
+        let Some(review) = current_human_review(connection, request)? else {
+            continue;
+        };
+        match reviews.iter_mut().find(|kept| {
+            kept.owner == review.owner
+                && kept.reviewer == review.reviewer
+                && kept.attempt == review.attempt
+        }) {
+            Some(kept) => {
+                let first = kept.requested_at_unix_ms.min(review.requested_at_unix_ms);
+                if review.requested_at_unix_ms >= kept.requested_at_unix_ms {
+                    *kept = review;
+                }
+                kept.requested_at_unix_ms = first;
+            }
+            None => reviews.push(review),
         }
     }
     Ok(reviews)
@@ -17682,7 +17725,7 @@ fn attention_request_view_tx(
             "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
                     predecessors, accepted_at_unix_ms
              FROM claims WHERE subject=?1 AND kind='attention.requested'
-             ORDER BY store_index LIMIT 1",
+             ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms, store_index LIMIT 1",
             [subject],
             claim_from_row,
         )
@@ -17695,7 +17738,8 @@ fn attention_request_view_tx(
             "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
                     predecessors, accepted_at_unix_ms
              FROM claims WHERE subject=?1 AND kind='attention.resolved'
-             ORDER BY store_index DESC LIMIT 1",
+             ORDER BY length(accepted_at_unix_ms) DESC, accepted_at_unix_ms DESC, store_index DESC
+             LIMIT 1",
             [subject],
             claim_from_row,
         )
@@ -27791,7 +27835,7 @@ fn mission_run_outcome_tx(
     if run.phase != "terminal" {
         return Ok(None);
     }
-    let mut statement = connection.prepare(&format!(
+    let mut statement = connection.prepare_cached(&format!(
         "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1 AND claims.kind='mission-run.state'
          ORDER BY {CANONICAL_ORDER_DESC} LIMIT 2"
@@ -27818,6 +27862,7 @@ fn run_outcome_from_claim(
     }
     Some(MissionRunOutcomeView {
         status: text(fields, "status")?,
+        // `mission-run.state` claims are durable, so the claim before is the state replaced.
         previous_status: previous.and_then(|previous| {
             text(
                 previous.body.get("fields").unwrap_or(&previous.body),
@@ -37170,6 +37215,25 @@ mission "takeover" state="ready" {
         );
         assert_ne!(reopened.generation, failed.generation);
         assert_eq!(reopened.revision, failed.revision);
+        assert!(reopened.outcome.is_none());
+        // The run's state history says who reopened it and why, and dates its state from then.
+        let reopening = store
+            .latest_claim(&failed.subject, Some("mission-run.state"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopening.actor.as_deref(), Some("person/operator"));
+        assert_eq!(
+            reopening.body["fields"],
+            json!({
+                "status": "running",
+                "phase": "normal",
+                "previous_phase": "terminal",
+                "reason": "the deploy check host is back",
+            })
+        );
+        let moment = &store.mission_run_states().unwrap()[&failed.subject];
+        assert_eq!(moment.since_unix_ms, reopening.accepted_at_unix_ms);
+        assert!(moment.outcome.is_none());
         let state = |path| {
             let step = takeover_step(&reopened, path);
             (step.status.as_str(), step.attempt)
@@ -37227,6 +37291,24 @@ mission "takeover" state="ready" {
         assert!(!current.contains(&failed.mission), "{current:?}");
         let history = store.mission_collection_ids(true, 0, 50).unwrap();
         assert!(history.contains(&failed.mission), "{history:?}");
+    }
+
+    #[test]
+    fn a_retired_mission_leaves_the_current_view_at_once_after_a_failed_run() {
+        let store = Store::open_memory("node").unwrap();
+        let failed = failed_takeover_run(&store, &["deploy-check"]);
+        store
+            .retire_mission(&failed.mission, "person/operator", "retire-failed")
+            .unwrap();
+        let current = store.mission_collection_ids(false, 0, 50).unwrap();
+        assert!(!current.contains(&failed.mission), "{current:?}");
+        let history = store.mission_collection_ids(true, 0, 50).unwrap();
+        assert!(history.contains(&failed.mission), "{history:?}");
+        assert_eq!(
+            store.mission_run(&failed.id).unwrap().unwrap().status,
+            "failed",
+            "retiring the mission leaves its runs as they ended"
+        );
     }
 
     #[test]
@@ -40242,6 +40324,90 @@ mission "review-current" state="ready" revision-cutover="restart-active" {{
             .set_mission_run_state(&revised.id, "cancelled", "normal", None)
             .unwrap();
         assert!(store.pending_human_reviews(None).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_gate_asked_again_is_one_review_that_has_waited_since_its_first_request() {
+        let store = Store::open_memory("node").unwrap();
+        publish_mission(
+            &store,
+            r#"version 2
+mission "asked-again" state="ready" {
+  goal "Review one change."
+  step "approval" { goal "Approve the change."; agentless }
+}"#,
+            "asked-again-mission",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "asked-again".into(),
+                revision: None,
+                workspace: ".".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "asked-again-run".into(),
+            })
+            .unwrap();
+        let step = run.steps[0].clone();
+        // An older build asked without a mode; a newer build words the same gate with one,
+        // so its request is a new operation.
+        let ask = |operation: &str, mode: Option<&str>| {
+            let mut fields = BTreeMap::from([
+                ("owner".into(), Value::String(step.subject.clone())),
+                ("reviewer".into(), Value::String("person/nathan".into())),
+                ("question".into(), Value::String("Approve it?".into())),
+                ("review_targets".into(), Value::Array(Vec::new())),
+                (
+                    "decisions".into(),
+                    Value::Array(vec![
+                        Value::String("approved".into()),
+                        Value::String("rejected".into()),
+                    ]),
+                ),
+                ("operation".into(), Value::String(operation.into())),
+                ("mission_revision".into(), Value::String(run.revision.clone())),
+                (
+                    "step_definition".into(),
+                    Value::String(step.definition_hash.clone()),
+                ),
+                ("attempt".into(), Value::from(step.attempt)),
+            ]);
+            if let Some(mode) = mode {
+                fields.insert("mode".into(), Value::String(mode.into()));
+            }
+            store
+                .append_claim(&ClaimInput {
+                    subject: operation.into(),
+                    kind: "gate.requested".into(),
+                    actor: None,
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(operation.into()),
+                })
+                .unwrap()
+        };
+        let first = ask("gate-operation/asked-again/first", None);
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let again = ask("gate-operation/asked-again/again", Some("approve"));
+        assert!(again.accepted_at_unix_ms > first.accepted_at_unix_ms);
+
+        let reviews = store.pending_human_reviews(None).unwrap();
+        assert_eq!(reviews.len(), 1, "{reviews:?}");
+        assert_eq!(
+            reviews[0].request, again.id,
+            "the reviewer answers the request the gate waits on"
+        );
+        assert_eq!(reviews[0].requested_at_unix_ms, first.accepted_at_unix_ms);
+
+        let items = store.attention_items(Some("person/nathan")).unwrap();
+        let gates = items
+            .iter()
+            .filter(|item| item.kind == "human-gate")
+            .collect::<Vec<_>>();
+        assert_eq!(gates.len(), 1);
+        assert_eq!(gates[0].requested_at_unix_ms, first.accepted_at_unix_ms);
     }
 
     fn request_fault(store: &Store, subject: &str, targets: &[&str]) {

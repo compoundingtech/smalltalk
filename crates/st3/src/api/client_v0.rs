@@ -1193,6 +1193,10 @@ fn mission_resources_filtered(
                 "running"
             } else if runs.iter().any(|run| run.status == "standing") {
                 "standing"
+            } else if definition.is_some_and(|(definition, _)| {
+                definition.state == crate::model::MissionState::Retired
+            }) {
+                "retired"
             } else {
                 match latest
                     .expect("a nonempty run list has a latest run")
@@ -7710,7 +7714,7 @@ mission "example/looped" state="ready" {
                 .unwrap()
         };
         let first = start("first");
-        start("second");
+        let second = start("second");
         state
             .store
             .set_mission_run_state(&first.id, "cancelled", "terminal", Some("no longer needed"))
@@ -7783,6 +7787,31 @@ mission "example/looped" state="ready" {
             "its work shipped before it was cancelled"
         );
         assert_eq!(finished["state_since"], finished["outcome"]["at"]);
+
+        // Retired once no run is open, the mission leaves the current view at once, even with
+        // a run that ended moments ago, and its history names it retired.
+        state
+            .store
+            .set_mission_run_state(&second.id, "failed", "terminal", Some("a check failed"))
+            .unwrap();
+        state
+            .store
+            .retire_mission("example/looped", "person/operator", "retire-looped")
+            .unwrap();
+        let current =
+            mission_resources(&state.store, state.store.index().unwrap(), false, None).unwrap();
+        assert!(
+            current
+                .iter()
+                .all(|value| value["id"] != "mission/example/looped")
+        );
+        let history =
+            mission_resources(&state.store, state.store.index().unwrap(), true, None).unwrap();
+        let retired = history
+            .iter()
+            .find(|value| value["id"] == "mission/example/looped")
+            .unwrap();
+        assert_eq!(retired["state"], "retired");
     }
 
     #[test]

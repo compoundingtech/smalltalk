@@ -366,6 +366,8 @@ pub struct Mission {
     pub system: bool,
     /// The mission's declaration as written, when st provides it.
     pub kdl: Option<String>,
+    /// The outcome a person or an authorized agent set on its finished run, and why.
+    pub outcome: Option<String>,
 }
 
 impl Mission {
