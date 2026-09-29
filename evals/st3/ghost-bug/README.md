@@ -6,7 +6,7 @@ cannot pass.
 
 The KDL records delegation, diagnosis, regression-first repair, publication, verification, and products as graph work.
 
-Validate its graph contract with `cargo test -p st3 --test examples`; paid live orchestration uses
+Validate its graph contract with `cargo test -p st3 --test integration examples::`; paid live orchestration uses
 the repository's internal eval controller, not the public CLI.
 
 Held-out gates (identical logic to ghost-bug): isolation (author-gated to `gbx.fix`), suite-green,
