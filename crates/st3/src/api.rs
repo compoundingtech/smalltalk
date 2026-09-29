@@ -3512,10 +3512,18 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         .await
         .map_err(ApiError::internal)?;
     let token = crate::resource::github_token().await;
+    // The link takes a moment, so it runs while the other checks do.
+    let toolchain = environment.as_ref().ok().cloned().map(|environment| {
+        tokio::task::spawn_blocking(move || crate::environment::toolchain_check(&environment))
+    });
     let mut report = tokio::task::spawn_blocking(move || doctor_report(&state))
         .await
         .map_err(ApiError::internal)??
         .0;
+    let toolchain = match toolchain {
+        Some(toolchain) => Some(toolchain.await.map_err(ApiError::internal)?),
+        None => None,
+    };
     report.checks.push(match environment {
         Ok(environment) => DoctorCheck {
             name: "daemon-environment".into(),
@@ -3531,6 +3539,7 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
             message: error.to_string(),
         },
     });
+    report.checks.extend(toolchain);
     report.checks.push(DoctorCheck {
         name: "github-observer-auth".into(),
         status: if token.is_ok() { "pass" } else { "warn" }.into(),
