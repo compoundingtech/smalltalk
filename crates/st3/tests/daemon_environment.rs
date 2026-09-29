@@ -18,7 +18,7 @@ fn executable(path: &Path, source: &str) {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
 }
 
-fn start_service(root: &Path, home: &Path) -> (Service, std::path::PathBuf) {
+fn start_service(root: &Path, home: &Path, state_home: &Path) -> (Service, std::path::PathBuf) {
     let socket = root.join("daemon.sock");
     let log = std::fs::File::create(root.join("daemon.log")).unwrap();
     let binary = assert_cmd::cargo::cargo_bin!("st3");
@@ -29,7 +29,7 @@ fn start_service(root: &Path, home: &Path) -> (Service, std::path::PathBuf) {
             .env("HOME", home)
             .env("SHELL", &shell)
             .env("XDG_CONFIG_HOME", root.join("config"))
-            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_STATE_HOME", state_home)
             .env("XDG_RUNTIME_DIR", root.join("runtime"))
             .current_dir(root)
             .args(["up", "--node", "orchid"])
@@ -69,6 +69,34 @@ fn doctor_report(home: &Path, socket: &Path) -> serde_json::Value {
 }
 
 #[test]
+fn client_without_runtime_dir_reaches_daemon_with_different_socket() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("home");
+    std::fs::create_dir_all(&home).unwrap();
+    let state_home = root.path().join("state").join("long".repeat(26));
+    let (_service, socket) = start_service(root.path(), &home, &state_home);
+    let state_socket = state_home.join("st3/run/st3.sock");
+    assert!(state_socket.as_os_str().len() > 108);
+    assert_eq!(std::fs::read_link(&state_socket).unwrap(), socket);
+
+    let output = Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+        .env_clear()
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", root.path().join("config"))
+        .env("XDG_STATE_HOME", &state_home)
+        .env("ST3_DAEMON_WAIT", "0")
+        .args(["agents", "ls"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn bare_service_environment_loads_shell_path_and_rechecks_credentials() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
@@ -87,7 +115,7 @@ fn bare_service_environment_loads_shell_path_and_rechecks_credentials() {
         "#!/bin/sh\n[ \"$ORCHID_CONTROL\" = from-shell ] || exit 9\nprintf '[]\\n'\n",
     );
     executable(&bin.join("gh"), "#!/bin/sh\nexit 1\n");
-    let (_service, socket) = start_service(root.path(), &home);
+    let (_service, socket) = start_service(root.path(), &home, &root.path().join("state"));
     let doctor = || doctor_report(&home, &socket);
     let report = doctor();
     let checks = report["checks"].as_array().unwrap();
@@ -149,7 +177,7 @@ fn doctor_reports_missing_build_tools_and_whether_a_small_crate_links() {
     for tool in ["cargo", "rustc", "mold", "sccache", "gh", "git"] {
         executable(&bin.join(tool), "#!/bin/sh\nexit 0\n");
     }
-    let (_service, socket) = start_service(root.path(), &home);
+    let (_service, socket) = start_service(root.path(), &home, &root.path().join("state"));
     let build_tools = || {
         let report = doctor_report(&home, &socket);
         let check = report["checks"]

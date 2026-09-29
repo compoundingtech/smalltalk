@@ -322,12 +322,28 @@ impl Config {
             config.state_dir = defaults.state_dir;
         }
         if config.socket.as_os_str().is_empty() {
-            config.socket = defaults.socket;
+            config.socket = if env::var_os("XDG_RUNTIME_DIR").is_some() {
+                defaults.socket
+            } else {
+                state_socket(&config.state_dir)
+            };
         }
         if config.client_gateway_socket.as_os_str().is_empty() {
             config.client_gateway_socket = defaults.client_gateway_socket;
         }
         Ok(config)
+    }
+
+    /// Resolve the daemon's published endpoint when this client lacks its runtime directory.
+    /// Following the link itself would exceed the Unix socket address limit for long state paths.
+    pub fn client_socket(&self) -> PathBuf {
+        if env::var_os("XDG_RUNTIME_DIR").is_none() && self.socket == state_socket(&self.state_dir) {
+            return fs::read_link(&self.socket)
+                .ok()
+                .filter(|target| target.is_absolute())
+                .unwrap_or_else(|| self.socket.clone());
+        }
+        self.socket.clone()
     }
 
     /// Merge `STATE/fleet/fleet.toml` from the effective state directory. Call it after
@@ -477,6 +493,10 @@ impl Config {
         }
         Ok(())
     }
+}
+
+fn state_socket(state_dir: &Path) -> PathBuf {
+    state_dir.join("run/st3.sock")
 }
 
 /// The terminating NUL also occupies a byte in sockaddr_un.sun_path.
