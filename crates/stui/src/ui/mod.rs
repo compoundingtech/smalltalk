@@ -2463,7 +2463,7 @@ impl Ui {
                 if let Some(Load::Ready(entries)) = self
                     .world
                     .conversations
-                    .get_mut("agent/fleet/harbor/reviewer")
+                    .get_mut("agent/example/harbor/reviewer")
                 {
                     entries.push(Entry {
                         id: "h3".into(),
@@ -2491,8 +2491,8 @@ impl Ui {
         let Some(demo) = &mut self.demo else { return };
         let now = Instant::now();
         match viewing.as_deref() {
-            Some("agent/fleet/cos") if demo.cos_seen.is_none() => demo.cos_seen = Some(now),
-            Some("agent/fleet/harbor/reviewer") if demo.harbor_seen.is_none() => {
+            Some("agent/example/cos") if demo.cos_seen.is_none() => demo.cos_seen = Some(now),
+            Some("agent/example/harbor/reviewer") if demo.harbor_seen.is_none() => {
                 demo.harbor_seen = Some(now)
             }
             _ => {}
@@ -2510,7 +2510,7 @@ impl Ui {
             let want = (((cos - 1.5) * 6.0) as usize).min(words.len());
             if want > demo.streamed
                 && let Some(Load::Ready(entries)) =
-                    self.world.conversations.get_mut("agent/fleet/cos")
+                    self.world.conversations.get_mut("agent/example/cos")
             {
                 let text = words[..want].join(" ");
                 if let Some(entry) = entries.iter_mut().find(|entry| entry.id == "stream") {
@@ -2530,7 +2530,7 @@ impl Ui {
             if let Some(Load::Ready(entries)) = self
                 .world
                 .conversations
-                .get_mut("agent/fleet/harbor/reviewer")
+                .get_mut("agent/example/harbor/reviewer")
                 && let Some(entry) = entries.iter_mut().find(|entry| entry.id == "h3")
             {
                 entry.body = Body::Tool {
@@ -2550,7 +2550,7 @@ impl Ui {
         }
         if cos > 8.0 && !demo.mail {
             demo.mail = true;
-            if let Some(Load::Ready(entries)) = self.world.conversations.get_mut("agent/fleet/cos")
+            if let Some(Load::Ready(entries)) = self.world.conversations.get_mut("agent/example/cos")
             {
                 entries.push(demo::late_mail());
             }
@@ -2892,15 +2892,15 @@ mod tests {
         let cos = ui
             .ids()
             .iter()
-            .position(|id| id == "agent/fleet/cos")
+            .position(|id| id == "agent/example/cos")
             .unwrap();
         ui.select(cos);
         frame(&ui, 140, 30);
-        let key = "chat:agent/fleet/cos".to_owned();
+        let key = "chat:agent/example/cos".to_owned();
         assert!(ui.panes.borrow()[&key].follow);
         ui.scroll_pane(&key, -5);
         assert!(!ui.panes.borrow()[&key].follow);
-        if let Some(Load::Ready(entries)) = ui.world.conversations.get_mut("agent/fleet/cos") {
+        if let Some(Load::Ready(entries)) = ui.world.conversations.get_mut("agent/example/cos") {
             entries.push(demo::late_mail());
         }
         let screen = frame(&ui, 140, 30).join("\n");
@@ -3011,7 +3011,7 @@ mod tests {
         let index = ui.ids().iter().position(|id| id == "attention/1").unwrap();
         ui.select(index);
         press(&mut ui, KeyCode::Char('t'));
-        assert_eq!(ui.chat.as_ref().unwrap().to, "agent/fleet/atlas/builder");
+        assert_eq!(ui.chat.as_ref().unwrap().to, "agent/example/atlas/builder");
         for character in "why now?".chars() {
             press(&mut ui, KeyCode::Char(character));
         }
@@ -3036,7 +3036,7 @@ mod tests {
         }
         ui.set_world(world);
         let item = ui.world.attention.items()[3].clone();
-        assert_eq!(ui.chat_target(&item).unwrap().0, "agent/fleet/cos");
+        assert_eq!(ui.chat_target(&item).unwrap().0, "agent/example/cos");
     }
 
     #[test]
@@ -3104,7 +3104,7 @@ mod tests {
             let template = agents[5].clone();
             for index in 0..40 {
                 let mut agent = template.clone();
-                agent.id = format!("agent/fleet/extra/{index}");
+                agent.id = format!("agent/example/extra/{index}");
                 agent.name = format!("Extra {index:02}");
                 agents.push(agent);
             }

@@ -18,7 +18,7 @@ if [[ ${ST3_SOAK_REPORT_SKIP_RUNTIME_CHECKS:-0} != 1 ]]; then
   /usr/bin/systemctl --user is-active --quiet st3-message-soak.service || {
     echo 'soak monitor service is not active' >&2; exit 1;
   }
-  for direction in hetz-to-silber silber-to-hetz; do
+  for direction in example-linux-to-example-mac example-mac-to-example-linux; do
     /usr/bin/jq -e '(.streak == 0) and (.attention == "")' "$STATE_DIR/$direction.json" >/dev/null || {
       echo "soak monitor has unresolved failures: $direction" >&2; exit 1;
     }
@@ -40,8 +40,8 @@ TZ=UTC /usr/bin/awk -v now="$NOW" -v duration="$MIN_DURATION" \
     if (!index($0, " ok direction=")) next
     direction = ""
     for (i = 2; i <= NF; i++) if ($i ~ /^direction=/) { split($i, field, "="); direction = field[2] }
-    if (direction == "hetz-to-silber") hetz++
-    else if (direction == "silber-to-hetz") silber++
+    if (direction == "example-linux-to-example-mac") example-linux++
+    else if (direction == "example-mac-to-example-linux") example-mac++
     else { bad = "unknown direction"; next }
     if (first < 0) first = epoch
     if (last >= 0 && epoch - last > max_gap) bad = "evidence gap exceeds maximum"
@@ -50,11 +50,11 @@ TZ=UTC /usr/bin/awk -v now="$NOW" -v duration="$MIN_DURATION" \
   END {
     if (!format_ready) bad = "72-hour window predates complete failure logging"
     else if (first < 0 || first - start > max_gap || now - last > max_gap) bad = "evidence does not cover the whole window"
-    else if (hetz < min_each || silber < min_each) bad = "too few successful probes in one direction"
+    else if (example-linux < min_each || example-mac < min_each) bad = "too few successful probes in one direction"
     if (bad != "") {
-      printf "FAIL: %s; hetz-to-silber=%d silber-to-hetz=%d window_seconds=%d\n", bad, hetz, silber, duration
+      printf "FAIL: %s; example-linux-to-example-mac=%d example-mac-to-example-linux=%d window_seconds=%d\n", bad, example-linux, example-mac, duration
       exit 1
     }
-    printf "PASS: continuous bidirectional exact receipts; hetz-to-silber=%d silber-to-hetz=%d window_seconds=%d max_gap_seconds=%d\n", hetz, silber, duration, max_gap
+    printf "PASS: continuous bidirectional exact receipts; example-linux-to-example-mac=%d example-mac-to-example-linux=%d window_seconds=%d max_gap_seconds=%d\n", example-linux, example-mac, duration, max_gap
   }
 ' "$LOG"

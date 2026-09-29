@@ -3,7 +3,7 @@
 Status: accepted
 
 Design confirmed by Johannes on 2026-09-05 through the issue #401 interview.
-Nathan confirmed the graph-subject model in the design discussion supplied by
+Alex confirmed the graph-subject model in the design discussion supplied by
 Johannes: the subject keeps a stable ID while its semantic name changes.
 
 ## Context

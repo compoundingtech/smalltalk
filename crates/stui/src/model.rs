@@ -1067,7 +1067,7 @@ mod tests {
     fn regression_recent_messages_include_closed_and_sessionless_messages() {
         let message: Resource = serde_json::from_str(r#"{"kind":"message","id":"message/old","revision":"one","updated_at":"2026-09-25T08:00:00Z","from":"agent/cos","to":"agent/st3","title":null,"content":"hello","state":"closed","sent_at":"2026-09-25T08:00:00Z","in_reply_to":null,"session_id":"session/old"}"#).unwrap();
         let model = Model {
-            actor: "person/nathan".into(),
+            actor: "person/alex".into(),
             messages: Collection {
                 items: vec![message],
                 ..Collection::default()
@@ -1192,7 +1192,7 @@ mod tests {
         ))
         .unwrap();
         let model = Model {
-            actor: "person/nathan".into(),
+            actor: "person/alex".into(),
             now: Collection {
                 items: resources,
                 ..Collection::default()
@@ -1207,7 +1207,7 @@ mod tests {
     #[test]
     fn action_fence_uses_exact_resource_revision_and_snapshot() {
         let resource: Resource = serde_json::from_str(
-            r#"{"id":"attention/one","kind":"attention","revision":"rev-7","updated_at":"2026-09-20T11:00:00Z","attention_kind":"review","source_id":"launch/one","person_id":"person/nathan","title":"Review","detail":"Choose","priority":"high","state":"open","requested_at":"2026-09-20T11:00:00Z"}"#
+            r#"{"id":"attention/one","kind":"attention","revision":"rev-7","updated_at":"2026-09-20T11:00:00Z","attention_kind":"review","source_id":"launch/one","person_id":"person/alex","title":"Review","detail":"Choose","priority":"high","state":"open","requested_at":"2026-09-20T11:00:00Z"}"#
         ).unwrap();
         let collection = Collection {
             items: vec![resource],

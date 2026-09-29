@@ -58,10 +58,10 @@ for the seat, like any other step of its run.
 ## Commands
 
 ```sh
-st agents queue agent/fleet/example/worker
-st agents queue move agent/fleet/example/worker mission-run/release/2026-09-26 --top \
+st agents queue agent/example/example/worker
+st agents queue move agent/example/example/worker mission-run/release/2026-09-26 --top \
   --reason "the release needs this first" --as person/operator
-st agents queue move agent/fleet/example/worker mission-run/docs/2026-09-26 \
+st agents queue move agent/example/example/worker mission-run/docs/2026-09-26 \
   --after mission-run/release/2026-09-26 --as person/operator
 ```
 
@@ -71,7 +71,7 @@ queued AGENT` runs the exact same show through the same code and prints the iden
 including `--json`; there is no `missions queued move`, only `agents queue move`.
 
 ```text
-AGENT QUEUE  agent/fleet/example/worker
+AGENT QUEUE  agent/example/example/worker
 CURRENT      step-run/build-7/build
 NEXT WORK    step-run/docs-3/review
 RUNS         3

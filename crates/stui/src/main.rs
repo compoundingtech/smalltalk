@@ -1699,8 +1699,8 @@ fn agent_is_child_of(child: &st3_client::Agent, parent: &st3_client::Agent) -> b
         return true;
     }
     child.under.is_empty()
-        && parent.header.id == "agent/fleet/st3/standing/st3"
-        && (child.header.id.starts_with("agent/fleet/st3/")
+        && parent.header.id == "agent/example/st3/standing/st3"
+        && (child.header.id.starts_with("agent/example/st3/")
             || child.header.id.starts_with("agent/st3/"))
 }
 fn session_is_importable(session: &st3_client::Session) -> bool {
@@ -3087,10 +3087,10 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     fn local_machine(model: &mut Model) {
-        model.machines.items.push(serde_json::from_str(r#"{"kind":"machine","id":"machine/hetz","revision":"one","updated_at":"2026-09-25T08:00:00Z","host_id":"host/hetz","name":"hetz","state":"local","fleet_id":null,"capacity":{"state":"available","reason":""},"occupancy":{"running_runtimes":1}}"#).unwrap());
+        model.machines.items.push(serde_json::from_str(r#"{"kind":"machine","id":"machine/example-linux","revision":"one","updated_at":"2026-09-25T08:00:00Z","host_id":"host/example-linux","name":"example-linux","state":"local","fleet_id":null,"capacity":{"state":"available","reason":""},"occupancy":{"running_runtimes":1}}"#).unwrap());
         model.sessions.snapshot = Some(st3_client::Snapshot {
-            id: "snapshot/hetz/1".into(),
-            host_id: "host/hetz".into(),
+            id: "snapshot/example-linux/1".into(),
+            host_id: "host/example-linux".into(),
             store_index: 1,
             projection_version: "v0".into(),
             created_at: "2026-09-25T08:00:00Z".into(),
@@ -3101,10 +3101,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("stui-person-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        std::fs::write(&path, "person = \"person/nathan\"\n").unwrap();
+        std::fs::write(&path, "person = \"person/alex\"\n").unwrap();
         assert_eq!(
             person_from_config(&path).unwrap().as_deref(),
-            Some("person/nathan")
+            Some("person/alex")
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3154,18 +3154,18 @@ mod tests {
     #[test]
     fn regression_fleet_agent_work_is_scoped_to_selected_host() {
         let agent: st3_client::Resource = serde_json::from_str(r#"{"kind":"agent","id":"agent/worker","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"Worker","state":"running","reachability":"reachable","runtime_ids":["runtime/worker"],"active_work_count":1}"#).unwrap();
-        let runtime: st3_client::Resource = serde_json::from_str(r#"{"kind":"runtime","id":"runtime/worker","revision":"a","updated_at":"2026-09-25T08:00:00Z","runtime_kind":"agent","owner_id":"agent/worker","owner_host_id":"host/Silber","state":"running","runtime_id":"worker","incarnation_id":null,"desired_revision":"a"}"#).unwrap();
+        let runtime: st3_client::Resource = serde_json::from_str(r#"{"kind":"runtime","id":"runtime/worker","revision":"a","updated_at":"2026-09-25T08:00:00Z","runtime_kind":"agent","owner_id":"agent/worker","owner_host_id":"host/ExampleMac","state":"running","runtime_id":"worker","incarnation_id":null,"desired_revision":"a"}"#).unwrap();
         let mut model = Model::default();
         model.agents.items.push(agent);
         model.runtimes.items.push(runtime);
         let app = App::new(model);
-        assert!(!app.agent_on_host("agent/worker", "host/hetz"));
-        assert!(app.agent_on_host("agent/worker", "host/Silber"));
+        assert!(!app.agent_on_host("agent/worker", "host/example-linux"));
+        assert!(app.agent_on_host("agent/worker", "host/ExampleMac"));
     }
 
     #[test]
     fn regression_device_rows_identify_each_device() {
-        let device: st3_client::Resource = serde_json::from_str(r#"{"kind":"device","id":"device/iphone-15","revision":"a","updated_at":"2026-09-25T08:00:00Z","person_id":"person/nathan","session_actor":"person/nathan/session/abc","state":"active","expires_at":"2026-10-01T00:00:00Z"}"#).unwrap();
+        let device: st3_client::Resource = serde_json::from_str(r#"{"kind":"device","id":"device/iphone-15","revision":"a","updated_at":"2026-09-25T08:00:00Z","person_id":"person/alex","session_actor":"person/alex/session/abc","state":"active","expires_at":"2026-10-01T00:00:00Z"}"#).unwrap();
         let st3_client::Resource::Device(device) = device else {
             panic!()
         };
@@ -3621,7 +3621,7 @@ mod tests {
 
     #[test]
     fn omp_agent_label_names_the_seat_and_driver() {
-        let agent: st3_client::Agent = serde_json::from_str(r#"{"kind":"agent","id":"agent/fleet/pty-rust/omp","revision":"one","updated_at":"2026-09-25T08:00:00Z","name":"fleet/pty-rust/omp","state":"running","reachability":"local","runtime_ids":[],"under":[]}"#).unwrap();
+        let agent: st3_client::Agent = serde_json::from_str(r#"{"kind":"agent","id":"agent/example/pty-rust/omp","revision":"one","updated_at":"2026-09-25T08:00:00Z","name":"fleet/pty-rust/omp","state":"running","reachability":"local","runtime_ids":[],"under":[]}"#).unwrap();
         assert_eq!(agent_label(&agent), "PTY Rust · OMP");
     }
 
@@ -3656,7 +3656,7 @@ mod tests {
     fn st3_descendants_nest_and_top_level_omp_shows_its_work() {
         let mut model = Model::default();
         for (id, name, driver, active) in [
-            ("agent/fleet/st3/standing/st3", "ST", "codex", 0),
+            ("agent/example/st3/standing/st3", "ST", "codex", 0),
             (
                 "agent/st3/tui-ios-fixes/2026-09-25/st3-tui-fixer",
                 "TUI fixer",
@@ -3664,12 +3664,12 @@ mod tests {
                 1,
             ),
             (
-                "agent/fleet/st3/delivery-soak/recipient",
+                "agent/example/st3/delivery-soak/recipient",
                 "Recipient",
                 "codex",
                 0,
             ),
-            ("agent/fleet/pty-rust/omp", "OMP", "omp", 1),
+            ("agent/example/pty-rust/omp", "OMP", "omp", 1),
         ] {
             model.agents.items.push(
                 serde_json::from_value(serde_json::json!({
@@ -3786,7 +3786,7 @@ mod tests {
         let mut model = Model::default();
         model.agents.items.push(agent);
         model.work.items.push(serde_json::from_str(r#"{"kind":"work","id":"step-run/new/review","revision":"one","updated_at":"2026-09-24T11:56:00Z","mission_run_id":"mission-run/new","generation_id":"run-generation/new","definition_id":"one","path":"review","state":"ready","attempt":1,"readiness_epoch":1,"claimant":null,"claim_incarnation":null,"blocked_reason":null}"#).unwrap());
-        model.runtimes.items.push(serde_json::from_str(r#"{"kind":"runtime","id":"runtime/worker","revision":"one","updated_at":"2026-09-25T08:00:00Z","runtime_kind":"agent","owner_id":"agent/worker","owner_host_id":"host/hetz","state":"running","runtime_id":"worker","incarnation_id":null,"desired_revision":"one"}"#).unwrap());
+        model.runtimes.items.push(serde_json::from_str(r#"{"kind":"runtime","id":"runtime/worker","revision":"one","updated_at":"2026-09-25T08:00:00Z","runtime_kind":"agent","owner_id":"agent/worker","owner_host_id":"host/example-linux","state":"running","runtime_id":"worker","incarnation_id":null,"desired_revision":"one"}"#).unwrap());
         local_machine(&mut model);
         let mut app = App::new(model);
         let mut terminal = Terminal::new(TestBackend::new(100, 35)).unwrap();
@@ -3922,7 +3922,7 @@ mod tests {
         let notice = st3_client::SyncNotice {
             state: "catching-up".into(),
             peers: vec![st3_client::SyncPeer {
-                host_id: "host/Silber".into(),
+                host_id: "host/ExampleMac".into(),
                 peer_only_envelopes: 124_384,
                 local_only_envelopes: 3,
                 last_exchange_at: None,
@@ -3950,7 +3950,7 @@ mod tests {
         assert!(!rows[0].contains("Online"));
         assert!(
             rows.iter().any(|row| row.contains(
-                "SYNCING  Silber has 124,384 envelopes this host lacks · caught up in about 14m"
+                "SYNCING  ExampleMac has 124,384 envelopes this host lacks · caught up in about 14m"
             )),
             "{rows:#?}"
         );
@@ -4073,8 +4073,8 @@ mod tests {
     #[test]
     fn now_card_lists_actions_and_confirmation_keys() {
         let mut model = Model::default();
-        model.actor = "person/nathan".into();
-        model.now.items.push(serde_json::from_str(r#"{"kind":"attention","id":"attention/a","revision":"one","updated_at":"2026-09-25T08:00:00Z","attention_kind":"human-gate","source_id":"step-run/a","person_id":"person/nathan","title":"Review deployment","detail":"Approve the release?","priority":"high","state":"open","requested_at":"2026-09-25T08:00:00Z","actions":["review.approve","review.reject"]}"#).unwrap());
+        model.actor = "person/alex".into();
+        model.now.items.push(serde_json::from_str(r#"{"kind":"attention","id":"attention/a","revision":"one","updated_at":"2026-09-25T08:00:00Z","attention_kind":"human-gate","source_id":"step-run/a","person_id":"person/alex","title":"Review deployment","detail":"Approve the release?","priority":"high","state":"open","requested_at":"2026-09-25T08:00:00Z","actions":["review.approve","review.reject"]}"#).unwrap());
         let app = App::new(model);
         let mut terminal = Terminal::new(TestBackend::new(110, 35)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
@@ -4092,8 +4092,8 @@ mod tests {
     #[tokio::test]
     async fn attention_key_requires_explicit_confirmation() {
         let mut model = Model::default();
-        model.actor = "person/nathan".into();
-        model.now.items.push(serde_json::from_str(r#"{"kind":"attention","id":"attention/a","revision":"one","updated_at":"2026-09-25T08:00:00Z","attention_kind":"human-gate","source_id":"step-run/a","person_id":"person/nathan","title":"Review","detail":"Approve?","priority":"high","state":"open","requested_at":"2026-09-25T08:00:00Z","actions":["review.approve","review.reject"]}"#).unwrap());
+        model.actor = "person/alex".into();
+        model.now.items.push(serde_json::from_str(r#"{"kind":"attention","id":"attention/a","revision":"one","updated_at":"2026-09-25T08:00:00Z","attention_kind":"human-gate","source_id":"step-run/a","person_id":"person/alex","title":"Review","detail":"Approve?","priority":"high","state":"open","requested_at":"2026-09-25T08:00:00Z","actions":["review.approve","review.reject"]}"#).unwrap());
         let mut app = App::new(model);
         let client = Client::unix("/nonexistent-stui-test.sock");
         handle_key(

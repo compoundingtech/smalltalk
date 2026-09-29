@@ -70,7 +70,7 @@ HTTPS route after every rollout, then make an authenticated paired-client read.
 This provides tailnet-only HTTPS and WebSocket transport at the host's Tailscale name while the
 gateway continues to enforce the same paired credential, scopes, terminal subprotocol, and
 single-use attachment capability. Begin pairing over the trusted local socket with, for example,
-`st devices --as person/nathan pair "Nathan iPhone"`; complete pairing from the remote device over
+`st devices --as person/alex pair "Alex iPhone"`; complete pairing from the remote device over
 the served gateway. To remove the carrier without changing graph credentials or daemon state:
 
 ```sh
@@ -349,7 +349,7 @@ Pairing codes expire after five minutes and reveal no fleet secret. The remote d
 request its own actor or scopes. By default the trusted local begin grants projection reads,
 terminal reads, attention control, and launch control. For an intentionally trusted device that
 needs Chat sends, mission/work actions, runtime control, and terminal input, the initiating person
-must use `st devices --as person/nathan pair --full-control "Nathan iPhone"` on the trusted local
+must use `st devices --as person/alex pair --full-control "Alex iPhone"` on the trusted local
 socket. The selected concrete scopes are sealed into that pairing; existing limited devices are
 not silently upgraded and must be re-paired, then revoked when no longer needed. Revocation takes
 effect for every subsequent request, including a new bounded terminal WebSocket exchange.

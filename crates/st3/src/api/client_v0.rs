@@ -6232,7 +6232,7 @@ mission "watch-work" state="ready" {
                 mission: "watch-work".into(),
                 revision: None,
                 workspace: root.path().display().to_string(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "client-watch-run".into(),
@@ -6347,7 +6347,7 @@ subscription "watch/source" {
                 idempotency_key: None,
             })
             .unwrap();
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let snapshot = new_client_snapshot(&state);
         let desired = state.store.selected_desired_token(&owner).unwrap().unwrap();
         let request = ActionRequest {
@@ -6414,7 +6414,7 @@ subscription "watch/source" {
                 mission: "reset-work".into(),
                 revision: None,
                 workspace: root.path().display().to_string(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "reset-run".into(),
@@ -6456,7 +6456,7 @@ subscription "watch/source" {
             })
             .unwrap();
         let snapshot = new_client_snapshot(&state);
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let request = ActionRequest {
             api_version: CLIENT_API_VERSION.into(),
             id: "action/reset-worker".into(),
@@ -6510,7 +6510,7 @@ subscription "watch/source" {
                 mission: "retry-work".into(),
                 revision: None,
                 workspace: root.path().display().to_string(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "client-retry-run".into(),
@@ -6523,7 +6523,7 @@ subscription "watch/source" {
             .unwrap();
         let current = state.store.step_run(&step.subject).unwrap().unwrap();
         let snapshot = new_client_snapshot(&state);
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let mut request = ActionRequest {
             api_version: CLIENT_API_VERSION.into(),
             id: "action/retry-check".into(),
@@ -6589,7 +6589,7 @@ subscription "watch/source" {
             .unwrap();
         assert!(peer_success > 1_000);
 
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let machines =
             machine_resources(&state, false, &new_client_snapshot(&state), &session).unwrap();
         let edge = machines
@@ -6613,12 +6613,12 @@ subscription "watch/source" {
             .request_attention(
                 "attention/sync-demo",
                 &crate::model::AttentionRequest {
-                    reviewer: "person/nathan".into(),
+                    reviewer: "person/alex".into(),
                     title: "Review the invented plan".into(),
                     reason: "A replicated change must refresh Now.".into(),
                     severity: "warning".into(),
                     targets: Vec::new(),
-                    actor: "agent/fleet/example/builder".into(),
+                    actor: "agent/example/example/builder".into(),
                     idempotency_key: "attention-event".into(),
                 },
             )
@@ -6761,7 +6761,7 @@ subscription "watch/source" {
             .record_transport_observation("laptop", "down", Some("asleep"), None)
             .unwrap();
 
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let machines =
             machine_resources(&state, false, &new_client_snapshot(&state), &session).unwrap();
         let laptop = machines
@@ -6788,12 +6788,12 @@ subscription "watch/source" {
             .append_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "custom.client.pairing-begun".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
                     ("pairing_id".into(), Value::String("pairing/named".into())),
                     (
                         "device_name".into(),
-                        Value::String("Nathan's iPhone".into()),
+                        Value::String("Alex's iPhone".into()),
                     ),
                 ]),
                 evidence: Vec::new(),
@@ -6806,13 +6806,13 @@ subscription "watch/source" {
             .append_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "custom.client.pairing-completed".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
                     ("device_id".into(), Value::String("device/named".into())),
-                    ("person_id".into(), Value::String("person/nathan".into())),
+                    ("person_id".into(), Value::String("person/alex".into())),
                     (
                         "session_actor".into(),
-                        Value::String("person/nathan/session/named".into()),
+                        Value::String("person/alex/session/named".into()),
                     ),
                     (
                         "expires_at_unix_ms".into(),
@@ -6825,8 +6825,8 @@ subscription "watch/source" {
             })
             .unwrap();
         let resources =
-            device_resources(&state, &new_client_snapshot(&state), "person/nathan").unwrap();
-        assert_eq!(resources[0]["name"], "Nathan's iPhone");
+            device_resources(&state, &new_client_snapshot(&state), "person/alex").unwrap();
+        assert_eq!(resources[0]["name"], "Alex's iPhone");
     }
 
     #[test]
@@ -6840,7 +6840,7 @@ subscription "watch/source" {
             .append_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "custom.client.pairing-completed".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
                     (
                         "credential_hash".into(),
@@ -6850,7 +6850,7 @@ subscription "watch/source" {
                         "session_actor".into(),
                         Value::String("client/test-session".into()),
                     ),
-                    ("person_id".into(), Value::String("person/nathan".into())),
+                    ("person_id".into(), Value::String("person/alex".into())),
                     ("scopes".into(), json!(["read.projections"])),
                     (
                         "expires_at_unix_ms".into(),
@@ -6878,7 +6878,7 @@ subscription "watch/source" {
             .append_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "custom.client.pairing-revoked".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::new(),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -7228,7 +7228,7 @@ mission "example/zero-run" state="ready" {
                 store_index: 9,
                 kind: "message.sent".into(),
                 subject: "message/safe-id".into(),
-                body: json!({"fields": {"content": "PRIVATE-MESSAGE", "from": "person/nathan", "to": "agent/worker", "session_id": "session/current"}}),
+                body: json!({"fields": {"content": "PRIVATE-MESSAGE", "from": "person/alex", "to": "agent/worker", "session_id": "session/current"}}),
             },
         ] {
             let projected = safe_event_projection(&state, &record);
@@ -7296,9 +7296,9 @@ mission "example/zero-run" state="ready" {
             .append_claim(&ClaimInput {
                 subject: "message/original-time".into(),
                 kind: "message.sent".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
-                    ("from".into(), Value::String("person/nathan".into())),
+                    ("from".into(), Value::String("person/alex".into())),
                     ("to".into(), Value::String("agent/worker".into())),
                     ("content".into(), Value::String("safe".into())),
                     ("status".into(), Value::String("sent".into())),
@@ -7325,9 +7325,9 @@ mission "example/zero-run" state="ready" {
                 .append_claim(&ClaimInput {
                     subject: format!("message/{id}"),
                     kind: "message.sent".into(),
-                    actor: Some("person/nathan".into()),
+                    actor: Some("person/alex".into()),
                     fields: BTreeMap::from([
-                        ("from".into(), Value::String("person/nathan".into())),
+                        ("from".into(), Value::String("person/alex".into())),
                         ("to".into(), Value::String("agent/worker".into())),
                         ("content".into(), Value::String("secret".into())),
                         ("status".into(), Value::String("sent".into())),
@@ -7403,9 +7403,9 @@ mission "example/zero-run" state="ready" {
                     .append_claim(&ClaimInput {
                         subject: format!("message/{id}"),
                         kind: "message.sent".into(),
-                        actor: Some("person/nathan".into()),
+                        actor: Some("person/alex".into()),
                         fields: BTreeMap::from([
-                            ("from".into(), Value::String("person/nathan".into())),
+                            ("from".into(), Value::String("person/alex".into())),
                             ("to".into(), Value::String("agent/worker".into())),
                             ("content".into(), Value::String(id.into())),
                             ("status".into(), Value::String("sent".into())),
@@ -7446,9 +7446,9 @@ mission "example/zero-run" state="ready" {
                 .append_claim(&ClaimInput {
                     subject: format!("message/{id}"),
                     kind: "message.sent".into(),
-                    actor: Some("person/nathan".into()),
+                    actor: Some("person/alex".into()),
                     fields: BTreeMap::from([
-                        ("from".into(), Value::String("person/nathan".into())),
+                        ("from".into(), Value::String("person/alex".into())),
                         ("to".into(), Value::String(owner.into())),
                         ("content".into(), Value::String(id.into())),
                         ("status".into(), Value::String("sent".into())),
@@ -7622,9 +7622,9 @@ mission "example/zero-run" state="ready" {
             .append_claim(&ClaimInput {
                 subject: "message/wake".into(),
                 kind: "message.sent".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
-                    ("from".into(), Value::String("person/nathan".into())),
+                    ("from".into(), Value::String("person/alex".into())),
                     ("to".into(), Value::String("agent/worker".into())),
                     ("content".into(), Value::String("wake".into())),
                     ("status".into(), Value::String("sent".into())),
@@ -7859,7 +7859,7 @@ mission "example/zero-run" state="ready" {
         let session_id = owned_sessions[0]["id"].as_str().unwrap().to_owned();
         assert_eq!(agent["current_session_id"], session_id);
 
-        let client_session = ClientSession::local(Some("person/nathan")).unwrap();
+        let client_session = ClientSession::local(Some("person/alex")).unwrap();
         let action = |key: &str, parameters: Value| ActionRequest {
             api_version: CLIENT_API_VERSION.into(),
             id: format!("action/{key}"),
@@ -8049,7 +8049,7 @@ mission "example/zero-run" state="ready" {
                 .unwrap();
         }
         let snapshot = new_client_snapshot(&state);
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let session_id = super::managed_session_id(owner, incarnation);
         let timeline = timeline_value(
             &state,
@@ -8070,9 +8070,9 @@ mission "example/zero-run" state="ready" {
             .append_claim(&ClaimInput {
                 subject: "message/managed-native".into(),
                 kind: "message.sent".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
-                    ("from".into(), json!("person/nathan")),
+                    ("from".into(), json!("person/alex")),
                     ("to".into(), json!(owner)),
                     ("session_id".into(), json!(session_id)),
                     ("content".into(), json!("Native message")),
@@ -8199,7 +8199,7 @@ mission "example/zero-run" state="ready" {
     fn managed_omp_session_reads_the_current_saved_conversation() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "managed-omp-test");
-        let owner = "agent/fleet/pty-rust/omp";
+        let owner = "agent/example/pty-rust/omp";
         let identity = owner.strip_prefix("agent/").unwrap();
         let incarnation = "123:2026-09-25T15:11:54.870Z";
         let directory = state
@@ -8309,9 +8309,9 @@ mission "example/zero-run" state="ready" {
             .append_claim(&ClaimInput {
                 subject: "message/timeline-user".into(),
                 kind: "message.sent".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
-                    ("from".into(), Value::String("person/nathan".into())),
+                    ("from".into(), Value::String("person/alex".into())),
                     ("to".into(), Value::String(subject.into())),
                     ("content".into(), Value::String("do the work".into())),
                     ("status".into(), Value::String("sent".into())),
@@ -8847,7 +8847,7 @@ mission "example/zero-run" state="ready" {
                 idempotency_key: None,
             })
             .unwrap();
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let request = ActionRequest {
             api_version: CLIENT_API_VERSION.into(),
             id: "action/terminal-attach-crash".into(),
@@ -9014,7 +9014,7 @@ mission "example/zero-run" state="ready" {
             },
             parameters: json!({ "target_id": "terminal/agent/concurrent-terminal-owner" }),
         };
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let count = 8;
         let barrier = Arc::new(Barrier::new(count));
         let threads = (0..count)
@@ -9104,7 +9104,7 @@ mission "example/zero-run" state="ready" {
             .store
             .append_claim(&runtime("running", "same-runtime-id:i1", "owner-running"))
             .unwrap();
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let projected = runtime_resources(&owner, true, &new_client_snapshot(&owner), &session)
             .unwrap()
             .into_iter()
@@ -9185,8 +9185,8 @@ mission "example/zero-run" state="ready" {
         })
         .unwrap();
         let paired = ClientSession {
-            actor: "person/nathan/session/device-one".into(),
-            authority_actor: "person/nathan".into(),
+            actor: "person/alex/session/device-one".into(),
+            authority_actor: "person/alex".into(),
             transport: "paired",
             scopes: ["terminal.read".into()].into_iter().collect(),
         };
@@ -9199,7 +9199,7 @@ mission "example/zero-run" state="ready" {
         let remote_capability = remote["stream_capability"].as_str().unwrap();
         assert_ne!(remote_capability, capability);
         let another_device = ClientSession {
-            actor: "person/nathan/session/device-two".into(),
+            actor: "person/alex/session/device-two".into(),
             ..paired.clone()
         };
         assert_eq!(

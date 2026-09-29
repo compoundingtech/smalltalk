@@ -157,9 +157,9 @@ mod tests {
     #[test]
     fn scope_unit_is_unique_and_systemd_safe() {
         // Keeps the (dotted) id for greppability, gains the st2- prefix, a nonce, and the .scope suffix.
-        let u = scope_unit("hetz.demo.agent");
+        let u = scope_unit("example-linux.demo.agent");
         assert!(
-            u.starts_with("st2-hetz.demo.agent-"),
+            u.starts_with("st2-example-linux.demo.agent-"),
             "unexpected unit name {u}"
         );
         assert!(u.ends_with(".scope"), "unexpected unit name {u}");

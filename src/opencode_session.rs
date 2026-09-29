@@ -2740,9 +2740,9 @@ mod tests {
     impl ContextFixture {
         fn new() -> Self {
             let tmp = tempfile::tempdir().unwrap();
-            let agent_dir = tmp.path().join("agents").join("hetz").join("seat");
+            let agent_dir = tmp.path().join("agents").join("example-linux").join("seat");
             std::fs::create_dir_all(&agent_dir).unwrap();
-            let producer = ContextProducer::new(&agent_dir, "hetz.seat", "incarnation-1").unwrap();
+            let producer = ContextProducer::new(&agent_dir, "example-linux.seat", "incarnation-1").unwrap();
             Self {
                 _tmp: tmp,
                 agent_dir,

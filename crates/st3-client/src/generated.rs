@@ -163,8 +163,8 @@ pub struct SyncPeer {
 }
 
 impl SyncPeer {
-    /// `Silber has 124,384 envelopes this host lacks · caught up in about 14m`, or
-    /// `Silber projects a different graph from the same envelopes` once they diverged.
+    /// `ExampleMac has 124,384 envelopes this host lacks · caught up in about 14m`, or
+    /// `ExampleMac projects a different graph from the same envelopes` once they diverged.
     pub fn summary(&self) -> String {
         let host = self.host_id.strip_prefix("host/").unwrap_or(&self.host_id);
         if self.diverged_since.is_some() {

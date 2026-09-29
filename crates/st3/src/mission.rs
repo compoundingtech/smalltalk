@@ -2934,7 +2934,7 @@ mission "alert-loop" state="ready" {
     on-exhausted {
       fail
       attention "Automatic review failed" {
-        reviewer "person/nathan"
+        reviewer "person/alex"
         severity "error"
       }
     }
@@ -2948,7 +2948,7 @@ mission "alert-loop" state="ready" {
             .unwrap();
         let attention = loop_spec.exhaustion_attention.as_ref().unwrap();
         assert_eq!(attention.title, "Automatic review failed");
-        assert_eq!(attention.reviewer, "person/nathan");
+        assert_eq!(attention.reviewer, "person/alex");
         assert_eq!(attention.severity, "error");
 
         let source = r#"
@@ -3008,7 +3008,7 @@ mission "bad" state="ready" {
   loop "work" {
     max-rounds 2
     round { completion { when "all-steps-exhausted" } }
-    on-exhausted { succeed; attention "Wrong" { reviewer "person/nathan" } }
+    on-exhausted { succeed; attention "Wrong" { reviewer "person/alex" } }
   }
 }"#,
                 "invalid-loop-exhaustion-attention",
@@ -3106,7 +3106,7 @@ version 2
     goal "Complete mission review."
     step "approval" {
       gate "human-review" type="human" {
-        reviewer "person/nathan"
+        reviewer "person/alex"
         question "Is this change ready to merge?"
         review "resource/mission-run/${ST_MISSION_RUN}/pull-request"
         review "doc/reports/run@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -3130,7 +3130,7 @@ version 2
         else {
             panic!("the gate is not human");
         };
-        assert_eq!(reviewer, "person/nathan");
+        assert_eq!(reviewer, "person/alex");
         assert_eq!(mode.as_deref(), Some("approve"));
         assert_eq!(question.as_deref(), Some("Is this change ready to merge?"));
         assert_eq!(
@@ -3505,7 +3505,7 @@ version 2
 
         let seat = crate::graph::parse_intent(
             r#"version 2
- agent "fleet/example/builder" {
+ agent "example/example/builder" {
    workspace "."
    command "true"
    constraint "Do not push."
@@ -3788,9 +3788,9 @@ mission "standing" state="ready" {
     command "true"
     mission-authority {
       publish "project/generated"
-      publish "fleet/fabric/*"
-      start "fleet/fabric/*"
-      revise "fleet/fabric/queue"
+      publish "example/fabric/*"
+      start "example/fabric/*"
+      revise "example/fabric/queue"
     }
   }
 }"#,
@@ -3809,11 +3809,11 @@ mission "standing" state="ready" {
         let desired = &runtime.subjects["agent/standing/planner"].desired;
         let authority = crate::graph::agent_mission_authority(desired);
         assert!(authority.allows("publish", "project/generated"));
-        assert!(authority.allows("publish", "fleet/fabric/cycle"));
-        assert!(!authority.allows("publish", "fleet/fabrics/cycle"));
-        assert!(authority.allows("start", "fleet/fabric/cycle"));
-        assert!(authority.allows("revise", "fleet/fabric/queue"));
-        assert!(!authority.allows("revise", "fleet/fabric/other"));
+        assert!(authority.allows("publish", "example/fabric/cycle"));
+        assert!(!authority.allows("publish", "example/fabrics/cycle"));
+        assert!(authority.allows("start", "example/fabric/cycle"));
+        assert!(authority.allows("revise", "example/fabric/queue"));
+        assert!(!authority.allows("revise", "example/fabric/other"));
 
         for source in [
             r#"version 2
@@ -3839,8 +3839,8 @@ mission "standing" state="ready" {
     workspace "."
     command "true"
     queue-authority {
-      move "fleet/fabric/builder"
-      move "fleet/review/*"
+      move "example/fabric/builder"
+      move "example/review/*"
       move "${ST_MISSION_RUN}/worker"
     }
   }
@@ -3861,12 +3861,12 @@ mission "standing" state="ready" {
             crate::graph::parse_execution_intent(&declarations, "node", "standing").unwrap();
         let desired = &runtime.subjects["agent/standing/chief"].desired;
         let authority = crate::graph::agent_queue_authority(desired);
-        assert!(authority.allows_move("agent/fleet/fabric/builder"));
-        assert!(authority.allows_move("fleet/fabric/builder"));
-        assert!(!authority.allows_move("agent/fleet/fabric/builder-two"));
-        assert!(authority.allows_move("agent/fleet/review/one"));
-        assert!(!authority.allows_move("agent/fleet/reviews/one"));
-        assert!(!authority.allows_move("agent/fleet/review"));
+        assert!(authority.allows_move("agent/example/fabric/builder"));
+        assert!(authority.allows_move("example/fabric/builder"));
+        assert!(!authority.allows_move("agent/example/fabric/builder-two"));
+        assert!(authority.allows_move("agent/example/review/one"));
+        assert!(!authority.allows_move("agent/example/reviews/one"));
+        assert!(!authority.allows_move("agent/example/review"));
         assert!(authority.allows_move("agent/standing/worker"));
         assert!(!authority.allows_move("agent/standing/chief"));
         assert_eq!(
@@ -3879,15 +3879,15 @@ mission "standing" state="ready" {
             r#"version 2
 mission "bad" state="ready" { goal "Reject empty authority."; agent "bad" { workspace "."; command "true"; queue-authority { } } }"#,
             r#"version 2
-mission "bad" state="ready" { goal "Reject a prefixed seat."; agent "bad" { workspace "."; command "true"; queue-authority { move "agent/fleet/worker" } } }"#,
+mission "bad" state="ready" { goal "Reject a prefixed seat."; agent "bad" { workspace "."; command "true"; queue-authority { move "agent/example/worker" } } }"#,
             r#"version 2
-mission "bad" state="ready" { goal "Reject an internal wildcard."; agent "bad" { workspace "."; command "true"; queue-authority { move "fleet/*/worker" } } }"#,
+mission "bad" state="ready" { goal "Reject an internal wildcard."; agent "bad" { workspace "."; command "true"; queue-authority { move "example/*/worker" } } }"#,
             r#"version 2
 mission "bad" state="ready" { goal "Reject a bare wildcard."; agent "bad" { workspace "."; command "true"; queue-authority { move "*" } } }"#,
             r#"version 2
-mission "bad" state="ready" { goal "Reject a duplicate rule."; agent "bad" { workspace "."; command "true"; queue-authority { move "fleet/*"; move "fleet/*" } } }"#,
+mission "bad" state="ready" { goal "Reject a duplicate rule."; agent "bad" { workspace "."; command "true"; queue-authority { move "example/*"; move "example/*" } } }"#,
             r#"version 2
-mission "bad" state="ready" { goal "Reject an unknown verb."; agent "bad" { workspace "."; command "true"; queue-authority { reorder "fleet/worker" } } }"#,
+mission "bad" state="ready" { goal "Reject an unknown verb."; agent "bad" { workspace "."; command "true"; queue-authority { reorder "example/worker" } } }"#,
             r#"version 2
 mission "bad" state="ready" { goal "Reject a second block."; agent "bad" { workspace "."; command "true"; queue-authority { move "a" }; queue-authority { move "b" } } }"#,
         ] {
@@ -4065,10 +4065,10 @@ version 2
         let separate_seat = crate::graph::parse_intent(
             r#"
 version 2
-agent "fleet/reviewer" { workspace "."; command "true" }
+agent "example/reviewer" { workspace "."; command "true" }
 mission "finite" state="ready" {
   goal "Keep root seats separate from mission authority."
-  step "work" { assigned-to "agent/fleet/reviewer" }
+  step "work" { assigned-to "agent/example/reviewer" }
 }
 "#,
             "node",

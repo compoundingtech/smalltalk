@@ -22,8 +22,8 @@ for (const rejected of [
 // LAN gateways: .local names and RFC1918 IPv4 over plain HTTP, labelled so the UI can warn.
 const { gatewayTransport } = await import('./gatewayUrl.ts');
 for (const [url, normalized] of [
-  ['http://Silber.local:4102/', 'http://silber.local:4102'],
-  ['http://studio-mac.local:4102', 'http://studio-mac.local:4102'],
+  ['http://ExampleMac.local:4102/', 'http://example-mac.local:4102'],
+  ['http://example-mac.local:4102', 'http://example-mac.local:4102'],
   ['http://10.0.0.5:4102', 'http://10.0.0.5:4102'],
   ['http://172.16.0.1:4102', 'http://172.16.0.1:4102'],
   ['http://172.31.255.254:4102', 'http://172.31.255.254:4102'],
@@ -41,9 +41,9 @@ for (const rejected of [
   'http://192.0.2.10:4102',
   'http://8.8.8.8',
   'http://local', // bare suffix
-  'http://silber.local.example.com:4102',
+  'http://example-mac.local.example.com:4102',
   'http://evil.com/.local',
-  'http://user@silber.local:4102',
+  'http://user@example-mac.local:4102',
 ]) {
   assert.equal(normalizeGatewayUrl(rejected), null, rejected);
   assert.equal(gatewayTransport(rejected), null, rejected);

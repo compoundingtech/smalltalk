@@ -13,7 +13,7 @@ Canonical KDL is the authoring interface. Publish one explicit Agent Spec transa
 
 Read the [vision](docs/vrs/vision.md), [requirements](docs/vrs/requirements.md), and
 [specification](docs/vrs/spec.md) before changing product behavior. Update `docs/vrs/spec.md` with
-implementation changes. Nathan must approve changes to `docs/vrs/vision.md` or
+implementation changes. Alex must approve changes to `docs/vrs/vision.md` or
 `docs/vrs/requirements.md`.
 
 ## Install
@@ -433,7 +433,7 @@ ensure-line "AGENTS.md" "@.st2/CONTRACT.md"
 ```
 
 Each harness loads the import from its native contract file. A later boot-prompt rewrite cannot
-silently remove the contract-loading instruction. On 2026-09-01, Nathan stated that Codex supports
+silently remove the contract-loading instruction. On 2026-09-01, Alex stated that Codex supports
 `@` imports in `AGENTS.md`. This Codex behavior is undocumented and was not source-verified for this
 change.
 

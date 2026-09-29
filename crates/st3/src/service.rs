@@ -1066,11 +1066,11 @@ mod tests {
     fn launchd_plist_has_supervision_logs_and_a_file_limit() -> Result<()> {
         let config = Config {
             node: "node-a".into(),
-            state_dir: "/Users/test/Library/Application Support/st3".into(),
+            state_dir: "/Users/example/Library/Application Support/st3".into(),
             socket: "/tmp/st3.sock".into(),
             ..Config::default()
         };
-        let spec = ServiceSpec::new("/Users/test/bin/st3", config, 1024)?;
+        let spec = ServiceSpec::new("/Users/example/bin/st3", config, 1024)?;
         let plist = render_launchd_plist(&spec);
         assert!(plist.contains("<string>com.compoundingtech.st3</string>"));
         assert!(plist.contains("<key>RunAtLoad</key><true/>"));
@@ -1088,8 +1088,8 @@ mod tests {
 
     #[test]
     fn macos_permission_guidance_names_the_exact_binary_and_manual_steps() {
-        let guidance = macos_permission_guidance(Path::new("/Users/test/bin/st3"));
-        assert!(guidance.contains("st executable\t/Users/test/bin/st3"));
+        let guidance = macos_permission_guidance(Path::new("/Users/example/bin/st3"));
+        assert!(guidance.contains("st executable\t/Users/example/bin/st3"));
         assert!(guidance.contains("Full Disk Access"));
         assert!(guidance.contains("Developer Tools"));
         assert!(guidance.contains("cannot grant"));

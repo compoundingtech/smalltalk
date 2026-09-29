@@ -18,7 +18,7 @@ iOS app must test against the same files.
 
 ## Definition of good
 
-Agreed with Nathan on 2026-09-28. Every screen is judged by these.
+Every screen is judged by these.
 
 1. **Never claim what you don't know.** Loading, empty and failed are three different states. A
    list that has not loaded says "Loading…", never "No items". A preview that cannot be read says

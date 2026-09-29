@@ -346,7 +346,7 @@ async fn attention_withdraw_removes_an_obsolete_request_from_now() {
         .request_attention(
             "attention/obsolete",
             &AttentionRequest {
-                reviewer: "person/nathan".into(),
+                reviewer: "person/alex".into(),
                 title: "No action needed".into(),
                 reason: "The original blocker has cleared.".into(),
                 severity: "warning".into(),
@@ -384,7 +384,7 @@ async fn attention_withdraw_removes_an_obsolete_request_from_now() {
         .await,
     );
     assert_eq!(withdrawn["status"], "withdrawn");
-    let current = value(&run_cli(&socket, &["attention", "ls", "--as", "person/nathan"]).await);
+    let current = value(&run_cli(&socket, &["attention", "ls", "--as", "person/alex"]).await);
     assert!(current["value"]["items"].as_array().unwrap().is_empty());
     server.abort();
 }
@@ -419,7 +419,7 @@ mission "typecase" state="ready" {
             mission: "typecase".into(),
             revision: None,
             workspace: "/tmp".into(),
-            requester: Some("person/nathan".into()),
+            requester: Some("person/alex".into()),
             mode: Some("run".into()),
             inputs: BTreeMap::new(),
             idempotency_key: "typecase-run".into(),
@@ -432,12 +432,12 @@ mission "typecase" state="ready" {
         .request_attention(
             "attention/typecase-remote-control",
             &AttentionRequest {
-                reviewer: "person/nathan".into(),
+                reviewer: "person/alex".into(),
                 title: "Publish Typecase without remote control".into(),
                 reason: "Publish the prepared revision as a person.".into(),
                 severity: "warning".into(),
                 targets: vec!["mission/typecase".into(), "resource/typecase/kdl".into()],
-                actor: "agent/fleet/st3".into(),
+                actor: "agent/example/st3".into(),
                 idempotency_key: "typecase-remote-control".into(),
             },
         )
@@ -455,7 +455,7 @@ mission "typecase" state="ready" {
     }
     assert!(socket.exists());
 
-    let now = run_cli_human(&socket, &["now", "--as", "person/nathan"]).await;
+    let now = run_cli_human(&socket, &["now", "--as", "person/alex"]).await;
     assert!(
         now.status.success(),
         "{}",
@@ -471,7 +471,7 @@ mission "typecase" state="ready" {
         "a resource has no state to show:\n{now}"
     );
 
-    let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/nathan"]).await);
+    let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/alex"]).await);
     let states = &listed["value"]["items"][0]["target_states"];
     assert_eq!(states[0]["id"], "mission/typecase");
     assert_eq!(states[0]["state"], "cancelled");
@@ -538,7 +538,7 @@ mission "cli/child" state="ready" {
             mission: "cli/root".into(),
             revision: None,
             workspace: "/tmp".into(),
-            requester: Some("person/nathan".into()),
+            requester: Some("person/alex".into()),
             mode: Some("run".into()),
             inputs: BTreeMap::new(),
             idempotency_key: "cli-root-run".into(),
@@ -550,7 +550,7 @@ mission "cli/child" state="ready" {
                 mission: "cli/child".into(),
                 revision: None,
                 workspace: "/tmp".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "cli-child-run".into(),
@@ -603,17 +603,17 @@ mission "cli/child" state="ready" {
         .append_claim(&ClaimInput {
             subject: "custom/client/cli-device".into(),
             kind: "custom.client.pairing-completed".into(),
-            actor: Some("person/nathan".into()),
+            actor: Some("person/alex".into()),
             fields: BTreeMap::from([
                 (
                     "credential_hash".into(),
                     Value::String(hex::encode(Sha256::digest(b"cli credential"))),
                 ),
                 ("device_id".into(), Value::String("device/cli".into())),
-                ("person_id".into(), Value::String("person/nathan".into())),
+                ("person_id".into(), Value::String("person/alex".into())),
                 (
                     "session_actor".into(),
-                    Value::String("person/nathan/session/cli".into()),
+                    Value::String("person/alex/session/cli".into()),
                 ),
                 ("scopes".into(), serde_json::json!(["read.projections"])),
                 ("expires_at_unix_ms".into(), serde_json::json!(u64::MAX / 2)),
@@ -637,13 +637,13 @@ mission "cli/child" state="ready" {
     }
     assert!(socket.exists(), "client-v0 test socket did not appear");
 
-    let now = value(&run_cli(&socket, &["now", "--as", "person/nathan"]).await);
+    let now = value(&run_cli(&socket, &["now", "--as", "person/alex"]).await);
     assert_eq!(now["api_version"], "st3.client.v0");
     assert_eq!(now["value"]["collection"], "now");
-    assert_eq!(now["value"]["filters"]["person"], "person/nathan");
+    assert_eq!(now["value"]["filters"]["person"], "person/alex");
 
     for arguments in [
-        vec!["attention", "ls", "--as", "person/nathan"],
+        vec!["attention", "ls", "--as", "person/alex"],
         vec!["agents", "ls"],
         vec!["agents", "tree"],
         vec!["work", "ls"],
@@ -786,14 +786,14 @@ mission "cli/child" state="ready" {
     assert_eq!(activity["api_version"], "st3.client.v0");
     assert_eq!(activity["value"]["kind"], "event-page");
 
-    let devices = value(&run_cli(&socket, &["devices", "--as", "person/nathan"]).await);
+    let devices = value(&run_cli(&socket, &["devices", "--as", "person/alex"]).await);
     assert_eq!(devices["value"]["items"][0]["id"], "device/cli");
     assert_eq!(devices["value"]["items"][0]["state"], "active");
 
     let pairing = value(
         &run_cli(
             &socket,
-            &["devices", "--as", "person/nathan", "pair", "test-phone"],
+            &["devices", "--as", "person/alex", "pair", "test-phone"],
         )
         .await,
     );
@@ -803,32 +803,32 @@ mission "cli/child" state="ready" {
     let revoked = value(
         &run_cli(
             &socket,
-            &["devices", "--as", "person/nathan", "revoke", "device/cli"],
+            &["devices", "--as", "person/alex", "revoke", "device/cli"],
         )
         .await,
     );
     assert_eq!(revoked["api_version"], "st3.client.v0");
     assert_eq!(revoked["value"]["status"], "completed");
 
-    let current = value(&run_cli(&socket, &["devices", "--as", "person/nathan"]).await);
+    let current = value(&run_cli(&socket, &["devices", "--as", "person/alex"]).await);
     assert!(current["value"]["items"].as_array().unwrap().is_empty());
-    let history = value(&run_cli(&socket, &["devices", "--as", "person/nathan", "--all"]).await);
+    let history = value(&run_cli(&socket, &["devices", "--as", "person/alex", "--all"]).await);
     assert_eq!(history["value"]["items"][0]["state"], "revoked");
 
     for (arguments, heading) in [
-        (vec!["now", "--as", "person/nathan"], "NEEDS YOU"),
+        (vec!["now", "--as", "person/alex"], "NEEDS YOU"),
         (vec!["machines"], "MACHINES"),
         (vec!["activity", "--limit", "10"], "ACTIVITY"),
-        (vec!["devices", "--as", "person/nathan", "--all"], "DEVICES"),
+        (vec!["devices", "--as", "person/alex", "--all"], "DEVICES"),
         (
-            vec!["attention", "ls", "--as", "person/nathan"],
+            vec!["attention", "ls", "--as", "person/alex"],
             "HUMAN ATTENTION",
         ),
         (vec!["agents", "ls"], "AGENTS"),
         (vec!["agents", "tree"], "AGENT TREE"),
         (vec!["work", "ls"], "WORK"),
         (vec!["terminals", "ls"], "TERMINALS"),
-        (vec!["conversations", "ls", "person/nathan"], "MESSAGES"),
+        (vec!["conversations", "ls", "person/alex"], "MESSAGES"),
     ] {
         let output = run_cli_human(&socket, &arguments).await;
         assert!(

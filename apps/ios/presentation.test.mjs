@@ -11,7 +11,7 @@ assert.deepEqual(attentionHeadline({ count: 0, loaded: false }), { text: 'Attent
 assert.deepEqual(attentionHeadline({ count: 3, loaded: true, error: 'offline' }), { text: '3 actionable items from the last load · refresh failed: offline', warning: true });
 
 // (2) Queued work shows how long the next step has been waiting.
-const pty = { id: 'agent/fleet/pty-rust/standing/hetz.pty-rust', name: 'fleet/pty-rust/standing/hetz.pty-rust', next_work_id: 'step-run/78cb/route', upcoming_work_ids: ['step-run/78cb/route'], queued_work_count: 1 };
+const pty = { id: 'agent/example/pty-rust/standing/example-linux.pty-rust', name: 'fleet/pty-rust/standing/example-linux.pty-rust', next_work_id: 'step-run/78cb/route', upcoming_work_ids: ['step-run/78cb/route'], queued_work_count: 1 };
 const work = [{ id: 'step-run/78cb/route', path: 'route', state: 'ready', updated_at: '2026-09-24T11:56:00Z' }];
 assert.equal(queuedWorkSummary(pty, work, now), 'Next: route · 1 queued · oldest ready 20h');
 assert.equal(queuedWorkSummary({ ...pty, next_work_id: null, queued_work_count: 0 }, work, now), null);
@@ -22,7 +22,7 @@ assert.equal(ago('2026-09-22T08:25:00Z', now), '3d');
 assert.equal(ago('not a time', now), 'unknown');
 
 // (3) A crash-looping seat must stand out rather than read as a normal row.
-const failing = { id: 'agent/fleet/st3/standing/st3', name: 'fleet/st3/standing/st3', state: 'failed', driver: 'codex', harness_state: 'ended', updated_at: '2026-09-25T08:14:00Z', operational: { layer: 'current', actionable: false, reasons: ['unhealthy'] } };
+const failing = { id: 'agent/example/st3/standing/st3', name: 'fleet/st3/standing/st3', state: 'failed', driver: 'codex', harness_state: 'ended', updated_at: '2026-09-25T08:14:00Z', operational: { layer: 'current', actionable: false, reasons: ['unhealthy'] } };
 assert.deepEqual(agentHealth(failing), { healthy: false, label: 'Failed · harness ended · unhealthy' });
 assert.deepEqual(agentHealth({ ...failing, state: 'starting', harness_state: null }), { healthy: false, label: 'Starting · unhealthy' });
 assert.deepEqual(agentHealth({ ...failing, state: 'running', harness_state: 'working', operational: { layer: 'current', actionable: true, reasons: [] } }), { healthy: true, label: 'Running · working' });
@@ -32,11 +32,11 @@ assert.equal(agentHeaderDetail(failing, now), 'codex · Failed · harness ended 
 assert.equal(agentHeaderDetail({ ...failing, driver: null, state: 'running', harness_state: 'ready', operational: undefined }, now), 'harness · Running · ready · observed 11m ago');
 
 // (9) Devices are named, and the connected device is identified.
-const mine = { id: 'device/925c2c443540582eb62871f8', person_id: 'person/nathan', session_actor: 'person/nathan/session/925c', state: 'active', updated_at: '2026-09-24T10:11:34Z', expires_at: '2026-10-24T10:11:27Z' };
-const other = { ...mine, id: 'device/df90eb3d61ba882eb1ee9e14', session_actor: 'person/nathan/session/df90' };
-assert.equal(deviceTitle({ ...mine, name: 'iPhone' }, 'person/nathan/session/925c'), 'iPhone · this device');
-assert.equal(deviceTitle(mine, 'person/nathan/session/925c'), 'This device');
-assert.equal(deviceTitle(other, 'person/nathan/session/925c'), 'Paired device df90eb3d');
+const mine = { id: 'device/925c2c443540582eb62871f8', person_id: 'person/alex', session_actor: 'person/alex/session/925c', state: 'active', updated_at: '2026-09-24T10:11:34Z', expires_at: '2026-10-24T10:11:27Z' };
+const other = { ...mine, id: 'device/df90eb3d61ba882eb1ee9e14', session_actor: 'person/alex/session/df90' };
+assert.equal(deviceTitle({ ...mine, name: 'iPhone' }, 'person/alex/session/925c'), 'iPhone · this device');
+assert.equal(deviceTitle(mine, 'person/alex/session/925c'), 'This device');
+assert.equal(deviceTitle(other, 'person/alex/session/925c'), 'Paired device df90eb3d');
 assert.notEqual(deviceTitle(mine, 'x'), deviceTitle(other, 'x'));
 assert.equal(deviceDetail(mine, now), 'active · paired 22h ago · expires 2026-10-24');
 
@@ -66,7 +66,7 @@ assert.equal(attentionKindLabel('agent-request'), 'Agent request');
 for (const action of ['attention.resolve', 'review.approve', 'review.reject', 'review.request-changes', 'launch.approve', 'launch.cancel', 'mission.approve-revision', 'mission.cancel-revision', 'message.read']) assert.doesNotMatch(attentionActionLabel(action), /\./);
 
 // (6) Delivery envelopes read as a message, without the unknown marker or raw IDs.
-assert.deepEqual(pingPresentation('[PING] ? agent/fleet/cos/standing/cos: Reclaim bounded reads; TUI and iOS now have their own seats [id:message/2d1268c28b3151be]'), { from: 'COS', text: 'Reclaim bounded reads; TUI and iOS now have their own seats' });
-assert.deepEqual(pingPresentation('[PING] ← person/nathan: Ship it [id:message/abc]'), { from: 'nathan', text: 'Ship it' });
+assert.deepEqual(pingPresentation('[PING] ? agent/example/cos/standing/cos: Reclaim bounded reads; TUI and iOS now have their own seats [id:message/2d1268c28b3151be]'), { from: 'COS', text: 'Reclaim bounded reads; TUI and iOS now have their own seats' });
+assert.deepEqual(pingPresentation('[PING] ← person/alex: Ship it [id:message/abc]'), { from: 'alex', text: 'Ship it' });
 assert.deepEqual(pingPresentation('Plain text [id:message/abc]'), { from: null, text: 'Plain text' });
 assert.deepEqual(pingPresentation('No envelope here'), { from: null, text: 'No envelope here' });

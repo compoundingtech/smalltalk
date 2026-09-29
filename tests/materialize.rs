@@ -58,14 +58,14 @@ fn task_selector_materializes_only_owning_agent() {
     fs::create_dir_all(&owner).unwrap();
     fs::create_dir_all(&sibling).unwrap();
     write(
-        &catalog.join("agents/Silber/cos/agent.kdl"),
+        &catalog.join("agents/ExampleMac/cos/agent.kdl"),
         agent_kdl(&owner, r#"    copy "_templates/owner" "OWNER.txt""#),
     );
     write(
-        &catalog.join("agents/Silber/pty/agent.kdl"),
+        &catalog.join("agents/ExampleMac/pty/agent.kdl"),
         agent_kdl(&sibling, r#"    copy "_templates/sibling" "SIBLING.txt""#)
             .replace("agent \"cos\"", "agent \"pty\"")
-            .replace("Silber.cos", "Silber.pty"),
+            .replace("ExampleMac.cos", "ExampleMac.pty"),
     );
     write(&catalog.join("_templates/owner"), "owner");
     write(&catalog.join("_templates/sibling"), "sibling");
@@ -74,10 +74,10 @@ fn task_selector_materializes_only_owning_agent() {
         .arg(&catalog)
         .args([
             "--host",
-            "Silber",
+            "ExampleMac",
             "--materialize-only",
             "--task",
-            "Silber.cos.agent",
+            "ExampleMac.cos.agent",
         ])
         .output()
         .unwrap();
@@ -101,20 +101,20 @@ fn shared_workspace_conflicting_copy_targets_fail_before_any_write() {
     let workspace = tmp.path().join("shared-workspace");
     fs::create_dir_all(&workspace).unwrap();
     write(
-        &catalog.join("agents/Silber/worker/agent.kdl"),
+        &catalog.join("agents/ExampleMac/worker/agent.kdl"),
         agent_kdl(
             &workspace,
             r#"    copy "_templates/worker.md" ".st2/PERSONA.md""#,
         ),
     );
     write(
-        &catalog.join("agents/Silber/orchestrator/agent.kdl"),
+        &catalog.join("agents/ExampleMac/orchestrator/agent.kdl"),
         agent_kdl(
             &workspace,
             r#"    copy "_templates/orchestrator.md" ".st2/PERSONA.md""#,
         )
         .replace("agent \"cos\"", "agent \"orchestrator\"")
-        .replace("Silber.cos", "Silber.orchestrator"),
+        .replace("ExampleMac.cos", "ExampleMac.orchestrator"),
     );
     write(&catalog.join("_templates/worker.md"), "worker\n");
     write(
@@ -124,7 +124,7 @@ fn shared_workspace_conflicting_copy_targets_fail_before_any_write() {
 
     let found = discover(&catalog);
     assert!(found.errors.is_empty(), "{:?}", found.errors);
-    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+    let report = materialize_catalog(&catalog, &found.specs, "ExampleMac");
 
     assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
     assert!(
@@ -146,20 +146,20 @@ fn selected_owner_cannot_bypass_a_shared_workspace_conflict() {
     let workspace = tmp.path().join("shared-workspace");
     fs::create_dir_all(&workspace).unwrap();
     write(
-        &catalog.join("agents/Silber/worker/agent.kdl"),
+        &catalog.join("agents/ExampleMac/worker/agent.kdl"),
         agent_kdl(
             &workspace,
             r#"    copy "_templates/worker.md" ".st2/PERSONA.md""#,
         ),
     );
     write(
-        &catalog.join("agents/Silber/orchestrator/agent.kdl"),
+        &catalog.join("agents/ExampleMac/orchestrator/agent.kdl"),
         agent_kdl(
             &workspace,
             r#"    copy "_templates/orchestrator.md" ".st2/PERSONA.md""#,
         )
         .replace("agent \"cos\"", "agent \"orchestrator\"")
-        .replace("Silber.cos", "Silber.orchestrator"),
+        .replace("ExampleMac.cos", "ExampleMac.orchestrator"),
     );
     write(&catalog.join("_templates/worker.md"), "worker\n");
     write(
@@ -177,11 +177,11 @@ fn selected_owner_cannot_bypass_a_shared_workspace_conflict() {
         &catalog,
         std::slice::from_ref(worker),
         &found.specs,
-        "Silber",
+        "ExampleMac",
     );
 
     assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
-    assert!(report.failed_agents.contains("Silber.cos"));
+    assert!(report.failed_agents.contains("ExampleMac.cos"));
     assert!(!workspace.join(".st2/PERSONA.md").exists());
 }
 
@@ -193,19 +193,19 @@ fn shared_workspace_byte_identical_claims_are_idempotent() {
     fs::create_dir_all(&workspace).unwrap();
     let render = r#"    copy "_templates/shared.md" ".st2/bus.md""#;
     write(
-        &catalog.join("agents/Silber/a/agent.kdl"),
+        &catalog.join("agents/ExampleMac/a/agent.kdl"),
         agent_kdl(&workspace, render),
     );
     write(
-        &catalog.join("agents/Silber/b/agent.kdl"),
+        &catalog.join("agents/ExampleMac/b/agent.kdl"),
         agent_kdl(&workspace, render)
             .replace("agent \"cos\"", "agent \"b\"")
-            .replace("Silber.cos", "Silber.b"),
+            .replace("ExampleMac.cos", "ExampleMac.b"),
     );
     write(&catalog.join("_templates/shared.md"), "shared\n");
     let found = discover(&catalog);
 
-    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+    let report = materialize_catalog(&catalog, &found.specs, "ExampleMac");
 
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert!(report.failed_agents.is_empty());
@@ -224,19 +224,19 @@ fn shared_workspace_mode_claims_must_match() {
     let regular = r#"    copy "_templates/shared" "bin/tool""#;
     let executable = r#"    copy "_templates/shared" "bin/tool" executable=#true"#;
     write(
-        &catalog.join("agents/Silber/a/agent.kdl"),
+        &catalog.join("agents/ExampleMac/a/agent.kdl"),
         agent_kdl(&workspace, regular),
     );
     write(
-        &catalog.join("agents/Silber/b/agent.kdl"),
+        &catalog.join("agents/ExampleMac/b/agent.kdl"),
         agent_kdl(&workspace, executable)
             .replace("agent \"cos\"", "agent \"b\"")
-            .replace("Silber.cos", "Silber.b"),
+            .replace("ExampleMac.cos", "ExampleMac.b"),
     );
     write(&catalog.join("_templates/shared"), "same\n");
     let found = discover(&catalog);
 
-    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+    let report = materialize_catalog(&catalog, &found.specs, "ExampleMac");
 
     assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
     assert!(report.errors[0].contains("conflicting render ownership"));
@@ -254,16 +254,16 @@ fn task_selector_ambiguous_refuses_without_mutation() {
     fs::create_dir_all(&b).unwrap();
     let kdl = |id: &str, ws: &Path, marker: &str| {
         format!(
-            "agent \"{id}\" {{\n host \"Silber\"\n type \"service\"\n workspace \"{}\"\n pty \"agent\" {{\n  id \"dup\"\n  command \"true\"\n }}\n render {{ file \"MARKER.txt\" \"{marker}\" }}\n}}\n",
+            "agent \"{id}\" {{\n host \"ExampleMac\"\n type \"service\"\n workspace \"{}\"\n pty \"agent\" {{\n  id \"dup\"\n  command \"true\"\n }}\n render {{ file \"MARKER.txt\" \"{marker}\" }}\n}}\n",
             ws.display()
         )
     };
     write(
-        &catalog.join("agents/Silber/a/agent.kdl"),
+        &catalog.join("agents/ExampleMac/a/agent.kdl"),
         kdl("a", &a, "a"),
     );
     write(
-        &catalog.join("agents/Silber/b/agent.kdl"),
+        &catalog.join("agents/ExampleMac/b/agent.kdl"),
         kdl("b", &b, "b"),
     );
     let found = st2::discover(&catalog);
@@ -278,7 +278,7 @@ fn task_selector_ambiguous_refuses_without_mutation() {
     let out = Command::new(env!("CARGO_BIN_EXE_st2"))
         .args(["up", "--catalog"])
         .arg(&catalog)
-        .args(["--host", "Silber", "--materialize-only", "--task", "dup"])
+        .args(["--host", "ExampleMac", "--materialize-only", "--task", "dup"])
         .output()
         .unwrap();
     assert!(!out.status.success());
@@ -290,25 +290,25 @@ fn task_selector_ambiguous_refuses_without_mutation() {
 fn task_selector_wrong_host_refuses_without_mutation() {
     let tmp = tempfile::tempdir().unwrap();
     let catalog = tmp.path().join("catalog");
-    let target = tmp.path().join("hetz-target");
+    let target = tmp.path().join("example-linux-target");
     fs::create_dir_all(&target).unwrap();
     let text = format!(
-        "agent \"remote\" {{\n host \"Hetz\"\n type \"service\"\n workspace \"{}\"\n pty \"agent\" {{ id \"hetz.task\" command \"true\" }}\n render {{ file \"MARKER.txt\" \"remote\" }}\n}}\n",
+        "agent \"remote\" {{\n host \"ExampleLinux\"\n type \"service\"\n workspace \"{}\"\n pty \"agent\" {{ id \"example-linux.task\" command \"true\" }}\n render {{ file \"MARKER.txt\" \"remote\" }}\n}}\n",
         target.display()
     );
-    write(&catalog.join("agents/Hetz/remote/agent.kdl"), text);
+    write(&catalog.join("agents/ExampleLinux/remote/agent.kdl"), text);
     let found = st2::discover(&catalog);
     assert!(found.errors.is_empty());
-    assert_eq!(found.specs[0].tasks[0].id.as_deref(), Some("hetz.task"));
+    assert_eq!(found.specs[0].tasks[0].id.as_deref(), Some("example-linux.task"));
     let out = Command::new(env!("CARGO_BIN_EXE_st2"))
         .args(["up", "--catalog"])
         .arg(&catalog)
         .args([
             "--host",
-            "Silber",
+            "ExampleMac",
             "--materialize-only",
             "--task",
-            "hetz.task",
+            "example-linux.task",
         ])
         .output()
         .unwrap();
@@ -359,11 +359,11 @@ fn task_selector_cli_modes_fail_closed() {
 fn task_selector_single_file_modes_refuse_unchanged() {
     let tmp = tempfile::tempdir().unwrap();
     let spec = tmp.path().join("spec.kdl");
-    fs::write(&spec, "agent \"a\" { host \"Silber\" command \"true\" }\n").unwrap();
+    fs::write(&spec, "agent \"a\" { host \"ExampleMac\" command \"true\" }\n").unwrap();
     let before = fs::read_to_string(&spec).unwrap();
     for extra in [
-        ["--materialize-only", "--task", "Silber.a.agent"],
-        ["--once", "--task", "Silber.a.agent"],
+        ["--materialize-only", "--task", "ExampleMac.a.agent"],
+        ["--once", "--task", "ExampleMac.a.agent"],
     ] {
         let out = Command::new(env!("CARGO_BIN_EXE_st2"))
             .args(["up", spec.to_str().unwrap()])
@@ -387,9 +387,9 @@ fn spec(catalog: &Path, identity: &str) -> AgentSpec {
 fn agent_kdl(workspace: &Path, render: &str) -> String {
     format!(
         r##"agent "cos" {{
-  host "Silber"
+  host "ExampleMac"
   workspace "{}"
-  env {{ ST_AGENT "Silber.cos" }}
+  env {{ ST_AGENT "ExampleMac.cos" }}
   command "true"
   ding
   render {{
@@ -442,7 +442,7 @@ fn every_directive_materializes_in_order_and_is_idempotent() {
         r#"{"keep":true,"nested":{"user":"value"}}"#,
     );
     write(
-        &catalog.join("agents/Silber/cos/agent.kdl"),
+        &catalog.join("agents/ExampleMac/cos/agent.kdl"),
         agent_kdl(
             &workspace,
             r##"    copy "_templates/AGENTS.md" "AGENTS.md"
@@ -463,7 +463,7 @@ fn every_directive_materializes_in_order_and_is_idempotent() {
     assert_eq!(plan.ops.len(), 7);
 
     for _ in 0..2 {
-        let report = materialize_catalog(&catalog, &found.specs, "Silber");
+        let report = materialize_catalog(&catalog, &found.specs, "ExampleMac");
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(report.warnings.is_empty(), "{:?}", report.warnings);
     }
@@ -473,7 +473,7 @@ fn every_directive_materializes_in_order_and_is_idempotent() {
         b"catalog-owned brief\n"
     );
     let env = fs::read_to_string(workspace.join(".st2/env.txt")).unwrap();
-    assert!(env.contains("agent=Silber.cos"));
+    assert!(env.contains("agent=ExampleMac.cos"));
     assert!(env.contains(&format!("root={}", catalog.display())));
 
     let json: serde_json::Value =
@@ -506,7 +506,7 @@ fn ensure_line_preserves_contract_files_and_is_idempotent() {
         "owner prose without a final newline",
     );
     write(
-        &catalog.join("agents/Silber/cos/agent.kdl"),
+        &catalog.join("agents/ExampleMac/cos/agent.kdl"),
         agent_kdl(
             &workspace,
             r#"    ensure-line "CLAUDE.md" "@.st2/CONTRACT.md"
@@ -517,7 +517,7 @@ fn ensure_line_preserves_contract_files_and_is_idempotent() {
     let found = discover(&catalog);
     assert!(found.errors.is_empty(), "{:?}", found.errors);
 
-    let first = materialize_catalog(&catalog, &found.specs, "Silber");
+    let first = materialize_catalog(&catalog, &found.specs, "ExampleMac");
     assert!(first.is_clean(), "{:?}", first.errors);
     assert_eq!(first.materialized.len(), 2);
     assert_eq!(
@@ -529,7 +529,7 @@ fn ensure_line_preserves_contract_files_and_is_idempotent() {
         "@.st2/CONTRACT.md\n"
     );
 
-    let second = materialize_catalog(&catalog, &found.specs, "Silber");
+    let second = materialize_catalog(&catalog, &found.specs, "ExampleMac");
     assert!(second.is_clean(), "{:?}", second.errors);
     assert!(second.materialized.is_empty(), "{:?}", second.materialized);
 }
@@ -547,7 +547,7 @@ fn ensure_line_verifies_tracked_contract_files_without_rewriting() {
         track(&workspace, name);
     }
     write(
-        &catalog.join("agents/Silber/cos/agent.kdl"),
+        &catalog.join("agents/ExampleMac/cos/agent.kdl"),
         agent_kdl(
             &workspace,
             r#"    ensure-line "CLAUDE.md" "@.st2/CONTRACT.md"
@@ -556,7 +556,7 @@ fn ensure_line_verifies_tracked_contract_files_without_rewriting() {
     );
 
     let found = discover(&catalog);
-    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+    let report = materialize_catalog(&catalog, &found.specs, "ExampleMac");
 
     assert!(report.is_clean(), "{:?}", report.errors);
     assert!(report.materialized.is_empty(), "{:?}", report.materialized);
@@ -579,7 +579,7 @@ fn ensure_line_refuses_missing_contract_line_in_a_tracked_file_before_any_write(
         write(&workspace.join(name), "owner prose\n");
         track(&workspace, name);
         write(
-            &catalog.join("agents/Silber/cos/agent.kdl"),
+            &catalog.join("agents/ExampleMac/cos/agent.kdl"),
             agent_kdl(
                 &workspace,
                 &format!(
@@ -589,7 +589,7 @@ fn ensure_line_refuses_missing_contract_line_in_a_tracked_file_before_any_write(
         );
 
         let found = discover(&catalog);
-        let report = materialize_catalog(&catalog, &found.specs, "Silber");
+        let report = materialize_catalog(&catalog, &found.specs, "ExampleMac");
 
         assert_eq!(report.errors.len(), 1, "{name}: {:?}", report.errors);
         assert!(
@@ -640,7 +640,7 @@ fn every_content_directive_refuses_to_change_a_tracked_target_before_any_write()
             write(&catalog.join("_templates/replacement"), contents);
         }
         write(
-            &catalog.join("agents/Silber/cos/agent.kdl"),
+            &catalog.join("agents/ExampleMac/cos/agent.kdl"),
             agent_kdl(
                 &workspace,
                 &format!("    {directive}\n    file \"must-not-exist\" \"blocked with {name}\""),
@@ -648,7 +648,7 @@ fn every_content_directive_refuses_to_change_a_tracked_target_before_any_write()
         );
 
         let found = discover(&catalog);
-        let report = materialize_catalog(&catalog, &found.specs, "Silber");
+        let report = materialize_catalog(&catalog, &found.specs, "ExampleMac");
         assert_eq!(report.errors.len(), 1, "{name}: {:?}", report.errors);
         assert!(
             report.errors[0].contains("generated materialization would change Git-tracked target")
@@ -684,7 +684,7 @@ fn byte_identical_tracked_target_is_allowed_without_modification() {
     track(&workspace, "AGENTS.md");
     write(&catalog.join("_templates/AGENTS.md"), "same\n");
     write(
-        &catalog.join("agents/Silber/cos/agent.kdl"),
+        &catalog.join("agents/ExampleMac/cos/agent.kdl"),
         agent_kdl(&workspace, r#"    copy "_templates/AGENTS.md" "AGENTS.md""#),
     );
 
@@ -693,7 +693,7 @@ fn byte_identical_tracked_target_is_allowed_without_modification() {
         .unwrap()
         .modified()
         .unwrap();
-    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+    let report = materialize_catalog(&catalog, &found.specs, "ExampleMac");
     let after = fs::metadata(workspace.join("AGENTS.md"))
         .unwrap()
         .modified()
@@ -715,7 +715,7 @@ fn mode_only_change_to_a_tracked_target_fails_before_any_write() {
     track(&workspace, "tool");
     write(&catalog.join("_templates/tool"), "same\n");
     write(
-        &catalog.join("agents/Silber/cos/agent.kdl"),
+        &catalog.join("agents/ExampleMac/cos/agent.kdl"),
         agent_kdl(
             &workspace,
             r#"    copy "_templates/tool" "tool" executable=#true
@@ -724,7 +724,7 @@ fn mode_only_change_to_a_tracked_target_fails_before_any_write() {
     );
 
     let found = discover(&catalog);
-    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+    let report = materialize_catalog(&catalog, &found.specs, "ExampleMac");
 
     assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
     assert!(report.errors[0].contains("generated materialization would change Git-tracked target"));
@@ -746,7 +746,7 @@ fn executable_copy_repairs_a_byte_identical_destination_mode() {
     write(&destination, "#!/bin/sh\nexit 0\n");
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o644)).unwrap();
     write(
-        &catalog.join("agents/Silber/cos/agent.kdl"),
+        &catalog.join("agents/ExampleMac/cos/agent.kdl"),
         agent_kdl(
             &workspace,
             r#"    copy "_templates/wrapper" "bin/wrapper" executable=#true"#,
@@ -755,7 +755,7 @@ fn executable_copy_repairs_a_byte_identical_destination_mode() {
 
     let found = discover(&catalog);
     assert!(found.errors.is_empty(), "{:?}", found.errors);
-    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+    let report = materialize_catalog(&catalog, &found.specs, "ExampleMac");
     assert!(report.is_clean(), "{:?}", report.errors);
     assert_eq!(
         fs::metadata(destination).unwrap().permissions().mode() & 0o777,
@@ -774,12 +774,12 @@ fn regular_copy_repairs_a_byte_identical_executable_mode() {
     write(&destination, "same\n");
     fs::set_permissions(&destination, fs::Permissions::from_mode(0o777)).unwrap();
     write(
-        &catalog.join("agents/Silber/cos/agent.kdl"),
+        &catalog.join("agents/ExampleMac/cos/agent.kdl"),
         agent_kdl(&workspace, r#"    copy "_templates/plain" "plain""#),
     );
 
     let found = discover(&catalog);
-    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+    let report = materialize_catalog(&catalog, &found.specs, "ExampleMac");
 
     assert!(report.is_clean(), "{:?}", report.errors);
     assert_eq!(
@@ -798,7 +798,7 @@ fn content_directives_create_exact_modes_under_a_restrictive_umask() {
     write(&template, "#!/bin/sh\nexit 0\n");
     fs::set_permissions(&template, fs::Permissions::from_mode(0o755)).unwrap();
     write(
-        &catalog.join("agents/Silber/cos/agent.kdl"),
+        &catalog.join("agents/ExampleMac/cos/agent.kdl"),
         agent_kdl(
             &workspace,
             r##"    copy "_templates/tool" "bin/copied" executable=#true
@@ -814,7 +814,7 @@ fn content_directives_create_exact_modes_under_a_restrictive_umask() {
     let mut process = Command::new(env!("CARGO_BIN_EXE_st2"));
     process.args(["up", "--catalog"]).arg(&catalog).args([
         "--host",
-        "Silber",
+        "ExampleMac",
         "--materialize-only",
     ]);
     unsafe {
@@ -867,7 +867,7 @@ fn inline_executable_content_is_exact_runnable_and_idempotent() {
     let workspace = tmp.path().join("workspace");
     fs::create_dir_all(&workspace).unwrap();
     write(
-        &catalog.join("agents/Silber/cos/agent.kdl"),
+        &catalog.join("agents/ExampleMac/cos/agent.kdl"),
         agent_kdl(
             &workspace,
             r#####"    file "bin/probe" executable=#true {
@@ -892,7 +892,7 @@ before
     let expected_quote = b"before\n\"\"\"# remains content\n".as_slice();
 
     let found = discover(&catalog);
-    let first = materialize_catalog(&catalog, &found.specs, "Silber");
+    let first = materialize_catalog(&catalog, &found.specs, "ExampleMac");
     assert!(first.is_clean(), "{:?}", first.errors);
     assert_eq!(first.materialized.len(), 3, "{:?}", first.materialized);
 
@@ -908,7 +908,7 @@ before
         0o755
     );
     let executed = Command::new(&probe)
-        .env("ST_AGENT", "Silber.inline-proof")
+        .env("ST_AGENT", "ExampleMac.inline-proof")
         .output()
         .unwrap();
     assert!(
@@ -916,9 +916,9 @@ before
         "{}",
         String::from_utf8_lossy(&executed.stderr)
     );
-    assert_eq!(executed.stdout, b"hello:Silber.inline-proof\n");
+    assert_eq!(executed.stdout, b"hello:ExampleMac.inline-proof\n");
 
-    let second = materialize_catalog(&catalog, &found.specs, "Silber");
+    let second = materialize_catalog(&catalog, &found.specs, "ExampleMac");
     assert!(second.is_clean(), "{:?}", second.errors);
     assert!(
         second.materialized.is_empty(),
@@ -946,11 +946,11 @@ fn one_inline_target_repairs_mode_toggles_in_both_directions() {
 
     for (executable, expected_mode) in [(true, 0o755), (false, 0o644), (true, 0o755)] {
         write(
-            &catalog.join("agents/Silber/cos/agent.kdl"),
+            &catalog.join("agents/ExampleMac/cos/agent.kdl"),
             declaration(executable),
         );
         let found = discover(&catalog);
-        let report = materialize_catalog(&catalog, &found.specs, "Silber");
+        let report = materialize_catalog(&catalog, &found.specs, "ExampleMac");
         assert!(report.is_clean(), "{:?}", report.errors);
         assert_eq!(report.materialized.len(), 1, "{:?}", report.materialized);
         assert_eq!(
@@ -986,7 +986,7 @@ fn invalid_render_mode_properties_fail_validation() {
         fs::create_dir_all(&workspace).unwrap();
         write(&catalog.join("_templates/source"), "source\n");
         write(
-            &catalog.join("agents/Silber/cos/agent.kdl"),
+            &catalog.join("agents/ExampleMac/cos/agent.kdl"),
             agent_kdl(&workspace, &format!("    {directive}")),
         );
         let found = discover(&catalog);
@@ -1008,12 +1008,12 @@ fn untracked_and_non_git_targets_remain_materializable() {
         write(&workspace.join("AGENTS.md"), "old\n");
         write(&catalog.join("_templates/AGENTS.md"), "new\n");
         write(
-            &catalog.join("agents/Silber/cos/agent.kdl"),
+            &catalog.join("agents/ExampleMac/cos/agent.kdl"),
             agent_kdl(&workspace, r#"    copy "_templates/AGENTS.md" "AGENTS.md""#),
         );
 
         let found = discover(&catalog);
-        let report = materialize_catalog(&catalog, &found.specs, "Silber");
+        let report = materialize_catalog(&catalog, &found.specs, "ExampleMac");
         assert!(report.is_clean(), "git={git}: {:?}", report.errors);
         assert_eq!(
             fs::read_to_string(workspace.join("AGENTS.md")).unwrap(),
@@ -1032,14 +1032,14 @@ fn suspended_declaration_does_not_materialize_workspace_content() {
     write(&catalog.join("_templates/AGENTS.md"), "new\n");
     let declaration = agent_kdl(&workspace, r#"    copy "_templates/AGENTS.md" "AGENTS.md""#)
         .replace(
-            "  host \"Silber\"\n",
-            "  host \"Silber\"\n  desired-state \"suspended\" reason=\"Waiting for capacity\"\n",
+            "  host \"ExampleMac\"\n",
+            "  host \"ExampleMac\"\n  desired-state \"suspended\" reason=\"Waiting for capacity\"\n",
         );
-    write(&catalog.join("agents/Silber/cos/agent.kdl"), declaration);
+    write(&catalog.join("agents/ExampleMac/cos/agent.kdl"), declaration);
 
     let found = discover(&catalog);
     assert!(found.errors.is_empty(), "{:?}", found.errors);
-    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+    let report = materialize_catalog(&catalog, &found.specs, "ExampleMac");
     assert!(report.is_clean(), "{:?}", report.errors);
     assert_eq!(
         fs::read_to_string(workspace.join("AGENTS.md")).unwrap(),
@@ -1054,10 +1054,10 @@ fn running_render_validation_checks_source_presence_and_destination_safety() {
     let workspace = tmp.path().join("workspace");
     fs::create_dir_all(&workspace).unwrap();
     write(
-        &catalog.join("agents/Silber/cos/agent.kdl"),
+        &catalog.join("agents/ExampleMac/cos/agent.kdl"),
         format!(
             r#"agent "cos" {{
-  host "Silber"
+  host "ExampleMac"
   workspace "{}"
   command "true"
   render {{ copy "_templates/source" "safe" }}
@@ -1068,21 +1068,21 @@ fn running_render_validation_checks_source_presence_and_destination_safety() {
     );
     let found = discover(&catalog);
     assert!(found.errors.is_empty(), "{:?}", found.errors);
-    let missing = validate_agent(&catalog, &found.specs[0], "Silber")
+    let missing = validate_agent(&catalog, &found.specs[0], "ExampleMac")
         .unwrap_err()
         .to_string();
     assert!(missing.contains("does not exist"), "{missing}");
 
     write(&catalog.join("_templates/source"), "source");
-    let unsafe_declaration = fs::read_to_string(catalog.join("agents/Silber/cos/agent.kdl"))
+    let unsafe_declaration = fs::read_to_string(catalog.join("agents/ExampleMac/cos/agent.kdl"))
         .unwrap()
         .replace(r#""safe""#, r#""../escape""#);
     write(
-        &catalog.join("agents/Silber/cos/agent.kdl"),
+        &catalog.join("agents/ExampleMac/cos/agent.kdl"),
         unsafe_declaration,
     );
     let unsafe_found = discover(&catalog);
-    let error = validate_agent(&catalog, &unsafe_found.specs[0], "Silber")
+    let error = validate_agent(&catalog, &unsafe_found.specs[0], "ExampleMac")
         .unwrap_err()
         .to_string();
     assert!(
@@ -1105,14 +1105,14 @@ fn missing_git_executable_fails_closed_before_workspace_write() {
     track(&workspace, "AGENTS.md");
     write(&catalog.join("_templates/AGENTS.md"), "new\n");
     write(
-        &catalog.join("agents/Silber/cos/agent.kdl"),
+        &catalog.join("agents/ExampleMac/cos/agent.kdl"),
         agent_kdl(&workspace, r#"    copy "_templates/AGENTS.md" "AGENTS.md""#),
     );
 
     let output = Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("up")
         .arg(&catalog)
-        .args(["--host", "Silber", "--materialize-only"])
+        .args(["--host", "ExampleMac", "--materialize-only"])
         .env("ST_HOOKS", &hooks_root)
         .env("PATH", &empty_path)
         .output()
@@ -1139,7 +1139,7 @@ fn a_gating_failure_blocks_only_that_agent_but_git_exclude_is_advisory() {
     fs::create_dir_all(&okay_workspace).unwrap();
 
     write(
-        &catalog.join("agents/Silber/cos/agent.kdl"),
+        &catalog.join("agents/ExampleMac/cos/agent.kdl"),
         agent_kdl(
             &bad_workspace,
             r#"    copy "_templates/missing.md" "AGENTS.md""#,
@@ -1151,14 +1151,14 @@ fn a_gating_failure_blocks_only_that_agent_but_git_exclude_is_advisory() {
     git-exclude "AGENTS.md""#,
     )
     .replacen(r#"agent "cos""#, r#"agent "worker""#, 1)
-    .replace("Silber.cos", "Silber.worker");
-    write(&catalog.join("agents/Silber/worker/agent.kdl"), okay);
+    .replace("ExampleMac.cos", "ExampleMac.worker");
+    write(&catalog.join("agents/ExampleMac/worker/agent.kdl"), okay);
 
     let found = discover(&catalog);
-    let report = materialize_catalog(&catalog, &found.specs, "Silber");
+    let report = materialize_catalog(&catalog, &found.specs, "ExampleMac");
     assert_eq!(report.errors.len(), 1);
-    assert!(report.failed_agents.contains("Silber.cos"));
-    assert!(!report.failed_agents.contains("Silber.worker"));
+    assert!(report.failed_agents.contains("ExampleMac.cos"));
+    assert!(!report.failed_agents.contains("ExampleMac.worker"));
     assert_eq!(
         fs::read_to_string(okay_workspace.join("AGENTS.md")).unwrap(),
         "okay"
@@ -1174,14 +1174,14 @@ fn source_can_be_relative_to_the_agent_file_for_blessed_catalog_compatibility() 
     fs::create_dir_all(&workspace).unwrap();
     write(&catalog.join("_templates/brief.md"), "brief\n");
     write(
-        &catalog.join("Silber/cos/agent.kdl"),
+        &catalog.join("ExampleMac/cos/agent.kdl"),
         agent_kdl(
             &workspace,
             r#"    copy "../../_templates/brief.md" "AGENTS.md""#,
         ),
     );
     let agent = spec(&catalog, "cos");
-    let report = materialize_catalog(&catalog, &[agent], "Silber");
+    let report = materialize_catalog(&catalog, &[agent], "ExampleMac");
     assert!(report.is_clean(), "{:?}", report.errors);
     assert_eq!(
         fs::read_to_string(workspace.join("AGENTS.md")).unwrap(),
@@ -1198,7 +1198,7 @@ fn up_materialize_only_writes_the_overlay_without_needing_pty() {
     fs::create_dir_all(&workspace).unwrap();
     write(&catalog.join("_templates/brief.md"), "brief\n");
     write(
-        &catalog.join("agents/Silber/cos/agent.kdl"),
+        &catalog.join("agents/ExampleMac/cos/agent.kdl"),
         agent_kdl(&workspace, r#"    copy "_templates/brief.md" "AGENTS.md""#),
     );
     let bin = tmp.path().join("bin");
@@ -1210,7 +1210,7 @@ fn up_materialize_only_writes_the_overlay_without_needing_pty() {
     let output = Command::new(env!("CARGO_BIN_EXE_st2"))
         .args(["up"])
         .arg(&catalog)
-        .args(["--host", "Silber", "--materialize-only"])
+        .args(["--host", "ExampleMac", "--materialize-only"])
         // Proves this path never tries the runtime's external pty backend.
         .env("ST_HOOKS", &hooks_root)
         .env("PATH", &bin)

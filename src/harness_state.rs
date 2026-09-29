@@ -980,7 +980,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
 
         let tmp = tempfile::tempdir().unwrap();
-        let agent_dir = tmp.path().join("agents/hetz/worker");
+        let agent_dir = tmp.path().join("agents/example-linux/worker");
         let path = harness_state_path(&agent_dir);
         let staging = tmp.path().join("staging");
         let record = serde_json::json!({"schema": "test"});
@@ -1015,14 +1015,14 @@ mod tests {
     }
 
     fn writer(dir: &Path) -> Writer {
-        Writer::new(dir, "hetz.worker", "codex", Some("worker".to_string()))
+        Writer::new(dir, "example-linux.worker", "codex", Some("worker".to_string()))
     }
 
     /// A new session arriving the way real wrappers do: a written claim, then adoption.
     fn takeover(dir: &Path, harness: &'static str) -> Writer {
         let token = session_token();
-        let seq = claim(dir, "hetz.worker", harness, &token).unwrap();
-        Writer::new(dir, "hetz.worker", harness, Some("worker".to_string()))
+        let seq = claim(dir, "example-linux.worker", harness, &token).unwrap();
+        Writer::new(dir, "example-linux.worker", harness, Some("worker".to_string()))
             .with_ownership(token, seq)
     }
 
@@ -1256,7 +1256,7 @@ mod tests {
         let raw = |written_at_ms: u64| {
             serde_json::to_vec(&Record {
                 schema: SCHEMA.to_string(),
-                agent: "hetz.worker".to_string(),
+                agent: "example-linux.worker".to_string(),
                 harness: "codex".to_string(),
                 state: Activity::Active,
                 blocked_on: BlockedOn::None,
@@ -1355,14 +1355,14 @@ mod tests {
         // A future schema gates interpretation entirely — even words spelled exactly like this
         // version's must not decode as anything definite, because v2 may have changed what the
         // same spelling means.
-        let raw = br#"{"schema":"st2.harness-state.v2","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3,"novelField":true}"#;
+        let raw = br#"{"schema":"st2.harness-state.v2","agent":"example-linux.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"empty","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3,"novelField":true}"#;
         let observed = read_raw_at(raw, None, 9_999_999_999_999);
         assert_eq!(observed.state, Activity::Unknown);
         assert_eq!(observed.reason.as_deref(), Some("unsupported-schema"));
         assert_eq!(observed.blocked_on, BlockedOn::Unknown);
 
         // And on a v1 record with a known state, unknown axis words stay indeterminate.
-        let raw = br#"{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"robot","inputBuffer":"overflowing","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3}"#;
+        let raw = br#"{"schema":"st2.harness-state.v1","agent":"example-linux.worker","harness":"codex","state":"active","blockedOn":"robot","inputBuffer":"overflowing","sinceMs":1,"writtenAtMs":9999999999999,"transitions":3}"#;
         let observed = read_raw_at(raw, None, 9_999_999_999_999);
         assert_eq!(observed.state, Activity::Active);
         assert_eq!(observed.blocked_on, BlockedOn::Unknown);
@@ -1400,7 +1400,7 @@ mod tests {
         use crate::harness_context::{self, Harness, Reading, harness_context_path};
 
         let tmp = tempfile::tempdir().unwrap();
-        let agent_dir = tmp.path().join("agents").join("hetz").join("worker");
+        let agent_dir = tmp.path().join("agents").join("example-linux").join("worker");
         fs::create_dir_all(&agent_dir).unwrap();
         let context_path = harness_context_path(&agent_dir);
 
@@ -1410,7 +1410,7 @@ mod tests {
             used_percent: Some(95.0),
             ..Reading::default()
         };
-        harness_context::Writer::new(&agent_dir, "hetz.worker", Harness::Claude)
+        harness_context::Writer::new(&agent_dir, "example-linux.worker", Harness::Claude)
             .unwrap()
             .observe(fill())
             .unwrap();
@@ -1418,7 +1418,7 @@ mod tests {
 
         // A wrapper relaunch: claim the state record, and the sibling goes with it.
         let token = session_token();
-        claim(&agent_dir, "hetz.worker", "claude", &token).unwrap();
+        claim(&agent_dir, "example-linux.worker", "claude", &token).unwrap();
         assert!(
             harness_context::read(&context_path).is_none(),
             "the new incarnation must read `no context yet`"
@@ -1435,20 +1435,20 @@ mod tests {
         );
 
         // Claiming a seat that never had a context record is not an error.
-        claim(&agent_dir, "hetz.worker", "claude", &session_token()).unwrap();
+        claim(&agent_dir, "example-linux.worker", "claude", &session_token()).unwrap();
 
         // …and the wrapperless boundary, which routes through the same body. It is eligible only
         // over a seat no wrapper holds, so it gets its own.
-        let hooks_dir = tmp.path().join("agents").join("hetz").join("hooked");
+        let hooks_dir = tmp.path().join("agents").join("example-linux").join("hooked");
         fs::create_dir_all(&hooks_dir).unwrap();
         let hooks_context = harness_context_path(&hooks_dir);
-        harness_context::Writer::new(&hooks_dir, "hetz.hooked", Harness::Claude)
+        harness_context::Writer::new(&hooks_dir, "example-linux.hooked", Harness::Claude)
             .unwrap()
             .observe(fill())
             .unwrap();
         let wrapperless = format!("{WRAPPERLESS_PREFIX}abc");
         assert!(
-            claim_wrapperless(&hooks_dir, "hetz.hooked", "claude", &wrapperless)
+            claim_wrapperless(&hooks_dir, "example-linux.hooked", "claude", &wrapperless)
                 .unwrap()
                 .is_some(),
             "the claim must actually have happened"
@@ -1462,7 +1462,7 @@ mod tests {
         let path = harness_state_path(tmp.path());
         let predecessor = Record {
             schema: SCHEMA.to_string(),
-            agent: "hetz.worker".to_string(),
+            agent: "example-linux.worker".to_string(),
             harness: "codex".to_string(),
             state: Activity::Active,
             blocked_on: BlockedOn::None,
@@ -1519,10 +1519,10 @@ mod tests {
         // The channel and wrapper are sibling processes of ONE session and share its token —
         // that sharing is what makes the wrapper's terminal record the session's last word.
         let token = session_token();
-        let mut channel = Writer::new(tmp.path(), "hetz.worker", "pi", Some("worker".into()))
+        let mut channel = Writer::new(tmp.path(), "example-linux.worker", "pi", Some("worker".into()))
             .with_session(token.clone());
         let mut wrapper =
-            Writer::new(tmp.path(), "hetz.worker", "pi", Some("worker".into())).with_session(token);
+            Writer::new(tmp.path(), "example-linux.worker", "pi", Some("worker".into())).with_session(token);
 
         assert!(channel.observe_unless_ended(active()).unwrap());
         wrapper.ended("signal 9").unwrap();
@@ -1595,7 +1595,7 @@ mod tests {
     fn foreign_schemas_are_never_coalesced_restamped_or_treated_as_terminal() {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
-        let foreign = br#"{"schema":"st2.harness-state.v2","agent":"hetz.worker","harness":"codex","state":"ended","blockedOn":"none","inputBuffer":"unknown","sinceMs":5,"writtenAtMs":99999999999999,"transitions":7,"novel":true}"#;
+        let foreign = br#"{"schema":"st2.harness-state.v2","agent":"example-linux.worker","harness":"codex","state":"ended","blockedOn":"none","inputBuffer":"unknown","sinceMs":5,"writtenAtMs":99999999999999,"transitions":7,"novel":true}"#;
         fs::write(&path, foreign).unwrap();
 
         // Heartbeat leaves a foreign record byte-identical rather than stripping its fields —
@@ -1638,7 +1638,7 @@ mod tests {
     fn live_observations_require_a_pty_session_and_unfenced_live_records_read_unknown() {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
-        let mut unfenced = Writer::new(tmp.path(), "hetz.worker", "codex", None);
+        let mut unfenced = Writer::new(tmp.path(), "example-linux.worker", "codex", None);
         assert!(
             unfenced.observe(active()).is_err(),
             "live states need a fence"
@@ -1650,7 +1650,7 @@ mod tests {
         let alive: &dyn Fn(&str) -> SessionLiveness = &|_| SessionLiveness::Alive;
         assert_eq!(read(&path, Some(alive)).unwrap().state, Activity::Ended);
         let live_unfenced = format!(
-            r#"{{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"unknown","sinceMs":1,"writtenAtMs":{},"transitions":1}}"#,
+            r#"{{"schema":"st2.harness-state.v1","agent":"example-linux.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"unknown","sinceMs":1,"writtenAtMs":{},"transitions":1}}"#,
             crate::message::now_ms()
         );
         fs::write(&path, live_unfenced).unwrap();
@@ -1752,16 +1752,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
         let token = session_token();
-        let mut wrapper = Writer::new(tmp.path(), "hetz.worker", "claude", Some("worker".into()))
+        let mut wrapper = Writer::new(tmp.path(), "example-linux.worker", "claude", Some("worker".into()))
             .with_session(token.clone());
-        let mut hook = Writer::new(tmp.path(), "hetz.worker", "claude", Some("worker".into()))
+        let mut hook = Writer::new(tmp.path(), "example-linux.worker", "claude", Some("worker".into()))
             .with_session(token);
 
         hook.observe(active()).unwrap();
         let entered: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
 
         // A sibling's restatement coalesces (no transition churn across hook processes)…
-        let mut hook2 = Writer::new(tmp.path(), "hetz.worker", "claude", Some("worker".into()))
+        let mut hook2 = Writer::new(tmp.path(), "example-linux.worker", "claude", Some("worker".into()))
             .with_session(entered.incarnation.clone());
         hook2.observe(active()).unwrap();
         let restated: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
@@ -1817,8 +1817,8 @@ mod tests {
 
         // The wrapper writes the claim and exports it; the hook adopts the pair.
         let token = session_token();
-        let seq = claim(tmp.path(), "hetz.worker", "claude", &token).unwrap();
-        let mut hook = Writer::new(tmp.path(), "hetz.worker", "claude", Some("worker".into()))
+        let seq = claim(tmp.path(), "example-linux.worker", "claude", &token).unwrap();
+        let mut hook = Writer::new(tmp.path(), "example-linux.worker", "claude", Some("worker".into()))
             .with_ownership(token.clone(), seq);
         hook.observe(Observation::new(
             Activity::Idle,
@@ -1829,7 +1829,7 @@ mod tests {
         assert_eq!(read(&path, None).unwrap().state, Activity::Idle);
 
         // A later session claims past it; the adopted writer becomes the straggler.
-        let mut next = Writer::new(tmp.path(), "hetz.worker", "claude", Some("worker".into()));
+        let mut next = Writer::new(tmp.path(), "example-linux.worker", "claude", Some("worker".into()));
         next.observe(active()).unwrap();
         let after = fs::read(&path).unwrap();
         hook.observe(Observation::new(
@@ -1848,7 +1848,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
         let poisoned = format!(
-            r#"{{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"unknown","ptySession":"worker","incarnation":"other","seq":3,"sinceMs":1,"writtenAtMs":{},"transitions":1}}"#,
+            r#"{{"schema":"st2.harness-state.v1","agent":"example-linux.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"unknown","ptySession":"worker","incarnation":"other","seq":3,"sinceMs":1,"writtenAtMs":{},"transitions":1}}"#,
             u64::MAX
         );
         fs::write(&path, poisoned).unwrap();
@@ -1875,7 +1875,7 @@ mod tests {
             .map(|_| {
                 let dir = dir.clone();
                 std::thread::spawn(move || {
-                    claim(&dir, "hetz.worker", "codex", &session_token()).unwrap()
+                    claim(&dir, "example-linux.worker", "codex", &session_token()).unwrap()
                 })
             })
             .collect();
@@ -1895,7 +1895,7 @@ mod tests {
         writer(tmp.path()).observe(active()).unwrap();
 
         let token = session_token();
-        let seq = claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
+        let seq = claim(tmp.path(), "example-linux.worker", "codex", &token).unwrap();
         let observed = read(&path, None).unwrap();
         assert_eq!(
             observed.state,
@@ -1905,7 +1905,7 @@ mod tests {
         assert_eq!(observed.reason.as_deref(), Some("claimed"));
         assert_eq!(observed.exit, None);
 
-        let mut successor = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
+        let mut successor = Writer::new(tmp.path(), "example-linux.worker", "codex", Some("worker".into()))
             .with_ownership(token, seq);
         successor.observe(active()).unwrap();
         assert_eq!(read(&path, None).unwrap().state, Activity::Active);
@@ -1917,11 +1917,11 @@ mod tests {
     fn non_claiming_writers_refuse_foreign_schemas_outright() {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
-        let v2 = br#"{"schema":"st2.harness-state.v2","agent":"hetz.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"unknown","incarnation":"future","sinceMs":1,"writtenAtMs":1,"transitions":1}"#;
+        let v2 = br#"{"schema":"st2.harness-state.v2","agent":"example-linux.worker","harness":"codex","state":"active","blockedOn":"none","inputBuffer":"unknown","incarnation":"future","sinceMs":1,"writtenAtMs":1,"transitions":1}"#;
         fs::write(&path, v2).unwrap();
 
         let token = session_token();
-        let mut adopted = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
+        let mut adopted = Writer::new(tmp.path(), "example-linux.worker", "codex", Some("worker".into()))
             .with_ownership(token, 5);
         adopted.observe(active()).unwrap();
         assert_eq!(
@@ -1976,14 +1976,14 @@ mod tests {
     fn wrapperless_claims_are_atomic_and_never_supersede_a_live_wrapper() {
         let tmp = tempfile::tempdir().unwrap();
         let wl =
-            |token: &str| claim_wrapperless(tmp.path(), "hetz.worker", "claude", token).unwrap();
+            |token: &str| claim_wrapperless(tmp.path(), "example-linux.worker", "claude", token).unwrap();
         assert!(wl("claude-session-a").is_some(), "virgin dir");
 
         // A wrapper's FRESH claim placeholder is a session mid-startup, not an ended one: the
         // check-and-write is one act under the lock, so the racing hooks-only SessionStart
         // cannot steal the sequence between the wrapper's read and its write.
         let wrapper_token = session_token();
-        let wrapper_seq = claim(tmp.path(), "hetz.worker", "claude", &wrapper_token).unwrap();
+        let wrapper_seq = claim(tmp.path(), "example-linux.worker", "claude", &wrapper_token).unwrap();
         assert!(
             wl("claude-session-b").is_none(),
             "fresh placeholder is owned"
@@ -1992,7 +1992,7 @@ mod tests {
         // A live wrapper record stays off limits; a REAL terminal record is claimable.
         let mut wrapper = Writer::new(
             tmp.path(),
-            "hetz.worker",
+            "example-linux.worker",
             "claude",
             Some("worker".to_string()),
         )
@@ -2015,9 +2015,9 @@ mod tests {
     fn an_abandoned_wrapper_placeholder_is_claimable_once_stale() {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
-        claim(tmp.path(), "hetz.worker", "claude", &session_token()).unwrap();
+        claim(tmp.path(), "example-linux.worker", "claude", &session_token()).unwrap();
         assert!(
-            claim_wrapperless(tmp.path(), "hetz.worker", "claude", "claude-session-x")
+            claim_wrapperless(tmp.path(), "example-linux.worker", "claude", "claude-session-x")
                 .unwrap()
                 .is_none()
         );
@@ -2026,7 +2026,7 @@ mod tests {
         aged.written_at_ms = crate::message::now_ms() - duration_ms(HARNESS_STATE_STALE) - 1;
         write_record(&path, &aged).unwrap();
         assert!(
-            claim_wrapperless(tmp.path(), "hetz.worker", "claude", "claude-session-x")
+            claim_wrapperless(tmp.path(), "example-linux.worker", "claude", "claude-session-x")
                 .unwrap()
                 .is_some()
         );
@@ -2039,11 +2039,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = harness_state_path(tmp.path());
         let saturated = format!(
-            r#"{{"schema":"st2.harness-state.v1","agent":"hetz.worker","harness":"codex","state":"idle","blockedOn":"none","inputBuffer":"unknown","ptySession":"worker","incarnation":"other","seq":{},"sinceMs":1,"writtenAtMs":1,"transitions":1}}"#,
+            r#"{{"schema":"st2.harness-state.v1","agent":"example-linux.worker","harness":"codex","state":"idle","blockedOn":"none","inputBuffer":"unknown","ptySession":"worker","incarnation":"other","seq":{},"sinceMs":1,"writtenAtMs":1,"transitions":1}}"#,
             u64::MAX
         );
         fs::write(&path, saturated).unwrap();
-        assert!(claim(tmp.path(), "hetz.worker", "codex", "t").is_err());
+        assert!(claim(tmp.path(), "example-linux.worker", "codex", "t").is_err());
 
         fs::write(&path, b"{not json").unwrap();
         let before = fs::read(&path).unwrap();
@@ -2054,7 +2054,7 @@ mod tests {
             before,
             "non-claiming writers refuse"
         );
-        let mut adopted = Writer::new(tmp.path(), "hetz.worker", "codex", Some("worker".into()))
+        let mut adopted = Writer::new(tmp.path(), "example-linux.worker", "codex", Some("worker".into()))
             .with_ownership(session_token(), 7);
         adopted.observe(active()).unwrap();
         assert_eq!(
@@ -2065,7 +2065,7 @@ mod tests {
 
         // The written claim supersedes even bytes it cannot parse; sequence and counter restart.
         let token = session_token();
-        let seq = claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
+        let seq = claim(tmp.path(), "example-linux.worker", "codex", &token).unwrap();
         assert_eq!(seq, 1);
         let record: Record = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
         assert_eq!(record.transitions, 0);
@@ -2084,7 +2084,7 @@ mod tests {
 
         fs::write(&path, b"{corrupted").unwrap();
         let token = session_token();
-        let seq = claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
+        let seq = claim(tmp.path(), "example-linux.worker", "codex", &token).unwrap();
         assert!(
             seq > damaged_seq.seq,
             "the floor carries the sequence past the damage ({seq} vs {})",
@@ -2111,7 +2111,7 @@ mod tests {
         use std::os::unix::fs::{PermissionsExt as _, symlink};
 
         let tmp = tempfile::tempdir().unwrap();
-        let agent_dir = tmp.path().join("agents/hetz/worker");
+        let agent_dir = tmp.path().join("agents/example-linux/worker");
         fs::create_dir_all(&agent_dir).unwrap();
         let victim = tmp.path().join("authored");
         fs::write(&victim, b"authored bytes").unwrap();
@@ -2158,7 +2158,7 @@ mod tests {
         // lingering token-only predecessor stays fenced out.
         fs::write(&path, b"{corrupted").unwrap();
         let token = session_token();
-        let seq = claim(tmp.path(), "hetz.worker", "codex", &token).unwrap();
+        let seq = claim(tmp.path(), "example-linux.worker", "codex", &token).unwrap();
         assert!(
             seq > 1,
             "the persisted floor carries the claim past sequence one ({seq})"
@@ -2188,7 +2188,7 @@ mod tests {
             ))
             .unwrap();
         assert!(
-            claim_wrapperless(tmp.path(), "hetz.worker", "claude", "claude-session-x")
+            claim_wrapperless(tmp.path(), "example-linux.worker", "claude", "claude-session-x")
                 .unwrap()
                 .is_none(),
             "wrapperless claims refuse unreadable records"

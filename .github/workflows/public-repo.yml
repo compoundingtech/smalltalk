@@ -1,0 +1,14 @@
+name: Public repository check
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  public-repo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check repository content
+        run: python3 scripts/check-public-repo

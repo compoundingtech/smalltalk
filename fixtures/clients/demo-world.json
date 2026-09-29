@@ -19,7 +19,7 @@
         },
         "harness": "claude",
         "host": "harbor",
-        "id": "agent/fleet/atlas/builder",
+        "id": "agent/example/atlas/builder",
         "mission": "mission/fleet/atlas/store-move",
         "name": "Atlas Builder",
         "parent": null,
@@ -44,7 +44,7 @@
         },
         "harness": "claude",
         "host": "harbor",
-        "id": "agent/fleet/docs/writer",
+        "id": "agent/example/docs/writer",
         "mission": "mission/fleet/site/pricing-page",
         "name": "Docs Writer",
         "parent": null,
@@ -69,7 +69,7 @@
         },
         "harness": "codex",
         "host": "harbor",
-        "id": "agent/fleet/release/captain",
+        "id": "agent/example/release/captain",
         "mission": "mission/fleet/release/weekly",
         "name": "Release Captain",
         "parent": null,
@@ -96,7 +96,7 @@
         },
         "harness": "claude",
         "host": "lark",
-        "id": "agent/fleet/cos",
+        "id": "agent/example/cos",
         "mission": null,
         "name": "Chief of Staff",
         "parent": null,
@@ -121,10 +121,10 @@
         },
         "harness": "claude",
         "host": "harbor",
-        "id": "agent/fleet/harbor/reviewer",
+        "id": "agent/example/harbor/reviewer",
         "mission": "mission/fleet/harbor/pull-request-review",
         "name": "Harbor Reviewer",
-        "parent": "agent/fleet/cos",
+        "parent": "agent/example/cos",
         "state": "working",
         "step": "review",
         "terminal": true,
@@ -146,7 +146,7 @@
         },
         "harness": "omp",
         "host": "harbor",
-        "id": "agent/fleet/rekey/worker",
+        "id": "agent/example/rekey/worker",
         "mission": "mission/fleet/rekey",
         "name": "Rekey Worker",
         "parent": null,
@@ -171,7 +171,7 @@
         },
         "harness": "pi",
         "host": "lark",
-        "id": "agent/fleet/pi/sketcher",
+        "id": "agent/example/pi/sketcher",
         "mission": null,
         "name": "Sketcher",
         "parent": null,
@@ -196,7 +196,7 @@
         },
         "harness": "codex",
         "host": "harbor",
-        "id": "agent/fleet/atlas/indexer",
+        "id": "agent/example/atlas/indexer",
         "mission": null,
         "name": "Atlas Indexer",
         "parent": null,
@@ -221,7 +221,7 @@
         },
         "harness": "claude",
         "host": "lark",
-        "id": "agent/fleet/planner",
+        "id": "agent/example/planner",
         "mission": null,
         "name": "Planner",
         "parent": null,
@@ -264,7 +264,7 @@
       {
         "actions": [],
         "age": "33m",
-        "agent": "agent/fleet/atlas/builder",
+        "agent": "agent/example/atlas/builder",
         "id": "attention/1",
         "kind": {
           "because": "cut-over cannot start until you answer; the old store stays read-only meanwhile",
@@ -296,7 +296,7 @@
       {
         "actions": [],
         "age": "12m",
-        "agent": "agent/fleet/docs/writer",
+        "agent": "agent/example/docs/writer",
         "id": "attention/2",
         "kind": {
           "excerpt": [
@@ -323,7 +323,7 @@
       {
         "actions": [],
         "age": "1h",
-        "agent": "agent/fleet/planner",
+        "agent": "agent/example/planner",
         "id": "attention/3",
         "kind": {
           "kind": "launch",
@@ -395,7 +395,7 @@
       {
         "actions": [],
         "age": "8m",
-        "agent": "agent/fleet/release/captain",
+        "agent": "agent/example/release/captain",
         "id": "attention/4",
         "kind": {
           "because": "the weekly release cannot tag until this seat is back",
@@ -414,7 +414,7 @@
       {
         "actions": [],
         "age": "19m",
-        "agent": "agent/fleet/rekey/worker",
+        "agent": "agent/example/rekey/worker",
         "id": "attention/5",
         "kind": {
           "changes": [
@@ -440,7 +440,7 @@
       {
         "actions": [],
         "age": "2h",
-        "agent": "agent/fleet/cos",
+        "agent": "agent/example/cos",
         "id": "attention/6",
         "kind": {
           "body": "Usage this week is **up 18%**, almost all from the atlas store move (reruns of the compare step).\n\nNo action needed; it should fall back once the cut-over is done.",
@@ -457,7 +457,7 @@
     ]
   },
   "conversations": {
-    "agent/fleet/atlas/builder": {
+    "agent/example/atlas/builder": {
       "state": "ready",
       "value": [
         {
@@ -650,11 +650,11 @@
         }
       ]
     },
-    "agent/fleet/atlas/indexer": {
+    "agent/example/atlas/indexer": {
       "state": "ready",
       "value": []
     },
-    "agent/fleet/cos": {
+    "agent/example/cos": {
       "state": "ready",
       "value": [
         {
@@ -780,7 +780,7 @@
         }
       ]
     },
-    "agent/fleet/docs/writer": {
+    "agent/example/docs/writer": {
       "state": "ready",
       "value": [
         {
@@ -871,7 +871,7 @@
         }
       ]
     },
-    "agent/fleet/harbor/reviewer": {
+    "agent/example/harbor/reviewer": {
       "state": "ready",
       "value": [
         {
@@ -892,7 +892,7 @@
         }
       ]
     },
-    "agent/fleet/pi/sketcher": {
+    "agent/example/pi/sketcher": {
       "state": "ready",
       "value": [
         {
@@ -905,7 +905,7 @@
         }
       ]
     },
-    "agent/fleet/rekey/worker": {
+    "agent/example/rekey/worker": {
       "state": "ready",
       "value": [
         {
@@ -918,7 +918,7 @@
         }
       ]
     },
-    "agent/fleet/release/captain": {
+    "agent/example/release/captain": {
       "state": "ready",
       "value": [
         {
@@ -1023,7 +1023,7 @@
       {
         "age": "33m",
         "agents": [
-          "agent/fleet/atlas/builder"
+          "agent/example/atlas/builder"
         ],
         "decision": "attention/1",
         "goals": [
@@ -1033,7 +1033,7 @@
         ],
         "host": "harbor",
         "id": "mission/fleet/atlas/store-move",
-        "kdl": "version 2\n\nmission \"fleet/atlas/store-move\" state=\"ready\" {\n  goal \"Move every row to the new store without losing a value.\"\n  goal \"Prove the two stores agree before anything cuts over.\"\n  goal \"Leave the old store readable until a person says otherwise.\"\n  constraint \"Never write to the old store.\"\n\n  step \"snapshot\" { assigned-to \"agent/fleet/atlas/builder\" }\n  step \"convert\" {\n    assigned-to \"agent/fleet/atlas/builder\"\n    depends-on { step \"snapshot\" completed }\n    gate \"conversion-check\" { exec \"atlas-cli check --converted\" }\n  }\n  step \"compare\" {\n    assigned-to \"agent/fleet/atlas/builder\"\n    depends-on { step \"convert\" completed }\n  }\n  step \"cut-over\" {\n    agentless\n    depends-on { step \"compare\" completed }\n    gate \"cut-over-review\" type=\"human\" {\n      reviewer \"person/robin\"\n      question \"The row counts agree and the contract check passed. Cut over?\"\n      review \"doc/atlas/compare-report\"\n    }\n  }\n  step \"cleanup\" {\n    assigned-to \"agent/fleet/atlas/builder\"\n    depends-on { step \"cut-over\" completed }\n  }\n}\n",
+        "kdl": "version 2\n\nmission \"fleet/atlas/store-move\" state=\"ready\" {\n  goal \"Move every row to the new store without losing a value.\"\n  goal \"Prove the two stores agree before anything cuts over.\"\n  goal \"Leave the old store readable until a person says otherwise.\"\n  constraint \"Never write to the old store.\"\n\n  step \"snapshot\" { assigned-to \"agent/example/atlas/builder\" }\n  step \"convert\" {\n    assigned-to \"agent/example/atlas/builder\"\n    depends-on { step \"snapshot\" completed }\n    gate \"conversion-check\" { exec \"atlas-cli check --converted\" }\n  }\n  step \"compare\" {\n    assigned-to \"agent/example/atlas/builder\"\n    depends-on { step \"convert\" completed }\n  }\n  step \"cut-over\" {\n    agentless\n    depends-on { step \"compare\" completed }\n    gate \"cut-over-review\" type=\"human\" {\n      reviewer \"person/robin\"\n      question \"The row counts agree and the contract check passed. Cut over?\"\n      review \"doc/atlas/compare-report\"\n    }\n  }\n  step \"cleanup\" {\n    assigned-to \"agent/example/atlas/builder\"\n    depends-on { step \"cut-over\" completed }\n  }\n}\n",
         "parent": null,
         "steps": [
           {
@@ -1142,7 +1142,7 @@
       {
         "age": "12m",
         "agents": [
-          "agent/fleet/docs/writer"
+          "agent/example/docs/writer"
         ],
         "decision": "attention/2",
         "goals": [
@@ -1198,7 +1198,7 @@
       {
         "age": "8m",
         "agents": [
-          "agent/fleet/release/captain"
+          "agent/example/release/captain"
         ],
         "decision": null,
         "goals": [
@@ -1275,7 +1275,7 @@
       {
         "age": "1m",
         "agents": [
-          "agent/fleet/harbor/reviewer"
+          "agent/example/harbor/reviewer"
         ],
         "decision": null,
         "goals": [
@@ -1331,7 +1331,7 @@
       {
         "age": "19m",
         "agents": [
-          "agent/fleet/rekey/worker"
+          "agent/example/rekey/worker"
         ],
         "decision": null,
         "goals": [
@@ -1406,7 +1406,7 @@
       {
         "age": "2h",
         "agents": [
-          "agent/fleet/docs/writer"
+          "agent/example/docs/writer"
         ],
         "decision": null,
         "goals": [
@@ -1503,7 +1503,7 @@
     "value": [
       {
         "agents": [
-          "agent/fleet/atlas/builder"
+          "agent/example/atlas/builder"
         ],
         "ahead": 7,
         "behind": 0,
@@ -1517,7 +1517,7 @@
       },
       {
         "agents": [
-          "agent/fleet/docs/writer"
+          "agent/example/docs/writer"
         ],
         "ahead": 2,
         "behind": 1,
@@ -1531,7 +1531,7 @@
       },
       {
         "agents": [
-          "agent/fleet/harbor/reviewer"
+          "agent/example/harbor/reviewer"
         ],
         "ahead": 0,
         "behind": 0,
@@ -1545,7 +1545,7 @@
       },
       {
         "agents": [
-          "agent/fleet/rekey/worker"
+          "agent/example/rekey/worker"
         ],
         "ahead": 0,
         "behind": 3,
@@ -1559,7 +1559,7 @@
       },
       {
         "agents": [
-          "agent/fleet/release/captain"
+          "agent/example/release/captain"
         ],
         "ahead": 0,
         "behind": 0,
@@ -1573,7 +1573,7 @@
       },
       {
         "agents": [
-          "agent/fleet/pi/sketcher"
+          "agent/example/pi/sketcher"
         ],
         "ahead": 0,
         "behind": 0,

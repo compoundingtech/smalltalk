@@ -47,11 +47,11 @@ assert.equal(timelineText({ message_id: 'metadata-only' }), null);
 
 // (5) Recent messages for an agent include messages addressed to or from it, not only session-tagged ones.
 const { sessionMessagesFor } = await import('./sessionView.ts');
-const st3 = { id: 'session/st3', kind: 'session', owner_id: 'agent/fleet/st3/standing/st3', state: 'running' };
+const st3 = { id: 'session/st3', kind: 'session', owner_id: 'agent/example/st3/standing/st3', state: 'running' };
 const messages = [
-  { id: 'message/b', from: 'agent/fleet/cos/standing/cos', to: 'agent/fleet/st3/standing/st3', session_id: null, sent_at: '2026-09-25T08:10:00Z', content: 'b' },
-  { id: 'message/a', from: 'agent/fleet/st3/standing/st3', to: 'person/nathan', session_id: null, sent_at: '2026-09-25T08:00:00Z', content: 'a' },
-  { id: 'message/c', from: 'person/nathan', to: 'agent/other', session_id: 'session/st3', sent_at: '2026-09-25T08:20:00Z', content: 'c' },
-  { id: 'message/d', from: 'person/nathan', to: 'agent/other', session_id: null, sent_at: '2026-09-25T08:30:00Z', content: 'd' },
+  { id: 'message/b', from: 'agent/example/cos/standing/cos', to: 'agent/example/st3/standing/st3', session_id: null, sent_at: '2026-09-25T08:10:00Z', content: 'b' },
+  { id: 'message/a', from: 'agent/example/st3/standing/st3', to: 'person/alex', session_id: null, sent_at: '2026-09-25T08:00:00Z', content: 'a' },
+  { id: 'message/c', from: 'person/alex', to: 'agent/other', session_id: 'session/st3', sent_at: '2026-09-25T08:20:00Z', content: 'c' },
+  { id: 'message/d', from: 'person/alex', to: 'agent/other', session_id: null, sent_at: '2026-09-25T08:30:00Z', content: 'd' },
 ];
 assert.deepEqual(sessionMessagesFor(messages, st3).map(m => m.id), ['message/a', 'message/b', 'message/c']);
