@@ -12581,7 +12581,9 @@ mod tests {
             "st attention withdraw",
             "`step-run/` or `run-generation/` target is no longer current",
             "a `mission/` retired or\n  cancelled",
-            "`resource/` and `doc/` targets are context",
+            "pull request target is merged or closed",
+            "a `loop-run/` running again",
+            "Other `resource/` targets and `doc/` targets are context",
             "had already ended when you made the request, keeps it open",
         ] {
             assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
