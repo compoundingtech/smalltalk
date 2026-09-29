@@ -6,7 +6,8 @@
   "scripts": {
     "start": "expo start",
     "typecheck": "tsc --noEmit",
-    "export:ios": "expo export --platform ios"
+    "export:ios": "expo export --platform ios",
+    "test": "node --experimental-transform-types --import ./testHooks.mjs --test"
   },
   "dependencies": {
     "@react-native-async-storage/async-storage": "2.2.0",
