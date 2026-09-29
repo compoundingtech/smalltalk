@@ -143,6 +143,13 @@ pub enum AttentionKind {
         from: String,
         body: String,
     },
+    /// An agent is stopped until the person decides or answers something.
+    Request {
+        /// Who asks, named, and its graph id to reply to.
+        from: String,
+        from_id: String,
+        question: String,
+    },
 }
 
 impl AttentionKind {
@@ -154,6 +161,7 @@ impl AttentionKind {
             AttentionKind::Revision { .. } => "revision",
             AttentionKind::Fault { .. } => "fault",
             AttentionKind::Message { .. } => "message",
+            AttentionKind::Request { .. } => "request",
         }
     }
 }
@@ -276,6 +284,8 @@ pub enum Word {
     Idle,
     Done,
     Failed,
+    /// Someone or something stopped it before it finished.
+    Cancelled,
 }
 
 impl Word {
@@ -292,6 +302,7 @@ impl Word {
             Word::Idle => "idle",
             Word::Done => "done",
             Word::Failed => "failed",
+            Word::Cancelled => "cancelled",
         }
     }
     pub fn explain(self) -> &'static str {
@@ -307,6 +318,7 @@ impl Word {
             Word::Idle => "running, with nothing ready",
             Word::Done => "every step finished",
             Word::Failed => "a step failed and nothing retried it",
+            Word::Cancelled => "it was stopped before it finished",
         }
     }
 }
