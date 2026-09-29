@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::cell::Cell;
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -674,7 +675,24 @@ impl Drop for WriterGuard<'_> {
     }
 }
 
-struct ReadPool {
+thread_local! {
+    static INTERACTIVE_READ: Cell<bool> = const { Cell::new(false) };
+}
+
+pub(crate) fn with_interactive_reads<T>(read: impl FnOnce() -> T) -> T {
+    INTERACTIVE_READ.with(|flag| {
+        struct Restore<'a>(&'a Cell<bool>, bool);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _restore = Restore(flag, flag.replace(true));
+        read()
+    })
+}
+
+struct ReadLane {
     connections: Mutex<Vec<Connection>>,
     available: Condvar,
     /// How many connections `Store::read_snapshot` holds. At least one always stays unpinned,
@@ -683,8 +701,24 @@ struct ReadPool {
     unpinned: Condvar,
 }
 
+impl ReadLane {
+    fn new(connections: Vec<Connection>) -> Self {
+        Self {
+            connections: Mutex::new(connections),
+            available: Condvar::new(),
+            pinned: Mutex::new(0),
+            unpinned: Condvar::new(),
+        }
+    }
+}
+
+struct ReadPool {
+    background: ReadLane,
+    interactive: ReadLane,
+}
+
 struct ReadGuard<'a> {
-    pool: &'a ReadPool,
+    lane: &'a ReadLane,
     connection: Option<Connection>,
     /// The connection `Store::read_snapshot` pinned for this thread, shared by every read in it.
     pinned: Option<Rc<Connection>>,
@@ -698,7 +732,7 @@ thread_local! {
 
 /// Ends a pinned read on every exit path, panics included.
 struct PinnedRead<'a> {
-    pool: &'a ReadPool,
+    lane: &'a ReadLane,
     connection: Option<Rc<Connection>>,
 }
 
@@ -706,9 +740,9 @@ impl Drop for PinnedRead<'_> {
     fn drop(&mut self) {
         PINNED_READER.with(|slot| slot.borrow_mut().take());
         {
-            let mut pinned = self.pool.pinned.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut pinned = self.lane.pinned.lock().unwrap_or_else(PoisonError::into_inner);
             *pinned -= 1;
-            self.pool.unpinned.notify_one();
+            self.lane.unpinned.notify_one();
         }
         let Some(connection) = self.connection.take() else {
             return;
@@ -718,24 +752,26 @@ impl Drop for PinnedRead<'_> {
         // connection rather than sharing it.
         if let Ok(connection) = Rc::try_unwrap(connection) {
             let mut connections = self
-                .pool
+                .lane
                 .connections
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             connections.push(connection);
-            self.pool.available.notify_one();
+            self.lane.available.notify_one();
         }
     }
 }
 
 impl ReadPool {
-    fn new(connections: Vec<Connection>) -> Self {
+    fn new(background: Vec<Connection>, interactive: Vec<Connection>) -> Self {
         Self {
-            connections: Mutex::new(connections),
-            available: Condvar::new(),
-            pinned: Mutex::new(0),
-            unpinned: Condvar::new(),
+            background: ReadLane::new(background),
+            interactive: ReadLane::new(interactive),
         }
+    }
+
+    fn lane(&self) -> &ReadLane {
+        INTERACTIVE_READ.with(|flag| if flag.get() { &self.interactive } else { &self.background })
     }
 
     fn key(&self) -> usize {
@@ -751,23 +787,24 @@ impl ReadPool {
         });
         if pinned.is_some() {
             return ReadGuard {
-                pool: self,
+                lane: self.lane(),
                 connection: None,
                 pinned,
             };
         }
-        let mut connections = self
+        let lane = self.lane();
+        let mut connections = lane
             .connections
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         while connections.is_empty() {
-            connections = self
+            connections = lane
                 .available
                 .wait(connections)
                 .unwrap_or_else(PoisonError::into_inner);
         }
         ReadGuard {
-            pool: self,
+            lane,
             connection: connections.pop(),
             pinned: None,
         }
@@ -792,12 +829,12 @@ impl Drop for ReadGuard<'_> {
             return;
         };
         let mut connections = self
-            .pool
+            .lane
             .connections
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         connections.push(connection);
-        self.pool.available.notify_one();
+        self.lane.available.notify_one();
     }
 }
 
@@ -901,6 +938,10 @@ impl Store {
     pub(crate) fn hold_read_connections_for_test(&self, hold: impl FnOnce()) {
         let _guards: Vec<_> = (0..READ_CONNECTIONS).map(|_| self.readers.get()).collect();
         hold();
+    }
+
+    pub(crate) fn hold_interactive_read_connections_for_test(&self, hold: impl FnOnce()) {
+        with_interactive_reads(|| self.hold_read_connections_for_test(hold));
     }
 
     pub(crate) fn hold_writer_for_test(&self, hold: impl FnOnce()) {
@@ -1808,10 +1849,13 @@ impl Store {
         }
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
-        let readers = open_read_connections(path, false)?;
+        let readers = ReadPool::new(
+            open_read_connections(path, false)?,
+            open_read_connections(path, false)?,
+        );
         Ok(Self {
             connection: WriterConnection::new(connection, committed_index.clone()),
-            readers: ReadPool::new(readers),
+            readers,
             committed_index,
             actual_cache: Mutex::new(HashMap::new()),
             message_cache: Mutex::new(HashMap::new()),
@@ -1858,10 +1902,13 @@ impl Store {
         }
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
-        let readers = open_read_connections(&uri, true)?;
+        let readers = ReadPool::new(
+            open_read_connections(&uri, true)?,
+            open_read_connections(&uri, true)?,
+        );
         Ok(Self {
             connection: WriterConnection::new(connection, committed_index.clone()),
-            readers: ReadPool::new(readers),
+            readers,
             committed_index,
             actual_cache: Mutex::new(HashMap::new()),
             message_cache: Mutex::new(HashMap::new()),
@@ -1899,15 +1946,14 @@ impl Store {
             let index = current_index(&self.readers.get())?;
             return read(index);
         }
+        let lane = self.readers.lane();
         {
-            let mut pinned = self
-                .readers
+            let mut pinned = lane
                 .pinned
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             while *pinned + 1 >= READ_CONNECTIONS {
-                pinned = self
-                    .readers
+                pinned = lane
                     .unpinned
                     .wait(pinned)
                     .unwrap_or_else(PoisonError::into_inner);
@@ -1918,7 +1964,7 @@ impl Store {
         // Declared first so it drops last: on every exit it ends the transaction, releases the
         // pin, and returns the connection to the pool.
         let pinned = PinnedRead {
-            pool: &self.readers,
+            lane,
             connection: Some(Rc::new(
                 guard
                     .connection
