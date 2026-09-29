@@ -52,6 +52,8 @@ pub const CLIENT_READ_MAX_HOPS: u8 = 4;
 /// Each node on a relayed read waits this much longer than the node after it, so an answer on its
 /// way back is never cut short by an earlier hop giving up first.
 const CLIENT_READ_HOP_MARGIN: Duration = Duration::from_secs(10);
+/// How long a relay reuses the fleet's observed links before it reads them again.
+const CLIENT_READ_LINKS_TTL: Duration = Duration::from_secs(5);
 /// The daemon route a replication worker hands a read to when it must forward it.
 pub const CLIENT_READ_FORWARD_PATH: &str = "/v1/internal/client-read/forward";
 const HEADER_FLEET: &str = "x-st3-fleet";
@@ -460,6 +462,8 @@ pub struct ClientRelay {
     http: reqwest::Client,
     /// The store whose replicated transport observations say which nodes reach which.
     links: Option<Arc<Store>>,
+    /// The links last read from that store, and when, so a busy gateway reads them rarely.
+    observed: Arc<std::sync::Mutex<Option<(std::time::Instant, Arc<[(String, String)]>)>>>,
 }
 
 impl ClientRelay {
@@ -472,9 +476,33 @@ impl ClientRelay {
     /// Whether a read for this host has somewhere to go: the host itself, or a peer that can
     /// carry it on.
     pub fn reaches(&self, host_id: &str) -> bool {
-        host_id
-            .strip_prefix("host/")
-            .is_some_and(|name| name != self.node && !self.next_hops(name, &[]).is_empty())
+        host_id.strip_prefix("host/").is_some_and(|name| {
+            name != self.node
+                && (self
+                    .peers
+                    .iter()
+                    .any(|peer| peer.name == name && !peer.url.is_empty())
+                    || !self.next_hops(name, &[]).is_empty())
+        })
+    }
+
+    /// The fleet's observed up links, read again once the last reading is a few seconds old.
+    fn observed_links(&self) -> Arc<[(String, String)]> {
+        let Some(store) = &self.links else {
+            return Arc::from([]);
+        };
+        let mut observed = self
+            .observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((read_at, links)) = observed.as_ref()
+            && read_at.elapsed() < CLIENT_READ_LINKS_TTL
+        {
+            return links.clone();
+        }
+        let links: Arc<[(String, String)]> = store.transport_links().unwrap_or_default().into();
+        *observed = Some((std::time::Instant::now(), links.clone()));
+        links
     }
 
     /// The peers to try, in order, for a read bound for `target`: the target itself when it is a
@@ -487,11 +515,7 @@ impl ClientRelay {
             .filter(|peer| !peer.url.is_empty() && peer.name != self.node)
             .filter(|peer| !visited.contains(&peer.name))
             .collect::<Vec<_>>();
-        let links = self
-            .links
-            .as_ref()
-            .and_then(|store| store.transport_links().ok())
-            .unwrap_or_default();
+        let links = self.observed_links();
         let names = dialable
             .iter()
             .map(|peer| peer.name.clone())
@@ -517,6 +541,7 @@ impl ClientRelay {
                 .connect_timeout(Duration::from_secs(3))
                 .build()?,
             links: None,
+            observed: Arc::default(),
         }))
     }
 
@@ -3101,11 +3126,10 @@ mod tests {
             .unwrap()
             .value;
         assert!(
-            timeline
-                .items
-                .iter()
-                .any(|entry| serde_json::to_value(&entry.body).unwrap()["text"]
-                    == "answered two hops away"),
+            timeline.items.iter().any(
+                |entry| serde_json::to_value(&entry.body).unwrap()["body"]["text"]
+                    == "answered two hops away"
+            ),
             "the owner's transcript must reach the gateway through the relay"
         );
 
