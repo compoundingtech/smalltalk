@@ -482,6 +482,8 @@ impl Ui {
             x += 1;
         }
         let (glyph, word, color) = match &self.world.link {
+            // Live, but showing a graph that exchanges cannot correct.
+            Link::Live if !self.world.diverged.is_empty() => ("⚠", "diverged", theme::RED),
             Link::Live => ("●", "live", theme::GREEN),
             Link::Connecting => (self.spinner(), "connecting", theme::YELLOW),
             Link::Offline(_) => ("○", "offline", theme::RED),
@@ -2891,6 +2893,17 @@ mod tests {
                 "tab {tab}: {screen}"
             );
         }
+    }
+
+    #[test]
+    fn a_diverged_host_says_so_instead_of_live() {
+        let mut world = demo::world();
+        let top = |world: &World| frame(&Ui::new(world.clone()), 140, 30)[0].clone();
+        assert!(top(&world).contains("● live"));
+        world.diverged = vec!["harbor".into()];
+        let header = top(&world);
+        assert!(header.contains("⚠ diverged"), "{header}");
+        assert!(!header.contains("live"), "{header}");
     }
 
     #[test]

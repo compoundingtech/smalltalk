@@ -495,6 +495,7 @@ stage_tests! {
     subscriptions => "stage/subscriptions",
     provider_capacity_retries => "stage/provider-capacity-retries",
     retired_agent_attention => "stage/retired-agent-attention",
+    disk_space => "stage/disk-space",
     attention_until => "stage/attention-until",
 }
 

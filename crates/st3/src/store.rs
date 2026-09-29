@@ -41,7 +41,16 @@ use crate::model::{SeatQueueMoveRequest, SeatQueueMoveView, SeatQueueRunView, Se
 use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
 mod checkpoint;
+mod checkpoint_agreement;
 
+pub use checkpoint_agreement::{
+    CHECKPOINT_ATTENTION_AFTER_MS, CHECKPOINT_EXCUSED, CHECKPOINT_PROTOCOL, CHECKPOINT_SEALED,
+    CHECKPOINT_VERIFIED, Certificate, CheckpointAction, CheckpointClaim, CheckpointContext,
+    CheckpointExcuseRequest, CheckpointStatusView, PendingCheckpointView, SealTerms,
+    VerifiedTerms, certificates, checkpoint_build, excused_writers, first_verifications,
+    newest_seals, participants as checkpoint_participants, stable_checkpoints,
+};
+use checkpoint_agreement::write_time;
 pub use checkpoint::{
     CheckpointPlanRequest, CheckpointPlanView, CheckpointProof, ClaimTombstone, DropCount,
     DropPlan, EnvelopeKey, EnvelopeTombstone, SealedSet, checkpoint_cut, checkpoint_name,
@@ -558,11 +567,28 @@ CREATE TABLE IF NOT EXISTS checkpoint_claims (
     accepted_at_unix_ms INTEGER NOT NULL,
     checkpoint TEXT NOT NULL
 );
+-- The checkpoints this node sealed, verified, trimmed or adopted. `seal_rowid` is the
+-- `replica_envelopes` high water of the set it sealed or verified, so it can read exactly that
+-- set again. Every write this node makes is dated at or after the highest cut here.
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id TEXT PRIMARY KEY,
+    cut_unix_ms INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    seal_rowid INTEGER,
+    sealed_digest TEXT,
+    drop_digest TEXT,
+    graph_digest TEXT,
+    detail TEXT NOT NULL DEFAULT '{}',
+    updated_at_unix_ms INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);
 CREATE INDEX IF NOT EXISTS checkpoint_claims_operation
 ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
 PRAGMA user_version = 13;
 "#;
+
+/// The writer connection's clock offset. Only a simulation sets it; see `write_time`.
+const WRITE_CLOCK: &str = "CREATE TEMP TABLE IF NOT EXISTS write_clock(offset_ms INTEGER NOT NULL);";
 
 const READ_CONNECTIONS: usize = 4;
 
@@ -944,9 +970,22 @@ struct PeerSyncProgress {
     window_started_at_unix_ms: u128,
     window_peer_only: u64,
     window_received: u64,
+    graph_compared_at_unix_ms: Option<u128>,
+    graph_differs_since_unix_ms: Option<u128>,
 }
 
 impl PeerSyncProgress {
+    /// Record one comparison of this node's graph digest with the peer's, made while both nodes
+    /// held the same envelopes.
+    fn compare_graphs(&mut self, equal: bool, now: u128) {
+        self.graph_compared_at_unix_ms = Some(now);
+        if equal {
+            self.graph_differs_since_unix_ms = None;
+        } else {
+            self.graph_differs_since_unix_ms.get_or_insert(now);
+        }
+    }
+
     /// Record one receipt from the peer and, when the peer's inventory allowed it, the measured
     /// difference `(peer_only, local_only)`. Rates are sampled over windows of at least
     /// `REPLICATION_SYNC_WINDOW_MS` and smoothed so one slow exchange does not swing the estimate.
@@ -997,6 +1036,14 @@ impl PeerSyncProgress {
         let mut sync = self.measured.clone()?;
         sync.catching_up = sync.peer_only_envelopes > REPLICATION_EXCHANGE_ENVELOPE_LIMIT as u64
             && now.saturating_sub(sync.measured_at_unix_ms) <= REPLICATION_SYNC_STALE_MS;
+        sync.graph_compared_at_unix_ms = self.graph_compared_at_unix_ms;
+        sync.graph_differs_since_unix_ms = self.graph_differs_since_unix_ms;
+        sync.diverged = self
+            .graph_differs_since_unix_ms
+            .zip(self.graph_compared_at_unix_ms)
+            .is_some_and(|(since, compared)| {
+                compared.saturating_sub(since) >= REPLICATION_DIVERGED_AFTER_MS
+            });
         Some(sync)
     }
 }
@@ -1739,6 +1786,7 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(&connection)?;
         {
             let transaction = connection.transaction()?;
@@ -1788,6 +1836,7 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(&connection)?;
         {
             let transaction = connection.transaction()?;
@@ -6840,7 +6889,7 @@ impl Store {
             transaction.commit().map_err(internal)?;
             return Ok(response);
         }
-        let now = now_ms();
+        let now = write_time(&transaction).map_err(internal)?;
         let sequence = next_replica_sequence(&transaction, &self.origin).map_err(internal)?;
         let previous_hash = previous_batch_hash(&transaction, &self.origin).map_err(internal)?;
         let batch_hash = batch_header_hash(&self.origin, sequence, previous_hash.as_deref(), now)
@@ -10139,7 +10188,7 @@ impl Store {
                 message_subjects: Vec::new(),
             });
         }
-        let now = now_ms();
+        let now = write_time(&transaction).map_err(internal)?;
         let sequence = next_replica_sequence(&transaction, &self.origin).map_err(internal)?;
         let previous_hash = previous_batch_hash(&transaction, &self.origin).map_err(internal)?;
         let batch_hash = batch_header_hash(&self.origin, sequence, previous_hash.as_deref(), now)
@@ -12265,12 +12314,27 @@ impl Store {
             &snapshot.buckets,
             &input.inventory,
         );
-        self.replication_sync
+        // Each graph projects the envelopes its node holds, so the digests are comparable only
+        // while both nodes hold the same ones, and only once this node has projected them all:
+        // nothing new arrived that still waits for admission, and no projection is deferred.
+        let graph_equal = (!input.inventory.digest.is_empty()
+            && input.inventory.digest == snapshot.inventory.digest
+            && !input.graph_digest.is_empty()
+            && received == 0
+            && signatures == 0
+            && !self.replication_projection_deferred())
+        .then(|| input.graph_digest == snapshot.graph_digest);
+        let now = now_ms();
+        let mut sync = self
+            .replication_sync
             .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .entry(relay.to_owned())
-            .or_default()
-            .observe(received, difference, now_ms());
+            .unwrap_or_else(PoisonError::into_inner);
+        let progress = sync.entry(relay.to_owned()).or_default();
+        progress.observe(received, difference, now);
+        if let Some(equal) = graph_equal {
+            progress.compare_graphs(equal, now);
+        }
+        drop(sync);
         Ok(ReplicationReceipt {
             received,
             duplicate,
@@ -12826,6 +12890,16 @@ impl Store {
             .unwrap_or_else(PoisonError::into_inner)
             .values()
             .any(|progress| progress.view(now).is_some_and(|sync| sync.catching_up))
+    }
+
+    /// Whether any peer's comparisons say this node's graph has diverged from that peer's.
+    pub fn replication_diverged(&self) -> bool {
+        let now = now_ms();
+        self.replication_sync
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .values()
+            .any(|progress| progress.view(now).is_some_and(|sync| sync.diverged))
     }
 
     /// The latest sync measurement for each configured peer that has one.
@@ -16385,7 +16459,7 @@ fn append_claim_tx(
         &claim_spec.cardinality,
     )
     .map_err(anyhow::Error::new)?;
-    let now = now_ms();
+    let now = write_time(transaction)?;
     let batch_id = if let Some(batch) = forced_batch {
         batch.to_owned()
     } else {
@@ -21371,6 +21445,12 @@ const REPLICATION_SYNC_WINDOW_MS: u128 = 10_000;
 /// A sync measurement older than this no longer says the node is catching up, and a longer gap
 /// between measurements gives no rate sample.
 const REPLICATION_SYNC_STALE_MS: u128 = 300_000;
+
+/// How long comparisons must keep finding the same envelopes projecting different graphs before
+/// the two nodes count as diverged. A peer can export between storing envelopes and projecting
+/// them, and a catching-up peer defers projection for up to `CATCH_UP_PROJECTION_INTERVAL_MS`,
+/// so a shorter difference can still settle by itself.
+const REPLICATION_DIVERGED_AFTER_MS: u128 = 2 * CATCH_UP_PROJECTION_INTERVAL_MS as u128;
 
 /// Sequences per compact inventory range. A range digest lets two peers skip every range they
 /// already share, so an exchange lists only the identities in ranges that differ.
@@ -32349,6 +32429,146 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                 .body["fields"]["state"],
             "idle"
         );
+    }
+
+    #[test]
+    fn the_same_envelopes_projecting_different_graphs_diverge() {
+        let left = Store::open_memory("left").unwrap();
+        let right = Store::open_memory("right").unwrap();
+        let intent = simple("true");
+        let preview = left
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: "work".into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        left.apply(&intent, &preview.subject_tokens, "work")
+            .unwrap();
+        receive_and_project(
+            &right,
+            "left",
+            &exchange_from(&left, &right.replication_inventory().unwrap()),
+        );
+        receive_and_project(
+            &left,
+            "right",
+            &exchange_from(&right, &left.replication_inventory().unwrap()),
+        );
+        // Each exchange a worker starts carries its node's inventory and graph digest.
+        let summary = |from: &Store, to: &Store, relay: &str| {
+            let exchange = from.export_replication_summary(TEST_FLEET).unwrap();
+            to.receive_replication_exchange(relay, TEST_FLEET, &exchange)
+                .unwrap();
+            to.replication_peer_sync(&[relay.to_owned()])
+                .remove(relay)
+                .unwrap()
+        };
+        let synced = summary(&left, &right, "left");
+        assert_eq!(
+            (synced.peer_only_envelopes, synced.local_only_envelopes),
+            (0, 0)
+        );
+        assert!(synced.graph_compared_at_unix_ms.is_some());
+        assert_eq!(synced.graph_differs_since_unix_ms, None);
+        assert!(!synced.diverged);
+
+        // Right loses the desired claim while keeping its envelope, as a node that drops
+        // received claims would: the inventories still match, the graphs no longer do.
+        {
+            let connection = right.connection.lock().unwrap();
+            connection
+                .execute_batch(
+                    "CREATE TEMP TABLE dropped_claims AS
+                         SELECT * FROM claims WHERE subject='exec/work' AND kind='intent.desired';
+                     CREATE TEMP TABLE dropped_desired AS
+                         SELECT * FROM desired WHERE subject='exec/work';
+                     PRAGMA foreign_keys=OFF;
+                     DELETE FROM desired WHERE subject='exec/work';
+                     DELETE FROM claims WHERE subject='exec/work' AND kind='intent.desired';
+                     PRAGMA foreign_keys=ON;",
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            left.replication_inventory().unwrap().digest,
+            right.replication_inventory().unwrap().digest
+        );
+        let differs = summary(&left, &right, "left");
+        let since = differs.graph_differs_since_unix_ms.expect("graphs differ");
+        assert_eq!(differs.graph_compared_at_unix_ms, Some(since));
+        assert!(
+            !differs.diverged,
+            "one comparison can catch a peer mid-projection"
+        );
+        assert!(!right.replication_diverged());
+        assert!(
+            summary(&right, &left, "right")
+                .graph_differs_since_unix_ms
+                .is_some(),
+            "the peer sees the difference too"
+        );
+
+        // A difference that outlasts any projection delay is divergence.
+        right
+            .replication_sync
+            .lock()
+            .unwrap()
+            .get_mut("left")
+            .unwrap()
+            .graph_differs_since_unix_ms = Some(since - REPLICATION_DIVERGED_AFTER_MS);
+        let diverged = summary(&left, &right, "left");
+        assert!(diverged.diverged);
+        assert_eq!(
+            diverged.graph_differs_since_unix_ms,
+            Some(since - REPLICATION_DIVERGED_AFTER_MS)
+        );
+        assert!(right.replication_diverged());
+        let status = right
+            .replication_status(true, Some(TEST_FLEET), &["left".to_owned()])
+            .unwrap();
+        assert!(status.peers[0].sync.as_ref().unwrap().diverged);
+        assert_ne!(
+            status.peers[0].graph_digest.as_deref(),
+            Some(status.graph_digest.as_str())
+        );
+
+        // Different envelopes cannot be compared, so they leave the last comparison standing.
+        let compared = diverged.graph_compared_at_unix_ms;
+        left.record_transport_observation("right", "up", None, None)
+            .unwrap();
+        let moved = summary(&left, &right, "left");
+        assert_eq!(moved.peer_only_envelopes, 1);
+        assert_eq!(moved.graph_compared_at_unix_ms, compared);
+        assert!(moved.diverged);
+
+        // Once the same envelopes project the same graph again, the divergence clears.
+        receive_and_project(
+            &right,
+            "left",
+            &exchange_from(&left, &right.replication_inventory().unwrap()),
+        );
+        {
+            let connection = right.connection.lock().unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA foreign_keys=OFF;
+                     INSERT INTO claims SELECT * FROM dropped_claims;
+                     INSERT INTO desired SELECT * FROM dropped_desired;
+                     PRAGMA foreign_keys=ON;",
+                )
+                .unwrap();
+        }
+        let healed = summary(&left, &right, "left");
+        assert_eq!(
+            (healed.peer_only_envelopes, healed.local_only_envelopes),
+            (0, 0)
+        );
+        assert_eq!(healed.graph_differs_since_unix_ms, None);
+        assert!(!healed.diverged);
+        assert!(!right.replication_diverged());
     }
 
     #[test]
