@@ -1162,12 +1162,12 @@ fn mission_resources_filtered(
         .flatten()
         .map(|run| run.subject.as_str())
         .collect::<BTreeSet<_>>();
+    let page_run_subjects = page_runs
+        .iter()
+        .map(|run| (*run).to_owned())
+        .collect::<Vec<_>>();
     let desired = if scope.is_some() {
-        let mut desired = Vec::new();
-        for run in &page_runs {
-            desired.extend(store.desired_subjects_for_owner_run(run)?);
-        }
-        desired
+        store.desired_subjects_for_owner_runs(&page_run_subjects)?
     } else {
         store.desired_subjects()?
     };
@@ -1191,12 +1191,7 @@ fn mission_resources_filtered(
         }
     }
     let run_states = if scope.is_some() {
-        store.mission_run_states_for_runs(
-            &page_runs
-                .iter()
-                .map(|run| (*run).to_owned())
-                .collect::<Vec<_>>(),
-        )?
+        store.mission_run_states_for_runs(&page_run_subjects)?
     } else {
         store.mission_run_states()?
     };
@@ -2152,7 +2147,6 @@ fn operation_resources(state: &AppState, at: &str) -> Result<Vec<Value>, ApiErro
     let checks = operation_checks(state)?;
     let mut values = checks
         .iter()
-        .cloned()
         .map(|check| {
             let digest = hex::encode(Sha256::digest(check.name.as_bytes()));
             json!({

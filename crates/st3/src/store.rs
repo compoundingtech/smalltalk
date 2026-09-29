@@ -9306,6 +9306,23 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// The desired subjects that the runs `owner_runs` own.
+    pub fn desired_subjects_for_owner_runs(
+        &self,
+        owner_runs: &[String],
+    ) -> Result<Vec<DesiredSubject>> {
+        if owner_runs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
+             FROM desired WHERE owner_run IN (SELECT value FROM json_each(?1)) ORDER BY subject",
+        )?;
+        let rows = statement.query_map([serde_json::to_string(owner_runs)?], desired_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
     /// The desired subjects that the steps `owner_steps` own.
     pub fn desired_subjects_for_owner_steps(
         &self,
