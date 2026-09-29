@@ -43,6 +43,8 @@ use crate::model::{
     PlanningCancelRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
     PlanningRevisionRequest, PlanningSessionStartRequest, PlanningSessionView, QuickAgentRequest,
     QuickAgentResponse, ReplicaRecordView, ReplicationExportRequest, ReplicationExportResponse,
+    ReplicationHealAnswer, ReplicationHealAnswerRequest, ReplicationHealNextRequest,
+    ReplicationHealStep,
     ReplicationPeerFailureRequest, ReplicationReceiveRequest, ReplicationReceiveResponse,
     ReplicationRepairRequest, ReplicationStatus, ReviewRequest, RevisionApprovalRequest,
     RevisionCancelRequest, RevisionCutover, RevisionProposalView, RevisionSubmissionView,
@@ -436,6 +438,16 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route(
             "/v1/internal/replication/peer-failure",
             post(replication_peer_failure),
+        )
+        .route(
+            "/v1/internal/replication/heal/answer",
+            post(replication_heal_answer)
+                .layer(DefaultBodyLimit::max(crate::peer::MAX_EXCHANGE_BYTES)),
+        )
+        .route(
+            "/v1/internal/replication/heal/next",
+            post(replication_heal_next)
+                .layer(DefaultBodyLimit::max(crate::peer::MAX_EXCHANGE_BYTES)),
         )
         .route("/v1/internal/fleet/membership", get(fleet_membership_view))
         .route("/v1/internal/fleet/status", get(fleet_status))
@@ -4221,7 +4233,14 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 .filter(|peer| peer.sync.as_ref().is_some_and(|sync| sync.diverged))
                 .map(|peer| peer.peer.as_str())
                 .collect::<Vec<_>>();
-            let status = if replication.unhealthy_projections != 0 || !diverged.is_empty() {
+            let first_sync_failed = replication
+                .first_sync
+                .as_ref()
+                .filter(|first| first.state == "failed");
+            let status = if replication.unhealthy_projections != 0
+                || !diverged.is_empty()
+                || first_sync_failed.is_some()
+            {
                 "fail"
             } else if !unavailable.is_empty() || unresolved != 0 {
                 "warn"
@@ -4232,7 +4251,15 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 name: "replication".into(),
                 status: status.into(),
                 message: format!(
-                    "{}{} envelopes; {} unresolved records; {} unhealthy projections{}; peers {}",
+                    "{}{}{} envelopes; {} unresolved records; {} unhealthy projections{}; peers {}",
+                    first_sync_failed
+                        .map(|first| format!(
+                            "the first sync with {} ended with a different graph, and a heal \
+                             did not fix it: {}; ",
+                            first.peer.as_deref().unwrap_or("a peer"),
+                            first.message.as_deref().unwrap_or("no reason recorded")
+                        ))
+                        .unwrap_or_default(),
                     if diverged.is_empty() {
                         String::new()
                     } else {
@@ -4568,6 +4595,50 @@ async fn replication_receive(
             .send_modify(|generation| *generation = generation.saturating_add(1));
     }
     Ok(Json(response))
+}
+
+/// Answer a peer's heal question. A swap or a replay can change the graph.
+async fn replication_heal_answer(
+    State(state): State<AppState>,
+    Json(request): Json<ReplicationHealAnswerRequest>,
+) -> Result<Json<ReplicationHealAnswer>, ApiError> {
+    if state.fleet_id.as_deref() != Some(request.fleet_id.as_str()) {
+        return Err(ApiError::bad(St3Error::new(
+            "fleet-id-mismatch",
+            "the peer belongs to another fleet",
+        )));
+    }
+    let store = state.store.clone();
+    let (answer, changed) = blocking_store(move || {
+        let before = store.replication_status(false, None, &[])?.graph_digest;
+        let answer = store.heal_answer(&request.peer, &request.query)?;
+        let changed = store.replication_status(false, None, &[])?.graph_digest != before;
+        Ok((answer, changed))
+    })
+    .await?;
+    if changed {
+        signal_changed(&state);
+    }
+    Ok(Json(answer))
+}
+
+/// Compare a peer's heal answer with this node's claims and say what to ask next.
+async fn replication_heal_next(
+    State(state): State<AppState>,
+    Json(request): Json<ReplicationHealNextRequest>,
+) -> Result<Json<ReplicationHealStep>, ApiError> {
+    let store = state.store.clone();
+    let (step, changed) = blocking_store(move || {
+        let before = store.replication_status(false, None, &[])?.graph_digest;
+        let step = store.heal_next(&request.peer, request.answer)?;
+        let changed = store.replication_status(false, None, &[])?.graph_digest != before;
+        Ok((step, changed))
+    })
+    .await?;
+    if changed {
+        signal_changed(&state);
+    }
+    Ok(Json(step))
 }
 
 fn replication_receive_has_new_data(received: usize) -> bool {
@@ -4989,6 +5060,8 @@ async fn refuse_while_leaving(
                 | "/v1/internal/replication/export"
                 | "/v1/internal/replication/receive"
                 | "/v1/internal/replication/peer-failure"
+                | "/v1/internal/replication/heal/answer"
+                | "/v1/internal/replication/heal/next"
                 | "/v1/internal/replication-wake"
         );
     if mutating && !allowed && state.store.fleet_leaving().unwrap_or(false) {
