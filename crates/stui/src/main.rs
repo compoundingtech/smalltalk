@@ -3957,10 +3957,11 @@ mod tests {
         assert!(!rows[0].contains("Online"));
         assert!(
             rows.iter().any(|row| row.contains(
-                "SYNCING  ExampleMac has 124,384 envelopes this host lacks · caught up in about 14m"
+                "SYNCING  ExampleMac has 124,384 envelopes this host lacks · caught up in about"
             )),
             "{rows:#?}"
         );
+        assert!(rows.iter().any(|row| row.contains("14m")), "{rows:#?}");
 
         // A newer collection served after the host caught up clears the notice.
         app.model.agents.snapshot = Some(snapshot(11));

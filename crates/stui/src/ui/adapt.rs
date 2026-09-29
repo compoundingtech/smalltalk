@@ -1375,7 +1375,7 @@ mod tests {
         });
         let preview = preview("harbor/audit", &normalized);
         assert_eq!(preview.goals, vec!["Audit dependencies"]);
-        assert_eq!(preview.steps[0].assignee, "fleet/auditor");
+        assert_eq!(preview.steps[0].assignee, "example/auditor");
         assert_eq!(preview.steps[1].after, vec!["scan"]);
         assert!(preview.steps[1].asks_you);
         assert_eq!(preview.agents.len(), 1);

@@ -2190,7 +2190,7 @@ mod tree_tests {
                 Item::Header { .. } => "H".into(),
             })
             .collect::<Vec<_>>();
-        assert_eq!(kinds[0], "F ▾ fleet/", "{kinds:#?}");
+        assert_eq!(kinds[0], "F ▾ example/", "{kinds:#?}");
         assert!(
             kinds
                 .iter()
