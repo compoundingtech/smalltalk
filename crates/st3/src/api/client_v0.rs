@@ -9,6 +9,13 @@ const COLLECTION_SUBPROTOCOL: &str = "st3.client.collections.v0";
 const TERMINAL_CAPABILITY_PROTOCOL_PREFIX: &str = "st3.cap.";
 const LOCAL_PERSON_HEADER: &str = "x-st3-person";
 
+pub(super) async fn request_latency(
+    Extension(session): Extension<ClientSession>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    Ok(Json(json!({ "routes": super::request_latency_snapshot() })))
+}
+
 // A client holds one socket for all its current collection views. A subscription
 // is a bounded window; history stays on the paged HTTP endpoints.
 #[derive(Clone, Deserialize)]

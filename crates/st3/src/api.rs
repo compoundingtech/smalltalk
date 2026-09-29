@@ -250,6 +250,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/client/capabilities", get(client_capabilities))
+        .route(
+            "/v1/client/request-latency",
+            get(client_v0::request_latency),
+        )
         .route("/v1/client/documents/content", get(client_v0::document_get))
         .route("/v1/client/now", get(client_v0::now))
         .route("/v1/client/machines", get(client_v0::machines))
@@ -514,6 +518,11 @@ async fn response_envelope(
 ) -> Response {
     let started = Instant::now();
     let request_path = request.uri().path().to_owned();
+    let request_route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|route| route.as_str().to_owned())
+        .unwrap_or_else(|| "/unmatched".to_owned());
     let client_request = request.uri().path().starts_with("/v1/client/");
     let fabric_boundary_error = (matches!(transport, ClientTransportBoundary::FabricLoopback)
         && !client_request
@@ -548,9 +557,11 @@ async fn response_envelope(
         let auth_state = state.clone();
         let transport = transport.as_str();
         let admitted = tokio::task::spawn_blocking(move || {
-            let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
-            let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
-            (authentication, snapshot)
+            crate::store::with_interactive_reads(|| {
+                let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
+                let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
+                (authentication, snapshot)
+            })
         })
         .await;
         match admitted {
@@ -568,7 +579,21 @@ async fn response_envelope(
     }
     let response = match (fabric_boundary_error, client_authentication) {
         (Some(error), _) | (None, Err(error)) => error.into_response(),
-        (None, Ok(_)) => next.run(request).await,
+        // Most handlers use synchronous SQLite and filesystem APIs. Run the whole
+        // handler on a blocking thread so a busy projection, replication pass, or
+        // reader pool cannot occupy an async worker needed to accept another call.
+        (None, Ok(_)) if request_path == "/v1/health" => next.run(request).await,
+        (None, Ok(_)) => {
+            let runtime = tokio::runtime::Handle::current();
+            match tokio::task::spawn_blocking(move || {
+                crate::store::with_interactive_reads(|| runtime.block_on(next.run(request)))
+            })
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => ApiError::internal(error).into_response(),
+            }
+        }
     };
     if response.status() == StatusCode::SWITCHING_PROTOCOLS
         || !response
@@ -577,7 +602,7 @@ async fn response_envelope(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("application/json"))
     {
-        report_slow_request(&request_path, started);
+        record_request_latency(&request_route, &request_path, started);
         return response;
     }
     let status = response.status();
@@ -650,12 +675,63 @@ async fn response_envelope(
     };
     let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-    report_slow_request(&request_path, started);
+    record_request_latency(&request_route, &request_path, started);
     Response::from_parts(parts, Body::from(body))
 }
 
-fn report_slow_request(path: &str, started: Instant) {
+#[derive(Default)]
+struct RouteLatency {
+    count: u64,
+    recent_ms: VecDeque<u64>,
+}
+
+static REQUEST_LATENCY: OnceLock<Mutex<BTreeMap<String, RouteLatency>>> = OnceLock::new();
+
+fn request_latency() -> &'static Mutex<BTreeMap<String, RouteLatency>> {
+    REQUEST_LATENCY.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn request_latency_snapshot() -> Vec<Value> {
+    let routes = request_latency().lock().unwrap();
+    routes
+        .iter()
+        .map(|(route, latency)| {
+            let mut sorted = latency.recent_ms.iter().copied().collect::<Vec<_>>();
+            sorted.sort_unstable();
+            let percentile = |percent: usize| {
+                sorted
+                    .get(
+                        ((sorted.len().saturating_mul(percent).saturating_add(99)) / 100)
+                            .saturating_sub(1),
+                    )
+                    .copied()
+                    .unwrap_or_default()
+            };
+            json!({
+                "route": route,
+                "count": latency.count,
+                "recent_count": sorted.len(),
+                "p50_ms": percentile(50),
+                "p99_ms": percentile(99),
+                "max_ms": sorted.last().copied().unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn record_request_latency(route: &str, path: &str, started: Instant) {
     let elapsed = started.elapsed();
+    {
+        let mut routes = request_latency().lock().unwrap();
+        if routes.len() < 256 || routes.contains_key(route) {
+            let sample = routes.entry(route.to_owned()).or_default();
+            sample.count = sample.count.saturating_add(1);
+            if sample.recent_ms.len() == 512 {
+                sample.recent_ms.pop_front();
+            }
+            sample.recent_ms.push_back(elapsed.as_millis() as u64);
+        }
+    }
     if elapsed < Duration::from_secs(1) {
         return;
     }
@@ -3337,7 +3413,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(operation)
+    tokio::task::spawn_blocking(move || crate::store::with_interactive_reads(operation))
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::internal)
@@ -3348,7 +3424,7 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, St3Error> + Send + 'static,
 {
-    tokio::task::spawn_blocking(operation)
+    tokio::task::spawn_blocking(move || crate::store::with_interactive_reads(operation))
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::bad)
@@ -3537,10 +3613,12 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         tokio::task::spawn_blocking(move || crate::environment::check_build_tools(&environment))
     });
     let token = crate::resource::github_token().await;
-    let mut report = tokio::task::spawn_blocking(move || doctor_report(&state))
-        .await
-        .map_err(ApiError::internal)??
-        .0;
+    let mut report = tokio::task::spawn_blocking(move || {
+        crate::store::with_interactive_reads(|| doctor_report(&state))
+    })
+    .await
+    .map_err(ApiError::internal)??
+    .0;
     if let Some(build_tools) = build_tools {
         report.checks.push(build_tools_check(
             &build_tools.await.map_err(ApiError::internal)?,
@@ -4018,6 +4096,21 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             status: "fail".into(),
             message: error.to_string(),
         }),
+    }
+    let mut routes = request_latency_snapshot();
+    routes.sort_by_key(|route| std::cmp::Reverse(route["p99_ms"].as_u64().unwrap_or_default()));
+    for route in routes.into_iter().take(10) {
+        checks.push(DoctorCheck {
+            name: format!(
+                "request-latency/{}",
+                route["route"].as_str().unwrap_or("unknown")
+            ),
+            status: "pass".into(),
+            message: format!(
+                "{} requests; recent p50 {} ms, p99 {} ms, max {} ms",
+                route["count"], route["p50_ms"], route["p99_ms"], route["max_ms"]
+            ),
+        });
     }
     let report_status = if checks.iter().any(|check| check.status == "fail") {
         "fail"
@@ -9829,7 +9922,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let before = state.store.index().unwrap();
-        report_slow_request("/v1/client/agents", Instant::now() - Duration::from_secs(2));
+        record_request_latency(
+            "/v1/client/agents",
+            "/v1/client/agents",
+            Instant::now() - Duration::from_secs(2),
+        );
         // The old implementation spawned a blocking write, so give that write
         // time to finish before proving the request caused no graph change.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -10106,7 +10203,7 @@ mod tests {
         let store = state.store.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
-            store.hold_read_connections_for_test(|| {
+            store.hold_interactive_read_connections_for_test(|| {
                 ready_tx.send(()).unwrap();
                 std::thread::sleep(Duration::from_millis(500));
             });
@@ -10134,6 +10231,113 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
         }
         holder.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_terminal_attach_does_not_delay_an_independent_request() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            store.hold_interactive_read_connections_for_test(|| {
+                ready_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(500));
+            });
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let app = router(state);
+        let started = Instant::now();
+        let attach = tokio::spawn(json_request(
+            app.clone(),
+            "/v1/sessions/attach/agent/probe",
+            json!({}),
+        ));
+        tokio::task::yield_now().await;
+        let (status, _) = get_request(app, "/v1/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "health waited {:?} behind a blocked terminal attach",
+            started.elapsed()
+        );
+
+        holder.join().unwrap();
+        let (status, _) = attach.await.unwrap();
+        assert!(!status.is_success());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn isolated_daemon_answers_health_under_stalled_attaches() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let socket = root.path().join("st3.sock");
+        let server_socket = socket.clone();
+        let server_state = state.clone();
+        let server =
+            tokio::spawn(async move { serve_unix(&server_socket, router(server_state)).await });
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let store = state.store.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            store.hold_read_connections_for_test(|| {
+                ready_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(1_200));
+            });
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let client = crate::client::Client::new(crate::client::Endpoint::Unix(socket));
+        let pending = (0..8)
+            .map(|_| {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let started = Instant::now();
+                    let _: anyhow::Result<Value> = client
+                        .post("/v1/sessions/attach/agent/probe", &json!({}))
+                        .await;
+                    started.elapsed()
+                })
+            })
+            .collect::<Vec<_>>();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let mut latencies = Vec::new();
+        for _ in 0..30 {
+            let started = Instant::now();
+            let _: Value = client.get("/v1/health").await.unwrap();
+            latencies.push(started.elapsed());
+        }
+        latencies.sort();
+        assert!(
+            latencies[29] < Duration::from_secs(1),
+            "health p99 was {:?}",
+            latencies[29]
+        );
+        let mut attach_latencies = Vec::new();
+        for request in pending {
+            attach_latencies.push(request.await.unwrap());
+        }
+        assert!(
+            attach_latencies
+                .iter()
+                .all(|latency| *latency < Duration::from_secs(1)),
+            "terminal attaches waited behind background reads: {attach_latencies:?}"
+        );
+        holder.join().unwrap();
+        let doctor: DoctorReport = client.get("/v1/doctor").await.unwrap();
+        assert!(doctor.checks.iter().any(|check| {
+            check.name == "request-latency//v1/health" && check.message.contains("p99")
+        }));
+        let (status, latency) = get_request(router(state), "/v1/client/request-latency").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(latency["routes"].as_array().unwrap().iter().any(|route| {
+            route["route"] == "/v1/health" && route["count"].as_u64().unwrap_or_default() >= 30
+        }));
+        server.abort();
     }
 
     #[test]
