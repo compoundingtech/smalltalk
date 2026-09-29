@@ -12387,20 +12387,25 @@ impl Store {
         // An inbound exchange is just as good evidence of reachability as an outbound one.
         // Keep the last success during a short missed-exchange window, so a failed dial on
         // one side cannot flap a peer that is still exchanging in the other direction.
-        let recent_exchange = self
-            .replication_peer_last_success(peer)?
-            .is_some_and(|last| now_ms().saturating_sub(last) < 90_000);
+        let last_success = self.replication_peer_last_success(peer)?;
+        let recent_exchange =
+            last_success.is_some_and(|last| now_ms().saturating_sub(last) < 90_000);
         if recent_exchange {
             return Ok(false);
         }
         // A peer may also have a fresh up observation without a matching peer-row success
         // (for example, after a worker restart). Its published status must get the same
-        // missed-exchange grace period or one outbound timeout reverses it immediately.
-        let recent_observation = self
-            .latest_claim(&format!("host/{peer}"), Some("transport.observed"))?
-            .filter(|claim| claim.origin == self.origin && claim.body["fields"]["status"] == "up")
-            .and_then(|claim| claim.body["fields"]["last_success_at"].as_u64())
-            .is_some_and(|last| now_ms().saturating_sub(u128::from(last)) < 90_000);
+        // missed-exchange grace period or one outbound timeout reverses it immediately. A row
+        // success, once recorded, is the newer evidence: every exchange updates it, while the
+        // observation changes only with the status.
+        let recent_observation = last_success.is_none()
+            && self
+                .latest_claim(&format!("host/{peer}"), Some("transport.observed"))?
+                .filter(|claim| {
+                    claim.origin == self.origin && claim.body["fields"]["status"] == "up"
+                })
+                .and_then(|claim| claim.body["fields"]["last_success_at"].as_u64())
+                .is_some_and(|last| now_ms().saturating_sub(u128::from(last)) < 90_000);
         if recent_observation {
             return Ok(false);
         }
@@ -27185,6 +27190,26 @@ mod tests {
             )
             .unwrap();
         assert!(stale
+            .record_peer_failure("target", "down", "request timed out")
+            .unwrap());
+
+        // Once an exchange has recorded a success, that row is the evidence, since every
+        // exchange updates it. When it is old, a timeout goes through even though the newest
+        // observation, from this node, still looks fresh.
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO replication_peers(peer, status, last_success_at_unix_ms, updated_at_unix_ms)
+                 VALUES ('target', 'up', ?1, ?2)",
+                params![
+                    now_ms().saturating_sub(91_000).to_string(),
+                    now_ms().to_string()
+                ],
+            )
+            .unwrap();
+        assert!(store
             .record_peer_failure("target", "down", "request timed out")
             .unwrap());
     }
