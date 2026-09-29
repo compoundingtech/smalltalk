@@ -383,6 +383,10 @@ pub enum ClientReadOperation {
         expected_sequence: u64,
         parameters: serde_json::Value,
     },
+    /// The directory this host gives a new agent that names no workspace.
+    AgentWorkspace {
+        identity: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -1620,6 +1624,17 @@ async fn receive_client_read(
                 };
                 Ok(serde_json::to_value(result.value)?)
             }
+            ClientReadOperation::AgentWorkspace { identity } => {
+                let workspace =
+                    crate::config::default_agent_workspace(&identity).map_err(|error| {
+                        ClientReadRejected {
+                            code: "validation-failed".into(),
+                            status: StatusCode::UNPROCESSABLE_ENTITY.as_u16(),
+                            message: error.to_string(),
+                        }
+                    })?;
+                Ok(serde_json::json!({ "workspace": workspace }))
+            }
         }
     }
     .await;
@@ -2571,6 +2586,327 @@ mod tests {
         assert_eq!(changed.value.lines[1].text, "$ echo remote");
         assert_eq!(changed.value.runtime_incarnation, "remote-runtime:i1");
         assert_ne!(changed.value.revision, first.value.revision);
+    }
+
+    /// `st terminals attach` from a host that does not own the terminal: the attach client paints
+    /// the owner's screens, and its keystrokes and size reach the owner's PTY as the person.
+    #[tokio::test]
+    async fn a_cli_attach_from_another_host_paints_screens_and_delivers_input() {
+        use pty_core::protocol::{
+            MessageType, PacketReader, decode_size, encode_geometry, encode_screen,
+            encode_status_response,
+        };
+        use std::os::unix::io::AsRawFd as _;
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let owner_root = tempfile::tempdir().unwrap();
+        let gateway_root = tempfile::tempdir().unwrap();
+        let app_state = |root: &Path, node: &str| crate::api::AppState {
+            store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"),
+            pty_binary: root.join("unused-pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
+        };
+        let owner = app_state(owner_root.path(), "owner-node");
+        let mut gateway = app_state(gateway_root.path(), "gateway-node");
+        // A live PTY session as its daemon publishes it: socket, daemon pid, and record.
+        let incarnation = format!("{}:now", std::process::id());
+        fs::create_dir_all(&owner.pty_root).unwrap();
+        fs::write(
+            owner.pty_root.join("remote-runtime.pid"),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+        fs::write(
+            owner.pty_root.join("remote-runtime.json"),
+            r#"{"createdAt":"now"}"#,
+        )
+        .unwrap();
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: "agent/remote-shell".into(),
+                kind: "runtime.observed".into(),
+                actor: Some("agent/remote-shell".into()),
+                fields: BTreeMap::from([
+                    ("runtime_id".into(), Value::String("remote-runtime".into())),
+                    ("incarnation_id".into(), Value::String(incarnation.clone())),
+                    ("status".into(), Value::String("running".into())),
+                    ("terminal".into(), Value::Bool(true)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("remote-shell-running".into()),
+            })
+            .unwrap();
+        gateway
+            .store
+            .import_replication("owner-node", &owner.store.export_replication(0).unwrap())
+            .unwrap();
+
+        // The session is 30x100. A viewer's PEEK gets its replay and then its output; typed input
+        // is echoed as output; an ATTACH gets a replay, and the RESIZE after it is recorded.
+        let sessions =
+            tokio::net::UnixListener::bind(owner.pty_root.join("remote-runtime.sock")).unwrap();
+        let (output, _) = tokio::sync::broadcast::channel::<Vec<u8>>(16);
+        let typed = Arc::new(Mutex::new(Vec::<u8>::new()));
+        let resized = Arc::new(Mutex::new(Vec::<(u16, u16)>::new()));
+        let (session_output, session_typed, session_resized) =
+            (output.clone(), typed.clone(), resized.clone());
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = sessions.accept().await {
+                let mut output = session_output.subscribe();
+                let (typed, resized) = (session_typed.clone(), session_resized.clone());
+                let echo = session_output.clone();
+                tokio::spawn(async move {
+                    let (mut reader, mut writer) = stream.into_split();
+                    let mut packets = PacketReader::new();
+                    let mut buffer = vec![0_u8; 4096];
+                    loop {
+                        tokio::select! {
+                            read = reader.read(&mut buffer) => {
+                                let Ok(count @ 1..) = read else { return };
+                                for packet in packets.feed(&buffer[..count]).unwrap() {
+                                    let reply = match packet.type_ {
+                                        MessageType::Peek => [
+                                            encode_geometry(30, 100),
+                                            encode_screen(b"owner shell\r\n$ "),
+                                        ]
+                                        .concat(),
+                                        MessageType::Attach => encode_screen(b"owner shell\r\n$ "),
+                                        MessageType::Status => encode_status_response("{}"),
+                                        MessageType::Resize => {
+                                            resized.lock().unwrap().push(decode_size(&packet.payload));
+                                            continue;
+                                        }
+                                        MessageType::Data => {
+                                            typed.lock().unwrap().extend(&packet.payload);
+                                            let _ = echo.send(packet.payload);
+                                            continue;
+                                        }
+                                        _ => continue,
+                                    };
+                                    if writer.write_all(&reply).await.is_err() {
+                                        return;
+                                    }
+                                }
+                            }
+                            bytes = output.recv() => {
+                                let Ok(bytes) = bytes else { return };
+                                let data = pty_core::protocol::encode_data(&bytes);
+                                if writer.write_all(&data).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let owner_socket = owner_root.path().join("st3.sock");
+        let main_socket = owner_socket.clone();
+        let owner_app = crate::api::router(owner.clone());
+        tokio::spawn(async move { crate::api::serve_unix(&main_socket, owner_app).await });
+        let peer = PeerState {
+            backend: PeerBackend::Main(Client::unix(&owner_socket)),
+            node: "owner-node".into(),
+            auth: FleetAuth::test("fleet-test", &[7; 32]),
+            fleet: FleetContext::legacy(BTreeSet::from(["gateway-node".into()])),
+            main_socket: owner_socket.clone(),
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, peer_router(peer)).await });
+        let secret = gateway_root.path().join("fleet-secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        gateway.client_relay = ClientRelay::from_config(&Config {
+            node: "gateway-node".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig {
+                name: "owner-node".into(),
+                url: format!("http://{address}"),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let gateway_socket = gateway_root.path().join("st3.sock");
+        let served_socket = gateway_socket.clone();
+        let gateway_app = crate::api::router(gateway);
+        tokio::spawn(async move { crate::api::serve_unix(&served_socket, gateway_app).await });
+        for socket in [&owner_socket, &gateway_socket] {
+            for _ in 0..200 {
+                if tokio::net::UnixStream::connect(socket).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        // The attach client's terminal: stdin and stdout are sockets the test holds the far ends
+        // of. Neither is a TTY, so the client asks for its default 24x80.
+        let (mut keyboard, stdin) = tokio::net::UnixStream::pair().unwrap();
+        let (stdout, mut display) = tokio::net::UnixStream::pair().unwrap();
+        let (stderr, _errors) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (stdin, stdout) = (stdin.into_std().unwrap(), stdout.into_std().unwrap());
+        stdin.set_nonblocking(false).unwrap();
+        stdout.set_nonblocking(false).unwrap();
+        let io = pty_client::ClientIo {
+            stdin: stdin.as_raw_fd(),
+            stdout: stdout.as_raw_fd(),
+            stderr: stderr.as_raw_fd(),
+        };
+        let client = st3_client::Client::unix_as(&gateway_socket, "person/avery");
+        let attach = tokio::spawn(async move {
+            let code = crate::remote_terminal::attach_with_io(
+                &client,
+                "agent/remote-shell",
+                "agent/remote-shell",
+                io,
+            )
+            .await;
+            drop((stdin, stdout, stderr));
+            code
+        });
+        let mut shown = String::new();
+        let mut wait_for = async |text: &str| {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(20);
+            let mut buffer = vec![0_u8; 65_536];
+            while !shown.contains(text) {
+                let count = tokio::time::timeout_at(deadline, display.read(&mut buffer))
+                    .await
+                    .unwrap_or_else(|_| panic!("`{text}` was never painted; painted {shown:?}"))
+                    .unwrap();
+                assert!(count > 0, "the display closed before `{text}`");
+                shown.push_str(&String::from_utf8_lossy(&buffer[..count]));
+            }
+        };
+        wait_for("owner shell").await;
+
+        keyboard.write_all(b"echo remote\r").await.unwrap();
+        wait_for("echo remote").await;
+        assert_eq!(typed.lock().unwrap().as_slice(), b"echo remote\r");
+        assert_eq!(resized.lock().unwrap().as_slice(), &[(24, 80)]);
+        let requested = owner
+            .store
+            .claims_for("agent/remote-shell", Some("terminal.input.requested"))
+            .unwrap();
+        assert_eq!(requested.len(), 1);
+        assert_eq!(requested[0].actor.as_deref(), Some("person/avery"));
+
+        // Ctrl+\ detaches once its double-tap window passes.
+        keyboard.write_all(&[0x1c]).await.unwrap();
+        let code = tokio::time::timeout(Duration::from_secs(10), attach)
+            .await
+            .expect("the attach ends after a detach")
+            .unwrap()
+            .unwrap();
+        assert_eq!(code, 0);
+        assert_eq!(typed.lock().unwrap().as_slice(), b"echo remote\r");
+    }
+
+    /// `st agents new --host OTHER` without a workspace: the host that runs the agent names the
+    /// directory below its own home, asked as a person through the fleet relay.
+    #[tokio::test]
+    async fn the_owning_host_names_a_new_agents_default_workspace() {
+        let owner_root = tempfile::tempdir().unwrap();
+        let gateway_root = tempfile::tempdir().unwrap();
+        let app_state = |root: &Path, node: &str| crate::api::AppState {
+            store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"),
+            pty_binary: root.join("unused-pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
+        };
+        let owner = app_state(owner_root.path(), "owner-node");
+        let mut gateway = app_state(gateway_root.path(), "gateway-node");
+        let owner_socket = owner_root.path().join("st3.sock");
+        let main_socket = owner_socket.clone();
+        let owner_app = crate::api::router(owner);
+        tokio::spawn(async move { crate::api::serve_unix(&main_socket, owner_app).await });
+        let peer = PeerState {
+            backend: PeerBackend::Main(Client::unix(&owner_socket)),
+            node: "owner-node".into(),
+            auth: FleetAuth::test("fleet-test", &[7; 32]),
+            fleet: FleetContext::legacy(BTreeSet::from(["gateway-node".into()])),
+            main_socket: owner_socket.clone(),
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, peer_router(peer)).await });
+        let secret = gateway_root.path().join("fleet-secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        gateway.client_relay = ClientRelay::from_config(&Config {
+            node: "gateway-node".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig {
+                name: "owner-node".into(),
+                url: format!("http://{address}"),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let gateway_app = crate::api::router(gateway);
+        let expected = crate::config::default_agent_workspace("site")
+            .unwrap()
+            .display()
+            .to_string();
+        assert!(expected.ends_with("/st/agents/site"));
+        let ask = |host: &str, person: Option<&str>, identity: &str| {
+            let mut request = Request::get(format!(
+                "/v1/hosts/{host}/agent-workspace?identity={identity}"
+            ));
+            if let Some(person) = person {
+                request = request.header("x-st3-person", person);
+            }
+            let app = gateway_app.clone();
+            let request = request.body(Body::empty()).unwrap();
+            async move {
+                let response = app.oneshot(request).await.unwrap();
+                let status = response.status();
+                let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&body).unwrap())
+            }
+        };
+
+        let (status, body) = ask("owner-node", Some("person/avery"), "site").await;
+        assert!(status.is_success(), "{body}");
+        assert_eq!(body["value"]["workspace"], expected);
+        assert_eq!(body["value"]["host_id"], "host/owner-node");
+        let (status, body) = ask("gateway-node", None, "site").await;
+        assert!(status.is_success(), "{body}");
+        assert_eq!(body["value"]["workspace"], expected);
+
+        let (status, body) = ask("owner-node", None, "site").await;
+        assert!(!status.is_success());
+        assert_eq!(body["code"], "missing-person", "{body}");
+        let (status, body) = ask("owner-node", Some("person/avery"), "..%2Fescape").await;
+        assert!(!status.is_success());
+        assert_eq!(body["code"], "validation-failed", "{body}");
+        assert!(body["message"].as_str().unwrap().contains("../escape"));
+        let (status, body) = ask("elsewhere", Some("person/avery"), "site").await;
+        assert!(!status.is_success());
+        assert_eq!(body["code"], "remote-unavailable", "{body}");
     }
 
     #[tokio::test]
