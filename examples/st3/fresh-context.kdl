@@ -1,0 +1,39 @@
+version 2
+
+// Apply the two seats, then publish and start the mission. The reader starts a new harness
+// session for every step it claims. The writer starts a new session for "draft" because that
+// step asks for one, then keeps that session for "refine".
+agent "example/context-reader" {
+  workspace "/srv/example/app"
+  restart "always"
+  fresh-context
+  harness "codex" { model "gpt-6-sol"; effort "medium" }
+}
+
+agent "example/context-writer" {
+  workspace "/srv/example/app"
+  restart "always"
+  harness "codex" { model "gpt-6-sol"; effort "medium" }
+}
+
+mission "context-work" state="ready" {
+  goal "Review, draft, and refine one example."
+
+  step "review" {
+    assigned-to "agent/example/context-reader"
+    goal "Review the example request."
+  }
+
+  step "draft" {
+    assigned-to "agent/example/context-writer"
+    depends-on { step "review" completed }
+    fresh-context
+    goal "Draft the example from a clean harness session."
+  }
+
+  step "refine" {
+    assigned-to "agent/example/context-writer"
+    depends-on { step "draft" completed }
+    goal "Refine the draft using the current harness context."
+  }
+}

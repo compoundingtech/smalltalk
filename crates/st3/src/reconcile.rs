@@ -1148,8 +1148,11 @@ impl<R: RuntimeControl> Reconciler<R> {
                         if subject.kind == "agent"
                             && let Some(incarnation) = observation.incarnation_id.as_deref()
                         {
-                            work_message_agents
-                                .push((subject.subject.clone(), incarnation.to_owned()));
+                            work_message_agents.push((
+                                subject.subject.clone(),
+                                incarnation.to_owned(),
+                                member.clone(),
+                            ));
                         }
                     }
                     Some(observation)
@@ -1174,8 +1177,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                         };
                         // A trust-prompt recovery stopped this incarnation in order to replace it,
                         // whatever the member's own exit policy says.
-                        let recovering =
-                            self.claude_trust_recovery_stopped(&subject.subject, &observation)?;
+                        let recovering = self
+                            .claude_trust_recovery_stopped(&subject.subject, &observation)?
+                            || self
+                                .fresh_context_recovery_stopped(&subject.subject, &observation)?;
                         if (restart || recovering) && member.lifecycle == MemberLifecycle::Service {
                             if let Some(error) = blocked.take() {
                                 return Err(error);
@@ -1242,7 +1247,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 RestartType::OnFailure => observation.exit_code != Some(0),
                                 RestartType::Never => false,
                             };
-                            if restart {
+                            if restart
+                                || self.fresh_context_recovery_stopped(
+                                    &subject.subject,
+                                    &observation,
+                                )?
+                            {
                                 if let Some(error) = blocked.take() {
                                     return Err(error);
                                 }
@@ -1262,7 +1272,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             // is recorded with that delivery.
             let deferred = work_message_agents
                 .last()
-                .is_some_and(|(agent, _)| agent == &subject.subject);
+                .is_some_and(|(agent, _, _)| agent == &subject.subject);
             if deferred {
                 if let Err(error) = result {
                     deferred_member_faults.insert(subject.subject.clone(), error);
@@ -1327,8 +1337,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         // Mission state is the primary control-plane projection. Evaluate it before
         // wake-message bookkeeping so a large mailbox or work history cannot starve
         // newly-created runs of their first readiness pass.
-        for (agent, incarnation) in work_message_agents {
-            let result = caught(|| self.reconcile_work_messages(&agent, &incarnation));
+        for (agent, incarnation, member) in work_message_agents {
+            let result =
+                caught(|| self.reconcile_work_messages(&agent, &incarnation, Some(&member)));
             let result = match deferred_member_faults.remove(&agent) {
                 Some(error) => Err(error),
                 None => result,
@@ -2074,6 +2085,25 @@ impl<R: RuntimeControl> Reconciler<R> {
             .collect())
     }
 
+    fn fresh_context_recovery_stopped(
+        &self,
+        subject: &str,
+        observation: &RuntimeObservation,
+    ) -> Result<bool> {
+        let Some(incarnation) = observation.incarnation_id.as_deref() else {
+            return Ok(false);
+        };
+        Ok(self
+            .store
+            .observations_for(subject, "runtime.action.requested")?
+            .iter()
+            .any(|claim| {
+                claim.body.pointer("/fields/action").and_then(Value::as_str)
+                    == Some("fresh-context")
+                    && claim_incarnation(claim) == Some(incarnation)
+            }))
+    }
+
     fn running_runtime_claim(
         &self,
         subject: &str,
@@ -2091,7 +2121,103 @@ impl<R: RuntimeControl> Reconciler<R> {
             }))
     }
 
-    fn reconcile_work_messages(&self, agent: &str, incarnation: &str) -> Result<()> {
+    fn prepare_fresh_context(
+        &self,
+        agent: &str,
+        incarnation: &str,
+        step: &StepRunView,
+        member: &MemberSpec,
+    ) -> Result<bool> {
+        if !step.fresh_context
+            && member.tags.get("st3.fresh_context").map(String::as_str) != Some("true")
+        {
+            return Ok(true);
+        }
+        let operation = crate::model::fresh_context_operation(step);
+        let matches_operation = |claim: &crate::model::ClaimRecord| {
+            claim.body.pointer("/fields/action").and_then(Value::as_str) == Some("fresh-context")
+                && claim
+                    .body
+                    .pointer("/fields/operation")
+                    .and_then(Value::as_str)
+                    == Some(operation.as_str())
+        };
+        if self
+            .store
+            .observations_for(agent, "runtime.action.succeeded")?
+            .iter()
+            .any(|claim| matches_operation(claim) && claim_incarnation(claim) == Some(incarnation))
+        {
+            return Ok(true);
+        }
+        let request = self
+            .store
+            .observations_for(agent, "runtime.action.requested")?
+            .into_iter()
+            .rev()
+            .find(&matches_operation);
+        if let Some(request) = request {
+            if claim_incarnation(&request) != Some(incarnation) {
+                self.store.append_claim(&ClaimInput {
+                    subject: agent.into(),
+                    kind: "runtime.action.succeeded".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("action".into(), Value::String("fresh-context".into())),
+                        ("operation".into(), Value::String(operation.clone())),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ]),
+                    evidence: vec![request.id],
+                    expected_subject: None,
+                    idempotency_key: Some(format!("{operation}:ready:{incarnation}")),
+                })?;
+                self.signal_changed();
+                return Ok(true);
+            }
+        } else {
+            self.store.append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "runtime.action.requested".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("action".into(), Value::String("fresh-context".into())),
+                    ("operation".into(), Value::String(operation.clone())),
+                    (
+                        "runtime_id".into(),
+                        Value::String(member.runtime_id.clone()),
+                    ),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("{operation}:request")),
+            })?;
+            self.signal_changed();
+        }
+        let observation = RuntimeObservation {
+            runtime_id: member.runtime_id.clone(),
+            terminal: member.terminal,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some(incarnation.into()),
+        };
+        self.reconcile_runtime_stop(
+            agent,
+            &member.runtime_id,
+            member.terminal,
+            Some(incarnation),
+            member.shutdown_timeout_ms,
+            Some(&observation),
+        )?;
+        Ok(false)
+    }
+
+    fn reconcile_work_messages(
+        &self,
+        agent: &str,
+        incarnation: &str,
+        member: Option<&MemberSpec>,
+    ) -> Result<()> {
         let incarnation_key = harness_incarnation_key(incarnation);
         // Closed work wakes still count as attempts. A closed wake can mean the
         // harness started a turn but could not claim this independent step yet;
@@ -2185,6 +2311,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             .iter()
             .filter(|step| Some(step.subject.as_str()) == next_wake)
         {
+            if let Some(member) = member
+                && !self.prepare_fresh_context(agent, incarnation, step, member)?
+            {
+                continue;
+            }
             if defers_inherited_work_wake(step, &work, harness.as_ref()) {
                 continue;
             }
@@ -6685,6 +6816,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                         run: run.subject.clone(),
                         generation: run.generation.clone(),
                         step: step.spec.path.clone(),
+                        fresh_context: step.spec.fresh_context,
                         queue: None,
                         queue_position: None,
                         definition_hash: step.spec.definition_hash.clone(),
@@ -21250,7 +21382,7 @@ mission "wake" state="ready" {
         let reconciler = Reconciler::new(store.clone(), runtime, "node".into(), notify.clone());
         let before = store.index().unwrap();
         reconciler
-            .reconcile_work_messages(&desired.subject, "worker-one")
+            .reconcile_work_messages(&desired.subject, "worker-one", None)
             .unwrap();
         assert_eq!(store.index().unwrap(), before);
         assert_eq!(
@@ -21775,6 +21907,7 @@ mission "ios-proof-blocked" state="ready" {
             run: "mission-run/run-1".into(),
             generation: "run-generation/run-1".into(),
             step: path.into(),
+            fresh_context: false,
             queue: None,
             queue_position: None,
             definition_hash: "definition".into(),
@@ -21923,6 +22056,7 @@ mission "ios-proof-blocked" state="ready" {
             run: "mission-run/older".into(),
             generation: "run-generation/older".into(),
             step: "work".into(),
+            fresh_context: false,
             queue: None,
             queue_position: None,
             definition_hash: "definition".into(),
@@ -22307,6 +22441,7 @@ agent "worker" { workspace "/tmp"; command "true"; restart "never" }
             run: "mission-run/run-1".into(),
             generation: "run-generation/run-1".into(),
             step: "work".into(),
+            fresh_context: false,
             queue: None,
             queue_position: None,
             definition_hash: "definition".into(),
@@ -22393,6 +22528,259 @@ agent "worker" { workspace "/tmp"; command "true"; restart "never" }
     }
 
     const SEAT: &str = "agent/node.worker";
+
+    #[test]
+    fn fresh_context_starts_a_new_incarnation_before_a_step_can_be_claimed() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+mission "context" state="ready" {
+  goal "Give the worker a clean step."
+  step "work" { assigned-to "agent/node.worker"; fresh-context }
+}"#,
+            "fresh-context-source",
+        );
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "context".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "fresh-context-run".into(),
+            })
+            .unwrap();
+        let member = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.subject == SEAT)
+            .unwrap()
+            .member
+            .unwrap();
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let step = store.work_for_reconcile(SEAT).unwrap().remove(0);
+        assert_eq!(step.subject, run.steps[0].subject);
+        assert!(step.fresh_context);
+        let claim = |incarnation: &str, key: &str| {
+            store.work_action(
+                &step.subject,
+                "claim",
+                &crate::model::WorkRequest {
+                    actor: Some(SEAT.into()),
+                    incarnation: Some(incarnation.into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: key.into(),
+                },
+            )
+        };
+
+        assert_eq!(
+            claim("old", "early-claim").unwrap_err().code,
+            "fresh-context-pending"
+        );
+        let mut ordinary = step.clone();
+        ordinary.fresh_context = false;
+        assert!(
+            reconciler
+                .prepare_fresh_context(SEAT, "old", &ordinary, &member)
+                .unwrap()
+        );
+        assert!(runtime.stops.lock().unwrap().is_empty());
+
+        let mut seat_member = member.clone();
+        seat_member
+            .tags
+            .insert("st3.fresh_context".into(), "true".into());
+        assert!(
+            !reconciler
+                .prepare_fresh_context(SEAT, "old", &ordinary, &seat_member)
+                .unwrap()
+        );
+        assert_eq!(runtime.stops.lock().unwrap().len(), 1);
+
+        assert!(
+            !reconciler
+                .prepare_fresh_context(SEAT, "old", &step, &member)
+                .unwrap()
+        );
+        assert_eq!(runtime.stops.lock().unwrap().len(), 1);
+        assert_eq!(
+            claim("old", "old-claim").unwrap_err().code,
+            "fresh-context-pending"
+        );
+        assert!(
+            reconciler
+                .prepare_fresh_context(SEAT, "new", &step, &member)
+                .unwrap()
+        );
+        assert_eq!(
+            claim("old", "stale-claim").unwrap_err().code,
+            "fresh-context-pending"
+        );
+        assert_eq!(
+            claim("new", "new-claim")
+                .unwrap()
+                .claim_incarnation
+                .as_deref(),
+            Some("new")
+        );
+    }
+
+    #[test]
+    fn fresh_context_wake_waits_for_the_replacement_harness() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+agent "worker" { workspace "/tmp"; command "true"; restart "never" }
+mission "context-wake" state="ready" {
+  goal "Wake a worker in a fresh session."
+  step "work" { assigned-to "agent/node.worker"; fresh-context }
+}"#,
+            "fresh-wake-source",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        let member = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.subject == SEAT)
+            .unwrap()
+            .member
+            .unwrap();
+        store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "context-wake".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "fresh-wake-run".into(),
+            })
+            .unwrap();
+        let observed = |incarnation: &str, status: &str| RuntimeObservation {
+            runtime_id: member.runtime_id.clone(),
+            terminal: true,
+            status: status.into(),
+            exit_code: Some(0),
+            incarnation_id: Some(incarnation.into()),
+        };
+        let ready = |incarnation: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: SEAT.into(),
+                    kind: "harness.observed".into(),
+                    actor: Some(SEAT.into()),
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String("ready".into())),
+                        ("driver".into(), Value::String("codex".into())),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("ready-{incarnation}")),
+                })
+                .unwrap();
+        };
+
+        *runtime.ptys.lock().unwrap() = vec![observed("old", "running")];
+        ready("old");
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.stops.lock().unwrap().len(), 1);
+        assert!(store.messages(Some(SEAT), false).unwrap().is_empty());
+
+        *runtime.ptys.lock().unwrap() = vec![observed("old", "exited")];
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(
+            runtime.starts.lock().unwrap().len(),
+            2,
+            "fresh context overrides restart never"
+        );
+
+        *runtime.ptys.lock().unwrap() = vec![observed("new", "running")];
+        ready("new");
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(store.messages(Some(SEAT), false).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn seat_fresh_context_covers_a_step_without_its_own_option() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+agent "worker" { workspace "/tmp"; command "true"; fresh-context }
+mission "seat-context" state="ready" {
+  goal "Use the seat's fresh-context policy."
+  step "work" { assigned-to "agent/node.worker" }
+}"#,
+            "seat-context-source",
+        );
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "seat-context".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/requester".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "seat-context-run".into(),
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        let step = store.work_for_reconcile(SEAT).unwrap().remove(0);
+        assert!(!step.fresh_context);
+        let member = store
+            .desired_subjects()
+            .unwrap()
+            .into_iter()
+            .find(|subject| subject.subject == SEAT)
+            .unwrap()
+            .member
+            .unwrap();
+        assert!(!store.fresh_context_ready(&step, SEAT, "old").unwrap());
+        assert!(
+            !reconciler
+                .prepare_fresh_context(SEAT, "old", &step, &member)
+                .unwrap()
+        );
+        assert_eq!(runtime.stops.lock().unwrap().len(), 1);
+        assert!(
+            reconciler
+                .prepare_fresh_context(SEAT, "new", &step, &member)
+                .unwrap()
+        );
+        assert!(store.fresh_context_ready(&step, SEAT, "new").unwrap());
+    }
 
     const SEAT_QUEUE_SOURCE: &str = r#"
 version 2

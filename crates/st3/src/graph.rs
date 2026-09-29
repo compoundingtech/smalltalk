@@ -1230,6 +1230,10 @@ fn parse_agent(
         )
     })?;
     validate_agent_body(children, &node_name)?;
+    let fresh_context = unique_child(children, "fresh-context")?
+        .map(|child| ensure_bare(child))
+        .transpose()?
+        .is_some();
     let identity = child_string(children, "identity")?.unwrap_or(node_name);
     let host = child_string(children, "host")?
         .or_else(|| enclosing_host.map(str::to_owned))
@@ -1329,6 +1333,11 @@ fn parse_agent(
 
     if let Some(member) = primary.as_mut() {
         member.tags.insert("st3.subject".into(), subject.clone());
+        if fresh_context {
+            member
+                .tags
+                .insert("st3.fresh_context".into(), "true".into());
+        }
     }
 
     let mut desired = canonical_node(node)?;
@@ -2379,6 +2388,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "env",
         "render",
         "harness",
+        "fresh-context",
         "mission-authority",
         "queue-authority",
         "seat-authority",
@@ -2413,6 +2423,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "env",
         "render",
         "harness",
+        "fresh-context",
         "mission-authority",
         "queue-authority",
         "seat-authority",

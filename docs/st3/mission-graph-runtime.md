@@ -26,6 +26,7 @@ A mission run has one stable subject. Each immutable run generation binds that r
 - st rejects missing step references and dependency cycles.
 - st does not accept `outcome`, `judges`, or `judge`.
 - `assigned-to` and `available-to` can set a mission default or select one step.
+- `fresh-context` on a step starts its claiming seat in a new harness session for that step. On an agent seat, it does so for every step the seat claims.
 - `agentless` is step-only. A step with no inherited selector is also agentless.
 - A selector does not grant revision authority.
 - A mission allows one active run by default.
@@ -258,6 +259,7 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
   constraint "A step-specific rule for this work."
   available-to "agent/${ST_MISSION_RUN}/worker-a"
   available-to "agent/${ST_MISSION_RUN}/worker-b"
+  fresh-context
   document "doc/project/request@SHA256"
 
   depends-on {
@@ -276,7 +278,9 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
 }
 ```
 
-`title`, `assigned-to`, `agentless`, `mission`, `retry`, `produces`, `produces-mission`, `uses-mission`, and `after-run` are single fields.
+`title`, `assigned-to`, `agentless`, `fresh-context`, `mission`, `retry`, `produces`, `produces-mission`, `uses-mission`, and `after-run` are single fields.
+
+`fresh-context` is a bare node. Before the daemon wakes a seat for that step, it stops the old harness session and starts a new one with the seat's normal boot context. The step goals arrive in the new session. A claim from the old incarnation is refused while the reset is pending. Steps without this option keep the current session unless the seat opts in for every step. A retry is a new attempt and receives its own fresh session.
 
 A retry repeats one failed step attempt. It handles a bounded transient failure.
 
@@ -1199,11 +1203,13 @@ agent "fleet/cos/standing/cos" {
   host "local"
   workspace "/work/cos"
   restart "always"
+  fresh-context
   harness "claude" { model "opus" }
 }
 ```
 
 The subject is exactly `agent/fleet/cos/standing/cos`; placement does not change its identity.
+The seat's bare `fresh-context` node starts a new harness session before each step it claims, even when the step has no `fresh-context` node. Omit it when the seat should retain context across ordinary steps.
 Typed harnesses always run their real interactive TUI in a PTY. Claude always loads the native st
 channel. Use `exec {}` for non-interactive provider commands.
 
