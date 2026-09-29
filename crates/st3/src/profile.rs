@@ -159,6 +159,55 @@ struct CallerTotals {
     cpu_ns: u64,
 }
 
+/// A thread's `/proc/thread-self/io` counters.
+#[derive(Clone, Copy, Default)]
+struct ThreadIo {
+    rchar: u64,
+    wchar: u64,
+    read_bytes: u64,
+    write_bytes: u64,
+}
+
+impl ThreadIo {
+    #[cfg(target_os = "linux")]
+    fn now() -> Self {
+        let io = fs::read_to_string("/proc/thread-self/io").unwrap_or_default();
+        let field = |name: &str| {
+            io.lines()
+                .find_map(|line| line.strip_prefix(name))
+                .and_then(|value| value.trim().parse::<u64>().ok())
+                .unwrap_or_default()
+        };
+        Self {
+            rchar: field("rchar:"),
+            wchar: field("wchar:"),
+            read_bytes: field("read_bytes:"),
+            write_bytes: field("write_bytes:"),
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn now() -> Self {
+        Self::default()
+    }
+
+    fn since(self, started: Self) -> Self {
+        Self {
+            rchar: self.rchar.saturating_sub(started.rchar),
+            wchar: self.wchar.saturating_sub(started.wchar),
+            read_bytes: self.read_bytes.saturating_sub(started.read_bytes),
+            write_bytes: self.write_bytes.saturating_sub(started.write_bytes),
+        }
+    }
+
+    fn add(&mut self, other: Self) {
+        self.rchar += other.rchar;
+        self.wchar += other.wchar;
+        self.read_bytes += other.read_bytes;
+        self.write_bytes += other.write_bytes;
+    }
+}
+
 #[derive(Clone, Copy, Default)]
 struct Stat {
     count: u64,
@@ -187,6 +236,9 @@ struct Acc {
     envelope_ns: u64,
     response_bytes: u64,
     cpu_ns: u64,
+    /// Bytes this operation's threads read and wrote through the kernel, and the part of that
+    /// which reached the block device.
+    io: ThreadIo,
     sql: Stat,
     writer_wait: Stat,
     writer_hold: Stat,
@@ -257,6 +309,7 @@ impl Totals {
         into.envelope_ns += acc.envelope_ns;
         into.response_bytes += acc.response_bytes;
         into.cpu_ns += acc.cpu_ns;
+        into.io.add(acc.io);
         into.sql.merge(&acc.sql);
         into.writer_wait.merge(&acc.writer_wait);
         into.writer_hold.merge(&acc.writer_hold);
@@ -356,10 +409,11 @@ thread_local! {
     static THREAD_ID: i32 = thread_id();
 }
 
-/// Leaves the operation a thread entered, adding the thread's CPU time to it.
+/// Leaves the operation a thread entered, adding the thread's CPU time and I/O to it.
 pub struct Entered {
     op: Option<Arc<OpInner>>,
     cpu_started: u64,
+    io_started: ThreadIo,
 }
 
 impl Drop for Entered {
@@ -368,7 +422,12 @@ impl Drop for Entered {
             return;
         };
         let cpu = thread_cpu_ns().saturating_sub(self.cpu_started);
-        op.acc.lock().unwrap_or_else(PoisonError::into_inner).cpu_ns += cpu;
+        let io = ThreadIo::now().since(self.io_started);
+        {
+            let mut acc = op.acc.lock().unwrap_or_else(PoisonError::into_inner);
+            acc.cpu_ns += cpu;
+            acc.io.add(io);
+        }
         CURRENT.with(|current| current.borrow_mut().take());
         if let Some(state) = STATE.get() {
             let tid = THREAD_ID.with(|tid| *tid);
@@ -409,6 +468,7 @@ impl Op {
             return Entered {
                 op: None,
                 cpu_started: 0,
+                io_started: ThreadIo::default(),
             };
         }
         if let Some(state) = STATE.get() {
@@ -422,6 +482,7 @@ impl Op {
         Entered {
             op: Some(self.0.clone()),
             cpu_started: thread_cpu_ns(),
+            io_started: ThreadIo::now(),
         }
     }
 
@@ -704,6 +765,10 @@ fn ms(ns: u64) -> f64 {
     (ns as f64 / 1_000_000.0 * 10.0).round() / 10.0
 }
 
+fn mb(bytes: u64) -> f64 {
+    (bytes as f64 / 100_000.0).round() / 10.0
+}
+
 fn unix_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -776,6 +841,10 @@ fn acc_json(acc: &Acc, statements: usize) -> Value {
         "envelope_ms": ms(acc.envelope_ns),
         "response_bytes": acc.response_bytes,
         "cpu_ms": ms(acc.cpu_ns),
+        "io_read_mb": mb(acc.io.rchar),
+        "io_written_mb": mb(acc.io.wchar),
+        "disk_read_mb": mb(acc.io.read_bytes),
+        "disk_written_mb": mb(acc.io.write_bytes),
         "sql_ms": ms(acc.sql.ns),
         "sql_count": acc.sql.count,
         "sql_max_ms": ms(acc.sql.max_ns),

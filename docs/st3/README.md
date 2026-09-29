@@ -21,6 +21,8 @@ Use these documents for implementation details:
   and tests their harnesses run, on Linux and macOS, and what needs root.
 - [Command recorder](command-recorder.md) explains how every `git` and `gh` call st starts is
   recorded, the log format, and what the recorder cannot see.
+- [Profiling the daemon](profiling.md) explains how the daemon accounts for its own time: waits
+  for the writer and read connections, SQLite statements, CPU, and callers.
 - [Agent migration](agent-migration.md) defines isolated rehearsal, cutover, and rollback.
 - [Eval audit](eval-audit.md) records the test intent and prompt boundary for each st eval.
 - [Running st with omp](omp.md) covers omp seat setup, behavior, and known limits;
