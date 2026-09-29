@@ -1,16 +1,18 @@
-import type { Agent, Attention, Device, Launch, Message, Mission, Runtime, Work } from '../../clients/typescript/st3-client';
+import type { Agent, Attention, Device, Launch, Mission } from '../../clients/typescript/st3-client';
 import type { SessionView } from './sessionView';
 
 export type MachineView = { id: string; kind: 'machine'; name: string; state: string; occupancy: { running_runtimes: number }; capacity: { state: string }; transports: Array<{ protocol: string; status: string }> };
-export type Data = { attention: Attention[]; messages: Message[]; agents: Agent[]; missions: Mission[]; launches: Launch[]; machines: MachineView[]; devices: Device[]; sessions: SessionView[]; runtimes: Runtime[]; work: Work[] };
-export const emptyData: Data = { attention: [], messages: [], agents: [], missions: [], launches: [], machines: [], devices: [], sessions: [], runtimes: [], work: [] };
+// The three windows the collections socket holds, and the lists a tab loads when it opens.
+export type Data = { attention: Attention[]; agents: Agent[]; missions: Mission[]; launches: Launch[]; machines: MachineView[]; devices: Device[]; sessions: SessionView[] };
+export const emptyData: Data = { attention: [], agents: [], missions: [], launches: [], machines: [], devices: [], sessions: [] };
 export const PROJECTION_CACHE_KEY = 'st3.projection.v1';
 
-const VERSION = 2;
+// Version 3: mission rows carry their steps and agents their queues; work and runtimes are gone.
+const VERSION = 3;
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_BYTES = 512 * 1024;
-const LIMITS: Record<keyof Data, number> = { attention: 50, messages: 30, agents: 100, missions: 40, launches: 30, machines: 30, devices: 30, sessions: 100, runtimes: 80, work: 100 };
-const kinds: Record<keyof Data, string> = { attention: 'attention', messages: 'message', agents: 'agent', missions: 'mission', launches: 'launch', machines: 'machine', devices: 'device', sessions: 'session', runtimes: 'runtime', work: 'work' };
+const LIMITS: Record<keyof Data, number> = { attention: 50, agents: 100, missions: 40, launches: 30, machines: 30, devices: 30, sessions: 100 };
+const kinds: Record<keyof Data, string> = { attention: 'attention', agents: 'agent', missions: 'mission', launches: 'launch', machines: 'machine', devices: 'device', sessions: 'session' };
 const sensitiveKey = /credential|authorization|token|secret|private.?key|stream.?capability|stream.?url/i;
 
 type Cache = { version: number; gateway: string; savedAt: number; hostId: string; actor: string; storeIndex: number; truncated: Array<keyof Data>; data: Data };
