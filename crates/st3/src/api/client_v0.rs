@@ -1196,7 +1196,12 @@ fn mission_resources_filtered(
                 }
             };
             let historical = matches!(state, "completed" | "failed" | "cancelled" | "retired");
-            if !history && historical {
+            // A run that failed or was cancelled stays in the current view for a while.
+            let recently_ended = matches!(state, "failed" | "cancelled")
+                && latest.is_some_and(|run| {
+                    run.updated_at_unix_ms >= crate::store::recently_ended_since()
+                });
+            if !history && historical && !recently_ended {
                 return Ok(None);
             }
             let run_generations = runs

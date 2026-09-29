@@ -107,7 +107,12 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
     let missions = missions(model);
     let quiet = missions
         .iter()
-        .filter(|mission| !matches!(mission.word, Word::Decision | Word::Done) && !mission.system)
+        .filter(|mission| {
+            !matches!(
+                mission.word,
+                Word::Decision | Word::Done | Word::Failed | Word::Cancelled
+            ) && !mission.system
+        })
         .count();
     World {
         person: person.to_owned(),
@@ -220,6 +225,25 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                         },
                     },
                 ),
+                // An agent stopped on the person: a request to answer, not a fault to clear.
+                "agent-request" => (
+                    Tier::Stopped,
+                    AttentionKind::Request {
+                        from: item
+                            .requester_id
+                            .as_deref()
+                            .map(|id| {
+                                model
+                                    .agents()
+                                    .find(|agent| agent.header.id == id)
+                                    .map(crate::agent_label)
+                                    .unwrap_or_else(|| short(id))
+                            })
+                            .unwrap_or_else(|| "An agent".into()),
+                        from_id: item.requester_id.clone().unwrap_or_default(),
+                        question: clean_message_text(&item.detail),
+                    },
+                ),
                 _ => (
                     if matches!(item.priority.as_str(), "critical" | "high") {
                         Tier::Alert
@@ -229,9 +253,6 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                     AttentionKind::Fault {
                         what: item.detail.clone(),
                         because: match item.priority.as_str() {
-                            _ if item.attention_kind == "agent-request" => {
-                                "an agent is asking you for help".into()
-                            }
                             "critical" => "marked critical".into(),
                             "high" => "marked high priority".into(),
                             _ => "raised for you".into(),
@@ -273,6 +294,9 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                     AttentionKind::Message { from, .. } if from.starts_with("agent/") => {
                         Some(from.clone())
                     }
+                    AttentionKind::Request { from_id, .. } if from_id.starts_with("agent/") => {
+                        Some(from_id.clone())
+                    }
                     _ => None,
                 });
             let related = item
@@ -288,12 +312,26 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                     (target.clone(), state)
                 })
                 .collect();
+            // Who raised it: the requester st names, else the agent the item is about. st's own
+            // machinery reads as st.
             let raised_by = item
-                .extra
-                .get("requester_id")
-                .or_else(|| item.extra.get("actor"))
-                .and_then(Value::as_str)
-                .map(str::to_owned);
+                .requester_id
+                .clone()
+                .or_else(|| {
+                    item.extra
+                        .get("actor")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .or_else(|| agent.clone())
+                .map(|who| match who.as_str() {
+                    "daemon/runtime" | "agent/st3/reconciler" => "st".to_owned(),
+                    _ => model
+                        .agents()
+                        .find(|candidate| candidate.header.id == who)
+                        .map(|candidate| format!("{} · {who}", crate::agent_label(candidate)))
+                        .unwrap_or(who),
+                });
             Attention {
                 id: item.header.id.clone(),
                 agent,
@@ -579,8 +617,12 @@ fn missions(model: &Model) -> Vec<Mission> {
                 Word::Decision
             } else if mission.state == "blocked" || states.contains(&"blocked") {
                 Word::Stalled
-            } else if states.iter().any(|state| matches!(*state, "failed")) {
+            } else if mission.state == "failed"
+                || states.iter().any(|state| matches!(*state, "failed"))
+            {
                 Word::Failed
+            } else if mission.state == "cancelled" {
+                Word::Cancelled
             } else if !work.is_empty()
                 && work.iter().all(|step| {
                     step.state == "completed"
@@ -675,6 +717,18 @@ fn missions(model: &Model) -> Vec<Mission> {
                     }
                 })
                 .collect::<Vec<_>>();
+            // Read a mission like a pipeline: what finished, what is happening, what is next.
+            // st says nothing about declaration order, so a later step must not sit above the
+            // one working now.
+            let mut steps = steps;
+            steps.sort_by_key(|step| match step.state {
+                StepState::Done => 0,
+                StepState::NeedsYou | StepState::Failed => 1,
+                StepState::Working => 2,
+                StepState::Ready => 3,
+                StepState::Waiting => 4,
+                StepState::Pending => 5,
+            });
             let agents = model
                 .agents()
                 .filter(|agent| {
@@ -698,10 +752,17 @@ fn missions(model: &Model) -> Vec<Mission> {
                 decision,
                 worktree: None,
                 parent: None,
-                system: mission.header.id.starts_with("mission/__st3/"),
+                system: is_system_mission(&mission.header.id),
             }
         })
         .collect()
+}
+
+/// Plumbing the Missions tab folds away until `x` shows it: st's own loop rounds, and CI
+/// (a `ci` segment, as in `mission/fleet/smalltalk/ci/run`). The graph has no mark for this
+/// yet, so the name decides. What needs a person still reaches Home as attention.
+fn is_system_mission(id: &str) -> bool {
+    id.starts_with("mission/__st3/") || id.split('/').any(|segment| segment == "ci")
 }
 
 // ------------------------------------------------------------------- machines

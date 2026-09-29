@@ -537,7 +537,7 @@ impl Ui {
         } else if self.confirm.is_some() {
             vec![("y", "confirm"), ("esc", "cancel")]
         } else {
-            let mut hints = vec![("1-5", "tabs"), ("↑↓", "select")];
+            let mut hints = vec![("1-4", "tabs"), ("↑↓", "select")];
             match self.tab {
                 0 => hints.extend([("keys", "on the card"), ("c", "write")]),
                 1 => hints.extend([
@@ -1407,7 +1407,7 @@ impl Ui {
         inner.blank();
         inner.section("keys", None, w);
         for (key, meaning) in [
-            ("1-5 or click", "switch tabs"),
+            ("1-4 or click", "switch tabs"),
             ("↑↓ j k or click", "select in the list"),
             ("wheel pgup pgdn", "scroll the pane under the pointer"),
             ("end", "jump to the newest message and follow it"),
@@ -1656,7 +1656,7 @@ impl Ui {
         match key.code {
             KeyCode::Char('q') => self.quit = true,
             KeyCode::Char('?') => self.help = true,
-            KeyCode::Char(digit @ '1'..='5') => self.switch_tab(digit as usize - '1' as usize),
+            KeyCode::Char(digit @ '1'..='4') => self.switch_tab(digit as usize - '1' as usize),
             KeyCode::Tab => self.switch_tab((self.tab + 1) % TABS.len()),
             KeyCode::BackTab => self.switch_tab((self.tab + TABS.len() - 1) % TABS.len()),
             KeyCode::Up | KeyCode::Char('k') => {
@@ -1805,13 +1805,13 @@ impl Ui {
                             self.flash("Put off until later · demo, this machine only");
                         }
                     }
-                    ("review" | "feedback" | "launch" | "message" | "revision", 'c') => {
+                    ("review" | "feedback" | "launch" | "message" | "revision" | "request", 'c') => {
                         self.editing = true
                     }
                     ("review" | "feedback" | "launch" | "revision", 'a') => {
                         self.confirm = Some('a')
                     }
-                    ("launch", 'd') | ("revision", 'j') | ("fault", 'r') => {
+                    ("launch", 'd') | ("revision", 'j') | ("fault" | "request", 'r') => {
                         self.confirm = Some(key)
                     }
                     ("message", 'm') => self.act('m'),
@@ -2066,6 +2066,17 @@ impl Ui {
                         id: id.clone(),
                         feedback: draft,
                     }),
+                    Some(AttentionKind::Request { from_id, .. }) => {
+                        let title = self
+                            .current_item()
+                            .map(|item| item.title.clone())
+                            .unwrap_or_default();
+                        Some(Effect::Discuss {
+                            to: from_id,
+                            title: format!("Re: {title}"),
+                            text: draft,
+                        })
+                    }
                     Some(AttentionKind::Message { from, .. }) => Some(Effect::Reply {
                         id: id.clone(),
                         to: from,
@@ -2167,7 +2178,7 @@ impl Ui {
                 ("launch", 'd') => "launch.cancel",
                 ("revision", 'a') => "mission.approve-revision",
                 ("revision", 'j') => "mission.cancel-revision",
-                ("fault", 'r') => "attention.resolve",
+                ("fault" | "request", 'r') => "attention.resolve",
                 ("message", 'm') => "message.read",
                 _ => return,
             };
@@ -2894,7 +2905,7 @@ mod tests {
             .filter(|(_, hit)| matches!(hit, Hit::Tab(_)))
             .map(|(rect, hit)| (*rect, hit.clone()))
             .collect::<Vec<_>>();
-        assert_eq!(tabs.len(), 5);
+        assert_eq!(tabs.len(), TABS.len());
         let (rect, _) = tabs[3];
         ui.mouse(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),

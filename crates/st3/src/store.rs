@@ -2186,6 +2186,7 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<String>> {
+        let ended_since = recently_ended_since();
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "WITH ids AS (
@@ -2210,15 +2211,21 @@ impl Store {
                    WHEN COALESCE(run_states.running,0)>0 THEN 'running'
                    WHEN COALESCE(run_states.standing,0)>0 THEN 'standing'
                    WHEN latest.status IS NOT NULL THEN latest.status
-                   ELSE def.state END NOT IN ('completed','failed','cancelled','retired'))
+                   ELSE def.state END NOT IN ('completed','failed','cancelled','retired')
+                   -- A run that failed or was cancelled stays in view for a while with its
+                   -- outcome, instead of vanishing the moment it ends.
+                   OR (latest.status IN ('failed','cancelled')
+                       AND COALESCE(run_states.running,0)=0 AND COALESCE(run_states.standing,0)=0
+                       AND CAST(latest.updated_at_unix_ms AS INTEGER)>=?4))
              ORDER BY CAST(COALESCE(latest.updated_at_unix_ms,published.accepted_at_unix_ms) AS INTEGER) DESC,
                       ids.mission_id ASC
              LIMIT ?2 OFFSET ?3",
         )?;
         statement
-            .query_map(params![history, limit as i64, offset as i64], |row| {
-                row.get::<_, String>(0).map(|id| format!("mission/{id}"))
-            })?
+            .query_map(
+                params![history, limit as i64, offset as i64, ended_since as i64],
+                |row| row.get::<_, String>(0).map(|id| format!("mission/{id}")),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -9870,7 +9877,13 @@ impl Store {
                     review_mode: None,
                     subject: attention_subject,
                     person: reviewer,
-                    requester_id: None,
+                    // st's subscription observer raised it.
+                    requester_id: Some(
+                        failure
+                            .actor
+                            .clone()
+                            .unwrap_or_else(|| "agent/st3/reconciler".into()),
+                    ),
                     launch_id: None,
                     variant_id: None,
                     message_id: None,
@@ -19212,6 +19225,14 @@ fn canonical_json_text(value: &Value) -> Result<String> {
 
 fn canonical_serialized_json_text(value: &impl Serialize) -> Result<String> {
     canonical_json_text(&serde_json::to_value(value)?)
+}
+
+/// How long a mission whose run failed or was cancelled stays in the current missions view.
+pub(crate) const RECENTLY_ENDED_MS: u128 = 24 * 60 * 60 * 1000;
+
+/// The earliest end that still counts as recent.
+pub(crate) fn recently_ended_since() -> u128 {
+    now_ms().saturating_sub(RECENTLY_ENDED_MS)
 }
 
 fn now_ms() -> u128 {
@@ -36636,6 +36657,31 @@ mission "takeover" state="ready" {
             .retry_failed_step(&old_check, "person/operator", "again", "retry-stale")
             .unwrap_err();
         assert_eq!(stale.code, "stale-run-generation");
+    }
+
+    #[test]
+    fn a_failed_mission_stays_in_the_current_view_for_a_day() {
+        let store = Store::open_memory("node").unwrap();
+        let failed = failed_takeover_run(&store, &["deploy-check"]);
+        assert_eq!(failed.status, "failed");
+        let current = store.mission_collection_ids(false, 0, 50).unwrap();
+        assert!(current.contains(&failed.mission), "{current:?}");
+
+        // A day later it is history only.
+        let old = crate::store::recently_ended_since().saturating_sub(1_000);
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE id=?1",
+                params![failed.id, old.to_string()],
+            )
+            .unwrap();
+        let current = store.mission_collection_ids(false, 0, 50).unwrap();
+        assert!(!current.contains(&failed.mission), "{current:?}");
+        let history = store.mission_collection_ids(true, 0, 50).unwrap();
+        assert!(history.contains(&failed.mission), "{history:?}");
     }
 
     #[test]

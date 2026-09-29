@@ -1628,14 +1628,15 @@ mission "client-action-demo" state="ready" {
             )
             .unwrap()
     );
+    // A cancelled run stays in the current view for a while, with its outcome.
     let (_, current_missions) = client_json(app.clone(), "/v1/client/missions").await;
-    assert!(
-        current_missions["value"]["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|item| item["id"] != "mission/client-action-demo")
-    );
+    let current = current_missions["value"]["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|item| item["id"] == "mission/client-action-demo")
+        .expect("a just-cancelled mission stays in the current view");
+    assert_eq!(current["state"], "cancelled");
     let (_, mission_history) = client_json(app, "/v1/client/missions?history=true").await;
     let cancelled = mission_history["value"]["items"]
         .as_array()

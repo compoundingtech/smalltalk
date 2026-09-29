@@ -44,8 +44,8 @@ Mauve (`person`) means a person is needed. Nothing else may use it.
 
 ## Tabs
 
-Home, Agents, Missions, Fleet, Worktrees. Worktrees shows invented data labelled **demo** until
-the graph has worktree resources, and must be hidden before a release.
+Home, Agents, Missions, Fleet. A Worktrees tab waits, hidden, until the graph has worktree
+resources: until then it could only show invented data.
 
 ### Home: what needs you
 
