@@ -647,6 +647,19 @@ fn observation_is_live(observation: &PtyObservation) -> bool {
 
 /// The registry entry as `pty list --json` printed it.
 fn observation(session: SessionInfo) -> Result<PtyObservation> {
+    // The old CLI snapshot kept a named but malformed record visible as unknown. Preserve that
+    // failure mode so one bad process identity cannot make every other PTY disappear.
+    if session.pid.is_some_and(|pid| pid < 0) {
+        return Ok(PtyObservation {
+            name: session.name,
+            status: "unknown".into(),
+            exit_code: None,
+            pid: None,
+            created_at: None,
+            display_name: None,
+            tags: BTreeMap::new(),
+        });
+    }
     let pid = session
         .pid
         .map(|pid| {
@@ -873,6 +886,21 @@ exit 0
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_named_record_with_an_invalid_pid_stays_visible_as_unknown() {
+        let record = SessionInfo {
+            name: "bad".into(),
+            socket_path: PathBuf::from("bad.sock"),
+            pid: Some(-1),
+            status: pty_core::registry::SessionStatus::Running,
+            metadata: None,
+        };
+        let observed = observation(record).unwrap();
+        assert_eq!(observed.name, "bad");
+        assert_eq!(observed.status, "unknown");
+        assert_eq!(observed.pid, None);
     }
 
     #[test]
