@@ -9760,7 +9760,32 @@ impl Store {
             }
         }
 
-        let messages = selected_actionable_messages(self.messages(person, false)?);
+        // Only a person's messages need attention. Without a person, read each person's
+        // mailbox through the recipient index instead of every open message in the fleet.
+        let messages = match person {
+            Some(person) => self.messages(Some(person), false)?,
+            None => {
+                let people = {
+                    let connection = self.readers.get();
+                    let mut statement = connection.prepare(
+                        "SELECT DISTINCT json_extract(body, '$.fields.to')
+                         FROM claims INDEXED BY claims_message_to_index
+                         WHERE kind='message.sent'
+                           AND json_extract(body, '$.fields.to') >= 'person/'
+                           AND json_extract(body, '$.fields.to') < 'person0'",
+                    )?;
+                    statement
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                let mut messages = Vec::new();
+                for person in people {
+                    messages.extend(self.messages(Some(&person), false)?);
+                }
+                messages
+            }
+        };
+        let messages = selected_actionable_messages(messages);
         if !messages.is_empty() {
             let connection = self.readers.get();
             for message in messages.into_iter().filter(|message| {
@@ -17149,6 +17174,8 @@ fn current_human_review(
     else {
         return Ok(None);
     };
+    // Only the run's header decides whether a review is current: its steps' queue and wake
+    // enrichment is the costliest read in st and would run for every open review.
     let (run, step, title) = if owner.starts_with("step-run/") {
         let step = connection
             .query_row(
@@ -17165,7 +17192,7 @@ fn current_human_review(
         let Some(step) = step else {
             return Ok(None);
         };
-        let run = mission_run_view_tx(
+        let run = mission_run_header_tx(
             connection,
             step.run.strip_prefix("mission-run/").unwrap_or(&step.run),
         )
@@ -17185,7 +17212,7 @@ fn current_human_review(
         let title = step.title.clone();
         (run, Some(step.step), title)
     } else if owner.starts_with("mission-run/") {
-        let run = mission_run_view_tx(
+        let run = mission_run_header_tx(
             connection,
             owner.strip_prefix("mission-run/").unwrap_or(owner),
         )
