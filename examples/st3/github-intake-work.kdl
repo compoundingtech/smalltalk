@@ -30,7 +30,7 @@ mission "example/app/review-pull-request" state="ready" {
       exec "remove-review-files" {
         host "local"
         workspace "${ST_WORKSPACE}"
-        command "/bin/rm -rf -- checkout tmp target"
+        command "rm -rf -- checkout tmp target"
         restart "never"
       }
       gate "review files were removed" {
