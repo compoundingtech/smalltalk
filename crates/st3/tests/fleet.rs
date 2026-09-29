@@ -1143,7 +1143,8 @@ async fn leave_drains_everything_before_it_leaves() {
     b.wait_listening().await;
     a.stop();
     let mut expected = BTreeSet::new();
-    // More than one exchange carries, written while the anchor is away.
+    // Written while the anchor is away, and more than an older peer's exchange carries (512),
+    // so the anchor comes back catching up and defers projecting what it receives.
     for index in 0..700 {
         b.note(&format!("b-{index}")).await;
         expected.insert(format!("custom/fleet-test/b-{index}"));

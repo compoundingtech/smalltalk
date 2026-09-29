@@ -7278,12 +7278,14 @@ impl Store {
             }
             let predecessors = intent_leaves_tx(&transaction, subject).map_err(internal)?;
             let body = serde_json::to_value(desired).map_err(internal)?;
+            // The writer decides whether a top-level project seat holds default mission
+            // authority; see `graph::effective_agent_mission_authority`.
             let claim_id = claim_hash(
                 &batch_id,
                 subject,
                 "intent.desired",
                 &self.origin,
-                None,
+                actor,
                 &body,
                 &predecessors,
             )
@@ -7295,7 +7297,7 @@ impl Store {
                 subject,
                 "intent.desired",
                 &self.origin,
-                None,
+                actor,
                 &body,
                 &predecessors,
                 now,
@@ -9009,6 +9011,45 @@ impl Store {
             "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step FROM desired ORDER BY subject",
         )?;
         let rows = statement.query_map([], desired_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The current desired declaration of `subject` and the actor its claim records. A
+    /// declaration from before claims recorded their writer, or the daemon's own, has none.
+    pub fn desired_subject_with_writer(
+        &self,
+        subject: &str,
+    ) -> Result<Option<(DesiredSubject, Option<String>)>> {
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                "SELECT desired.subject, desired.kind, desired.body, desired.member,
+                        desired.owner_run, desired.owner_generation, desired.owner_step,
+                        claims.actor
+                 FROM desired LEFT JOIN claims ON claims.id = desired.claim_id
+                 WHERE desired.subject = ?1",
+                [subject],
+                |row| Ok((desired_from_row(row)?, row.get::<_, Option<String>>(7)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Each current agent declaration with the actor its claim records, as
+    /// `desired_subject_with_writer` reads one.
+    pub fn agent_declarations_with_writers(&self) -> Result<Vec<(DesiredSubject, Option<String>)>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT desired.subject, desired.kind, desired.body, desired.member,
+                    desired.owner_run, desired.owner_generation, desired.owner_step,
+                    claims.actor
+             FROM desired LEFT JOIN claims ON claims.id = desired.claim_id
+             WHERE desired.kind = 'agent'
+             ORDER BY desired.subject",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((desired_from_row(row)?, row.get::<_, Option<String>>(7)?))
+        })?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 

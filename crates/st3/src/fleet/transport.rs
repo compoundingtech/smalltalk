@@ -131,6 +131,19 @@ pub async fn tailscale_addresses(tailscale: &Path) -> Result<Vec<IpAddr>> {
     Ok(parse_tailscale_ips(&run(tailscale, &["ip"]).await?))
 }
 
+/// `fabric peers` rows: a NodeID, the local name (possibly empty), and the peer's grants.
+fn parse_fabric_peers(printed: &str) -> Vec<(String, String)> {
+    printed
+        .lines()
+        .filter_map(|line| {
+            let mut columns = line.split('\t');
+            let node = columns.next()?.trim();
+            let name = columns.next().unwrap_or_default().trim();
+            (!node.is_empty()).then(|| (node.to_owned(), name.to_owned()))
+        })
+        .collect()
+}
+
 /// The default Fabric protocol for a fleet, so a throwaway fleet never collides with another.
 pub fn default_fabric_protocol(fleet_id: &str) -> String {
     format!("st3/fleet/{fleet_id}")
@@ -169,6 +182,33 @@ impl Fabric {
         run(&self.program, &["unexpose", protocol])
             .await
             .map(|_| ())
+    }
+
+    /// Expose `argv` to trusted peers under `protocol`: Fabric runs it once for each incoming
+    /// tunnel, with the tunnel on its stdin and stdout. Fabric keeps the exposure in its own
+    /// configuration, so it outlives this process and any st daemon.
+    pub async fn expose_exec(&self, protocol: &str, argv: &[&str]) -> Result<()> {
+        let mut arguments = vec!["expose", protocol, "--exec", "--"];
+        arguments.extend_from_slice(argv);
+        run(&self.program, &arguments).await.map(|_| ())
+    }
+
+    /// The trusted peers in Fabric's `peers.toml`, as NodeID and local name.
+    pub async fn peers(&self) -> Result<Vec<(String, String)>> {
+        Ok(parse_fabric_peers(&run(&self.program, &["peers"]).await?))
+    }
+
+    /// Ask Fabric for a local Unix socket that tunnels to a peer's exposed protocol and return
+    /// its path. Fabric reuses the socket while its listener lives.
+    pub async fn dial_socket(&self, node: &str, protocol: &str) -> Result<PathBuf> {
+        let printed = run(&self.program, &["dial", node, protocol]).await?;
+        let path = PathBuf::from(printed.trim());
+        anyhow::ensure!(
+            path.is_absolute(),
+            "fabric dial printed `{}`",
+            printed.trim()
+        );
+        Ok(path)
     }
 
     /// Ask Fabric for a loopback TCP tunnel to a peer's exposed protocol and return its
@@ -368,6 +408,45 @@ mod tests {
 
         let remote = Fabric::new(shim(root.path(), "echo 192.168.1.4:45678"));
         assert!(remote.dial("node-b", "p").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn a_pty_route_exposes_a_command_and_dials_a_unix_socket() {
+        let root = tempfile::tempdir().unwrap();
+        let log = root.path().join("calls");
+        let fabric = Fabric::new(shim(
+            root.path(),
+            &format!(
+                "echo \"$@\" >> {log}\ncase \"$1\" in \
+                 peers) printf 'node-b\\tBox\\techo,st3/pty/x\\nnode-c\\t\\techo\\n';; \
+                 dial) echo /run/fabric/dials/node-b.sock;; *) ;; esac",
+                log = log.display()
+            ),
+        ));
+        fabric
+            .expose_exec("st3/pty/x", &["/bin/st", "terminals", "serve-fabric"])
+            .await
+            .unwrap();
+        assert_eq!(
+            fabric.peers().await.unwrap(),
+            vec![
+                ("node-b".to_owned(), "Box".to_owned()),
+                ("node-c".to_owned(), String::new()),
+            ]
+        );
+        assert_eq!(
+            fabric.dial_socket("node-b", "st3/pty/x").await.unwrap(),
+            PathBuf::from("/run/fabric/dials/node-b.sock")
+        );
+        let calls = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            calls,
+            "expose st3/pty/x --exec -- /bin/st terminals serve-fabric\npeers\n\
+             dial node-b st3/pty/x\n"
+        );
+
+        let relative = Fabric::new(shim(root.path(), "echo dials/node-b.sock"));
+        assert!(relative.dial_socket("node-b", "p").await.is_err());
     }
 
     #[test]

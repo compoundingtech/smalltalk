@@ -1786,10 +1786,20 @@ enum PtyCommand {
     /// Attach this terminal interactively to one running terminal member.
     ///
     /// A terminal on this host is attached through its PTY session, fenced to the incarnation st
-    /// selected, so a busy daemon cannot block it. A terminal on another fleet host is reached
-    /// through the client gateway, the path paired clients use, as the person from `--as` or the
-    /// st config. Attaching never starts or restarts a session. Detach with Ctrl+\.
+    /// selected, so a busy daemon cannot block it. A terminal on another fleet host is attached
+    /// PTY to PTY over Fabric when Fabric reaches that host (see `st terminals expose-fabric`),
+    /// and otherwise through the client gateway, the path paired clients use, as the person from
+    /// `--as` or the st config. Attaching never starts or restarts a session. Detach with Ctrl+\.
     Attach(PtyAttachArgs),
+    /// Let fleet peers attach this host's terminals PTY to PTY over Fabric.
+    ///
+    /// Fabric keeps the exposure in its own configuration and runs `st terminals serve-fabric`
+    /// for each tunnel, so an attach works while st's daemon is busy or down. Each peer also needs
+    /// a grant for the printed protocol in this machine's Fabric `peers.toml`.
+    ExposeFabric(PtyExposeFabricArgs),
+    /// Serve one Fabric tunnel to a PTY session on stdin and stdout. Fabric runs this.
+    #[command(hide = true)]
+    ServeFabric(PtyServeFabricArgs),
     /// Read one terminal's current screen without taking control.
     Peek(PtySubjectArgs),
     /// Read a terminal screen through the client gateway, including a remote fleet host.
@@ -1868,6 +1878,24 @@ struct PtyAttachArgs {
     /// config. A terminal on this host needs no person.
     #[arg(long = "as", value_parser = parse_person_subject)]
     person: Option<String>,
+}
+
+#[derive(Args)]
+struct PtyExposeFabricArgs {
+    /// The st executable Fabric runs for each tunnel; defaults to this one. Name a stable path,
+    /// since Fabric keeps it after this build is replaced.
+    #[arg(long)]
+    st: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct PtyServeFabricArgs {
+    /// Serve the tunnel on stdin and stdout, as Fabric's exec exposure runs it.
+    #[arg(long, required = true)]
+    stdio: bool,
+    /// The PTY root whose sessions this serves.
+    #[arg(long)]
+    pty_root: PathBuf,
 }
 
 #[derive(Args)]
@@ -3055,6 +3083,13 @@ async fn run(cli: Cli) -> Result<()> {
     if let Command::Up(args) = cli.command {
         return run_up(args).await;
     }
+    // Fabric runs this for each tunnel. It needs no config and no daemon.
+    if let Command::Terminals {
+        command: PtyCommand::ServeFabric(args),
+    } = &cli.command
+    {
+        return st3::terminal_fabric::serve_stdio(&args.pty_root).await;
+    }
     if let Command::Skill(args) = cli.command {
         return run_skill(args);
     }
@@ -3139,20 +3174,21 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Lanes { command } => {
             run_lanes(&client, config.person.as_deref(), command, cli.json).await
         }
+        Command::Terminals {
+            command: PtyCommand::ExposeFabric(args),
+        } => expose_fabric(&config, args).await,
         Command::Terminals { command } => {
-            // The configured daemon's PTY root, to attach its sessions when it cannot answer.
-            let pty_root = matches!(&endpoint, Endpoint::Unix(socket) if *socket == config.socket)
-                .then(|| {
-                    config
-                        .pty_root
-                        .clone()
-                        .unwrap_or_else(|| config.state_dir.join("pty"))
-                });
+            // This host's PTY root, whichever endpoint answers: a terminal whose session runs
+            // there is attached through it when that endpoint cannot answer in time.
+            let pty_root = config
+                .pty_root
+                .clone()
+                .unwrap_or_else(|| config.state_dir.join("pty"));
             run_pty(
                 &client,
                 &endpoint,
                 config.person.as_deref(),
-                pty_root.as_deref(),
+                Some(&pty_root),
                 command,
                 cli.json,
             )
@@ -4621,6 +4657,9 @@ async fn run_pty(
             let person = args.person.as_deref().or(configured_person);
             attach_terminal(client, endpoint, pty_root, person, &subject, args.force).await
         }
+        PtyCommand::ExposeFabric(_) | PtyCommand::ServeFabric(_) => {
+            unreachable!("handled before any daemon client")
+        }
         PtyCommand::Peek(args) => {
             let subject = normalize_member_subject(&args.subject, "pty");
             let screen: SessionScreen = client
@@ -4832,9 +4871,32 @@ fn render_terminal_screen(screen: &ClientTerminalScreen) -> String {
 /// on this host before it attaches to the newest one without the daemon.
 const LOCAL_ATTACH_CONSULT: Duration = Duration::from_secs(1);
 
+/// The daemon's answer to attaching one terminal.
+enum AttachAnswer {
+    /// A PTY session on this host that the daemon selected and this CLI connects to itself.
+    Local(st3::model::LocalTerminal),
+    /// The daemon's WebSocket bridge: an HTTP endpoint, or a daemon from before direct
+    /// attachment.
+    Bridge(Attachment),
+}
+
+/// Ask the daemon behind `client` how to attach `subject`.
+async fn consult_attach(client: &Client, subject: &str) -> Result<AttachAnswer> {
+    if let Some(terminal) = client.local_terminal(subject).await? {
+        return Ok(AttachAnswer::Local(terminal));
+    }
+    client
+        .post(
+            &format!("/v1/sessions/attach/{}", urlencoding::encode(subject)),
+            &AttachRequest::default(),
+        )
+        .await
+        .map(AttachAnswer::Bridge)
+}
+
 /// Attach this terminal to one terminal member. A terminal on this host is attached through its
 /// PTY session; one that another fleet host owns goes through the client gateway, the path paired
-/// clients use, as `person`.
+/// clients use, as `person`. `pty_root` is this host's PTY root, whichever endpoint answers.
 async fn attach_terminal(
     client: &Client,
     endpoint: &Endpoint,
@@ -4851,61 +4913,61 @@ async fn attach_terminal(
             "st terminals attach: already inside PTY session `{outer}`. Detach first with Ctrl+\\, or pass --force."
         );
     }
-    // The subject's running PTY sessions under the configured daemon's PTY root, read from the
-    // registry alone. When there are any, the daemon has a moment to choose one and refuse; a
-    // daemon that cannot answer that fast must not keep anyone from debugging this host.
+    // The subject's running PTY sessions on this host, read from the registry alone. When there
+    // are any, the daemon has a moment to choose one and refuse; a daemon that cannot answer that
+    // fast must not keep anyone from debugging this host.
     let local = pty_root
         .map(|root| (root, st3::client::tagged_pty_sessions(root, subject)))
         .filter(|(_, sessions)| !sessions.is_empty());
-    let lookup = client.local_terminal(subject);
-    let answer = match &local {
-        Some((root, sessions)) => match tokio::time::timeout(LOCAL_ATTACH_CONSULT, lookup).await {
-            Ok(answer) => answer,
-            Err(_) => {
+    let daemon = format!("st daemon at {}", endpoint_label(endpoint));
+    let mut consult = std::pin::pin!(consult_attach(client, subject));
+    let answer = match tokio::time::timeout(LOCAL_ATTACH_CONSULT, consult.as_mut()).await {
+        Ok(answer) => answer,
+        Err(_) => match (&local, pty_root) {
+            (Some((root, sessions)), _) => {
                 let waited = format!(
-                    "did not answer within {} ms",
+                    "the {daemon} did not answer within {} ms",
                     LOCAL_ATTACH_CONSULT.as_millis()
                 );
                 let code = attach_unconsulted(root, subject, sessions, &waited).await?;
                 return terminal_exit(code);
             }
+            (None, Some(root)) => {
+                eprintln!(
+                    "st terminals attach: waiting for the {daemon}; no PTY session of `{subject}` runs under {} to attach without it.",
+                    root.display()
+                );
+                consult.await
+            }
+            (None, None) => consult.await,
         },
-        None => lookup.await,
     };
     let code = match answer {
-        Ok(Some(terminal)) => st3::client::attach_local_terminal(&terminal).await?,
-        Ok(None) => {
-            // An HTTP endpoint, or a daemon from before direct attachment: its WebSocket bridge.
-            let attached: Result<Attachment> = client
-                .post(
-                    &format!("/v1/sessions/attach/{}", urlencoding::encode(subject)),
-                    &AttachRequest::default(),
-                )
-                .await;
-            match attached {
-                Ok(attachment) => {
-                    client
-                        .proxy_terminal_resilient(subject, &attachment)
-                        .await?
-                }
-                Err(error) if st3::client::api_error_code(&error) == Some("runtime-not-local") => {
-                    attach_remote_terminal(endpoint, person, subject, error).await?
-                }
-                Err(error) => return Err(error),
-            }
+        Ok(AttachAnswer::Local(terminal)) => st3::client::attach_local_terminal(&terminal).await?,
+        Ok(AttachAnswer::Bridge(attachment)) => {
+            client
+                .proxy_terminal_resilient(subject, &attachment)
+                .await?
         }
         Err(error) if st3::client::api_error_code(&error) == Some("runtime-not-local") => {
-            attach_remote_terminal(endpoint, person, subject, error).await?
+            attach_remote_terminal(client, endpoint, person, subject, error).await?
         }
         Err(error) => match &local {
             Some((root, sessions)) if st3::client::daemon_did_not_answer(&error) => {
-                let failed = format!("did not answer ({error:#})");
+                let failed = format!("the {daemon} did not answer ({error:#})");
                 attach_unconsulted(root, subject, sessions, &failed).await?
             }
             _ => return Err(error),
         },
     };
     terminal_exit(code)
+}
+
+fn endpoint_label(endpoint: &Endpoint) -> String {
+    match endpoint {
+        Endpoint::Unix(socket) => socket.display().to_string(),
+        Endpoint::Http(url) => url.clone(),
+    }
 }
 
 fn terminal_exit(code: i32) -> Result<()> {
@@ -4916,9 +4978,11 @@ fn terminal_exit(code: i32) -> Result<()> {
     }
 }
 
-/// Attach to a terminal that another fleet host owns through the client gateway, as `person`.
-/// `not_local` is the local daemon's refusal, which names the owner.
+/// Attach to a terminal that another fleet host owns, as `person`: PTY to PTY over Fabric when
+/// Fabric reaches the owner, and otherwise through the client gateway. `not_local` is the local
+/// daemon's refusal, which names the owner.
 async fn attach_remote_terminal(
+    client: &Client,
     endpoint: &Endpoint,
     person: Option<&str>,
     subject: &str,
@@ -4931,7 +4995,127 @@ async fn attach_remote_terminal(
     })?;
     let person = parse_person_subject(person).map_err(anyhow::Error::msg)?;
     let gateway = generated_client(endpoint, Some(&person))?;
+    let unreached = match fabric_route(client, &gateway, subject).await {
+        Ok((target, request)) => match st3::terminal_fabric::attach(&target, &request).await? {
+            Ok(code) => return Ok(code),
+            Err(error) => format!("Fabric did not reach its PTY session: {error}"),
+        },
+        Err(error) => format!("{error:#}"),
+    };
+    eprintln!("st terminals attach: {unreached}. Attaching through the client gateway instead.");
     st3::remote_terminal::attach(&gateway, subject, subject).await
+}
+
+/// The Fabric route to the PTY session of `subject`, a terminal another fleet host owns. st
+/// first checks that the gateway grants its person terminal reading and control, then reads the
+/// runtime and incarnation this daemon holds for it. The owner proves that incarnation before
+/// it passes a byte.
+async fn fabric_route(
+    client: &Client,
+    gateway: &GeneratedClient,
+    subject: &str,
+) -> Result<(
+    st3::terminal_fabric::FabricTarget,
+    st3::terminal_fabric::RouteRequest,
+)> {
+    let capabilities = gateway.capabilities().await?.value;
+    for scope in ["terminal.read", "terminal.control"] {
+        anyhow::ensure!(
+            capabilities.capabilities.iter().any(|capability| {
+                capability.id == scope && capability.state == st3_client::CapabilityState::Granted
+            }),
+            "the client gateway does not grant `{scope}` for a direct attachment"
+        );
+    }
+    let status = status_for(client, subject).await?;
+    let selected = status
+        .subjects
+        .first()
+        .with_context(|| format!("st has no runtime for `{subject}`"))?;
+    let owner = selected
+        .actual_origin
+        .as_deref()
+        .with_context(|| format!("st does not know which host runs `{subject}`"))?;
+    let fields = selected
+        .actual
+        .as_ref()
+        .map(|actual| actual.get("fields").unwrap_or(actual))
+        .with_context(|| format!("st has no runtime for `{subject}`"))?;
+    let field = |name: &str| fields.get(name).and_then(Value::as_str);
+    anyhow::ensure!(
+        field("status") == Some("running") && fields.get("terminal") != Some(&Value::Bool(false)),
+        "`{subject}` has no running terminal on `{owner}`"
+    );
+    let (Some(runtime_id), Some(incarnation)) = (field("runtime_id"), field("incarnation_id"))
+    else {
+        anyhow::bail!("st has no runtime incarnation for `{subject}` on `{owner}`");
+    };
+    let (fabric, fleet_id) = configured_fabric()?;
+    let fleet_id = fleet_id
+        .with_context(|| format!("this machine is in no fleet to reach `{owner}` through"))?;
+    let fabric =
+        fabric.with_context(|| format!("this machine has no `fabric` to reach `{owner}` with"))?;
+    let view: st3::fleet::FleetView = client.get("/v1/internal/fleet/membership").await?;
+    let peer = st3::terminal_fabric::owner_peer(&fabric, &view.members, owner)
+        .await
+        .with_context(|| {
+            format!("`{owner}` advertises no Fabric node, and no Fabric peer of this machine has its name")
+        })?;
+    Ok((
+        st3::terminal_fabric::FabricTarget {
+            fabric,
+            peer,
+            protocol: st3::terminal_fabric::protocol(&fleet_id),
+        },
+        st3::terminal_fabric::RouteRequest::new(runtime_id, subject, incarnation),
+    ))
+}
+
+/// This machine's `fabric`, the fleet file's override or the one on `PATH`, and its fleet.
+fn configured_fabric() -> Result<(Option<st3::fleet::transport::Fabric>, Option<String>)> {
+    let mut config = Config::load_unvalidated(None)?;
+    config.apply_fleet_file()?;
+    let override_path = config
+        .fleet
+        .as_ref()
+        .and_then(|file| file.fabric.as_deref());
+    let fabric = st3::fleet::transport::resolve_tool(override_path, "fabric")
+        .map(st3::fleet::transport::Fabric::new);
+    Ok((fabric, config.fleet_id))
+}
+
+/// `st terminals expose-fabric`: have this machine's Fabric serve the fleet's PTY sessions.
+async fn expose_fabric(config: &Config, args: PtyExposeFabricArgs) -> Result<()> {
+    let (fabric, fleet_id) = configured_fabric()?;
+    let fleet_id =
+        fleet_id.context("this machine is in no fleet, so no peer can attach its terminals")?;
+    let fabric = fabric.context("`fabric` is not on PATH")?;
+    let st = match args.st {
+        Some(st) => std::path::absolute(st)?,
+        None => std::env::current_exe().context("find this st executable")?,
+    };
+    let pty_root = std::path::absolute(
+        config
+            .pty_root
+            .clone()
+            .unwrap_or_else(|| config.state_dir.join("pty")),
+    )?;
+    let protocol = st3::terminal_fabric::protocol(&fleet_id);
+    let (st, pty_root) = (st.display().to_string(), pty_root.display().to_string());
+    let argv = [
+        st.as_str(),
+        "terminals",
+        "serve-fabric",
+        "--stdio",
+        "--pty-root",
+        pty_root.as_str(),
+    ];
+    fabric.expose_exec(&protocol, &argv).await?;
+    println!("Fabric serves the PTY sessions under {pty_root} as `{protocol}`, with `{st}`.");
+    println!(
+        "Add `{protocol}` to the `allow` list of each peer in this machine's Fabric peers.toml, then run `fabric reload-peers`."
+    );
+    Ok(())
 }
 
 /// Attach to the newest of `subject`'s running PTY sessions on this host without the st daemon,
@@ -4941,13 +5125,13 @@ async fn attach_unconsulted(
     pty_root: &Path,
     subject: &str,
     sessions: &[st3::client::TaggedPtySession],
-    daemon: &str,
+    why: &str,
 ) -> Result<i32> {
     let (newest, others) = sessions
         .split_first()
         .context("an attachment without st needs a PTY session")?;
     eprintln!(
-        "st terminals attach: the st daemon {daemon}, so st was not consulted. Attaching as the local user to PTY session `{}` of `{subject}` (started {}) under {}, without st's incarnation check.",
+        "st terminals attach: {why}, so st was not consulted. Attaching as the local user to PTY session `{}` of `{subject}` (started {}) under {}, without st's incarnation check.",
         newest.runtime_id,
         newest.created_at,
         pty_root.display()
@@ -6172,7 +6356,9 @@ async fn follow_conversation(
     json_output: bool,
 ) -> Result<()> {
     let mut stream = client.collection_stream().await?;
-    stream.subscribe_conversation("conversation", target).await?;
+    stream
+        .subscribe_conversation("conversation", target)
+        .await?;
     let mut seen = BTreeMap::new();
     loop {
         match stream.next_event().await? {
@@ -8692,6 +8878,13 @@ fn render_client_agent(
     if let Some(owner) = &agent.owner_run_id {
         let _ = writeln!(output, "MISSION      {owner}");
     }
+    if let Some(authority) = &agent.mission_authority {
+        let _ = writeln!(
+            output,
+            "AUTHORITY    {}",
+            render_mission_authority(authority)
+        );
+    }
     if let Some(usage) = &agent.usage {
         let _ = writeln!(output, "USAGE        {}", render_usage(usage));
         if usage.incarnation_count > 0 {
@@ -8745,6 +8938,36 @@ fn render_client_agent(
         let _ = writeln!(output, "RUNTIME      {runtime}");
     }
     output
+}
+
+/// Each mission pattern with the verbs it allows, then where the authority comes from.
+fn render_mission_authority(authority: &st3_client::AgentMissionAuthority) -> String {
+    let mut patterns: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (verb, rules) in [
+        ("publish", &authority.publish),
+        ("start", &authority.start),
+        ("revise", &authority.revise),
+    ] {
+        for pattern in rules {
+            match patterns.iter_mut().find(|(known, _)| known == pattern) {
+                Some((_, verbs)) => verbs.push(verb),
+                None => patterns.push((pattern, vec![verb])),
+            }
+        }
+    }
+    let rules = if patterns.is_empty() {
+        "no missions".to_owned()
+    } else {
+        patterns
+            .iter()
+            .map(|(pattern, verbs)| format!("{} mission/{pattern}", verbs.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    match authority.source.as_str() {
+        "none" => rules,
+        source => format!("{rules} ({source})"),
+    }
 }
 
 fn render_client_agents(
@@ -13964,6 +14187,42 @@ mod tests {
     }
 
     #[test]
+    fn agent_card_shows_mission_authority_and_its_source() {
+        let card = |authority: serde_json::Value| {
+            let agent: st3_client::Agent = serde_json::from_value(serde_json::json!({
+                "kind": "agent", "id": "agent/fleet/website/standing/website", "revision": "one",
+                "updated_at": "2026-09-29T12:00:00Z", "name": "Website",
+                "state": "running", "reachability": "local", "runtime_ids": [],
+                "mission_authority": authority
+            }))
+            .unwrap();
+            render_client_agent(&agent, &[], 0)
+        };
+        let namespace = serde_json::json!(["fleet/website/*"]);
+        assert!(
+            card(serde_json::json!({
+                "source": "default",
+                "publish": namespace, "start": namespace, "revise": namespace
+            }))
+            .contains("AUTHORITY    publish, start, revise mission/fleet/website/* (default)")
+        );
+        assert!(
+            card(serde_json::json!({
+                "source": "declared",
+                "publish": ["fleet/website/docs/*"], "start": ["fleet/website/docs/*", "fleet/website/deploy"]
+            }))
+            .contains(
+                "AUTHORITY    publish, start mission/fleet/website/docs/*; start mission/fleet/website/deploy (declared)"
+            )
+        );
+        assert!(
+            card(serde_json::json!({"source": "declared"}))
+                .contains("AUTHORITY    no missions (declared)")
+        );
+        assert!(card(serde_json::json!({"source": "none"})).contains("AUTHORITY    no missions\n"));
+    }
+
+    #[test]
     fn agent_card_shows_current_and_next_work_ids() {
         let resource: st3_client::Resource = serde_json::from_value(serde_json::json!({
             "kind": "agent", "id": "agent/worker", "revision": "one",
@@ -14362,7 +14621,10 @@ mod tests {
             .unwrap()
             .parse::<u64>()
             .unwrap();
-        assert!(after >= last_index, "the wait replayed existing events: {query}");
+        assert!(
+            after >= last_index,
+            "the wait replayed existing events: {query}"
+        );
         waiter.abort();
         server.abort();
     }
