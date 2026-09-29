@@ -1398,6 +1398,17 @@ fn client_agent_resources_uncached(
             Some((desired.subject, client_host_id(&host)))
         })
         .collect::<BTreeMap<_, _>>();
+    let agent_subjects = status
+        .subjects
+        .iter()
+        .filter(|subject| {
+            (subject.subject.starts_with("agent/") || subject.kind.as_deref() == Some("agent"))
+                && (history || subject.projection.layer == "current")
+        })
+        .map(|subject| subject.subject.clone())
+        .collect::<Vec<_>>();
+    let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
+    let member_faults = store.member_reconcile_faults_at(snapshot_index)?;
     let mut agents = status
         .subjects
         .into_iter()
@@ -1406,7 +1417,7 @@ fn client_agent_resources_uncached(
         })
         .filter(|subject| history || subject.projection.layer == "current")
         .map(|subject| -> anyhow::Result<(String, Value)> {
-            let fault = store.member_reconcile_fault(&subject.subject, Some(snapshot_index))?;
+            let fault = member_faults.get(&subject.subject);
             let fields = subject
                 .actual
                 .as_ref()
@@ -1543,7 +1554,7 @@ fn client_agent_resources_uncached(
                 .get(&subject.subject)
                 .cloned()
                 .unwrap_or_default();
-            let usage = store.usage_summary_at(&subject.subject, None, Some(snapshot_index))?;
+            let usage = usage_summaries.get(&subject.subject);
             let value = json!({
                 "id": subject.subject,
                 "kind": "agent",

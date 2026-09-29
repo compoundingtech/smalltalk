@@ -8596,6 +8596,40 @@ impl Store {
         )
     }
 
+    /// Current member faults for an agent collection, reduced in one SQL scan.
+    pub fn member_reconcile_faults_at(&self, at_index: u64) -> Result<BTreeMap<String, String>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, body FROM (
+                 SELECT subject, body,
+                        ROW_NUMBER() OVER (PARTITION BY subject ORDER BY store_index DESC) AS rank
+                 FROM claims
+                 WHERE subject LIKE 'agent/%' AND kind='runtime.reconcile-decision'
+                   AND store_index<=?1
+                   AND json_extract(body, '$.fields.key')='member-reconcile'
+             ) WHERE rank=1",
+        )?;
+        let mut faults = BTreeMap::new();
+        for row in statement.query_map([at_index], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (subject, body) = row?;
+            let body: Value = serde_json::from_str(&body)?;
+            let fields = body.get("fields").unwrap_or(&body);
+            if fields.get("decision").and_then(Value::as_str) == Some("member-fault") {
+                faults.insert(
+                    subject,
+                    fields
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("member reconciliation failed")
+                        .to_owned(),
+                );
+            }
+        }
+        Ok(faults)
+    }
+
     pub fn latest_claim(&self, subject: &str, kind: Option<&str>) -> Result<Option<ClaimRecord>> {
         let connection = self.readers.get();
         let query = "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
