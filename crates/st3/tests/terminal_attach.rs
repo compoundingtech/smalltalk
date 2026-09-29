@@ -59,6 +59,29 @@ fn observe_terminal(store: &Store, incarnation: &str) {
         .unwrap();
 }
 
+/// Replicate `source`, another host, into `target` until both hold the same authority.
+fn replicate(source: &Store, target: &Store) {
+    const FLEET: &str = "attach-fleet";
+    source.bind_fleet(FLEET).unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    for _ in 0..100 {
+        let inventory = target.replication_inventory().unwrap();
+        if inventory.digest == source.replication_inventory().unwrap().digest {
+            return;
+        }
+        let exchange = source
+            .export_replication_exchange(FLEET, &inventory)
+            .unwrap();
+        target
+            .receive_replication_exchange("owner-node", FLEET, &exchange)
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        target.apply_replication_repairs().unwrap();
+        target.project_replication_backlog().unwrap();
+    }
+    panic!("the replica never converged");
+}
+
 /// The incarnation st derives for the stand-in session, which this test process serves.
 fn incarnation(created_at: &str) -> String {
     format!("{}:{created_at}", std::process::id())
@@ -348,4 +371,31 @@ async fn a_terminal_on_this_host_is_named_but_not_attached_while_its_daemon_is_d
         !root.path().join("pty-runs").exists(),
         "without its daemon st must not attach or start anything"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminal_another_host_owns_is_not_attached_through_a_local_pty() {
+    let root = tempfile::tempdir().unwrap();
+    let state = state(root.path());
+    // Another host runs the terminal; this daemon knows it only through replication.
+    let owner = Store::open_memory("owner-node").unwrap();
+    observe_terminal(&owner, &incarnation(CREATED_AT));
+    replicate(&owner, &state.store);
+    let socket = root.path().join("st3.sock");
+    let server = serve_unix(state, &socket).await;
+    // A local session under the same name must not be mistaken for it.
+    let session = pty_session(root.path());
+
+    let (output, _) = attach(root.path(), socket.to_str().unwrap()).await;
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "{stderr}");
+    // It goes to the client gateway as a person, and none is configured here.
+    assert!(stderr.contains("owner-node"), "{stderr}");
+    assert!(stderr.contains("needs `--as person/NAME`"), "{stderr}");
+    assert!(
+        session.join().unwrap().is_none(),
+        "a terminal on another host must not be attached through a local PTY"
+    );
+    server.abort();
 }
