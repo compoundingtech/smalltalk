@@ -388,6 +388,17 @@ ON local_observations(dedupe_key) WHERE dedupe_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS local_observations_timeline_index
 ON local_observations(subject, json_extract(body, '$.fields.incarnation_id'), id)
 WHERE kind='harness.timeline';
+-- A mission capacity retry is scheduling state owned by this reconciler. Replicating every
+-- backoff attempt makes every peer reconcile even though only this node can retry it.
+CREATE TABLE IF NOT EXISTS local_subscription_mission_deferrals (
+    subject TEXT NOT NULL,
+    request TEXT NOT NULL,
+    not_before_unix_ms INTEGER NOT NULL,
+    attempts INTEGER NOT NULL,
+    PRIMARY KEY(subject, request)
+);
+CREATE INDEX IF NOT EXISTS local_subscription_mission_deferrals_deadline_index
+ON local_subscription_mission_deferrals(not_before_unix_ms);
 CREATE TABLE IF NOT EXISTS local_usage_totals (
     subject TEXT NOT NULL,
     incarnation_id TEXT NOT NULL,
@@ -4182,7 +4193,7 @@ impl Store {
     pub fn next_subscription_mission_retry_deadline(&self) -> Result<Option<u128>> {
         let connection = self.readers.get();
         let now = now_ms() as i64;
-        let deadline: Option<i64> = connection.query_row(
+        let legacy: Option<i64> = connection.query_row(
             "SELECT MIN(CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER))
              FROM claims INDEXED BY claims_subscription_deferred_deadline_index
              WHERE kind='subscription.mission-deferred'
@@ -4190,7 +4201,13 @@ impl Store {
             [now],
             |row| row.get(0),
         )?;
-        Ok(deadline.map(|value| value as u128))
+        let local: Option<i64> = connection.query_row(
+            "SELECT MIN(not_before_unix_ms) FROM local_subscription_mission_deferrals
+             WHERE not_before_unix_ms>?1",
+            [now],
+            |row| row.get(0),
+        )?;
+        Ok(local.into_iter().chain(legacy).min().map(|value| value as u128))
     }
 
     pub fn request_mission_run_cancellation(
@@ -10424,6 +10441,18 @@ impl Store {
         request: &str,
     ) -> Result<Option<(u128, u32)>> {
         let connection = self.readers.get();
+        let local: Option<(i64, u32)> = connection
+            .query_row(
+                "SELECT not_before_unix_ms, attempts
+                 FROM local_subscription_mission_deferrals
+                 WHERE subject=?1 AND request=?2",
+                params![subject, request],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((deadline, attempts)) = local {
+            return Ok(Some((deadline as u128, attempts)));
+        }
         let count: u32 = connection.query_row(
             "SELECT COUNT(*) FROM claims
              WHERE subject=?1 AND kind='subscription.mission-deferred'
@@ -10444,6 +10473,26 @@ impl Store {
             |row| row.get(0),
         )?;
         Ok(deadline.map(|deadline| (u128::from(deadline), count)))
+    }
+
+    pub fn record_subscription_mission_deferral(
+        &self,
+        subject: &str,
+        request: &str,
+        deadline: u128,
+        attempts: u32,
+    ) -> Result<()> {
+        let deadline = i64::try_from(deadline)?;
+        self.connection.write().execute(
+            "INSERT INTO local_subscription_mission_deferrals
+                 (subject, request, not_before_unix_ms, attempts)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(subject, request) DO UPDATE SET
+                 not_before_unix_ms=excluded.not_before_unix_ms,
+                 attempts=excluded.attempts",
+            params![subject, request, deadline, attempts],
+        )?;
+        Ok(())
     }
 
     pub fn pending_schedule_work_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
@@ -12338,10 +12387,21 @@ impl Store {
         // An inbound exchange is just as good evidence of reachability as an outbound one.
         // Keep the last success during a short missed-exchange window, so a failed dial on
         // one side cannot flap a peer that is still exchanging in the other direction.
-        if self
+        let recent_exchange = self
             .replication_peer_last_success(peer)?
-            .is_some_and(|last| now_ms().saturating_sub(last) < 90_000)
-        {
+            .is_some_and(|last| now_ms().saturating_sub(last) < 90_000);
+        if recent_exchange {
+            return Ok(false);
+        }
+        // A peer may also have a fresh up observation without a matching peer-row success
+        // (for example, after a worker restart). Its published status must get the same
+        // missed-exchange grace period or one outbound timeout reverses it immediately.
+        let recent_observation = self
+            .latest_claim(&format!("host/{peer}"), Some("transport.observed"))?
+            .filter(|claim| claim.origin == self.origin && claim.body["fields"]["status"] == "up")
+            .and_then(|claim| claim.body["fields"]["last_success_at"].as_u64())
+            .is_some_and(|last| now_ms().saturating_sub(u128::from(last)) < 90_000);
+        if recent_observation {
             return Ok(false);
         }
         if self
@@ -27097,6 +27157,39 @@ mod tests {
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
 
     #[test]
+    fn recent_up_observation_prevents_a_transport_timeout_flap() {
+        let store = Store::open_memory("source").unwrap();
+        store
+            .record_transport_observation("target", "up", None, None)
+            .unwrap();
+        assert_eq!(store.replication_peer_last_success("target").unwrap(), None);
+        assert!(!store
+            .record_peer_failure("target", "down", "request timed out")
+            .unwrap());
+        assert_eq!(
+            store
+                .latest_claim("host/target", Some("transport.observed"))
+                .unwrap()
+                .unwrap()
+                .body["fields"]["status"],
+            "up"
+        );
+
+        let stale = Store::open_memory("source").unwrap();
+        stale
+            .record_transport_observation(
+                "target",
+                "up",
+                None,
+                Some(now_ms().saturating_sub(91_000)),
+            )
+            .unwrap();
+        assert!(stale
+            .record_peer_failure("target", "down", "request timed out")
+            .unwrap());
+    }
+
+    #[test]
     fn persistent_store_uses_bounded_sqlite_page_caches() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::open(&directory.path().join("state.sqlite3"), "node").unwrap();
@@ -27159,6 +27252,22 @@ mod tests {
                 .unwrap(),
             None,
         );
+        let before = store.index().unwrap();
+        let third = second + 30_000;
+        store
+            .record_subscription_mission_deferral(subject, "request-a", third.into(), 3)
+            .unwrap();
+        assert_eq!(store.index().unwrap(), before);
+        assert_eq!(
+            store
+                .subscription_mission_deferral(subject, "request-a")
+                .unwrap(),
+            Some((third.into(), 3)),
+        );
+        assert_eq!(
+            store.next_subscription_mission_retry_deadline().unwrap(),
+            Some(first.into()),
+        );
         let connection = store.readers.get();
         let request_plan: String = connection
             .query_row(
@@ -27186,6 +27295,37 @@ mod tests {
         assert!(
             deadline_plan.contains("claims_subscription_deferred_deadline_index"),
             "{deadline_plan}"
+        );
+    }
+
+    #[test]
+    fn local_subscription_deferral_survives_a_daemon_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("state.sqlite3");
+        let deadline = now_ms() + 30_000;
+        {
+            let store = Store::open(&path, "node").unwrap();
+            let before = store.index().unwrap();
+            store
+                .record_subscription_mission_deferral(
+                    "subscription/reviews",
+                    "request-a",
+                    deadline,
+                    7,
+                )
+                .unwrap();
+            assert_eq!(store.index().unwrap(), before);
+        }
+        let reopened = Store::open(&path, "node").unwrap();
+        assert_eq!(
+            reopened
+                .subscription_mission_deferral("subscription/reviews", "request-a")
+                .unwrap(),
+            Some((deadline, 7)),
+        );
+        assert_eq!(
+            reopened.next_subscription_mission_retry_deadline().unwrap(),
+            Some(deadline),
         );
     }
 
