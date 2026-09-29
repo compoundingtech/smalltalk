@@ -30,6 +30,10 @@ pub enum TrimFault {
     AfterChunk(usize),
     /// Every row is deleted and the checkpoint is not yet marked trimmed.
     BeforeFinish,
+    /// The first chunk bumps the graph generation without changing the graph.
+    TouchGraph,
+    /// The first chunk changes a graph table, as a trim must never do.
+    ChangeGraph,
 }
 
 /// The newest stable checkpoint, when this node cannot trim it from its own plan. A peer that
@@ -144,6 +148,30 @@ impl Store {
     pub fn set_trim_chunk_envelopes(&self, envelopes: usize) {
         self.trim_chunk_envelopes
             .store(envelopes.max(1), Ordering::Release);
+    }
+
+    /// Apply a graph fault a test armed, inside the first chunk's transaction.
+    fn alter_graph_for_trim_fault(&self, transaction: &Transaction<'_>) -> Result<()> {
+        let mut fault = self
+            .trim_fault
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match *fault {
+            Some(TrimFault::TouchGraph) => {
+                transaction.execute("UPDATE graph_generation SET value=value+1", [])?;
+            }
+            Some(TrimFault::ChangeGraph) => {
+                transaction.execute(
+                    "INSERT INTO desired(subject, kind, revision, claim_id, body)
+                     SELECT 'custom/trim-fault/changed', 'custom', '1', id, '{}'
+                     FROM claims LIMIT 1",
+                    [],
+                )?;
+            }
+            _ => return Ok(()),
+        }
+        *fault = None;
+        Ok(())
     }
 
     fn stop_for_trim_fault(&self, at: TrimFault) -> Result<()> {
@@ -334,6 +362,41 @@ impl Store {
         Ok(actions)
     }
 
+    /// A deliberate bug for the convergence suite: adopt a manifest without checking it
+    /// against its certificate. Nothing else calls it.
+    #[doc(hidden)]
+    pub fn adopt_checkpoint_unverified_for_tests(
+        &self,
+        manifest: &CheckpointManifest,
+    ) -> Result<Vec<CheckpointAction>> {
+        let claims = self.checkpoint_claims()?;
+        let certificates = certificates(&claims, &manifest.checkpoint);
+        let certificate = chosen_certificate(&certificates)
+            .ok_or_else(|| anyhow::anyhow!("{} is not stable here", manifest.checkpoint))?;
+        let mut actions = Vec::new();
+        self.trim_checkpoint(
+            &manifest.checkpoint,
+            manifest.cut_unix_ms,
+            &certificate.terms.drop_digest,
+            &manifest.envelopes,
+            &manifest.claims,
+            true,
+            &mut actions,
+        )?;
+        Ok(actions)
+    }
+
+    /// A deliberate bug for the convergence suite: forget every tombstone, as a trim that
+    /// deleted rows without keeping tombstones would. Nothing else calls it.
+    #[doc(hidden)]
+    pub fn forget_tombstones_for_tests(&self) -> Result<()> {
+        self.connection
+            .write()
+            .execute_batch("DELETE FROM checkpoint_envelopes; DELETE FROM checkpoint_claims;")?;
+        self.replica_rows_changed();
+        Ok(())
+    }
+
     fn set_checkpoint_state(&self, checkpoint: &str, cut_unix_ms: u128, state: &str) -> Result<()> {
         let connection = self.connection.write();
         connection.execute(
@@ -506,6 +569,7 @@ impl Store {
             let generation = graph_generation(&transaction)?;
             transaction.execute_batch("SAVEPOINT trim_chunk")?;
             delete_dropped_rows_tx(&transaction, &envelopes, &claims)?;
+            self.alter_graph_for_trim_fault(&transaction)?;
             let changed = if graph_generation(&transaction)? == generation {
                 false
             } else {
@@ -513,7 +577,7 @@ impl Store {
                 transaction.execute_batch("ROLLBACK TO trim_chunk")?;
                 let before = graph_digest(&transaction)?;
                 delete_dropped_rows_tx(&transaction, &envelopes, &claims)?;
-                before != after
+                before != after || graph_digest(&transaction)? != before
             };
             transaction.execute_batch("RELEASE trim_chunk")?;
             if changed {

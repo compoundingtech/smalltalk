@@ -356,6 +356,14 @@ pub struct PendingCheckpointView {
     pub builds: BTreeMap<String, String>,
 }
 
+/// A person's word that a trim which stopped because the graph would change may be left as it
+/// is, so checkpoints go on.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct CheckpointResumeRequest {
+    pub reason: String,
+    pub actor: String,
+}
+
 /// A person's request that checkpoints stop waiting for an unreachable writer.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckpointExcuseRequest {
@@ -1031,14 +1039,23 @@ fn terms_key(terms: &SealTerms) -> String {
     hex::encode(digest.finalize())
 }
 
-/// The accepted time of a new batch or claim: the clock, but never before the cut of a
-/// checkpoint this node has sealed. A seal promises the other participants that nothing this
-/// node writes afterwards is dated before its cut. `temp.write_clock` shifts the clock for a
-/// simulation; see `Store::set_write_clock_offset`.
-pub(super) fn write_time(connection: &Connection) -> Result<u128> {
+/// The accepted time of a new batch or claim by `origin`: the clock, but never before the cut
+/// of a checkpoint this node has sealed, and never before `origin`'s newest batch. A seal
+/// promises the other participants that nothing this node writes afterwards is dated before its
+/// cut. Folds read claims in canonical order, which starts with the accepted time, so a writer
+/// whose clock stepped back would otherwise date its new claims before its older ones.
+/// `temp.write_clock` shifts the clock for a simulation; see `Store::set_write_clock_offset`.
+pub(super) fn write_time(connection: &Connection, origin: &str) -> Result<u128> {
     let floor: Option<i64> = connection
         .prepare_cached("SELECT MAX(cut_unix_ms) FROM checkpoints")?
         .query_row([], |row| row.get(0))?;
+    let newest_own: Option<String> = connection
+        .prepare_cached(
+            "SELECT accepted_at_unix_ms FROM batches WHERE origin=?1
+             ORDER BY replica_sequence DESC LIMIT 1",
+        )?
+        .query_row([origin], |row| row.get(0))
+        .optional()?;
     let offset: i64 = connection
         .prepare_cached("SELECT offset_ms FROM temp.write_clock")
         .and_then(|mut statement| statement.query_row([], |row| row.get(0)))
@@ -1048,7 +1065,10 @@ pub(super) fn write_time(connection: &Connection) -> Result<u128> {
     let floor = floor
         .and_then(|floor| u128::try_from(floor).ok())
         .unwrap_or(0);
-    Ok(now.max(floor))
+    let newest_own = newest_own
+        .and_then(|accepted| accepted.parse::<u128>().ok())
+        .unwrap_or(0);
+    Ok(now.max(floor).max(newest_own))
 }
 
 #[cfg(test)]
@@ -1531,6 +1551,88 @@ mod tests {
             .unwrap()
             .claims;
         assert!(newest.last().unwrap().accepted_at_unix_ms > cut + 5 * DAY_MS);
+    }
+
+    /// Folds read a subject's claims in canonical order, which starts with the accepted time. A
+    /// writer whose clock steps back must still date each new claim at or after its last one,
+    /// or its new state would sort before its old state and every node would show the old.
+    #[test]
+    fn a_writer_never_dates_a_claim_before_its_own_newest() {
+        let alder = Store::open_memory("alder").unwrap();
+        alder.set_write_clock_offset(2 * DAY_MS as i64).unwrap();
+        observe(&alder, 2);
+        alder.set_write_clock_offset(0).unwrap();
+        observe(&alder, 2);
+        let claims = alder
+            .claims_page(None, None, 0, None, false, 10_000)
+            .unwrap()
+            .claims;
+        assert_eq!(claims.len(), 4);
+        for pair in claims.windows(2) {
+            assert!(pair[1].accepted_at_unix_ms >= pair[0].accepted_at_unix_ms);
+        }
+        let newest = alder
+            .latest_claim(
+                &format!("daemon/{}", alder.origin),
+                Some("daemon.diagnostic"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(newest.id, claims.last().unwrap().id);
+    }
+
+    /// A trim that would change the graph stops, records why, and seals nothing more until a
+    /// person has looked. A trim that only bumps the graph generation compares the digests and
+    /// goes on.
+    #[test]
+    fn a_trim_that_would_change_the_graph_waits_for_a_person() {
+        let scratch = tempfile::tempdir().unwrap();
+        let context = context(scratch.path(), 0);
+        let [alder, birch] = ["alder", "birch"].map(|name| Store::open_memory(name).unwrap());
+        stable_pair(&alder, &birch, &context);
+        alder.set_trim_fault(Some(TrimFault::TouchGraph));
+        assert_eq!(kinds(&step(&alder, &context)), ["trimmed"]);
+
+        let (_, graph) = authority(&birch);
+        let held = claim_ids(&birch);
+        birch.set_trim_fault(Some(TrimFault::ChangeGraph));
+        assert_eq!(kinds(&step(&birch, &context)), ["graph-changed"]);
+        assert_eq!(authority(&birch).1, graph);
+        assert!(claim_ids(&birch).is_superset(&held));
+        let status = birch.checkpoint_status(context.now_unix_ms, &[]).unwrap();
+        assert!(status.halted);
+        assert_eq!(status.trimmed, None);
+        assert!(
+            birch
+                .claims_for("daemon/birch", Some("daemon.diagnostic"))
+                .unwrap()
+                .iter()
+                .any(|claim| claim.body["fields"]["code"] == "checkpoint-trim-graph-changed")
+        );
+
+        // Nothing more happens, even when the next checkpoint is due.
+        let next = CheckpointContext {
+            now_unix_ms: context.now_unix_ms + DAY_MS,
+            ..context.clone()
+        };
+        observe(&birch, 1);
+        assert!(step(&birch, &next).is_empty());
+        assert!(
+            birch
+                .resume_checkpoints("agent/birch.worker", "looked")
+                .is_err()
+        );
+        assert!(birch.resume_checkpoints("person/operator", " ").is_err());
+        birch
+            .resume_checkpoints("person/operator", "the change came from a test fault")
+            .unwrap();
+        assert!(
+            !birch
+                .checkpoint_status(next.now_unix_ms, &[])
+                .unwrap()
+                .halted
+        );
+        assert_eq!(kinds(&step(&birch, &next)), ["sealed"]);
     }
 
     fn authority(store: &Store) -> (String, String) {

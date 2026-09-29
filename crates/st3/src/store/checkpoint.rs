@@ -1470,6 +1470,22 @@ impl Store {
         })
     }
 
+    /// What the readers a checkpoint must preserve answer for each of `subjects` at
+    /// `now_unix_ms`, as canonical JSON text: the answers the proof compares. Nodes holding the
+    /// same kept claims answer identically, and so does a node that never trimmed.
+    pub fn checkpoint_reader_answers(
+        &self,
+        subjects: &BTreeSet<String>,
+        now_unix_ms: u128,
+    ) -> Result<BTreeMap<String, String>> {
+        let connection = self.readers.get();
+        let connection = connection.unchecked_transaction()?;
+        reader_answers(&connection, subjects, now_unix_ms)?
+            .into_iter()
+            .map(|(subject, answer)| Ok((subject, canonical_json_text(&answer)?)))
+            .collect()
+    }
+
     /// Copy this store to `copy` from one consistent snapshot, while the writer carries on.
     fn copy_store_to(&self, copy: &Path) -> Result<()> {
         // Readers are read-only, and `VACUUM INTO` needs a connection that may write the copy.

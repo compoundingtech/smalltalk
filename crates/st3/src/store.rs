@@ -45,7 +45,7 @@ mod checkpoint_trim;
 pub use checkpoint_agreement::{
     CHECKPOINT_ATTENTION_AFTER_MS, CHECKPOINT_EXCUSED, CHECKPOINT_PROTOCOL, CHECKPOINT_SEALED,
     CHECKPOINT_VERIFIED, Certificate, CheckpointAction, CheckpointClaim, CheckpointContext,
-    CheckpointExcuseRequest, CheckpointStatusView, PendingCheckpointView, SealTerms,
+    CheckpointExcuseRequest, CheckpointResumeRequest, CheckpointStatusView, PendingCheckpointView, SealTerms,
     VerifiedTerms, certificates, checkpoint_build, chosen_certificate, excused_writers,
     first_verifications,
     newest_seals, participants as checkpoint_participants, stable_checkpoints,
@@ -6653,7 +6653,7 @@ impl Store {
             transaction.commit().map_err(internal)?;
             return Ok(response);
         }
-        let now = write_time(&transaction).map_err(internal)?;
+        let now = write_time(&transaction, &self.origin).map_err(internal)?;
         let sequence = next_replica_sequence(&transaction, &self.origin).map_err(internal)?;
         let previous_hash = previous_batch_hash(&transaction, &self.origin).map_err(internal)?;
         let batch_hash = batch_header_hash(&self.origin, sequence, previous_hash.as_deref(), now)
@@ -9923,7 +9923,7 @@ impl Store {
                 message_subjects: Vec::new(),
             });
         }
-        let now = write_time(&transaction).map_err(internal)?;
+        let now = write_time(&transaction, &self.origin).map_err(internal)?;
         let sequence = next_replica_sequence(&transaction, &self.origin).map_err(internal)?;
         let previous_hash = previous_batch_hash(&transaction, &self.origin).map_err(internal)?;
         let batch_hash = batch_header_hash(&self.origin, sequence, previous_hash.as_deref(), now)
@@ -16228,7 +16228,7 @@ fn append_claim_tx(
         &claim_spec.cardinality,
     )
     .map_err(anyhow::Error::new)?;
-    let now = write_time(transaction)?;
+    let now = write_time(transaction, origin)?;
     let batch_id = if let Some(batch) = forced_batch {
         batch.to_owned()
     } else {
@@ -16489,12 +16489,15 @@ fn selected_actual_source_at(
     desired_host: Option<&str>,
 ) -> Result<(Option<String>, Option<String>, bool)> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
-    let mut statement = connection.prepare(
-        "SELECT id, kind, origin, predecessors,
-                CASE WHEN kind='runtime.observed' THEN body END FROM claims
-         WHERE subject=?1 AND store_index<=?2
-         ORDER BY store_index",
-    )?;
+    // Canonical order, not arrival order, so every node holding these claims selects the same
+    // source.
+    let mut statement = connection.prepare(&format!(
+        "SELECT claims.id, claims.kind, claims.origin, claims.predecessors,
+                CASE WHEN claims.kind='runtime.observed' THEN claims.body END
+         FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.store_index<=?2
+         ORDER BY {CANONICAL_ORDER}"
+    ))?;
     let rows = statement
         .query_map(params![subject, at_index], |row| {
             Ok((
@@ -23142,28 +23145,53 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
     Ok(true)
 }
 
-fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), St3Error> {
-    let mut statement = transaction
-        .prepare(
-            "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
-                    claims.origin, claims.actor, claims.body, claims.predecessors,
-                    claims.accepted_at_unix_ms
-             FROM claims JOIN batches ON batches.id=claims.batch_id
-             WHERE NOT EXISTS (
-                 SELECT 1 FROM replica_records
-                 WHERE replica_records.claim_id=claims.id
-                   AND replica_records.state='repaired'
-             )
+/// The IDs of the claims matching `filter`, in replay order. A replay reads the IDs first and
+/// then each claim by ID: a claim whose projection fails rolls back its savepoint, and SQLite
+/// aborts every read still open on the connection when that happens.
+fn replay_order_claim_ids_tx(
+    transaction: &Transaction<'_>,
+    filter: &str,
+) -> Result<Vec<String>, St3Error> {
+    transaction
+        .prepare(&format!(
+            "SELECT claims.id FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE {filter}
              ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
                       batches.origin, batches.replica_sequence,
                       COALESCE((SELECT MIN(position) FROM replica_records
-                                WHERE replica_records.claim_id=claims.id), 0), claims.id",
+                                WHERE replica_records.claim_id=claims.id), 0), claims.id"
+        ))
+        .map_err(internal)?
+        .query_map([], |row| row.get(0))
+        .map_err(internal)?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(internal)
+}
+
+fn replay_claim_tx(transaction: &Transaction<'_>, id: &str) -> Result<ClaimRecord, St3Error> {
+    transaction
+        .prepare_cached(
+            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors,
+                    accepted_at_unix_ms
+             FROM claims WHERE id=?1",
         )
-        .map_err(internal)?;
-    let claims = statement.query_map([], claim_from_row).map_err(internal)?;
+        .map_err(internal)?
+        .query_row([id], claim_from_row)
+        .map_err(internal)
+}
+
+fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), St3Error> {
+    let ids = replay_order_claim_ids_tx(
+        transaction,
+        "NOT EXISTS (
+             SELECT 1 FROM replica_records
+             WHERE replica_records.claim_id=claims.id
+               AND replica_records.state='repaired'
+         )",
+    )?;
     clear_quarantined_claims_tx(transaction, "projection:base")?;
-    for claim in claims {
-        let claim = claim.map_err(internal)?;
+    for id in ids {
+        let claim = replay_claim_tx(transaction, &id)?;
         insert_event(
             transaction,
             claim.store_index,
@@ -23463,21 +23491,8 @@ fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), 
                   'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released')",
             _ => "claims.kind='step-run.carried'",
         };
-        let mut statement = transaction
-            .prepare(&format!(
-                "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
-                        claims.origin, claims.actor, claims.body, claims.predecessors,
-                        claims.accepted_at_unix_ms
-                 FROM claims JOIN batches ON batches.id=claims.batch_id WHERE {filter}
-                 ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
-                          batches.origin, batches.replica_sequence,
-                          COALESCE((SELECT MIN(position) FROM replica_records
-                                    WHERE replica_records.claim_id=claims.id), 0), claims.id"
-            ))
-            .map_err(internal)?;
-        let claims = statement.query_map([], claim_from_row).map_err(internal)?;
-        for claim in claims {
-            let claim = claim.map_err(internal)?;
+        for id in replay_order_claim_ids_tx(transaction, filter)? {
+            let claim = replay_claim_tx(transaction, &id)?;
             project_claim_isolated_tx(transaction, "projection:runs", &claim, || match pass {
                 0 => project_mission_run_created(transaction, &claim),
                 1 => project_mission_run_update(transaction, &claim),
@@ -27689,6 +27704,82 @@ mod tests {
         let connection = store.connection.lock().unwrap();
         assert!(connection.total_changes() - before <= 2);
         assert!(operation_tx(&connection, "op/existing").unwrap().is_some());
+    }
+
+    /// A full replay projects each claim in its own savepoint and quarantines one it cannot
+    /// project. Once the transaction has changed the schema, as a checkpoint proof's does with
+    /// its temporary tables, SQLite aborts every open read when a savepoint rolls back. The
+    /// replay must not be reading then, or one malformed claim fails every proof on that node.
+    #[test]
+    fn a_replay_quarantines_claims_it_cannot_project_and_projects_the_rest() {
+        const FLEET: &str = "5e3c1a9b-2d4f-4b6e-8a7c-0f1e2d3c4b5a";
+        let source = Store::open_memory("source").unwrap();
+        for n in 0..3 {
+            source
+                .append_claim(&ClaimInput {
+                    subject: format!("mission-run/broken-{n}"),
+                    kind: "mission-run.created".into(),
+                    actor: None,
+                    fields: BTreeMap::new(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("broken-{n}")),
+                })
+                .unwrap();
+        }
+        let later = source
+            .append_claim(&ClaimInput {
+                subject: "daemon/source".into(),
+                kind: "daemon.started".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), json!("running"))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("started".into()),
+            })
+            .unwrap();
+        source.bind_fleet(FLEET).unwrap();
+        let target = Store::open_memory("target").unwrap();
+        target.bind_fleet(FLEET).unwrap();
+        let exchange = source
+            .export_replication_exchange(FLEET, &target.replication_inventory().unwrap())
+            .unwrap();
+        target
+            .receive_replication_exchange("source", FLEET, &exchange)
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        target.project_replication_backlog().unwrap();
+        let connection = target.readers.get();
+        let quarantined: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM projection_health
+                 WHERE aggregate LIKE 'projection:runs:%' AND status='stale'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(quarantined, 3);
+        let healthy: String = connection
+            .query_row(
+                "SELECT status FROM projection_health WHERE aggregate='graph'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(healthy, "healthy");
+        assert!(
+            target
+                .latest_claim("daemon/source", Some("daemon.started"))
+                .unwrap()
+                .is_some_and(|claim| claim.id == later.id)
+        );
+        drop(connection);
+        // The proof replays the same claims after creating its temporary tables.
+        let scratch = tempfile::tempdir().unwrap();
+        let (_, _, proof) = target
+            .plan_checkpoint_through(now_ms() + 1_000, None, scratch.path())
+            .unwrap();
+        assert!(proof.passed, "{proof:?}");
     }
 
     /// A panic while the writer is held leaves no half-written transaction behind, so it must not
