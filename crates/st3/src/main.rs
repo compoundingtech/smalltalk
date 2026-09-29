@@ -3033,7 +3033,7 @@ async fn run(cli: Cli) -> Result<()> {
             run_lanes(&client, config.person.as_deref(), command, cli.json).await
         }
         Command::Terminals { command } => {
-            // The configured daemon's PTY root, to name its sessions when it cannot answer.
+            // The configured daemon's PTY root, to attach its sessions when it cannot answer.
             let pty_root = matches!(&endpoint, Endpoint::Unix(socket) if *socket == config.socket)
                 .then(|| {
                     config
@@ -4631,6 +4631,10 @@ fn render_terminal_screen(screen: &ClientTerminalScreen) -> String {
     output
 }
 
+/// How long `st terminals attach` waits for its daemon to choose among a terminal's PTY sessions
+/// on this host before it attaches to the newest one without the daemon.
+const LOCAL_ATTACH_CONSULT: Duration = Duration::from_secs(1);
+
 /// Attach this terminal to one terminal member. A terminal on this host is attached through its
 /// PTY session; one that another fleet host owns goes through the client gateway, the path paired
 /// clients use, as `person`.
@@ -4650,9 +4654,28 @@ async fn attach_terminal(
             "st terminals attach: already inside PTY session `{outer}`. Detach first with Ctrl+\\, or pass --force."
         );
     }
-    // A terminal on this host is attached through its PTY session, so a daemon too busy to write
-    // cannot keep anyone from debugging.
-    let code = match client.local_terminal(subject).await {
+    // The subject's running PTY sessions under the configured daemon's PTY root, read from the
+    // registry alone. When there are any, the daemon has a moment to choose one and refuse; a
+    // daemon that cannot answer that fast must not keep anyone from debugging this host.
+    let local = pty_root
+        .map(|root| (root, st3::client::tagged_pty_sessions(root, subject)))
+        .filter(|(_, sessions)| !sessions.is_empty());
+    let lookup = client.local_terminal(subject);
+    let answer = match &local {
+        Some((root, sessions)) => match tokio::time::timeout(LOCAL_ATTACH_CONSULT, lookup).await {
+            Ok(answer) => answer,
+            Err(_) => {
+                let waited = format!(
+                    "did not answer within {} ms",
+                    LOCAL_ATTACH_CONSULT.as_millis()
+                );
+                let code = attach_unconsulted(root, subject, sessions, &waited).await?;
+                return terminal_exit(code);
+            }
+        },
+        None => lookup.await,
+    };
+    let code = match answer {
         Ok(Some(terminal)) => st3::client::attach_local_terminal(&terminal).await?,
         Ok(None) => {
             // An HTTP endpoint, or a daemon from before direct attachment: its WebSocket bridge.
@@ -4677,15 +4700,18 @@ async fn attach_terminal(
         Err(error) if st3::client::api_error_code(&error) == Some("runtime-not-local") => {
             attach_remote_terminal(endpoint, person, subject, error).await?
         }
-        Err(error) => {
-            if let Some(pty_root) = pty_root
-                && st3::client::daemon_did_not_answer(&error)
-            {
-                print_unfenced_attach(pty_root, subject);
+        Err(error) => match &local {
+            Some((root, sessions)) if st3::client::daemon_did_not_answer(&error) => {
+                let failed = format!("did not answer ({error:#})");
+                attach_unconsulted(root, subject, sessions, &failed).await?
             }
-            return Err(error);
-        }
+            _ => return Err(error),
+        },
     };
+    terminal_exit(code)
+}
+
+fn terminal_exit(code: i32) -> Result<()> {
     if code == 0 {
         Ok(())
     } else {
@@ -4711,32 +4737,31 @@ async fn attach_remote_terminal(
     st3::remote_terminal::attach(&gateway, subject, subject).await
 }
 
-/// Without its daemon, st cannot say which incarnation of `subject` it selected, so it does not
-/// attach. The PTY registry still names the subject's sessions on this host, and a person may
-/// choose one directly.
-fn print_unfenced_attach(pty_root: &Path, subject: &str) {
-    let sessions = st3::client::tagged_pty_sessions(pty_root, subject);
-    if sessions.is_empty() {
-        return;
-    }
+/// Attach to the newest of `subject`'s running PTY sessions on this host without the st daemon,
+/// as the local user who owns the PTY root. The note says st was not consulted, and names any
+/// other session a person may have meant.
+async fn attach_unconsulted(
+    pty_root: &Path,
+    subject: &str,
+    sessions: &[st3::client::TaggedPtySession],
+    daemon: &str,
+) -> Result<i32> {
+    let (newest, others) = sessions
+        .split_first()
+        .context("an attachment without st needs a PTY session")?;
     eprintln!(
-        "st terminals attach: the st daemon did not answer, so st cannot confirm which incarnation of `{subject}` it selected and did not attach. To attach to a PTY session of `{subject}` on this host without that check:"
+        "st terminals attach: the st daemon {daemon}, so st was not consulted. Attaching as the local user to PTY session `{}` of `{subject}` (started {}) under {}, without st's incarnation check.",
+        newest.runtime_id,
+        newest.created_at,
+        pty_root.display()
     );
-    let root = pty_root.display().to_string();
-    let root = if root
-        .bytes()
-        .all(|byte| byte.is_ascii_alphanumeric() || b"/._-+=:@%,".contains(&byte))
-    {
-        root
-    } else {
-        format!("'{}'", root.replace('\'', r"'\''"))
-    };
-    for session in sessions {
+    for other in others {
         eprintln!(
-            "  PTY_ROOT={root} pty attach --no-restart {}    # started {}",
-            session.runtime_id, session.created_at
+            "  also running: `{}` (started {})",
+            other.runtime_id, other.created_at
         );
     }
+    st3::client::attach_unconsulted_terminal(pty_root, subject, newest).await
 }
 
 async fn run_inspect(client: &Client, args: InspectArgs, json_output: bool) -> Result<()> {

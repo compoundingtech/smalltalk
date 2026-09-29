@@ -1,7 +1,9 @@
 #![cfg(unix)]
 //! `st terminals attach` reaches a terminal on this host through its PTY session, and a terminal
-//! behind an HTTP endpoint through the daemon's WebSocket. Each test owns an in-process daemon and
-//! a stand-in PTY session that reports which process attached to it.
+//! behind an HTTP endpoint through the daemon's WebSocket. When the configured daemon is down or
+//! does not answer within a second, it attaches to the subject's newest PTY session on this host
+//! without st. Each test owns a daemon, in process or stand-in, and a stand-in PTY session that
+//! reports which process attached to it.
 
 use std::collections::BTreeMap;
 use std::io::{Read as _, Write as _};
@@ -98,15 +100,27 @@ struct Attached {
 /// with a screen and an exit, as a `pty` daemon does, and gives up after ten seconds without a
 /// client.
 fn pty_session(root: &Path) -> std::thread::JoinHandle<Option<Attached>> {
-    let pty_root = root.join("pty");
-    std::fs::create_dir_all(&pty_root).unwrap();
+    serve_pty_session(
+        &root.join("pty"),
+        RUNTIME_ID,
+        json!({ "createdAt": CREATED_AT }),
+    )
+}
+
+/// A stand-in `pty` session `runtime_id` under `pty_root` with registry record `metadata`.
+fn serve_pty_session(
+    pty_root: &Path,
+    runtime_id: &str,
+    metadata: Value,
+) -> std::thread::JoinHandle<Option<Attached>> {
+    std::fs::create_dir_all(pty_root).unwrap();
     std::fs::write(
-        pty_root.join(format!("{RUNTIME_ID}.json")),
-        json!({ "createdAt": CREATED_AT }).to_string(),
+        pty_root.join(format!("{runtime_id}.json")),
+        metadata.to_string(),
     )
     .unwrap();
     let listener =
-        std::os::unix::net::UnixListener::bind(pty_root.join(format!("{RUNTIME_ID}.sock")))
+        std::os::unix::net::UnixListener::bind(pty_root.join(format!("{runtime_id}.sock")))
             .unwrap();
     listener.set_nonblocking(true).unwrap();
     std::thread::spawn(move || {
@@ -151,6 +165,51 @@ fn pty_session(root: &Path) -> std::thread::JoinHandle<Option<Attached>> {
     })
 }
 
+/// The configured daemon's PTY registry for `root`, as `configured_attach` sees it: `running`
+/// sessions name this test process as their PTY daemon.
+struct ConfiguredRegistry {
+    pty_root: PathBuf,
+}
+
+impl ConfiguredRegistry {
+    fn new(root: &Path) -> Self {
+        let pty_root = root.join("state/st3/pty");
+        std::fs::create_dir_all(&pty_root).unwrap();
+        Self { pty_root }
+    }
+
+    fn record(&self, runtime_id: &str, metadata: Value) {
+        std::fs::write(
+            self.pty_root.join(format!("{runtime_id}.json")),
+            metadata.to_string(),
+        )
+        .unwrap();
+    }
+
+    fn running(&self, runtime_id: &str) {
+        std::fs::write(
+            self.pty_root.join(format!("{runtime_id}.pid")),
+            std::process::id().to_string(),
+        )
+        .unwrap();
+    }
+
+    /// A running stand-in session of `SUBJECT` that this process serves.
+    fn serve(
+        &self,
+        runtime_id: &str,
+        created_at: &str,
+    ) -> std::thread::JoinHandle<Option<Attached>> {
+        let session = serve_pty_session(
+            &self.pty_root,
+            runtime_id,
+            json!({ "createdAt": created_at, "tags": { "st3.subject": SUBJECT } }),
+        );
+        self.running(runtime_id);
+        session
+    }
+}
+
 /// A `pty` on the CLI's PATH that records any run: attaching must never start a session.
 fn recording_pty(root: &Path) -> PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
@@ -192,6 +251,35 @@ async fn attach(root: &Path, endpoint: &str) -> (Output, u32) {
         .await
         .unwrap();
     (output, pid)
+}
+
+/// Run `st terminals attach` against the configured daemon for `root`: its socket is
+/// `ROOT/run/st3.sock` and its PTY root `ROOT/state/st3/pty`. Returns the output, the CLI's pid,
+/// and how long it ran.
+async fn configured_attach(root: &Path, daemon_wait: &str) -> (Output, u32, Duration) {
+    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
+    let mut command = std::process::Command::new(binary);
+    command
+        .env_remove("ST_AGENT")
+        .env_remove("ST_MISSION_RUN")
+        .env_remove("PTY_SESSION")
+        .env_remove("ST3_ENDPOINT")
+        .env_remove("ST3_DAEMON_WAIT")
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_STATE_HOME", root.join("state"))
+        .env("XDG_RUNTIME_DIR", root.join("run"))
+        .env("PATH", recording_pty(root))
+        .args(["--daemon-wait", daemon_wait, "terminals", "attach", SUBJECT])
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let started = Instant::now();
+    let child = command.spawn().unwrap();
+    let pid = child.id();
+    let output = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
+        .await
+        .unwrap();
+    (output, pid, started.elapsed())
 }
 
 async fn serve_unix(state: AppState, socket: &Path) -> tokio::task::JoinHandle<()> {
@@ -297,79 +385,99 @@ async fn a_replaced_pty_session_receives_nothing_from_a_local_attach() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_terminal_on_this_host_is_named_but_not_attached_while_its_daemon_is_down() {
+async fn a_terminal_on_this_host_attaches_without_st_while_its_daemon_is_down() {
     let root = tempfile::tempdir().unwrap();
-    // The configured daemon's PTY root; its socket under XDG_RUNTIME_DIR never listens.
-    let pty_root = root.path().join("state/st3/pty");
-    std::fs::create_dir_all(&pty_root).unwrap();
-    let record = |runtime_id: &str, metadata: Value| {
-        std::fs::write(
-            pty_root.join(format!("{runtime_id}.json")),
-            metadata.to_string(),
-        )
-        .unwrap();
-    };
-    // This test process stands in for a live session's PTY daemon.
-    let running = |runtime_id: &str| {
-        std::fs::write(
-            pty_root.join(format!("{runtime_id}.pid")),
-            std::process::id().to_string(),
-        )
-        .unwrap();
-    };
-    record(
-        RUNTIME_ID,
-        json!({ "createdAt": CREATED_AT, "tags": { "st3.subject": SUBJECT } }),
+    // The configured daemon's socket under XDG_RUNTIME_DIR never listens.
+    let registry = ConfiguredRegistry::new(root.path());
+    let session = registry.serve(RUNTIME_ID, CREATED_AT);
+    // An earlier session of the subject that still runs; the newest is attached.
+    registry.record(
+        "example-worker-earlier",
+        json!({ "createdAt": "2026-09-29T07:00:00.000Z", "tags": { "st3.subject": SUBJECT } }),
     );
-    running(RUNTIME_ID);
-    record(
+    registry.running("example-worker-earlier");
+    registry.record(
         "example-other",
         json!({ "createdAt": CREATED_AT, "tags": { "st3.subject": "agent/example/other" } }),
     );
-    running("example-other");
-    // An earlier session of the subject whose daemon wrote its exit record and left.
-    record(
+    registry.running("example-other");
+    // A later session of the subject whose daemon wrote its exit record and left.
+    registry.record(
         "example-worker-exited",
         json!({
-            "createdAt": "2026-09-29T07:00:00.000Z",
-            "exitedAt": "2026-09-29T07:59:00.000Z",
+            "createdAt": "2026-09-29T09:00:00.000Z",
+            "exitedAt": "2026-09-29T09:30:00.000Z",
             "exitCode": 0,
             "tags": { "st3.subject": SUBJECT },
         }),
     );
 
-    let binary = assert_cmd::cargo::cargo_bin!("st3").to_path_buf();
-    let output = std::process::Command::new(binary)
-        .env_remove("ST_AGENT")
-        .env_remove("ST_MISSION_RUN")
-        .env_remove("PTY_SESSION")
-        .env_remove("ST3_ENDPOINT")
-        .env_remove("ST3_DAEMON_WAIT")
-        .env("XDG_CONFIG_HOME", root.path().join("config"))
-        .env("XDG_STATE_HOME", root.path().join("state"))
-        .env("XDG_RUNTIME_DIR", root.path().join("run"))
-        .env("PATH", recording_pty(root.path()))
-        .args(["--daemon-wait", "0", "terminals", "attach", SUBJECT])
-        .stdin(Stdio::null())
-        .output()
-        .unwrap();
+    let (output, cli, _) = configured_attach(root.path(), "0").await;
 
+    assert_attached(&output);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert_eq!(output.status.code(), Some(5), "{stderr}");
     assert!(
-        stderr.contains(&format!(
-            "PTY_ROOT={} pty attach --no-restart {RUNTIME_ID}",
-            pty_root.display()
-        )),
-        "the session to attach to directly was not named: {stderr}"
+        stderr.contains("st was not consulted") && stderr.contains(&format!("`{RUNTIME_ID}`")),
+        "the attachment must say st was not consulted: {stderr}"
+    );
+    assert!(
+        stderr.contains("also running: `example-worker-earlier`"),
+        "the subject's other running session is named: {stderr}"
     );
     assert!(
         !stderr.contains("example-other") && !stderr.contains("example-worker-exited"),
         "only the subject's running sessions are named: {stderr}"
     );
+    let attached = session.join().unwrap().expect("the CLI attached");
+    assert_eq!(attached.pid, Some(cli as i32));
     assert!(
         !root.path().join("pty-runs").exists(),
-        "without its daemon st must not attach or start anything"
+        "attaching ran `pty`, which can start the session again"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_terminal_on_this_host_attaches_while_its_daemon_never_answers() {
+    let root = tempfile::tempdir().unwrap();
+    // The configured daemon takes every connection and never answers, as a daemon stuck behind
+    // a saturated disk does.
+    let run = root.path().join("run");
+    std::fs::create_dir_all(&run).unwrap();
+    let daemon = std::os::unix::net::UnixListener::bind(run.join("st3.sock")).unwrap();
+    daemon.set_nonblocking(true).unwrap();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stopped = stop.clone();
+    let silent = std::thread::spawn(move || {
+        let mut held = Vec::new();
+        while !stopped.load(std::sync::atomic::Ordering::Relaxed) {
+            match daemon.accept() {
+                Ok((stream, _)) => held.push(stream),
+                Err(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        held.len()
+    });
+    let registry = ConfiguredRegistry::new(root.path());
+    let session = registry.serve(RUNTIME_ID, CREATED_AT);
+
+    let (output, cli, elapsed) = configured_attach(root.path(), "30").await;
+
+    assert_attached(&output);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("did not answer within 1000 ms") && stderr.contains("st was not consulted"),
+        "{stderr}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(10),
+        "the attach waited {elapsed:?} for a daemon that never answers"
+    );
+    let attached = session.join().unwrap().expect("the CLI attached");
+    assert_eq!(attached.pid, Some(cli as i32));
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        silent.join().unwrap() > 0,
+        "st must still ask its daemon first"
     );
 }
 

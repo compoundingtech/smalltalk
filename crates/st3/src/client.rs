@@ -494,38 +494,8 @@ async fn attach_local_terminal_with_io(terminal: &LocalTerminal, io: ClientIo) -
 /// incarnation's PTY daemon, and the registry must record the incarnation's start time. A socket
 /// path proves nothing alone, since a replacement session binds the same path.
 async fn open_local_terminal(terminal: &LocalTerminal) -> Result<StdUnixStream> {
-    let socket = terminal
-        .pty_root
-        .join(format!("{}.sock", terminal.runtime_id));
-    let stream = tokio::time::timeout(
-        LOCAL_TERMINAL_CONNECT,
-        tokio::net::UnixStream::connect(&socket),
-    )
-    .await
-    .map_err(|_| {
-        anyhow::anyhow!(
-            "terminal `{}` did not accept a connection at {} within {} ms",
-            terminal.subject,
-            socket.display(),
-            LOCAL_TERMINAL_CONNECT.as_millis()
-        )
-    })?
-    .with_context(|| {
-        format!(
-            "connect to terminal `{}` at {}",
-            terminal.subject,
-            socket.display()
-        )
-    })?
-    .into_std()?;
-    stream.set_nonblocking(false)?;
-    let peer = pty_core::unix_peer::credentials(&stream).with_context(|| {
-        format!(
-            "identify the process serving terminal `{}` at {}",
-            terminal.subject,
-            socket.display()
-        )
-    })?;
+    let (stream, peer) =
+        connect_pty_session(&terminal.pty_root, &terminal.runtime_id, &terminal.subject).await?;
     let created_at = pty_core::registry::read_metadata_in(&terminal.pty_root, &terminal.runtime_id)
         .map(|metadata| metadata.created_at)
         .with_context(|| {
@@ -535,7 +505,7 @@ async fn open_local_terminal(terminal: &LocalTerminal) -> Result<StdUnixStream> 
                 terminal.pty_root.display()
             )
         })?;
-    let incarnation = format!("{}:{created_at}", peer.pid);
+    let incarnation = format!("{peer}:{created_at}");
     anyhow::ensure!(
         incarnation == terminal.incarnation_id,
         "terminal `{}` changed incarnation: st selected `{}`, but its PTY is `{incarnation}`",
@@ -545,29 +515,96 @@ async fn open_local_terminal(terminal: &LocalTerminal) -> Result<StdUnixStream> 
     Ok(stream)
 }
 
+/// Connect to PTY session `runtime_id` under `pty_root`, returning the stream and the pid the
+/// kernel reports for the process serving it. Nothing is sent.
+async fn connect_pty_session(
+    pty_root: &Path,
+    runtime_id: &str,
+    subject: &str,
+) -> Result<(StdUnixStream, i32)> {
+    let socket = pty_root.join(format!("{runtime_id}.sock"));
+    let stream = tokio::time::timeout(
+        LOCAL_TERMINAL_CONNECT,
+        tokio::net::UnixStream::connect(&socket),
+    )
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "terminal `{subject}` did not accept a connection at {} within {} ms",
+            socket.display(),
+            LOCAL_TERMINAL_CONNECT.as_millis()
+        )
+    })?
+    .with_context(|| format!("connect to terminal `{subject}` at {}", socket.display()))?
+    .into_std()?;
+    stream.set_nonblocking(false)?;
+    let peer = pty_core::unix_peer::credentials(&stream).with_context(|| {
+        format!(
+            "identify the process serving terminal `{subject}` at {}",
+            socket.display()
+        )
+    })?;
+    Ok((stream, peer.pid))
+}
+
+/// Attach this terminal straight to a PTY session that only the PTY registry named, for when the
+/// st daemon cannot say which incarnation it selected. The kernel must still name the session's
+/// live PTY daemon, as the registry records it, as the process serving the socket, so a session
+/// replaced after the registry was read receives nothing. It never starts or restarts anything.
+pub async fn attach_unconsulted_terminal(
+    pty_root: &Path,
+    subject: &str,
+    session: &TaggedPtySession,
+) -> Result<i32> {
+    attach_unconsulted_terminal_with_io(pty_root, subject, session, ClientIo::default()).await
+}
+
+async fn attach_unconsulted_terminal_with_io(
+    pty_root: &Path,
+    subject: &str,
+    session: &TaggedPtySession,
+    io: ClientIo,
+) -> Result<i32> {
+    let (stream, peer) = connect_pty_session(pty_root, &session.runtime_id, subject).await?;
+    anyhow::ensure!(
+        peer == session.pid,
+        "PTY session `{}` of `{subject}` changed: its registry names PTY daemon {}, but process {peer} serves it",
+        session.runtime_id,
+        session.pid
+    );
+    proxy_stream_with_io(&session.runtime_id, stream, None, io).await
+}
+
 /// A running PTY session under a PTY root that is tagged as one st subject's terminal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TaggedPtySession {
     pub runtime_id: String,
     pub created_at: String,
+    /// The session's live PTY daemon, as the registry records it.
+    pub pid: i32,
 }
 
-/// The running PTY sessions under `pty_root` tagged as `subject`'s, read from the PTY registry
-/// alone. Only the daemon knows which incarnation it selected, so this names sessions for a
-/// person to choose from when the daemon cannot answer; it never attaches.
+/// The running PTY sessions under `pty_root` tagged as `subject`'s, newest first, read from the
+/// PTY registry alone. Only the daemon knows which incarnation it selected; without it, the
+/// newest session is the best guess.
 pub fn tagged_pty_sessions(pty_root: &Path, subject: &str) -> Vec<TaggedPtySession> {
-    pty_core::registry::list_sessions_in(pty_root, &pty_core::registry::ListOptions::default())
-        .into_iter()
-        .filter(pty_core::registry::SessionInfo::is_running)
-        .filter_map(|session| {
-            let metadata = session.metadata?;
-            let tagged = metadata.tags.as_ref()?.get("st3.subject")? == subject;
-            tagged.then_some(TaggedPtySession {
-                runtime_id: session.name,
-                created_at: metadata.created_at,
+    let mut sessions: Vec<_> =
+        pty_core::registry::list_sessions_in(pty_root, &pty_core::registry::ListOptions::default())
+            .into_iter()
+            .filter(pty_core::registry::SessionInfo::is_running)
+            .filter_map(|session| {
+                let pid = session.pid?;
+                let metadata = session.metadata?;
+                let tagged = metadata.tags.as_ref()?.get("st3.subject")? == subject;
+                tagged.then_some(TaggedPtySession {
+                    runtime_id: session.name,
+                    created_at: metadata.created_at,
+                    pid,
+                })
             })
-        })
-        .collect()
+            .collect();
+    sessions.sort_by(|left, right| right.created_at.cmp(&left.created_at));
+    sessions
 }
 
 /// Whether an API call failed because the requested subject does not exist on this host.
@@ -1951,6 +1988,52 @@ mod tests {
         assert!(
             session.join().unwrap().is_empty(),
             "a fenced-out session must receive nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_attach_without_st_reaches_the_pty_session_its_registry_names() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("pty");
+        let session = pty_session(&root, "worker", "2026-09-29T08:00:00.000Z");
+        let tagged = TaggedPtySession {
+            runtime_id: "worker".into(),
+            created_at: "2026-09-29T08:00:00.000Z".into(),
+            // The stand-in session is served by this process.
+            pid: std::process::id() as i32,
+        };
+        let (io, _input, _output) = silent_io();
+
+        let exit = attach_unconsulted_terminal_with_io(&root, "agent/worker", &tagged, io)
+            .await
+            .unwrap();
+
+        assert_eq!(exit, 0);
+        assert!(!session.join().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_attach_without_st_sends_nothing_to_a_socket_another_process_serves() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("pty");
+        let session = pty_session(&root, "worker", "2026-09-29T08:00:00.000Z");
+        // The registry named another PTY daemon; a replacement now serves the same path.
+        let tagged = TaggedPtySession {
+            runtime_id: "worker".into(),
+            created_at: "2026-09-29T08:00:00.000Z".into(),
+            pid: std::process::id() as i32 + 1,
+        };
+        let (io, _input, _output) = silent_io();
+
+        let error = attach_unconsulted_terminal_with_io(&root, "agent/worker", &tagged, io)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("changed"), "{error}");
+        assert!(
+            session.join().unwrap().is_empty(),
+            "a session the registry did not name must receive nothing"
         );
     }
 

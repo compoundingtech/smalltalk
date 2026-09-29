@@ -388,9 +388,10 @@ host, `st terminals attach` reads the PTY session from the local daemon
 itself. Before it sends a byte, the socket's kernel-reported peer and the PTY record must match the
 runtime incarnation. Through an HTTP endpoint, or with a daemon that lacks that route, it uses the
 daemon's WebSocket bridge with a single-use capability. The Fabric-loopback gateway refuses the
-local-terminal route, as it refuses every route outside `/v1/client/`. When the local daemon does
-not answer, the CLI does not attach: it lists the subject's running PTY sessions from the registry
-so a person can run `pty attach --no-restart` on one. `st terminals attach` to a terminal on another
+local-terminal route, as it refuses every route outside `/v1/client/`. When the local daemon does not
+answer within a second, the CLI attaches to the newest of the subject's running PTY sessions in the
+registry without it, as the local user. It prints that st was not consulted, and the kernel-reported
+peer must still be the PTY daemon the registry records. `st terminals attach` to a terminal on another
 fleet host uses this protocol as the configured person: it paints each screen into the local
 terminal and sends keystrokes and size changes as `terminal.input` (raw mode) and `terminal.resize`
 actions.
