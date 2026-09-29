@@ -31,18 +31,6 @@ const HARNESS_OPTIONAL_FIELDS: [&str; 7] = [
     "exit",
 ];
 
-/// The kinds `step_execution_timing_at` folds for a step.
-const TIMING_KINDS: [&str; 8] = [
-    "step-run.state",
-    "step-run.carried",
-    "work.claimed",
-    "work.renewed",
-    "work.progress",
-    "work.submitted",
-    "work.failed",
-    "work.released",
-];
-
 /// The claims that close a subscription's mission request, as `pending_subscription_mission_requests`
 /// reads them.
 const REQUEST_CLOSERS: [&str; 3] = [
@@ -53,9 +41,8 @@ const REQUEST_CLOSERS: [&str; 3] = [
 
 /// A canonical description of every rule. The rules digest hashes it with `RULES_VERSION`.
 const RULES_DESCRIPTION: &str = "\
-harness.observed slot=subject,incarnation_id keep=first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,first-working-after,newest-carrier-of-each-optional-field
+harness.observed slot=subject,incarnation_id keep=first,first-ready,first-ready-not-provider-auth,newest,newest-not-working,every-working-after,newest-carrier-of-each-optional-field
 harness.timeline slot=subject,incarnation_id keep=newest min-age-before-cut=5d
-work.renewed slot=subject,attempt keep=newest,timing-chain
 loop.state slot=subject keep=first-and-last-of-each-run-of-status-and-round,first-with-items
 subscription.mission-deferred slot=subject,request keep=all-while-open,newest
 observer.observed slot=subject keep=newest,newest-carrier-of-each-field
@@ -229,7 +216,6 @@ enum Rule {
     HarnessObserved,
     LoopState,
     Deferral,
-    Renewal,
 }
 
 fn fields(claim: &ClaimRecord) -> Option<&serde_json::Map<String, Value>> {
@@ -265,7 +251,6 @@ fn slot_of(claim: &ClaimRecord) -> Option<(Rule, Vec<String>)> {
         "harness.observed" => field_str(claim, "incarnation_id")
             .map(|_| (Rule::HarnessObserved, slot(&["incarnation_id"]))),
         "harness.timeline" => Some((Rule::NewestAged, slot(&["incarnation_id"]))),
-        "work.renewed" => Some((Rule::Renewal, slot(&["attempt"]))),
         "loop.state" => Some((Rule::LoopState, slot(&[]))),
         "subscription.mission-deferred" => Some((Rule::Deferral, slot(&["request"]))),
         "observer.observed" => Some((Rule::Newest, slot(&[]))),
@@ -344,7 +329,10 @@ fn harness_keep(claims: &[&ClaimRecord]) -> BTreeSet<usize> {
     {
         keep.insert(position);
     }
-    // `agent_working_since`: the last other state, and the first `working` after it.
+    // `agent_working_since`: the first `working` after the last other state. A late
+    // observation of another state can land anywhere after the last one kept here, and the
+    // answer is then the first `working` after it, so every `working` after the last other
+    // state stays. Earlier ones can never be the answer again.
     let last_other = claims
         .iter()
         .rposition(|claim| state(claim).is_some_and(|state| state != "working"));
@@ -352,11 +340,10 @@ fn harness_keep(claims: &[&ClaimRecord]) -> BTreeSet<usize> {
         keep.insert(position);
     }
     let after = last_other.map_or(0, |position| position + 1);
-    if let Some(offset) = claims[after..]
-        .iter()
-        .position(|claim| state(claim).as_deref() == Some("working"))
-    {
-        keep.insert(after + offset);
+    for (offset, claim) in claims[after..].iter().enumerate() {
+        if state(claim).as_deref() == Some("working") {
+            keep.insert(after + offset);
+        }
     }
     // `current_harness_at` takes each optional field from the newest observation carrying it.
     for name in HARNESS_OPTIONAL_FIELDS {
@@ -410,132 +397,6 @@ fn timing_answers(events: &[TimingEvent], attempt: u32, cut: u128) -> Vec<(Optio
                 .map(move |active| fold_step_timing(events, attempt, snapshot, active))
         })
         .collect()
-}
-
-/// Renewals of one attempt that `fold_step_timing` does not need. A renewal can go when, before
-/// any event arrives after the lease expiry that stood before it, a later renewal or progress
-/// report of the same attempt sets a new expiry. The newest renewal always stays. The fold is
-/// replayed with and without the drops, and nothing is dropped if any answer differs.
-fn renewal_drops(
-    claims: &[SealedClaim],
-    events: &[usize],
-    attempt: u32,
-    cut: u128,
-) -> BTreeSet<usize> {
-    let attempt_matches = |claim: &ClaimRecord| {
-        !claim.kind.starts_with("work.")
-            || fields(claim)
-                .and_then(|fields| fields.get("attempt"))
-                .and_then(Value::as_u64)
-                == Some(u64::from(attempt))
-    };
-    let events = events
-        .iter()
-        .copied()
-        .filter(|index| attempt_matches(&claims[*index].claim))
-        .collect::<Vec<_>>();
-    let newest_renewal = events
-        .iter()
-        .rev()
-        .copied()
-        .find(|index| claims[*index].claim.kind == "work.renewed");
-    let expiry_of = |claim: &ClaimRecord| {
-        fields(claim)
-            .and_then(|fields| fields.get("claim_expires_at_unix_ms"))
-            .and_then(Value::as_u64)
-            .map(u128::from)
-    };
-    let active =
-        |claim: &ClaimRecord| matches!(field_str(claim, "status"), Some("claimed" | "working"));
-    let mut drops = BTreeSet::new();
-    let mut started = false;
-    let mut lease: Option<u128> = None;
-    for (position, index) in events.iter().copied().enumerate() {
-        let claim = &claims[index].claim;
-        let accepted = claim.accepted_at_unix_ms;
-        if started && lease.is_some_and(|expiry| accepted > expiry) {
-            started = false;
-            lease = None;
-        }
-        match claim.kind.as_str() {
-            "step-run.state" if active(claim) => started = true,
-            "step-run.state" => {
-                started = false;
-                lease = None;
-            }
-            "work.claimed" => {
-                started = true;
-                lease = expiry_of(claim);
-            }
-            "step-run.carried"
-                if active(claim)
-                    && fields(claim)
-                        .and_then(|fields| fields.get("claimant"))
-                        .is_some_and(|claimant| !claimant.is_null()) =>
-            {
-                started = true;
-                lease = expiry_of(claim);
-            }
-            "work.submitted" | "work.failed" | "work.released" => {
-                started = false;
-                lease = None;
-            }
-            "work.renewed" | "work.progress" if started => {
-                // A renewal that shortens the lease stays: a late event between it and the next
-                // renewal could otherwise close the interval on one side only.
-                let bridged = claim.kind == "work.renewed"
-                    && Some(index) != newest_renewal
-                    && lease
-                        .is_some_and(|expiry| expiry_of(claim).is_some_and(|own| own >= expiry))
-                    && lease.is_some_and(|expiry| {
-                        events[position + 1..]
-                            .iter()
-                            .map(|next| &claims[*next].claim)
-                            .take_while(|next| next.accepted_at_unix_ms <= expiry)
-                            .find(|next| !(next.kind == "step-run.state" && active(next)))
-                            .is_some_and(|next| {
-                                matches!(next.kind.as_str(), "work.renewed" | "work.progress")
-                            })
-                    });
-                if bridged {
-                    drops.insert(index);
-                } else {
-                    lease = expiry_of(claim);
-                }
-            }
-            _ => {}
-        }
-    }
-    let mut dropped = vec![false; claims.len()];
-    for index in &drops {
-        dropped[*index] = true;
-    }
-    if timing_unchanged(claims, &events, attempt, cut, &dropped) {
-        drops
-    } else {
-        BTreeSet::new()
-    }
-}
-
-/// `fold_step_timing` answers the same for `attempt` with and without the dropped claims, at the
-/// cut and at the end of time. The answer at the end of time includes the final lease expiry.
-fn timing_unchanged(
-    claims: &[SealedClaim],
-    events: &[usize],
-    attempt: u32,
-    cut: u128,
-    dropped: &[bool],
-) -> bool {
-    let full = events
-        .iter()
-        .map(|index| timing_event(&claims[*index].claim))
-        .collect::<Vec<_>>();
-    let kept = events
-        .iter()
-        .filter(|index| !dropped[**index])
-        .map(|index| timing_event(&claims[*index].claim))
-        .collect::<Vec<_>>();
-    timing_answers(&full, attempt, cut) == timing_answers(&kept, attempt, cut)
 }
 
 /// Decide what a checkpoint drops from `sealed`. See the module documentation and invariants
@@ -593,8 +454,6 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
                     (0..members.len()).collect()
                 }
             }
-            // Renewals are decided with the step's timing below.
-            Rule::Renewal => (0..members.len()).collect(),
         };
         let mut keep = keep;
         if *rule != Rule::LoopState {
@@ -606,42 +465,6 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
                     < cut.saturating_sub(LOCAL_KIND_MIN_AGE_MS);
             if !keep.contains(&position) && old_enough {
                 dropped[*index] = true;
-            }
-        }
-    }
-
-    // Renewals, attempt by attempt, against the step's timing fold.
-    let mut timing: BTreeMap<&str, Vec<usize>> = BTreeMap::new();
-    for index in first.iter().copied() {
-        let sealed_claim = &claims[index];
-        if TIMING_KINDS.contains(&sealed_claim.claim.kind.as_str()) {
-            timing
-                .entry(sealed_claim.claim.subject.as_str())
-                .or_default()
-                .push(index);
-        }
-    }
-    let mut timed_attempts = Vec::new();
-    for events in timing.values() {
-        let attempts = events
-            .iter()
-            .filter(|index| claims[**index].claim.kind == "work.renewed")
-            .filter_map(|index| {
-                fields(&claims[*index].claim)
-                    .and_then(|fields| fields.get("attempt"))
-                    .and_then(Value::as_u64)
-            })
-            .collect::<BTreeSet<_>>();
-        for attempt in attempts {
-            let Ok(attempt) = u32::try_from(attempt) else {
-                continue;
-            };
-            let drops = renewal_drops(claims, events, attempt, cut);
-            if !drops.is_empty() {
-                timed_attempts.push((events.as_slice(), attempt));
-            }
-            for index in drops {
-                dropped[index] = true;
             }
         }
     }
@@ -749,18 +572,6 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
                     dropped[*index] = false;
                 }
                 changed = true;
-            }
-        }
-        // Keeping a renewal back can change which renewals bridge which expiry, so each
-        // attempt's timing is checked again against what is now dropped.
-        for (events, attempt) in &timed_attempts {
-            if !timing_unchanged(claims, events, *attempt, cut, &dropped) {
-                for index in events.iter() {
-                    if claims[*index].claim.kind == "work.renewed" && dropped[*index] {
-                        dropped[*index] = false;
-                        changed = true;
-                    }
-                }
             }
         }
         if !changed {
@@ -964,6 +775,52 @@ fn replay_from_nothing(transaction: &Transaction<'_>) -> Result<()> {
     project_replicated_base_claims(transaction)?;
     project_replicated_mission_runs(transaction)?;
     rebuild_planning_tx(transaction)?;
+    Ok(())
+}
+
+/// Record the tombstones of a checkpoint's drop. Recording them again changes nothing.
+pub(crate) fn record_checkpoint_tombstones_tx(
+    transaction: &Transaction<'_>,
+    checkpoint: &str,
+    envelopes: &[EnvelopeTombstone],
+    claims: &[ClaimTombstone],
+) -> Result<()> {
+    let mut insert_envelope = transaction.prepare_cached(
+        "INSERT OR IGNORE INTO checkpoint_envelopes(
+             writer, sequence, envelope_hash, accepted_at_unix_ms, checkpoint)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+    )?;
+    for envelope in envelopes {
+        insert_envelope.execute(params![
+            envelope.writer,
+            envelope.sequence,
+            envelope.envelope_hash,
+            i64::try_from(envelope.accepted_at_unix_ms)?,
+            checkpoint
+        ])?;
+    }
+    let mut insert_claim = transaction.prepare_cached(
+        "INSERT OR IGNORE INTO checkpoint_claims(
+             id, writer, sequence, envelope_hash, subject, kind, actor, predecessors,
+             operation_id, request_digest, accepted_at_unix_ms, checkpoint)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+    )?;
+    for claim in claims {
+        insert_claim.execute(params![
+            claim.id,
+            claim.writer,
+            claim.sequence,
+            claim.envelope_hash,
+            claim.subject,
+            claim.kind,
+            claim.actor,
+            serde_json::to_string(&claim.predecessors)?,
+            claim.operation_id,
+            claim.request_digest,
+            i64::try_from(claim.accepted_at_unix_ms)?,
+            checkpoint
+        ])?;
+    }
     Ok(())
 }
 
@@ -1212,7 +1069,8 @@ fn answers_digest(answers: &BTreeMap<String, Value>) -> Result<String> {
     digest.update(b"st3-checkpoint-readers-v1\0");
     for (subject, value) in answers {
         digest_field(&mut digest, Some(subject));
-        digest_field(&mut digest, Some(&serde_json::to_string(value)?));
+        // Canonical text, so equal answers digest alike whatever order their keys were built in.
+        digest_field(&mut digest, Some(&canonical_json_text(value)?));
     }
     Ok(hex::encode(digest.finalize()))
 }
@@ -1308,6 +1166,13 @@ pub fn prove_on_copy(copy: &Path, sealed: &SealedSet, plan: &DropPlan) -> Result
     replay_from_nothing(&transaction)?;
     let graph_digest_before = graph_digest(&transaction)?;
     let before = reader_answers(&transaction, &subjects, sealed.cut_unix_ms)?;
+    // As a trim does: tombstones first, which readers that walk ancestry pass through.
+    record_checkpoint_tombstones_tx(
+        &transaction,
+        &checkpoint_name(sealed.cut_unix_ms),
+        &plan.envelopes,
+        &plan.claims,
+    )?;
     delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims)?;
     replay_from_nothing(&transaction)?;
     let graph_digest_after = graph_digest(&transaction)?;
@@ -1766,9 +1631,87 @@ mod tests {
         );
         let plan = plan_drops(&sealed.build());
         // Kept: the first, the first ready, the first ready without a login prompt, the last
-        // idle and the first working after it, and the newest.
-        assert_eq!(dropped(&plan), ids([&claims[3], &claims[6]]));
+        // idle, every working after it, and the newest.
+        assert_eq!(dropped(&plan), ids([&claims[3]]));
         assert!(!dropped(&plan).contains(&legacy));
+    }
+
+    /// `agent_working_since` over one incarnation's states in canonical order: the first
+    /// `working` after the last other state.
+    fn working_since(states: &[(Option<String>, u128)]) -> Option<u128> {
+        let after = states
+            .iter()
+            .rposition(|(state, _)| state.as_deref().is_some_and(|state| state != "working"))
+            .map_or(0, |position| position + 1);
+        states[after..]
+            .iter()
+            .find(|(state, _)| state.as_deref() == Some("working"))
+            .map(|(_, at)| *at)
+    }
+
+    fn harness_state() -> impl Strategy<Value = Option<&'static str>> {
+        prop_oneof![
+            4 => Just(Some("working")),
+            2 => Just(Some("idle")),
+            1 => Just(Some("ready")),
+            1 => Just(Some("blocked")),
+            1 => Just(None),
+        ]
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// A late observation from a writer outside the sealed set can land anywhere in an
+        /// incarnation's history. The answers read from the kept observations stay the same as
+        /// those read from all of them.
+        #[test]
+        fn late_harness_observations_never_change_what_readers_answer(
+            states in proptest::collection::vec(harness_state(), 1..30),
+            late in harness_state(),
+            late_at in 0u128..40,
+        ) {
+            let mut sealed = Sealed::default();
+            for (offset, state) in states.iter().enumerate() {
+                let mut body = json!({"incarnation_id": "inc-1"});
+                if let Some(state) = state {
+                    body["state"] = json!(state);
+                }
+                sealed.add("alder", T + offset as u128, draft("harness.observed", AGENT, body));
+            }
+            let set = sealed.build();
+            let gone = dropped(&plan_drops(&set));
+            let observed = |claim: &ClaimRecord| {
+                (field_str(claim, "state").map(str::to_owned), claim.accepted_at_unix_ms)
+            };
+            let harness = set
+                .claims
+                .iter()
+                .filter(|claim| claim.claim.kind == "harness.observed")
+                .collect::<Vec<_>>();
+            let full = harness.iter().map(|claim| observed(&claim.claim)).collect::<Vec<_>>();
+            let kept = harness
+                .iter()
+                .filter(|claim| !gone.contains(&claim.claim.id))
+                .map(|claim| observed(&claim.claim))
+                .collect::<Vec<_>>();
+            let ever_ready = |states: &[(Option<String>, u128)]| {
+                states.iter().any(|(state, _)| {
+                    matches!(state.as_deref(), Some("ready" | "working" | "idle"))
+                })
+            };
+            prop_assert_eq!(working_since(&full), working_since(&kept));
+            prop_assert_eq!(ever_ready(&full), ever_ready(&kept));
+            let late = (late.map(str::to_owned), T + late_at);
+            let with_late = |states: &[(Option<String>, u128)]| {
+                let mut states = states.to_vec();
+                let position = states.partition_point(|state| state.1 <= late.1);
+                states.insert(position, late.clone());
+                states
+            };
+            prop_assert_eq!(working_since(&with_late(&full)), working_since(&with_late(&kept)));
+            prop_assert_eq!(ever_ready(&with_late(&full)), ever_ready(&with_late(&kept)));
+        }
     }
 
     #[test]
@@ -1862,21 +1805,47 @@ mod tests {
             .collect()
     }
 
+    /// No renewal goes. The timing fold closes an interval when the next event arrives after the
+    /// expiry that stands, so a late lease event from a writer outside the sealed set, landing
+    /// before a renewal, would make that renewal decide the answer. This is the case proptest
+    /// found for a rule that dropped renewals the next renewal made redundant.
     #[test]
-    fn a_renewal_goes_when_the_next_renewal_arrives_before_the_lease_it_replaced() {
+    fn renewals_stay_because_a_late_lease_can_need_any_of_them() {
         let mut sealed = Sealed::default();
-        let claims = step_events(
+        step_events(
             &mut sealed,
             &[
-                ("work.claimed", 100, Some(T + 1_000)),
-                ("work.renewed", 200, Some(T + 1_100)),
-                ("work.renewed", 300, Some(T + 1_200)),
-                ("work.renewed", 400, Some(T + 1_300)),
-                ("work.submitted", 500, None),
+                ("work.claimed", 0, Some(T + 30)),
+                ("work.renewed", 4, Some(T + 30)),
+                ("work.renewed", 18, Some(T + 19)),
             ],
         );
-        let plan = plan_drops(&sealed.build());
-        assert_eq!(dropped(&plan), ids([&claims[1], &claims[2]]));
+        let set = sealed.build();
+        assert!(dropped(&plan_drops(&set)).is_empty());
+        let events = set
+            .claims
+            .iter()
+            .map(|claim| timing_event(&claim.claim))
+            .collect::<Vec<_>>();
+        let late = (
+            "work.progress".to_owned(),
+            json!({"fields": work("work.progress", 1, Some(T + 4))}),
+            T,
+        );
+        let with_late = |events: &[TimingEvent]| {
+            let mut events = events.to_vec();
+            events.insert(1, late.clone());
+            events
+        };
+        let without_first_renewal = [events[0].clone(), events[2].clone()];
+        assert_eq!(
+            fold_step_timing(&with_late(&events), 1, u128::MAX, false),
+            (None, 19)
+        );
+        assert_eq!(
+            fold_step_timing(&with_late(&without_first_renewal), 1, u128::MAX, false),
+            (None, 4)
+        );
     }
 
     #[test]
@@ -2381,6 +2350,8 @@ mod tests {
         let cut = now_ms() + 1_000;
         let (plan, proof) = store.plan_checkpoint(cut, scratch.path()).unwrap();
         assert!(proof.passed, "{proof:?}");
+        assert_eq!(proof.graph_digest_before, proof.graph_digest);
+        assert_eq!(proof.reader_digest_before, proof.reader_digest);
         assert!(
             plan.claims
                 .iter()
@@ -2451,9 +2422,104 @@ mod tests {
             .map(|store| store.plan_checkpoint(cut, scratch.path()).unwrap().1);
         for proof in &proofs {
             assert!(proof.passed, "{proof:?}");
+            assert_eq!(proof.reader_digest_before, proof.reader_digest);
             assert_eq!(proof.graph_digest, proofs[0].graph_digest);
             assert_eq!(proof.reader_digest, proofs[0].reader_digest);
         }
+    }
+
+    /// Nearly every claim cites the claim before it on its subject. A walk from a runtime's
+    /// newest observation back to another writer's older one must pass through a dropped claim
+    /// by its tombstone, or the status would show a runtime conflict that is not there.
+    #[test]
+    fn ancestry_walks_through_a_dropped_claim() {
+        let birch = Store::open_memory("birch").unwrap();
+        let older = birch
+            .append_claim(&input(
+                AGENT,
+                "runtime.observed",
+                None,
+                json!({"status": "running", "incarnation_id": "inc-1"}),
+                "birch-runtime",
+            ))
+            .unwrap();
+        birch.bind_fleet("fleet/test").unwrap();
+        let alder = Store::open_memory("alder").unwrap();
+        receive(
+            &alder,
+            "birch",
+            &birch
+                .export_replication_exchange("fleet/test", &ReplicationInventory::default())
+                .unwrap(),
+        );
+        let middle = alder
+            .append_claim(&input(
+                AGENT,
+                "harness.observed",
+                Some(AGENT),
+                json!({"state": "working", "incarnation_id": "inc-1"}),
+                "alder-harness",
+            ))
+            .unwrap();
+        let newest = alder
+            .append_claim(&input(
+                AGENT,
+                "runtime.observed",
+                None,
+                json!({"status": "running", "incarnation_id": "inc-1"}),
+                "alder-runtime",
+            ))
+            .unwrap();
+        assert_eq!(middle.predecessors, [older.id.clone()]);
+        assert_eq!(newest.predecessors, [middle.id.clone()]);
+        let source = |store: &Store| {
+            selected_actual_source_at(&store.readers.get(), AGENT, None, None).unwrap()
+        };
+        assert_eq!(
+            source(&alder),
+            (Some(newest.id.clone()), Some("alder".into()), false)
+        );
+
+        let tombstone = ClaimTombstone {
+            id: middle.id.clone(),
+            writer: "alder".into(),
+            sequence: 0,
+            envelope_hash: String::new(),
+            subject: middle.subject.clone(),
+            kind: middle.kind.clone(),
+            actor: middle.actor.clone(),
+            predecessors: middle.predecessors.clone(),
+            operation_id: middle.operation_id.clone(),
+            request_digest: middle.request_digest.clone(),
+            accepted_at_unix_ms: middle.accepted_at_unix_ms,
+        };
+        {
+            let mut connection = alder.connection.write();
+            let transaction = connection.transaction().unwrap();
+            record_checkpoint_tombstones_tx(
+                &transaction,
+                "checkpoint/test",
+                &[],
+                std::slice::from_ref(&tombstone),
+            )
+            .unwrap();
+            // Recording twice changes nothing.
+            record_checkpoint_tombstones_tx(
+                &transaction,
+                "checkpoint/test",
+                &[],
+                std::slice::from_ref(&tombstone),
+            )
+            .unwrap();
+            delete_dropped_rows_tx(&transaction, &[], std::slice::from_ref(&tombstone)).unwrap();
+            assert!(claim_descends_from(&transaction, &newest.id, &older.id).unwrap());
+            transaction.commit().unwrap();
+        }
+        assert!(alder.claim_by_id(&middle.id).unwrap().is_none());
+        assert_eq!(
+            source(&alder),
+            (Some(newest.id.clone()), Some("alder".into()), false)
+        );
     }
 
     /// Plans a checkpoint over a copy of a real store and prints the dry run:

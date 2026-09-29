@@ -520,6 +520,34 @@ CREATE TABLE IF NOT EXISTS replica_envelope_holds (
     updated_at_unix_ms TEXT NOT NULL,
     PRIMARY KEY(writer, sequence, envelope_hash)
 );
+
+-- A dropped envelope's identity. See `store/checkpoint.rs`.
+CREATE TABLE IF NOT EXISTS checkpoint_envelopes (
+    writer TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    accepted_at_unix_ms INTEGER NOT NULL,
+    checkpoint TEXT NOT NULL,
+    PRIMARY KEY(writer, sequence, envelope_hash)
+);
+-- A dropped claim: what evidence checks, ancestry walks and idempotent retries still read.
+CREATE TABLE IF NOT EXISTS checkpoint_claims (
+    id TEXT PRIMARY KEY,
+    writer TEXT NOT NULL,
+    sequence INTEGER NOT NULL,
+    envelope_hash TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    actor TEXT,
+    predecessors TEXT NOT NULL,
+    operation_id TEXT,
+    request_digest TEXT,
+    accepted_at_unix_ms INTEGER NOT NULL,
+    checkpoint TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);
+CREATE INDEX IF NOT EXISTS checkpoint_claims_operation
+ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
 PRAGMA user_version = 13;
 "#;
 
@@ -15959,10 +15987,25 @@ fn selected_actual_source_at(
     let Some((selected_id, _, selected_origin, _, selected_body)) = selected else {
         return Ok((None, None, false));
     };
-    let predecessors = rows
+    // A checkpoint may have dropped claims on the path from the selected claim to an older
+    // observation. Their tombstones keep the links, so the walk passes through them.
+    let dropped = connection
+        .prepare_cached("SELECT id, predecessors FROM checkpoint_claims WHERE subject=?1")?
+        .query_map([subject], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                serde_json::from_str::<Vec<String>>(&row.get::<_, String>(1)?).unwrap_or_default(),
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut predecessors = dropped
         .iter()
-        .map(|(id, _, _, predecessors, _)| (id.as_str(), predecessors.as_slice()))
+        .map(|(id, predecessors)| (id.as_str(), predecessors.as_slice()))
         .collect::<BTreeMap<_, _>>();
+    predecessors.extend(
+        rows.iter()
+            .map(|(id, _, _, predecessors, _)| (id.as_str(), predecessors.as_slice())),
+    );
     let descends_from = |ancestor: &str| {
         let mut pending = vec![selected_id.as_str()];
         let mut visited = BTreeSet::new();
@@ -23683,9 +23726,12 @@ fn claim_descends_from(
         if !seen.insert(claim_id.clone()) {
             continue;
         }
+        // A checkpoint may have dropped a claim on the path; its tombstone keeps the links.
         let predecessors = transaction
             .query_row(
-                "SELECT predecessors FROM claims WHERE id=?1",
+                "SELECT predecessors FROM claims WHERE id=?1
+                 UNION ALL SELECT predecessors FROM checkpoint_claims WHERE id=?1
+                 LIMIT 1",
                 [&claim_id],
                 |row| row.get::<_, String>(0),
             )
