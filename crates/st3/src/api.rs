@@ -1156,37 +1156,56 @@ fn client_work_resources(
         });
     }
     let desired = store.desired_subjects()?;
-    let mut step_specs = BTreeMap::<String, BTreeMap<String, crate::model::StepSpec>>::new();
-    for run_id in work
+    let work_subjects = work
+        .iter()
+        .map(|step| step.subject.as_str())
+        .collect::<BTreeSet<_>>();
+    let usage_subjects = desired
+        .iter()
+        .filter(|seat| {
+            seat.owner_step
+                .as_deref()
+                .is_some_and(|step| work_subjects.contains(step))
+        })
+        .map(|seat| seat.subject.clone())
+        .collect::<Vec<_>>();
+    let usage_summaries = store.usage_summaries_at(&usage_subjects, Some(snapshot_index))?;
+    let mut usage_by_step = BTreeMap::<&str, Vec<&crate::model::UsageSummary>>::new();
+    for seat in &desired {
+        if let (Some(step), Some(usage)) = (
+            seat.owner_step.as_deref(),
+            usage_summaries.get(&seat.subject),
+        ) {
+            usage_by_step.entry(step).or_default().push(usage);
+        }
+    }
+    let agentless_runs = work
         .iter()
         .filter(|item| item.agentless)
-        .map(|item| &item.run)
-    {
-        if step_specs.contains_key(run_id) {
-            continue;
-        }
-        let Some(run) = store.mission_run(run_id)? else {
-            continue;
-        };
-        let Some(mission) = store.mission_spec(
-            run.mission.trim_start_matches("mission/"),
-            Some(&run.revision),
-        )?
-        else {
-            continue;
-        };
-        step_specs.insert(run_id.clone(), mission.steps);
-    }
+        .map(|item| item.run.clone())
+        .collect::<Vec<_>>();
+    let step_specs = store
+        .mission_specs_for_runs(&agentless_runs)?
+        .into_iter()
+        .map(|(run, mission)| (run, mission.steps))
+        .collect::<BTreeMap<_, _>>();
+    let work_annotations = store.work_annotations(&work)?;
     work.into_iter()
         .map(|work| {
-            let operational = store.work_annotation(&work)?;
+            let operational = work_annotations
+                .get(&work.subject)
+                .expect("every work item has an annotation");
             let state = match work.status.as_str() {
                 "pending" => "waiting",
                 "working" => "claimed",
                 other => other,
             };
-            let usage =
-                aggregate_usage_for_step(store, &desired, &work.subject, Some(snapshot_index))?;
+            let usage = aggregate_usage_values(
+                usage_by_step
+                    .get(work.subject.as_str())
+                    .into_iter()
+                    .flat_map(|summaries| summaries.iter().copied()),
+            );
             let gate_kind = if work.agentless {
                 let spec = step_specs
                     .get(&work.run)
@@ -1269,16 +1288,23 @@ fn client_work_resources(
         .collect()
 }
 
+#[cfg(test)]
 fn aggregate_usage<'a>(
     store: &Store,
     subjects: impl Iterator<Item = &'a str>,
     at_index: Option<u64>,
 ) -> anyhow::Result<Option<crate::model::UsageSummary>> {
+    let usages = subjects
+        .map(|subject| store.usage_summary_at(subject, None, at_index))
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok(aggregate_usage_values(usages.iter().flatten()))
+}
+
+fn aggregate_usage_values<'a>(
+    usages: impl Iterator<Item = &'a crate::model::UsageSummary>,
+) -> Option<crate::model::UsageSummary> {
     let mut aggregate = None::<crate::model::UsageSummary>;
-    for subject in subjects {
-        let Some(usage) = store.usage_summary_at(subject, None, at_index)? else {
-            continue;
-        };
+    for usage in usages {
         let total = aggregate.get_or_insert_with(|| crate::model::UsageSummary {
             aggregation: "cumulative-per-incarnation-else-response-deltas".into(),
             ..crate::model::UsageSummary::default()
@@ -1296,11 +1322,12 @@ fn aggregate_usage<'a>(
         if let Some(cost) = usage.cost {
             total.cost = Some(total.cost.unwrap_or_default() + cost);
         }
-        total.currency = total.currency.clone().or(usage.currency);
+        total.currency = total.currency.clone().or(usage.currency.clone());
     }
-    Ok(aggregate)
+    aggregate
 }
 
+#[cfg(test)]
 fn aggregate_usage_for_step(
     store: &Store,
     desired: &[crate::model::DesiredSubject],
@@ -1317,6 +1344,7 @@ fn aggregate_usage_for_step(
     )
 }
 
+#[cfg(test)]
 fn aggregate_usage_for_runs(
     store: &Store,
     desired: &[crate::model::DesiredSubject],
@@ -1372,6 +1400,17 @@ fn client_agent_resources_uncached(
             Some((desired.subject, client_host_id(&host)))
         })
         .collect::<BTreeMap<_, _>>();
+    let agent_subjects = status
+        .subjects
+        .iter()
+        .filter(|subject| {
+            (subject.subject.starts_with("agent/") || subject.kind.as_deref() == Some("agent"))
+                && (history || subject.projection.layer == "current")
+        })
+        .map(|subject| subject.subject.clone())
+        .collect::<Vec<_>>();
+    let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
+    let member_faults = store.member_reconcile_faults_at(snapshot_index)?;
     let mut agents = status
         .subjects
         .into_iter()
@@ -1380,7 +1419,7 @@ fn client_agent_resources_uncached(
         })
         .filter(|subject| history || subject.projection.layer == "current")
         .map(|subject| -> anyhow::Result<(String, Value)> {
-            let fault = store.member_reconcile_fault(&subject.subject, Some(snapshot_index))?;
+            let fault = member_faults.get(&subject.subject);
             let fields = subject
                 .actual
                 .as_ref()
@@ -1517,7 +1556,7 @@ fn client_agent_resources_uncached(
                 .get(&subject.subject)
                 .cloned()
                 .unwrap_or_default();
-            let usage = store.usage_summary_at(&subject.subject, None, Some(snapshot_index))?;
+            let usage = usage_summaries.get(&subject.subject);
             let value = json!({
                 "id": subject.subject,
                 "kind": "agent",

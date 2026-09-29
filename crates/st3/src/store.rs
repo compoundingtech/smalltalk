@@ -1337,12 +1337,45 @@ fn subscription_request_view(
 /// remaining requests wait for a person.
 pub const MAX_OBSERVATION_DELIVERIES: usize = 5;
 
+/// One repository item whose recorded facts changed. `deliver` says whether the change asks a
+/// subscription for a review or a triage.
+struct DiscoveredItem {
+    subject: String,
+    kind: &'static str,
+    facts: Value,
+    deliver: bool,
+}
+
+/// A pull request is reviewed once for each head it is ready at: when it first appears open and
+/// ready, when a draft becomes ready, and when a new head replaces one that was known. Nothing
+/// else starts a review. A closure, a merge, a reopening at the same head, a title edit, and a
+/// field that an older build did not record never do, because st would review a head it already
+/// saw or one nobody can act on. A known item with no known head proves nothing, so a head first
+/// recorded for it is a baseline.
+fn pull_request_needs_review(prior: Option<&Value>, item: &Value) -> bool {
+    let head = item.get("head").filter(|head| !head.is_null());
+    let open = item
+        .get("state")
+        .and_then(Value::as_str)
+        .is_none_or(|state| state == "open");
+    let ready = item.get("draft").and_then(Value::as_bool) != Some(true);
+    if head.is_none() || !open || !ready {
+        return false;
+    }
+    let Some(prior) = prior else {
+        return true;
+    };
+    let prior_head = prior.get("head").filter(|head| !head.is_null());
+    prior.get("draft").and_then(Value::as_bool) == Some(true)
+        || prior_head.is_some_and(|prior_head| Some(prior_head) != head)
+}
+
 fn discovered_collection_items(
     repository: &str,
     field: &str,
     previous: Option<&Value>,
     current: &Value,
-) -> Vec<(String, String, Value)> {
+) -> Vec<DiscoveredItem> {
     // The first listing that names its repository ID is also the first complete listing. The
     // earlier facts came from a first-page read, so the items this listing adds were missed, not
     // opened. They become known without a delivery.
@@ -1369,6 +1402,8 @@ fn discovered_collection_items(
             let prior = previous_items
                 .iter()
                 .find(|old| old.get("number").and_then(Value::as_u64) == Some(number));
+            // A pull request's item resource follows its head and state, so a review that has not
+            // started yet can tell that its head was replaced or its pull request closed.
             if prior.is_some_and(|old| match field {
                 "pull_requests" => ["head", "state", "draft"]
                     .iter()
@@ -1377,20 +1412,23 @@ fn discovered_collection_items(
             }) {
                 return None;
             }
-            let (segment, kind) = match field {
-                "pull_requests" => ("pull-request", "vcs.pull-request"),
-                "issues" => ("issue", "vcs.issue"),
+            let (segment, kind, deliver) = match field {
+                "pull_requests" => (
+                    "pull-request",
+                    "vcs.pull-request",
+                    pull_request_needs_review(prior, item),
+                ),
+                "issues" => ("issue", "vcs.issue", true),
                 _ => return None,
             };
+            let state = item
+                .get("state")
+                .cloned()
+                .unwrap_or_else(|| Value::String("open".into()));
             let mut facts = serde_json::Map::from_iter([
                 ("repository".into(), Value::String(repository.into())),
                 ("number".into(), Value::from(number)),
-                (
-                    "state".into(),
-                    item.get("state")
-                        .cloned()
-                        .unwrap_or_else(|| Value::String("open".into())),
-                ),
+                ("state".into(), state.clone()),
             ]);
             for name in ["url", "title"] {
                 if let Some(value) = item.get(name).filter(|value| !value.is_null()) {
@@ -1402,16 +1440,26 @@ fn discovered_collection_items(
                     "draft".into(),
                     item.get("draft").cloned().unwrap_or(Value::Bool(false)),
                 );
-                facts.insert("merged".into(), Value::Bool(false));
+                // An open listing cannot tell a merge from a closure, so only an open pull
+                // request is known to be unmerged.
+                if state == "open" {
+                    facts.insert("merged".into(), Value::Bool(false));
+                }
                 if let Some(head) = item.get("head").filter(|head| !head.is_null()) {
                     facts.insert("head_sha".into(), head.clone());
                 }
+                for name in ["branch", "author", "opened_by", "opened_by_run"] {
+                    if let Some(value) = item.get(name).filter(|value| !value.is_null()) {
+                        facts.insert(name.into(), value.clone());
+                    }
+                }
             }
-            Some((
-                format!("{repository}/{segment}/{number}"),
-                kind.into(),
-                Value::Object(facts),
-            ))
+            Some(DiscoveredItem {
+                subject: format!("{repository}/{segment}/{number}"),
+                kind,
+                facts: Value::Object(facts),
+                deliver,
+            })
         })
         .collect()
 }
@@ -1464,15 +1512,103 @@ fn collection_delivery_was_requested_tx(
             })
             .optional()?;
         let observed = observed.and_then(|body| serde_json::from_str::<Value>(&body).ok());
-        let old_head = observed
+        let old_head = match observed
             .as_ref()
             .and_then(|value| value.pointer("/fields/facts/head_sha"))
-            .and_then(Value::as_str);
-        if old_head == head {
+            .and_then(Value::as_str)
+        {
+            Some(old_head) => Some(old_head.to_owned()),
+            None => listed_head_tx(transaction, observed.as_ref())?,
+        };
+        if old_head.as_deref() == head {
             return Ok(true);
         }
     }
     Ok(false)
+}
+
+/// Item claims written before items carried `head_sha` still cite the repository listing they
+/// came from, and that listing names the head.
+fn listed_head_tx(
+    transaction: &rusqlite::Transaction<'_>,
+    item: Option<&Value>,
+) -> rusqlite::Result<Option<String>> {
+    let Some(item) = item else {
+        return Ok(None);
+    };
+    let (Some(number), Some(listing)) = (
+        item.pointer("/fields/facts/number").and_then(Value::as_u64),
+        item.pointer("/evidence/0").and_then(Value::as_str),
+    ) else {
+        return Ok(None);
+    };
+    let listing = transaction
+        .query_row("SELECT body FROM claims WHERE id=?1", [listing], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?
+        .and_then(|body| serde_json::from_str::<Value>(&body).ok());
+    Ok(listing
+        .as_ref()
+        .and_then(|value| value.pointer("/fields/facts/pull_requests"))
+        .and_then(Value::as_array)
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item.get("number").and_then(Value::as_u64) == Some(number))
+        })
+        .and_then(|item| item.get("head"))
+        .and_then(Value::as_str)
+        .map(str::to_owned))
+}
+
+/// The mission runs that published a `resource/mission-run/RUN/pull-request` naming this pull
+/// request, by URL or by repository and number, at the same head when both name one. An
+/// authoring mission publishes that resource when it opens the pull request.
+fn authoring_pull_request_runs_tx(
+    connection: &Connection,
+    facts: &Value,
+) -> rusqlite::Result<Vec<String>> {
+    let url = facts.get("url").and_then(Value::as_str);
+    let repository = facts.get("repository").and_then(Value::as_str);
+    let number = facts.get("number").and_then(Value::as_u64);
+    if url.is_none() && (repository.is_none() || number.is_none()) {
+        return Ok(Vec::new());
+    }
+    let head = facts.get("head_sha").and_then(Value::as_str);
+    let mut statement = connection.prepare(
+        "SELECT subject, body FROM claims WHERE kind='resource.observed'
+         AND subject LIKE 'resource/mission-run/%/pull-request'
+         AND (json_extract(body, '$.fields.facts.url')=?1
+           OR (json_extract(body, '$.fields.facts.repository')=?2
+               AND json_extract(body, '$.fields.facts.number')=?3))
+         ORDER BY store_index",
+    )?;
+    let candidates = statement
+        .query_map(params![url, repository, number], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut runs = Vec::new();
+    for (resource, body) in candidates {
+        let value: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+        let authored_head = value
+            .pointer("/fields/facts/head_sha")
+            .and_then(Value::as_str);
+        if head.is_some() && authored_head.is_some() && head != authored_head {
+            continue;
+        }
+        let Some(run) = resource
+            .strip_prefix("resource/")
+            .and_then(|name| name.strip_suffix("/pull-request"))
+        else {
+            continue;
+        };
+        if !runs.iter().any(|known| known == run) {
+            runs.push(run.to_owned());
+        }
+    }
+    Ok(runs)
 }
 
 fn open_read_connections(path: &Path, shared_memory: bool) -> Result<Vec<Connection>> {
@@ -1755,6 +1891,38 @@ impl Store {
         body.map(|body| serde_json::from_str(&body))
             .transpose()
             .map_err(Into::into)
+    }
+
+    /// Load the definitions behind a collection of runs in one read.
+    pub fn mission_specs_for_runs(
+        &self,
+        runs: &[String],
+    ) -> Result<BTreeMap<String, MissionSpec>> {
+        if runs.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let ids = runs
+            .iter()
+            .map(|run| run.strip_prefix("mission-run/").unwrap_or(run))
+            .collect::<Vec<_>>();
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT mission_runs.id, mission_revisions.body
+             FROM mission_runs
+             JOIN run_generations ON run_generations.id=mission_runs.current_generation_id
+             JOIN mission_revisions ON mission_revisions.mission_id=mission_runs.mission_id
+              AND mission_revisions.revision=run_generations.revision
+             WHERE mission_runs.id IN (SELECT value FROM json_each(?1))",
+        )?;
+        statement
+            .query_map([serde_json::to_string(&ids)?], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .map(|row| {
+                let (id, body) = row?;
+                Ok((format!("mission-run/{id}"), serde_json::from_str(&body)?))
+            })
+            .collect()
     }
 
     /// Return every current published mission definition, including definitions with no runs.
@@ -4509,6 +4677,16 @@ impl Store {
                 .filter(|view| view.status == "ready" && view.assigned_to.is_some())
                 .map(|view| view.subject.as_str()),
         )?;
+        let run_ids = views
+            .iter()
+            .map(|view| view.run.strip_prefix("mission-run/").unwrap_or(&view.run))
+            .collect::<BTreeSet<_>>();
+        let run_phases = connection
+            .prepare("SELECT id, phase FROM mission_runs WHERE id IN (SELECT value FROM json_each(?1))")?
+            .query_map([serde_json::to_string(&run_ids)?], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
         let mut visible = Vec::with_capacity(views.len());
         for mut view in views {
             if detailed {
@@ -4517,12 +4695,9 @@ impl Store {
                 enrich_step_queue_for_reconcile_at(&connection, &mut view, snapshot_unix_ms)?;
             }
             view.carried_claimant = carried_claimants.get(&view.subject).cloned();
-            let run_phase: String = connection.query_row(
-                "SELECT phase FROM mission_runs WHERE id=?1",
-                [view.run.strip_prefix("mission-run/").unwrap_or(&view.run)],
-                |row| row.get(0),
-            )?;
-            if run_phase == "revision-draining"
+            if run_phases
+                .get(view.run.strip_prefix("mission-run/").unwrap_or(&view.run))
+                .is_some_and(|phase| phase == "revision-draining")
                 && !matches!(view.status.as_str(), "claimed" | "working" | "verifying")
             {
                 continue;
@@ -4628,6 +4803,63 @@ impl Store {
                 },
             )
             .optional()?;
+        Ok(Self::work_annotation_with_owner(work, owner))
+    }
+
+    /// Hydrate owner state once for a collection instead of querying each step.
+    pub fn work_annotations(
+        &self,
+        work: &[StepRunView],
+    ) -> Result<BTreeMap<String, OperationalAnnotation>> {
+        let runs = work
+            .iter()
+            .map(|step| step.run.strip_prefix("mission-run/").unwrap_or(&step.run))
+            .collect::<BTreeSet<_>>();
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT mission_runs.id, run_generations.id, mission_runs.status,
+                    mission_runs.current_generation_id, mission_runs.mode,
+                    run_generations.status, root_runs.status, root_runs.phase
+             FROM mission_runs
+             JOIN run_generations ON run_generations.run_id=mission_runs.id
+             JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
+             WHERE mission_runs.id IN (SELECT value FROM json_each(?1))",
+        )?;
+        let owners = statement
+            .query_map([serde_json::to_string(&runs)?], |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    (
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ),
+                ))
+            })?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+        Ok(work
+            .iter()
+            .map(|step| {
+                let run = step.run.strip_prefix("mission-run/").unwrap_or(&step.run);
+                let generation = generation_id_from_subject(&step.generation);
+                let owner = owners
+                    .get(&(run.to_owned(), generation.to_owned()))
+                    .cloned();
+                (
+                    step.subject.clone(),
+                    Self::work_annotation_with_owner(step, owner),
+                )
+            })
+            .collect())
+    }
+
+    fn work_annotation_with_owner(
+        work: &StepRunView,
+        owner: Option<(String, String, String, String, String, String)>,
+    ) -> OperationalAnnotation {
         let mut reasons: Vec<String> = Vec::new();
         if let Some((
             run_status,
@@ -4676,14 +4908,14 @@ impl Store {
                 "terminal-owner" | "terminal-root-owner" | "superseded" | "eval" | "terminal-work"
             )
         });
-        Ok(OperationalAnnotation {
+        OperationalAnnotation {
             layer: if historical { "history" } else { "current" }.into(),
             actionable: !historical
                 && matches!(work.status.as_str(), "ready" | "claimed" | "working"),
             reasons,
             owner_generation: Some(work.generation.clone()),
             runtime_incarnation: work.claim_incarnation.clone(),
-        })
+        }
     }
 
     pub fn active_step_blockers_at(
@@ -8656,6 +8888,40 @@ impl Store {
         )
     }
 
+    /// Current member faults for an agent collection, reduced in one SQL scan.
+    pub fn member_reconcile_faults_at(&self, at_index: u64) -> Result<BTreeMap<String, String>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, body FROM (
+                 SELECT subject, body,
+                        ROW_NUMBER() OVER (PARTITION BY subject ORDER BY store_index DESC) AS rank
+                 FROM claims
+                 WHERE subject LIKE 'agent/%' AND kind='runtime.reconcile-decision'
+                   AND store_index<=?1
+                   AND json_extract(body, '$.fields.key')='member-reconcile'
+             ) WHERE rank=1",
+        )?;
+        let mut faults = BTreeMap::new();
+        for row in statement.query_map([at_index], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })? {
+            let (subject, body) = row?;
+            let body: Value = serde_json::from_str(&body)?;
+            let fields = body.get("fields").unwrap_or(&body);
+            if fields.get("decision").and_then(Value::as_str) == Some("member-fault") {
+                faults.insert(
+                    subject,
+                    fields
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("member reconciliation failed")
+                        .to_owned(),
+                );
+            }
+        }
+        Ok(faults)
+    }
+
     /// The latest claim of a subject, or of one kind of it, in canonical order.
     pub fn latest_claim(&self, subject: &str, kind: Option<&str>) -> Result<Option<ClaimRecord>> {
         let connection = self.readers.get();
@@ -9680,9 +9946,26 @@ impl Store {
         let mut collection_discoveries = BTreeMap::<String, Vec<(String, String)>>::new();
         if !baseline {
             for field in ["pull_requests", "issues"] {
-                for (subject, kind, item_facts) in
-                    discovered_collection_items(resource, field, previous.as_ref(), &facts)
+                for DiscoveredItem {
+                    subject,
+                    kind,
+                    facts: mut item_facts,
+                    deliver,
+                } in discovered_collection_items(resource, field, previous.as_ref(), &facts)
                 {
+                    // An agent's checkout names the opener first. An authoring run's own pull
+                    // request resource names the run when no agent was found.
+                    if deliver
+                        && field == "pull_requests"
+                        && item_facts.get("opened_by").is_none()
+                        && item_facts.get("opened_by_run").is_none()
+                        && let Some(run) = authoring_pull_request_runs_tx(&transaction, &item_facts)
+                            .map_err(internal)?
+                            .into_iter()
+                            .next()
+                    {
+                        item_facts["opened_by_run"] = Value::String(run);
+                    }
                     let predecessors = latest_claim_id_tx(&transaction, &subject)
                         .map_err(internal)?
                         .into_iter()
@@ -9708,10 +9991,12 @@ impl Store {
                         Some(&batch_id),
                     )
                     .map_err(internal)?;
-                    collection_discoveries
-                        .entry(field.into())
-                        .or_default()
-                        .push((subject, claim.id));
+                    if deliver {
+                        collection_discoveries
+                            .entry(field.into())
+                            .or_default()
+                            .push((subject, claim.id));
+                    }
                 }
             }
         }
@@ -10093,58 +10378,66 @@ impl Store {
 
     /// Find a mission-run PR resource for this discovered PR when that run already has a human
     /// review gate for its own PR. Intake uses this graph provenance to avoid a second reviewer.
+    /// Why a pull request review that has not started must not start: since the request, its
+    /// pull request closed or merged, went back to draft, or moved to a newer head. `None` while
+    /// the requested head is still the open pull request's current head.
+    pub fn stale_pull_request_request(
+        &self,
+        resource: &str,
+        discovery: &str,
+    ) -> Result<Option<String>> {
+        let Some(requested) = self.claim_by_id(discovery)? else {
+            return Ok(None);
+        };
+        let Some(current) = self
+            .latest_actual_value(resource)?
+            .and_then(|actual| actual.get("facts").cloned())
+        else {
+            return Ok(None);
+        };
+        let number = current
+            .get("number")
+            .and_then(Value::as_u64)
+            .map_or_else(|| resource.to_owned(), |number| format!("#{number}"));
+        if let Some(state) = current
+            .get("state")
+            .and_then(Value::as_str)
+            .filter(|state| *state != "open")
+        {
+            return Ok(Some(format!("pull request {number} is {state}")));
+        }
+        if current.get("draft").and_then(Value::as_bool) == Some(true) {
+            return Ok(Some(format!("pull request {number} is a draft again")));
+        }
+        let short = |head: &str| head.chars().take(12).collect::<String>();
+        let requested_head = requested
+            .body
+            .pointer("/fields/facts/head_sha")
+            .and_then(Value::as_str);
+        let current_head = current.get("head_sha").and_then(Value::as_str);
+        if let (Some(requested_head), Some(current_head)) = (requested_head, current_head)
+            && requested_head != current_head
+        {
+            return Ok(Some(format!(
+                "pull request {number} moved from head {} to {}",
+                short(requested_head),
+                short(current_head)
+            )));
+        }
+        Ok(None)
+    }
+
     pub fn authoring_review_owner(&self, discovery: &str) -> Result<Option<String>> {
         let Some(claim) = self.claim_by_id(discovery)? else {
             return Ok(None);
         };
-        let url = claim
-            .body
-            .pointer("/fields/facts/url")
-            .and_then(Value::as_str);
-        let repository = claim
-            .body
-            .pointer("/fields/facts/repository")
-            .and_then(Value::as_str);
-        let number = claim
-            .body
-            .pointer("/fields/facts/number")
-            .and_then(Value::as_u64);
-        if url.is_none() && (repository.is_none() || number.is_none()) {
+        let Some(facts) = claim.body.pointer("/fields/facts") else {
             return Ok(None);
-        }
-        let head = claim
-            .body
-            .pointer("/fields/facts/head_sha")
-            .and_then(Value::as_str);
-        let candidates = {
-            let connection = self.readers.get();
-            let mut statement = connection.prepare(
-                "SELECT subject, body FROM claims WHERE kind='resource.observed'
-                 AND subject LIKE 'resource/mission-run/%/pull-request'
-                 AND (json_extract(body, '$.fields.facts.url')=?1
-                   OR (json_extract(body, '$.fields.facts.repository')=?2
-                       AND json_extract(body, '$.fields.facts.number')=?3))",
-            )?;
-            statement
-                .query_map(params![url, repository, number], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        for (resource, body) in candidates {
-            let value: Value = serde_json::from_str(&body)?;
-            let authored_head = value
-                .pointer("/fields/facts/head_sha")
-                .and_then(Value::as_str);
-            if head.is_some() && authored_head.is_some() && head != authored_head {
-                continue;
-            }
-            let Some(run_id) = resource
-                .strip_prefix("resource/mission-run/")
-                .and_then(|name| name.strip_suffix("/pull-request"))
-            else {
-                continue;
-            };
+        let candidates = authoring_pull_request_runs_tx(&self.readers.get(), facts)?;
+        for run in candidates {
+            let resource = format!("resource/{run}/pull-request");
+            let run_id = run.strip_prefix("mission-run/").unwrap_or(&run);
             let Some(run) = self.mission_run(run_id)? else {
                 continue;
             };
@@ -10265,19 +10558,6 @@ impl Store {
         incarnation: Option<&str>,
         at_index: Option<u64>,
     ) -> Result<Option<UsageSummary>> {
-        #[derive(Default)]
-        struct Spend {
-            cumulative: Option<CumulativeUsage>,
-            rollups: BTreeMap<String, (u64, u64, u64, u64, u64)>,
-            response_total: u64,
-            response_input: u64,
-            response_output: u64,
-            response_cached: u64,
-            response_cost: f64,
-            response_has_cost: bool,
-            response_currency: Option<String>,
-        }
-
         let connection = self.readers.get();
         let at_index = at_index.unwrap_or(i64::MAX as u64);
         let mut statement = connection.prepare(
@@ -10292,6 +10572,79 @@ impl Store {
                 row.get::<_, String>(2)?,
             ))
         })?;
+        Self::usage_summary_from_rows(rows, incarnation)
+    }
+
+    /// Fetch usage for a bounded resource page with one SQL read per SQLite
+    /// parameter chunk, then apply the same reduction as a detail read.
+    pub fn usage_summaries_at(
+        &self,
+        subjects: &[String],
+        at_index: Option<u64>,
+    ) -> Result<BTreeMap<String, UsageSummary>> {
+        let connection = self.readers.get();
+        let mut grouped = BTreeMap::<String, Vec<rusqlite::Result<(u64, String, String)>>>::new();
+        let unique_subjects = subjects
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for chunk in unique_subjects.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = vec!["?"; chunk.len()].join(",");
+            let sql = format!(
+                "SELECT subject, store_index, body, accepted_at_unix_ms FROM claims
+                 WHERE kind='harness.usage' AND store_index<={} AND subject IN ({placeholders})
+                 ORDER BY subject, store_index",
+                at_index.unwrap_or(i64::MAX as u64)
+            );
+            let mut statement = connection.prepare(&sql)?;
+            for row in statement.query_map(rusqlite::params_from_iter(chunk), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            })? {
+                let (subject, index, body, accepted) = row?;
+                grouped
+                    .entry(subject)
+                    .or_default()
+                    .push(Ok((index, body, accepted)));
+            }
+        }
+        let mut summaries = BTreeMap::new();
+        for (subject, rows) in grouped {
+            if let Some(summary) = Self::usage_summary_from_rows(rows, None)? {
+                summaries.insert(subject, summary);
+            }
+        }
+        Ok(summaries)
+    }
+
+    fn usage_summary_from_rows<I>(
+        rows: I,
+        incarnation: Option<&str>,
+    ) -> Result<Option<UsageSummary>>
+    where
+        I: IntoIterator<Item = rusqlite::Result<(u64, String, String)>>,
+    {
+        #[derive(Default)]
+        struct Spend {
+            cumulative: Option<CumulativeUsage>,
+            rollups: BTreeMap<String, (u64, u64, u64, u64, u64)>,
+            response_total: u64,
+            response_input: u64,
+            response_output: u64,
+            response_cached: u64,
+            response_cost: f64,
+            response_has_cost: bool,
+            response_currency: Option<String>,
+        }
+
         let mut spend = BTreeMap::<String, Spend>::new();
         let mut context = None::<(u64, ContextUsage)>;
         let mut saw = false;
@@ -33368,6 +33721,11 @@ mission "external-blocker" state="ready" {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].status, "blocked");
         let annotation = store.work_annotation(&blocked).unwrap();
+        let batched = store.work_annotations(&[blocked.clone()]).unwrap();
+        assert_eq!(
+            serde_json::to_value(&annotation).unwrap(),
+            serde_json::to_value(&batched[&blocked.subject]).unwrap()
+        );
         assert!(!annotation.actionable);
         assert!(annotation.reasons.contains(&"external-blocker".into()));
         assert_eq!(
@@ -33723,6 +34081,11 @@ version 2
                 .unwrap()
                 .reasons
                 .contains(&"terminal-root-owner".to_owned())
+        );
+        let batched = store.work_annotations(&history).unwrap();
+        assert_eq!(
+            serde_json::to_value(store.work_annotation(nested).unwrap()).unwrap(),
+            serde_json::to_value(&batched[&nested.subject]).unwrap()
         );
 
         let fresh = store
@@ -36167,6 +36530,13 @@ version 2
 
         assert_ne!(revised.generation, run.generation);
         assert_eq!(revised.initial_revision, run.revision);
+        assert_eq!(
+            store
+                .mission_specs_for_runs(&[revised.subject.clone()])
+                .unwrap()[&revised.subject]
+                .revision,
+            revised.revision
+        );
         let generations = store.run_generations(&run.id).unwrap();
         assert_eq!(generations.len(), 2);
         assert_eq!(generations[0].subject, run.generation);
@@ -37257,7 +37627,10 @@ mission "review-guardrail" state="ready" {
     fn repository_collections_create_one_typed_resource_for_each_new_item() {
         let previous = json!({"pull_requests": [], "issues": []});
         let current = json!({
-            "pull_requests": [{"number": 7, "url": "https://example.test/pull/7", "title": "Ready"}],
+            "pull_requests": [{
+                "number": 7, "url": "https://example.test/pull/7", "title": "Ready",
+                "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            }],
             "issues": [{"number": 8, "url": "https://example.test/issues/8", "title": "Bug"}],
         });
         let pulls = discovered_collection_items(
@@ -37267,10 +37640,11 @@ mission "review-guardrail" state="ready" {
             &current,
         );
         assert_eq!(pulls.len(), 1);
-        assert_eq!(pulls[0].0, "resource/github/acme/demo/pull-request/7");
-        assert_eq!(pulls[0].1, "vcs.pull-request");
-        assert_eq!(pulls[0].2["repository"], "resource/github/acme/demo");
-        assert_eq!(pulls[0].2["draft"], false);
+        assert_eq!(pulls[0].subject, "resource/github/acme/demo/pull-request/7");
+        assert_eq!(pulls[0].kind, "vcs.pull-request");
+        assert_eq!(pulls[0].facts["repository"], "resource/github/acme/demo");
+        assert_eq!(pulls[0].facts["draft"], false);
+        assert!(pulls[0].deliver);
 
         let issues = discovered_collection_items(
             "resource/github/acme/demo",
@@ -37279,9 +37653,10 @@ mission "review-guardrail" state="ready" {
             &current,
         );
         assert_eq!(issues.len(), 1);
-        assert_eq!(issues[0].0, "resource/github/acme/demo/issue/8");
-        assert_eq!(issues[0].1, "vcs.issue");
-        assert_eq!(issues[0].2["repository"], "resource/github/acme/demo");
+        assert_eq!(issues[0].subject, "resource/github/acme/demo/issue/8");
+        assert_eq!(issues[0].kind, "vcs.issue");
+        assert_eq!(issues[0].facts["repository"], "resource/github/acme/demo");
+        assert!(issues[0].deliver);
     }
 
     #[test]
@@ -37292,7 +37667,9 @@ mission "review-guardrail" state="ready" {
         }]});
         let after = json!({"repository_id": 7, "pull_requests": [{
             "number": 4, "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "state": "open", "draft": false,
+            "state": "open", "draft": false, "branch": "agent/example",
+            "author": "example-login", "opened_by": "agent/example/builder",
+            "opened_by_run": "mission-run/example",
         }]});
         let changes = discovered_collection_items(
             "resource/github/acme/demo",
@@ -37301,13 +37678,22 @@ mission "review-guardrail" state="ready" {
             &after,
         );
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].0, "resource/github/acme/demo/pull-request/4");
         assert_eq!(
-            changes[0].2["head_sha"],
+            changes[0].subject,
+            "resource/github/acme/demo/pull-request/4"
+        );
+        assert!(changes[0].deliver);
+        assert_eq!(
+            changes[0].facts["head_sha"],
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
+        assert_eq!(changes[0].facts["branch"], "agent/example");
+        assert_eq!(changes[0].facts["author"], "example-login");
+        assert_eq!(changes[0].facts["opened_by"], "agent/example/builder");
+        assert_eq!(changes[0].facts["opened_by_run"], "mission-run/example");
+        assert_eq!(changes[0].facts["merged"], false);
         let facts = changes[0]
-            .2
+            .facts
             .as_object()
             .unwrap()
             .iter()
@@ -37336,7 +37722,108 @@ mission "review-guardrail" state="ready" {
             &closed,
         );
         assert_eq!(changes.len(), 1);
-        assert_eq!(changes[0].2["state"], "closed");
+        assert_eq!(changes[0].facts["state"], "closed");
+        assert!(!changes[0].deliver, "a closure never asks for a review");
+        assert!(
+            changes[0].facts.get("merged").is_none(),
+            "an open listing cannot tell a merge from a closure"
+        );
+    }
+
+    #[test]
+    fn only_a_new_ready_head_of_an_open_pull_request_asks_for_review() {
+        let a = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let b = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let asks = |before: Value, after: Value| {
+            let previous = json!({"repository_id": 7, "pull_requests": [before]});
+            let current = json!({"repository_id": 7, "pull_requests": [after]});
+            let changes = discovered_collection_items(
+                "resource/github/acme/demo",
+                "pull_requests",
+                Some(&previous),
+                &current,
+            );
+            assert!(changes.len() <= 1);
+            changes.first().map(|change| change.deliver)
+        };
+        // An older build recorded no per-item state. Its open items gain one, and the items it
+        // retained after they left the open listing are now closed. Neither is a new head.
+        assert_eq!(
+            asks(
+                json!({"number": 4, "head": a}),
+                json!({"number": 4, "head": a, "state": "open", "draft": false})
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            asks(
+                json!({"number": 4, "head": a}),
+                json!({"number": 4, "head": a, "state": "closed", "draft": false})
+            ),
+            Some(false)
+        );
+        // A pull request that closed and moved on is not reviewed either.
+        assert_eq!(
+            asks(
+                json!({"number": 4, "head": a, "state": "open"}),
+                json!({"number": 4, "head": b, "state": "closed", "draft": false})
+            ),
+            Some(false)
+        );
+        // Reopening at the same head, or a head first recorded for a known item, is a baseline.
+        assert_eq!(
+            asks(
+                json!({"number": 4, "head": a, "state": "closed", "draft": false}),
+                json!({"number": 4, "head": a, "state": "open", "draft": false})
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            asks(
+                json!({"number": 4, "state": "open"}),
+                json!({"number": 4, "head": a, "state": "open", "draft": false})
+            ),
+            Some(false)
+        );
+        // A draft is not reviewed, and it is when it becomes ready at the same head.
+        assert_eq!(
+            asks(
+                json!({"number": 4, "head": a, "state": "open", "draft": false}),
+                json!({"number": 4, "head": b, "state": "open", "draft": true})
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            asks(
+                json!({"number": 4, "head": a, "state": "open", "draft": true}),
+                json!({"number": 4, "head": a, "state": "open", "draft": false})
+            ),
+            Some(true)
+        );
+        // A new head of an open pull request is reviewed, including one that an older build
+        // recorded without a state.
+        assert_eq!(
+            asks(
+                json!({"number": 4, "head": a}),
+                json!({"number": 4, "head": b, "state": "open", "draft": false})
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            asks(
+                json!({"number": 3, "head": a}),
+                json!({"number": 4, "head": b, "state": "open", "draft": false})
+            ),
+            Some(true)
+        );
+        // An open pull request with no head cannot be reviewed at a head.
+        assert_eq!(
+            asks(
+                json!({"number": 3, "head": a}),
+                json!({"number": 4, "state": "open", "draft": false})
+            ),
+            Some(false)
+        );
     }
 
     #[test]
@@ -39141,6 +39628,14 @@ message "human-attention" {
             .usage_summary_at(subject, None, None)
             .unwrap()
             .unwrap();
+        let batch = store
+            .usage_summaries_at(
+                &[subject.into(), "agent/missing".into(), subject.into()],
+                None,
+            )
+            .unwrap();
+        assert_eq!(batch.get(subject), Some(&usage));
+        assert!(!batch.contains_key("agent/missing"));
         assert_eq!(usage.total_tokens, 200);
         assert_eq!(usage.incarnation_count, 2);
         assert_eq!(usage.context.unwrap().used_tokens, Some(999));
