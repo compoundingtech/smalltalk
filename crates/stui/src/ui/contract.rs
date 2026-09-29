@@ -151,12 +151,26 @@ fn files() -> Vec<(&'static str, Value)> {
     ]
 }
 
+/// Sorts every object's keys, so the files read the same whether or not another crate in the
+/// build turns on serde_json's `preserve_order` (the workspace build does; `-p stui` does not).
+fn sorted_keys(value: Value) -> Value {
+    match value {
+        Value::Object(map) => {
+            let mut entries: Vec<_> = map.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            Value::Object(entries.into_iter().map(|(k, v)| (k, sorted_keys(v))).collect())
+        }
+        Value::Array(items) => Value::Array(items.into_iter().map(sorted_keys).collect()),
+        other => other,
+    }
+}
+
 #[test]
 fn the_shared_client_contract_matches_stui() {
     let update = std::env::var_os("STUI_UPDATE_CONTRACT").is_some();
     for (name, value) in files() {
         let path = root().join(name);
-        let text = serde_json::to_string_pretty(&value).unwrap() + "\n";
+        let text = serde_json::to_string_pretty(&sorted_keys(value)).unwrap() + "\n";
         if update {
             std::fs::write(&path, &text).unwrap();
             continue;
