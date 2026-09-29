@@ -9795,13 +9795,14 @@ async fn host_agent_workspace(
     let relay = state
         .client_relay
         .as_ref()
-        .filter(|relay| relay.has_peer(&host_id))
+        .filter(|relay| relay.reaches(&host_id))
         .ok_or_else(|| remote_unavailable(&host_id))?;
     let value = relay
         .read(
             &host_id,
             &crate::peer::ClientReadRequest {
                 authority_actor: person.into(),
+                relay: None,
                 request: crate::peer::ClientReadOperation::AgentWorkspace {
                     identity: query.identity,
                 },
