@@ -172,6 +172,29 @@ that a later envelope resolves still looks open. Every client page then carries 
 `st now` and the other product commands print a `SYNCING` line before their items, and stui shows
 `⟳ Syncing` with the same line.
 
+Two nodes are in sync only when they hold the same envelopes and project the same graph from
+them. Each exchange at which both nodes hold the same envelopes compares their graph digests; an
+exchange that stores new envelopes, or meets a deferred projection, compares nothing. The same
+envelopes must project the same graph, so a difference that outlasts a minute, longer than a peer
+takes to project what it stored, means the graphs diverged: for example, one node lost claims it
+had admitted while keeping their envelopes. Exchanges cannot fix that, so the status view leads
+with it:
+
+```text
+sync	diverged: node-b holds the same envelopes but projects a different graph, since 3m ago
+peer	node-b	up
+  last exchange 2s ago
+  diverged: the same envelopes project different graphs since 3m ago (compared 2s ago; this node 0f3a9c21d4e8, node-b 7b21e05c9a44)
+  exchanges cannot fix this; views on one node are wrong until it is repaired
+```
+
+While any peer has diverged, `st doctor` fails its replication check, every client page carries a
+`sync` notice in the `diverged` state, `st now` and the other product commands print a `DIVERGED`
+line, and stui's header shows `⚠ diverged`. A shorter difference shows as `graphs differ` and fails
+nothing. A comparison stands until the next exchange at which both nodes hold the same envelopes;
+the first one that finds equal graphs clears it. Like the envelope difference, comparisons live in
+memory and the first exchanges after a restart rebuild them.
+
 Repair publishes a new claim. It does not delete or change the bad record.
 
 ```sh
