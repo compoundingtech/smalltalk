@@ -10357,6 +10357,7 @@ mod tests {
         server.abort();
     }
 
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "current_thread")]
     async fn slow_peer_identity_lookup_does_not_stop_existing_api_connections() {
         use http_body_util::{BodyExt as _, Empty};
