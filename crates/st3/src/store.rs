@@ -40,6 +40,7 @@ use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
 mod checkpoint;
 mod checkpoint_agreement;
+mod lanes;
 
 pub use checkpoint_agreement::{
     CHECKPOINT_ATTENTION_AFTER_MS, CHECKPOINT_EXCUSED, CHECKPOINT_PROTOCOL, CHECKPOINT_SEALED,
