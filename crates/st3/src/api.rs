@@ -4100,26 +4100,34 @@ async fn replication_receive(
                 .record_transport_observation(&request.peer, "up", None, None)
                 .map_err(|error| St3Error::new("internal", error.to_string()))?;
         }
-        let (admission, repairs, projected) =
-            if replication_receive_has_new_data(receipt.received + receipt.signatures) {
-                let admission = store
-                    .validate_replication_backlog()
-                    .map_err(|error| St3Error::new("internal", error.to_string()))?;
-                let repairs = store
-                    .apply_replication_repairs()
-                    .map_err(|error| St3Error::new("internal", error.to_string()))?;
-                let projected = store
-                    .project_replication_backlog()
-                    .map_err(|error| St3Error::new("internal", error.to_string()))?;
-                (admission, repairs, projected)
-            } else {
-                (Default::default(), 0, true)
-            };
+        let new_data = replication_receive_has_new_data(receipt.received + receipt.signatures);
+        let (admission, repairs) = if new_data {
+            let admission = store
+                .validate_replication_backlog()
+                .map_err(|error| St3Error::new("internal", error.to_string()))?;
+            let repairs = store
+                .apply_replication_repairs()
+                .map_err(|error| St3Error::new("internal", error.to_string()))?;
+            (admission, repairs)
+        } else {
+            (Default::default(), 0)
+        };
+        // A catching-up node defers projection; the first receive after the deferral window,
+        // with or without new data, projects what it admitted meanwhile.
+        let was_deferred = store.replication_projection_deferred();
+        let projection = if new_data || was_deferred {
+            store
+                .project_replication_backlog_unless_catching_up()
+                .map_err(|error| St3Error::new("internal", error.to_string()))?
+        } else {
+            Some(true)
+        };
+        let projected = projection.unwrap_or(false);
         let store_index = store
             .index()
             .map_err(|error| St3Error::new("internal", error.to_string()))?;
-        let changed =
-            store_index != before_index || (projected && (admission.changed || repairs != 0));
+        let changed = store_index != before_index
+            || (projected && (admission.changed || repairs != 0 || was_deferred));
         let quiet_only = projection_was_healthy
             && projected
             && repairs == 0
@@ -4128,13 +4136,14 @@ async fn replication_receive(
             && store
                 .claims_since_only_quiet_notifications(before_index)
                 .map_err(|error| St3Error::new("internal", error.to_string()))?;
+        // A deferred projection left the graph as it was, so the reconciler has nothing new.
         Ok((
             ReplicationReceiveResponse {
                 receipt,
                 changed,
                 store_index,
             },
-            changed && !quiet_only,
+            changed && !quiet_only && projection.is_some(),
         ))
     })
     .await?;
@@ -4169,7 +4178,10 @@ async fn replication_peer_failure(
                 None,
             )?;
         }
-        Ok(store.index()? != before_index)
+        // A peer that fails mid-sync sends no more exchanges, so project what it delivered.
+        let projected = store.replication_projection_deferred()
+            && store.project_replication_backlog_unless_catching_up()? == Some(true);
+        Ok(store.index()? != before_index || projected)
     })
     .await?;
     if changed {
@@ -4590,20 +4602,32 @@ async fn fleet_membership_view(
 
 async fn replication_wake(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let store = state.store.clone();
-    let (admission, repairs, projection_attempted, projected) = blocking_store(move || {
-        let admission = store.validate_replication_backlog()?;
-        let repairs = store.apply_replication_repairs()?;
-        let projection_attempted =
-            admission.changed || repairs != 0 || store.replication_projection_needs_recovery()?;
-        let projected = if projection_attempted {
-            store.project_replication_backlog()?
-        } else {
-            true
-        };
-        Ok((admission, repairs, projection_attempted, projected))
-    })
-    .await?;
-    if projected && (admission.changed || repairs != 0) {
+    let (admission, repairs, projection_attempted, projected, was_deferred) =
+        blocking_store(move || {
+            let admission = store.validate_replication_backlog()?;
+            let repairs = store.apply_replication_repairs()?;
+            let was_deferred = store.replication_projection_deferred();
+            let projection_attempted = admission.changed
+                || repairs != 0
+                || was_deferred
+                || store.replication_projection_needs_recovery()?;
+            let projected = if projection_attempted {
+                store
+                    .project_replication_backlog_unless_catching_up()?
+                    .unwrap_or(false)
+            } else {
+                true
+            };
+            Ok((
+                admission,
+                repairs,
+                projection_attempted,
+                projected,
+                was_deferred,
+            ))
+        })
+        .await?;
+    if projected && (admission.changed || repairs != 0 || was_deferred) {
         signal_changed(&state);
     }
     Ok(Json(json!({

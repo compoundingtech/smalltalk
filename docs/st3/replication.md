@@ -57,7 +57,7 @@ The service installer creates a separate systemd user service or launchd agent f
 
 A local graph change writes `replication.wake`. The worker watches only this file, not the SQLite files.
 
-The worker coalesces wake bursts for one second, so new authority, such as a mission publish, reaches every peer within seconds. An exchange that moved envelopes runs again at once until a backlog drains.
+The worker coalesces wake bursts for one second, so new authority, such as a mission publish, reaches every peer within seconds. An exchange that stored new envelopes on either side runs again at once until a backlog drains. An exchange that stored nothing new waits for the next wake, even if it carried envelopes the other side already held.
 
 The worker also runs a 30-second anti-entropy exchange. This timer repairs a missed file event or a network interruption.
 
@@ -91,6 +91,10 @@ Each receiver derives projections locally from the admitted claims.
 4. Reconciliation changes local runtimes from the last good graph.
 
 An unknown or invalid record stays in `replica_records`. It does not block a valid sibling or a later envelope.
+
+Admission commits once per pass over the pending envelopes, so one disk flush covers an exchange. Each envelope is admitted in its own savepoint, so an invalid one is rolled back and recorded alone.
+
+A node catching up with a peer, one more than one exchange behind it, projects at most every 30 seconds and again as soon as it has caught up. History arrives older than the node's own claims, so the node cannot extend its projection incrementally; projecting after every exchange would replay the whole graph each time. Meanwhile `st now`, `st missions ls` and stui say the node is syncing.
 
 An unknown claim kind or field can become valid after a schema upgrade. Admission retries unknown records on each wake and startup. Records that older builds classified as invalid solely because of an unknown field are also reconsidered, preserving and admitting the original signed claim when the upgraded schema recognizes it.
 
