@@ -568,6 +568,123 @@ async fn invite_and_join_sync_full_history() {
     }
 }
 
+/// The `sync` object `st replication status` reports for `peer`, or null.
+fn peer_sync(node: &Node, peer: &str) -> Value {
+    node.st_json(&["replication", "status"])["peers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|status| status["peer"] == peer)
+        .map(|status| status["sync"].clone())
+        .unwrap_or(Value::Null)
+}
+
+/// Two members can hold the same envelopes and still project different graphs, as when one of
+/// them lost claims it had admitted. No exchange fixes that, so neither may call the pair in
+/// sync: replication status says diverged, doctor fails, and every client page carries it.
+#[tokio::test(flavor = "multi_thread")]
+async fn members_with_the_same_envelopes_but_different_claims_report_divergence() {
+    let root = tempfile::tempdir().unwrap();
+    let a = anchor(root.path(), "a").await;
+    let mut b = joined(root.path(), &a, "b", &[]).await;
+    let mission = root.path().join("probe.kdl");
+    fs::write(
+        &mission,
+        "version 2\nmission \"divergence-probe\" state=\"ready\" {\n  \
+         goal \"Give both graphs a row that one member can lose.\"\n  \
+         step \"only\" { agentless }\n}\n",
+    )
+    .unwrap();
+    a.st_ok(&[
+        "missions",
+        "publish",
+        mission.to_str().unwrap(),
+        "--as",
+        PERSON,
+    ]);
+    wait_until(
+        "both members hold the mission and call the pair in sync",
+        90,
+        || async {
+            a.st_json(&["replication", "status"])["graph_digest"]
+                == b.st_json(&["replication", "status"])["graph_digest"]
+                && [(&a, "b"), (&b, "a")].iter().all(|(node, peer)| {
+                    node.st_ok(&["replication", "status"])
+                        .contains("in sync: the same envelopes and the same graph")
+                        && peer_sync(node, peer)["graph_compared_at_unix_ms"].is_number()
+                })
+        },
+    )
+    .await;
+
+    // B loses the mission's claims but keeps their envelopes, so both inventories still match.
+    b.stop();
+    {
+        let store = rusqlite::Connection::open(b.state_dir().join("claims.sqlite3")).unwrap();
+        let dropped = store
+            .execute(
+                "DELETE FROM mission_definitions WHERE mission_id LIKE '%divergence-probe%'",
+                [],
+            )
+            .unwrap();
+        assert_eq!(dropped, 1, "b projected the mission");
+        store
+            .execute_batch(
+                "PRAGMA foreign_keys=OFF;
+                 DELETE FROM claims WHERE subject LIKE '%divergence-probe%';",
+            )
+            .unwrap();
+    }
+    b.start().await;
+
+    wait_until("both members report the divergence", 180, || async {
+        peer_sync(&a, "b")["diverged"] == true && peer_sync(&b, "a")["diverged"] == true
+    })
+    .await;
+    for (node, peer) in [(&a, "b"), (&b, "a")] {
+        let status = node.st_ok(&["replication", "status"]);
+        assert!(
+            status.contains(&format!(
+                "sync\tdiverged: {peer} holds the same envelopes but projects a different graph"
+            )),
+            "{status}"
+        );
+        assert!(!status.contains("in sync"), "{status}");
+        let doctor = node.st(&["--json", "doctor"]);
+        assert!(!doctor.status.success(), "{} doctor passed", node.name);
+        let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "replication")
+            .cloned()
+            .unwrap();
+        assert_eq!(check["status"], "fail", "{check}");
+        assert!(
+            check["message"]
+                .as_str()
+                .unwrap()
+                .starts_with(&format!("graph diverged from {peer}")),
+            "{check}"
+        );
+        let page = node.st_json(&["machines"]);
+        assert_eq!(page["value"]["sync"]["state"], "diverged", "{page}");
+        assert_eq!(
+            page["value"]["sync"]["peers"][0]["host_id"],
+            format!("host/{peer}")
+        );
+        assert!(page["value"]["sync"]["peers"][0]["diverged_since"].is_string());
+        let machines = node.st_ok(&["machines"]);
+        assert!(
+            machines.starts_with(&format!(
+                "DIVERGED  {peer} projects a different graph from the same envelopes"
+            )),
+            "{machines}"
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn a_dial_out_member_is_caught_up_and_never_reported_down() {
     let root = tempfile::tempdir().unwrap();

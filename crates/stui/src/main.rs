@@ -449,8 +449,11 @@ impl App {
                 chunks[0],
             );
         } else {
-            let syncing = self.model.sync_notice().is_some();
-            let connection = if self.live_ready && syncing {
+            let sync = self.model.sync_notice();
+            let diverged = sync.is_some_and(st3_client::SyncNotice::diverged);
+            let connection = if self.live_ready && diverged {
+                "⚠ Diverged"
+            } else if self.live_ready && sync.is_some() {
                 "⟳ Syncing"
             } else if self.live_ready {
                 "● Online"
@@ -519,7 +522,9 @@ impl App {
                 self.select_control.get(),
             );
             frame.render_widget(
-                Paragraph::new(state).style(Style::default().fg(if self.live_ready && !syncing {
+                Paragraph::new(state).style(Style::default().fg(if self.live_ready && diverged {
+                    Color::Red
+                } else if self.live_ready && sync.is_none() {
                     Color::Green
                 } else {
                     Color::Yellow
@@ -720,12 +725,19 @@ impl App {
             lines.push(String::new());
         }
         if let Some(sync) = self.model.sync_notice() {
-            lines.extend(
-                sync.peers
-                    .iter()
-                    .map(|peer| format!("SYNCING  {}", peer.summary())),
-            );
-            lines.push("Until this host catches up, what you see here can be out of date.".into());
+            lines.extend(sync.peers.iter().map(|peer| {
+                let label = if peer.diverged_since.is_some() {
+                    "DIVERGED"
+                } else {
+                    "SYNCING"
+                };
+                format!("{label}  {}", peer.summary())
+            }));
+            lines.push(if sync.diverged() {
+                "Exchanges cannot fix this, so what you see here can be wrong.".into()
+            } else {
+                "Until this host catches up, what you see here can be out of date.".into()
+            });
             lines.push(String::new());
         }
         if let Some(result) = &self.action_result {
@@ -3915,6 +3927,7 @@ mod tests {
                 local_only_envelopes: 3,
                 last_exchange_at: None,
                 estimated_catch_up_seconds: Some(840),
+                diverged_since: None,
             }],
         };
         let mut model = Model::default();
