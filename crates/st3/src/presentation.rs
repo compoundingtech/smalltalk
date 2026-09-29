@@ -1234,6 +1234,7 @@ mod tests {
             run: "mission-run/demo/run".into(),
             generation: "run-generation/demo-generation".into(),
             step: path.into(),
+            fresh_context: false,
             queue: None,
             queue_position: None,
             definition_hash: "definition-hash".into(),
@@ -1407,9 +1408,13 @@ mod tests {
     fn attention_list_shows_kind_age_targets_and_safe_commands() {
         let item = AttentionItemView {
             kind: "fault".into(),
+            review_mode: None,
             subject: "attention/fabric".into(),
             person: "person/nathan".into(),
             requester_id: None,
+            launch_id: None,
+            variant_id: None,
+            message_id: None,
             title: "Fabric needs review".into(),
             detail: "The queue did not recover.".into(),
             mission: Some("mission/fabric".into()),

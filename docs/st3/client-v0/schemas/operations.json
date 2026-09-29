@@ -9,6 +9,7 @@
   },
   "reads": [
     { "id": "capabilities.get", "method": "GET", "path": "/v1/client/capabilities", "response": "Capabilities" },
+    { "id": "document.get", "method": "GET", "path": "/v1/client/documents/content", "response": "DocumentContent" },
     { "id": "now.list", "method": "GET", "path": "/v1/client/now", "response": "Page" },
     { "id": "machines.list", "method": "GET", "path": "/v1/client/machines", "response": "Page" },
     { "id": "devices.list", "method": "GET", "path": "/v1/client/devices", "response": "Page" },
@@ -30,6 +31,10 @@
     { "id": "agent-queue.get", "method": "GET", "path": "/v1/client/agent-queues/{id}", "response": "AgentQueue" },
     { "id": "runtimes.list", "method": "GET", "path": "/v1/client/runtimes", "response": "Page" },
     { "id": "runtimes.get", "method": "GET", "path": "/v1/client/runtimes/{id}", "response": "Resource" },
+    { "id": "observers.list", "method": "GET", "path": "/v1/client/observers", "response": "Page" },
+    { "id": "observers.get", "method": "GET", "path": "/v1/client/observers/{id}", "response": "Resource" },
+    { "id": "subscriptions.list", "method": "GET", "path": "/v1/client/subscriptions", "response": "Page" },
+    { "id": "subscriptions.get", "method": "GET", "path": "/v1/client/subscriptions/{id}", "response": "Resource" },
     { "id": "terminals.list", "method": "GET", "path": "/v1/client/terminals", "response": "Page" },
     { "id": "operations.list", "method": "GET", "path": "/v1/client/operations", "response": "Page" },
     { "id": "operations.get", "method": "GET", "path": "/v1/client/operations/{id}", "response": "Resource" },
@@ -38,6 +43,7 @@
     { "id": "sessions.list", "method": "GET", "path": "/v1/client/sessions", "response": "Page" },
     { "id": "sessions.get", "method": "GET", "path": "/v1/client/sessions/{id}", "response": "Resource" },
     { "id": "timeline.list", "method": "GET", "path": "/v1/client/sessions/{id}/timeline", "response": "TimelinePage" },
+    { "id": "conversation.changes", "method": "GET", "path": "/v1/client/conversations/{id}/changes", "response": "ConversationChanges" },
     { "id": "events.list", "method": "GET", "path": "/v1/client/events", "response": "EventPage" },
     { "id": "terminal.screen", "method": "GET", "path": "/v1/client/terminals/{id}/screen", "response": "TerminalScreen" }
   ],
@@ -45,11 +51,13 @@
     { "id": "action.submit", "method": "POST", "path": "/v1/client/actions", "request": "ActionRequest", "response": "ActionResult" },
     { "id": "pairing.begin", "method": "POST", "path": "/v1/client/pairings", "request": "PairingBegin", "response": "PairingChallenge", "local_only": true },
     { "id": "pairing.complete", "method": "POST", "path": "/v1/client/pairings/{id}/complete", "request": "PairingComplete", "response": "PairedSession" },
-    { "id": "terminal.stream", "method": "GET", "path": "/v1/client/terminals/{id}/stream", "response": "TerminalScreen", "websocket_protocol": "st3.client.terminal.v0" }
+    { "id": "terminal.stream", "method": "GET", "path": "/v1/client/terminals/{id}/stream", "response": "TerminalScreen", "websocket_protocol": "st3.client.terminal.v0" },
+    { "id": "conversation.stream", "method": "GET", "path": "/v1/client/conversations/{id}/stream", "response": "ConversationChanges", "websocket_protocol": "st3.client.conversation.v0" }
   ],
   "actions": {
     "review.approve": { "capability": "control.attention", "parameters": "TargetParameters" },
     "review.reject": { "capability": "control.attention", "parameters": "TargetParameters" },
+    "review.request-changes": { "capability": "control.attention", "parameters": "TargetParameters" },
     "attention.resolve": { "capability": "control.attention", "parameters": "AttentionResolveParameters" },
     "message.send": { "capability": "control.messages", "parameters": "MessageSendParameters" },
     "message.read": { "capability": "control.messages", "parameters": "TargetParameters" },
@@ -71,6 +79,7 @@
     "work.complete": { "capability": "control.work", "parameters": "TargetParameters" },
     "work.fail": { "capability": "control.work", "parameters": "TargetParameters" },
     "work.release": { "capability": "control.work", "parameters": "TargetParameters" },
+    "work.retry": { "capability": "control.work", "parameters": "WorkRetryParameters" },
     "work.publish-mission": { "capability": "control.work", "parameters": "WorkPublishMissionParameters" },
     "agent.queue-move": { "capability": "control.work", "parameters": "AgentQueueMoveParameters" },
     "runtime.stop": { "capability": "control.runtimes", "parameters": "TargetParameters" },

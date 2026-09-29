@@ -1,5 +1,6 @@
 mod cache;
 mod model;
+mod tree;
 mod ui;
 
 use anyhow::{Context, Result};
@@ -38,7 +39,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-const TABS: [&str; 4] = ["Now", "Chat", "Control", "Fleet"];
+const TABS: [&str; 5] = ["Now", "Chat", "Control", "Fleet", "Tree"];
 const TIMELINE_REFRESH: Duration = Duration::from_secs(30);
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -126,8 +127,9 @@ enum Update {
 struct App {
     model: Model,
     tab: usize,
-    selected: [usize; 4],
-    scroll: [u16; 4],
+    selected: [usize; 5],
+    scroll: [u16; 5],
+    tree_open: Option<tree::Target>,
     sidebar: bool,
     show_system_missions: bool,
     mode: Mode,
@@ -152,7 +154,7 @@ struct App {
     action_result: Option<String>,
     notice: Option<String>,
     chat_max_scroll: Cell<u16>,
-    sidebar_offsets: [Cell<usize>; 4],
+    sidebar_offsets: [Cell<usize>; 5],
     live_ready: bool,
     dirty: bool,
     timeline_requested: Option<String>,
@@ -168,8 +170,9 @@ impl App {
         Self {
             model,
             tab: 0,
-            selected: [0; 4],
-            scroll: [0, u16::MAX, 0, 0],
+            selected: [0; 5],
+            scroll: [0, u16::MAX, 0, 0, 0],
+            tree_open: None,
             sidebar: true,
             show_system_missions: false,
             mode: Mode::Normal,
@@ -194,7 +197,13 @@ impl App {
             action_result: None,
             notice: None,
             chat_max_scroll: Cell::new(0),
-            sidebar_offsets: [Cell::new(0), Cell::new(0), Cell::new(0), Cell::new(0)],
+            sidebar_offsets: [
+                Cell::new(0),
+                Cell::new(0),
+                Cell::new(0),
+                Cell::new(0),
+                Cell::new(0),
+            ],
             live_ready: false,
             dirty: true,
             timeline_requested: None,
@@ -376,7 +385,8 @@ impl App {
             0 => self.model.attention().count(),
             1 => self.agent_tree().len() + self.model.undeclared_sessions().count(),
             2 => self.control_missions().len(),
-            _ => self.model.machines().count(),
+            3 => self.model.machines().count(),
+            _ => self.model.tree.targets().len(),
         }
     }
     fn mission_group(&self, mission: &st3_client::Mission) -> &'static str {
@@ -533,7 +543,7 @@ impl App {
             .split(chunks[1]);
             if columns[0].width > 0 {
                 frame.render_widget(
-                    Paragraph::new("Now\nChat\nControl\nFleet")
+                    Paragraph::new("Now\nChat\nControl\nFleet\nTree")
                         .style(Style::default().fg(Color::DarkGray))
                         .block(Block::default().borders(Borders::ALL)),
                     columns[0],
@@ -601,7 +611,7 @@ impl App {
                     .iter()
                     .map(|(v, depth)| {
                         format!(
-                            "{}{} {}{}  ·  {}",
+                            "{}{} {}{}{}  ·  {}",
                             "  ".repeat(*depth),
                             state_glyph(&v.state),
                             agent_label(v),
@@ -615,6 +625,9 @@ impl App {
                             } else {
                                 String::new()
                             },
+                            v.usage.as_ref().filter(|usage| usage.incarnation_count > 0)
+                                .map(|usage| format!(" · {} tokens", usage.total_tokens))
+                                .unwrap_or_default(),
                             v.reachability
                         )
                     })
@@ -644,10 +657,17 @@ impl App {
                         )
                     })
                     .collect(),
-                _ => self
+                3 => self
                     .model
                     .machines()
                     .map(|v| format!("{} {}", v.name, v.state))
+                    .collect(),
+                _ => self
+                    .model
+                    .tree
+                    .targets()
+                    .iter()
+                    .map(|target| self.model.tree.target_label(target))
                     .collect(),
             };
             let entries = list
@@ -768,6 +788,18 @@ impl App {
                             "Harness: {driver} · {}",
                             peer.harness_state.as_deref().unwrap_or("unknown")
                         ));
+                    }
+                    if let Some(usage) = &peer.usage {
+                        if usage.incarnation_count > 0 {
+                            lines.push(format!("Usage: {} tokens", usage.total_tokens));
+                            lines.push(format!(
+                                "  input {} · output {} · cache write {} · cache read {}",
+                                usage.input_tokens,
+                                usage.output_tokens,
+                                usage.cache_write_tokens,
+                                usage.cached_tokens
+                            ));
+                        }
                     }
                     lines.push(format!(
                         "Current session: {}",
@@ -998,7 +1030,7 @@ impl App {
                     lines.push("Older completed steps omitted".into());
                 }
             }
-            _ => {
+            3 => {
                 lines.push("FLEET  /  MACHINES".into());
                 lines.push(String::new());
                 let selected_machine = self.model.machines().nth(self.selected[3]);
@@ -1082,6 +1114,15 @@ impl App {
                 }
                 if self.model.machines.truncated || self.model.devices.truncated {
                     lines.push("[More fleet items beyond bounded view]".into());
+                }
+            }
+            _ => {
+                if let Some(target) = &self.tree_open {
+                    lines.extend(self.model.tree.detail_lines(target));
+                    lines.push(String::new());
+                    lines.push("Esc  Return to tree".into());
+                } else {
+                    lines.extend(self.model.tree.overview_lines());
                 }
             }
         }
@@ -1190,7 +1231,11 @@ impl App {
                     }
                 }
                 2 => "↑↓/click mission · wheel/Pg scroll · c new mission · q quit".into(),
-                _ => "↑↓/click machine · wheel/Pg scroll · q quit".into(),
+                3 => "↑↓/click machine · wheel/Pg scroll · q quit".into(),
+                _ if self.tree_open.is_some() => {
+                    "↑↓ select run or seat · Enter details · Esc tree · Pg/wheel scroll".into()
+                }
+                _ => "↑↓ select run or seat · Enter details · Pg/wheel scroll · q quit".into(),
             },
             Mode::Confirm => self
                 .pending_action
@@ -2369,9 +2414,13 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
         return Ok(false);
     }
     match key.code {
+        KeyCode::Esc if app.tab == 4 && app.tree_open.is_some() => {
+            app.tree_open = None;
+            app.scroll[4] = 0;
+        }
         KeyCode::Char('q') | KeyCode::Esc => return Ok(true),
         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => return Ok(true),
-        KeyCode::Char(d @ '1'..='4') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+        KeyCode::Char(d @ '1'..='5') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
             app.tab = d as usize - '1' as usize;
             app.selected[app.tab] = app.selected[app.tab].min(app.count().saturating_sub(1));
         }
@@ -2496,6 +2545,10 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
             } else {
                 app.notice = Some("Reconnect before attaching a terminal".into());
             }
+        }
+        KeyCode::Enter if app.tab == 4 => {
+            app.tree_open = app.model.tree.targets().get(app.selected[4]).cloned();
+            app.scroll[4] = 0;
         }
         _ => {}
     }
@@ -2711,6 +2764,7 @@ fn main() -> Result<()> {
                             app.model.agents = model.agents;
                             app.model.sessions = model.sessions;
                             app.model.messages = model.messages;
+                            app.model.tree = model.tree;
                             app.model.status = "Cached · loading details…".into();
                         } else {
                             app.model = *model;
@@ -2739,9 +2793,16 @@ fn main() -> Result<()> {
                     {
                         app.notice = None;
                     }
-                    for tab in 0..4 {
+                    for tab in 0..TABS.len() {
                         app.selected[tab] =
                             app.selected[tab].min(app.count_for(tab).saturating_sub(1));
+                    }
+                    if app
+                        .tree_open
+                        .as_ref()
+                        .is_some_and(|target| !app.model.tree.contains(target))
+                    {
+                        app.tree_open = None;
                     }
                     app.dirty = true;
                 }
@@ -3041,7 +3102,7 @@ mod tests {
     #[test]
     fn regression_agent_header_shows_harness_state() {
         let mut model = Model::default();
-        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"ST","state":"running","reachability":"reachable","driver":"claude","harness_state":"ready"}"#).unwrap());
+        model.agents.items.push(serde_json::from_str(r#"{"kind":"agent","id":"agent/st3","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"ST","state":"running","reachability":"reachable","driver":"claude","harness_state":"ready","usage":{"total_tokens":42,"input_tokens":4,"output_tokens":2,"cache_write_tokens":6,"cached_tokens":30,"incarnation_count":1,"aggregation":"cumulative-per-incarnation-else-response-deltas"}}"#).unwrap());
         let mut app = App::new(model);
         app.tab = 1;
         let mut terminal = Terminal::new(TestBackend::new(120, 35)).unwrap();
@@ -3054,6 +3115,8 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(content.contains("Harness: claude · ready"));
+        assert!(content.contains("Usage: 42 tokens"));
+        assert!(content.contains("cache write 6 · cache read 30"));
         assert!(content.contains("observed"));
     }
 
@@ -3214,6 +3277,95 @@ mod tests {
                 assert!(content.contains(label));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn tree_screen_navigates_into_a_run_and_seat() {
+        let fixture =
+            serde_json::from_str(include_str!("../../st3/tests/fixtures/missions-tree.json"))
+                .unwrap();
+        let mut model = Model::default();
+        model.tree = tree::MissionsTree::from_response(fixture).unwrap();
+        let mut app = App::new(model);
+        let client = Client::unix("/tmp/stui-tree-test.sock");
+        let mut terminal = Terminal::new(TestBackend::new(110, 30)).unwrap();
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Char('5'), KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(app.tab, 4);
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("RUNNING MISSIONS"));
+        assert!(screen.contains("mission/atlas: build"));
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.tree_open,
+            Some(tree::Target::Run("mission-run/atlas/1".into()))
+        );
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("MISSION RUN"));
+        assert!(screen.contains("step-run/atlas/review"));
+        assert!(
+            !handle_key(
+                &mut app,
+                &client,
+                KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)
+            )
+            .await
+            .unwrap()
+        );
+        assert!(app.tree_open.is_none());
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Down, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        handle_key(
+            &mut app,
+            &client,
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            app.tree_open,
+            Some(tree::Target::Seat("agent/orbit/standing".into()))
+        );
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let screen = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(screen.contains("STANDING SEAT"));
+        assert!(screen.contains("mission-run/boron/1"));
     }
     #[test]
     fn terminal_key_encoding() {

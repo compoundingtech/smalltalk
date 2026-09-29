@@ -218,6 +218,8 @@ pub struct Operational {
     pub owner_generation: Option<String>,
     #[serde(default)]
     pub runtime_incarnation: Option<String>,
+    #[serde(default)]
+    pub runtime_desired_revision: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -229,6 +231,16 @@ pub struct Attention {
     pub attention_kind: String,
     pub source_id: String,
     pub person_id: String,
+    pub requester_id: Option<String>,
+    pub launch_id: Option<String>,
+    pub variant_id: Option<String>,
+    pub message_id: Option<String>,
+    pub preview_token: Option<String>,
+    pub preview: Option<LaunchPreview>,
+    pub what: Option<String>,
+    pub because: Option<String>,
+    pub fix: Option<Value>,
+    pub review_mode: Option<String>,
     pub mission_id: Option<String>,
     pub mission_run_id: Option<String>,
     pub step_run_id: Option<String>,
@@ -250,6 +262,20 @@ pub struct AttentionTargetState {
     pub state: String,
     #[serde(default)]
     pub since: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct DocumentContent {
+    pub reference: String,
+    pub bytes: Vec<u8>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct LaunchPreview {
+    pub goal: String,
+    pub steps: Vec<Value>,
+    pub agents: Vec<Value>,
+    pub gates: Value,
+    pub diagnostics_count: u64,
+    pub request_excerpt: String,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Message {
@@ -389,6 +415,8 @@ pub struct Launch {
     pub title: String,
     pub phase: String,
     pub request: String,
+    pub preview_token: Option<String>,
+    pub preview: Option<LaunchPreview>,
     pub planner: String,
     pub planner_config: PlannerConfig,
     pub target: Value,
@@ -490,6 +518,8 @@ pub struct UsageSummary {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub cost: Option<f64>,
     pub currency: Option<String>,
     pub incarnation_count: usize,
@@ -508,6 +538,9 @@ pub struct Mission {
     #[serde(default)]
     pub runs: Vec<String>,
     #[serde(default)]
+    pub run_details: Vec<MissionRunSummary>,
+    pub must_act: Option<String>,
+    #[serde(default)]
     pub active_runs: Option<usize>,
     #[serde(default)]
     pub run_generations: BTreeMap<String, String>,
@@ -515,6 +548,22 @@ pub struct Mission {
     pub visualization: Option<Visualization>,
     #[serde(default)]
     pub usage: Option<UsageSummary>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MissionRunSummary {
+    pub id: String,
+    pub generation_id: Option<String>,
+    pub requester: String,
+    pub status: String,
+    pub phase: String,
+    pub progress: Value,
+    pub current_steps: Vec<Value>,
+    pub must_act: String,
+    pub state_since: String,
+    pub last_progress: Option<String>,
+    pub blocker: Option<Value>,
+    pub after: Option<String>,
+    pub deadline: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Work {
@@ -526,7 +575,11 @@ pub struct Work {
     pub generation_id: String,
     pub definition_id: String,
     pub path: String,
+    pub title: Option<String>,
+    pub assigned_to: Option<String>,
+    pub last_progress: Option<String>,
     pub state: String,
+    pub gate_kind: Option<String>,
     pub attempt: u32,
     pub readiness_epoch: u64,
     pub claimant: Option<String>,
@@ -563,6 +616,9 @@ pub struct Agent {
     pub driver: Option<String>,
     #[serde(default)]
     pub harness_state: Option<String>,
+    pub host_id: Option<String>,
+    pub last_activity_at: Option<String>,
+    pub silent_since: Option<String>,
     #[serde(default)]
     pub fault: Option<String>,
     #[serde(default)]
@@ -579,6 +635,8 @@ pub struct Agent {
     pub upcoming_work_ids: Vec<String>,
     #[serde(default)]
     pub queued_work_count: u64,
+    #[serde(default)]
+    pub usage: Option<UsageSummary>,
     #[serde(default)]
     pub under: Vec<AgentRelationship>,
 }
@@ -648,7 +706,7 @@ pub struct Runtime {
     pub state: String,
     pub runtime_id: String,
     pub incarnation_id: Option<String>,
-    pub desired_revision: String,
+    pub desired_revision: Option<String>,
     #[serde(default)]
     pub owner_run_id: Option<String>,
     #[serde(default)]
@@ -657,6 +715,52 @@ pub struct Runtime {
     pub terminal_sequence: Option<u64>,
     #[serde(default)]
     pub terminal_access: Option<TerminalAccess>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Observer {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+    pub state: String,
+    pub spec: ObserverSpec,
+    pub owner_run_id: Option<String>,
+    pub owner_generation_id: Option<String>,
+    pub owner_step_id: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Subscription {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, Value>,
+    pub state: String,
+    pub spec: SubscriptionSpec,
+    pub owner_run_id: Option<String>,
+    pub owner_generation_id: Option<String>,
+    pub owner_step_id: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ObserverSpec {
+    pub resource: String,
+    pub provider: String,
+    pub locator: String,
+    pub fields: Vec<String>,
+    pub stopped: bool,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SubscriptionSpec {
+    pub observer: String,
+    pub to: String,
+    pub fields: Vec<String>,
+    pub condition: Option<Value>,
+    pub delivery: String,
+    pub mission: Option<String>,
+    pub revision: Option<String>,
+    pub resource_input: Option<String>,
+    pub workspace: Option<String>,
+    pub requester: Option<String>,
+    pub stopped: bool,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct MachineCapacity {
@@ -763,6 +867,8 @@ pub enum Resource {
     Work(Work),
     Agent(Agent),
     Runtime(Runtime),
+    Observer(Observer),
+    Subscription(Subscription),
     Machine(Machine),
     Device(Device),
     Operation(Operation),
@@ -783,6 +889,8 @@ impl Resource {
             Self::Work(v) => &v.header,
             Self::Agent(v) => &v.header,
             Self::Runtime(v) => &v.header,
+            Self::Observer(v) => &v.header,
+            Self::Subscription(v) => &v.header,
             Self::Machine(v) => &v.header,
             Self::Device(v) => &v.header,
             Self::Operation(v) => &v.header,
@@ -790,6 +898,14 @@ impl Resource {
             Self::Session(v) => &v.header,
         }
     }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct ConversationChanges {
+    pub kind: String,
+    pub session_id: String,
+    pub items: Vec<TimelineEntry>,
+    pub next_cursor: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1045,6 +1161,10 @@ pub struct TimelineUsageBody {
     #[serde(default)]
     pub cached_tokens: Option<u64>,
     #[serde(default)]
+    pub cache_write_tokens: Option<u64>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
+    #[serde(default)]
     pub total_tokens: Option<u64>,
     #[serde(default)]
     pub context_used_tokens: Option<u64>,
@@ -1169,6 +1289,8 @@ pub enum ActionType {
     ReviewApprove,
     #[serde(rename = "review.reject")]
     ReviewReject,
+    #[serde(rename = "review.request-changes")]
+    ReviewRequestChanges,
     #[serde(rename = "message.send")]
     MessageSend,
     #[serde(rename = "message.read")]
@@ -1209,6 +1331,8 @@ pub enum ActionType {
     WorkFail,
     #[serde(rename = "work.release")]
     WorkRelease,
+    #[serde(rename = "work.retry")]
+    WorkRetry,
     #[serde(rename = "work.publish-mission")]
     WorkPublishMission,
     #[serde(rename = "agent.queue-move")]
@@ -1279,6 +1403,11 @@ pub struct TargetParameters {
     pub summary: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct WorkRetryParameters {
+    pub target_id: String,
+    pub reason: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

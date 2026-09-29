@@ -146,6 +146,66 @@ fn every_tracked_st3_example_uses_the_normative_grammar() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn github_review_example_removes_its_checkout_and_temp_build_files() {
+    use std::process::Command;
+
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let source = fs::read_to_string(root.join("examples/st3/github-intake-work.kdl")).unwrap();
+    let document: kdl::KdlDocument = source.parse().unwrap();
+    let review = document
+        .nodes()
+        .iter()
+        .find(|node| {
+            node.name().value() == "mission"
+                && node
+                    .entries()
+                    .first()
+                    .and_then(|entry| entry.value().as_string())
+                    == Some("example/app/review-pull-request")
+        })
+        .unwrap();
+    let cleanup = review.children().unwrap().get("finally").unwrap();
+    let cleanup_step = cleanup.children().unwrap().get("step").unwrap();
+    let exec = cleanup_step.children().unwrap().get("exec").unwrap();
+    let command = exec
+        .children()
+        .unwrap()
+        .get("command")
+        .unwrap()
+        .entries()
+        .first()
+        .unwrap()
+        .value()
+        .as_string()
+        .unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    for name in ["checkout", "tmp", "target"] {
+        let path = directory.path().join(name);
+        fs::create_dir(&path).unwrap();
+        fs::write(path.join("artifact"), "review build output").unwrap();
+    }
+    assert!(
+        Command::new("/bin/sh")
+            .arg("-c")
+            .arg(command)
+            .current_dir(directory.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    for name in ["checkout", "tmp", "target"] {
+        assert!(
+            !directory.path().join(name).exists(),
+            "{name} survived review cleanup"
+        );
+    }
+    assert!(source.contains("TMPDIR=${ST_WORKSPACE}/tmp"));
+    let intake = fs::read_to_string(root.join("examples/st3/github-intake.kdl")).unwrap();
+    assert!(intake.contains("--workspace /srv/example/intake"));
+}
+
 fn example_files(directory: &str) -> Vec<PathBuf> {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")

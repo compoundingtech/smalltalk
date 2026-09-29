@@ -53,6 +53,13 @@ pub enum Retention {
     /// An observation kept only in the local observation log of the node that
     /// made it and trimmed after that node's retention window.
     Local,
+    /// An observation kept in the local observation log. The replicated claim log
+    /// gets a claim only when its state changes; each claim replaces the previous
+    /// one for the same subject.
+    Latest,
+    /// `Local` when the system records it without an actor; a request or result
+    /// that a person or agent writes as its actor replicates as a claim.
+    SystemLocal,
 }
 
 impl Retention {
@@ -186,7 +193,7 @@ impl Registry {
             ));
         }
         output.push_str("\n`resource.observed` validates facts against the resource kind. Custom resource facts remain open.\n");
-        output.push_str("\nA `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window.\n");
+        output.push_str("\nA `durable` claim is a fact in the replicated claim log. A `local` claim is an observation kept only in the local observation log of the node that made it, trimmed after that node's retention window. A `latest` claim is an observation kept in that log whose replicated claims are written only when its state changes; each one replaces the previous one for its subject. A `system-local` claim is `local` when the system records it without an actor and replicates when a person or agent writes it as its actor.\n");
         output
     }
 
@@ -704,6 +711,7 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("pull_requests", array()),
                 ("issues", array()),
                 ("repository_id", integer()),
+                ("github_http_requests_since_start", integer()),
             ],
         ),
     );
@@ -754,6 +762,7 @@ fn resource_specs() -> BTreeMap<String, ResourceSpec> {
                 ("title", string()),
                 ("author", string()),
                 ("head", reference()),
+                ("head_sha", string()),
                 ("base", reference()),
                 ("state", string()),
                 ("draft", boolean()),
@@ -1742,6 +1751,7 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
                 "mission-run",
                 "observer",
                 "schedule",
+                "step-run",
                 "subscription",
             ],
             WritePolicy::SystemOnly,
@@ -1796,6 +1806,20 @@ fn claim_retention(kind: &str) -> Retention {
         // The owner reads a transcript from the harness's own session file, or from this log
         // when there is none. Other nodes relay timeline reads to the owner.
         "harness.timeline" => Retention::Local,
+        // Only the node that made them reads these: render receipts and the readiness
+        // deadline, whose attention request replicates.
+        "render.applied" | "runtime.readiness-deadline-reached" => Retention::Local,
+        // The owner's reconciler records its own starts, stops and kills: the stop deadline
+        // fence, restart windows and adoption read them on that node only. Another node
+        // stops a runtime through a replicated `stop` intent. A person's signal names its
+        // requester and replicates.
+        "runtime.action.requested"
+        | "runtime.action.succeeded"
+        | "runtime.action.failed"
+        | "runtime.action.deadline-reached" => Retention::SystemLocal,
+        // Other nodes read the current harness state and usage: step readiness is judged on
+        // the mission's node and fleet views run anywhere. Nothing reads a heartbeat.
+        "harness.observed" | "harness.usage" => Retention::Latest,
         _ => Retention::Durable,
     }
 }
@@ -1935,6 +1959,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("status", string()),
             ("attempt", integer()),
             ("reason", string()),
+            ("goals", array()),
             ("not_before_unix_ms", integer()),
         ],
         "step-run.carried" => &[
@@ -1965,6 +1990,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("status", string()),
             ("owner", reference()),
             ("reviewer", reference()),
+            ("mode", enumeration(&["approve", "feedback"])),
             ("question", string()),
             ("review_targets", array()),
             ("decisions", array()),
@@ -1982,7 +2008,11 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("baseline", boolean()),
         ],
         "gate.result" => &[
-            ("verdict", required_enum(&["pass", "fail", "error"])),
+            (
+                "verdict",
+                required_enum(&["pass", "fail", "error", "feedback"]),
+            ),
+            ("decision", string()),
             ("reason", string()),
             ("operation", reference()),
             ("request", string()),
@@ -2176,7 +2206,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("host", string()),
             ("shutdown_timeout_ms", integer()),
         ],
-        "render.applied" => &[("writes", array())],
+        "render.applied" => &[("writes", array()), ("warnings", array())],
         "runtime.restart-window-reset" => &[
             ("desired_token", string()),
             ("incarnation_id", required_string()),
@@ -2259,6 +2289,11 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("output_tokens", integer()),
             ("total_tokens", integer()),
             ("cached_tokens", integer()),
+            ("cache_write_tokens", integer()),
+            ("owner_run", string()),
+            ("owner_step", string()),
+            ("host", string()),
+            ("observed_at_unix_ms", integer()),
             ("context_used_tokens", integer()),
             ("context_window_tokens", integer()),
             ("context_used_percent", number()),
@@ -2269,7 +2304,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("currency", string()),
             (
                 "semantics",
-                required_enum(&["context_occupancy", "session_cumulative", "response"]),
+                required_enum(&[
+                    "context_occupancy",
+                    "session_cumulative",
+                    "response",
+                    "response_rollup",
+                ]),
             ),
             ("driver", required_string()),
             ("model", string()),
@@ -2281,6 +2321,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
                 required_enum(&["append", "replace", "finalize"]),
             ),
             ("entry_id", required_string()),
+            ("source_id", string()),
             ("sequence", integer()),
             ("revision", required_integer()),
             (
@@ -2488,11 +2529,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
         ],
         "subscription.mission-requested" => &[
             ("mission", required_reference_to(&["mission"])),
-            ("mission_revision", required_string()),
+            ("mission_revision", string()),
             ("resource", required_reference_to(&["resource"])),
             ("resource_input", required_string()),
             ("workspace", required_string()),
             ("discovery", required_string()),
+            ("delivery_key", string()),
             ("requester", reference_to(&["agent", "person"])),
             ("held", boolean()),
         ],

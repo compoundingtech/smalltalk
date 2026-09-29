@@ -6,6 +6,10 @@ use serde_json::Value;
 
 pub const MAX_EVAL_TIMEOUT_MS: u64 = 20 * 60 * 1_000;
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[derive(Debug)]
 pub struct St3Error {
     pub code: &'static str,
@@ -159,6 +163,8 @@ pub struct UsageSummary {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cost: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -375,6 +381,8 @@ impl Default for RetrySpec {
 pub struct StepSpec {
     pub id: String,
     pub path: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fresh_context: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -687,11 +695,19 @@ pub enum GateSpec {
     Human {
         name: String,
         reviewer: String,
+        // Preserve absence in older mission claims: their revision was hashed before
+        // human gates carried a mode. Runtime evaluation treats None as approve.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        mode: Option<String>,
         #[serde(default)]
         question: Option<String>,
         #[serde(default)]
         review_targets: Vec<String>,
     },
+}
+
+fn default_human_gate_mode() -> String {
+    "approve".into()
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -838,6 +854,8 @@ pub struct ObserverSpec {
     pub provider: String,
     pub locator: String,
     pub fields: Vec<String>,
+    #[serde(default)]
+    pub every_ms: Option<u64>,
     pub stopped: bool,
 }
 
@@ -1502,6 +1520,8 @@ pub struct HumanReviewView {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     pub reviewer: String,
+    #[serde(default = "default_human_gate_mode")]
+    pub mode: String,
     pub question: String,
     #[serde(default)]
     pub review_targets: Vec<String>,
@@ -1520,10 +1540,18 @@ pub struct AttentionActionView {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttentionItemView {
     pub kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub review_mode: Option<String>,
     pub subject: String,
     pub person: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub requester_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
     pub title: String,
     pub detail: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2018,6 +2046,8 @@ pub struct StepRunView {
     pub run: String,
     pub generation: String,
     pub step: String,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub fresh_context: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub queue: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2069,6 +2099,13 @@ pub struct StepRunView {
     pub not_before_unix_ms: Option<u128>,
     pub created_at_unix_ms: u128,
     pub updated_at_unix_ms: u128,
+}
+
+pub fn fresh_context_operation(step: &StepRunView) -> String {
+    format!(
+        "fresh-context:{}:{}:{}",
+        step.subject, step.attempt, step.readiness_epoch
+    )
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -2302,6 +2339,10 @@ pub struct ReplicationInventory {
     /// ignore this field and exchange the full inventory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buckets: Vec<ReplicationInventoryBucket>,
+    /// The most envelopes the sending node takes in one exchange. Older peers leave it out and
+    /// are sent at most 512.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepts: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2363,6 +2404,9 @@ pub struct ReplicationReceiveRequest {
     pub peer: String,
     pub fleet_id: String,
     pub exchange: ReplicationExchange,
+    /// How long the worker's request that returned this exchange took, when it made one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round_trip_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2414,7 +2458,56 @@ pub struct ReplicationStatus {
     #[serde(default)]
     pub fenced_envelopes: u64,
     pub unhealthy_projections: u64,
+    /// Each unhealthy projection, such as one replicated claim this build could not project.
+    #[serde(default)]
+    pub unhealthy: Vec<UnhealthyProjection>,
     pub peers: Vec<ReplicationPeerStatus>,
+    /// Where this process spent replication time since it started.
+    #[serde(default)]
+    pub timings: ReplicationTimings,
+}
+
+/// Cumulative replication time in one daemon process since it started, split by stage, for
+/// profiling a sync. Each store stage starts once it holds the store's write connection, so the
+/// stages do not overlap one another, except that admission includes verification and snapshot
+/// includes signing. SQLite time is every statement the process ran, inside any stage or outside
+/// all of them.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ReplicationTimings {
+    /// Exchanges this node received from peers, in either direction.
+    pub exchanges: u64,
+    pub envelopes_received: u64,
+    /// This node's own requests to peers, from send to response, including the peer's work.
+    pub round_trip_ms: u64,
+    /// Comparing inventories and reading envelopes to send.
+    pub export_ms: u64,
+    /// Refreshing this node's inventory and digests after a write, including sealing and
+    /// signing its own new envelopes.
+    pub snapshot_ms: u64,
+    /// Storing received envelopes.
+    pub receipt_ms: u64,
+    /// Validating and admitting received envelopes as claims.
+    pub admission_ms: u64,
+    /// The part of admission spent decoding envelopes, checking their hashes and claim schemas,
+    /// and looking up their stored signatures. Receipt verifies the signatures themselves.
+    pub verify_ms: u64,
+    /// Reducing admitted claims into the current graph.
+    pub projection_ms: u64,
+    pub repair_ms: u64,
+    /// Signing this node's own envelopes with its member key.
+    pub signing_ms: u64,
+    pub sqlite_ms: u64,
+    /// SQLite commits, and their part of `sqlite_ms`. Each one waits for a disk flush.
+    pub commits: u64,
+    pub commit_ms: u64,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct UnhealthyProjection {
+    pub aggregate: String,
+    pub status: String,
+    pub error_code: Option<String>,
+    pub error_message: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

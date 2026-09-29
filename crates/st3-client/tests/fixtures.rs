@@ -94,7 +94,7 @@ fn generated_models_decode_every_stream_fixture() {
 #[test]
 fn generated_resource_union_decodes_all_kinds() {
     let resources: Vec<Resource> = serde_json::from_slice(&fixture("resources.json")).unwrap();
-    assert_eq!(resources.len(), 15);
+    assert_eq!(resources.len(), 17);
     assert!(
         resources
             .iter()

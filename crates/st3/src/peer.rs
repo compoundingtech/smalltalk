@@ -56,6 +56,61 @@ const HEADER_MEMBER_SIGNATURE: &str = "x-st3-member-signature";
 const MEMBER_SIGNATURE_DOMAIN: &str = "st3-member-v1";
 pub(crate) const MAX_EXCHANGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// The HTTP content coding for large exchange bodies: zlib-wrapped deflate. A requester asks
+/// for it with `Accept-Encoding`, and a peer says with the same header in its answer that it
+/// takes it in requests. Signatures cover the uncompressed JSON, so an older build, which
+/// neither asks nor says, exchanges plain JSON as before.
+const EXCHANGE_ENCODING: &str = "deflate";
+
+/// Bodies smaller than this go uncompressed: a quiet exchange is a few kilobytes, while a page
+/// of envelopes is megabytes and deflates to about a third.
+const DEFLATE_MIN_BYTES: usize = 64 * 1024;
+
+fn deflate(body: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::ZlibEncoder::new(
+        Vec::with_capacity(body.len() / 3),
+        flate2::Compression::fast(),
+    );
+    encoder.write_all(body)?;
+    Ok(encoder.finish()?)
+}
+
+/// Inflate an exchange body, refusing one that would expand past `MAX_EXCHANGE_BYTES`.
+fn inflate(body: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut inflated = Vec::with_capacity(body.len() * 3);
+    flate2::read::ZlibDecoder::new(body)
+        .take(MAX_EXCHANGE_BYTES as u64 + 1)
+        .read_to_end(&mut inflated)
+        .context("inflate the exchange body")?;
+    anyhow::ensure!(
+        inflated.len() <= MAX_EXCHANGE_BYTES,
+        "the exchange body inflates past {MAX_EXCHANGE_BYTES} bytes"
+    );
+    Ok(inflated)
+}
+
+fn deflated(headers: &HeaderMap) -> bool {
+    headers
+        .get("content-encoding")
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(EXCHANGE_ENCODING.as_bytes()))
+}
+
+fn accepts_deflate(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("accept-encoding")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|coding| {
+            coding
+                .split(';')
+                .next()
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case(EXCHANGE_ENCODING))
+        })
+}
+
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
@@ -292,6 +347,11 @@ impl FleetAuth {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "operation", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum ClientReadOperation {
+    ConversationChanges {
+        session_id: String,
+        after: Option<String>,
+        wait_ms: u64,
+    },
     Timeline {
         session_id: String,
         limit: usize,
@@ -646,11 +706,14 @@ impl PeerBackend {
         }
     }
 
+    /// Hand an exchange to the main daemon. `round_trip` is how long this worker's request that
+    /// returned it took, when the exchange is a response.
     async fn receive(
         &self,
         peer: &str,
         fleet_id: &str,
         exchange: &ReplicationExchange,
+        round_trip: Option<Duration>,
     ) -> Result<ReplicationReceiveResponse> {
         match self {
             Self::Main(client) => {
@@ -661,12 +724,16 @@ impl PeerBackend {
                             peer: peer.to_owned(),
                             fleet_id: fleet_id.to_owned(),
                             exchange: exchange.clone(),
+                            round_trip_ms: round_trip.map(|duration| duration.as_millis() as u64),
                         },
                     )
                     .await
             }
             #[cfg(test)]
             Self::Local(store) => {
+                if let Some(round_trip) = round_trip {
+                    store.record_replication_round_trip(round_trip);
+                }
                 let receipt = store
                     .receive_replication_exchange(peer, fleet_id, exchange)
                     .map_err(anyhow::Error::msg)?;
@@ -1193,6 +1260,22 @@ async fn receive_client_read(
         );
         let client = st3_client::Client::unix_as(&state.main_socket, &request.authority_actor);
         match request.request {
+            ClientReadOperation::ConversationChanges {
+                session_id,
+                after,
+                wait_ms,
+            } => {
+                anyhow::ensure!(
+                    wait_ms <= CLIENT_READ_MAX_WAIT_MS,
+                    "the conversation wait exceeds its bound"
+                );
+                Ok(serde_json::to_value(
+                    client
+                        .conversation_changes(&session_id, after.as_deref(), wait_ms)
+                        .await?
+                        .value,
+                )?)
+            }
             ClientReadOperation::Timeline {
                 session_id,
                 limit,
@@ -1513,22 +1596,22 @@ async fn dial_peer(
         match exchange(&http, &backend, &node, &peer, &auth, &fleet, &main_socket).await {
             Ok(moved) => {
                 backoff = Duration::from_secs(1);
-                // A busy harness can write several observations while one exchange is in
-                // flight. Keep the first exchange immediate, then coalesce the resulting wake
-                // burst without disabling the 30-second retry path. The window stays short so a
-                // publish is startable on every peer within seconds.
-                let not_before = tokio::time::Instant::now() + REPLICATION_WAKE_COALESCE;
                 if moved {
-                    // One exchange carries a bounded batch. Keep going while envelopes still
-                    // move instead of leaving the rest of a backlog to the timer.
+                    // One exchange carries a bounded batch. Keep going at once while envelopes
+                    // still move instead of leaving the rest of a backlog to the timer.
                     notify.borrow_and_update();
                 } else {
+                    // A busy harness can write several observations while one exchange is in
+                    // flight. Keep the first exchange immediate, then coalesce the resulting
+                    // wake burst without disabling the 30-second retry path. The window stays
+                    // short so a publish is startable on every peer within seconds.
+                    let not_before = tokio::time::Instant::now() + REPLICATION_WAKE_COALESCE;
                     tokio::select! {
                         _ = notify.changed() => {}
                         _ = tokio::time::sleep(worker_interval(Duration::from_secs(30))) => {}
                     }
+                    tokio::time::sleep_until(not_before).await;
                 }
-                tokio::time::sleep_until(not_before).await;
             }
             Err(error) => {
                 if let Some(removed) = error.downcast_ref::<RemovedFromFleet>() {
@@ -1583,6 +1666,20 @@ async fn receive_exchange(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let body = if deflated(&headers) {
+        match inflate(&body) {
+            Ok(body) => Bytes::from(body),
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("replication request body: {error:#}"),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        body
+    };
     let sender = match state
         .auth
         .verify_sender(&headers, "POST", EXCHANGE_PATH, &body, None, None)
@@ -1608,7 +1705,7 @@ async fn receive_exchange(
             serde_json::from_slice(&body).context("decode the replication exchange")?;
         let received = state
             .backend
-            .receive(&relay, state.auth.fleet_id(), &request)
+            .receive(&relay, state.auth.fleet_id(), &request, None)
             .await?;
         if received.changed {
             wake_main(&state.main_socket).await;
@@ -1628,12 +1725,13 @@ async fn receive_exchange(
                 &request.signature_requests,
             )
             .await?;
-        signed_response(
+        let response = signed_response(
             &state,
             &request_digest,
             response.store_index,
             response.exchange,
-        )
+        )?;
+        deflate_response(response, accepts_deflate(&headers)).await
     }
     .await;
     match result {
@@ -1775,6 +1873,31 @@ fn signed_response_for<T: Serialize>(
     Ok(response)
 }
 
+/// Say that this node takes compressed requests, and compress a large signed response body
+/// for a requester that asked. The signature covers the uncompressed JSON.
+async fn deflate_response(response: Response, requested: bool) -> Result<Response> {
+    let (mut parts, body) = response.into_parts();
+    parts.headers.insert(
+        "accept-encoding",
+        HeaderValue::from_static(EXCHANGE_ENCODING),
+    );
+    let body = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .context("read the signed response body")?;
+    if !requested || body.len() < DEFLATE_MIN_BYTES {
+        return Ok(Response::from_parts(parts, axum::body::Body::from(body)));
+    }
+    parts.headers.insert(
+        "content-encoding",
+        HeaderValue::from_static(EXCHANGE_ENCODING),
+    );
+    parts.headers.remove("content-length");
+    Ok(Response::from_parts(
+        parts,
+        axum::body::Body::from(deflate(&body)?),
+    ))
+}
+
 fn signed_error_response(
     state: &PeerState,
     request_digest: &str,
@@ -1840,12 +1963,16 @@ async fn exchange(
         envelopes: Vec::new(),
         ..first
     };
-    let remote = post_signed(http, peer, node, auth, fleet, &query).await?;
+    let started = std::time::Instant::now();
+    let (remote, peer_inflates) = post_signed(http, peer, node, auth, fleet, &query, false).await?;
+    let round_trip = started.elapsed();
     let different = remote.inventory.digest != local_digest;
-    let pulled = !remote.envelopes.is_empty();
     let received = backend
-        .receive(&peer.name, auth.fleet_id(), &remote)
+        .receive(&peer.name, auth.fleet_id(), &remote, Some(round_trip))
         .await?;
+    // Progress means new envelopes stored on one side or the other. A peer that keeps sending,
+    // or keeps being sent, envelopes that are never stored must not keep the worker busy.
+    let pulled = received.receipt.received != 0;
     if received.changed {
         wake_main(main_socket).await;
     }
@@ -1863,12 +1990,17 @@ async fn exchange(
             )
             .await?
             .exchange;
-        pushed = !push.envelopes.is_empty();
-        let response = post_signed(http, peer, node, auth, fleet, &push).await?;
-        pulled_follow_up = !response.envelopes.is_empty();
+        let started = std::time::Instant::now();
+        // A peer that says it takes compressed requests gets a large push compressed.
+        let (response, _) =
+            post_signed(http, peer, node, auth, fleet, &push, peer_inflates).await?;
+        let round_trip = started.elapsed();
+        // The peer stores a push before it answers, so its inventory moved if the push landed.
+        pushed = !push.envelopes.is_empty() && response.inventory.digest != remote.inventory.digest;
         let received = backend
-            .receive(&peer.name, auth.fleet_id(), &response)
+            .receive(&peer.name, auth.fleet_id(), &response, Some(round_trip))
             .await?;
+        pulled_follow_up = received.receipt.received != 0;
         if received.changed {
             wake_main(main_socket).await;
         }
@@ -1876,6 +2008,8 @@ async fn exchange(
     Ok(pulled || pulled_follow_up || pushed)
 }
 
+/// Send one signed exchange, compressed when `compress` is set and the body is large, and return
+/// the peer's verified answer and whether the peer takes compressed requests.
 async fn post_signed(
     http: &reqwest::Client,
     peer: &PeerConfig,
@@ -1883,17 +2017,26 @@ async fn post_signed(
     auth: &FleetAuth,
     fleet: &FleetContext,
     exchange: &ReplicationExchange,
-) -> Result<ReplicationExchange> {
+    compress: bool,
+) -> Result<(ReplicationExchange, bool)> {
     let body = serde_json::to_vec(exchange)?;
     let request_digest = FleetAuth::body_digest(&body);
     let headers = auth.request_headers(node, &body)?;
     let endpoint = format!("{}{}", peer.url.trim_end_matches('/'), EXCHANGE_PATH);
     let started = std::time::Instant::now();
-    let response = http
+    let mut request = http
         .post(&endpoint)
         .headers(headers)
         .header("content-type", "application/json")
-        .body(body)
+        .header("accept-encoding", EXCHANGE_ENCODING);
+    request = if compress && body.len() >= DEFLATE_MIN_BYTES {
+        request
+            .header("content-encoding", EXCHANGE_ENCODING)
+            .body(deflate(&body)?)
+    } else {
+        request.body(body)
+    };
+    let response = request
         .send()
         .await
         .with_context(|| {
@@ -1916,6 +2059,11 @@ async fn post_signed(
             )
         })?
         .to_vec();
+    let bytes = if deflated(&headers) {
+        inflate(&bytes)?
+    } else {
+        bytes
+    };
     let responder = auth.verify_sender(
         &headers,
         "RESPONSE",
@@ -1960,7 +2108,7 @@ async fn post_signed(
         response.api_version == "st3.v1",
         "the peer API version differs"
     );
-    Ok(response.value)
+    Ok((response.value, accepts_deflate(&headers)))
 }
 
 async fn wake_main(socket: &Path) {
@@ -2172,6 +2320,213 @@ mod tests {
         assert_eq!(changed.value.lines[1].text, "$ echo remote");
         assert_eq!(changed.value.runtime_incarnation, "remote-runtime:i1");
         assert_ne!(changed.value.revision, first.value.revision);
+    }
+
+    #[tokio::test]
+    async fn a_gateway_receives_remote_conversation_changes_without_idle_data() {
+        let owner_root = tempfile::tempdir().unwrap();
+        let gateway_root = tempfile::tempdir().unwrap();
+        let make_state = |root: &Path, node: &str| crate::api::AppState {
+            store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"),
+            pty_binary: root.join("unused-pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
+        };
+        let owner = make_state(owner_root.path(), "conversation-owner");
+        let mut gateway = make_state(gateway_root.path(), "conversation-gateway");
+        let agent = "agent/conversation-peer";
+        let incarnation = "conversation-runtime:i1";
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    (
+                        "runtime_id".into(),
+                        serde_json::json!("conversation-runtime"),
+                    ),
+                    ("incarnation_id".into(), serde_json::json!(incarnation)),
+                    ("status".into(), serde_json::json!("running")),
+                    ("terminal".into(), serde_json::json!(false)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("conversation-peer-runtime".into()),
+            })
+            .unwrap();
+        gateway
+            .store
+            .import_replication(
+                "conversation-owner",
+                &owner.store.export_replication(0).unwrap(),
+            )
+            .unwrap();
+        let session_id = format!(
+            "session/{}",
+            &hex::encode(sha2::Sha256::digest(
+                format!("{agent}:{incarnation}").as_bytes()
+            ))[..24]
+        );
+        let owner_socket = owner_root.path().join("st3.sock");
+        let served_owner = owner_socket.clone();
+        let owner_app = crate::api::router(owner.clone());
+        tokio::spawn(async move { crate::api::serve_unix(&served_owner, owner_app).await });
+        let peer = PeerState {
+            backend: PeerBackend::Main(Client::unix(&owner_socket)),
+            node: "conversation-owner".into(),
+            auth: FleetAuth::test("fleet-test", &[7; 32]),
+            fleet: FleetContext::legacy(BTreeSet::from(["conversation-gateway".into()])),
+            main_socket: owner_socket.clone(),
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, peer_router(peer)).await });
+        let secret = gateway_root.path().join("fleet-secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        gateway.client_relay = ClientRelay::from_config(&Config {
+            node: "conversation-gateway".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig {
+                name: "conversation-owner".into(),
+                url: format!("http://{address}"),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let gateway_socket = gateway_root.path().join("st3.sock");
+        let served_gateway = gateway_socket.clone();
+        tokio::spawn(async move {
+            crate::api::serve_unix(&served_gateway, crate::api::router(gateway)).await
+        });
+        for socket in [&owner_socket, &gateway_socket] {
+            for _ in 0..200 {
+                if tokio::net::UnixStream::connect(socket).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        let client = st3_client::Client::unix_as(&gateway_socket, "person/example");
+        let baseline = client
+            .conversation_changes(&session_id, None, 0)
+            .await
+            .unwrap()
+            .value;
+        assert!(baseline.items.is_empty());
+        let cursor = baseline.next_cursor;
+        let mut stream = client.conversation_stream(&session_id, None).await.unwrap();
+        let opened = stream.next().await.unwrap().unwrap();
+        assert!(opened.value.items.is_empty());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stream.next())
+                .await
+                .is_err()
+        );
+        let idle = client
+            .conversation_changes(&session_id, Some(&cursor), 100)
+            .await
+            .unwrap()
+            .value;
+        assert!(idle.items.is_empty());
+        let waiting_client = client.clone();
+        let waiting_id = session_id.clone();
+        let waiting_cursor = cursor.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_client
+                .conversation_changes(&waiting_id, Some(&waiting_cursor), 1000)
+                .await
+                .unwrap()
+                .value
+        });
+        tokio::task::yield_now().await;
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: "message/conversation-peer-first".into(),
+                kind: "message.sent".into(),
+                actor: Some("person/example".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), serde_json::json!("person/example")),
+                    ("to".into(), serde_json::json!(agent)),
+                    ("session_id".into(), serde_json::json!(session_id)),
+                    ("content".into(), serde_json::json!("hello")),
+                    ("status".into(), serde_json::json!("sent")),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("conversation-peer-message".into()),
+            })
+            .unwrap();
+        owner.event_notify.send_modify(|value| *value += 1);
+        let first = tokio::time::timeout(Duration::from_millis(900), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(first.items.len(), 2);
+        let resume = first.next_cursor;
+        let streamed = tokio::time::timeout(Duration::from_millis(900), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(streamed.value.items.len(), 2);
+        let stream_cursor = streamed.value.next_cursor;
+        stream.close().await;
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "harness.timeline".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    ("operation".into(), serde_json::json!("append")),
+                    (
+                        "entry_id".into(),
+                        serde_json::json!("timeline-entry/conversation-peer-reply"),
+                    ),
+                    ("revision".into(), serde_json::json!(1)),
+                    ("role".into(), serde_json::json!("assistant")),
+                    ("entry_type".into(), serde_json::json!("content")),
+                    ("final".into(), serde_json::json!(true)),
+                    (
+                        "body".into(),
+                        serde_json::json!({"media_type":"text/plain","text":"reply"}),
+                    ),
+                    ("driver".into(), serde_json::json!("codex")),
+                    ("incarnation_id".into(), serde_json::json!(incarnation)),
+                    ("sequence".into(), serde_json::json!(1)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("conversation-peer-reply".into()),
+            })
+            .unwrap();
+        let replay = client
+            .conversation_changes(&session_id, Some(&resume), 0)
+            .await
+            .unwrap()
+            .value;
+        assert_eq!(replay.items.len(), 1);
+        let mut reconnected = client
+            .conversation_stream(&session_id, Some(&stream_cursor))
+            .await
+            .unwrap();
+        let resumed = reconnected.next().await.unwrap().unwrap();
+        assert_eq!(resumed.value.items.len(), 1);
+        reconnected.close().await;
     }
 
     #[tokio::test]
@@ -2437,6 +2792,118 @@ mod tests {
         .unwrap();
     }
 
+    #[test]
+    fn exchange_bodies_deflate_and_refuse_a_body_that_inflates_too_far() {
+        let body = serde_json::to_vec(&serde_json::json!({"envelopes": vec!["same"; 1_000]})).unwrap();
+        let compressed = deflate(&body).unwrap();
+        assert!(compressed.len() * 10 < body.len());
+        assert_eq!(inflate(&compressed).unwrap(), body);
+
+        let bomb = deflate(&vec![0_u8; MAX_EXCHANGE_BYTES + 1]).unwrap();
+        assert!(bomb.len() < 1024 * 1024);
+        assert!(inflate(&bomb).is_err());
+        assert!(inflate(b"not deflate").is_err());
+
+        let mut headers = HeaderMap::new();
+        assert!(!accepts_deflate(&headers));
+        headers.insert("accept-encoding", HeaderValue::from_static("gzip, Deflate;q=0.5"));
+        assert!(accepts_deflate(&headers));
+        headers.insert("accept-encoding", HeaderValue::from_static("gzip, deflated"));
+        assert!(!accepts_deflate(&headers));
+    }
+
+    #[tokio::test]
+    async fn the_peer_route_deflates_only_for_a_requester_that_asks() {
+        let fleet = "1f91ca65-7793-48cc-866e-ac15690130e1";
+        let auth = FleetAuth::test(fleet, &[5; 32]);
+        // Enough envelopes that the answer to an empty inventory is worth compressing.
+        let target = Arc::new(Store::open_memory("target").unwrap());
+        target.bind_fleet(fleet).unwrap();
+        for index in 0..300 {
+            target
+                .append_claim(&ClaimInput {
+                    subject: format!("host/peer-{index}"),
+                    kind: "transport.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let state = PeerState {
+            backend: PeerBackend::Local(target),
+            node: "target".into(),
+            auth: auth.clone(),
+            fleet: FleetContext::legacy(BTreeSet::from(["source".into()])),
+            main_socket: PathBuf::from("/no/such/socket"),
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let exchange = ReplicationExchange {
+            peer: "source".into(),
+            fleet_id: fleet.into(),
+            schema_digest: st3_schema::registry().digest(),
+            authority_digest: String::new(),
+            graph_digest: String::new(),
+            inventory: ReplicationInventory::default(),
+            envelopes: Vec::new(),
+            signature_requests: Vec::new(),
+            signatures: Vec::new(),
+        };
+        let body = serde_json::to_vec(&exchange).unwrap();
+        let request_digest = FleetAuth::body_digest(&body);
+        // An older build sends plain JSON and does not ask for compression; a new one sends a
+        // compressed request once the peer has answered compressed, and always asks.
+        for (compress, ask) in [(false, false), (false, true), (true, true)] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(EXCHANGE_PATH)
+                .body(Body::from(if compress {
+                    deflate(&body).unwrap()
+                } else {
+                    body.clone()
+                }))
+                .unwrap();
+            request
+                .headers_mut()
+                .extend(auth.request_headers("source", &body).unwrap());
+            if compress {
+                request.headers_mut().insert(
+                    "content-encoding",
+                    HeaderValue::from_static(EXCHANGE_ENCODING),
+                );
+            }
+            if ask {
+                request.headers_mut().insert(
+                    "accept-encoding",
+                    HeaderValue::from_static(EXCHANGE_ENCODING),
+                );
+            }
+            let response = peer_router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let headers = response.headers().clone();
+            assert!(accepts_deflate(&headers), "a new build takes compressed requests");
+            assert_eq!(deflated(&headers), ask);
+            let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let response_body = if ask {
+                inflate(&response_body).unwrap()
+            } else {
+                response_body.to_vec()
+            };
+            assert!(response_body.len() >= DEFLATE_MIN_BYTES);
+            auth.verify(
+                &headers,
+                "RESPONSE",
+                EXCHANGE_PATH,
+                &response_body,
+                Some("target"),
+                Some(&request_digest),
+            )
+            .unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn signed_peer_exchange_moves_new_authority_in_both_directions() {
         let fleet = "1f91ca65-7793-48cc-866e-ac15690130e1";
@@ -2498,7 +2965,7 @@ mod tests {
             url: format!("http://{address}"),
         };
         let http = replication_http_client();
-        exchange(
+        let pushed = exchange(
             &http,
             &PeerBackend::Local(source.clone()),
             "source",
@@ -2509,6 +2976,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(pushed, "the peer stored what this node pushed");
         assert!(
             target
                 .latest_claim("host/source", Some("transport.observed"))
@@ -2527,7 +2995,7 @@ mod tests {
                 idempotency_key: Some("target-up".into()),
             })
             .unwrap();
-        exchange(
+        let pulled = exchange(
             &http,
             &PeerBackend::Local(source.clone()),
             "source",
@@ -2538,6 +3006,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(pulled, "this node stored what the peer sent");
         assert!(
             source
                 .latest_claim("host/target", Some("transport.observed"))
@@ -2555,7 +3024,7 @@ mod tests {
             1,
             "the two-phase exchanges and later wakeup should reuse one TCP connection"
         );
-        exchange(
+        let moved = exchange(
             &replication_http_client(),
             &PeerBackend::Local(source.clone()),
             "source",
@@ -2566,6 +3035,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(!moved, "converged nodes store nothing, so the worker may rest");
         assert_eq!(
             connection_ports.lock().unwrap().len(),
             2,
@@ -2632,7 +3102,10 @@ mod tests {
             .export_replication_exchange(fleet, &ReplicationInventory::default())
             .unwrap();
         let backend = PeerBackend::Main(Client::unix(socket));
-        let received = backend.receive("source", fleet, &exchange).await.unwrap();
+        let received = backend
+            .receive("source", fleet, &exchange, None)
+            .await
+            .unwrap();
         assert!(received.changed);
         assert!(received.receipt.received > 0);
         let exported = backend
@@ -2678,7 +3151,10 @@ mod tests {
                 .len(),
             before + 1
         );
-        backend.receive("source", fleet, &exchange).await.unwrap();
+        backend
+            .receive("source", fleet, &exchange, None)
+            .await
+            .unwrap();
         let recovered = store
             .latest_claim("host/source", Some("transport.observed"))
             .unwrap()

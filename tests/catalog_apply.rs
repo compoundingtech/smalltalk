@@ -1014,7 +1014,8 @@ fn bootstrap_replay_validates_the_same_catalog_capability_it_locked() {
 }
 
 fn wait_for(path: &Path) {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    // Publication can be delayed while other CI suites saturate the shared host.
+    let deadline = Instant::now() + Duration::from_secs(20);
     while !path.exists() {
         assert!(
             Instant::now() < deadline,

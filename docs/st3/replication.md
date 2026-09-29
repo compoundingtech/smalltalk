@@ -57,7 +57,7 @@ The service installer creates a separate systemd user service or launchd agent f
 
 A local graph change writes `replication.wake`. The worker watches only this file, not the SQLite files.
 
-The worker coalesces wake bursts for one second, so new authority, such as a mission publish, reaches every peer within seconds. An exchange that moved envelopes runs again at once until a backlog drains.
+The worker coalesces wake bursts for one second, so new authority, such as a mission publish, reaches every peer within seconds. An exchange that stored new envelopes on either side runs again at once until a backlog drains. An exchange that stored nothing new waits for the next wake, even if it carried envelopes the other side already held.
 
 The worker also runs a 30-second anti-entropy exchange. This timer repairs a missed file event or a network interruption.
 
@@ -75,9 +75,11 @@ The inventory is a set, not a high-water cursor. Sparse delivery and two candida
 
 The inventory is compact. It carries one digest per writer range of 256 sequences, and it lists identities only for ranges whose digests differ. A peer sends a range the other side lacks entirely, and it sends identities within a differing range only after the other side has listed that range. One two-phase exchange therefore converges both directions without sending the whole authority log. A peer without range digests receives and sends the full identity list, as before.
 
-One exchange carries at most 512 envelopes in each direction.
+Each inventory says how many envelopes its sender takes in one exchange, 4,096 for this build. A peer sends at most that many, and at most 512 to a peer whose inventory does not say, as older builds do not.
 
 Each missing envelope contains one base64-encoded CBOR payload. Receipt stores the outer envelope before it decodes the payload.
+
+An exchange body larger than 64 KiB travels deflate-compressed (`Content-Encoding: deflate`), which shrinks a page of envelopes to about a third. A requester asks for compressed answers with `Accept-Encoding: deflate`; a peer's answer carries the same header when it takes compressed requests, and the requester then compresses its push. Signatures cover the uncompressed JSON, and an inflated body may not exceed the 64 MB exchange limit. An older build neither asks nor says, so it exchanges plain JSON.
 
 The payload is only an immutable claim batch plus the content-addressed blobs those claims
 reference. Nodes do not send SQLite rows, leases, reducers, projections, or runtime snapshots.
@@ -92,9 +94,22 @@ Each receiver derives projections locally from the admitted claims.
 
 An unknown or invalid record stays in `replica_records`. It does not block a valid sibling or a later envelope.
 
+Admission commits once per pass over the pending envelopes, so one disk flush covers an exchange. Each envelope is admitted in its own savepoint, so an invalid one is rolled back and recorded alone.
+
+A node catching up with a peer, one more than one exchange behind it, projects at most every 30 seconds and again as soon as it has caught up. History arrives older than the node's own claims, so the node cannot extend its projection incrementally; projecting after every exchange would replay the whole graph each time. Meanwhile `st now`, `st missions ls` and stui say the node is syncing.
+
 An unknown claim kind or field can become valid after a schema upgrade. Admission retries unknown records on each wake and startup. Records that older builds classified as invalid solely because of an unknown field are also reconsidered, preserving and admitting the original signed claim when the upgraded schema recognizes it.
 
 A projection fault keeps the last good projection. The daemon continues to serve status and repair commands.
+
+A valid claim can still fail to project, for example a body written by another build. That claim
+is quarantined on its own: its projection is rolled back, and every other claim, from every peer,
+still reaches the graph. `st replication status` lists it as an `unhealthy` projection named
+`projection:base:CLAIM` or `projection:runs:CLAIM`, and `st doctor` names it. Each full replay
+decides the claim again.
+
+A repair that cannot be applied is listed the same way, as `repair:CLAIM`. The other repairs still
+apply, and the daemon still starts.
 
 ## Deterministic convergence
 
@@ -138,6 +153,18 @@ with different digests counts exactly once the peer lists it; until then its cou
 bound. The estimate divides the remaining envelopes by how fast that number shrank over recent
 10-second windows, so a peer that keeps writing lengthens it. The measurements live in memory; the
 first exchange after a restart rebuilds them.
+
+The `timings` line shows where this daemon has spent replication time since it started:
+
+```text
+timings	486 exchanges, 130004 envelopes received; ms: round-trip=6088 export=340 snapshot=2775 receipt=1591 admission=33634 (verify=1971) projection=489104 repair=12 signing=0 sqlite=566278 (132887 commits, 17587 ms)
+```
+
+Each store stage counts only the time it holds the store's write connection, so one stage does
+not count another's wait. Round trips are this node's own requests to its peers, including the
+peer's work to answer them. SQLite time is every statement the daemon ran; each commit waits for
+a disk flush. `/v1/replication/status` carries the same numbers as `timings`.
+`crates/st3/tests/first_sync.rs` uses them to profile an empty node syncing from a peer; `cargo test --release -p st3 --test first_sync -- --nocapture` runs it.
 
 A node is catching up while a peer measured in the last five minutes holds more envelopes than one
 exchange carries. During that time its projections can show early history as current: a request
