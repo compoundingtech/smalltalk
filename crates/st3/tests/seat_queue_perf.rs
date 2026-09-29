@@ -4,7 +4,7 @@
 //!
 //! ```sh
 //! ST3_PERF_STORE=/path/to/copy/claims.sqlite3 \
-//!   cargo test --release -p st3 --test seat_queue_perf -- --ignored --nocapture
+//!   cargo test --release -p st3 --test integration seat_queue_perf:: -- --ignored --nocapture
 //! ```
 
 use std::path::PathBuf;

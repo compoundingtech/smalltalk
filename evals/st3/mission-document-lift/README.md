@@ -10,5 +10,5 @@ The producing step binds the exact immutable mission revision. A later step uses
 
 Mechanical gates prove publication order, exact revision binding, inherited assignment, complete graph work, the final graph product, and the file result.
 
-Validate its graph contract with `cargo test -p st3 --test examples`; live orchestration uses the
+Validate its graph contract with `cargo test -p st3 --test integration examples::`; live orchestration uses the
 repository's internal eval controller, not the public CLI.
