@@ -61,5 +61,22 @@ frame with code `stale-fence` ends that subscription only. Unsubscribing, or
 closing the socket, stops following; `terminal.detach` still ends the viewer
 record. After a dropped socket, attach again and subscribe on the new socket.
 
+## Conversations
+
+A conversation is one more subscription too. Name an agent or a session:
+
+```json
+{"kind":"subscribe","id":"talk","collection":"conversation","conversation":"agent/ID"}
+```
+
+An agent's conversation is its current session's timeline with the Small Talk to or from the agent
+joined in. The first `conversation` frame carries `id`, `collection` (`conversation`),
+`session_id`, `replace: true`, the newest page of timeline `items`, and `has_more`. Later frames
+carry `replace: false` and the entries that changed since; an entry revised in place arrives
+again with its new revision. When too much changed for one frame, or a change can no longer be
+replayed, the newest page arrives again with `replace: true`. An `error` frame ends that
+subscription only, for example while the owning host is unreachable. After a dropped socket,
+subscribe again on the new one.
+
 `st missions ls --watch`, `st attention ls --watch`, `st agents ls --watch`,
 and `st work ls --watch` consume this same transport.

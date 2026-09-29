@@ -1166,6 +1166,48 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
     let error: st3_client::ErrorEnvelope = denied.json().await.unwrap();
     assert_eq!(error.code, st3_client::ErrorCode::Forbidden);
 
+    // A phone's one socket: the paired gateway passes the collections subprotocol, holds a
+    // window, and carries a terminal on the same socket. A bad credential never opens it.
+    assert!(
+        Client::fabric_loopback(&base, "not-a-real-client-credential")
+            .collection_stream()
+            .await
+            .is_err()
+    );
+    let mut collections = client.collection_stream().await.unwrap();
+    collections
+        .subscribe("missions", "missions", 20, None, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_collection_event(&mut collections, "the paired missions snapshot").await,
+        CollectionEvent::Snapshot { id, .. } if id == "missions"
+    ));
+    let socket_attachment = attach_terminal(&client, "fabric-collection").await;
+    collections
+        .subscribe_terminal(
+            "screen",
+            &socket_attachment.terminal_id,
+            Some("terminal-demo-runtime:fabric-i1"),
+            socket_attachment.stream_capability.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+    loop {
+        match next_collection_event(&mut collections, "the paired terminal screen").await {
+            CollectionEvent::Screen { id, screen } if id == "screen" => {
+                assert_eq!(
+                    screen.value.runtime_incarnation,
+                    "terminal-demo-runtime:fabric-i1"
+                );
+                break;
+            }
+            CollectionEvent::Changes { id, .. } if id == "missions" => {}
+            other => panic!("expected the paired terminal screen, got {other:?}"),
+        }
+    }
+    drop(collections);
+
     let fabric_attachment = attach_terminal(&client, "fabric-first").await;
     let (_terminal_stream, terminal) =
         first_screen(&client, &fabric_attachment, "terminal-demo-runtime:fabric-i1")
