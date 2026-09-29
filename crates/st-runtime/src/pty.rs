@@ -248,6 +248,7 @@ impl PtyRuntime {
             ]);
         }
         arguments.push(OsString::from("--"));
+        arguments.extend(crate::work_prefix().into_iter().map(OsString::from));
         match launch {
             Launch::Shell(source) => {
                 arguments.extend([OsString::from("sh"), OsString::from("-c"), source.into()]);
@@ -275,9 +276,10 @@ impl PtyRuntime {
                 }
             };
             if output.status.success() {
-                self.wait_for_publication(id, previous_incarnation.as_deref())?;
+                let published = self.wait_for_publication(id, previous_incarnation.as_deref())?;
                 std::fs::remove_file(&fence)
                     .with_context(|| format!("clear PTY publication fence {}", fence.display()))?;
+                crate::protect_servers(std::slice::from_ref(&published));
                 return Ok(());
             }
             last_error = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -358,16 +360,21 @@ impl PtyRuntime {
             .join(format!("{digest:x}"))
     }
 
-    fn wait_for_publication(&self, id: &str, previous_incarnation: Option<&str>) -> Result<()> {
+    /// Waits for `id` to publish an incarnation other than `previous_incarnation`, and returns it.
+    fn wait_for_publication(
+        &self,
+        id: &str,
+        previous_incarnation: Option<&str>,
+    ) -> Result<PtyObservation> {
         let deadline = Instant::now() + self.spawn_timeout;
         loop {
-            if self.snapshot()?.into_iter().any(|observation| {
+            if let Some(published) = self.snapshot()?.into_iter().find(|observation| {
                 observation.name == id
-                    && observation_incarnation(&observation)
+                    && observation_incarnation(observation)
                         .as_deref()
                         .is_some_and(|current| Some(current) != previous_incarnation)
             }) {
-                return Ok(());
+                return Ok(published);
             }
             if Instant::now() >= deadline {
                 return Err(PtySpawnTimeout {
@@ -594,7 +601,7 @@ impl PtyRuntime {
 }
 
 /// A wedged PTY command must not stall the reconciler indefinitely.
-fn output_within(mut command: Command, timeout: Duration) -> Result<Output> {
+pub(crate) fn output_within(mut command: Command, timeout: Duration) -> Result<Output> {
     let child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1277,5 +1284,151 @@ exit 0
         assert_eq!(timeout_error.phase, PtySpawnTimeoutPhase::Lock);
         assert_eq!(timeout_error.timeout, timeout);
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// The installed `pty`, when this host runs sessions in systemd user scopes.
+    fn scoped_pty() -> Option<PathBuf> {
+        if crate::isolation_mode() != crate::Isolation::Scope {
+            return None;
+        }
+        let environment = BTreeMap::from([("PATH".into(), std::env::var("PATH").ok()?)]);
+        crate::resolve_executable("pty", &environment).ok()
+    }
+
+    fn cgroup_leaf(pid: u32) -> String {
+        let text = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+        let path = text
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .unwrap();
+        path.rsplit('/').next().unwrap().to_owned()
+    }
+
+    fn cgroup_file(pid: u32, file: &str) -> String {
+        let text = fs::read_to_string(format!("/proc/{pid}/cgroup")).unwrap();
+        let path = text
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .unwrap();
+        fs::read_to_string(
+            Path::new("/sys/fs/cgroup")
+                .join(path.trim_start_matches('/'))
+                .join(file),
+        )
+        .unwrap()
+    }
+
+    /// A harness that writes its pid to `pid` and waits.
+    fn waiting_harness(pid: &Path) -> Launch {
+        Launch::Argv(vec![
+            "sh".into(),
+            "-c".into(),
+            format!("echo $$ > '{}'; exec sleep 60", pid.display()),
+        ])
+    }
+
+    fn read_pid(path: &Path) -> u32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(pid) = fs::read_to_string(path)
+                .ok()
+                .and_then(|text| text.trim().parse().ok())
+            {
+                return pid;
+            }
+            assert!(Instant::now() < deadline, "the harness never wrote its pid");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Asks st to protect `id`'s server until it runs in its own scope, then checks that the
+    /// harness stayed behind in the scope st started the session in.
+    fn assert_server_left_its_harness(runtime: &PtyRuntime, id: &str, harness: u32) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let (server, work_unit) = loop {
+            let observation = runtime.session(id).map(observation).unwrap().unwrap();
+            crate::protect_servers(std::slice::from_ref(&observation));
+            let server = observation.pid.unwrap();
+            if cgroup_leaf(server) == crate::server_unit(id, server) {
+                break (server, observation.tags["st3.scope-unit"].clone());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "PTY server {server} stayed in {}",
+                cgroup_leaf(server)
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert_eq!(cgroup_leaf(harness), work_unit);
+        assert_eq!(cgroup_file(server, "cpu.weight").trim(), "1000");
+        assert_eq!(cgroup_file(harness, "cpu.weight").trim(), "100");
+    }
+
+    #[test]
+    fn a_spawned_pty_server_runs_apart_from_its_harness() {
+        let Some(pty) = scoped_pty() else {
+            eprintln!("skipped: no systemd user scopes or no pty binary");
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let runtime = PtyRuntime::new(root.path().join("r")).with_binary(pty.to_string_lossy());
+        let pid_file = root.path().join("harness.pid");
+        let environment = BTreeMap::from([("PATH".into(), std::env::var("PATH").unwrap())]);
+        runtime
+            .spawn(
+                "protect-spawn",
+                &waiting_harness(&pid_file),
+                root.path(),
+                &environment,
+                None,
+                &BTreeMap::new(),
+            )
+            .unwrap();
+        let harness = read_pid(&pid_file);
+
+        assert_server_left_its_harness(&runtime, "protect-spawn", harness);
+        runtime.stop("protect-spawn").unwrap();
+    }
+
+    #[test]
+    fn a_pty_server_from_an_older_release_moves_when_observed() {
+        let Some(pty) = scoped_pty() else {
+            eprintln!("skipped: no systemd user scopes or no pty binary");
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("r");
+        let pid_file = root.path().join("harness.pid");
+        let Launch::Argv(harness_argv) = waiting_harness(&pid_file) else {
+            unreachable!()
+        };
+        // An older release started the server in the session's scope and left it there.
+        let unit = crate::scope_unit("st3", "protect-old");
+        let mut arguments = vec![
+            "run".to_owned(),
+            "-d".into(),
+            "--id".into(),
+            "protect-old".into(),
+            "--tag".into(),
+            format!("st3.scope-unit={unit}"),
+            "--".into(),
+        ];
+        arguments.extend(harness_argv);
+        let argument_refs = arguments
+            .iter()
+            .map(std::ffi::OsStr::new)
+            .collect::<Vec<_>>();
+        let status = crate::wrap_isolated(&unit, pty.as_os_str(), &argument_refs)
+            .env("PTY_ROOT", &registry)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let harness = read_pid(&pid_file);
+        let runtime = PtyRuntime::new(registry).with_binary(pty.to_string_lossy());
+        let server = runtime.session("protect-old").unwrap().pid.unwrap() as u32;
+        assert_eq!(cgroup_leaf(server), unit);
+
+        assert_server_left_its_harness(&runtime, "protect-old", harness);
+        runtime.stop("protect-old").unwrap();
     }
 }

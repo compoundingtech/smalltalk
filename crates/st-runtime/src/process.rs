@@ -90,6 +90,19 @@ impl ExecRuntime {
                 )
             }
         };
+        // Builds and tests run below the live path; see `crate::priority`.
+        let (program, arguments) = match crate::work_prefix().split_first() {
+            Some((prefix, prefix_arguments)) => (
+                OsString::from(prefix),
+                prefix_arguments
+                    .iter()
+                    .map(OsString::from)
+                    .chain(std::iter::once(program))
+                    .chain(arguments)
+                    .collect(),
+            ),
+            None => (program, arguments),
+        };
         let unit = crate::scope_unit("st3", id);
         let argument_refs = arguments
             .iter()
