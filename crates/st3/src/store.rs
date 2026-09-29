@@ -17087,123 +17087,135 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
         .query_map([], claim_from_row)?
         .collect::<Result<Vec<_>, _>>()?;
     drop(statement);
+    clear_quarantined_claims_tx(transaction, "projection:planning")?;
     for claim in claims {
-        let id = claim
-            .subject
-            .strip_prefix("planning-session/")
-            .context("a planning claim has an invalid subject")?;
-        let fields = claim
-            .body
-            .get("fields")
-            .and_then(Value::as_object)
-            .context("a planning claim has no fields")?;
-        let text = |name: &str| fields.get(name).and_then(Value::as_str);
-        let accepted = claim.accepted_at_unix_ms.to_string();
-        match claim.kind.as_str() {
-            "planning-session.started" => {
-                let mission = text("mission")
-                    .context("planning-session.started has no mission")?
-                    .strip_prefix("mission/")
-                    .unwrap_or_else(|| text("mission").expect("the mission was checked"));
-                let target_run = text("target_run")
-                    .map(|value| value.strip_prefix("mission-run/").unwrap_or(value));
-                let target_generation = text("target_generation")
-                    .map(|value| value.strip_prefix("run-generation/").unwrap_or(value));
-                transaction.execute(
-                    "INSERT INTO planning_sessions(id, mission_id, request_ref, workspace, requester, planner, planner_spec_json, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'planning', ?8, ?9, ?10, ?10)",
-                    params![
-                        id,
-                        mission,
-                        text("request").context("planning-session.started has no request")?,
-                        text("workspace").context("planning-session.started has no workspace")?,
-                        text("requester").or(claim.actor.as_deref()).context("planning-session.started has no requester")?,
-                        text("planner").context("planning-session.started has no planner")?,
-                        fields.get("planner_config").map(serde_json::to_string).transpose()?.unwrap_or_else(|| "{\"provider\":\"codex\"}".into()),
-                        target_run,
-                        target_generation,
-                        accepted,
-                    ],
-                )?;
-            }
-            "planning-session.candidate-submitted" => {
-                let variant = text("variant").unwrap_or("default");
-                let revision = fields
-                    .get("candidate_revision")
-                    .or_else(|| fields.get("revision"))
-                    .and_then(Value::as_u64)
-                    .context("a planning candidate has no revision")?;
-                transaction.execute(
-                    "INSERT INTO planning_candidates(session_id, variant, revision, markdown_ref, kdl_ref, mission_revision, submitted_at_unix_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        id,
-                        variant,
-                        revision,
-                        text("markdown").context("a planning candidate has no Markdown")?,
-                        text("kdl").context("a planning candidate has no KDL")?,
-                        text("mission_revision").context("a planning candidate has no mission revision")?,
-                        accepted,
-                    ],
-                )?;
-                transaction.execute(
-                    "DELETE FROM planning_previews WHERE session_id=?1 AND variant=?2",
-                    params![id, variant],
-                )?;
-                transaction.execute(
-                    "UPDATE planning_sessions SET status='review', updated_at_unix_ms=?2 WHERE id=?1",
-                    params![id, accepted],
-                )?;
-            }
-            "planning-session.previewed" => {
-                let variant = text("variant").unwrap_or("default");
-                let revision = fields
-                    .get("candidate_revision")
-                    .and_then(Value::as_u64)
-                    .context("a launch preview has no candidate revision")?;
-                let mission = fields
-                    .get("mission")
-                    .context("a launch preview has no mission response")?;
-                transaction.execute(
-                    "INSERT INTO planning_previews(session_id, variant, candidate_revision, hash, store_index, graph, diff, mission_response, created_at_unix_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                     ON CONFLICT(session_id, variant) DO UPDATE SET candidate_revision=excluded.candidate_revision, hash=excluded.hash,
-                       store_index=excluded.store_index, graph=excluded.graph, diff=excluded.diff,
-                       mission_response=excluded.mission_response, created_at_unix_ms=excluded.created_at_unix_ms",
-                    params![
-                        id,
-                        variant,
-                        revision,
-                        text("preview_hash").context("a launch preview has no hash")?,
-                        fields.get("store_index").and_then(Value::as_u64).context("a launch preview has no store index")?,
-                        text("graph").context("a launch preview has no graph")?,
-                        text("diff").context("a launch preview has no diff")?,
-                        serde_json::to_string(mission)?,
-                        accepted,
-                    ],
-                )?;
-            }
-            "planning-session.revision-requested" => {
-                transaction.execute(
-                    "UPDATE planning_sessions SET status='revision-requested', updated_at_unix_ms=?2 WHERE id=?1",
-                    params![id, accepted],
-                )?;
-                transaction.execute("DELETE FROM planning_previews WHERE session_id=?1", [id])?;
-            }
-            "planning-session.approved" => {
-                transaction.execute(
-                    "UPDATE planning_sessions SET status='approved', published_revision=?2, updated_at_unix_ms=?3 WHERE id=?1",
-                    params![id, text("mission_revision"), accepted],
-                )?;
-            }
-            "planning-session.cancelled" => {
-                transaction.execute(
-                    "UPDATE planning_sessions SET status='cancelled', updated_at_unix_ms=?2 WHERE id=?1",
-                    params![id, accepted],
-                )?;
-            }
-            _ => {}
+        // A claim admission accepted but this projection cannot read, such as one from a faulty
+        // or older producer, is quarantined alone instead of failing the whole graph.
+        project_claim_isolated_tx(transaction, "projection:planning", &claim, || {
+            project_planning_claim_tx(transaction, &claim).map_err(|error| {
+                St3Error::new("unprojectable-planning-claim", format!("{error:#}"))
+            })
+        })?;
+    }
+    Ok(())
+}
+
+fn project_planning_claim_tx(transaction: &Transaction<'_>, claim: &ClaimRecord) -> Result<()> {
+    let id = claim
+        .subject
+        .strip_prefix("planning-session/")
+        .context("a planning claim has an invalid subject")?;
+    let fields = claim
+        .body
+        .get("fields")
+        .and_then(Value::as_object)
+        .context("a planning claim has no fields")?;
+    let text = |name: &str| fields.get(name).and_then(Value::as_str);
+    let accepted = claim.accepted_at_unix_ms.to_string();
+    match claim.kind.as_str() {
+        "planning-session.started" => {
+            let mission = text("mission")
+                .context("planning-session.started has no mission")?
+                .strip_prefix("mission/")
+                .unwrap_or_else(|| text("mission").expect("the mission was checked"));
+            let target_run =
+                text("target_run").map(|value| value.strip_prefix("mission-run/").unwrap_or(value));
+            let target_generation = text("target_generation")
+                .map(|value| value.strip_prefix("run-generation/").unwrap_or(value));
+            transaction.execute(
+                "INSERT INTO planning_sessions(id, mission_id, request_ref, workspace, requester, planner, planner_spec_json, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'planning', ?8, ?9, ?10, ?10)",
+                params![
+                    id,
+                    mission,
+                    text("request").context("planning-session.started has no request")?,
+                    text("workspace").context("planning-session.started has no workspace")?,
+                    text("requester").or(claim.actor.as_deref()).context("planning-session.started has no requester")?,
+                    text("planner").context("planning-session.started has no planner")?,
+                    fields.get("planner_config").map(serde_json::to_string).transpose()?.unwrap_or_else(|| "{\"provider\":\"codex\"}".into()),
+                    target_run,
+                    target_generation,
+                    accepted,
+                ],
+            )?;
         }
+        "planning-session.candidate-submitted" => {
+            let variant = text("variant").unwrap_or("default");
+            let revision = fields
+                .get("candidate_revision")
+                .or_else(|| fields.get("revision"))
+                .and_then(Value::as_u64)
+                .context("a planning candidate has no revision")?;
+            transaction.execute(
+                "INSERT INTO planning_candidates(session_id, variant, revision, markdown_ref, kdl_ref, mission_revision, submitted_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id,
+                    variant,
+                    revision,
+                    text("markdown").context("a planning candidate has no Markdown")?,
+                    text("kdl").context("a planning candidate has no KDL")?,
+                    text("mission_revision").context("a planning candidate has no mission revision")?,
+                    accepted,
+                ],
+            )?;
+            transaction.execute(
+                "DELETE FROM planning_previews WHERE session_id=?1 AND variant=?2",
+                params![id, variant],
+            )?;
+            transaction.execute(
+                "UPDATE planning_sessions SET status='review', updated_at_unix_ms=?2 WHERE id=?1",
+                params![id, accepted],
+            )?;
+        }
+        "planning-session.previewed" => {
+            let variant = text("variant").unwrap_or("default");
+            let revision = fields
+                .get("candidate_revision")
+                .and_then(Value::as_u64)
+                .context("a launch preview has no candidate revision")?;
+            let mission = fields
+                .get("mission")
+                .context("a launch preview has no mission response")?;
+            transaction.execute(
+                "INSERT INTO planning_previews(session_id, variant, candidate_revision, hash, store_index, graph, diff, mission_response, created_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                 ON CONFLICT(session_id, variant) DO UPDATE SET candidate_revision=excluded.candidate_revision, hash=excluded.hash,
+                   store_index=excluded.store_index, graph=excluded.graph, diff=excluded.diff,
+                   mission_response=excluded.mission_response, created_at_unix_ms=excluded.created_at_unix_ms",
+                params![
+                    id,
+                    variant,
+                    revision,
+                    text("preview_hash").context("a launch preview has no hash")?,
+                    fields.get("store_index").and_then(Value::as_u64).context("a launch preview has no store index")?,
+                    text("graph").context("a launch preview has no graph")?,
+                    text("diff").context("a launch preview has no diff")?,
+                    serde_json::to_string(mission)?,
+                    accepted,
+                ],
+            )?;
+        }
+        "planning-session.revision-requested" => {
+            transaction.execute(
+                "UPDATE planning_sessions SET status='revision-requested', updated_at_unix_ms=?2 WHERE id=?1",
+                params![id, accepted],
+            )?;
+            transaction.execute("DELETE FROM planning_previews WHERE session_id=?1", [id])?;
+        }
+        "planning-session.approved" => {
+            transaction.execute(
+                "UPDATE planning_sessions SET status='approved', published_revision=?2, updated_at_unix_ms=?3 WHERE id=?1",
+                params![id, text("mission_revision"), accepted],
+            )?;
+        }
+        "planning-session.cancelled" => {
+            transaction.execute(
+                "UPDATE planning_sessions SET status='cancelled', updated_at_unix_ms=?2 WHERE id=?1",
+                params![id, accepted],
+            )?;
+        }
+        _ => {}
     }
     Ok(())
 }
