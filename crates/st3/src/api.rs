@@ -36,8 +36,8 @@ use crate::model::{
     GateResultRequest, HumanReviewView, IntentInput, LaunchApproveAndStartRequest,
     LaunchApproveAndStartView, LaunchDecisionAnswerRequest, LaunchDecisionOption,
     LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType, LaunchStartRequest,
-    MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendRequest, MessageView,
-    MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
+    LocalTerminal, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendRequest,
+    MessageView, MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
     MissionRevisionRequest, MissionRunRequest, MissionRunView, OperationalRepairApplyRequest,
     OperationalRepairPlan, OperationalRepairResult, PlannerSpec, PlanningApprovalRequest,
     PlanningCancelRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
@@ -255,6 +255,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/client/capabilities", get(client_capabilities))
+        .route(
+            "/v1/client/request-latency",
+            get(client_v0::request_latency),
+        )
         .route("/v1/client/documents/content", get(client_v0::document_get))
         .route("/v1/client/now", get(client_v0::now))
         .route("/v1/client/machines", get(client_v0::machines))
@@ -500,6 +504,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/sessions/screen/{*subject}", get(screen_session))
         .route("/v1/sessions/attach/{*subject}", post(attach_session))
         .route("/v1/sessions/{subject}/attach", post(attach_session))
+        .route(
+            "/v1/sessions/local-terminal/{*subject}",
+            get(local_terminal),
+        )
         .route("/v1/sessions/terminal/{*subject}", get(terminal_session))
         .route(
             "/v1/hosts/{host}/agent-workspace",
@@ -531,6 +539,27 @@ async fn response_envelope(
 ) -> Response {
     let started = Instant::now();
     let request_path = request.uri().path().to_owned();
+    // Keep these small control-plane reads out of the pool used by potentially
+    // long client projections and history queries. In particular, authentication
+    // and snapshot admission must use the same reserved lane as the handler.
+    let read_class = if request.method() == axum::http::Method::GET
+        && (request_path == "/v1/status"
+            || request_path == "/v1/client/agents"
+            || request_path.starts_with("/v1/client/agents/"))
+    {
+        crate::store::ReadClass::Critical
+    } else if request.method() == axum::http::Method::GET
+        && request_path == "/v1/client/machines"
+    {
+        crate::store::ReadClass::Operational
+    } else {
+        crate::store::ReadClass::Interactive
+    };
+    let request_route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|route| route.as_str().to_owned())
+        .unwrap_or_else(|| "/unmatched".to_owned());
     let client_request = request.uri().path().starts_with("/v1/client/");
     let fabric_boundary_error = (matches!(transport, ClientTransportBoundary::FabricLoopback)
         && !client_request
@@ -565,9 +594,11 @@ async fn response_envelope(
         let auth_state = state.clone();
         let transport = transport.as_str();
         let admitted = tokio::task::spawn_blocking(move || {
-            let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
-            let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
-            (authentication, snapshot)
+            crate::store::with_read_class(read_class, || {
+                let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
+                let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
+                (authentication, snapshot)
+            })
         })
         .await;
         match admitted {
@@ -585,7 +616,21 @@ async fn response_envelope(
     }
     let response = match (fabric_boundary_error, client_authentication) {
         (Some(error), _) | (None, Err(error)) => error.into_response(),
-        (None, Ok(_)) => next.run(request).await,
+        // Most handlers use synchronous SQLite and filesystem APIs. Run the whole
+        // handler on a blocking thread so a busy projection, replication pass, or
+        // reader pool cannot occupy an async worker needed to accept another call.
+        (None, Ok(_)) if request_path == "/v1/health" => next.run(request).await,
+        (None, Ok(_)) => {
+            let runtime = tokio::runtime::Handle::current();
+            match tokio::task::spawn_blocking(move || {
+                crate::store::with_read_class(read_class, || runtime.block_on(next.run(request)))
+            })
+            .await
+            {
+                Ok(response) => response,
+                Err(error) => ApiError::internal(error).into_response(),
+            }
+        }
     };
     if response.status() == StatusCode::SWITCHING_PROTOCOLS
         || !response
@@ -594,7 +639,7 @@ async fn response_envelope(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("application/json"))
     {
-        report_slow_request(&request_path, started);
+        record_request_latency(&request_route, &request_path, started);
         return response;
     }
     let status = response.status();
@@ -617,10 +662,9 @@ async fn response_envelope(
             .map(|snapshot| snapshot.store_index)
             .unwrap_or_default()
     } else {
-        let store = state.store.clone();
-        blocking_store(move || store.index())
-            .await
-            .unwrap_or_default()
+        // index() is an atomic load. Health must not queue behind blocking
+        // handlers just to decorate its response.
+        state.store.index().unwrap_or_default()
     };
     let request_id = if client_request {
         format!("request/{}", new_request_id())
@@ -667,12 +711,63 @@ async fn response_envelope(
     };
     let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-    report_slow_request(&request_path, started);
+    record_request_latency(&request_route, &request_path, started);
     Response::from_parts(parts, Body::from(body))
 }
 
-fn report_slow_request(path: &str, started: Instant) {
+#[derive(Default)]
+struct RouteLatency {
+    count: u64,
+    recent_ms: VecDeque<u64>,
+}
+
+static REQUEST_LATENCY: OnceLock<Mutex<BTreeMap<String, RouteLatency>>> = OnceLock::new();
+
+fn request_latency() -> &'static Mutex<BTreeMap<String, RouteLatency>> {
+    REQUEST_LATENCY.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn request_latency_snapshot() -> Vec<Value> {
+    let routes = request_latency().lock().unwrap();
+    routes
+        .iter()
+        .map(|(route, latency)| {
+            let mut sorted = latency.recent_ms.iter().copied().collect::<Vec<_>>();
+            sorted.sort_unstable();
+            let percentile = |percent: usize| {
+                sorted
+                    .get(
+                        ((sorted.len().saturating_mul(percent).saturating_add(99)) / 100)
+                            .saturating_sub(1),
+                    )
+                    .copied()
+                    .unwrap_or_default()
+            };
+            json!({
+                "route": route,
+                "count": latency.count,
+                "recent_count": sorted.len(),
+                "p50_ms": percentile(50),
+                "p99_ms": percentile(99),
+                "max_ms": sorted.last().copied().unwrap_or_default(),
+            })
+        })
+        .collect()
+}
+
+fn record_request_latency(route: &str, path: &str, started: Instant) {
     let elapsed = started.elapsed();
+    {
+        let mut routes = request_latency().lock().unwrap();
+        if routes.len() < 256 || routes.contains_key(route) {
+            let sample = routes.entry(route.to_owned()).or_default();
+            sample.count = sample.count.saturating_add(1);
+            if sample.recent_ms.len() == 512 {
+                sample.recent_ms.pop_front();
+            }
+            sample.recent_ms.push_back(elapsed.as_millis() as u64);
+        }
+    }
     if elapsed < Duration::from_secs(1) {
         return;
     }
@@ -3455,7 +3550,12 @@ where
     T: Send + 'static,
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(operation)
+    let read_class = match crate::store::read_class() {
+        crate::store::ReadClass::Critical => crate::store::ReadClass::Critical,
+        crate::store::ReadClass::Operational => crate::store::ReadClass::Operational,
+        _ => crate::store::ReadClass::Interactive,
+    };
+    tokio::task::spawn_blocking(move || crate::store::with_read_class(read_class, operation))
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::internal)
@@ -3466,7 +3566,12 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, St3Error> + Send + 'static,
 {
-    tokio::task::spawn_blocking(operation)
+    let read_class = match crate::store::read_class() {
+        crate::store::ReadClass::Critical => crate::store::ReadClass::Critical,
+        crate::store::ReadClass::Operational => crate::store::ReadClass::Operational,
+        _ => crate::store::ReadClass::Interactive,
+    };
+    tokio::task::spawn_blocking(move || crate::store::with_read_class(read_class, operation))
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::bad)
@@ -3483,6 +3588,15 @@ pub async fn serve_unix_bound(socket: &Path, app: Router) -> anyhow::Result<()> 
 }
 
 async fn serve_unix_inner(socket: &Path, app: Router, bind_harness: bool) -> anyhow::Result<()> {
+    serve_unix_with_ancestor(socket, app, bind_harness, harness_ancestor).await
+}
+
+async fn serve_unix_with_ancestor(
+    socket: &Path,
+    app: Router,
+    bind_harness: bool,
+    ancestor: fn(u32) -> Option<String>,
+) -> anyhow::Result<()> {
     crate::config::validate_unix_socket_path(socket, "--socket or --client-gateway-socket")?;
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent)?;
@@ -3505,18 +3619,26 @@ async fn serve_unix_inner(socket: &Path, app: Router, bind_harness: bool) -> any
                 continue;
             }
         };
-        let bound_agent = if bind_harness {
+        let peer_pid = if bind_harness {
             stream
                 .peer_cred()
                 .ok()
                 .and_then(|cred| cred.pid())
                 .and_then(|pid| u32::try_from(pid).ok())
-                .and_then(harness_ancestor)
         } else {
             None
         };
         let app = app.clone();
         tokio::spawn(async move {
+            // /proc ancestry may fault in pages on a loaded host. Keep that work
+            // out of the accept loop so a slow lookup delays only this peer.
+            let bound_agent = match peer_pid {
+                Some(pid) => tokio::task::spawn_blocking(move || ancestor(pid))
+                    .await
+                    .ok()
+                    .flatten(),
+                None => None,
+            };
             let service = hyper::service::service_fn(move |request: Request<Incoming>| {
                 let app = app.clone();
                 let bound_agent = bound_agent.clone();
@@ -3656,10 +3778,12 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         tokio::task::spawn_blocking(move || crate::environment::check_build_tools(&environment))
     });
     let token = crate::resource::github_token().await;
-    let mut report = tokio::task::spawn_blocking(move || doctor_report(&state))
-        .await
-        .map_err(ApiError::internal)??
-        .0;
+    let mut report = tokio::task::spawn_blocking(move || {
+        crate::store::with_interactive_reads(|| doctor_report(&state))
+    })
+    .await
+    .map_err(ApiError::internal)??
+    .0;
     if let Some(build_tools) = build_tools {
         report.checks.push(build_tools_check(
             &build_tools.await.map_err(ApiError::internal)?,
@@ -3689,6 +3813,23 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
             crate::resource::GITHUB_AUTH_REMEDY.into()
         },
     });
+    // Request samples are live operational telemetry. Keep them on /v1/doctor,
+    // outside the store-index-fenced operation projection built by doctor_report.
+    let mut routes = request_latency_snapshot();
+    routes.sort_by_key(|route| std::cmp::Reverse(route["p99_ms"].as_u64().unwrap_or_default()));
+    for route in routes.into_iter().take(10) {
+        report.checks.push(DoctorCheck {
+            name: format!(
+                "request-latency/{}",
+                route["route"].as_str().unwrap_or("unknown")
+            ),
+            status: "pass".into(),
+            message: format!(
+                "{} requests; recent p50 {} ms, p99 {} ms, max {} ms",
+                route["count"], route["p50_ms"], route["p99_ms"], route["max_ms"]
+            ),
+        });
+    }
     report.checks.extend(github_usage_checks(
         &crate::resource::github_usage_report(),
         client_now_ms(),
@@ -9744,10 +9885,19 @@ async fn attach_session(
             "terminal attachment requires a terminal session",
         )));
     }
-    let (capability, expires_at_unix_ms) = state
-        .store
-        .issue_capability("terminal", &subject, Some(&session.incarnation_id), 30_000)
-        .map_err(ApiError::internal)?;
+    // Issuing a capability waits for the store writer, which a reconcile pass can hold for
+    // seconds; the wait must not hold a runtime worker.
+    let store = state.store.clone();
+    let (capability_subject, incarnation_id) = (subject.clone(), session.incarnation_id.clone());
+    let (capability, expires_at_unix_ms) = blocking_store(move || {
+        store.issue_capability(
+            "terminal",
+            &capability_subject,
+            Some(&incarnation_id),
+            30_000,
+        )
+    })
+    .await?;
     Ok(Json(Attachment {
         websocket_path: format!(
             "/v1/sessions/terminal/{}?capability={}",
@@ -9759,6 +9909,35 @@ async fn attach_session(
         incarnation_id: Some(session.incarnation_id),
         capability,
         expires_at_unix_ms,
+    }))
+}
+
+/// Name the PTY session of a running terminal on this host, so `st terminals attach` can connect
+/// to it directly. It checks what an attachment checks but issues no capability: it only reads,
+/// so it answers while a busy reconciler holds the writer, and the attach never waits for this
+/// daemon again. The caller proves the incarnation against the PTY itself before attaching.
+async fn local_terminal(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+) -> Result<Json<LocalTerminal>, ApiError> {
+    // A read can still wait on a saturated disk; it must not hold a runtime worker meanwhile.
+    let (lookup, lookup_subject) = (state.clone(), subject.clone());
+    let session = tokio::task::spawn_blocking(move || live_session(&lookup, &lookup_subject, None))
+        .await
+        .map_err(ApiError::internal)??;
+    if !session.terminal {
+        return Err(ApiError::bad(St3Error::new(
+            "unsupported-capability",
+            "terminal attachment requires a terminal session",
+        )));
+    }
+    // An isolated daemon may run with a relative PTY root; the client resolves nothing itself.
+    let pty_root = std::path::absolute(&state.pty_root).map_err(ApiError::internal)?;
+    Ok(Json(LocalTerminal {
+        subject,
+        runtime_id: session.runtime_id,
+        incarnation_id: session.incarnation_id,
+        pty_root,
     }))
 }
 
@@ -9931,10 +10110,9 @@ async fn terminal_session(
     AxumPath(subject): AxumPath<String>,
     Query(query): Query<TerminalQuery>,
 ) -> Result<Response, ApiError> {
-    let capability = state
-        .store
-        .consume_capability(&query.capability, "terminal")
-        .map_err(ApiError::bad)?;
+    let store = state.store.clone();
+    let secret = query.capability;
+    let capability = blocking_action(move || store.consume_capability(&secret, "terminal")).await?;
     if capability.used || capability.subject != subject {
         return Err(ApiError::bad(St3Error::new(
             "invalid-capability",
@@ -10216,7 +10394,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let before = state.store.index().unwrap();
-        report_slow_request("/v1/client/agents", Instant::now() - Duration::from_secs(2));
+        record_request_latency(
+            "/v1/client/agents",
+            "/v1/client/agents",
+            Instant::now() - Duration::from_secs(2),
+        );
         // The old implementation spawned a blocking write, so give that write
         // time to finish before proving the request caused no graph change.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -10493,7 +10675,7 @@ mod tests {
         let store = state.store.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
-            store.hold_read_connections_for_test(|| {
+            store.hold_interactive_read_connections_for_test(|| {
                 ready_tx.send(()).unwrap();
                 std::thread::sleep(Duration::from_millis(500));
             });
@@ -10521,6 +10703,249 @@ mod tests {
             assert_eq!(status, StatusCode::OK);
         }
         holder.join().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocked_terminal_attach_does_not_delay_an_independent_request() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            store.hold_interactive_read_connections_for_test(|| {
+                ready_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(500));
+            });
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let app = router(state);
+        let started = Instant::now();
+        let attach = tokio::spawn(json_request(
+            app.clone(),
+            "/v1/sessions/attach/agent/probe",
+            json!({}),
+        ));
+        tokio::task::yield_now().await;
+        let (status, _) = get_request(app, "/v1/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "health waited {:?} behind a blocked terminal attach",
+            started.elapsed()
+        );
+
+        holder.join().unwrap();
+        let (status, _) = attach.await.unwrap();
+        assert!(!status.is_success());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_reads_answer_during_a_long_write_and_busy_query_pool() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        // A disk-backed store uses WAL like the daemon. Shared-cache memory stores
+        // deliberately make readers wait for an uncommitted writer.
+        state.store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), "node").unwrap());
+        let store = state.store.clone();
+        let (read_ready_tx, read_ready_rx) = std::sync::mpsc::channel();
+        let read_holder = std::thread::spawn(move || {
+            store.hold_interactive_read_connections_for_test(|| {
+                read_ready_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(30));
+            });
+        });
+        read_ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let store = state.store.clone();
+        let (write_ready_tx, write_ready_rx) = std::sync::mpsc::channel();
+        let write_holder = std::thread::spawn(move || {
+            store.hold_write_transaction_for_test(|| {
+                write_ready_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(30));
+            });
+        });
+        write_ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let app = router(state);
+        for path in ["/v1/status", "/v1/client/agents", "/v1/client/machines"] {
+            let started = Instant::now();
+            let response =
+                tokio::time::timeout(Duration::from_millis(100), get_request(app.clone(), path))
+                    .await;
+            assert!(
+                response.is_ok(),
+                "{path} waited {:?} behind a long write or query",
+                started.elapsed()
+            );
+            assert_eq!(response.unwrap().0, StatusCode::OK);
+        }
+        read_holder.join().unwrap();
+        write_holder.join().unwrap();
+    }
+
+    #[test]
+    fn health_response_does_not_queue_for_a_blocking_thread() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || {
+                ready_tx.send(()).unwrap();
+                release_rx.recv().unwrap();
+            });
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+            let root = tempfile::tempdir().unwrap();
+            let app = router(state(root.path()));
+            let started = Instant::now();
+            let response =
+                tokio::time::timeout(Duration::from_millis(250), get_request(app, "/v1/health"))
+                    .await;
+            release_tx.send(()).unwrap();
+            blocker.await.unwrap();
+            assert!(
+                response.is_ok(),
+                "health waited {:?} for the busy blocking pool",
+                started.elapsed()
+            );
+            assert_eq!(response.unwrap().0, StatusCode::OK);
+        });
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn isolated_daemon_answers_health_under_stalled_attaches() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let socket = root.path().join("st3.sock");
+        let server_socket = socket.clone();
+        let server_state = state.clone();
+        let server =
+            tokio::spawn(async move { serve_unix(&server_socket, router(server_state)).await });
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let store = state.store.clone();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            store.hold_read_connections_for_test(|| {
+                ready_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(1_200));
+            });
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let client = crate::client::Client::new(crate::client::Endpoint::Unix(socket));
+        let pending = (0..8)
+            .map(|_| {
+                let client = client.clone();
+                tokio::spawn(async move {
+                    let started = Instant::now();
+                    let _: anyhow::Result<Value> = client
+                        .post("/v1/sessions/attach/agent/probe", &json!({}))
+                        .await;
+                    started.elapsed()
+                })
+            })
+            .collect::<Vec<_>>();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        let mut latencies = Vec::new();
+        for _ in 0..30 {
+            let started = Instant::now();
+            let _: Value = client.get("/v1/health").await.unwrap();
+            latencies.push(started.elapsed());
+        }
+        latencies.sort();
+        assert!(
+            latencies[29] < Duration::from_secs(1),
+            "health p99 was {:?}",
+            latencies[29]
+        );
+        let mut attach_latencies = Vec::new();
+        for request in pending {
+            attach_latencies.push(request.await.unwrap());
+        }
+        assert!(
+            attach_latencies
+                .iter()
+                .all(|latency| *latency < Duration::from_secs(1)),
+            "terminal attaches waited behind background reads: {attach_latencies:?}"
+        );
+        holder.join().unwrap();
+        let doctor: DoctorReport = client.get("/v1/doctor").await.unwrap();
+        assert!(doctor.checks.iter().any(|check| {
+            check.name.starts_with("request-latency/") && check.message.contains("p99")
+        }));
+        let (status, latency) = get_request(router(state), "/v1/client/request-latency").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(latency["routes"].as_array().unwrap().iter().any(|route| {
+            route["route"] == "/v1/health" && route["count"].as_u64().unwrap_or_default() >= 30
+        }));
+        server.abort();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "current_thread")]
+    async fn slow_peer_identity_lookup_does_not_stop_existing_api_connections() {
+        use http_body_util::{BodyExt as _, Empty};
+        use hyper::client::conn::http1::SendRequest;
+
+        fn slow_ancestor(_pid: u32) -> Option<String> {
+            std::thread::sleep(Duration::from_millis(500));
+            None
+        }
+
+        async fn health(sender: &mut SendRequest<Empty<axum::body::Bytes>>) {
+            let response = sender
+                .send_request(
+                    Request::builder()
+                        .uri("/v1/health")
+                        .header("host", "local")
+                        .body(Empty::new())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            response.into_body().collect().await.unwrap();
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("st3.sock");
+        let server_socket = socket.clone();
+        let app = router(state(root.path()));
+        let server = tokio::spawn(async move {
+            serve_unix_with_ancestor(&server_socket, app, true, slow_ancestor).await
+        });
+        while !socket.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let stream = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let (mut sender, connection) = hyper::client::conn::http1::handshake(TokioIo::new(stream))
+            .await
+            .unwrap();
+        tokio::spawn(async move {
+            let _ = connection.await;
+        });
+        health(&mut sender).await;
+
+        let _slow_peer = tokio::net::UnixStream::connect(&socket).await.unwrap();
+        let started = Instant::now();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        health(&mut sender).await;
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "an unrelated identity lookup stalled the API for {:?}",
+            started.elapsed()
+        );
+        server.abort();
     }
 
     #[test]
@@ -10676,6 +11101,127 @@ mod tests {
         assert_eq!(second["items"][0]["name"], "doc/late/target");
         assert_ne!(first["items"][0]["hash"], second["items"][0]["hash"]);
         assert_eq!(second["has_more"], false);
+    }
+
+    fn observe_terminal(store: &Store, subject: &str, incarnation: &str, terminal: bool) {
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("runtime_id".into(), Value::String("worker-runtime".into())),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ("status".into(), Value::String("running".into())),
+                    ("terminal".into(), Value::Bool(terminal)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+
+    /// Hetz, 2026-09-29: under CI load an attach waited behind the store writer until its
+    /// WebSocket handshake gave up. Naming a local terminal must not wait for the writer.
+    #[tokio::test]
+    async fn a_local_terminal_is_named_by_reads_alone_while_the_writer_is_busy() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        // An isolated daemon may be started with a relative PTY root.
+        state.pty_root = PathBuf::from("isolated/pty");
+        observe_terminal(
+            &state.store,
+            "agent/worker",
+            "4242:2026-09-29T08:00:00.000Z",
+            true,
+        );
+        let store = state.store.clone();
+        let index = store.index().unwrap();
+        let app = router(state);
+        let (held, holding) = std::sync::mpsc::channel();
+        let holder_store = store.clone();
+        let holder = std::thread::spawn(move || {
+            holder_store.hold_writer_for_test(|| {
+                held.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(1_500));
+            });
+        });
+        holding.recv().unwrap();
+
+        let started = std::time::Instant::now();
+        let (status, terminal) = get_request(app, "/v1/sessions/local-terminal/agent/worker").await;
+        let elapsed = started.elapsed();
+        holder.join().unwrap();
+
+        assert_eq!(status, StatusCode::OK, "{terminal}");
+        assert!(
+            elapsed < Duration::from_millis(750),
+            "naming a local terminal waited {elapsed:?} for the writer"
+        );
+        assert_eq!(terminal["subject"], "agent/worker");
+        assert_eq!(terminal["runtime_id"], "worker-runtime");
+        assert_eq!(terminal["incarnation_id"], "4242:2026-09-29T08:00:00.000Z");
+        assert_eq!(
+            terminal["pty_root"],
+            std::env::current_dir()
+                .unwrap()
+                .join("isolated/pty")
+                .display()
+                .to_string()
+        );
+        assert_eq!(store.index().unwrap(), index, "it must write nothing");
+    }
+
+    #[tokio::test]
+    async fn a_local_terminal_keeps_the_attachment_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        observe_terminal(
+            &state.store,
+            "agent/headless",
+            "1:2026-09-29T08:00:00.000Z",
+            false,
+        );
+        let owner = Store::open_memory("owner-node").unwrap();
+        observe_terminal(&owner, "agent/remote", "2:2026-09-29T08:00:00.000Z", true);
+        state
+            .store
+            .import_replication("owner-node", &owner.export_replication(0).unwrap())
+            .unwrap();
+        observe_terminal(
+            &state.store,
+            "agent/local",
+            "3:2026-09-29T08:00:00.000Z",
+            true,
+        );
+        // A paired client never learns a PTY path: the gateway serves only client v0.
+        let (status, refused) = get_request(
+            fabric_router(state.clone()),
+            "/v1/sessions/local-terminal/agent/local",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        let app = router(state);
+
+        let (status, refused) =
+            get_request(app.clone(), "/v1/sessions/local-terminal/agent/headless").await;
+        assert!(status.is_client_error(), "{refused}");
+        assert_eq!(refused["code"], "unsupported-capability");
+
+        let (status, refused) =
+            get_request(app.clone(), "/v1/sessions/local-terminal/agent/remote").await;
+        assert!(status.is_client_error(), "{refused}");
+        assert_eq!(refused["code"], "runtime-not-local");
+
+        // An unknown subject is refused exactly as its WebSocket attachment is.
+        let (status, refused) =
+            get_request(app.clone(), "/v1/sessions/local-terminal/agent/missing").await;
+        let (attach_status, attach_refused) =
+            json_request(app, "/v1/sessions/attach/agent/missing", json!({})).await;
+        assert!(status.is_client_error(), "{refused}");
+        assert_eq!(status, attach_status);
+        assert_eq!(refused["code"], attach_refused["code"], "{refused}");
     }
 
     #[tokio::test]

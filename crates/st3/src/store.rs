@@ -1,5 +1,6 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::cell::Cell;
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -673,7 +674,40 @@ impl Drop for WriterGuard<'_> {
     }
 }
 
-struct ReadPool {
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReadClass {
+    Background,
+    Interactive,
+    Operational,
+    Critical,
+}
+
+thread_local! {
+    static READ_CLASS: Cell<ReadClass> = const { Cell::new(ReadClass::Background) };
+}
+
+pub(crate) fn read_class() -> ReadClass {
+    READ_CLASS.with(Cell::get)
+}
+
+pub(crate) fn with_read_class<T>(class: ReadClass, read: impl FnOnce() -> T) -> T {
+    READ_CLASS.with(|flag| {
+        struct Restore<'a>(&'a Cell<ReadClass>, ReadClass);
+        impl Drop for Restore<'_> {
+            fn drop(&mut self) {
+                self.0.set(self.1);
+            }
+        }
+        let _restore = Restore(flag, flag.replace(class));
+        read()
+    })
+}
+
+pub(crate) fn with_interactive_reads<T>(read: impl FnOnce() -> T) -> T {
+    with_read_class(ReadClass::Interactive, read)
+}
+
+struct ReadLane {
     connections: Mutex<Vec<Connection>>,
     available: Condvar,
     /// How many connections `Store::read_snapshot` holds. At least one always stays unpinned,
@@ -682,8 +716,26 @@ struct ReadPool {
     unpinned: Condvar,
 }
 
+impl ReadLane {
+    fn new(connections: Vec<Connection>) -> Self {
+        Self {
+            connections: Mutex::new(connections),
+            available: Condvar::new(),
+            pinned: Mutex::new(0),
+            unpinned: Condvar::new(),
+        }
+    }
+}
+
+struct ReadPool {
+    background: ReadLane,
+    interactive: ReadLane,
+    operational: ReadLane,
+    critical: ReadLane,
+}
+
 struct ReadGuard<'a> {
-    pool: &'a ReadPool,
+    lane: &'a ReadLane,
     connection: Option<Connection>,
     /// The connection `Store::read_snapshot` pinned for this thread, shared by every read in it.
     pinned: Option<Rc<Connection>>,
@@ -697,7 +749,7 @@ thread_local! {
 
 /// Ends a pinned read on every exit path, panics included.
 struct PinnedRead<'a> {
-    pool: &'a ReadPool,
+    lane: &'a ReadLane,
     connection: Option<Rc<Connection>>,
 }
 
@@ -705,9 +757,9 @@ impl Drop for PinnedRead<'_> {
     fn drop(&mut self) {
         PINNED_READER.with(|slot| slot.borrow_mut().take());
         {
-            let mut pinned = self.pool.pinned.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut pinned = self.lane.pinned.lock().unwrap_or_else(PoisonError::into_inner);
             *pinned -= 1;
-            self.pool.unpinned.notify_one();
+            self.lane.unpinned.notify_one();
         }
         let Some(connection) = self.connection.take() else {
             return;
@@ -717,23 +769,37 @@ impl Drop for PinnedRead<'_> {
         // connection rather than sharing it.
         if let Ok(connection) = Rc::try_unwrap(connection) {
             let mut connections = self
-                .pool
+                .lane
                 .connections
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             connections.push(connection);
-            self.pool.available.notify_one();
+            self.lane.available.notify_one();
         }
     }
 }
 
 impl ReadPool {
-    fn new(connections: Vec<Connection>) -> Self {
+    fn new(
+        background: Vec<Connection>,
+        interactive: Vec<Connection>,
+        operational: Vec<Connection>,
+        critical: Vec<Connection>,
+    ) -> Self {
         Self {
-            connections: Mutex::new(connections),
-            available: Condvar::new(),
-            pinned: Mutex::new(0),
-            unpinned: Condvar::new(),
+            background: ReadLane::new(background),
+            interactive: ReadLane::new(interactive),
+            operational: ReadLane::new(operational),
+            critical: ReadLane::new(critical),
+        }
+    }
+
+    fn lane(&self) -> &ReadLane {
+        match read_class() {
+            ReadClass::Background => &self.background,
+            ReadClass::Interactive => &self.interactive,
+            ReadClass::Operational => &self.operational,
+            ReadClass::Critical => &self.critical,
         }
     }
 
@@ -750,23 +816,24 @@ impl ReadPool {
         });
         if pinned.is_some() {
             return ReadGuard {
-                pool: self,
+                lane: self.lane(),
                 connection: None,
                 pinned,
             };
         }
-        let mut connections = self
+        let lane = self.lane();
+        let mut connections = lane
             .connections
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         while connections.is_empty() {
-            connections = self
+            connections = lane
                 .available
                 .wait(connections)
                 .unwrap_or_else(PoisonError::into_inner);
         }
         ReadGuard {
-            pool: self,
+            lane,
             connection: connections.pop(),
             pinned: None,
         }
@@ -791,12 +858,12 @@ impl Drop for ReadGuard<'_> {
             return;
         };
         let mut connections = self
-            .pool
+            .lane
             .connections
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         connections.push(connection);
-        self.pool.available.notify_one();
+        self.lane.available.notify_one();
     }
 }
 
@@ -893,9 +960,26 @@ impl Store {
         hold();
     }
 
+    pub(crate) fn hold_interactive_read_connections_for_test(&self, hold: impl FnOnce()) {
+        with_interactive_reads(|| self.hold_read_connections_for_test(hold));
+    }
+
     pub(crate) fn hold_writer_for_test(&self, hold: impl FnOnce()) {
         let _writer = self.connection.write();
         hold();
+    }
+
+    pub(crate) fn hold_write_transaction_for_test(&self, hold: impl FnOnce()) {
+        let mut writer = self.connection.write();
+        let transaction = writer.transaction().unwrap();
+        transaction
+            .execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES ('test-write-stall', '1')",
+                [],
+            )
+            .unwrap();
+        hold();
+        transaction.rollback().unwrap();
     }
 }
 
@@ -1771,6 +1855,16 @@ fn open_read_connections(path: &Path, shared_memory: bool) -> Result<Vec<Connect
         .collect()
 }
 
+fn claims_page_query(subject: bool, descending: bool) -> String {
+    let subject_filter = if subject { "subject=?3 AND " } else { "" };
+    let order = if descending { "DESC" } else { "ASC" };
+    format!(
+        "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+         FROM claims WHERE {subject_filter}store_index>?1 AND (?2 IS NULL OR store_index<?2)
+         ORDER BY store_index {order} LIMIT ?4"
+    )
+}
+
 impl Store {
     pub fn open(path: &Path, origin: impl Into<String>) -> Result<Self> {
         let origin = origin.into();
@@ -1798,10 +1892,15 @@ impl Store {
         }
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
-        let readers = open_read_connections(path, false)?;
+        let readers = ReadPool::new(
+            open_read_connections(path, false)?,
+            open_read_connections(path, false)?,
+            open_read_connections(path, false)?,
+            open_read_connections(path, false)?,
+        );
         Ok(Self {
             connection: WriterConnection::new(connection, committed_index.clone()),
-            readers: ReadPool::new(readers),
+            readers,
             committed_index,
             actual_cache: Mutex::new(HashMap::new()),
             message_cache: Mutex::new(HashMap::new()),
@@ -1848,10 +1947,15 @@ impl Store {
         }
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
-        let readers = open_read_connections(&uri, true)?;
+        let readers = ReadPool::new(
+            open_read_connections(&uri, true)?,
+            open_read_connections(&uri, true)?,
+            open_read_connections(&uri, true)?,
+            open_read_connections(&uri, true)?,
+        );
         Ok(Self {
             connection: WriterConnection::new(connection, committed_index.clone()),
-            readers: ReadPool::new(readers),
+            readers,
             committed_index,
             actual_cache: Mutex::new(HashMap::new()),
             message_cache: Mutex::new(HashMap::new()),
@@ -1889,15 +1993,14 @@ impl Store {
             let index = current_index(&self.readers.get())?;
             return read(index);
         }
+        let lane = self.readers.lane();
         {
-            let mut pinned = self
-                .readers
+            let mut pinned = lane
                 .pinned
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             while *pinned + 1 >= READ_CONNECTIONS {
-                pinned = self
-                    .readers
+                pinned = lane
                     .unpinned
                     .wait(pinned)
                     .unwrap_or_else(PoisonError::into_inner);
@@ -1908,7 +2011,7 @@ impl Store {
         // Declared first so it drops last: on every exit it ends the transaction, releases the
         // pin, and returns the connection to the pool.
         let pinned = PinnedRead {
-            pool: &self.readers,
+            lane,
             connection: Some(Rc::new(
                 guard
                     .connection
@@ -5908,127 +6011,12 @@ impl Store {
         phase: &str,
         reason: Option<&str>,
     ) -> Result<bool> {
-        let run = run.strip_prefix("mission-run/").unwrap_or(run);
-        let subject = format!("mission-run/{run}");
         let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
-        let current: Option<(String, String)> = transaction
-            .query_row(
-                "SELECT status, phase FROM mission_runs WHERE id=?1",
-                [run],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((current_status, current_phase)) = current else {
-            return Ok(false);
-        };
-        let target_is_terminal = is_terminal_run_state(status) || phase == "terminal";
-        let now = now_ms();
-        if current_phase == "terminal"
-            || (current_status == status && current_phase == phase && target_is_terminal)
-        {
-            let generation: String = transaction.query_row(
-                "SELECT current_generation_id FROM mission_runs WHERE id=?1",
-                [run],
-                |row| row.get(0),
-            )?;
-            let reason = reason.unwrap_or("the owning mission run is terminal");
-            let mut claim_ids = cancel_descendant_mission_runs_tx(
-                &transaction,
-                &self.origin,
-                &generation,
-                "daemon/runtime",
-                reason,
-                now,
-            )?;
-            claim_ids.extend(terminalize_run_steps_tx(
-                &transaction,
-                &self.origin,
-                run,
-                reason,
-                None,
-                None,
-                now,
-            )?);
-            transaction.commit()?;
-            return Ok(!claim_ids.is_empty());
-        }
-        if current_status == status && current_phase == phase {
-            return Ok(false);
-        }
-        if (current_phase.starts_with("cleanup-") && phase != "terminal")
-            || (current_phase == "final-cancelled"
-                && !matches!(phase, "final-cancelled" | "cleanup-cancelled" | "terminal"))
-        {
-            return Ok(false);
-        }
-        transaction.execute(
-            "UPDATE mission_runs SET status=?2, phase=?3, updated_at_unix_ms=?4 WHERE id=?1",
-            params![run, status, phase, now.to_string()],
-        )?;
-        transaction.execute(
-            "UPDATE run_generations SET status=?2, updated_at_unix_ms=?3
-             WHERE id=(SELECT current_generation_id FROM mission_runs WHERE id=?1)",
-            params![run, status, now.to_string()],
-        )?;
-        let body = json!({"fields": {"status": status, "phase": phase, "reason": reason}});
-        append_claim_tx(
-            &transaction,
-            &self.origin,
-            &subject,
-            "mission-run.state",
-            None,
-            &body,
-            &[],
-            None,
-        )?;
-        let generation: String = transaction.query_row(
-            "SELECT current_generation_id FROM mission_runs WHERE id=?1",
-            [run],
-            |row| row.get(0),
-        )?;
-        append_claim_tx(
-            &transaction,
-            &self.origin,
-            &format!("run-generation/{generation}"),
-            "run-generation.state",
-            None,
-            &body,
-            &[],
-            None,
-        )?;
-        if phase.starts_with("cleanup-") {
-            terminalize_run_steps_tx(
-                &transaction,
-                &self.origin,
-                run,
-                reason.unwrap_or("the mission run entered cleanup"),
-                Some("daemon/runtime"),
-                None,
-                now,
-            )?;
-        }
-        if target_is_terminal {
-            cancel_descendant_mission_runs_tx(
-                &transaction,
-                &self.origin,
-                &generation,
-                "daemon/runtime",
-                reason.unwrap_or("the owning mission run is terminal"),
-                now,
-            )?;
-            terminalize_run_steps_tx(
-                &transaction,
-                &self.origin,
-                run,
-                reason.unwrap_or("the owning mission run is terminal"),
-                None,
-                None,
-                now,
-            )?;
-        }
+        let changed =
+            set_mission_run_state_tx(&transaction, &self.origin, run, status, phase, reason)?;
         transaction.commit()?;
-        Ok(true)
+        Ok(changed)
     }
 
     pub fn apply_internal(
@@ -8312,19 +8300,22 @@ impl Store {
         // each worker holds one snapshot connection for its slice, then merge in subject order.
         let subjects = subjects.into_iter().collect::<Vec<_>>();
         let chunk_size = subjects.len().div_ceil(READ_CONNECTIONS);
+        let read_class = read_class();
         let parts = std::thread::scope(|scope| {
             subjects
                 .chunks(chunk_size)
                 .map(|chunk| {
                     let names = chunk.iter().cloned().collect::<BTreeSet<_>>();
                     scope.spawn(move || {
-                        self.status_at_view_for_names(
-                            None,
-                            None,
-                            Some(store_index),
-                            include_history,
-                            Some(names),
-                        )
+                        with_read_class(read_class, || {
+                            self.status_at_view_for_names(
+                                None,
+                                None,
+                                Some(store_index),
+                                include_history,
+                                Some(names),
+                            )
+                        })
                     })
                 })
                 .collect::<Vec<_>>()
@@ -11311,14 +11302,19 @@ impl Store {
         limit: usize,
     ) -> Result<ClaimsPage> {
         let connection = self.readers.get();
-        let order = if descending { "DESC" } else { "ASC" };
-        let query = format!(
-            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-             FROM claims WHERE store_index>?1 AND (?2 IS NULL OR store_index<?2) AND (?3 IS NULL OR subject=?3) ORDER BY store_index {order}"
-        );
+        let query = claims_page_query(subject.is_some(), descending);
         let mut statement = connection.prepare(&query)?;
-        let rows =
-            statement.query_map(params![after_index, before_index, subject], claim_from_row)?;
+        // The owner filter is evaluated per subject below. Other pages can stop
+        // in SQLite at one row past the requested bound, before decoding bodies.
+        let scan_limit = if owner_run.is_some() {
+            i64::MAX
+        } else {
+            i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX)
+        };
+        let rows = statement.query_map(
+            params![after_index, before_index, subject, scan_limit],
+            claim_from_row,
+        )?;
         let mut claims = Vec::new();
         for row in rows {
             let claim = row?;
@@ -12480,6 +12476,104 @@ impl Store {
         self.replication_projection_deferred.load(Ordering::Acquire)
     }
 
+    /// Once per store, before a replay from nothing first decides its graph. Earlier replays
+    /// re-applied claims over the rows a projection had left and could re-apply a run's old
+    /// terminal state over the revision that reopened it, so this node's reconciler treated the
+    /// run as over although its claims say it runs. A replay that follows the claims would start
+    /// that work again long after anyone expected it. Each such run this node drives gets the
+    /// claims that end it as its graph showed; runs that other nodes drive are theirs to settle.
+    /// A run with a peer's claim this node has not projected yet may have been reopened for real,
+    /// so it is left to the claims. Returns the settled runs.
+    pub fn settle_runs_for_canonical_replay(&self) -> Result<Vec<String>> {
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction()?;
+        if transaction
+            .query_row(
+                "SELECT 1 FROM meta WHERE key='canonical_replay_settled'",
+                [],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+        {
+            return Ok(Vec::new());
+        }
+        let frontier: u64 = transaction
+            .query_row(
+                "SELECT last_good_store_index FROM projection_health WHERE aggregate='graph'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        let ended = {
+            let mut statement = transaction.prepare(
+                "SELECT runs.id, runs.status FROM mission_runs AS runs
+                 WHERE (runs.phase='terminal' OR runs.status IN ('completed','failed','cancelled'))
+                   AND EXISTS (SELECT 1 FROM claims WHERE claims.subject='mission-run/' || runs.id
+                               AND claims.kind='mission-run.created' AND claims.origin=?1)
+                   AND NOT EXISTS (
+                     SELECT 1 FROM claims
+                     WHERE claims.store_index>?2 AND claims.origin<>?1
+                       AND (claims.subject='mission-run/' || runs.id
+                            OR claims.subject IN (SELECT 'run-generation/' || generations.id
+                                                  FROM run_generations AS generations
+                                                  WHERE generations.run_id=runs.id)
+                            OR (claims.kind='run-generation.created'
+                                AND json_extract(claims.body, '$.fields.run')='mission-run/' || runs.id)))
+                 ORDER BY runs.id",
+            )?;
+            statement
+                .query_map(params![self.origin, frontier], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        replay_graph_from_nothing_tx(&transaction)?;
+        let mut settled = Vec::new();
+        for (run, status) in ended {
+            let reopened = transaction
+                .query_row(
+                    "SELECT phase<>'terminal' AND status NOT IN ('completed','failed','cancelled')
+                     FROM mission_runs WHERE id=?1",
+                    [&run],
+                    |row| row.get::<_, bool>(0),
+                )
+                .optional()?
+                .unwrap_or(false);
+            if reopened {
+                let status = if is_terminal_run_state(&status) {
+                    status.as_str()
+                } else {
+                    "cancelled"
+                };
+                set_mission_run_state_tx(
+                    &transaction,
+                    &self.origin,
+                    &run,
+                    status,
+                    "terminal",
+                    Some("this node treated the run as over before replays followed its claims"),
+                )?;
+                settled.push(run);
+            }
+        }
+        reapply_local_work_lease_renewals_tx(&transaction)?;
+        transaction.execute(
+            "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
+             VALUES ('graph', 'healthy', ?1, ?2)
+             ON CONFLICT(aggregate) DO UPDATE SET status='healthy', last_good_store_index=excluded.last_good_store_index,
+                error_code=NULL, error_message=NULL, updated_at_unix_ms=excluded.updated_at_unix_ms",
+            params![current_index_tx(&transaction)?, now_ms().to_string()],
+        )?;
+        transaction.execute(
+            "INSERT OR REPLACE INTO meta(key, value) VALUES ('canonical_replay_settled', ?1)",
+            [now_ms().to_string()],
+        )?;
+        transaction.commit()?;
+        Ok(settled)
+    }
+
     pub fn project_replication_backlog(&self) -> Result<bool> {
         let mut connection = self.connection.write();
         let _timing = time_stage(&self.replication_timers.projection);
@@ -12513,10 +12607,7 @@ impl Store {
             if !projected {
                 #[cfg(test)]
                 FULL_REPLAYS.with(|replays| replays.set(replays.get() + 1));
-                rebuild_operations_tx(&transaction).map_err(internal)?;
-                project_replicated_base_claims(&transaction)?;
-                project_replicated_mission_runs(&transaction)?;
-                rebuild_planning_tx(&transaction).map_err(internal)?;
+                replay_graph_from_nothing_tx(&transaction)?;
             }
             reapply_local_work_lease_renewals_tx(&transaction)?;
             Ok(())
@@ -19616,6 +19707,25 @@ impl Store {
         ))
     }
 
+    /// Read the already admitted membership for client projections. Seeding a
+    /// replication snapshot can take the writer lock and must stay out of a
+    /// person's read request while replication is busy.
+    pub fn fleet_view_for_client(&self) -> Result<crate::fleet::FleetView> {
+        let member_key = self
+            .member_key
+            .read()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .map(|key| key.public().to_owned());
+        let connection = self.readers.get();
+        Ok(crate::fleet::FleetView::from_membership(
+            &fleet_membership_tx_with_local_signer(
+                &connection,
+                member_key.as_deref().map(|key| (self.origin.as_str(), key)),
+            )?,
+        ))
+    }
+
     /// Sign every envelope of this node's writer that has no signature by its member key,
     /// optionally only those added after one `replica_envelopes` row.
     fn sign_own_envelopes_tx(
@@ -19812,6 +19922,13 @@ fn max_envelope_rowid(connection: &Connection) -> Result<i64> {
 /// Fold the admitted `fleet.*` claims from the pinned anchor. A store without an anchor has an
 /// empty membership, in which every writer is legacy.
 fn fleet_membership_tx(connection: &Connection) -> Result<crate::fleet::Membership> {
+    fleet_membership_tx_with_local_signer(connection, None)
+}
+
+fn fleet_membership_tx_with_local_signer(
+    connection: &Connection,
+    local_signer: Option<(&str, &str)>,
+) -> Result<crate::fleet::Membership> {
     let Some(anchor) = fleet_meta(connection, "fleet_anchor_key")? else {
         return Ok(crate::fleet::Membership::default());
     };
@@ -19843,7 +19960,7 @@ fn fleet_membership_tx(connection: &Connection) -> Result<crate::fleet::Membersh
     )?;
     let mut claims: Vec<crate::fleet::FleetClaim> = Vec::with_capacity(rows.len());
     for (id, kind, subject, body, writer, sequence, envelope_hash) in rows {
-        let signers = match &envelope_hash {
+        let mut signers = match &envelope_hash {
             Some(hash) => signers_statement
                 .query_map(params![writer, sequence, hash], |row| {
                     row.get::<_, String>(0)
@@ -19851,6 +19968,15 @@ fn fleet_membership_tx(connection: &Connection) -> Result<crate::fleet::Membersh
                 .collect::<Result<BTreeSet<_>, _>>()?,
             None => BTreeSet::new(),
         };
+        // A locally appended batch has not been seeded into an envelope yet.
+        // Its eventual signature uses this node's key; include it in the client
+        // view without doing that write while a request is being served.
+        if envelope_hash.is_none()
+            && let Some((local_origin, key)) = local_signer
+            && writer == local_origin
+        {
+            signers.insert(key.to_owned());
+        }
         if let Some(existing) = claims.iter_mut().find(|claim| claim.id == id) {
             existing.signers.extend(signers);
             continue;
@@ -23584,6 +23710,163 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
     Ok(true)
 }
 
+fn set_mission_run_state_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    run: &str,
+    status: &str,
+    phase: &str,
+    reason: Option<&str>,
+) -> Result<bool> {
+    let run = run.strip_prefix("mission-run/").unwrap_or(run);
+    let subject = format!("mission-run/{run}");
+    let current: Option<(String, String)> = transaction
+        .query_row(
+            "SELECT status, phase FROM mission_runs WHERE id=?1",
+            [run],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let Some((current_status, current_phase)) = current else {
+        return Ok(false);
+    };
+    let target_is_terminal = is_terminal_run_state(status) || phase == "terminal";
+    let now = now_ms();
+    if current_phase == "terminal"
+        || (current_status == status && current_phase == phase && target_is_terminal)
+    {
+        let generation: String = transaction.query_row(
+            "SELECT current_generation_id FROM mission_runs WHERE id=?1",
+            [run],
+            |row| row.get(0),
+        )?;
+        let reason = reason.unwrap_or("the owning mission run is terminal");
+        let mut claim_ids = cancel_descendant_mission_runs_tx(
+            transaction,
+            origin,
+            &generation,
+            "daemon/runtime",
+            reason,
+            now,
+        )?;
+        claim_ids.extend(terminalize_run_steps_tx(
+            transaction,
+            origin,
+            run,
+            reason,
+            None,
+            None,
+            now,
+        )?);
+        return Ok(!claim_ids.is_empty());
+    }
+    if current_status == status && current_phase == phase {
+        return Ok(false);
+    }
+    if (current_phase.starts_with("cleanup-") && phase != "terminal")
+        || (current_phase == "final-cancelled"
+            && !matches!(phase, "final-cancelled" | "cleanup-cancelled" | "terminal"))
+    {
+        return Ok(false);
+    }
+    transaction.execute(
+        "UPDATE mission_runs SET status=?2, phase=?3, updated_at_unix_ms=?4 WHERE id=?1",
+        params![run, status, phase, now.to_string()],
+    )?;
+    transaction.execute(
+        "UPDATE run_generations SET status=?2, updated_at_unix_ms=?3
+         WHERE id=(SELECT current_generation_id FROM mission_runs WHERE id=?1)",
+        params![run, status, now.to_string()],
+    )?;
+    let body = json!({"fields": {"status": status, "phase": phase, "reason": reason}});
+    append_claim_tx(
+        transaction,
+        origin,
+        &subject,
+        "mission-run.state",
+        None,
+        &body,
+        &[],
+        None,
+    )?;
+    let generation: String = transaction.query_row(
+        "SELECT current_generation_id FROM mission_runs WHERE id=?1",
+        [run],
+        |row| row.get(0),
+    )?;
+    append_claim_tx(
+        transaction,
+        origin,
+        &format!("run-generation/{generation}"),
+        "run-generation.state",
+        None,
+        &body,
+        &[],
+        None,
+    )?;
+    if phase.starts_with("cleanup-") {
+        terminalize_run_steps_tx(
+            transaction,
+            origin,
+            run,
+            reason.unwrap_or("the mission run entered cleanup"),
+            Some("daemon/runtime"),
+            None,
+            now,
+        )?;
+    }
+    if target_is_terminal {
+        cancel_descendant_mission_runs_tx(
+            transaction,
+            origin,
+            &generation,
+            "daemon/runtime",
+            reason.unwrap_or("the owning mission run is terminal"),
+            now,
+        )?;
+        terminalize_run_steps_tx(
+            transaction,
+            origin,
+            run,
+            reason.unwrap_or("the owning mission run is terminal"),
+            None,
+            None,
+            now,
+        )?;
+    }
+    Ok(true)
+}
+
+/// The graph tables a replay derives from claims alone, children before the tables their
+/// foreign keys name. Local tables, such as lease renewals, are not among them.
+const REPLAYED_GRAPH_TABLES: [&str; 8] = [
+    "desired",
+    "mission_definitions",
+    "mission_run_deadlines",
+    "mission_run_after",
+    "step_runs",
+    "revision_proposals",
+    "run_generations",
+    "mission_runs",
+];
+
+/// Clear the graph and replay every claim into it, as a node that joins late does. A replay
+/// over the rows an earlier projection left behind depends on how that projection ran: it
+/// skipped a generation it had already projected, so it re-applied a terminal state that the
+/// generation had reopened. Two nodes holding the same claims then showed different graphs.
+fn replay_graph_from_nothing_tx(transaction: &Transaction<'_>) -> Result<(), St3Error> {
+    for table in REPLAYED_GRAPH_TABLES {
+        transaction
+            .execute(&format!("DELETE FROM {table}"), [])
+            .map_err(internal)?;
+    }
+    rebuild_operations_tx(transaction).map_err(internal)?;
+    project_replicated_base_claims(transaction)?;
+    project_replicated_mission_runs(transaction)?;
+    rebuild_planning_tx(transaction).map_err(internal)?;
+    Ok(())
+}
+
 fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), St3Error> {
     let mut statement = transaction
         .prepare(
@@ -23602,10 +23885,16 @@ fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), S
                                 WHERE replica_records.claim_id=claims.id), 0), claims.id",
         )
         .map_err(internal)?;
-    let claims = statement.query_map([], claim_from_row).map_err(internal)?;
+    // Read every claim before projecting any: rolling back one claim's savepoint aborts a
+    // statement that is still stepping, which would fail the whole replay.
+    let claims = statement
+        .query_map([], claim_from_row)
+        .map_err(internal)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(internal)?;
+    drop(statement);
     clear_quarantined_claims_tx(transaction, "projection:base")?;
     for claim in claims {
-        let claim = claim.map_err(internal)?;
         insert_event(
             transaction,
             claim.store_index,
@@ -23917,9 +24206,13 @@ fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), 
                                     WHERE replica_records.claim_id=claims.id), 0), claims.id"
             ))
             .map_err(internal)?;
-        let claims = statement.query_map([], claim_from_row).map_err(internal)?;
+        let claims = statement
+            .query_map([], claim_from_row)
+            .map_err(internal)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(internal)?;
+        drop(statement);
         for claim in claims {
-            let claim = claim.map_err(internal)?;
             project_claim_isolated_tx(transaction, "projection:runs", &claim, || match pass {
                 0 => project_mission_run_created(transaction, &claim),
                 1 => project_mission_run_update(transaction, &claim),
@@ -24637,11 +24930,17 @@ fn project_run_generation_created(
             .flatten();
         // The predecessor is already terminal when its successor is replayed.
         // Its projected step may have been cancelled after the carried claim was
-        // written, so use that claim as the authority for the successor state.
+        // written, so use that claim as the authority for the successor state. Only this
+        // generation carries onto its own step subjects, but a cutover may write each carried
+        // claim in a batch of its own, so find it by subject rather than by this batch.
         let carried_body = transaction
             .query_row(
-                "SELECT body FROM claims WHERE subject=?1 AND batch_id=?2 AND kind='step-run.carried'",
-                params![subject, claim.batch_id],
+                &format!(
+                    "SELECT claims.body FROM claims JOIN batches ON batches.id=claims.batch_id
+                     WHERE claims.subject=?1 AND claims.kind='step-run.carried'
+                     ORDER BY {CANONICAL_ORDER} LIMIT 1"
+                ),
+                [&subject],
                 |row| row.get::<_, String>(0),
             )
             .optional()
@@ -27839,6 +28138,33 @@ mod tests {
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    #[test]
+    fn subject_claim_pages_seek_the_subject_index() {
+        let store = Store::open_memory("node").unwrap();
+        store.claims_page(None, None, 0, None, false, 1).unwrap();
+        store
+            .claims_page(Some("agent/target"), None, 0, None, false, 1)
+            .unwrap();
+        let connection = store.readers.get();
+        for descending in [false, true] {
+            let query = format!("EXPLAIN QUERY PLAN {}", claims_page_query(true, descending));
+            let plan = connection
+                .prepare(&query)
+                .unwrap()
+                .query_map(params![0, None::<u64>, "agent/target", 2], |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+                .join("; ");
+            assert!(
+                plan.contains("claims_subject_index"),
+                "a subject page must not scan the whole graph: {plan}"
+            );
+        }
+    }
 
     #[test]
     fn a_pinned_read_sees_one_snapshot_while_commits_land() {
@@ -37102,6 +37428,326 @@ mission "takeover" state="ready" {
                 .collect::<Vec<_>>()
         };
         assert_eq!(states(&replicated), states(&reopened));
+    }
+
+    /// Every node that holds the same claims shows the same graph, however it projected them:
+    /// one exchange at a time as the source writes, from envelopes that arrive newest first, or
+    /// all at once as a node that joins late.
+    #[test]
+    fn graph_digests_agree_after_sync_whatever_path_projected_the_graph() {
+        let source = Store::open_memory("source").unwrap();
+        let stepwise = Store::open_memory("stepwise").unwrap();
+        let reversed = Store::open_memory("reversed").unwrap();
+        let late = Store::open_memory("late").unwrap();
+        let sync = |target: &Store| {
+            receive_and_project(
+                target,
+                "source",
+                &exchange_from(&source, &target.replication_inventory().unwrap()),
+            );
+        };
+
+        let failed = failed_takeover_run(&source, &["deploy-check"]);
+        sync(&stepwise);
+        sync(&reversed);
+        // Revising a failed run reopens it. Each carried step claim is its own batch.
+        let revised = publish_takeover(
+            &source,
+            &TAKEOVER_SOURCE.replace(
+                r#"step "smoke-check" { depends-on"#,
+                r#"step "smoke-check" { goal "Probe the new health endpoint."; depends-on"#,
+            ),
+            "takeover-revision",
+        );
+        let reopened = source
+            .adopt_mission_revision(
+                &failed.id,
+                &revised,
+                "person/requester",
+                "the smoke check probes the new endpoint",
+                "revise-failed-takeover",
+            )
+            .unwrap();
+        sync(&stepwise);
+        source
+            .set_step_state(
+                &takeover_step(&reopened, "deploy-check").subject,
+                "ready",
+                None,
+            )
+            .unwrap();
+        sync(&stepwise);
+        // A node admits the envelopes of one exchange in sequence order, so the newest arrives
+        // in an exchange of its own and the older ones follow in the next.
+        let newest_first = |target: &Store| {
+            let mut older = exchange_from(&source, &target.replication_inventory().unwrap());
+            let newest = older.envelopes.split_off(older.envelopes.len() - 1);
+            receive_and_project(
+                target,
+                "source",
+                &ReplicationExchange {
+                    envelopes: newest,
+                    ..older.clone()
+                },
+            );
+            receive_and_project(target, "source", &older);
+        };
+        newest_first(&reversed);
+        // Later writes that arrive out of order make each node replay the claims it already
+        // projected, including the reopened generation.
+        let smoke = takeover_step(&reopened, "smoke-check").subject.clone();
+        source.set_step_state(&smoke, "ready", None).unwrap();
+        source
+            .set_step_state(&smoke, "working", Some("the smoke check started"))
+            .unwrap();
+        FULL_REPLAYS.with(|replays| replays.set(0));
+        newest_first(&stepwise);
+        newest_first(&reversed);
+        assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 2);
+        sync(&late);
+
+        let graph = |store: &Store| {
+            let run = store.mission_run(&failed.id).unwrap().unwrap();
+            let steps = run
+                .steps
+                .iter()
+                .map(|step| (step.step.clone(), step.status.clone(), step.attempt))
+                .collect::<Vec<_>>();
+            let digest = store
+                .replication_status(true, Some(TEST_FLEET), &[])
+                .unwrap()
+                .graph_digest;
+            (run.status, run.phase, steps, digest)
+        };
+        let expected = graph(&source);
+        assert_eq!(
+            (expected.0.as_str(), expected.1.as_str()),
+            ("running", "normal")
+        );
+        for (name, target) in [
+            ("stepwise", &stepwise),
+            ("reversed", &reversed),
+            ("late", &late),
+        ] {
+            assert_eq!(graph(target), expected, "{name}");
+        }
+    }
+
+    /// A node written by a build from before the claim-log diet upgrades in place, keeps
+    /// writing, and syncs with a node that joins late. Both show the graph the old build showed.
+    ///
+    /// The fixture is what 91af810a (main before #604) wrote: `failed_takeover_run` with
+    /// deploy-check failed, `adopt_mission_revision` reopening it with the smoke-check goal
+    /// changed, deploy-check set ready, then four `harness.observed` heartbeats, one
+    /// `harness.usage`, one `harness.timeline` and a system `runtime.action.requested` and
+    /// `runtime.action.succeeded`, all of which replicated before the diet. The store was
+    /// vacuumed with 512-byte pages and gzipped.
+    #[test]
+    fn a_store_written_before_the_log_diet_upgrades_and_syncs_to_the_same_graph() {
+        use std::io::Read;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claims.sqlite3");
+        let mut bytes = Vec::new();
+        flate2::read::GzDecoder::new(
+            &include_bytes!("../tests/fixtures/pre-diet-store.sqlite3.gz")[..],
+        )
+        .read_to_end(&mut bytes)
+        .unwrap();
+        std::fs::write(&path, bytes).unwrap();
+
+        let upgraded = Store::open(&path, "writer").unwrap();
+        upgraded.bind_fleet(TEST_FLEET).unwrap();
+        // As the daemon starts. The old build showed the reopened run running, so nothing settles.
+        upgraded.validate_replication_backlog().unwrap();
+        upgraded.apply_replication_repairs().unwrap();
+        assert!(
+            upgraded
+                .settle_runs_for_canonical_replay()
+                .unwrap()
+                .is_empty()
+        );
+        assert!(upgraded.project_replication_backlog().unwrap());
+        // After the upgrade, a system runtime action stays local and a heartbeat that changes
+        // nothing but its time does not replicate.
+        let agent = "agent/writer.worker";
+        for (kind, actor, fields) in [
+            (
+                "runtime.action.requested",
+                None,
+                json!({"action": "terminate"}),
+            ),
+            (
+                "harness.observed",
+                Some(agent),
+                json!({"state": "idle", "incarnation_id": "inc-1", "observed_at_ms": 2_000}),
+            ),
+        ] {
+            upgraded
+                .append_claim(&ClaimInput {
+                    subject: agent.into(),
+                    kind: kind.into(),
+                    actor: actor.map(str::to_owned),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("after-upgrade:{kind}")),
+                })
+                .unwrap();
+        }
+        let joined = Store::open_memory("joined").unwrap();
+        receive_and_project(
+            &joined,
+            "writer",
+            &exchange_from(&upgraded, &joined.replication_inventory().unwrap()),
+        );
+
+        let run_id = upgraded
+            .readers
+            .get()
+            .query_row("SELECT id FROM mission_runs", [], |row| {
+                row.get::<_, String>(0)
+            })
+            .unwrap();
+        let graph = |store: &Store| {
+            let run = store.mission_run(&run_id).unwrap().unwrap();
+            let steps = run
+                .steps
+                .iter()
+                .map(|step| (step.step.clone(), step.status.clone(), step.attempt))
+                .collect::<Vec<_>>();
+            let status = store
+                .replication_status(true, Some(TEST_FLEET), &[])
+                .unwrap();
+            (
+                run.status,
+                run.phase,
+                steps,
+                status.authority_digest,
+                status.graph_digest,
+            )
+        };
+        let (status, phase, steps, authority, digest) = graph(&upgraded);
+        assert_eq!((status.as_str(), phase.as_str()), ("running", "normal"));
+        assert_eq!(
+            steps,
+            [
+                ("announce", "pending", 1),
+                ("deploy-check", "ready", 2),
+                ("prepare", "completed", 1),
+                ("report", "pending", 1),
+                ("smoke-check", "pending", 1),
+            ]
+            .map(|(step, status, attempt)| (
+                step.to_owned(),
+                status.to_owned(),
+                attempt
+            ))
+        );
+        assert_eq!(graph(&joined), (status, phase, steps, authority, digest));
+    }
+
+    /// A replay over existing rows used to re-apply a reopened run's old terminal state, so the
+    /// node that drives the run treated it as over. Before its first canonical replay, that node
+    /// writes the claims that keep the run over, rather than start its work again. A replica
+    /// leaves the run to the node that drives it.
+    #[test]
+    fn a_run_an_old_replay_ended_stays_over_with_claims_that_say_so() {
+        let source = Store::open_memory("source").unwrap();
+        let replica = Store::open_memory("replica").unwrap();
+        let failed = failed_takeover_run(&source, &["deploy-check"]);
+        let revised = publish_takeover(
+            &source,
+            &TAKEOVER_SOURCE.replace(
+                r#"step "smoke-check" { depends-on"#,
+                r#"step "smoke-check" { goal "Probe the new health endpoint."; depends-on"#,
+            ),
+            "takeover-revision",
+        );
+        source
+            .adopt_mission_revision(
+                &failed.id,
+                &revised,
+                "person/requester",
+                "the smoke check probes the new endpoint",
+                "revise-failed-takeover",
+            )
+            .unwrap();
+        receive_and_project(
+            &replica,
+            "source",
+            &exchange_from(&source, &replica.replication_inventory().unwrap()),
+        );
+        // The replay before this change, over the rows each node had projected.
+        let replay_over_existing_rows = |store: &Store| {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            rebuild_operations_tx(&transaction).unwrap();
+            project_replicated_base_claims(&transaction).unwrap();
+            project_replicated_mission_runs(&transaction).unwrap();
+            rebuild_planning_tx(&transaction).unwrap();
+            transaction.commit().unwrap();
+        };
+        let run_state = |store: &Store| {
+            let run = store.mission_run(&failed.id).unwrap().unwrap();
+            (run.status, run.phase)
+        };
+        for store in [&source, &replica] {
+            replay_over_existing_rows(store);
+            assert_eq!(run_state(store), ("failed".into(), "terminal".into()));
+        }
+
+        assert_eq!(
+            replica.settle_runs_for_canonical_replay().unwrap(),
+            Vec::<String>::new()
+        );
+        assert_eq!(run_state(&replica), ("running".into(), "normal".into()));
+        assert_eq!(
+            source.settle_runs_for_canonical_replay().unwrap(),
+            std::slice::from_ref(&failed.id)
+        );
+        assert_eq!(run_state(&source), ("failed".into(), "terminal".into()));
+        assert!(
+            source
+                .settle_runs_for_canonical_replay()
+                .unwrap()
+                .is_empty()
+        );
+
+        receive_and_project(
+            &replica,
+            "source",
+            &exchange_from(&source, &replica.replication_inventory().unwrap()),
+        );
+        let late = Store::open_memory("late").unwrap();
+        receive_and_project(
+            &late,
+            "source",
+            &exchange_from(&source, &late.replication_inventory().unwrap()),
+        );
+        let graph = |store: &Store| {
+            let run = store.mission_run(&failed.id).unwrap().unwrap();
+            let steps = run
+                .steps
+                .iter()
+                .map(|step| (step.step.clone(), step.status.clone(), step.attempt))
+                .collect::<Vec<_>>();
+            let digest = store
+                .replication_status(true, Some(TEST_FLEET), &[])
+                .unwrap()
+                .graph_digest;
+            (run.status, run.phase, steps, digest)
+        };
+        let expected = graph(&source);
+        assert!(
+            expected
+                .2
+                .iter()
+                .all(|(_, status, _)| matches!(status.as_str(), "completed" | "cancelled")),
+            "{expected:?}"
+        );
+        assert_eq!(graph(&replica), expected, "replica");
+        assert_eq!(graph(&late), expected, "late");
     }
 
     #[test]
