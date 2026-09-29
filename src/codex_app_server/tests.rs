@@ -5491,6 +5491,30 @@ fn app_server_configuration_extraction_fails_closed_at_ambiguous_boundaries() {
 }
 
 #[test]
+fn a_controlled_tui_starts_without_the_update_notice() {
+    // A seat starts with no prompt; the update notice would hold its TUI before any thread exists.
+    let args = vec![
+        "--remote".to_string(),
+        "unix:///server.sock".to_string(),
+        "resume".to_string(),
+        "thread-prior".to_string(),
+    ];
+    let command = controlled_tui_command("codex", &args);
+    assert_eq!(command.get_program(), "codex");
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        [
+            "-c",
+            "check_for_update_on_startup=false",
+            "--remote",
+            "unix:///server.sock",
+            "resume",
+            "thread-prior"
+        ]
+    );
+}
+
+#[test]
 fn controlled_tui_resumes_a_prior_binding_without_overriding_authored_selection() {
     let authored = vec!["--model".into(), "gpt-test".into(), "boot".into()];
     assert_eq!(

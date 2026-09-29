@@ -6,7 +6,7 @@ This table records the purpose and the prompt boundary for every st eval.
 
 | Eval | Audit result |
 | --- | --- |
-| `agent-migration-rehearsal` | Keep. It proves the generated boot file, an exact rendered migration document, assigned work, and cleanup. |
+| `agent-migration-rehearsal` | Keep. It proves a start with no startup prompt and no `.st3` directory, an exact rendered migration document, assigned work, and cleanup. |
 | `automatic-github-intake` | Keep. It proves that one durable resource event starts one isolated, pinned review mission. |
 | `claude-skill-inheritance` | Keep. It proves native Claude skill inheritance without an authored runtime prompt. |
 | `constraint-inheritance` | Keep. It proves that mission constraints reach nested steps. |
@@ -38,9 +38,9 @@ This table records the purpose and the prompt boundary for every st eval.
 | `run-generation-revision` | Keep. It proves compatible progress across a run revision. |
 | `seat-mission-work` | Keep. It proves a slash-qualified top-level seat with a real TUI claims and completes finite mission work. |
 | `seat-queue` | Keep. It proves one durable seat, Claude by default or Codex or omp through its runner, follows a queue move by an agent with queue authority, refuses the same move from the seat itself, passes over a head run waiting on a gate, returns to it once ready, keeps held claims, and gets no terminal input. |
-| `signal-rename` | Repair. Personas now contain product facts only and rely on the generated boot contract. |
+| `signal-rename` | Repair. Personas now contain product facts only. |
 | `test-writing` | Keep. It proves a direct coding mission with held-out gates. |
 | `weird-git-setup` | Keep. It proves work in a nonstandard repository layout. |
 | `work-wake-reliability` | Keep. It repeatedly proves fresh mission assignment, two live revisions, post-restart assignment, durable wake acknowledgement, cancellation, and agentless finalization without terminal input. |
 
-Eval personas can contain domain facts and fixture ownership. They cannot duplicate st conversations, claim, or boot procedures.
+Eval personas can contain domain facts and fixture ownership. They cannot duplicate st conversation or claim procedures.

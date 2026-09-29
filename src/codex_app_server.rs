@@ -2582,9 +2582,18 @@ fn spawn_controlled_app_server(
         .with_context(|| format!("starting {codex} app-server"))
 }
 
+/// Settings every controlled TUI starts with. A seat starts with no prompt, so any interactive
+/// startup screen would hold it before it creates a thread; the update notice is one.
+const CONTROLLED_TUI_OVERRIDES: [&str; 2] = ["-c", "check_for_update_on_startup=false"];
+
+fn controlled_tui_command(codex: &str, args: &[String]) -> Command {
+    let mut command = Command::new(codex);
+    command.args(CONTROLLED_TUI_OVERRIDES).args(args);
+    command
+}
+
 fn spawn_controlled_tui(codex: &str, args: &[String]) -> std::io::Result<Child> {
-    Command::new(codex)
-        .args(args)
+    controlled_tui_command(codex, args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())

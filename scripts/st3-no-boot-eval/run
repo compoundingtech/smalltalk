@@ -1,0 +1,332 @@
+#!/usr/bin/env bash
+# Prove that st starts a seat idle. One fresh isolated daemon starts a seat for every named
+# harness in a Git workspace that still holds what older releases rendered: a `.st3/boot.md` and
+# a `.st3/` line in the Git exclude file. For each seat the eval requires that:
+#
+#   1. the started seat takes no turn and writes no transcript entry while nothing is posted;
+#   2. st removed the legacy `.st3` directory and exclude line, and installed the st skill;
+#   3. once a step is assigned and a message is posted, the seat claims and completes the step
+#      and replies to the message;
+#   4. after its provider is killed and st restarts it, the seat takes no turn again.
+#
+# Usage: run ST3_BIN OUT HARNESS...
+#   HARNESS is claude, codex, omp, pi, or opencode.
+#
+# NB_MODEL_<HARNESS> overrides a seat's model. NB_QUIET_SECONDS (default 30) is how long each
+# idle window is watched. NB_WORK_SECONDS (default 600) bounds the step and the reply.
+# NB_EXTRA_PATH is prepended to the daemon's PATH, for a harness installed outside the login PATH.
+#
+# Run it outside any st seat: the isolated daemon binds a caller to the nearest ST_AGENT among
+# its ancestors, and this eval acts as a person. Each driver installs the st skill in this user's
+# home, as it does on a real host.
+#
+# OUT/result.json holds the verdict and one record per seat. OUT/evidence/ keeps the agent cards,
+# subject histories, transcripts, the driver log, and the daemon log.
+set -Eeuo pipefail
+
+here="$(cd "$(dirname "$0")" && pwd)"
+repo="$(cd "$here/../.." && pwd)"
+source "$repo/scripts/st3-seat-queue-perf/daemon.sh"
+candidate="$(readlink -f "$1")"
+mkdir -p "$2/evidence"
+out="$(cd "$2" && pwd)"
+shift 2
+harnesses=("$@")
+((${#harnesses[@]} > 0)) || { echo "name at least one harness: claude, codex, omp, pi or opencode" >&2; exit 2; }
+quiet_seconds=${NB_QUIET_SECONDS:-30}
+work_seconds=${NB_WORK_SECONDS:-600}
+ready_seconds=${NB_READY_DEADLINE_SECONDS:-300}
+
+harness_block() {
+  local model
+  case $1 in
+    claude)
+      model=${NB_MODEL_CLAUDE:-opus}
+      printf '  harness "claude" {\n    model "%s"\n    args "--permission-mode" "bypassPermissions"\n  }\n' "$model" ;;
+    codex)
+      model=${NB_MODEL_CODEX:-gpt-6-luna}
+      printf '  harness "codex" {\n    model "%s"\n    effort "low"\n    args "--dangerously-bypass-approvals-and-sandbox" "--dangerously-bypass-hook-trust"\n  }\n' "$model" ;;
+    omp)
+      model=${NB_MODEL_OMP:-openai-codex/gpt-5.6-luna}
+      printf '  harness "omp" {\n    model "%s"\n    effort "low"\n  }\n' "$model" ;;
+    pi)
+      model=${NB_MODEL_PI:-openai-codex/gpt-5.6-luna}
+      printf '  harness "pi" {\n    model "%s"\n    effort "low"\n  }\n' "$model" ;;
+    opencode)
+      model=${NB_MODEL_OPENCODE:-openai/gpt-5.6-luna}
+      printf '  harness "opencode" {\n    model "%s"\n  }\n' "$model" ;;
+    *) echo "unknown harness $1: use claude, codex, omp, pi or opencode" >&2; return 2 ;;
+  esac
+}
+
+root="$(mktemp -d /tmp/nbe.XXXXXX)"
+socket="$root/st3.sock"
+st3() { ST3_ENDPOINT="$socket" ST3_DAEMON_WAIT="${ST3_DAEMON_WAIT:-60}" "$root/bin/st3" "$@"; }
+
+# transcript HARNESS: the seat's native transcript path, or nothing while it has none.
+transcript() {
+  local slug thread
+  case $1 in
+    claude)
+      slug="$(printf '%s' "$root/ws/claude" | sed 's|[^A-Za-z0-9]|-|g')"
+      ls -t "$HOME/.claude/projects/$slug"/*.jsonl 2>/dev/null | head -1 || true
+      ;;
+    codex)
+      thread="$(find "$root/state/drivers" -path '*/state/binding.json' -exec cat {} \; 2>/dev/null \
+        | jq -r '.threadId // .thread_id // empty' | head -1)"
+      [[ -n $thread ]] && find "$HOME/.codex/sessions" -type f -name "*$thread*.jsonl" 2>/dev/null | head -1
+      ;;
+    omp | pi)
+      find "$root/state/drivers" -path "*nb.$1*" -path '*/provider-sessions/*.jsonl' -type f 2>/dev/null | head -1
+      ;;
+  esac
+  return 0
+}
+
+# turn_entries HARNESS: the number of user and assistant entries in the seat's transcript.
+turn_entries() {
+  local file
+  file="$(transcript "$1")"
+  [[ -n $file && -f $file ]] || { echo 0; return; }
+  jq -c 'select(
+      (.type == "user" or .type == "assistant")
+      or (.type == "response_item" and .payload.type == "message" and (.payload.role == "user" or .payload.role == "assistant"))
+      or (.type == "event_msg" and (.payload.type == "user_message" or .payload.type == "agent_message"))
+      or (.type == "message" and (.message.role == "user" or .message.role == "assistant"))
+    )' "$file" 2>/dev/null | wc -l
+}
+
+# working_since HARNESS MS: how many times st observed the seat working at or after MS.
+working_since() {
+  st3 subject history "agent/nb.$1" --json --limit 100 2>/dev/null \
+    | jq -s --argjson since "$2" \
+      'map(select(.kind == "harness.observed" and .body.fields.state == "working" and .accepted_at_unix_ms >= $since)) | length'
+}
+
+agent_json() { st3 agents show "agent/nb.$1" --json 2>/dev/null || echo '{}'; }
+
+now_ms() {
+  local micros=${EPOCHREALTIME/./}
+  printf '%s\n' "$((micros / 1000))"
+}
+
+# wait_idle HARNESS [NOT_INCARNATION]: wait until the seat runs, is not working, and, when given,
+# has a different incarnation. A harness that has taken no turn reports `ready`; after a turn it
+# reports `idle`.
+wait_idle() {
+  local deadline=$((SECONDS + ready_seconds)) card
+  while :; do
+    card="$(agent_json "$1")"
+    if jq -e --arg old "${2:-}" '.value.state == "running"
+        and (.value.harness_state == "ready" or .value.harness_state == "idle")
+        and ($old == "" or .value.incarnation_id != $old)' <<<"$card" >/dev/null; then
+      return 0
+    fi
+    if ((SECONDS >= deadline)); then
+      printf '%s\n' "$card" >"$out/evidence/$1-not-idle.json"
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+cleanup() {
+  local harness file
+  for harness in "${harnesses[@]}"; do
+    file="$(transcript "$harness")"
+    [[ -n $file && -f $file ]] && cp "$file" "$out/evidence/$harness-transcript.jsonl"
+    st3 subject history "agent/nb.$harness" --json --limit 100 >"$out/evidence/$harness-history.jsonl" 2>/dev/null || true
+  done
+  cp "$root/daemon.log" "$out/evidence/" 2>/dev/null || true
+  cp "$root/xdg-state/st3/driver-api-warnings.log" "$out/evidence/driver.log" 2>/dev/null || true
+  perf_stop_daemon "$root" >/dev/null 2>&1 || true
+  rm -rf "$root"
+}
+trap cleanup EXIT
+trap 'exit 143' TERM INT
+
+login_path="$(perf_login_path)"
+mkdir -p "$root/bin" "$root/state" "$root/pty" "$root/xdg-state" "$root/ws"
+cp "$candidate" "$root/bin/st3"
+cat >"$root/config.toml" <<TOML
+node = "nbnode"
+person = "person/eval"
+state_dir = "$root/state"
+socket = "$socket"
+client_gateway_socket = "$root/client.sock"
+TOML
+env -i HOME="$HOME" USER="$USER" LOGNAME="$USER" SHELL="$SHELL" LANG="${LANG:-C.UTF-8}" \
+  PATH="$root/bin:${NB_EXTRA_PATH:+$NB_EXTRA_PATH:}$login_path" XDG_STATE_HOME="$root/xdg-state" \
+  ${XDG_RUNTIME_DIR:+XDG_RUNTIME_DIR="$XDG_RUNTIME_DIR"} \
+  ${DBUS_SESSION_BUS_ADDRESS:+DBUS_SESSION_BUS_ADDRESS="$DBUS_SESSION_BUS_ADDRESS"} \
+  setsid "$root/bin/st3" up --config "$root/config.toml" --pty-root "$root/pty" \
+  >>"$root/daemon.log" 2>&1 </dev/null &
+echo $! >"$root/daemon.pid"
+for _ in $(seq 1 300); do
+  ST3_DAEMON_WAIT=0 st3 conversations ls person/eval --json >/dev/null 2>&1 && break
+  sleep 0.2
+done
+
+# Each workspace holds what an older release rendered there.
+{
+  echo 'version 2'
+  for harness in "${harnesses[@]}"; do
+    workspace="$root/ws/$harness"
+    mkdir -p "$workspace/.st3/host"
+    git -C "$workspace" init -q
+    printf '# st boot\n' >"$workspace/.st3/boot.md"
+    printf 'Host facts.\n' >"$workspace/.st3/host/nbnode.md"
+    printf '.st3/\n' >>"$workspace/.git/info/exclude"
+    printf 'agent "nb.%s" {\n  workspace "%s"\n  restart "always"\n' "$harness" "$workspace"
+    harness_block "$harness"
+    printf '}\n'
+  done
+} >"$root/seats.kdl"
+cp "$root/seats.kdl" "$out/evidence/seats.kdl"
+started_at=$(now_ms)
+st3 agents apply "$root/seats.kdl" --as person/eval >"$out/evidence/apply.txt"
+
+declare -A idle_ok start_turns start_working st3_left exclude_left skill_ok
+for harness in "${harnesses[@]}"; do
+  if wait_idle "$harness"; then idle_ok[$harness]=1; else idle_ok[$harness]=0; fi
+done
+# The idle window: nothing is posted, so no seat may take a turn.
+sleep "$quiet_seconds"
+for harness in "${harnesses[@]}"; do
+  agent_json "$harness" >"$out/evidence/$harness-started.json"
+  start_turns[$harness]="$(turn_entries "$harness")"
+  start_working[$harness]="$(working_since "$harness" "$started_at")"
+  workspace="$root/ws/$harness"
+  [[ -e $workspace/.st3 ]] && st3_left[$harness]=1 || st3_left[$harness]=0
+  grep -qx '.st3/' "$workspace/.git/info/exclude" && exclude_left[$harness]=1 || exclude_left[$harness]=0
+  case $harness in
+    claude) skill="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/skills/st/SKILL.md" ;;
+    *) skill="$HOME/.agents/skills/st/SKILL.md" ;;
+  esac
+  cmp -s "$skill" <(st3 skill) && skill_ok[$harness]=1 || skill_ok[$harness]=0
+done
+
+# The work: one step per seat, assigned the way a mission assigns a standing seat, and one message.
+{
+  echo 'version 2'
+  echo 'mission "eval/no-boot" state="ready" timeout="30m" {'
+  echo '  goal "Each seat completes one assigned step."'
+  for harness in "${harnesses[@]}"; do
+    printf '  step "%s" timeout="%ss" {\n' "$harness" "$work_seconds"
+    printf '    assigned-to "agent/nb.%s"\n' "$harness"
+    printf '    goal "Create a file named DONE in your workspace that contains the word done, then complete this step with the path of that file as evidence."\n'
+    printf '  }\n'
+  done
+  echo '}'
+} >"$root/mission.kdl"
+cp "$root/mission.kdl" "$out/evidence/mission.kdl"
+st3 missions publish "$root/mission.kdl" --as person/eval >"$out/evidence/publish.txt"
+st3 --json missions start eval/no-boot --id nb --workspace "$root/ws" --as person/eval >"$out/evidence/start.json"
+declare -A message
+for harness in "${harnesses[@]}"; do
+  message[$harness]="$(st3 conversations send "agent/nb.$harness" --from person/eval \
+    --subject "No-boot check" \
+    --body "Reply to this message with the single word PONG." --json | jq -er .subject)"
+done
+
+declare -A step_state replied
+deadline=$((SECONDS + work_seconds))
+while ((SECONDS < deadline)); do
+  pending=0
+  st3 missions show mission-run/nb --json >"$root/run.json" 2>/dev/null || true
+  st3 conversations ls person/eval --json >"$root/inbox.json" 2>/dev/null || echo '[]' >"$root/inbox.json"
+  for harness in "${harnesses[@]}"; do
+    step_state[$harness]="$(jq -r --arg step "$harness" \
+      '[.. | objects | select(.path? == $step and (.state? | type) == "string") | .state] | first // "unknown"' \
+      "$root/run.json" 2>/dev/null || echo unknown)"
+    replied[$harness]="$(jq -r --arg from "agent/nb.$harness" --arg parent "${message[$harness]}" \
+      'map(select(.from == $from and .in_reply_to == $parent)) | length' "$root/inbox.json")"
+    [[ ${step_state[$harness]} == completed && ${replied[$harness]} != 0 ]] || pending=1
+  done
+  ((pending)) || break
+  sleep 2
+done
+cp "$root/run.json" "$out/evidence/run.json" 2>/dev/null || true
+cp "$root/inbox.json" "$out/evidence/inbox.json" 2>/dev/null || true
+
+# The restart: kill each provider; st restarts the seat, which must again take no turn.
+declare -A before_restart restart_ok restart_turns restart_working restarted_at
+for harness in "${harnesses[@]}"; do
+  old="$(agent_json "$harness" | jq -r '.value.incarnation_id // empty')"
+  before_restart[$harness]="$(turn_entries "$harness")"
+  for proc in /proc/[0-9]*; do
+    { tr '\0' '\n' <"$proc/environ"; } 2>/dev/null | grep -qxF "ST_AGENT=agent/nb.$harness" || continue
+    { tr '\0' ' ' <"$proc/cmdline"; } 2>/dev/null | grep -q " driver $harness " || continue
+    kill -TERM "${proc#/proc/}" 2>/dev/null || true
+  done
+  restarted_at[$harness]=$(now_ms)
+  if wait_idle "$harness" "$old"; then restart_ok[$harness]=1; else restart_ok[$harness]=0; fi
+done
+sleep "$quiet_seconds"
+for harness in "${harnesses[@]}"; do
+  agent_json "$harness" >"$out/evidence/$harness-restarted.json"
+  restart_turns[$harness]=$(( $(turn_entries "$harness") - ${before_restart[$harness]} ))
+  restart_working[$harness]="$(working_since "$harness" "${restarted_at[$harness]}")"
+done
+
+verdict=pass
+records=()
+for harness in "${harnesses[@]}"; do
+  record="$(jq -n \
+    --arg harness "$harness" \
+    --argjson idle "${idle_ok[$harness]}" \
+    --argjson start_turns "${start_turns[$harness]}" \
+    --argjson start_working "${start_working[$harness]}" \
+    --argjson st3_left "${st3_left[$harness]}" \
+    --argjson exclude_left "${exclude_left[$harness]}" \
+    --argjson skill "${skill_ok[$harness]}" \
+    --arg step "${step_state[$harness]:-unknown}" \
+    --argjson replied "${replied[$harness]:-0}" \
+    --argjson done_file "$([[ -s $root/ws/$harness/DONE ]] && echo 1 || echo 0)" \
+    --argjson restart "${restart_ok[$harness]}" \
+    --argjson restart_turns "${restart_turns[$harness]}" \
+    --argjson restart_working "${restart_working[$harness]}" '
+    {
+      harness: $harness,
+      started_idle: ($idle == 1),
+      transcript_entries_before_message: $start_turns,
+      working_observations_before_message: $start_working,
+      legacy_st3_left: ($st3_left == 1),
+      legacy_exclude_left: ($exclude_left == 1),
+      skill_installed: ($skill == 1),
+      step_state: $step,
+      done_file: ($done_file == 1),
+      replies: $replied,
+      restarted_idle: ($restart == 1),
+      transcript_entries_after_restart: $restart_turns,
+      working_observations_after_restart: $restart_working
+    }
+    | .failures = ([
+        (if .started_idle then empty else "the started seat did not become idle" end),
+        (if .transcript_entries_before_message == 0 then empty else "the started seat wrote \(.transcript_entries_before_message) transcript entries before a message" end),
+        (if .working_observations_before_message == 0 then empty else "st saw the started seat working before a message" end),
+        (if .legacy_st3_left then "the legacy .st3 directory is still there" else empty end),
+        (if .legacy_exclude_left then "the legacy .st3/ exclude line is still there" else empty end),
+        (if .skill_installed then empty else "the st skill is not installed" end),
+        (if .step_state == "completed" then empty else "the step is \(.step_state)" end),
+        (if .done_file then empty else "the step left no DONE file" end),
+        (if .replies > 0 then empty else "the seat did not reply to the message" end),
+        (if .restarted_idle then empty else "the restarted seat did not become idle" end),
+        (if .transcript_entries_after_restart == 0 then empty else "the restarted seat wrote \(.transcript_entries_after_restart) transcript entries" end),
+        (if .working_observations_after_restart == 0 then empty else "st saw the restarted seat working" end)
+      ])
+    | .verdict = (if (.failures | length) == 0 then "pass" else "fail" end)')"
+  records+=("$record")
+  [[ $(jq -r .verdict <<<"$record") == pass ]] || verdict=fail
+done
+
+printf '%s\n' "${records[@]}" | jq -s \
+  --arg verdict "$verdict" \
+  --arg candidate "$candidate" \
+  --arg candidate_sha "$(sha256sum "$candidate" | cut -d' ' -f1)" \
+  --argjson quiet "$quiet_seconds" \
+  '{verdict: $verdict, candidate: $candidate, candidate_sha256: $candidate_sha, quiet_seconds: $quiet, seats: .}' \
+  >"$out/result.json"
+jq -r '.seats[] | "\(.harness)\t\(.verdict)\t\(.failures | join("; "))"' "$out/result.json"
+echo "verdict: $verdict"
+[[ $verdict == pass ]]

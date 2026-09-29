@@ -5175,8 +5175,13 @@ async fn start_planning_session(
         .map_err(ApiError::internal)?
         .into_iter()
         .collect();
-    let prompt = format!(
-        "You are the durable {} planner for launch {id}. Use `st conversations ls`, read and archive the native Small Talk request, and use `st documents get` for each immutable document reference. Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{mission_id}` and its state must be ready. You can submit named variants with `st launch submit {id} --variant NAME --markdown FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay available for revision messages until approval or cancellation.",
+    // The planner seat starts idle, so what it is asked to do arrives as its launch request.
+    let references = context_reference
+        .as_ref()
+        .map(|context| format!("{request_reference}\n{context}"))
+        .unwrap_or_else(|| request_reference.clone());
+    let request_text = format!(
+        "You are the durable {} planner for launch {id}. Use `st documents get` for each immutable document reference below. Write one Markdown mission and one complete version 2 KDL mission. The KDL mission ID must be `{mission_id}` and its state must be ready. You can submit named variants with `st launch submit {id} --variant NAME --markdown FILE --kdl KDL_FILE`. Use temporary files outside the workspace, and remove them after submission. Do not change the workspace. Do not publish or run the mission. Stay available for revision messages until approval or cancellation.\n\n{references}",
         planner_config.provider
     );
     let arguments = match planner_config.provider.as_str() {
@@ -5194,7 +5199,6 @@ async fn start_planning_session(
             worktree: request.workspace.clone(),
             model: planner_config.model.clone(),
             effort: planner_config.effort.clone(),
-            prompt: Some(prompt),
             arguments,
             expected_subject,
             idempotency_key: format!("{}:planner", request.idempotency_key),
@@ -5221,10 +5225,7 @@ async fn start_planning_session(
         &format!("planning-request:{id}"),
         &requester,
         &planner.subject,
-        &context_reference
-            .as_ref()
-            .map(|context| format!("{request_reference}\n{context}"))
-            .unwrap_or_else(|| request_reference.clone()),
+        &request_text,
         "Launch request",
     )?;
     let mut started_fields = BTreeMap::from([
@@ -7825,9 +7826,6 @@ async fn quick_agent(
             driver_body.push_str(&format!(" {argument:?}"));
         }
         driver_body.push('\n');
-    }
-    if let Some(prompt) = &request.prompt {
-        driver_body.push_str(&format!("prompt {prompt:?}\n"));
     }
     let kdl = format!(
         "version 2\nagent {bus_id:?} {{\n  identity {bus_id:?}\n  workspace {:?}\n  restart \"always\"\n  harness {driver:?} {{\n{driver_body}  }}\n}}\n",
@@ -11870,7 +11868,7 @@ version 2
 version 2
   agent "side-effect" {
     workspace "/tmp"
-    harness "codex" { prompt "This must never be published." }
+    harness "codex" {}
   }
 "#
         .to_vec();

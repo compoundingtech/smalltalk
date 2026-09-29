@@ -42,15 +42,13 @@ mission "release" state="ready" {
 
 Direct runtime declarations in a mission belong to each run of that mission. Direct declarations in a step become desired when that step activates. They stop being desired when their owner run ends or a successor generation removes them.
 
-Before a native harness starts, st renders `.st3/boot.md` into its workspace. The native driver always appends this exact launch text once:
+A native harness starts with no prompt. It takes no turn until a person types or a message is posted. When a step assigned to it becomes ready, st posts it a message that names the step. Mission goals and constraints remain in the graph.
 
-```text
-Read @.st3/boot.md completely. Then list, claim, do, and finish your current st work.
-```
+A harness block cannot declare `prompt`. Parsing refuses it with `harness-prompt-removed`; put the instruction in a step goal or send the seat a message.
 
-A harness `prompt` is optional. An authored prompt supplies stable repository context only. Mission goals and constraints remain in the graph.
+st no longer writes a `.st3` directory into a native harness workspace. It removes one that older releases wrote there, unless Git tracks something in it, and removes the `.st3/` line from the Git exclude file once no worktree sharing that file still has a `.st3` directory. A declared `render { git-exclude ".st3/" }` adds nothing.
 
-st refuses to replace a tracked `.st3/boot.md` with different bytes. That member’s complete render transaction fails, and the agent does not start. Other members continue reconciling; `st agents show` and `st doctor` report the fault.
+A declared `render` operation that would change a tracked file fails that member’s complete render transaction, and the agent does not start. Other members continue reconciling; `st agents show` and `st doctor` report the fault.
 
 ## Mission constraints
 
@@ -83,6 +81,8 @@ host "build-node" {
 ```
 
 Publish the document bytes before this declaration. A missing version rejects the publication.
+
+st writes no file for a host document. `st work claim` prints each document of the machine it runs on after the claimed step, under a `HOST  NODE` heading, each under its exact reference.
 
 ## Starting a mission run
 
@@ -328,7 +328,8 @@ planning-session "planning/release/01990000000070008000000000000000" {
 }
 ```
 
-The session creates a session-scoped planner with a bounded runtime ID. Codex with no explicit model
+The session creates a session-scoped planner with a bounded runtime ID. The planner starts idle;
+its instructions arrive as a message titled "Launch request". Codex with no explicit model
 or effort uses `gpt-6-sol` and `medium`; `st launch start --provider`, `--model`, and `--effort`
 can select another eligible harness configuration. The daemon's `[planner]` configuration supplies
 defaults for API-created launches. Each launch stores its effective planner configuration; changing

@@ -3048,7 +3048,7 @@ version 2
 
         agent "worker" {
           workspace "."
-          harness "codex" { prompt "Run durable work." }
+          harness "codex" {}
         }
 
     }

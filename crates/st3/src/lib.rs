@@ -28,6 +28,8 @@ pub mod render;
 pub mod resource;
 pub mod seat_queue;
 pub mod service;
+/// The st agent skill bundled in this binary and installed for each harness.
+pub mod skill;
 pub mod store;
 
 pub use graph::{parse_intent, validate_mission_runtimes};
