@@ -963,7 +963,7 @@ Read @.st3/boot.md completely. Then list, claim, do, and finish your current st 
 
 Each member’s render transaction writes the canonical `.st3/boot.md` before its native harness starts.
 
-The file explains graph work, Small Talk, wait behavior, and diagnostics. It does not contain a mission goal.
+The file explains graph work, messages, and attention requests. It does not contain a mission goal. With one host document link it renders in at most 20 lines.
 
 An authored prompt can add stable harness context. It cannot replace or duplicate the boot contract.
 

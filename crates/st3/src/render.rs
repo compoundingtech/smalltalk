@@ -936,6 +936,35 @@ mod tests {
     }
 
     #[test]
+    fn the_rendered_boot_document_stays_within_twenty_lines() {
+        let store = Store::open_memory("node").unwrap();
+        let document = store
+            .put_document("doc/hosts/node", b"Host facts.\n", &None, "host-doc")
+            .unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let source = format!(
+            r#"version 2
+  host "local" {{
+  document "doc/hosts/node@{}"
+  agent "one" {{ workspace {:?}; harness "claude" {{}} }}
+}}"#,
+            document.hash,
+            workspace.path().display().to_string()
+        );
+        let intent = crate::graph::parse_test_intent(&source, "node").unwrap();
+        let desired = intent.subjects.values().collect::<Vec<_>>();
+
+        apply_all(&store, &desired, "node");
+        let boot = fs::read_to_string(workspace.path().join(".st3/boot.md")).unwrap();
+        assert!(boot.contains("## Host documents"));
+        let lines = boot.lines().count();
+        assert!(
+            lines <= 20,
+            "the rendered boot.md has {lines} lines:\n{boot}"
+        );
+    }
+
+    #[test]
     fn host_document_pipeline_rejects_missing_non_text_and_colliding_content() {
         let store = Store::open_memory("node").unwrap();
         let workspace = tempfile::tempdir().unwrap();

@@ -285,9 +285,10 @@ Each run has a report in `evals/st3/cross-harness-message-wake/reports/`, named 
 - omp's Python `eval` tool runs with a filtered environment without `ST_AGENT`, `ST3_BIN`, or
   `ST3_ENDPOINT`. Run st commands from the shell tool. The session context says so, and the CLI
   refuses another agent's identity.
-- The cross-harness message wake eval hands out work only by message. The boot contract asks for
-  claimable graph work, so omp and Codex seats sometimes stop and request person action there. That
-  is an eval and boot-contract mismatch, not an omp delivery fault.
+- The cross-harness message wake eval hands out work only by message. The boot contract used to ask
+  for claimable graph work, so omp and Codex seats sometimes stopped and requested person action
+  there. That was an eval and boot-contract mismatch, not an omp delivery fault. The trimmed boot
+  contract no longer carries that rule.
 - Each run's report records its model from the provider transcript and its token counts.
 
 ## Still open

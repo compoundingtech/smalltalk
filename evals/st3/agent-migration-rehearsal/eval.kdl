@@ -28,7 +28,7 @@ mission "eval/agent-migration-rehearsal" state="ready" timeout="20m" {
     agentless
     depends-on { step "write-report" completed }
     gate "the runtime rendered the canonical boot file" {
-      exec "test -s .st3/boot.md && grep -Fqx 'The st3 graph is the authority for current work. This file contains stable runtime guidance only.' .st3/boot.md"
+      exec "test -s .st3/boot.md && grep -Fq 'The st graph is the authority for work.' .st3/boot.md"
       host "local"
       workspace "${ST_WORKSPACE}/agent"
       time-limit "1m"
