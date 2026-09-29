@@ -194,18 +194,30 @@ impl Node {
         self.daemon = Some(daemon);
         let client = self.client();
         // The pinned compatibility build may be cold while other CI lanes compile.
-        // Give startup room for that load, and preserve its logs if it fails to start.
+        // Give startup room for that load. Bound each health probe as well: a request
+        // stalled behind startup must not consume the whole startup deadline.
         let deadline = Instant::now() + Duration::from_secs(90);
         loop {
-            if client.get::<Value>("/v1/health").await.is_ok() {
-                break;
-            }
+            let health_error = match tokio::time::timeout(
+                Duration::from_secs(3),
+                client.get::<Value>("/v1/health"),
+            )
+            .await
+            {
+                Ok(Ok(_)) => break,
+                Ok(Err(error)) => error.to_string(),
+                Err(_) => "health request timed out after 3 seconds".into(),
+            };
             if let Some(status) = self.daemon.as_mut().unwrap().try_wait().unwrap() {
-                panic!("{} daemon exited with {status}:\n{}", self.name, self.logs());
+                panic!(
+                    "{} daemon exited with {status} (last health probe: {health_error}):\n{}",
+                    self.name,
+                    self.logs()
+                );
             }
             assert!(
                 Instant::now() < deadline,
-                "timed out waiting until {} daemon starts:\n{}",
+                "timed out waiting until {} daemon starts (last health probe: {health_error}):\n{}",
                 self.name,
                 self.logs()
             );
