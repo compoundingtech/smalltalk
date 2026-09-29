@@ -74,7 +74,7 @@
     { "path": "st mission show|start", "purpose_id": "missions", "disposition": "rename-missions" },
     { "path": "st pty ls|attach|peek|send|signal|ui", "purpose_id": "terminals", "disposition": "replace-with-terminals-without-legacy-ui" },
     { "path": "st repair dry-run|apply", "purpose_id": "repair", "disposition": "add-canonical" },
-    { "path": "st replication status|invalid|inspect|diff|repair", "purpose_id": "replication", "disposition": "keep" },
+    { "path": "st replication status|invalid|inspect|diff|repair|checkpoint", "purpose_id": "replication", "disposition": "keep" },
     { "path": "st service install|status|permissions|restart|reset|uninstall", "purpose_id": "service", "disposition": "keep" },
     { "path": "st claude-channel install|status|uninstall", "purpose_id": "debug", "disposition": "demote-expert" },
     { "path": "st doc put|get|list", "purpose_id": "documents", "disposition": "replace-with-documents-put-get-ls" },

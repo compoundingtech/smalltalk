@@ -38,6 +38,14 @@ use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
 use crate::model::{SeatQueueMoveRequest, SeatQueueMoveView, SeatQueueRunView, SeatQueueView};
 use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
+mod checkpoint;
+
+pub use checkpoint::{
+    CheckpointPlanRequest, CheckpointPlanView, CheckpointProof, ClaimTombstone, DropCount,
+    DropPlan, EnvelopeKey, EnvelopeTombstone, SealedSet, checkpoint_cut, checkpoint_name,
+    newest_due_cut, rules_digest,
+};
+
 type StepStateRow = (String, bool, u32, String, String, String, String, String);
 type StepRetryRow = (String, u32, bool, String, String, String, String, String);
 type CumulativeUsage = (u64, u64, u64, u64, Option<f64>, Option<String>);
@@ -679,6 +687,10 @@ pub struct Store {
     /// This node's fleet member key. Set, it signs every envelope of this node's writer.
     member_key: std::sync::RwLock<Option<Arc<crate::fleet::MemberKey>>>,
     origin: String,
+    /// The database file, or the shared-memory URI of an in-memory store. A checkpoint proof
+    /// opens its own connection here to copy the store.
+    path: PathBuf,
+    shared_memory: bool,
 }
 
 const MESSAGE_CACHE_LIMIT: usize = 4096;
@@ -1501,6 +1513,8 @@ impl Store {
             last_replication_projection_unix_ms: AtomicU64::new(0),
             member_key: std::sync::RwLock::new(None),
             origin,
+            path: path.to_path_buf(),
+            shared_memory: false,
         })
     }
 
@@ -1548,6 +1562,8 @@ impl Store {
             last_replication_projection_unix_ms: AtomicU64::new(0),
             member_key: std::sync::RwLock::new(None),
             origin,
+            path: uri,
+            shared_memory: true,
         })
     }
 
@@ -25368,16 +25384,43 @@ fn step_execution_timing_at(
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
 
+    let events = events
+        .into_iter()
+        .map(|(kind, body, accepted)| {
+            (
+                kind,
+                serde_json::from_str::<Value>(&body).unwrap_or(Value::Null),
+                accepted.parse::<u128>().unwrap_or(0),
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(fold_step_timing(
+        &events,
+        attempt,
+        snapshot_unix_ms,
+        currently_active,
+    ))
+}
+
+/// Fold a step's execution timing from its step and work events in canonical order: the active
+/// interval of `attempt` as of `snapshot_unix_ms`, and the time elapsed in earlier intervals.
+/// An interval closes when the next event arrives after its lease expiry. The checkpoint
+/// planner replays the same fold, so it keeps every renewal the answer depends on.
+pub(crate) fn fold_step_timing(
+    events: &[(String, Value, u128)],
+    attempt: u32,
+    snapshot_unix_ms: u128,
+    currently_active: bool,
+) -> (Option<u128>, u128) {
     let mut elapsed = 0_u128;
     let mut started = None;
     let mut lease_expires = None;
     for (kind, body, accepted) in events {
-        let accepted = accepted.parse::<u128>().unwrap_or(0);
+        let accepted = *accepted;
         if accepted > snapshot_unix_ms {
             break;
         }
-        let body = serde_json::from_str::<Value>(&body).unwrap_or(Value::Null);
-        let fields = body.get("fields").unwrap_or(&body);
+        let fields = body.get("fields").unwrap_or(body);
         if kind.starts_with("work.")
             && fields.get("attempt").and_then(Value::as_u64) != Some(u64::from(attempt))
         {
@@ -25478,7 +25521,7 @@ fn step_execution_timing_at(
             started = None;
         }
     }
-    Ok((started, elapsed))
+    (started, elapsed)
 }
 
 fn apply_effective_step_state(
