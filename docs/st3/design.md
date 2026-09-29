@@ -106,8 +106,8 @@ The reconciler takes up each item of a pass on its own. The items are:
 - each observer, schedule, and subscription;
 - each mission run, and each step within it;
 - each later stage of the pass: intake, observers, schedules, scheduled work, subscriptions,
-  provider-capacity retries, retired-agent attention, mission evaluation, and attention `until`
-  conditions.
+  provider-capacity retries, retired-agent attention, disk space, mission evaluation, and
+  attention `until` conditions.
 
 When an item fails or panics, the reconciler records the fault on that item's subject and carries
 on with every other item:
@@ -119,6 +119,18 @@ on with every other item:
 
 A fault is recorded again only when its cause changes. The item's next success records its
 recovery.
+
+A fault that lasts two minutes asks `person/operator` once, naming the subject, the cause, and
+`st subject SUBJECT`. A new cause replaces that item, and the next success closes it. While whole
+passes fail or the reconciler panics, one item on `daemon/HOST` names `st doctor` and
+`st service restart`, and the next successful pass closes it.
+
+The daemon also reads the free space of its state directory's filesystem and of each workspace on
+its host, every 30 seconds. When one has under 2 GiB or 2% left, one item on `daemon/HOST` names
+each such filesystem and how to free space. It closes once each has 4 GiB and 4% free, so a
+filesystem near the line does not raise and close items over and over. A person who closes the
+item early is not asked again until the space recovers. `st doctor` shows the free space of the
+state directory.
 
 Sometimes a fault cannot be recorded on its item, for example when a store write fails. The item
 was still skipped on its own and the pass carried on. The daemon then records `daemon.diagnostic`
