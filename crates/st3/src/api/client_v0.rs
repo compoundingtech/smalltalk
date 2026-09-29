@@ -305,7 +305,7 @@ fn conversation_owner_host(
         if state
             .client_relay
             .as_ref()
-            .is_none_or(|relay| !relay.has_peer(owner))
+            .is_none_or(|relay| !relay.reaches(owner))
         {
             return Err(remote_unavailable(owner));
         }
@@ -331,6 +331,7 @@ async fn conversation_page(
                 owner,
                 &crate::peer::ClientReadRequest {
                     authority_actor: session.authority_actor.clone(),
+                    relay: None,
                     request: crate::peer::ClientReadOperation::Timeline {
                         session_id: session_id.to_owned(),
                         limit: PAGE,
@@ -378,6 +379,7 @@ async fn conversation_changes_value(
                 owner,
                 &crate::peer::ClientReadRequest {
                     authority_actor: session.authority_actor.clone(),
+                    relay: None,
                     request: crate::peer::ClientReadOperation::ConversationChanges {
                         session_id: session_id.to_owned(),
                         after: after.map(str::to_owned),
@@ -3791,6 +3793,7 @@ pub(super) async fn conversation_changes(
                     &owner,
                     &crate::peer::ClientReadRequest {
                         authority_actor: session.authority_actor,
+                        relay: None,
                         request: crate::peer::ClientReadOperation::ConversationChanges {
                             session_id,
                             after: query.after,
@@ -3852,7 +3855,7 @@ pub(super) async fn conversation_stream(
         if state
             .client_relay
             .as_ref()
-            .is_none_or(|relay| !relay.has_peer(owner))
+            .is_none_or(|relay| !relay.reaches(owner))
         {
             return Err(remote_unavailable(owner));
         }
@@ -3887,6 +3890,7 @@ async fn conversation_stream_socket(
                         owner,
                         &crate::peer::ClientReadRequest {
                             authority_actor: session.authority_actor.clone(),
+                            relay: None,
                             request: crate::peer::ClientReadOperation::ConversationChanges {
                                 session_id: session_id.clone(),
                                 after: after_input.clone(),
@@ -4531,7 +4535,7 @@ fn remote_terminal_live_session(
     if state
         .client_relay
         .as_ref()
-        .is_none_or(|relay| !relay.has_peer(&owner_host_id))
+        .is_none_or(|relay| !relay.reaches(&owner_host_id))
     {
         return Err(remote_unavailable(&owner_host_id));
     }
@@ -4682,6 +4686,7 @@ pub(super) async fn terminal_screen(
                     &host,
                     &crate::peer::ClientReadRequest {
                         authority_actor: session.authority_actor.clone(),
+                        relay: None,
                         request,
                     },
                 )
@@ -4919,6 +4924,7 @@ async fn remote_terminal_stream_socket(
     loop {
         let request = crate::peer::ClientReadRequest {
             authority_actor: authority_actor.clone(),
+            relay: None,
             request: match sent.clone() {
                 Some(after_revision) => crate::peer::ClientReadOperation::TerminalScreenChange {
                     terminal_id: terminal_id.clone(),
@@ -5142,7 +5148,7 @@ fn terminal_attachment_response(
         && state
             .client_relay
             .as_ref()
-            .is_none_or(|relay| !relay.has_peer(owner_host_id))
+            .is_none_or(|relay| !relay.reaches(owner_host_id))
     {
         return Err(remote_unavailable(owner_host_id));
     }
@@ -5324,7 +5330,7 @@ fn consume_terminal_attachment(
                     || state
                         .client_relay
                         .as_ref()
-                        .is_some_and(|relay| relay.has_peer(owner))
+                        .is_some_and(|relay| relay.reaches(owner))
             })
         && field("terminal_id").and_then(Value::as_str) == Some(terminal_id)
         && field("runtime_incarnation").and_then(Value::as_str) == Some(incarnation)
@@ -6754,6 +6760,7 @@ pub(super) async fn action(
                     &live.owner_host_id,
                     &crate::peer::ClientReadRequest {
                         authority_actor: session.authority_actor.clone(),
+                        relay: None,
                         request: crate::peer::ClientReadOperation::TerminalControl {
                             action_id: request.id.clone(),
                             idempotency_key: request.idempotency_key.clone(),
@@ -6815,6 +6822,7 @@ pub(super) async fn action(
                     &live.owner_host_id,
                     &crate::peer::ClientReadRequest {
                         authority_actor: session.authority_actor.clone(),
+                        relay: None,
                         request: crate::peer::ClientReadOperation::TerminalScreen {
                             terminal_id: client_detail_id("terminal", &target),
                         },

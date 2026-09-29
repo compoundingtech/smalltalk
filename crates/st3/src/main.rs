@@ -3265,7 +3265,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
         pty_binary: pty_binary.clone(),
         fleet_id: config.fleet_id.clone(),
         configured_peers: config.peers.iter().map(|peer| peer.name.clone()).collect(),
-        client_relay: st3::peer::ClientRelay::from_config(&config)?,
+        client_relay: st3::peer::ClientRelay::from_config(&config)?
+            .map(|relay| relay.with_links(store.clone())),
         native_session_home: std::env::var_os("HOME").map(PathBuf::from),
         planner_default: config.planner.clone(),
     };
