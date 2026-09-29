@@ -28,7 +28,6 @@ use crate::fleet::transport::{
     local_addresses, resolve_tool, routes_from_endpoints, tailscale_addresses,
 };
 use crate::fleet::{Acceptance, FleetView, MemberKey, Refusal, Sender, verify_signature};
-use crate::model::InventoryCheckpoint;
 use crate::model::{
     ApiResponse, ReplicaEnvelopeId, ReplicationExchange, ReplicationExportRequest,
     ReplicationExportResponse, ReplicationInventory, ReplicationPeerFailureRequest,
@@ -36,6 +35,7 @@ use crate::model::{
 };
 #[cfg(test)]
 use crate::store::Store;
+use crate::model::InventoryCheckpoint;
 use crate::store::{
     CheckpointAction, CheckpointManifest, CheckpointManifestNeed, CheckpointManifestPage,
     CheckpointManifestRequest,
@@ -103,11 +103,9 @@ fn inflate(body: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn deflated(headers: &HeaderMap) -> bool {
-    headers.get("content-encoding").is_some_and(|value| {
-        value
-            .as_bytes()
-            .eq_ignore_ascii_case(EXCHANGE_ENCODING.as_bytes())
-    })
+    headers
+        .get("content-encoding")
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(EXCHANGE_ENCODING.as_bytes()))
 }
 
 fn accepts_deflate(headers: &HeaderMap) -> bool {
@@ -2502,8 +2500,8 @@ mod tests {
 
         // The owner's PTY session: a replay on PEEK, then whatever output the test writes.
         fs::create_dir_all(&owner.pty_root).unwrap();
-        let sessions =
-            tokio::net::UnixListener::bind(owner.pty_root.join("remote-runtime.sock")).unwrap();
+        let sessions = tokio::net::UnixListener::bind(owner.pty_root.join("remote-runtime.sock"))
+            .unwrap();
         let (output, _) = tokio::sync::broadcast::channel::<Vec<u8>>(16);
         let session_output = output.clone();
         tokio::spawn(async move {
@@ -2518,14 +2516,8 @@ mod tests {
                     };
                     let mut peek = [0_u8; 6];
                     if stream.read_exact(&mut peek).await.is_err()
-                        || stream
-                            .write_all(&packet(10, &[0, 24, 0, 80]))
-                            .await
-                            .is_err()
-                        || stream
-                            .write_all(&packet(5, b"owner shell\r\n$ "))
-                            .await
-                            .is_err()
+                        || stream.write_all(&packet(10, &[0, 24, 0, 80])).await.is_err()
+                        || stream.write_all(&packet(5, b"owner shell\r\n$ ")).await.is_err()
                     {
                         return;
                     }
@@ -3103,8 +3095,7 @@ mod tests {
 
     #[test]
     fn exchange_bodies_deflate_and_refuse_a_body_that_inflates_too_far() {
-        let body =
-            serde_json::to_vec(&serde_json::json!({"envelopes": vec!["same"; 1_000]})).unwrap();
+        let body = serde_json::to_vec(&serde_json::json!({"envelopes": vec!["same"; 1_000]})).unwrap();
         let compressed = deflate(&body).unwrap();
         assert!(compressed.len() * 10 < body.len());
         assert_eq!(inflate(&compressed).unwrap(), body);
@@ -3116,15 +3107,9 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         assert!(!accepts_deflate(&headers));
-        headers.insert(
-            "accept-encoding",
-            HeaderValue::from_static("gzip, Deflate;q=0.5"),
-        );
+        headers.insert("accept-encoding", HeaderValue::from_static("gzip, Deflate;q=0.5"));
         assert!(accepts_deflate(&headers));
-        headers.insert(
-            "accept-encoding",
-            HeaderValue::from_static("gzip, deflated"),
-        );
+        headers.insert("accept-encoding", HeaderValue::from_static("gzip, deflated"));
         assert!(!accepts_deflate(&headers));
     }
 
@@ -3199,10 +3184,7 @@ mod tests {
             let response = peer_router(state.clone()).oneshot(request).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             let headers = response.headers().clone();
-            assert!(
-                accepts_deflate(&headers),
-                "a new build takes compressed requests"
-            );
+            assert!(accepts_deflate(&headers), "a new build takes compressed requests");
             assert_eq!(deflated(&headers), ask);
             let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
             let response_body = if ask {
@@ -3570,10 +3552,7 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(
-            !moved,
-            "converged nodes store nothing, so the worker may rest"
-        );
+        assert!(!moved, "converged nodes store nothing, so the worker may rest");
         assert_eq!(
             connection_ports.lock().unwrap().len(),
             2,

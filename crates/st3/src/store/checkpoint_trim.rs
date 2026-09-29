@@ -128,7 +128,7 @@ enum Application {
     /// It verified the certificate every node applies, so it trims from its own plan.
     OwnPlan {
         checkpoint: String,
-        certificate: Certificate,
+        certificate: Box<Certificate>,
         seal_rowid: i64,
     },
     /// It adopts the certificate's manifest from a peer.
@@ -205,7 +205,7 @@ impl Store {
         {
             return Ok(Some(Application::OwnPlan {
                 checkpoint,
-                certificate,
+                certificate: Box::new(certificate),
                 seal_rowid,
             }));
         }
