@@ -11,7 +11,7 @@ for (const name of ['Models.generated', 'Client.generated']) {
     const output = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2020 } }).outputText;
     fs.writeFileSync(path.join(temporary, `${name}.js`), output);
 }
-const { St3Client, ClientError } = require(path.join(temporary, 'Client.generated.js'));
+const { St3Client, ClientError, applyWindow } = require(path.join(temporary, 'Client.generated.js'));
 const { CONTRACT_SHA256 } = require(path.join(temporary, 'Models.generated.js'));
 fs.rmSync(temporary, { recursive: true, force: true });
 
@@ -137,6 +137,73 @@ test('conversation stream opens at a cursor and delivers bounded changes', async
     socket.onmessage({ data: JSON.stringify(envelope(change)) });
     assert.deepEqual(received, [change]);
     stream.close();
+});
+
+function collectionSocket() {
+    return { onopen: null, onmessage: null, onclose: null, onerror: null, sent: [], closed: [], send(text) { this.sent.push(JSON.parse(text)); }, close(code) { this.closed.push(code); } };
+}
+const mission = (id, title) => ({ kind: 'mission', id, revision: `${id}@1`, updated_at: snapshot.created_at, title, state: 'running', runs: [], run_generations: {}, mission_revision: 'r' });
+
+test('collection stream holds commands until the socket opens and passes frames through', async () => {
+    const socket = collectionSocket();
+    const opened = [];
+    const frames = [];
+    const ends = [];
+    const client = new St3Client({ baseUrl: 'https://example.test/', credential: () => 'secret', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const stream = await client.collectionStream({ onFrame: frame => frames.push(frame), onEnd: error => ends.push(error), socket: (url, protocols, headers) => { opened.push({ url, protocols, headers }); return socket; } });
+    assert.deepEqual(opened, [{ url: 'wss://example.test/v1/client/collections/stream', protocols: ['st3.client.collections.v0'], headers: { Authorization: 'Bearer secret' } }]);
+    stream.subscribe('missions', 'missions', 200);
+    stream.subscribe('mine', 'attention', 50, { person: 'person/example' });
+    assert.deepEqual(socket.sent, []);
+    socket.onopen();
+    stream.subscribeTerminal('term', 'terminal/example', 'pty-1:2026-09-20T00:00:00Z', 'capability-proof');
+    stream.subscribeConversation('talk', 'agent/example');
+    stream.unsubscribe('talk');
+    assert.deepEqual(socket.sent, [
+        { kind: 'subscribe', id: 'missions', collection: 'missions', limit: 200 },
+        { kind: 'subscribe', id: 'mine', collection: 'attention', limit: 50, person: 'person/example' },
+        { kind: 'subscribe', id: 'term', collection: 'terminal', terminal: 'terminal/example', incarnation: 'pty-1:2026-09-20T00:00:00Z', capability: 'capability-proof' },
+        { kind: 'subscribe', id: 'talk', collection: 'conversation', conversation: 'agent/example' },
+        { kind: 'unsubscribe', id: 'talk' },
+    ]);
+    // A terminal's stale fence ends that subscription only: the socket and its windows keep going.
+    socket.onmessage({ data: JSON.stringify({ kind: 'error', id: 'term', collection: 'terminal', code: 'stale-fence', message: 'the terminal restarted' }) });
+    socket.onmessage({ data: JSON.stringify({ kind: 'resync', id: 'missions' }) });
+    socket.onmessage({ data: JSON.stringify({ kind: 'snapshot', id: 'missions', collection: 'missions', snapshot, items: [], order: [], has_more: false }) });
+    assert.deepEqual(frames.map(frame => [frame.kind, frame.id]), [['error', 'term'], ['resync', 'missions'], ['snapshot', 'missions']]);
+    assert.deepEqual(ends, []);
+    socket.onmessage({ data: 'not json' });
+    assert.equal(ends.length, 1);
+    assert.deepEqual(socket.closed, [1000]);
+});
+
+test('closing the collection stream sends nothing more and reports no end', async () => {
+    const socket = collectionSocket();
+    const ends = [];
+    const client = new St3Client({ baseUrl: 'http://100.64.0.1:7777', fetchImpl: async () => { throw new Error('no HTTP'); } });
+    const stream = await client.collectionStream({ onFrame: () => {}, onEnd: error => ends.push(error), socket: url => { assert.ok(url.startsWith('ws://100.64.0.1:7777/')); return socket; } });
+    socket.onopen();
+    stream.close();
+    stream.subscribe('agents', 'agents');
+    assert.deepEqual(socket.sent, []);
+    assert.deepEqual(socket.closed, [1000]);
+    assert.deepEqual(ends, []);
+});
+
+test('applyWindow keeps a window in the order each frame names', () => {
+    const [a, b, c] = [mission('mission/a', 'A'), mission('mission/b', 'B'), mission('mission/c', 'C')];
+    let window = applyWindow(undefined, { kind: 'changes', id: 'm', collection: 'missions', snapshot, upserts: [a], removes: [], order: ['mission/a'], has_more: false });
+    assert.equal(window, undefined);
+    window = applyWindow(window, { kind: 'snapshot', id: 'm', collection: 'missions', snapshot, items: [b, a], order: ['mission/a', 'mission/b'], has_more: true });
+    assert.deepEqual(window.items.map(item => item.id), ['mission/a', 'mission/b']);
+    assert.equal(window.hasMore, true);
+    const renamed = { ...b, title: 'B again' };
+    const later = { ...snapshot, id: 'snapshot/later', store_index: 2 };
+    window = applyWindow(window, { kind: 'changes', id: 'm', collection: 'missions', snapshot: later, upserts: [c, renamed], removes: ['mission/a'], order: ['mission/b', 'mission/c'], has_more: false });
+    assert.deepEqual(window.items.map(item => [item.id, item.title]), [['mission/b', 'B again'], ['mission/c', 'C']]);
+    assert.equal(window.hasMore, false);
+    assert.equal(window.snapshot.id, 'snapshot/later');
+    assert.equal(applyWindow(window, { kind: 'resync', id: 'm' }), window);
 });
 
 test('generated hash uses normative schema and operations bytes', () => {

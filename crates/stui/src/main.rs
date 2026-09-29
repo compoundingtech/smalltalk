@@ -1,4 +1,5 @@
 mod cache;
+mod feed;
 mod model;
 mod tree;
 mod ui;
@@ -2605,6 +2606,26 @@ fn main() -> Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
+    // The new screens are the default: one socket, pushed changes, no polling. `--old` keeps
+    // the previous screens and their event-polling sync for a while.
+    if !args.iter().any(|arg| arg == "--old") {
+        let cached = cache_path
+            .as_deref()
+            .zip(person.as_deref())
+            .and_then(|(path, actor)| cache::load(path, actor));
+        let (updates, incoming) = mpsc::channel::<feed::Update>();
+        let (commands, command_receiver) = tokio::sync::mpsc::unbounded_channel();
+        runtime.spawn(feed::run(client.clone(), updates, command_receiver));
+        return ui::live::run(ui::live::Context {
+            client,
+            runtime,
+            incoming,
+            commands,
+            person: person.unwrap_or_default(),
+            cache_path,
+            cached,
+        });
+    }
     let (updates, incoming) = mpsc::channel::<Update>();
     let background_client = client.clone();
     let background_updates = updates.clone();
@@ -2733,20 +2754,6 @@ fn main() -> Result<()> {
             }
         }
     });
-    // The new screens are the default; `--old` keeps the previous ones for a while.
-    if !args.iter().any(|arg| arg == "--old") {
-        let cached = cache_path
-            .as_deref()
-            .zip(person.as_deref())
-            .and_then(|(path, actor)| cache::load(path, actor));
-        return ui::live::run(ui::live::Context {
-            client,
-            runtime,
-            incoming,
-            person: person.unwrap_or_default(),
-            cached,
-        });
-    }
     let mut app = App::new(Model::default());
     app.model.status = "Loading…".into();
     let mut guard = TerminalGuard::enter()?;
