@@ -35,9 +35,13 @@ use crate::model::{
 };
 #[cfg(test)]
 use crate::store::Store;
+use crate::store::{CheckpointManifest, CheckpointManifestPage, CheckpointManifestRequest};
 
 const PROTOCOL: &str = "st3-replication-v1";
 const EXCHANGE_PATH: &str = "/v1/peer/exchange";
+/// A page of a checkpoint's manifest, for a node that adopts a checkpoint it did not take part
+/// in. Older builds neither serve nor call it.
+const CHECKPOINT_PATH: &str = "/v1/peer/checkpoint";
 const REPLICATION_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
 const REPLICATION_WAKE_COALESCE: Duration = Duration::from_secs(1);
 const CLIENT_READ_PATH: &str = "/v1/peer/client-read";
@@ -750,6 +754,21 @@ impl PeerBackend {
         }
     }
 
+    async fn checkpoint_manifest(
+        &self,
+        request: &CheckpointManifestRequest,
+    ) -> Result<CheckpointManifestPage> {
+        match self {
+            Self::Main(client) => {
+                client
+                    .post("/v1/internal/replication/checkpoint", request)
+                    .await
+            }
+            #[cfg(test)]
+            Self::Local(store) => store.checkpoint_manifest_page(request),
+        }
+    }
+
     async fn publish_endpoints(&self, mode: &str, endpoints: &[Value]) -> Result<()> {
         match self {
             Self::Main(client) => {
@@ -1221,6 +1240,10 @@ async fn keep_fleet_view_current(
 fn peer_router(state: PeerState) -> Router {
     Router::new()
         .route(EXCHANGE_PATH, post(receive_exchange))
+        .route(
+            CHECKPOINT_PATH,
+            post(receive_checkpoint_request).layer(DefaultBodyLimit::max(16_384)),
+        )
         .route(
             JOIN_PATH,
             post(receive_join).layer(DefaultBodyLimit::max(MAX_JOIN_BYTES)),
@@ -1749,6 +1772,142 @@ async fn receive_exchange(
             .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, message).into_response())
         }
     }
+}
+
+/// Answer a member or config peer with one page of a checkpoint's manifest. It is authenticated
+/// exactly like an exchange, and the answer is signed for this path.
+async fn receive_checkpoint_request(
+    State(state): State<PeerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let sender =
+        match state
+            .auth
+            .verify_sender(&headers, "POST", CHECKPOINT_PATH, &body, None, None)
+        {
+            Ok(sender) if state.fleet.accept(&sender).is_ok() => sender,
+            _ => return (StatusCode::UNAUTHORIZED, "untrusted checkpoint request").into_response(),
+        };
+    let request_digest = FleetAuth::body_digest(&body);
+    let result = async {
+        let request: CheckpointManifestRequest =
+            serde_json::from_slice(&body).context("decode the checkpoint request")?;
+        let page = state.backend.checkpoint_manifest(&request).await?;
+        let response = signed_response_for(&state, CHECKPOINT_PATH, &request_digest, 0, page)?;
+        deflate_response(response, accepts_deflate(&headers)).await
+    }
+    .await;
+    result.unwrap_or_else(|error| {
+        let message = format!("checkpoint request from {} failed: {error:#}", sender.name);
+        signed_error_response_for(
+            &state,
+            CHECKPOINT_PATH,
+            &request_digest,
+            0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &message,
+        )
+        .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, message).into_response())
+    })
+}
+
+/// Fetch a checkpoint's whole manifest from a peer, page by page. The caller verifies it against
+/// the checkpoint's certificate before storing anything from it.
+#[allow(dead_code)] // Adoption calls it; see doc/fleet/smalltalk/checkpoint-design, P5.
+async fn fetch_checkpoint_manifest(
+    http: &reqwest::Client,
+    peer: &PeerConfig,
+    node: &str,
+    auth: &FleetAuth,
+    fleet: &FleetContext,
+    checkpoint: &str,
+    cut_unix_ms: u128,
+) -> Result<CheckpointManifest> {
+    let mut manifest = CheckpointManifest {
+        checkpoint: checkpoint.to_owned(),
+        cut_unix_ms,
+        ..CheckpointManifest::default()
+    };
+    let mut after = None;
+    loop {
+        let request = CheckpointManifestRequest {
+            checkpoint: checkpoint.to_owned(),
+            cut_unix_ms,
+            after,
+        };
+        let page = fetch_checkpoint_manifest_page(http, peer, node, auth, fleet, &request).await?;
+        after = manifest.append(page).map_err(anyhow::Error::msg)?;
+        if after.is_none() {
+            return Ok(manifest);
+        }
+    }
+}
+
+async fn fetch_checkpoint_manifest_page(
+    http: &reqwest::Client,
+    peer: &PeerConfig,
+    node: &str,
+    auth: &FleetAuth,
+    fleet: &FleetContext,
+    request: &CheckpointManifestRequest,
+) -> Result<CheckpointManifestPage> {
+    let body = serde_json::to_vec(request)?;
+    let request_digest = FleetAuth::body_digest(&body);
+    let headers = auth.request_headers_for(CHECKPOINT_PATH, node, &body)?;
+    let endpoint = format!("{}{}", peer.url.trim_end_matches('/'), CHECKPOINT_PATH);
+    let response = http
+        .post(&endpoint)
+        .headers(headers)
+        .header("content-type", "application/json")
+        .header("accept-encoding", EXCHANGE_ENCODING)
+        .body(body)
+        .send()
+        .await
+        .with_context(|| format!("checkpoint request to peer {} failed", peer.name))?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let bytes = response.bytes().await?.to_vec();
+    let bytes = if deflated(&headers) {
+        inflate(&bytes)?
+    } else {
+        bytes
+    };
+    let responder = auth.verify_sender(
+        &headers,
+        "RESPONSE",
+        CHECKPOINT_PATH,
+        &bytes,
+        Some(&peer.name),
+        Some(&request_digest),
+    )?;
+    if let Err(refusal) = fleet.accept(&responder) {
+        anyhow::bail!(
+            "peer {} failed member authentication ({}): {}",
+            peer.name,
+            refusal.code,
+            refusal.message
+        );
+    }
+    anyhow::ensure!(
+        status.is_success(),
+        "peer {} returned {status}: {}",
+        peer.name,
+        String::from_utf8_lossy(&bytes)
+    );
+    let response: ApiResponse<CheckpointManifestPage> =
+        serde_json::from_slice(&bytes).context("decode the signed checkpoint page")?;
+    anyhow::ensure!(
+        response.api_version == "st3.v1",
+        "the peer API version differs"
+    );
+    anyhow::ensure!(
+        response.value.checkpoint == request.checkpoint
+            && response.value.cut_unix_ms == request.cut_unix_ms,
+        "peer {} answered for another checkpoint",
+        peer.name
+    );
+    Ok(response.value)
 }
 
 /// The join route. It exists only while this node sponsors an open invite; otherwise it answers
@@ -2902,6 +3061,96 @@ mod tests {
             )
             .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn a_peer_serves_a_checkpoint_manifest_to_its_fleet_only() {
+        use crate::store::{ClaimTombstone, EnvelopeTombstone, checkpoint_cut};
+        let fleet = "1f91ca65-7793-48cc-866e-ac15690130e1";
+        let auth = FleetAuth::test(fleet, &[6; 32]);
+        let target = Arc::new(Store::open_memory("target").unwrap());
+        target.bind_fleet(fleet).unwrap();
+        let checkpoint = "checkpoint/2026-09-27";
+        let cut = checkpoint_cut(checkpoint).unwrap();
+        let envelopes = (1..=3)
+            .map(|sequence| EnvelopeTombstone {
+                writer: "source".into(),
+                sequence,
+                envelope_hash: format!("{sequence:064x}"),
+                accepted_at_unix_ms: cut - 1_000 + u128::from(sequence),
+            })
+            .collect::<Vec<_>>();
+        let claims = envelopes
+            .iter()
+            .map(|envelope| ClaimTombstone {
+                id: format!("claim-{}", envelope.sequence),
+                writer: envelope.writer.clone(),
+                sequence: envelope.sequence,
+                envelope_hash: envelope.envelope_hash.clone(),
+                subject: "daemon/source".into(),
+                kind: "daemon.diagnostic".into(),
+                actor: None,
+                predecessors: Vec::new(),
+                operation_id: None,
+                request_digest: None,
+                accepted_at_unix_ms: envelope.accepted_at_unix_ms,
+            })
+            .collect::<Vec<_>>();
+        target
+            .apply_checkpoint_drop(checkpoint, &envelopes, &claims)
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = PeerState {
+            backend: PeerBackend::Local(target.clone()),
+            node: "target".into(),
+            auth: auth.clone(),
+            fleet: FleetContext::legacy(BTreeSet::from(["source".into()])),
+            main_socket: PathBuf::from("/no/such/socket"),
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let server = tokio::spawn(axum::serve(listener, peer_router(state)).into_future());
+        let peer = PeerConfig {
+            name: "target".into(),
+            url: format!("http://{address}"),
+        };
+        let http = replication_http_client();
+        let dialer = FleetContext::legacy(BTreeSet::from(["target".into()]));
+        let manifest =
+            fetch_checkpoint_manifest(&http, &peer, "source", &auth, &dialer, checkpoint, cut)
+                .await
+                .unwrap();
+        assert_eq!(
+            manifest,
+            target.checkpoint_manifest(checkpoint, cut).unwrap()
+        );
+        assert_eq!(manifest.envelopes, envelopes);
+        assert_eq!(manifest.claims, claims);
+        crate::store::verify_checkpoint_manifest(
+            &manifest,
+            &crate::store::drop_digest(&envelopes, &claims),
+        )
+        .unwrap();
+
+        // A node that is not the target's peer, or holds another fleet secret, gets nothing.
+        let stranger =
+            fetch_checkpoint_manifest(&http, &peer, "stranger", &auth, &dialer, checkpoint, cut)
+                .await;
+        assert!(stranger.is_err());
+        let other_fleet = FleetAuth::test(fleet, &[7; 32]);
+        let forged = fetch_checkpoint_manifest(
+            &http,
+            &peer,
+            "source",
+            &other_fleet,
+            &dialer,
+            checkpoint,
+            cut,
+        )
+        .await;
+        assert!(forged.is_err());
+        server.abort();
     }
 
     #[tokio::test]

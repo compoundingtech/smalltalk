@@ -722,6 +722,7 @@ async fn unix_request(
 fn request_deadline(path: &str, deadlines: ClientDeadlines) -> Duration {
     if path.starts_with("/v1/internal/replication/export")
         || path.starts_with("/v1/internal/replication/receive")
+        || path.starts_with("/v1/internal/replication/checkpoint")
     {
         deadlines.bulk
     } else if path.starts_with("/v1/checkpoint/plan") || path.starts_with("/v1/checkpoint/status")
