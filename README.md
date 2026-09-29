@@ -146,8 +146,10 @@ host creates. The command prints the agent's subject, here `agent/builder.site`.
 the declaration without applying it, and `--description` says what the agent is for.
 
 Ctrl+\\ detaches and leaves the agent running. `st terminals attach agent/builder.site` attaches
-again later, from any machine in the fleet: a terminal on another host goes through the client
-gateway as your person, the same path the apps use.
+again later, from any machine in the fleet. A terminal on another host is attached PTY to PTY over
+Fabric when that host runs `st terminals expose-fabric` and grants your machine the protocol it
+prints; no st daemon carries the bytes. Otherwise it goes through the client gateway as your
+person, the same path the apps use.
 
 ## Declare a seat
 

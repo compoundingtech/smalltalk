@@ -31,6 +31,8 @@ pub mod service;
 /// The st agent skill bundled in this binary and installed for each harness.
 pub mod skill;
 pub mod store;
+/// Attaches a local terminal to another fleet host's PTY session over Fabric, without st daemons.
+pub mod terminal_fabric;
 
 pub use graph::{parse_intent, validate_mission_runtimes};
 pub use model::{NormalizedIntent, St3Error};
