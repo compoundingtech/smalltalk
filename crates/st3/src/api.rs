@@ -414,6 +414,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/replication/records/{*record}", get(replication_record))
         .route("/v1/replication/repair", post(repair_replication_record))
         .route("/v1/checkpoint/plan", post(checkpoint_plan))
+        .route("/v1/checkpoint/status", get(checkpoint_status))
+        .route("/v1/checkpoint/excuse", post(checkpoint_excuse))
         .route(
             "/v1/internal/replication/export",
             post(replication_export).layer(DefaultBodyLimit::max(crate::peer::MAX_EXCHANGE_BYTES)),
@@ -582,7 +584,7 @@ async fn response_envelope(
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("application/json"))
     {
-        report_slow_request(&state, &request_path, started);
+        report_slow_request(&request_path, started);
         return response;
     }
     let status = response.status();
@@ -655,37 +657,19 @@ async fn response_envelope(
     };
     let body = serde_json::to_vec(&envelope).unwrap_or_else(|_| b"{}".to_vec());
     parts.headers.remove(axum::http::header::CONTENT_LENGTH);
-    report_slow_request(&state, &request_path, started);
+    report_slow_request(&request_path, started);
     Response::from_parts(parts, Body::from(body))
 }
 
-fn report_slow_request(state: &AppState, path: &str, started: Instant) {
+fn report_slow_request(path: &str, started: Instant) {
     let elapsed = started.elapsed();
     if elapsed < Duration::from_secs(1) {
         return;
     }
-    let store = state.store.clone();
-    let subject = format!("daemon/{}", state.node);
-    let reason = format!("request {path} took {} ms", elapsed.as_millis());
-    tokio::task::spawn_blocking(move || {
-        let result = store.append_claim(&ClaimInput {
-            subject,
-            kind: "daemon.diagnostic".into(),
-            actor: None,
-            fields: BTreeMap::from([
-                ("severity".into(), Value::String("error".into())),
-                ("code".into(), Value::String("slow-request".into())),
-                ("status".into(), Value::String("faulted".into())),
-                ("reason".into(), Value::String(reason.clone())),
-            ]),
-            evidence: Vec::new(),
-            expected_subject: None,
-            idempotency_key: None,
-        });
-        if let Err(error) = result {
-            eprintln!("slow request fault could not be recorded: {reason}: {error}");
-        }
-    });
+    // Request latency is an operational sample, not a graph change. Publishing a
+    // claim here causes replication and reconciliation on every node, including
+    // during the contention that made the request slow in the first place.
+    eprintln!("st3: slow request {path} took {} ms", elapsed.as_millis());
 }
 
 fn new_request_id() -> String {
@@ -4140,6 +4124,28 @@ async fn checkpoint_plan(
     blocking_store(move || store.checkpoint_plan_view(cut, &scratch))
         .await
         .map(Json)
+}
+
+async fn checkpoint_status(
+    State(state): State<AppState>,
+) -> Result<Json<crate::store::CheckpointStatusView>, ApiError> {
+    let store = state.store.clone();
+    let peers = state.configured_peers.clone();
+    blocking_store(move || store.checkpoint_status(client_now_ms(), &peers))
+        .await
+        .map(Json)
+}
+
+async fn checkpoint_excuse(
+    State(state): State<AppState>,
+    Json(request): Json<crate::store::CheckpointExcuseRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    let claim = state
+        .store
+        .excuse_checkpoint_writer(&request)
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(claim))
 }
 
 async fn repair_replication_record(
@@ -9876,35 +9882,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn slow_request_records_a_durable_fault() {
+    async fn slow_request_does_not_change_the_graph() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
-        report_slow_request(
-            &state,
-            "/v1/client/agents",
-            Instant::now() - Duration::from_secs(2),
+        let before = state.store.index().unwrap();
+        report_slow_request("/v1/client/agents", Instant::now() - Duration::from_secs(2));
+        // The old implementation spawned a blocking write, so give that write
+        // time to finish before proving the request caused no graph change.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(state.store.index().unwrap(), before);
+        assert!(
+            state
+                .store
+                .latest_claim("daemon/node", Some("daemon.diagnostic"))
+                .unwrap()
+                .is_none()
         );
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Some(claim) = state
-                    .store
-                    .latest_claim("daemon/node", Some("daemon.diagnostic"))
-                    .unwrap()
-                {
-                    assert_eq!(claim.body["fields"]["code"], "slow-request");
-                    assert!(
-                        claim.body["fields"]["reason"]
-                            .as_str()
-                            .unwrap()
-                            .contains("/v1/client/agents")
-                    );
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .unwrap();
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -14976,21 +14969,21 @@ version 2
         assert_eq!(filtered, json!([]));
 
         let subject = created["subject"].as_str().unwrap();
-        let wrong = serde_json::to_value(AttentionResolveRequest {
+        let agent = serde_json::to_value(AttentionResolveRequest {
             outcome: "resolved".into(),
             reason: None,
-            actor: "person/someone-else".into(),
-            idempotency_key: "api-attention-wrong".into(),
+            actor: "agent/fabric/other".into(),
+            idempotency_key: "api-attention-agent".into(),
         })
         .unwrap();
         let (status, rejected) = json_request(
             app.clone(),
             &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
-            wrong,
+            agent,
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
-        assert_eq!(rejected["code"], "wrong-attention-reviewer");
+        assert_eq!(rejected["code"], "attention-resolver-not-person");
 
         let resolution = serde_json::to_value(AttentionResolveRequest {
             outcome: "resolved".into(),

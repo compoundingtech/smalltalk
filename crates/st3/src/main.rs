@@ -2063,6 +2063,19 @@ enum CheckpointCommand {
         #[arg(long)]
         cut: Option<String>,
     },
+    /// Show the newest stable checkpoint and who has sealed or verified the one being agreed.
+    Status,
+    /// Stop waiting for an unreachable writer. It fences nothing: what the writer wrote while
+    /// away still replicates when it returns, and its next seal ends the excusal.
+    Excuse {
+        /// The writer, as its node name.
+        writer: String,
+        #[arg(long)]
+        reason: String,
+        /// The person excusing it.
+        #[arg(long = "as")]
+        actor: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2333,19 +2346,22 @@ enum AttentionCommand {
     },
     /// Request attention after an explicit fault.
     ///
-    /// The item stays in `st now` until its reviewer resolves it or you withdraw it with
+    /// The item stays in `st now` until a person resolves it or you withdraw it with
     /// `st attention withdraw` once the condition clears. It also leaves `now` on its own:
     ///
-    /// - at once, when a `step-run/` or `run-generation/` target is no longer current;
+    /// - at once, when a `step-run/` or `run-generation/` target is no longer current, or a
+    ///   pull request target is merged or closed;
     /// - otherwise, once every other target has ended after the request: a `mission/` retired or
     ///   cancelled, a `mission-run/` terminal, an `attention/` item resolved or its gate no
-    ///   longer pending, or an `agent/` stopped or ready on a later incarnation.
+    ///   longer pending, an `agent/` stopped or ready on a later incarnation, an `observer/`
+    ///   stopped or observing again, a `subscription/` stopped, a `loop-run/` running again or
+    ///   its run revised or cancelled, or a `message/` closed.
     ///
-    /// `resource/` and `doc/` targets are context and never end an item. A target of any other
-    /// kind, or one that had already ended when you made the request, keeps it open.
+    /// Other `resource/` targets and `doc/` targets are context and never end an item. A target
+    /// of any other kind, or one that had already ended when you made the request, keeps it open.
     #[command(verbatim_doc_comment)]
     Request(AttentionRequestArgs),
-    /// Resolve or dismiss an explicit attention request.
+    /// Resolve or dismiss any attention request, as any person.
     Resolve(AttentionResolveArgs),
     /// Withdraw an obsolete attention request as its original requester.
     Withdraw(AttentionWithdrawArgs),
@@ -2878,7 +2894,9 @@ async fn run(cli: Cli) -> Result<()> {
         Command::Doctor(args) => run_doctor(&immediate, args, cli.json).await,
         Command::Recorder { command } => run_recorder(command, &config, cli.json),
         Command::Repair { command } => run_repair(&client, command, cli.json).await,
-        Command::Replication { command } => run_replication(&client, command, cli.json).await,
+        Command::Replication { command } => {
+            run_replication(&client, &config, command, cli.json).await
+        }
         Command::Fleet { command } => run_fleet(&endpoint, command, cli.json).await,
         Command::Uninstall(args) => run_uninstall(&endpoint, args).await,
         Command::Service { command } => run_service(command, cli.json),
@@ -3161,6 +3179,20 @@ async fn run_up(args: UpArgs) -> Result<()> {
         store.clone(),
         config.observations.clone(),
     ));
+    if config.checkpoint.enabled {
+        tokio::spawn(run_checkpoints(
+            store.clone(),
+            st3::store::CheckpointContext {
+                now_unix_ms: 0,
+                configured_peers: config.peers.iter().map(|peer| peer.name.clone()).collect(),
+                scratch: config.state_dir.join("checkpoint"),
+                reviewer: config
+                    .person
+                    .clone()
+                    .unwrap_or_else(|| "person/operator".into()),
+            },
+        ));
+    }
     if let Some(otlp) = &config.observations.otlp {
         let exporter = st3::otlp::OtlpExporter::new(otlp, &config.node)?;
         eprintln!(
@@ -5696,7 +5728,12 @@ async fn wait_for_condition(
     condition: &str,
     actor: Option<&str>,
 ) -> Result<Value> {
-    let mut cursor = 0;
+    // Capture the current index before checking the condition. A change made during the
+    // check is then still visible to the event wait, without reading all prior events.
+    let health: Value = client.get("/v1/health").await?;
+    let mut cursor = health["store_index"]
+        .as_u64()
+        .context("the daemon health response has no store index")?;
     loop {
         if let Some(value) = condition_value(client, subject, condition).await? {
             return Ok(value);
@@ -5958,6 +5995,7 @@ fn render_replication_peers(peers: &[ReplicationPeerStatus], now: u128) -> Strin
 
 async fn run_replication(
     client: &Client,
+    config: &Config,
     command: ReplicationCommand,
     json_output: bool,
 ) -> Result<()> {
@@ -6162,7 +6200,75 @@ async fn run_replication(
             print!("{}", render_checkpoint_plan(&plan));
             Ok(())
         }
+        ReplicationCommand::Checkpoint {
+            command: CheckpointCommand::Status,
+        } => {
+            let status: st3::store::CheckpointStatusView =
+                client.get("/v1/checkpoint/status").await?;
+            if json_output {
+                return print_value(&status, true);
+            }
+            print!("{}", render_checkpoint_status(&status));
+            Ok(())
+        }
+        ReplicationCommand::Checkpoint {
+            command:
+                CheckpointCommand::Excuse {
+                    writer,
+                    reason,
+                    actor,
+                },
+        } => {
+            let actor = fleet_person(actor, config)?;
+            let request = st3::store::CheckpointExcuseRequest {
+                writer,
+                reason,
+                actor,
+            };
+            let claim: st3::model::ClaimRecord =
+                client.post("/v1/checkpoint/excuse", &request).await?;
+            print_value(&claim, json_output)
+        }
     }
+}
+
+fn render_checkpoint_status(status: &st3::store::CheckpointStatusView) -> String {
+    let names = |names: &std::collections::BTreeSet<String>| {
+        if names.is_empty() {
+            "none".to_owned()
+        } else {
+            names.iter().cloned().collect::<Vec<_>>().join(", ")
+        }
+    };
+    let mut output = format!("CHECKPOINTS  {}\n", status.node);
+    match &status.newest_stable {
+        Some(stable) => output.push_str(&format!(
+            "stable        {} · {} participants\n",
+            stable.checkpoint,
+            stable.terms.participants.len()
+        )),
+        None => output.push_str("stable        none\n"),
+    }
+    output.push_str(&format!("participants  {}\n", names(&status.participants)));
+    if !status.excused.is_empty() {
+        output.push_str(&format!("excused       {}\n", names(&status.excused)));
+    }
+    if !status.left.is_empty() {
+        output.push_str(&format!("left          {}\n", names(&status.left)));
+    }
+    if let Some(pending) = &status.pending {
+        output.push_str(&format!("pending       {}\n", pending.checkpoint));
+        output.push_str(&format!("  sealed      {}\n", names(&pending.sealed)));
+        output.push_str(&format!("  unsealed    {}\n", names(&pending.unsealed)));
+        for (writer, difference) in &pending.disagreeing {
+            output.push_str(&format!("  differs     {writer}: {difference}\n"));
+        }
+        output.push_str(&format!("  verified    {}\n", names(&pending.verified)));
+        if !pending.verifications_agree {
+            output.push_str("  verifications disagree; see daemon diagnostics\n");
+        }
+    }
+    output
 }
 
 fn render_checkpoint_plan(plan: &st3::store::CheckpointPlanView) -> String {
@@ -11363,6 +11469,33 @@ async fn trim_local_observations(store: Arc<Store>, observations: st3::config::O
     }
 }
 
+/// Seal and verify checkpoints every ten minutes. The proof copies the store and replays it, so
+/// it runs on a blocking thread, and a copy left by a crash is removed first.
+async fn run_checkpoints(store: Arc<Store>, context: st3::store::CheckpointContext) {
+    const CHECKPOINT_INTERVAL: Duration = Duration::from_secs(10 * 60);
+    let _ = std::fs::remove_dir_all(&context.scratch);
+    loop {
+        let store = store.clone();
+        let context = st3::store::CheckpointContext {
+            now_unix_ms: now_ms(),
+            ..context.clone()
+        };
+        match tokio::task::spawn_blocking(move || store.checkpoint_step(&context)).await {
+            Ok(Ok(actions)) => {
+                for action in actions {
+                    eprintln!(
+                        "st3: checkpoint {}",
+                        serde_json::to_string(&action).unwrap_or_default()
+                    );
+                }
+            }
+            Ok(Err(error)) => eprintln!("st3: checkpoint work failed: {error:#}"),
+            Err(error) => eprintln!("st3: checkpoint work stopped: {error}"),
+        }
+        tokio::time::sleep(CHECKPOINT_INTERVAL).await;
+    }
+}
+
 fn now_ms() -> u128 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -12021,6 +12154,81 @@ mod tests {
         server.abort();
     }
 
+    #[tokio::test]
+    async fn trace_wait_starts_after_existing_events() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("st3.sock");
+        let store = Arc::new(Store::open_memory("wait-cursor-test").unwrap());
+        let mut last_index = 0;
+        for number in 0..3 {
+            last_index = store
+                .append_claim(&ClaimInput {
+                    subject: "host/wait-cursor-test".into(),
+                    kind: "transport.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("wait-cursor-test-{number}")),
+                })
+                .unwrap()
+                .store_index;
+        }
+        let state = AppState {
+            store,
+            notify: Arc::new(Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: "wait-cursor-test".into(),
+            state_dir: root.path().to_path_buf(),
+            pty_root: root.path().join("pty"),
+            pty_binary: PathBuf::from("pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: PlannerSpec::default(),
+        };
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let app = router(state).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let sent = sent.clone();
+                async move {
+                    if request.uri().path() == "/v1/events" {
+                        let _ = sent.send(request.uri().query().unwrap_or_default().to_owned());
+                    }
+                    next.run(request).await
+                }
+            },
+        ));
+        let server = tokio::spawn(async move {
+            serve_unix(&socket, app).await.unwrap();
+        });
+        let path = root.path().join("st3.sock");
+        for _ in 0..100 {
+            if path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        let client = Client::unix(&path);
+        let waiter = tokio::spawn(async move {
+            wait_for_condition(&client, "host/wait-cursor-test", "completed", None).await
+        });
+        let query = tokio::time::timeout(Duration::from_secs(2), received.recv())
+            .await
+            .expect("the wait did not request events")
+            .expect("the server stopped before the event request");
+        let after = query
+            .split('&')
+            .find_map(|part| part.strip_prefix("after="))
+            .unwrap()
+            .parse::<u64>()
+            .unwrap();
+        assert!(after >= last_index, "the wait replayed existing events: {query}");
+        waiter.abort();
+        server.abort();
+    }
+
     #[test]
     fn conversation_follow_is_explicit_and_bounded() {
         let cli = Cli::try_parse_from([
@@ -12654,7 +12862,9 @@ mod tests {
             "st attention withdraw",
             "`step-run/` or `run-generation/` target is no longer current",
             "a `mission/` retired or\n  cancelled",
-            "`resource/` and `doc/` targets are context",
+            "pull request target is merged or closed",
+            "a `loop-run/` running again",
+            "Other `resource/` targets and `doc/` targets are context",
             "had already ended when you made the request, keeps it open",
         ] {
             assert!(help.contains(expected), "missing {expected:?} in:\n{help}");

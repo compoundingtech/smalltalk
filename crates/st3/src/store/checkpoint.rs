@@ -197,6 +197,32 @@ pub struct SealedSet {
     pub cut_unix_ms: u128,
     pub envelopes: Vec<SealedEnvelope>,
     pub claims: Vec<SealedClaim>,
+    /// The highest `replica_envelopes` row when the set was read. Reading the set again up to
+    /// this row gives the same set, whatever arrived since.
+    pub seal_rowid: i64,
+    /// Tombstones dated before the cut, from earlier checkpoints. Their envelopes are in
+    /// `envelopes` with no claims, so a trimmed and an untrimmed node seal the same identities.
+    pub envelope_tombstones: Vec<EnvelopeTombstone>,
+    pub claim_tombstones: Vec<ClaimTombstone>,
+}
+
+/// What a seal records of a sealed set: its digest, how many envelopes it holds, and the row it
+/// was read up to. Reading it needs no claims.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SealedIdentities {
+    pub digest: String,
+    pub count: usize,
+    pub seal_rowid: i64,
+}
+
+impl SealedIdentities {
+    pub fn of(sealed: &SealedSet) -> Self {
+        Self {
+            digest: sealed_digest(sealed),
+            count: sealed.envelopes.len(),
+            seal_rowid: sealed.seal_rowid,
+        }
+    }
 }
 
 /// What a checkpoint drops from a sealed set.
@@ -637,7 +663,12 @@ pub fn plan_drops(sealed: &SealedSet) -> DropPlan {
         sealed_envelopes: sealed.envelopes.len(),
         sealed_claims: first.len(),
         sealed_digest: sealed_digest(sealed),
-        drop_digest: drop_digest(&envelopes, &tombstones),
+        // Cumulative: every tombstone before the cut, from earlier checkpoints and this one. A
+        // node that adopts the checkpoint checks the whole manifest against it.
+        drop_digest: drop_digest(
+            &[sealed.envelope_tombstones.as_slice(), envelopes.as_slice()].concat(),
+            &[sealed.claim_tombstones.as_slice(), tombstones.as_slice()].concat(),
+        ),
         retained_digest: retained_digest(retained.iter().copied()),
         envelopes,
         claims: tombstones,
@@ -1209,6 +1240,16 @@ impl Store {
     /// The envelopes this node holds from before `cut_unix_ms`, and their admitted claims in
     /// canonical order. An envelope with any claim dated at or after the cut is not before it.
     pub fn checkpoint_sealed_set(&self, cut_unix_ms: u128) -> Result<SealedSet> {
+        self.checkpoint_sealed_set_through(cut_unix_ms, None)
+    }
+
+    /// The sealed set as of one `replica_envelopes` row: envelopes that arrived after
+    /// `through_rowid` are left out, so a node reads again exactly the set it sealed.
+    pub fn checkpoint_sealed_set_through(
+        &self,
+        cut_unix_ms: u128,
+        through_rowid: Option<i64>,
+    ) -> Result<SealedSet> {
         {
             // Every local batch has an envelope before the planner reads them.
             let mut connection = self.connection.write();
@@ -1217,6 +1258,14 @@ impl Store {
             transaction.commit()?;
         }
         let connection = self.readers.get();
+        // One read transaction, so the envelopes, the claims and the high water agree.
+        let connection = connection.unchecked_transaction()?;
+        let seal_rowid: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM replica_envelopes",
+            [],
+            |row| row.get(0),
+        )?;
+        let seal_rowid = through_rowid.map_or(seal_rowid, |through| through.min(seal_rowid));
         let mut envelopes = connection
             .prepare(
                 "SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash,
@@ -1224,9 +1273,9 @@ impl Store {
                         (SELECT COUNT(*) FROM replica_records records
                          WHERE records.writer=envelopes.writer AND records.sequence=envelopes.sequence
                            AND records.envelope_hash=envelopes.envelope_hash)
-                 FROM replica_envelopes envelopes",
+                 FROM replica_envelopes envelopes WHERE envelopes.rowid <= ?1",
             )?
-            .query_map([], |row| {
+            .query_map([seal_rowid], |row| {
                 Ok(SealedEnvelope {
                     key: EnvelopeKey {
                         writer: row.get(0)?,
@@ -1297,11 +1346,127 @@ impl Store {
                 valid,
             })
             .collect();
+        // Envelopes an earlier checkpoint dropped are still part of what this node seals.
+        let envelope_tombstones = connection
+            .prepare(
+                "SELECT writer, sequence, envelope_hash, accepted_at_unix_ms
+                 FROM checkpoint_envelopes WHERE accepted_at_unix_ms < ?1",
+            )?
+            .query_map([i64::try_from(cut_unix_ms)?], |row| {
+                Ok(EnvelopeTombstone {
+                    writer: row.get(0)?,
+                    sequence: row.get(1)?,
+                    envelope_hash: row.get(2)?,
+                    accepted_at_unix_ms: u128::try_from(row.get::<_, i64>(3)?).unwrap_or(0),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let claim_tombstones = connection
+            .prepare(
+                "SELECT id, writer, sequence, envelope_hash, subject, kind, actor, predecessors,
+                        operation_id, request_digest, accepted_at_unix_ms
+                 FROM checkpoint_claims WHERE accepted_at_unix_ms < ?1",
+            )?
+            .query_map([i64::try_from(cut_unix_ms)?], |row| {
+                Ok(ClaimTombstone {
+                    id: row.get(0)?,
+                    writer: row.get(1)?,
+                    sequence: row.get(2)?,
+                    envelope_hash: row.get(3)?,
+                    subject: row.get(4)?,
+                    kind: row.get(5)?,
+                    actor: row.get(6)?,
+                    predecessors: serde_json::from_str(&row.get::<_, String>(7)?)
+                        .unwrap_or_default(),
+                    operation_id: row.get(8)?,
+                    request_digest: row.get(9)?,
+                    accepted_at_unix_ms: u128::try_from(row.get::<_, i64>(10)?).unwrap_or(0),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for tombstone in &envelope_tombstones {
+            let key = EnvelopeKey {
+                writer: tombstone.writer.clone(),
+                sequence: tombstone.sequence,
+                envelope_hash: tombstone.envelope_hash.clone(),
+            };
+            if !before.contains(&key) {
+                envelopes.push(SealedEnvelope {
+                    key,
+                    accepted_at_unix_ms: tombstone.accepted_at_unix_ms,
+                    records: 0,
+                });
+            }
+        }
         envelopes.sort_by(|left, right| left.key.cmp(&right.key));
         Ok(SealedSet {
             cut_unix_ms,
             envelopes,
             claims,
+            seal_rowid,
+            envelope_tombstones,
+            claim_tombstones,
+        })
+    }
+
+    /// The identities `checkpoint_sealed_set_through` would read, without the claims: what a
+    /// seal and the status need, every few minutes, on a store of any size.
+    pub fn checkpoint_sealed_identities(
+        &self,
+        cut_unix_ms: u128,
+        through_rowid: Option<i64>,
+    ) -> Result<SealedIdentities> {
+        {
+            let mut connection = self.connection.write();
+            let transaction = connection.transaction()?;
+            seed_replica_envelopes_tx(&transaction, &self.origin, None)?;
+            transaction.commit()?;
+        }
+        let connection = self.readers.get();
+        let connection = connection.unchecked_transaction()?;
+        let seal_rowid: i64 = connection.query_row(
+            "SELECT COALESCE(MAX(rowid), 0) FROM replica_envelopes",
+            [],
+            |row| row.get(0),
+        )?;
+        let seal_rowid = through_rowid.map_or(seal_rowid, |through| through.min(seal_rowid));
+        let cut = i64::try_from(cut_unix_ms)?;
+        // As in `checkpoint_sealed_set_through`: an envelope is before the cut when it and every
+        // claim admitted from it are dated before the cut.
+        let identities = connection
+            .prepare(
+                "SELECT envelopes.writer, envelopes.sequence, envelopes.envelope_hash
+                 FROM replica_envelopes AS envelopes
+                 WHERE envelopes.rowid <= ?2
+                   AND CAST(envelopes.accepted_at_unix_ms AS INTEGER) < ?1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM replica_records AS records
+                       JOIN claims ON claims.id=records.claim_id
+                       WHERE records.writer=envelopes.writer
+                         AND records.sequence=envelopes.sequence
+                         AND records.envelope_hash=envelopes.envelope_hash
+                         AND CAST(claims.accepted_at_unix_ms AS INTEGER) >= ?1)
+                 UNION
+                 SELECT writer, sequence, envelope_hash FROM checkpoint_envelopes
+                 WHERE accepted_at_unix_ms < ?1",
+            )?
+            .query_map(params![cut, seal_rowid], |row| {
+                Ok(EnvelopeKey {
+                    writer: row.get(0)?,
+                    sequence: row.get(1)?,
+                    envelope_hash: row.get(2)?,
+                })
+            })?
+            .collect::<rusqlite::Result<BTreeSet<_>>>()?;
+        let mut digest = Sha256::new();
+        digest.update(b"st3-checkpoint-sealed-v1\0");
+        for key in &identities {
+            update_identity_digest(&mut digest, &key.writer, key.sequence, &key.envelope_hash);
+        }
+        Ok(SealedIdentities {
+            digest: hex::encode(digest.finalize()),
+            count: identities.len(),
+            seal_rowid,
         })
     }
 
@@ -1326,7 +1491,19 @@ impl Store {
         cut_unix_ms: u128,
         scratch: &Path,
     ) -> Result<(DropPlan, CheckpointProof)> {
-        let sealed = self.checkpoint_sealed_set(cut_unix_ms)?;
+        self.plan_checkpoint_through(cut_unix_ms, None, scratch)
+            .map(|(_, plan, proof)| (plan, proof))
+    }
+
+    /// Plan and prove the sealed set as of one `replica_envelopes` row. See
+    /// `checkpoint_sealed_set_through`.
+    pub fn plan_checkpoint_through(
+        &self,
+        cut_unix_ms: u128,
+        through_rowid: Option<i64>,
+        scratch: &Path,
+    ) -> Result<(SealedSet, DropPlan, CheckpointProof)> {
+        let sealed = self.checkpoint_sealed_set_through(cut_unix_ms, through_rowid)?;
         let plan = plan_drops(&sealed);
         fs::create_dir_all(scratch)?;
         let copy = scratch.join(format!("proof-{}.sqlite3", Uuid::now_v7().simple()));
@@ -1336,7 +1513,8 @@ impl Store {
         for suffix in ["", "-journal", "-wal", "-shm"] {
             let _ = fs::remove_file(format!("{}{suffix}", copy.display()));
         }
-        Ok((plan, result?))
+        let proof = result?;
+        Ok((sealed, plan, proof))
     }
 
     /// `st replication checkpoint plan`: plan and prove one checkpoint without changing anything.
@@ -1476,6 +1654,9 @@ mod tests {
                 cut_unix_ms: CUT,
                 envelopes: self.envelopes,
                 claims: self.claims.into_iter().map(|(.., claim)| claim).collect(),
+                seal_rowid: 0,
+                envelope_tombstones: Vec::new(),
+                claim_tombstones: Vec::new(),
             }
         }
     }
@@ -2151,7 +2332,10 @@ mod tests {
             ..claim.clone()
         };
         assert_eq!(
-            drop_digest(std::slice::from_ref(&envelope), &[claim.clone(), other.clone()]),
+            drop_digest(
+                std::slice::from_ref(&envelope),
+                &[claim.clone(), other.clone()]
+            ),
             drop_digest(&[envelope], &[other, claim])
         );
     }
@@ -2437,6 +2621,58 @@ mod tests {
             assert_eq!(proof.graph_digest, proofs[0].graph_digest);
             assert_eq!(proof.reader_digest, proofs[0].reader_digest);
         }
+    }
+
+    /// After a trim, the dropped envelopes are tombstones. A later checkpoint still seals their
+    /// identities, and its drop digest still covers them, so a node that trimmed and one that
+    /// has not yet agree on both.
+    #[test]
+    fn a_trimmed_node_seals_and_digests_like_an_untrimmed_one() {
+        let trimmed = Store::open_memory("alder").unwrap();
+        write_history(&trimmed);
+        trimmed.bind_fleet("fleet/test").unwrap();
+        let untrimmed = Store::open_memory("birch").unwrap();
+        receive(
+            &untrimmed,
+            "alder",
+            &trimmed
+                .export_replication_exchange("fleet/test", &ReplicationInventory::default())
+                .unwrap(),
+        );
+        let first = now_ms() + 1_000;
+        let plan = plan_drops(&trimmed.checkpoint_sealed_set(first).unwrap());
+        assert!(!plan.claims.is_empty());
+        {
+            let mut connection = trimmed.connection.write();
+            let transaction = connection.transaction().unwrap();
+            let checkpoint = checkpoint_name(first);
+            record_checkpoint_tombstones_tx(
+                &transaction,
+                &checkpoint,
+                &plan.envelopes,
+                &plan.claims,
+            )
+            .unwrap();
+            delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
+            transaction.commit().unwrap();
+        }
+        let second = first + DAY_MS;
+        let [after_trim, without_trim] =
+            [&trimmed, &untrimmed].map(|store| store.checkpoint_sealed_set(second).unwrap());
+        assert_eq!(sealed_digest(&after_trim), sealed_digest(&without_trim));
+        // A seal reads only the identities, and they give the same digest as the whole set.
+        for (store, set) in [(&trimmed, &after_trim), (&untrimmed, &without_trim)] {
+            assert_eq!(
+                store.checkpoint_sealed_identities(second, None).unwrap(),
+                SealedIdentities::of(set)
+            );
+        }
+        assert_eq!(after_trim.envelope_tombstones.len(), plan.envelopes.len());
+        assert!(after_trim.claims.len() < without_trim.claims.len());
+        let [after_trim, without_trim] = [after_trim, without_trim].map(|set| plan_drops(&set));
+        assert!(after_trim.claims.is_empty(), "{:?}", after_trim.claims);
+        assert_eq!(after_trim.drop_digest, plan.drop_digest);
+        assert_eq!(without_trim.drop_digest, plan.drop_digest);
     }
 
     /// Nearly every claim cites the claim before it on its subject. A walk from a runtime's
