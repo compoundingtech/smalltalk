@@ -91,6 +91,8 @@ CREATE TABLE IF NOT EXISTS claims (
 CREATE INDEX IF NOT EXISTS claims_subject_index ON claims(subject, store_index);
 CREATE INDEX IF NOT EXISTS claims_kind_index ON claims(kind, store_index);
 CREATE INDEX IF NOT EXISTS claims_subject_kind_index ON claims(subject, kind, store_index);
+CREATE INDEX IF NOT EXISTS claims_subject_kind_accepted_index
+ON claims(subject, kind, length(accepted_at_unix_ms), accepted_at_unix_ms);
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
@@ -527,12 +529,26 @@ PRAGMA user_version = 13;
 
 const READ_CONNECTIONS: usize = 4;
 
-const CLAIMS_FOR_SUBJECT: &str =
-    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-     FROM claims WHERE subject=?1 ORDER BY store_index";
-const CLAIMS_FOR_SUBJECT_KIND: &str =
-    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-     FROM claims WHERE subject=?1 AND kind=?2 ORDER BY store_index";
+/// Claims in canonical order: accepted time, then writer, batch sequence and position in the
+/// batch. Every node that holds the same claims orders them the same way, as the full replay does.
+/// `store_index` is arrival order, which differs from node to node, so a fold over one subject's
+/// history uses this order. Queries that use it join `batches` on `claims.batch_id`.
+const CANONICAL_ORDER: &str = "length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
+     batches.origin, batches.replica_sequence, claims.batch_id, claims.store_index";
+const CANONICAL_ORDER_DESC: &str = "length(claims.accepted_at_unix_ms) DESC,
+     claims.accepted_at_unix_ms DESC, batches.origin DESC, batches.replica_sequence DESC,
+     claims.batch_id DESC, claims.store_index DESC";
+const CLAIM_COLUMNS: &str = "claims.id, claims.store_index, claims.batch_id, claims.subject,
+     claims.kind, claims.origin, claims.actor, claims.body, claims.predecessors,
+     claims.accepted_at_unix_ms";
+
+fn claims_for_subject_query(kind: bool) -> String {
+    let kind = if kind { " AND claims.kind=?2" } else { "" };
+    format!(
+        "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1{kind} ORDER BY {CANONICAL_ORDER}"
+    )
+}
 
 struct WriterConnection {
     connection: Mutex<Connection>,
@@ -4154,6 +4170,29 @@ impl Store {
             }
         }
         Ok(faults)
+    }
+
+    /// The latest fault claim on `subject` in `scope`, while that fault is open.
+    pub fn open_reconcile_fault_claim(
+        &self,
+        subject: &str,
+        scope: &str,
+    ) -> Result<Option<ClaimRecord>> {
+        let connection = self.readers.get();
+        let claim = connection
+            .query_row(
+                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                        predecessors, accepted_at_unix_ms
+                 FROM claims WHERE subject=?1 AND kind='reconcile.fault'
+                   AND origin=?2 AND json_extract(body, '$.fields.scope')=?3
+                 ORDER BY store_index DESC LIMIT 1",
+                params![subject, self.origin, scope],
+                claim_from_row,
+            )
+            .optional()?;
+        Ok(claim.filter(|claim| {
+            claim.body.pointer("/fields/status").and_then(Value::as_str) == Some("faulted")
+        }))
     }
 
     /// The reason for an open fault on `subject` in `scope`, if the latest record is a fault.
@@ -8913,12 +8952,21 @@ impl Store {
         Ok(faults)
     }
 
+    /// The latest claim of a subject, or of one kind of it, in canonical order.
     pub fn latest_claim(&self, subject: &str, kind: Option<&str>) -> Result<Option<ClaimRecord>> {
         let connection = self.readers.get();
-        let query = "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-                     FROM claims WHERE subject=?1 AND (?2 IS NULL OR kind=?2) ORDER BY store_index DESC LIMIT 1";
+        let filter = if kind.is_some() {
+            " AND claims.kind=?2"
+        } else {
+            " AND ?2 IS NULL"
+        };
+        let query = format!(
+            "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1{filter} ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+        );
         connection
-            .query_row(query, params![subject, kind], claim_from_row)
+            .prepare_cached(&query)?
+            .query_row(params![subject, kind], claim_from_row)
             .optional()
             .map_err(Into::into)
     }
@@ -9101,6 +9149,18 @@ impl Store {
         } else {
             format!("attention/{subject}")
         };
+        // Any person can close any item, whoever it was routed to, so an item routed to an agent
+        // or to another person never outlives everyone who could close it. The resolution
+        // records who closed it. An agent withdraws its own requests instead.
+        let actor = normalize_actor(&request.actor, "person");
+        if !actor.starts_with("person/") {
+            return Err(St3Error::new(
+                "attention-resolver-not-person",
+                format!(
+                    "only a person resolves or dismisses attention request `{subject}`; its requester can withdraw it"
+                ),
+            ));
+        }
         if self
             .attention_request(&subject)
             .map_err(internal)?
@@ -9133,21 +9193,17 @@ impl Store {
                         .map(str::to_owned)
                 })
                 .unwrap_or_default();
-            let requester = if requester.is_empty() {
-                normalize_actor(&request.actor, "person")
-            } else {
+            // The failure is routed to the person who requested the delivery. A subscription
+            // that requests as an agent routes it to no person, so it goes to whoever closes it.
+            let reviewer = if requester.starts_with("person/") {
                 requester
+            } else {
+                actor.clone()
             };
-            if requester != normalize_actor(&request.actor, "person") {
-                return Err(St3Error::new(
-                    "wrong-attention-reviewer",
-                    format!("attention request `{subject}` requires `{requester}`"),
-                ));
-            }
             self.request_attention(
                 &subject,
                 &AttentionRequest {
-                    reviewer: requester,
+                    reviewer,
                     title: "Subscription mission failed".into(),
                     reason: fields
                         .get("reason")
@@ -9170,16 +9226,6 @@ impl Store {
                     format!("attention request `{subject}` does not exist"),
                 )
             })?;
-        let actor = normalize_actor(&request.actor, "person");
-        if actor != current.reviewer {
-            return Err(St3Error::new(
-                "wrong-attention-reviewer",
-                format!(
-                    "attention request `{subject}` requires `{}`",
-                    current.reviewer
-                ),
-            ));
-        }
         self.append_claim(&ClaimInput {
             subject: subject.clone(),
             kind: "attention.resolved".into(),
@@ -9538,6 +9584,7 @@ impl Store {
                 let attention_subject = subscription_failure_attention_subject(&failure.id);
                 if attention_request_view_tx(&connection, &attention_subject)?
                     .is_some_and(|request| request.status != "pending")
+                    || !subscription_failure_is_current_tx(&connection, &failure)?
                 {
                     continue;
                 }
@@ -10321,11 +10368,11 @@ impl Store {
         // and the reconciler asks for one kind of each agent's claims on every pass.
         let rows = match kind {
             Some(kind) => connection
-                .prepare(CLAIMS_FOR_SUBJECT_KIND)?
+                .prepare_cached(&claims_for_subject_query(true))?
                 .query_map(params![subject, kind], claim_from_row)?
                 .collect::<Result<Vec<_>, _>>(),
             None => connection
-                .prepare(CLAIMS_FOR_SUBJECT)?
+                .prepare_cached(&claims_for_subject_query(false))?
                 .query_map([subject], claim_from_row)?
                 .collect::<Result<Vec<_>, _>>(),
         };
@@ -11148,21 +11195,29 @@ impl Store {
         snapshot_index: u64,
     ) -> Result<Option<u128>> {
         let connection = self.readers.get();
-        let previous: Option<u64> = connection.query_row(
-            "SELECT MAX(store_index) FROM claims WHERE subject=?1 AND kind='harness.observed'
-             AND json_extract(body, '$.fields.incarnation_id')=?2
-             AND json_extract(body, '$.fields.state')!='working' AND store_index<=?3",
-            params![agent, incarnation, snapshot_index],
-            |row| row.get(0),
-        )?;
-        let started: Option<String> = connection.query_row(
-            "SELECT accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind='harness.observed'
-             AND json_extract(body, '$.fields.incarnation_id')=?2
-             AND json_extract(body, '$.fields.state')='working'
-             AND store_index>?3 AND store_index<=?4 ORDER BY store_index LIMIT 1",
-            params![agent, incarnation, previous.unwrap_or(0), snapshot_index], |row| row.get(0),
-        ).optional()?;
-        Ok(started.and_then(|time| time.parse().ok()))
+        // The first `working` observation after the incarnation's last other state, in canonical
+        // order, so every node that holds the same claims agrees.
+        let mut statement = connection.prepare_cached(&format!(
+            "SELECT json_extract(claims.body, '$.fields.state'), claims.accepted_at_unix_ms
+             FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1 AND claims.kind='harness.observed'
+               AND json_extract(claims.body, '$.fields.incarnation_id')=?2
+               AND claims.store_index<=?3
+             ORDER BY {CANONICAL_ORDER}"
+        ))?;
+        let states = statement
+            .query_map(params![agent, incarnation, snapshot_index], |row| {
+                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let after = states
+            .iter()
+            .rposition(|(state, _)| state.as_deref().is_some_and(|state| state != "working"))
+            .map_or(0, |position| position + 1);
+        Ok(states[after..]
+            .iter()
+            .find(|(state, _)| state.as_deref() == Some("working"))
+            .and_then(|(_, time)| time.parse().ok()))
     }
 
     fn timeline_claim_rows_for_incarnation_at(
@@ -12388,20 +12443,25 @@ impl Store {
         // An inbound exchange is just as good evidence of reachability as an outbound one.
         // Keep the last success during a short missed-exchange window, so a failed dial on
         // one side cannot flap a peer that is still exchanging in the other direction.
-        let recent_exchange = self
-            .replication_peer_last_success(peer)?
-            .is_some_and(|last| now_ms().saturating_sub(last) < 90_000);
+        let last_success = self.replication_peer_last_success(peer)?;
+        let recent_exchange =
+            last_success.is_some_and(|last| now_ms().saturating_sub(last) < 90_000);
         if recent_exchange {
             return Ok(false);
         }
         // A peer may also have a fresh up observation without a matching peer-row success
         // (for example, after a worker restart). Its published status must get the same
-        // missed-exchange grace period or one outbound timeout reverses it immediately.
-        let recent_observation = self
-            .latest_claim(&format!("host/{peer}"), Some("transport.observed"))?
-            .filter(|claim| claim.origin == self.origin && claim.body["fields"]["status"] == "up")
-            .and_then(|claim| claim.body["fields"]["last_success_at"].as_u64())
-            .is_some_and(|last| now_ms().saturating_sub(u128::from(last)) < 90_000);
+        // missed-exchange grace period or one outbound timeout reverses it immediately. A row
+        // success, once recorded, is the newer evidence: every exchange updates it, while the
+        // observation changes only with the status.
+        let recent_observation = last_success.is_none()
+            && self
+                .latest_claim(&format!("host/{peer}"), Some("transport.observed"))?
+                .filter(|claim| {
+                    claim.origin == self.origin && claim.body["fields"]["status"] == "up"
+                })
+                .and_then(|claim| claim.body["fields"]["last_success_at"].as_u64())
+                .is_some_and(|last| now_ms().saturating_sub(u128::from(last)) < 90_000);
         if recent_observation {
             return Ok(false);
         }
@@ -15195,8 +15255,10 @@ fn latest_claim_of_kind_tx(
 ) -> Result<Option<ClaimRecord>, St3Error> {
     transaction
         .query_row(
-            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-             FROM claims WHERE subject=?1 AND kind=?2 ORDER BY store_index DESC LIMIT 1",
+            &format!(
+                "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
+                 WHERE claims.subject=?1 AND claims.kind=?2 ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+            ),
             params![subject, kind],
             claim_from_row,
         )
@@ -16425,16 +16487,18 @@ fn latest_actual_at(
     at_index: Option<u64>,
 ) -> Result<Option<Value>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
-    let mut statement = connection.prepare(
-        "SELECT kind, body FROM claims
-         WHERE subject=?1
-           AND kind!='intent.desired'
-           AND kind NOT LIKE 'harness.%'
-           AND kind!='runtime.readiness-deadline-reached'
-           AND kind!='reconcile.fault'
-           AND store_index<=?2
-         ORDER BY store_index",
-    )?;
+    // Folded in canonical order, so two nodes holding the same claims agree however they
+    // received them.
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT claims.kind, claims.body FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1
+           AND claims.kind!='intent.desired'
+           AND claims.kind NOT LIKE 'harness.%'
+           AND claims.kind!='runtime.readiness-deadline-reached'
+           AND claims.kind!='reconcile.fault'
+           AND claims.store_index<=?2
+         ORDER BY {CANONICAL_ORDER}"
+    ))?;
     let rows = statement
         .query_map(params![subject, at_index], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -16476,13 +16540,15 @@ fn current_harness_at(
 ) -> Result<Option<crate::model::CurrentHarnessView>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     let runtime = connection
-        .query_row(
-            "SELECT store_index, body FROM claims
-             WHERE subject=?1 AND kind='runtime.observed' AND store_index<=?2
-             ORDER BY store_index DESC LIMIT 1",
-            params![subject, at_index],
-            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
-        )
+        .prepare_cached(&format!(
+            "SELECT claims.store_index, claims.body
+             FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1 AND claims.kind='runtime.observed' AND claims.store_index<=?2
+             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+        ))?
+        .query_row(params![subject, at_index], |row| {
+            Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+        })
         .optional()?;
     let Some((runtime_index, runtime_body)) = runtime else {
         return Ok(None);
@@ -16501,13 +16567,17 @@ fn current_harness_at(
     // activity can otherwise overwrite a one-off blocked observation. Fence the entire incarnation
     // instead.
     let prompt_rejection = connection
-        .query_row(
-            "SELECT id, accepted_at_unix_ms, json_extract(body, '$.fields.code') FROM claims
-             WHERE subject=?1 AND kind='harness.diagnostic' AND store_index<=?2
-               AND json_extract(body, '$.fields.code')
+        .prepare_cached(&format!(
+            "SELECT claims.id, claims.accepted_at_unix_ms, json_extract(claims.body, '$.fields.code')
+             FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE claims.subject=?1 AND claims.kind='harness.diagnostic'
+               AND claims.store_index<=?2
+               AND json_extract(claims.body, '$.fields.code')
                    IN ('provider-auth-expired', 'provider-auth-restored', 'provider-trust-prompt')
-               AND json_extract(body, '$.fields.incarnation_id')=?3
-             ORDER BY store_index DESC LIMIT 1",
+               AND json_extract(claims.body, '$.fields.incarnation_id')=?3
+             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+        ))?
+        .query_row(
             params![subject, at_index, incarnation_id],
             |row| {
                 Ok((
@@ -16542,11 +16612,14 @@ fn current_harness_at(
         }));
     }
 
-    let mut statement = connection.prepare(
-        "SELECT id, store_index, body, accepted_at_unix_ms FROM claims
-         WHERE subject=?1 AND kind='harness.observed' AND store_index<=?2
-         ORDER BY store_index DESC",
-    )?;
+    // Newest first in canonical order, so every node that holds the same claims shows the same
+    // harness state.
+    let mut statement = connection.prepare_cached(&format!(
+        "SELECT claims.id, claims.store_index, claims.body, claims.accepted_at_unix_ms
+         FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind='harness.observed' AND claims.store_index<=?2
+         ORDER BY {CANONICAL_ORDER_DESC}"
+    ))?;
     let rows = statement.query_map(params![subject, at_index], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -17116,16 +17189,24 @@ fn selected_actionable_messages(messages: Vec<MessageView>) -> Vec<MessageView> 
 }
 
 /// A fault request stays current until a target that owns its lifecycle ends it. A stale
-/// `run-generation/` or `step-run/` target ends it at once. Otherwise it ends once every target
-/// that is not context has moved on after the request was accepted. `resource/` and `doc/`
-/// targets are context. A target that had already moved on when the request was made keeps it
-/// current, because the request is then about that outcome.
+/// `run-generation/` or `step-run/` target ends it at once, and so does a pull request that is
+/// merged or closed. Otherwise it ends once every target that is not context has moved on after
+/// the request was accepted. Other `resource/` targets and `doc/` targets are context. A target
+/// that had already moved on when the request was made keeps it current, because the request is
+/// then about that outcome.
 fn attention_request_is_current_tx(
     connection: &Connection,
     request: &AttentionRequestView,
 ) -> Result<bool> {
     if request.reason.to_ascii_lowercase().contains("superseded") {
         return Ok(false);
+    }
+    // A decision about a pull request has nothing left to decide once it is merged or closed,
+    // even when that happened before the request.
+    for target in &request.targets {
+        if pull_request_closed_tx(connection, target)? {
+            return Ok(false);
+        }
     }
     let mut runtime_targets = false;
     for target in &request.targets {
@@ -17324,12 +17405,191 @@ fn attention_target_moved_on_tx(
             .optional()?;
         return Ok(after(started));
     }
-    // Resources and documents are context. A target of any other kind, such as a loop, has no
-    // rule here, so it keeps the request current.
+    if target.starts_with("observer/") {
+        // A stopped observer has nothing left to observe. One that observes successfully again
+        // has recovered from what the request described.
+        if let Some(stopped) = declaration_stopped_tx(connection, target)? {
+            return Ok(after(Some(stopped)));
+        }
+        let state = connection
+            .query_row(
+                "SELECT json_extract(body, '$.fields.state'), accepted_at_unix_ms, store_index
+                 FROM claims WHERE subject=?1 AND kind='observer.state'
+                 ORDER BY store_index DESC LIMIT 1",
+                [target],
+                |row| {
+                    let accepted_at = row.get::<_, String>(1)?;
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        (
+                            accepted_at.parse().unwrap_or_default(),
+                            row.get::<_, u64>(2)?,
+                        ),
+                    ))
+                },
+            )
+            .optional()?;
+        return Ok(match state {
+            Some((Some(state), moment)) if state == "healthy" => after(Some(moment)),
+            _ => Some(false),
+        });
+    }
+    if target.starts_with("subscription/") {
+        return Ok(after(declaration_stopped_tx(connection, target)?));
+    }
+    if let Some(path) = target.strip_prefix("loop-run/") {
+        return loop_run_moved_on_tx(connection, target, path, since);
+    }
+    if target.starts_with("message/") {
+        let closed = connection
+            .query_row(
+                "SELECT accepted_at_unix_ms, store_index FROM claims
+                 WHERE subject=?1 AND kind='message.closed'
+                 ORDER BY store_index DESC LIMIT 1",
+                [target],
+                claim_moment,
+            )
+            .optional()?;
+        return Ok(after(closed));
+    }
+    // Resources and documents are context. A target of any other kind has no rule here, so it
+    // keeps the request current.
     if target.starts_with("resource/") || target.starts_with("doc/") {
         return Ok(None);
     }
     Ok(Some(false))
+}
+
+/// Whether `target`, with or without a pinned observation, names a pull request whose latest
+/// observation shows it merged or closed.
+fn pull_request_closed_tx(connection: &Connection, target: &str) -> Result<bool> {
+    Ok(pull_request_state_tx(connection, target)?.is_some_and(|(state, _)| state != "open"))
+}
+
+/// The state of the pull request that `target` names, with or without a pinned observation, from
+/// its latest observation: `open`, `closed` or `merged`. An open listing records a pull request
+/// that left it as `closed`; the pull request provider records `state.state` and `state.merged`.
+fn pull_request_state_tx(connection: &Connection, target: &str) -> Result<Option<(String, u128)>> {
+    let subject = target
+        .split_once('@')
+        .map_or(target, |(subject, _)| subject);
+    if !subject.starts_with("resource/") {
+        return Ok(None);
+    }
+    let observed = connection
+        .query_row(
+            "SELECT json_extract(body, '$.fields'), accepted_at_unix_ms FROM claims
+             WHERE subject=?1 AND kind='resource.observed'
+             ORDER BY store_index DESC LIMIT 1",
+            [subject],
+            |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()?;
+    let Some((Some(fields), accepted_at)) = observed else {
+        return Ok(None);
+    };
+    let fields = serde_json::from_str::<Value>(&fields).unwrap_or(Value::Null);
+    if fields.get("kind").and_then(Value::as_str) != Some("vcs.pull-request") {
+        return Ok(None);
+    }
+    let Some(facts) = fields.get("facts") else {
+        return Ok(None);
+    };
+    let merged = |value: &Value| value.get("merged").and_then(Value::as_bool) == Some(true);
+    let state = match facts.get("state") {
+        _ if merged(facts) => "merged",
+        Some(Value::String(state)) if state == "open" => "open",
+        Some(Value::String(_)) => "closed",
+        Some(state @ Value::Object(_)) if merged(state) => "merged",
+        Some(state @ Value::Object(_))
+            if state.get("state").and_then(Value::as_str) == Some("closed") =>
+        {
+            "closed"
+        }
+        _ => "open",
+    };
+    Ok(Some((
+        state.into(),
+        accepted_at.parse().unwrap_or_default(),
+    )))
+}
+
+/// When the current declaration of `subject` became a `stop`, or `None` while it still runs.
+fn declaration_stopped_tx(connection: &Connection, subject: &str) -> Result<Option<ClaimMoment>> {
+    let Some(row) = current_desired_row(connection, subject)? else {
+        return Ok(None);
+    };
+    let body = serde_json::from_str::<Value>(&row.body).unwrap_or(Value::Null);
+    let stopped = row.kind == "stop"
+        || body
+            .get("children")
+            .and_then(Value::as_array)
+            .is_some_and(|children| {
+                children.len() == 1
+                    && children[0].get("name").and_then(Value::as_str) == Some("stop")
+            });
+    if !stopped {
+        return Ok(None);
+    }
+    Ok(connection
+        .query_row(
+            "SELECT accepted_at_unix_ms, store_index FROM claims WHERE id=?1",
+            [&row.claim_id],
+            claim_moment,
+        )
+        .optional()?)
+}
+
+/// A loop that stopped moved on once it runs again after a retry, once a revision replaced its
+/// run generation, or once its run was cancelled. Its run failing because it stopped does not
+/// end it: that failure is what the request reports.
+fn loop_run_moved_on_tx(
+    connection: &Connection,
+    target: &str,
+    path: &str,
+    since: ClaimMoment,
+) -> Result<Option<bool>> {
+    let after = |moment: Option<ClaimMoment>| Some(moment.is_some_and(|moment| moment > since));
+    let running_again = connection
+        .query_row(
+            "SELECT accepted_at_unix_ms, store_index FROM claims
+             WHERE subject=?1 AND kind='loop.state'
+               AND json_extract(body, '$.fields.status')!='failed'
+             ORDER BY store_index DESC LIMIT 1",
+            [target],
+            claim_moment,
+        )
+        .optional()?;
+    if after(running_again) == Some(true) {
+        return Ok(Some(true));
+    }
+    let Some((generation, _)) = path.split_once('/') else {
+        return Ok(Some(false));
+    };
+    let run = connection
+        .query_row(
+            "SELECT mission_runs.id, mission_runs.status,
+                    mission_runs.current_generation_id=run_generations.id
+             FROM run_generations
+             JOIN mission_runs ON mission_runs.id=run_generations.run_id
+             WHERE run_generations.id=?1",
+            [generation],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, bool>(2)?,
+                ))
+            },
+        )
+        .optional()?;
+    Ok(match run {
+        Some((_, _, false)) => Some(true),
+        Some((run, status, true)) if status == "cancelled" => {
+            after(mission_run_ended_tx(connection, &run)?)
+        }
+        _ => Some(false),
+    })
 }
 
 /// When a terminal run first reached a terminal status, from its own state history.
@@ -17460,7 +17720,35 @@ fn attention_target_state_tx(connection: &Connection, target: &str) -> Result<Op
             target,
         );
     }
-    Ok(None)
+    if target.starts_with("observer/") || target.starts_with("subscription/") {
+        if let Some((stopped_at, _)) = declaration_stopped_tx(connection, target)? {
+            return Ok(Some(("stopped".into(), Some(stopped_at))));
+        }
+        return row(
+            "SELECT coalesce(json_extract(body, '$.fields.state'), 'unknown'), accepted_at_unix_ms
+             FROM claims WHERE subject=?1 AND kind IN ('observer.state', 'subscription.state')
+             ORDER BY store_index DESC LIMIT 1",
+            target,
+        );
+    }
+    if target.starts_with("loop-run/") {
+        return row(
+            "SELECT coalesce(json_extract(body, '$.fields.status'), 'unknown'), accepted_at_unix_ms
+             FROM claims WHERE subject=?1 AND kind='loop.state'
+             ORDER BY store_index DESC LIMIT 1",
+            target,
+        );
+    }
+    if target.starts_with("message/") {
+        return row(
+            "SELECT substr(kind, 9), accepted_at_unix_ms FROM claims
+             WHERE subject=?1 AND kind IN
+               ('message.sent', 'message.staged', 'message.delivered', 'message.read', 'message.closed')
+             ORDER BY store_index DESC LIMIT 1",
+            target,
+        );
+    }
+    Ok(pull_request_state_tx(connection, target)?.map(|(state, since)| (state, Some(since))))
 }
 
 fn attention_action(label: &str, argv: &[&str]) -> AttentionActionView {
@@ -17468,6 +17756,15 @@ fn attention_action(label: &str, argv: &[&str]) -> AttentionActionView {
         label: label.into(),
         argv: argv.iter().map(|value| (*value).to_owned()).collect(),
     }
+}
+
+/// A failed subscription request stays a fault while its subscription runs. A failed request is
+/// never retried, so only a stop ends it on its own: a stopped subscription starts nothing more.
+fn subscription_failure_is_current_tx(
+    connection: &Connection,
+    failure: &ClaimRecord,
+) -> Result<bool> {
+    Ok(declaration_stopped_tx(connection, &failure.subject)?.is_none())
 }
 
 fn subscription_failure_attention_subject(claim_id: &str) -> String {
@@ -27175,6 +27472,26 @@ mod tests {
         assert!(stale
             .record_peer_failure("target", "down", "request timed out")
             .unwrap());
+
+        // Once an exchange has recorded a success, that row is the evidence, since every
+        // exchange updates it. When it is old, a timeout goes through even though the newest
+        // observation, from this node, still looks fresh.
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO replication_peers(peer, status, last_success_at_unix_ms, updated_at_unix_ms)
+                 VALUES ('target', 'up', ?1, ?2)",
+                params![
+                    now_ms().saturating_sub(91_000).to_string(),
+                    now_ms().to_string()
+                ],
+            )
+            .unwrap();
+        assert!(store
+            .record_peer_failure("target", "down", "request timed out")
+            .unwrap());
     }
 
     #[test]
@@ -31503,6 +31820,142 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         assert_eq!(right_status.unknown_records, 1);
     }
 
+    /// One exchange carrying exactly `envelopes`, as a peer that holds only those would send it.
+    fn exchange_of(peer: &str, envelopes: Vec<ReplicaEnvelope>) -> ReplicationExchange {
+        ReplicationExchange {
+            peer: peer.into(),
+            fleet_id: TEST_FLEET.into(),
+            schema_digest: st3_schema::registry().digest(),
+            authority_digest: String::new(),
+            graph_digest: String::new(),
+            inventory: ReplicationInventory {
+                digest: String::new(),
+                envelopes: envelopes
+                    .iter()
+                    .map(|envelope| ReplicaEnvelopeId {
+                        writer: envelope.writer.clone(),
+                        sequence: envelope.sequence,
+                        hash: envelope.hash.clone(),
+                    })
+                    .collect(),
+                buckets: Vec::new(),
+                accepts: None,
+            },
+            envelopes,
+            signature_requests: Vec::new(),
+            signatures: Vec::new(),
+        }
+    }
+
+    /// Status, the harness view and the latest claim of a kind fold in canonical order. Two nodes
+    /// that hold the same claims therefore agree even when the claims reached them in different
+    /// orders, which a checkpoint relies on when it drops claims that a later one replaced.
+    #[test]
+    fn nodes_that_received_the_same_claims_in_different_orders_agree() {
+        let source = Store::open_memory("source").unwrap();
+        let agent = "agent/source.worker";
+        for (status, incarnation) in [
+            ("running", "inc-0"),
+            ("exited", "inc-0"),
+            ("running", "inc-1"),
+        ] {
+            source
+                .append_claim(&ClaimInput {
+                    subject: agent.into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String(status.into())),
+                        ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("runtime:{status}:{incarnation}")),
+                })
+                .unwrap();
+        }
+        for (state, observed_at) in [("idle", 1_000), ("working", 2_000), ("idle", 3_000)] {
+            source
+                .append_claim_outcome(&harness_state(agent, state, observed_at))
+                .unwrap();
+        }
+        let envelopes = exchange_from(&source, &ReplicationInventory::default()).envelopes;
+        assert!(envelopes.len() >= 6);
+
+        let in_order = Store::open_memory("in-order").unwrap();
+        receive_and_project(
+            &in_order,
+            "source",
+            &exchange_of("source", envelopes.clone()),
+        );
+        // The other node admits every envelope in its own exchange, newest first, so its store
+        // indexes run backwards.
+        let reversed = Store::open_memory("reversed").unwrap();
+        for envelope in envelopes.iter().rev() {
+            receive_and_project(
+                &reversed,
+                "source",
+                &exchange_of("source", vec![envelope.clone()]),
+            );
+        }
+        let first = |store: &Store| {
+            store
+                .claims_for(agent, Some("runtime.observed"))
+                .unwrap()
+                .first()
+                .map(|claim| claim.store_index)
+        };
+        assert!(
+            first(&reversed) > first(&in_order),
+            "the reversed node must have admitted the oldest claim last"
+        );
+
+        for store in [&in_order, &reversed] {
+            let actual = store.latest_actual_value(agent).unwrap().unwrap();
+            assert_eq!(actual["status"], "running");
+            assert_eq!(actual["incarnation_id"], "inc-1");
+            let harness = store.current_harness(agent).unwrap().unwrap();
+            assert_eq!(harness.state, "idle");
+        }
+        assert_eq!(
+            in_order
+                .latest_claim(agent, Some("runtime.observed"))
+                .unwrap()
+                .unwrap()
+                .id,
+            reversed
+                .latest_claim(agent, Some("runtime.observed"))
+                .unwrap()
+                .unwrap()
+                .id,
+        );
+        let ids = |store: &Store| {
+            store
+                .claims_for(agent, None)
+                .unwrap()
+                .into_iter()
+                .map(|claim| claim.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids(&in_order), ids(&reversed));
+        assert_eq!(
+            in_order
+                .latest_claim(agent, Some("harness.observed"))
+                .unwrap()
+                .unwrap()
+                .body["fields"]["state"],
+            "idle"
+        );
+        assert_eq!(
+            reversed
+                .latest_claim(agent, Some("harness.observed"))
+                .unwrap()
+                .unwrap()
+                .body["fields"]["state"],
+            "idle"
+        );
+    }
+
     #[test]
     fn concurrent_graph_writes_converge_after_a_partition() {
         let left = Store::open_memory("left").unwrap();
@@ -32769,7 +33222,10 @@ version 2
         let store = Store::open_memory("node").unwrap();
         let connection = store.connection.lock().unwrap();
         let mut statement = connection
-            .prepare(&format!("EXPLAIN QUERY PLAN {CLAIMS_FOR_SUBJECT_KIND}"))
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                claims_for_subject_query(true)
+            ))
             .unwrap();
         let plan = statement
             .query_map(params!["agent/example", "harness.diagnostic"], |row| {
@@ -32780,7 +33236,8 @@ version 2
             .unwrap()
             .join("\n");
         assert!(
-            plan.contains("claims_subject_kind_index (subject=? AND kind=?)"),
+            plan.contains("claims_subject_kind_accepted_index (subject=? AND kind=?)")
+                || plan.contains("claims_subject_kind_index (subject=? AND kind=?)"),
             "one kind of a subject's claims must not read every claim of the subject:\n{plan}"
         );
         drop(statement);
@@ -38713,6 +39170,182 @@ mission "{mission}" state="ready" {{
     }
 
     #[test]
+    fn a_decision_about_a_pull_request_ends_when_it_merges_or_closes() {
+        let store = Store::open_memory("node").unwrap();
+        let observe = |number: u64, state: &str, merged: Option<bool>| {
+            let mut facts = json!({
+                "repository": "resource/github/acme/demo",
+                "number": number,
+                "state": state,
+                "draft": false,
+                "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            });
+            if let Some(merged) = merged {
+                facts["merged"] = Value::Bool(merged);
+            }
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("resource/github/acme/demo/pull-request/{number}"),
+                    kind: "resource.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("kind".into(), Value::String("vcs.pull-request".into())),
+                        ("facts".into(), facts),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        let snapshot = observe(7, "open", Some(false));
+        request_fault(
+            &store,
+            "attention/review-7",
+            &[
+                &format!("resource/github/acme/demo/pull-request/7@{}", snapshot.id),
+                "doc/mission-run/example/review@abc",
+            ],
+        );
+        request_fault(
+            &store,
+            "attention/gate-8",
+            &["resource/github/acme/demo/pull-request/8"],
+        );
+        observe(8, "open", Some(false));
+        request_fault(&store, "attention/queue", &["resource/fabric/queue"]);
+        assert!(fault_is_current(&store, "attention/review-7"));
+        assert!(fault_is_current(&store, "attention/gate-8"));
+
+        // An open listing records a pull request that left it as closed.
+        observe(7, "closed", None);
+        assert!(!fault_is_current(&store, "attention/review-7"));
+        // The pull request provider records a merge.
+        observe(8, "closed", Some(true));
+        assert!(!fault_is_current(&store, "attention/gate-8"));
+
+        // A review raised after its pull request already merged has nothing to decide either.
+        request_fault(
+            &store,
+            "attention/late-review",
+            &["resource/github/acme/demo/pull-request/8"],
+        );
+        assert!(!fault_is_current(&store, "attention/late-review"));
+        // Other resources are still context.
+        assert!(fault_is_current(&store, "attention/queue"));
+        let states = store
+            .attention_target_states(&[
+                format!("resource/github/acme/demo/pull-request/7@{}", snapshot.id),
+                "resource/github/acme/demo/pull-request/8".into(),
+                "resource/fabric/queue".into(),
+            ])
+            .unwrap()
+            .into_iter()
+            .map(|state| state.state)
+            .collect::<Vec<_>>();
+        assert_eq!(states, ["closed", "merged"]);
+    }
+
+    #[test]
+    fn attention_about_an_observer_ends_when_it_observes_again() {
+        let store = Store::open_memory("node").unwrap();
+        let state = |state: &str, key: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "observer/demo".into(),
+                    kind: "observer.state".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String(state.into())),
+                        ("revision".into(), Value::String("r1".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap();
+        };
+        state("healthy", "healthy-before");
+        state("unreachable", "unreachable");
+        request_fault(&store, "attention/observer", &["observer/demo"]);
+        assert!(
+            fault_is_current(&store, "attention/observer"),
+            "a healthy state from before the request is not a recovery"
+        );
+        assert_eq!(
+            store
+                .attention_target_states(&["observer/demo".into()])
+                .unwrap()[0]
+                .state,
+            "unreachable"
+        );
+        state("healthy", "healthy-after");
+        assert!(!fault_is_current(&store, "attention/observer"));
+    }
+
+    #[test]
+    fn attention_about_a_stopped_loop_ends_when_the_loop_runs_again() {
+        let store = Store::open_memory("node").unwrap();
+        let run = start_agentless_run(&store, "looping");
+        let generation = run.generation.strip_prefix("run-generation/").unwrap();
+        let loop_run = format!("loop-run/{generation}/review");
+        let loop_state = |status: &str, round: u64| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: loop_run.clone(),
+                    kind: "loop.state".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String(status.into())),
+                        ("round".into(), Value::from(round)),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("{status}-{round}")),
+                })
+                .unwrap();
+        };
+        loop_state("running", 3);
+        request_fault(&store, "attention/loop", &[&loop_run, &run.subject]);
+        loop_state("failed", 3);
+        store
+            .set_mission_run_state(&run.id, "failed", "terminal", Some("the loop stopped"))
+            .unwrap();
+        assert!(
+            fault_is_current(&store, "attention/loop"),
+            "the run failing because its loop stopped is what the request reports"
+        );
+
+        loop_state("running", 4);
+        assert!(!fault_is_current(&store, "attention/loop"));
+    }
+
+    #[test]
+    fn attention_about_a_message_ends_when_the_message_is_closed() {
+        let store = Store::open_memory("node").unwrap();
+        let append = |kind: &str, status: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "message/0123456789abcdef".into(),
+                    kind: kind.into(),
+                    actor: Some("agent/example".into()),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("anchor-{status}")),
+                })
+                .unwrap();
+        };
+        append("message.sent", "sent");
+        request_fault(&store, "attention/anchor", &["message/0123456789abcdef"]);
+        append("message.delivered", "delivered");
+        append("message.read", "read");
+        assert!(fault_is_current(&store, "attention/anchor"));
+        append("message.closed", "closed");
+        assert!(!fault_is_current(&store, "attention/anchor"));
+    }
+
+    #[test]
     fn attention_whose_agent_target_moved_on_is_not_current() {
         let store = Store::open_memory("node").unwrap();
         let observe = |agent: &str, incarnation: &str| {
@@ -38912,29 +39545,39 @@ mission "typecase" state="ready" {
                 .is_empty()
         );
 
-        let wrong = AttentionResolveRequest {
+        let agent = AttentionResolveRequest {
             outcome: "resolved".into(),
             reason: None,
-            actor: "person/someone-else".into(),
-            idempotency_key: "resolve-fabric-wrong".into(),
+            actor: "agent/fabric/worker".into(),
+            idempotency_key: "resolve-fabric-agent".into(),
         };
         assert_eq!(
             store
-                .resolve_attention(&first.subject, &wrong)
+                .resolve_attention(&first.subject, &agent)
                 .unwrap_err()
                 .code,
-            "wrong-attention-reviewer"
+            "attention-resolver-not-person"
         );
+        // Any person can close an item routed to another person.
         let resolution = AttentionResolveRequest {
             outcome: "dismissed".into(),
             reason: Some("The fault is expected during maintenance.".into()),
-            actor: "nathan".into(),
+            actor: "someone-else".into(),
             idempotency_key: "resolve-fabric".into(),
         };
         let closed = store
             .resolve_attention(&first.subject, &resolution)
             .unwrap();
         assert_eq!(closed.status, "dismissed");
+        assert_eq!(
+            store
+                .latest_claim(&first.subject, Some("attention.resolved"))
+                .unwrap()
+                .unwrap()
+                .actor
+                .as_deref(),
+            Some("person/someone-else")
+        );
         assert_eq!(closed.outcome.as_deref(), Some("dismissed"));
         assert!(store.attention_items(None).unwrap().is_empty());
         let retry = store

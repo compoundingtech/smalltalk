@@ -24,11 +24,13 @@ use crate::model::{
     StepSpec, SubscriptionSpec, UsedMissionSpec, WorkSelector,
 };
 use crate::resource::{
-    ObservationRequest, ProviderRateLimit, ProviderUnauthenticated, RegisteredResourceProvider,
-    ResourceProvider,
+    ObservationRequest, ProviderForbidden, ProviderRateLimit, ProviderUnauthenticated,
+    RegisteredResourceProvider, ResourceProvider,
 };
 use crate::store::Store;
 
+/// The actor of every attention request the reconciler raises.
+const RECONCILER_ACTOR: &str = "agent/st3/reconciler";
 const HARNESS_READINESS_DEADLINE_MS: u128 = 60_000;
 const WORK_WAKE_RETRY_MS: u128 = 15_000;
 // A mechanical gate may run for minutes. Each poll reruns the entire host reconciliation
@@ -573,6 +575,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.notify.notify_one();
         // When the last pass began, and whether it changed nothing.
         let mut quiet_pass_started = None;
+        // Whether a successful pass must close this host's reconciler item. The first pass after a
+        // start checks, since a panic or a restart can leave one open.
+        let mut may_have_failed = true;
         loop {
             match self.blocking(|this| this.next_reconcile_deadline()).await {
                 Some(deadline) => {
@@ -586,24 +591,38 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             for pass in 0..64 {
                 let started = now_ms();
-                let changed = self
-                    .blocking(|this| {
+                let check_recovery = may_have_failed;
+                let (changed, failed) = self
+                    .blocking(move |this| {
                         let before = this.store.index().ok();
-                        if let Err(error) = this.reconcile_once() {
-                            let _ = this.record_once(
-                                &format!("daemon/{}", this.host),
-                                "daemon.diagnostic",
-                                BTreeMap::from([
-                                    ("severity".into(), Value::String("error".into())),
-                                    ("code".into(), Value::String("reconcile-failed".into())),
-                                    ("status".into(), Value::String("unreachable".into())),
-                                    ("reason".into(), Value::String(error.to_string())),
-                                ]),
-                            );
-                        }
-                        before != this.store.index().ok()
+                        let failed = match this.reconcile_once() {
+                            Err(error) => {
+                                let _ = this.record_once(
+                                    &format!("daemon/{}", this.host),
+                                    "daemon.diagnostic",
+                                    BTreeMap::from([
+                                        ("severity".into(), Value::String("error".into())),
+                                        ("code".into(), Value::String("reconcile-failed".into())),
+                                        ("status".into(), Value::String("unreachable".into())),
+                                        ("reason".into(), Value::String(error.to_string())),
+                                    ]),
+                                );
+                                let _ = this.request_reconciler_attention(&format!(
+                                    "A reconcile pass failed: {error:#}"
+                                ));
+                                true
+                            }
+                            Ok(()) => {
+                                if check_recovery {
+                                    let _ = this.resolve_reconciler_attention();
+                                }
+                                false
+                            }
+                        };
+                        (before != this.store.index().ok(), failed)
                     })
                     .await;
+                may_have_failed = failed;
                 self.event_notify
                     .send_modify(|generation| *generation = generation.saturating_add(1));
                 quiet_pass_started = (!changed).then_some(started);
@@ -646,6 +665,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                 return;
             }
             let reason = panic_message(error.into_panic().as_ref());
+            let _ = self.request_reconciler_attention(&format!(
+                "The reconciler panicked and restarts: {reason}"
+            ));
             let _ = self.record_once(
                 &format!("daemon/{}", self.host),
                 "daemon.diagnostic",
@@ -666,6 +688,58 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     fn signal_changed(&self) {
         signal_changed(&self.notify, &self.event_notify);
+    }
+
+    /// Raise one host item while whole reconcile passes fail or the reconciler panics. Nothing on
+    /// the host advances in that time. The first cause names the item; later failures keep it.
+    fn request_reconciler_attention(&self, cause: &str) -> Result<()> {
+        let daemon = format!("daemon/{}", self.host);
+        if self
+            .store
+            .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
+            .iter()
+            .any(|request| {
+                request.title == RECONCILER_FAILING_TITLE && request.targets == [daemon.as_str()]
+            })
+        {
+            return Ok(());
+        }
+        let key = format!("reconciler-failing:{}:{}", self.host, now_ms());
+        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+        self.store.request_attention(
+            &format!("attention/{}", &digest[..32]),
+            &AttentionRequest {
+                reviewer: "person/operator".into(),
+                title: RECONCILER_FAILING_TITLE.into(),
+                reason: format!(
+                    "{cause}. Nothing on {} advances until a pass succeeds. Check the host with `st doctor` and the daemon's log; `st service restart` restarts the daemon. This item closes after the next successful pass.",
+                    self.host
+                ),
+                severity: "error".into(),
+                targets: vec![daemon],
+                actor: RECONCILER_ACTOR.into(),
+                idempotency_key: key,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn resolve_reconciler_attention(&self) -> Result<()> {
+        let daemon = format!("daemon/{}", self.host);
+        for request in self
+            .store
+            .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
+        {
+            if request.title == RECONCILER_FAILING_TITLE && request.targets == [daemon.as_str()] {
+                self.store.resolve_attention_automatically(
+                    &request.subject,
+                    "a reconcile pass succeeded",
+                    &format!("reconciler-recovered:{}", request.request),
+                )?;
+                self.signal_changed();
+            }
+        }
+        Ok(())
     }
 
     /// Reconcile one item of the pass on its own. An error or a panic is recorded as a fault on
@@ -705,7 +779,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         value
     }
 
-    /// Record a fault when it first appears or its cause changes, and its recovery once.
+    /// Record a fault when it first appears or its cause changes, and its recovery once. A fault
+    /// that lasts [`FAULT_ATTENTION_AFTER_MS`] raises one attention item for its subject and
+    /// cause. A new cause replaces that item, and recovery closes it.
     fn record_fault(&self, subject: &str, scope: &str, outcome: Result<()>) -> Result<()> {
         match outcome {
             Err(error) => {
@@ -714,10 +790,18 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let open = faults.get_or_insert_with(BTreeMap::new);
                 let key = (subject.to_owned(), scope.to_owned());
                 if open.get(&key) == Some(&reason) {
-                    return Ok(());
+                    drop(faults);
+                    return self.request_fault_attention(subject, scope);
+                }
+                let replaced = open.contains_key(&key);
+                drop(faults);
+                if replaced {
+                    self.resolve_fault_attention(subject, scope, "its cause changed")?;
                 }
                 self.append_fault(subject, scope, "faulted", &reason)?;
-                open.insert(key, reason);
+                self.open_faults()?
+                    .get_or_insert_with(BTreeMap::new)
+                    .insert(key, reason);
                 Ok(())
             }
             Ok(()) => self.close_fault(subject, scope, "the item reconciled successfully"),
@@ -725,14 +809,77 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn close_fault(&self, subject: &str, scope: &str, reason: &str) -> Result<()> {
-        let mut faults = self.open_faults()?;
-        let open = faults.get_or_insert_with(BTreeMap::new);
         let key = (subject.to_owned(), scope.to_owned());
-        if !open.contains_key(&key) {
+        if !self
+            .open_faults()?
+            .get_or_insert_with(BTreeMap::new)
+            .contains_key(&key)
+        {
             return Ok(());
         }
+        self.resolve_fault_attention(subject, scope, reason)?;
         self.append_fault(subject, scope, "recovered", reason)?;
-        open.remove(&key);
+        self.open_faults()?
+            .get_or_insert_with(BTreeMap::new)
+            .remove(&key);
+        Ok(())
+    }
+
+    /// Raise the attention item of the open fault on `subject` in `scope` once it has lasted
+    /// long enough that st's own retries did not clear it.
+    fn request_fault_attention(&self, subject: &str, scope: &str) -> Result<()> {
+        let Some(fault) = self.store.open_reconcile_fault_claim(subject, scope)? else {
+            return Ok(());
+        };
+        if now_ms().saturating_sub(fault.accepted_at_unix_ms) < FAULT_ATTENTION_AFTER_MS {
+            return Ok(());
+        }
+        let attention = fault_attention_subject(&fault.id);
+        if self.store.attention_request(&attention)?.is_some() {
+            return Ok(());
+        }
+        let reason = fault
+            .body
+            .pointer("/fields/reason")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        self.store.request_attention(
+            &attention,
+            &AttentionRequest {
+                reviewer: "person/operator".into(),
+                title: format!("st cannot reconcile {subject}"),
+                reason: format!(
+                    "{scope} for {subject} on {} keeps failing: {reason}. st retries it on every pass. Inspect it with `st subject {subject}`; `st doctor` checks the host. This item closes when it reconciles.",
+                    self.host
+                ),
+                severity: "error".into(),
+                targets: vec![subject.into()],
+                actor: RECONCILER_ACTOR.into(),
+                idempotency_key: format!("reconcile-fault-attention:{}", fault.id),
+            },
+        )?;
+        self.signal_changed();
+        Ok(())
+    }
+
+    /// Close the attention item of the open fault on `subject` in `scope`, if it raised one.
+    fn resolve_fault_attention(&self, subject: &str, scope: &str, reason: &str) -> Result<()> {
+        let Some(fault) = self.store.open_reconcile_fault_claim(subject, scope)? else {
+            return Ok(());
+        };
+        let attention = fault_attention_subject(&fault.id);
+        if self
+            .store
+            .attention_request(&attention)?
+            .is_some_and(|request| request.status == "pending")
+        {
+            self.store.resolve_attention_automatically(
+                &attention,
+                &format!("{scope} for {subject}: {reason}"),
+                &format!("reconcile-fault-closed:{}", fault.id),
+            )?;
+            self.signal_changed();
+        }
         Ok(())
     }
 
@@ -8079,6 +8226,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         if spec.stopped {
             self.cancel_unstarted_subscription_requests(&item.subject)?;
+            self.resolve_released_held_attention(&item.subject, &BTreeMap::new())?;
             return Ok(());
         }
         if spec.delivery != "mission" {
@@ -8088,6 +8236,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .store
             .pending_subscription_mission_requests(&item.subject)?;
         if requests.is_empty() {
+            self.resolve_released_held_attention(&item.subject, &BTreeMap::new())?;
             return Ok(());
         }
         let is_held = |request: &crate::model::ClaimRecord| {
@@ -8280,9 +8429,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                 idempotency_key: Some(format!("subscription-mission-started:{}", run.id)),
             })?;
         }
-        for (observation, count) in held {
-            self.request_held_subscription_attention(&item.subject, &observation, count)?;
+        for (observation, count) in &held {
+            self.request_held_subscription_attention(&item.subject, observation, *count)?;
         }
+        self.resolve_released_held_attention(&item.subject, &held)?;
         anyhow::ensure!(waiting.is_empty(), "{}", waiting.join("; "));
         Ok(())
     }
@@ -8343,10 +8493,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         observation: &str,
         count: usize,
     ) -> Result<()> {
-        let digest = hex::encode(sha2::Sha256::digest(
-            format!("held-subscription-requests:{subscription}:{observation}").as_bytes(),
-        ));
-        let attention_subject = format!("attention/{}", &digest[..32]);
+        let attention_subject = held_subscription_attention_subject(subscription, observation);
+        let digest = attention_subject
+            .strip_prefix("attention/")
+            .unwrap_or(&attention_subject);
         if self.store.attention_request(&attention_subject)?.is_some() {
             return Ok(());
         }
@@ -8354,18 +8504,48 @@ impl<R: RuntimeControl> Reconciler<R> {
             &attention_subject,
             &AttentionRequest {
                 reviewer: "person/operator".into(),
-                title: "A subscription is holding mission requests".into(),
+                title: HELD_SUBSCRIPTION_TITLE.into(),
                 reason: format!(
                     "One observation for {subscription} requested more than {} mission runs, so {count} wait for a person. List them with `st missions requests {subscription}`, then release or cancel each one.",
                     crate::store::MAX_OBSERVATION_DELIVERIES
                 ),
                 severity: "warning".into(),
                 targets: vec![subscription.into()],
-                actor: "agent/st3/reconciler".into(),
-                idempotency_key: format!("held-subscription-requests:{}", &digest[..32]),
+                actor: RECONCILER_ACTOR.into(),
+                idempotency_key: format!("held-subscription-requests:{digest}"),
             },
         )?;
         self.signal_changed();
+        Ok(())
+    }
+
+    /// Close each held-requests item of `subscription` once none of its observation's requests
+    /// is held: each was released, cancelled or started, or the subscription stopped.
+    fn resolve_released_held_attention(
+        &self,
+        subscription: &str,
+        held: &BTreeMap<String, usize>,
+    ) -> Result<()> {
+        let still_held = held
+            .keys()
+            .map(|observation| held_subscription_attention_subject(subscription, observation))
+            .collect::<BTreeSet<_>>();
+        for request in self
+            .store
+            .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
+        {
+            if request.targets == [subscription]
+                && request.title == HELD_SUBSCRIPTION_TITLE
+                && !still_held.contains(&request.subject)
+            {
+                self.store.resolve_attention_automatically(
+                    &request.subject,
+                    &format!("{subscription} holds no request from that observation"),
+                    &format!("held-subscription-released:{}", request.request),
+                )?;
+                self.signal_changed();
+            }
+        }
         Ok(())
     }
 
@@ -8544,6 +8724,13 @@ impl<R: RuntimeControl> Reconciler<R> {
         let cursors = self.observer_cursors.clone();
         let observer_subject = observer.subject.clone();
         let observer_owner_run = observer.owner_run.clone();
+        let host = self.host.clone();
+        let was_failing = observer_actual.as_ref().is_some_and(|actual| {
+            matches!(
+                actual.get("state").and_then(Value::as_str),
+                Some("unreachable" | "degraded")
+            )
+        });
         let previous_facts = self
             .store
             .latest_actual_value(&spec.resource)?
@@ -8620,6 +8807,13 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     .lock()
                                     .unwrap_or_else(PoisonError::into_inner)
                                     .insert(deadline_key.clone(), observation.cursor);
+                                if was_failing {
+                                    let _ = resolve_observer_attention(
+                                        &store,
+                                        &host,
+                                        &observer_subject,
+                                    );
+                                }
                             }
                             Err(error) => {
                                 let retry_at = now_ms().saturating_add(60_000);
@@ -8658,6 +8852,17 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     expected_subject: None,
                                     idempotency_key: Some(key),
                                 });
+                                // A permanent error is not polled again, so it waits for a
+                                // person to correct the declaration.
+                                if permanent_observation_error(error.code) {
+                                    let _ = request_observer_attention(
+                                        &store,
+                                        &observer_subject,
+                                        observer_owner_run.as_deref(),
+                                        &revision,
+                                        &ObserverCondition::Rejected(error.to_string()),
+                                    );
+                                }
                             }
                         }
                     }
@@ -8672,65 +8877,56 @@ impl<R: RuntimeControl> Reconciler<R> {
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
                             .insert(deadline_key.clone(), retry_at);
-                        if rate_limit.is_some_and(|limit| limit.unauthenticated)
-                            || error.downcast_ref::<ProviderUnauthenticated>().is_some()
-                            || observer_unreachable_since(&store, &observer_subject)
-                                .ok()
-                                .flatten()
-                                .is_some_and(|since| now_ms().saturating_sub(since) >= 3_600_000)
-                        {
+                        let previous = store.latest_actual_value(&observer_subject).ok().flatten();
+                        let condition = ObserverCondition::of(&error, previous.as_ref());
+                        let unchanged_failure = previous.as_ref().is_some_and(|actual| {
+                            actual.get("state").and_then(Value::as_str) == Some("unreachable")
+                                && actual.get("reason").and_then(Value::as_str)
+                                    == Some(reason.as_str())
+                        });
+                        if !unchanged_failure || refresh_attempt.is_some() {
+                            let failure_hash = hex::encode(sha2::Sha256::digest(
+                                format!("{operation}:{reason}").as_bytes(),
+                            ));
+                            let mut fields = BTreeMap::from([
+                                ("state".into(), Value::String("unreachable".into())),
+                                ("reason".into(), Value::String(reason)),
+                                ("error_code".into(), Value::String(condition.code().into())),
+                                ("revision".into(), Value::String(revision.clone())),
+                                (
+                                    "next_check_unix_ms".into(),
+                                    Value::String(retry_at.to_string()),
+                                ),
+                            ]);
+                            if let Some(attempt) = &refresh_attempt {
+                                fields.insert("attempt".into(), Value::String(attempt.clone()));
+                            }
+                            let _ = store.append_claim(&ClaimInput {
+                                subject: observer_subject.clone(),
+                                kind: "observer.state".into(),
+                                actor: None,
+                                fields,
+                                evidence: Vec::new(),
+                                expected_subject: None,
+                                idempotency_key: Some(format!(
+                                    "observer-failure:{}",
+                                    &failure_hash[..20]
+                                )),
+                            });
+                        }
+                        let since = observer_unreachable_since(&store, &observer_subject)
+                            .ok()
+                            .flatten()
+                            .unwrap_or_else(now_ms);
+                        if condition.needs_person(now_ms().saturating_sub(since)) {
                             let _ = request_observer_attention(
                                 &store,
                                 &observer_subject,
                                 observer_owner_run.as_deref(),
                                 &revision,
-                                &reason,
+                                &condition,
                             );
                         }
-                        let unchanged_failure = store
-                            .latest_actual_value(&observer_subject)
-                            .ok()
-                            .flatten()
-                            .is_some_and(|actual| {
-                                actual.get("state").and_then(Value::as_str) == Some("unreachable")
-                                    && actual.get("reason").and_then(Value::as_str)
-                                        == Some(reason.as_str())
-                            });
-                        if unchanged_failure && refresh_attempt.is_none() {
-                            armed
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .remove(&operation);
-                            signal_changed(&notify, &event_notify);
-                            return;
-                        }
-                        let failure_hash = hex::encode(sha2::Sha256::digest(
-                            format!("{operation}:{reason}").as_bytes(),
-                        ));
-                        let mut fields = BTreeMap::from([
-                            ("state".into(), Value::String("unreachable".into())),
-                            ("reason".into(), Value::String(reason)),
-                            ("revision".into(), Value::String(revision.clone())),
-                            (
-                                "next_check_unix_ms".into(),
-                                Value::String(retry_at.to_string()),
-                            ),
-                        ]);
-                        if let Some(attempt) = &refresh_attempt {
-                            fields.insert("attempt".into(), Value::String(attempt.clone()));
-                        }
-                        let _ = store.append_claim(&ClaimInput {
-                            subject: observer_subject.clone(),
-                            kind: "observer.state".into(),
-                            actor: None,
-                            fields,
-                            evidence: Vec::new(),
-                            expected_subject: None,
-                            idempotency_key: Some(format!(
-                                "observer-failure:{}",
-                                &failure_hash[..20]
-                            )),
-                        });
                     }
                 }
                 armed
@@ -9637,6 +9833,27 @@ fn permanent_observation_error(code: &str) -> bool {
     )
 }
 
+const HELD_SUBSCRIPTION_TITLE: &str = "A subscription is holding mission requests";
+const RECONCILER_FAILING_TITLE: &str = "The reconciler is failing";
+
+/// How long a fault must last before it asks a person. st retries a faulted item on every pass,
+/// so most faults clear sooner and never reach anyone.
+const FAULT_ATTENTION_AFTER_MS: u128 = 120_000;
+
+fn fault_attention_subject(fault: &str) -> String {
+    let digest = hex::encode(sha2::Sha256::digest(
+        format!("reconcile-fault-attention:{fault}").as_bytes(),
+    ));
+    format!("attention/{}", &digest[..32])
+}
+
+fn held_subscription_attention_subject(subscription: &str, observation: &str) -> String {
+    let digest = hex::encode(sha2::Sha256::digest(
+        format!("held-subscription-requests:{subscription}:{observation}").as_bytes(),
+    ));
+    format!("attention/{}", &digest[..32])
+}
+
 fn observer_unreachable_since(store: &Store, subject: &str) -> Result<Option<u128>> {
     let mut since = None;
     for claim in store.claims_for(subject, Some("observer.state"))? {
@@ -9650,33 +9867,152 @@ fn observer_unreachable_since(store: &Store, subject: &str) -> Result<Option<u12
     Ok(since)
 }
 
+/// Why an observer cannot observe, and whether a person has to act.
+enum ObserverCondition {
+    /// GitHub rejected the token or refused access. Nothing changes until a person acts.
+    Access(String),
+    /// A rate limit ends at a known reset. It needs a person only when the observer was already
+    /// limited and is still limited after the reset that limit named.
+    RateLimited { reason: String, outlasted: bool },
+    /// Any other failure. A person looks at it once it has lasted an hour.
+    Unreachable(String),
+    /// The daemon rejected the observation itself. It is not polled again on this revision.
+    Rejected(String),
+}
+
+/// How long after a named reset a rate limit counts as outlasting it, for clock skew.
+const RATE_LIMIT_RESET_GRACE_MS: u128 = 60_000;
+const OBSERVER_UNREACHABLE_ATTENTION_MS: u128 = 3_600_000;
+
+impl ObserverCondition {
+    fn of(error: &anyhow::Error, previous: Option<&Value>) -> Self {
+        let reason = error.to_string();
+        if error.downcast_ref::<ProviderForbidden>().is_some()
+            || error.downcast_ref::<ProviderUnauthenticated>().is_some()
+        {
+            return Self::Access(reason);
+        }
+        if error.downcast_ref::<ProviderRateLimit>().is_some() {
+            let outlasted = previous.is_some_and(|actual| {
+                actual.get("state").and_then(Value::as_str) == Some("unreachable")
+                    && actual.get("error_code").and_then(Value::as_str) == Some("rate-limited")
+                    && actual
+                        .get("next_check_unix_ms")
+                        .and_then(Value::as_str)
+                        .and_then(|value| value.parse::<u128>().ok())
+                        .is_some_and(|reset| {
+                            reset.saturating_add(RATE_LIMIT_RESET_GRACE_MS) <= now_ms()
+                        })
+            });
+            return Self::RateLimited { reason, outlasted };
+        }
+        Self::Unreachable(reason)
+    }
+
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Access(_) => "access-denied",
+            Self::RateLimited { .. } => "rate-limited",
+            Self::Unreachable(_) => "unreachable",
+            Self::Rejected(_) => "rejected",
+        }
+    }
+
+    fn needs_person(&self, failing_for_ms: u128) -> bool {
+        match self {
+            Self::Access(_) | Self::Rejected(_) => true,
+            Self::RateLimited { outlasted, .. } => *outlasted,
+            Self::Unreachable(_) => failing_for_ms >= OBSERVER_UNREACHABLE_ATTENTION_MS,
+        }
+    }
+
+    fn title(&self) -> &'static str {
+        match self {
+            Self::Access(_) => "An observer has no access to GitHub",
+            Self::RateLimited { .. } => "A GitHub rate limit outlasted its reset",
+            Self::Unreachable(_) => "An observer has failed for an hour",
+            Self::Rejected(_) => "st rejects an observer's observations",
+        }
+    }
+
+    /// The cause and the command that fixes it.
+    fn reason(&self, subject: &str) -> String {
+        let closes = "This item closes when the observer observes again.";
+        match self {
+            Self::Access(reason) => format!(
+                "{subject} cannot observe its resource: {reason}. Give the daemon account's GitHub token access to the repository, with `gh auth login` or `gh auth refresh -h github.com -s repo` as that account. The observer tries again on its own. {closes}"
+            ),
+            Self::RateLimited { reason, .. } => format!(
+                "{subject} is still limited after the reset GitHub named: {reason}. Something else spends the shared GitHub budget; `st doctor` shows the requests each observer made. The observer waits for each reset on its own. {closes}"
+            ),
+            Self::Unreachable(reason) => format!(
+                "{subject} has failed to observe for over an hour: {reason}. Inspect it with `st subject {subject}`. {closes}"
+            ),
+            Self::Rejected(reason) => format!(
+                "st rejected an observation from {subject}: {reason}. Correct the observer's declaration and apply it again; inspect it with `st subject {subject}`. {closes}"
+            ),
+        }
+    }
+}
+
+/// Raise one attention item per observer, revision, cause and failure episode. An episode ends
+/// when the observer records a healthy state, so a later failure raises a new item even after a
+/// person closed the last one.
 fn request_observer_attention(
     store: &Store,
     subject: &str,
     owner_run: Option<&str>,
     revision: &str,
-    reason: &str,
+    condition: &ObserverCondition,
 ) -> Result<()> {
+    let episode = store
+        .claims_for(subject, Some("observer.state"))?
+        .into_iter()
+        .rev()
+        .find(|claim| {
+            claim.body.pointer("/fields/state").and_then(Value::as_str) == Some("healthy")
+        })
+        .map_or_else(|| "first".to_owned(), |claim| claim.id);
+    let key = format!(
+        "observer-attention:{subject}:{revision}:{}:{episode}",
+        condition.code()
+    );
+    let hash = hex::encode(sha2::Sha256::digest(key.as_bytes()));
+    let attention = format!("attention/observer-{}", &hash[..24]);
+    if store.attention_request(&attention)?.is_some() {
+        return Ok(());
+    }
     let reviewer = owner_run
         .and_then(|owner| store.mission_run(owner).ok().flatten())
         .map(|run| run.requester)
         .filter(|requester| requester.starts_with("person/"))
         .unwrap_or_else(|| "person/operator".into());
-    let hash = hex::encode(sha2::Sha256::digest(
-        format!("{subject}:{revision}").as_bytes(),
-    ));
     store.request_attention(
-        &format!("attention/github-observer-{}", &hash[..20]),
+        &attention,
         &AttentionRequest {
             reviewer,
-            title: "GitHub observer needs attention".into(),
-            reason: format!("{subject} cannot observe its repository: {reason}"),
+            title: condition.title().into(),
+            reason: condition.reason(subject),
             severity: "error".into(),
             targets: vec![subject.into()],
-            actor: "agent/st3/reconciler".into(),
-            idempotency_key: format!("github-observer-attention:{hash}"),
+            actor: RECONCILER_ACTOR.into(),
+            idempotency_key: key,
         },
     )?;
+    Ok(())
+}
+
+/// Close every item this host raised about `subject` once the observer observes again.
+fn resolve_observer_attention(store: &Store, host: &str, subject: &str) -> Result<()> {
+    for request in store.pending_attention_requests_raised_by(RECONCILER_ACTOR, host)? {
+        if request.targets == [subject] {
+            store.resolve_attention_automatically(
+                &request.subject,
+                &format!("{subject} observes again"),
+                &format!("observer-recovered:{}", request.request),
+            )?;
+        }
+    }
     Ok(())
 }
 
@@ -18742,7 +19078,6 @@ observer "repo" {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 Err(anyhow::Error::new(crate::resource::ProviderRateLimit {
                     retry_at_unix_ms: self.retry_at_unix_ms,
-                    unauthenticated: false,
                     status: 429,
                 }))
             })
@@ -18848,10 +19183,10 @@ observer "repo" {
             "node".into(),
             Arc::new(Notify::new()),
         )
-        .with_resource_provider(Arc::new(RateLimitedResourceProvider {
+        .with_resource_provider(Arc::new(ScriptedResourceProvider::new(
             calls,
-            retry_at_unix_ms: now_ms() + 180_000,
-        }))
+            [ScriptedObservation::Fail, ScriptedObservation::Fail],
+        )))
         .with_event_notify(event_notify);
         reconciler.reconcile_once().unwrap();
         tokio::time::timeout(Duration::from_secs(1), event_changed.changed())
@@ -18862,14 +19197,14 @@ observer "repo" {
         assert_eq!(
             attention
                 .iter()
-                .filter(|item| item.title == "GitHub observer needs attention")
+                .filter(|item| item.title == "An observer has failed for an hour")
                 .count(),
             1
         );
         assert_eq!(
             attention
                 .iter()
-                .find(|item| item.title == "GitHub observer needs attention")
+                .find(|item| item.title == "An observer has failed for an hour")
                 .unwrap()
                 .person,
             "person/operator"
@@ -18880,10 +19215,344 @@ observer "repo" {
                 .attention_items(None)
                 .unwrap()
                 .iter()
-                .filter(|item| item.title == "GitHub observer needs attention")
+                .filter(|item| item.title == "An observer has failed for an hour")
                 .count(),
             1
         );
+    }
+
+    /// What a scripted observation answers.
+    enum ScriptedObservation {
+        Observe,
+        RateLimit,
+        Forbidden,
+        Fail,
+    }
+
+    /// Answers each observation with the next scripted outcome.
+    struct ScriptedResourceProvider {
+        calls: Arc<AtomicUsize>,
+        outcomes: Mutex<std::collections::VecDeque<ScriptedObservation>>,
+    }
+
+    impl ScriptedResourceProvider {
+        fn new(
+            calls: Arc<AtomicUsize>,
+            outcomes: impl IntoIterator<Item = ScriptedObservation>,
+        ) -> Self {
+            Self {
+                calls,
+                outcomes: Mutex::new(outcomes.into_iter().collect()),
+            }
+        }
+    }
+
+    impl ResourceProvider for ScriptedResourceProvider {
+        fn observe(
+            &self,
+            _request: ObservationRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<crate::resource::ProviderObservation>>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(async {
+                let outcome = self
+                    .outcomes
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .expect("an observation was scripted");
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                match outcome {
+                    ScriptedObservation::Observe => Ok(crate::resource::ProviderObservation {
+                        facts: serde_json::json!({"issues": []}),
+                        cursor: Some("no-issues".into()),
+                        next_check_unix_ms: now_ms().saturating_add(60_000),
+                    }),
+                    ScriptedObservation::RateLimit => {
+                        Err(anyhow::Error::new(crate::resource::ProviderRateLimit {
+                            retry_at_unix_ms: now_ms() + 180_000,
+                            status: 403,
+                        }))
+                    }
+                    ScriptedObservation::Forbidden => {
+                        Err(anyhow::Error::new(crate::resource::ProviderForbidden {
+                            status: 403,
+                            message: "Resource not accessible by personal access token".into(),
+                        }))
+                    }
+                    ScriptedObservation::Fail => Err(anyhow::anyhow!("connection reset by peer")),
+                }
+            })
+        }
+    }
+
+    const SCRIPTED_OBSERVER: &str = r#"version 2
+resource "repo" { kind "vcs.repository" }
+observer "repo" {
+  resource "resource/repo"
+  provider "github.repository"
+  locator "example/repo"
+  field "issues"
+}"#;
+
+    /// Run one observation now and wait until it has recorded its outcome.
+    async fn observe_now(reconciler: &Reconciler<FakeRuntime>, calls: &AtomicUsize) {
+        let revision = reconciler
+            .store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap();
+        let expected = calls.load(Ordering::SeqCst) + 1;
+        reconciler
+            .observer_deadlines
+            .lock()
+            .unwrap()
+            .insert(format!("observer/repo:{revision}"), 0);
+        reconciler.reconcile_once().unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while calls.load(Ordering::SeqCst) < expected
+                || !reconciler.armed_observers.lock().unwrap().is_empty()
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the observation finished");
+    }
+
+    fn observer_items(store: &Store) -> Vec<crate::model::AttentionItemView> {
+        store
+            .attention_items(None)
+            .unwrap()
+            .into_iter()
+            .filter(|item| item.targets == ["observer/repo"])
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_rate_limit_asks_a_person_only_after_it_outlasts_its_reset() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, SCRIPTED_OBSERVER, "outlasted-rate-limit");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_resource_provider(Arc::new(ScriptedResourceProvider::new(
+            calls.clone(),
+            [
+                ScriptedObservation::RateLimit,
+                ScriptedObservation::RateLimit,
+                ScriptedObservation::Observe,
+            ],
+        )));
+
+        // A rate limit resets on its own, so it raises nothing.
+        observe_now(&reconciler, &calls).await;
+        let state = store.latest_actual_value("observer/repo").unwrap().unwrap();
+        assert_eq!(state["error_code"], "rate-limited");
+        assert!(observer_items(&store).is_empty());
+
+        // The reset it named passed, and the observer is still limited.
+        let revision = store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "observer/repo".into(),
+                kind: "observer.state".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("unreachable".into())),
+                    (
+                        "reason".into(),
+                        Value::String("GitHub HTTP 403 rate limit".into()),
+                    ),
+                    ("error_code".into(), Value::String("rate-limited".into())),
+                    ("revision".into(), Value::String(revision)),
+                    (
+                        "next_check_unix_ms".into(),
+                        Value::String((now_ms() - RATE_LIMIT_RESET_GRACE_MS - 1).to_string()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        observe_now(&reconciler, &calls).await;
+        let items = observer_items(&store);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "A GitHub rate limit outlasted its reset");
+        assert!(
+            items[0].detail.contains("`st doctor`"),
+            "{}",
+            items[0].detail
+        );
+
+        // Observing again closes it.
+        observe_now(&reconciler, &calls).await;
+        assert!(observer_items(&store).is_empty());
+        let closed = store.attention_request(&items[0].subject).unwrap().unwrap();
+        assert_eq!(closed.status, "resolved");
+    }
+
+    #[tokio::test]
+    async fn a_permission_refusal_asks_a_person_at_once_and_again_after_it_recovers() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, SCRIPTED_OBSERVER, "forbidden-observer");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        )
+        .with_resource_provider(Arc::new(ScriptedResourceProvider::new(
+            calls.clone(),
+            [
+                ScriptedObservation::Forbidden,
+                ScriptedObservation::Forbidden,
+                ScriptedObservation::Observe,
+                ScriptedObservation::Forbidden,
+            ],
+        )));
+
+        observe_now(&reconciler, &calls).await;
+        observe_now(&reconciler, &calls).await;
+        let first = observer_items(&store);
+        assert_eq!(first.len(), 1, "one item for the whole failure");
+        assert_eq!(first[0].title, "An observer has no access to GitHub");
+        assert_eq!(first[0].person, "person/operator");
+        assert!(first[0].detail.contains("gh auth"), "{}", first[0].detail);
+
+        observe_now(&reconciler, &calls).await;
+        assert!(observer_items(&store).is_empty());
+        assert_eq!(
+            store
+                .attention_request(&first[0].subject)
+                .unwrap()
+                .unwrap()
+                .status,
+            "resolved"
+        );
+
+        // A later failure is a new episode, and raises a new item.
+        observe_now(&reconciler, &calls).await;
+        let second = observer_items(&store);
+        assert_eq!(second.len(), 1);
+        assert_ne!(second[0].subject, first[0].subject);
+    }
+
+    #[test]
+    fn a_lasting_fault_raises_one_item_per_cause_and_closes_when_it_reconciles() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("faults.sqlite");
+        let store = Arc::new(Store::open(&database, "node").unwrap());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let fail = |reason: &'static str| {
+            reconciler.isolate("stage/example", "daemon/node", || -> Result<()> {
+                anyhow::bail!(reason)
+            });
+        };
+        let age_open_fault = || {
+            let fault = store
+                .open_reconcile_fault_claim("daemon/node", "stage/example")
+                .unwrap()
+                .unwrap();
+            rusqlite::Connection::open(&database)
+                .unwrap()
+                .execute(
+                    "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
+                    rusqlite::params![
+                        (now_ms() - FAULT_ATTENTION_AFTER_MS - 1).to_string(),
+                        fault.id
+                    ],
+                )
+                .unwrap();
+        };
+        let items = || {
+            store
+                .attention_items(None)
+                .unwrap()
+                .into_iter()
+                .filter(|item| item.targets == ["daemon/node"])
+                .collect::<Vec<_>>()
+        };
+
+        // st retries a fault on every pass, so a fresh one asks no one.
+        fail("the disk is full");
+        fail("the disk is full");
+        assert!(items().is_empty());
+
+        age_open_fault();
+        fail("the disk is full");
+        fail("the disk is full");
+        let first = items();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].title, "st cannot reconcile daemon/node");
+        assert!(first[0].detail.contains("the disk is full"));
+        assert!(first[0].detail.contains("`st subject daemon/node`"));
+
+        // A new cause replaces the item.
+        fail("the database is locked");
+        assert!(items().is_empty());
+        age_open_fault();
+        fail("the database is locked");
+        let second = items();
+        assert_eq!(second.len(), 1);
+        assert!(second[0].detail.contains("the database is locked"));
+
+        // Reconciling closes it.
+        reconciler.isolate("stage/example", "daemon/node", || -> Result<()> { Ok(()) });
+        assert!(items().is_empty());
+        assert_eq!(
+            store
+                .attention_request(&second[0].subject)
+                .unwrap()
+                .unwrap()
+                .status,
+            "resolved"
+        );
+    }
+
+    #[test]
+    fn a_failing_reconciler_raises_one_host_item_until_a_pass_succeeds() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler
+            .request_reconciler_attention("A reconcile pass failed: the store is locked")
+            .unwrap();
+        reconciler
+            .request_reconciler_attention(
+                "The reconciler panicked and restarts: index out of bounds",
+            )
+            .unwrap();
+        let items = store.attention_items(None).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].title, "The reconciler is failing");
+        assert_eq!(items[0].targets, ["daemon/node"]);
+        assert!(items[0].detail.contains("the store is locked"));
+
+        reconciler.resolve_reconciler_attention().unwrap();
+        assert!(store.attention_items(None).unwrap().is_empty());
     }
 
     struct SharedDiscoveryProvider {
@@ -19216,6 +19885,133 @@ subscription "reviews" {{
                 .iter()
                 .any(|item| item.subject == failure_attention.subject)
         );
+    }
+
+    #[test]
+    fn a_person_closes_an_agent_requested_subscription_failure_and_a_stop_ends_the_rest() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+mission "review" state="ready" {
+  input "source" kind="resource"
+  completion { when "all-steps-exhausted" }
+  goal "Review a discovered item."
+  step "review" { agentless }
+}"#,
+            "agent-failure-mission",
+        );
+        let revision = store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        apply_source(
+            &store,
+            &format!(
+                r#"version 2
+resource "repo" {{ kind "vcs.repository" }}
+observer "repo" {{
+  resource "resource/repo"
+  provider "github.repository"
+  locator "example/repo"
+  field "issues"
+}}
+subscription "reviews" {{
+  observer "observer/repo"
+  on "issues"
+  delivery "mission" {{
+    mission "review@{revision}"
+    resource "source"
+    workspace "/tmp/st3-review"
+    requester "agent/example/steward"
+  }}
+}}"#
+            ),
+            "agent-failure-subscription",
+        );
+        let discovery = store
+            .append_claim(&ClaimInput {
+                subject: "resource/repo".into(),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("kind".into(), Value::String("vcs.repository".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        for input in ["first", "second"] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "subscription/reviews".into(),
+                    kind: "subscription.mission-requested".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("mission".into(), Value::String("mission/review".into())),
+                        ("mission_revision".into(), Value::String(revision.clone())),
+                        ("resource".into(), Value::String("resource/repo".into())),
+                        ("resource_input".into(), Value::String(input.into())),
+                        ("workspace".into(), Value::String("/tmp/st3-review".into())),
+                        ("discovery".into(), Value::String(discovery.id.clone())),
+                        (
+                            "requester".into(),
+                            Value::String("agent/example/steward".into()),
+                        ),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler
+            .reconcile_subscription_missions(&store.desired_subjects().unwrap())
+            .unwrap();
+        let failures = || {
+            store
+                .attention_items(None)
+                .unwrap()
+                .into_iter()
+                .filter(|item| item.subject.starts_with("attention/subscription-failure-"))
+                .collect::<Vec<_>>()
+        };
+        let open = failures();
+        assert_eq!(open.len(), 2);
+        assert!(
+            open.iter().all(|item| item.person.is_empty()),
+            "a failure requested by an agent is routed to no person"
+        );
+
+        // The requester is an agent, which cannot close an item. Any person can.
+        let closed = store
+            .resolve_attention(
+                &open[0].subject,
+                &crate::model::AttentionResolveRequest {
+                    outcome: "dismissed".into(),
+                    reason: Some("The intake run was cancelled days ago".into()),
+                    actor: "person/nathan".into(),
+                    idempotency_key: "dismiss-agent-subscription-failure".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(closed.status, "dismissed");
+        assert_eq!(closed.reviewer, "person/nathan");
+        assert_eq!(failures().len(), 1);
+
+        // A stopped subscription starts nothing more, so its failures end on their own.
+        apply_source(
+            &store,
+            "version 2\nsubscription \"reviews\" { stop }\n",
+            "agent-failure-subscription-stop",
+        );
+        assert!(failures().is_empty());
     }
 
     #[test]
@@ -20522,6 +21318,15 @@ subscription "triage" {{
                 .count(),
             1
         );
+        // Nothing is held any more, so the item closes.
+        let held_items = store
+            .attention_requests(Some("person/operator"), true)
+            .unwrap()
+            .into_iter()
+            .filter(|request| request.title == "A subscription is holding mission requests")
+            .collect::<Vec<_>>();
+        assert_eq!(held_items.len(), 1);
+        assert_eq!(held_items[0].status, "resolved");
     }
 
     const INTAKE_REVIEW_SOURCE: &str = r#"version 2
