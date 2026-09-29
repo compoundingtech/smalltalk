@@ -1776,44 +1776,47 @@ fn machine_resources(
         }
     }
 
-    let work = super::client_work_resources(
-        &state.store,
-        None,
-        history,
-        client_snapshot_time(snapshot),
-        snapshot.store_index,
-    )?;
+    // Machines need only the claimant, subject, and update time. Building full
+    // client work resources also reduces usage history and mission annotations
+    // for every step, which makes this small host list expensive during the
+    // startup burst when many seats connect at once.
+    let work = if history {
+        state
+            .store
+            .client_work_history_at_snapshot(None, client_snapshot_time(snapshot))?
+    } else {
+        state
+            .store
+            .client_work_at_snapshot(None, false, client_snapshot_time(snapshot))?
+    };
     let mut host_work = BTreeMap::<String, BTreeSet<String>>::new();
     for item in work {
-        let Some(claimant) = item["claimant"].as_str() else {
+        let Some(claimant) = item.claimant.as_deref() else {
             continue;
         };
         let Some(host_id) = runtime_owner_hosts.get(claimant) else {
             continue;
         };
-        if let Some(work_id) = item["id"].as_str() {
-            host_work
-                .entry(host_id.clone())
-                .or_default()
-                .insert(work_id.to_owned());
-        }
-        if let Some(updated_at) = item["updated_at"].as_str() {
-            host_updated_at
-                .entry(host_id.clone())
-                .and_modify(|current| {
-                    if updated_at > current.as_str() {
-                        *current = updated_at.to_owned();
-                    }
-                })
-                .or_insert_with(|| updated_at.to_owned());
-        }
+        host_work
+            .entry(host_id.clone())
+            .or_default()
+            .insert(item.subject);
+        let updated_at = client_timestamp(item.updated_at_unix_ms);
+        host_updated_at
+            .entry(host_id.clone())
+            .and_modify(|current| {
+                if updated_at > *current {
+                    *current = updated_at.clone();
+                }
+            })
+            .or_insert(updated_at);
     }
 
     let local_host = client_host_id(&state.node);
     let mut host_ids = BTreeSet::from([local_host.clone()]);
     // Fleet members count as configured hosts; ended members are history. A config peer that
     // ended as a member is history too, even while its [[peers]] entry remains.
-    let fleet = state.store.fleet_view()?;
+    let fleet = state.store.fleet_view_for_client()?;
     let dial_out_hosts = fleet
         .members
         .iter()

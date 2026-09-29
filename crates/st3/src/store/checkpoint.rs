@@ -9,6 +9,17 @@
 
 use super::*;
 
+mod tombstones;
+
+pub use tombstones::{
+    CHECKPOINT_MANIFEST_PAGE_LIMIT, CheckpointManifest, CheckpointManifestCursor,
+    CheckpointManifestPage, CheckpointManifestRequest, verify_checkpoint_manifest,
+};
+pub(crate) use tombstones::{
+    checkpointed_operation, checkpointed_operations, claim_or_tombstone_exists, claim_tombstoned,
+    envelope_tombstoned,
+};
+
 /// The rule engine's version. It is part of the rules digest, so nodes agree on a checkpoint only
 /// when they run the same rules.
 pub const RULES_VERSION: u32 = 1;

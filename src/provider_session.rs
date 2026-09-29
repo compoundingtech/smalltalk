@@ -15,6 +15,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, Result};
+use serde::{Deserialize, Serialize};
 
 use crate::{harness_state, status};
 
@@ -22,6 +23,158 @@ pub(crate) const PROVIDER_POLL: Duration = Duration::from_millis(250);
 const STOP_GRACE: Duration = Duration::from_secs(5);
 
 pub(crate) static STOP: AtomicBool = AtomicBool::new(false);
+
+/// Whether a stop handler recorded a stop. A driver that released its provider to re-execute
+/// asks this once the stop signals are blocked, and adopts the provider again to stop it.
+pub fn stop_requested() -> bool {
+    STOP.load(Ordering::SeqCst)
+}
+
+/// Set by a driver that is about to re-execute itself into a replaced st binary. Every wrapper
+/// loop that sees it returns [`Detached`] with what the next image needs to adopt its provider,
+/// and leaves the provider, its terminal, and its observed record exactly as they are.
+pub static DETACH: AtomicBool = AtomicBool::new(false);
+
+/// A provider session a wrapper released for adoption by the driver's next image.
+///
+/// It travels as an error so every wrapper keeps its ordinary `Result<()>` signature: a caller
+/// that does not re-execute never sets [`DETACH`] and never sees one.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Detached {
+    pub session: DetachedSession,
+}
+
+impl std::fmt::Display for Detached {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "the provider session was released for adoption by a replacement driver"
+        )
+    }
+}
+
+impl std::error::Error for Detached {}
+
+/// What each harness hands its next driver image.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+pub enum DetachedSession {
+    /// One provider child in the wrapper's terminal process group, observed under a claimed
+    /// session incarnation: Claude, pi, and omp.
+    Provider { pid: u32, session: String, seq: u64 },
+    /// The OpenCode TUI and the loopback server it answers on.
+    OpenCode {
+        pid: u32,
+        session: String,
+        seq: u64,
+        port: u16,
+        password: String,
+        version_ok: bool,
+        producer_version: Option<String>,
+    },
+    /// The Codex TUI, its app-server process group, and the write end of the group's watchdog
+    /// pipe, which must stay open across the exec or the watchdog ends the group.
+    Codex {
+        tui_pid: u32,
+        server_pid: u32,
+        watchdog_pid: u32,
+        owner_write_fd: i32,
+        socket_path: PathBuf,
+        /// Whether the session runs in the provider-safe fallback mode it may have degraded to.
+        safe_fallback: bool,
+    },
+}
+
+impl DetachedSession {
+    /// Descriptors the next image must inherit.
+    pub fn inherited_descriptors(&self) -> Vec<i32> {
+        match self {
+            Self::Codex { owner_write_fd, .. } => vec![*owner_write_fd],
+            Self::Provider { .. } | Self::OpenCode { .. } => Vec::new(),
+        }
+    }
+}
+
+/// A provider child this wrapper spawned, or one a predecessor image spawned and this image
+/// adopted. `execve` keeps the parent relationship, so both can be reaped and signalled.
+pub(crate) enum ProviderProcess {
+    Spawned(Child),
+    Adopted { pid: u32, exit: Option<ExitStatus> },
+}
+
+impl ProviderProcess {
+    pub(crate) fn adopted(pid: u32) -> Self {
+        Self::Adopted { pid, exit: None }
+    }
+
+    pub(crate) fn id(&self) -> u32 {
+        match self {
+            Self::Spawned(child) => child.id(),
+            Self::Adopted { pid, .. } => *pid,
+        }
+    }
+
+    pub(crate) fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
+        match self {
+            Self::Spawned(child) => child.try_wait(),
+            Self::Adopted { pid, exit } => {
+                if exit.is_none() {
+                    *exit = reap(*pid, libc::WNOHANG)?;
+                }
+                Ok(*exit)
+            }
+        }
+    }
+
+    pub(crate) fn wait(&mut self) -> std::io::Result<ExitStatus> {
+        match self {
+            Self::Spawned(child) => child.wait(),
+            Self::Adopted { pid, exit } => {
+                if let Some(status) = exit {
+                    return Ok(*status);
+                }
+                let status = reap(*pid, 0)?
+                    .ok_or_else(|| std::io::Error::other("waitpid returned without a status"))?;
+                *exit = Some(status);
+                Ok(status)
+            }
+        }
+    }
+
+    pub(crate) fn kill(&mut self) -> std::io::Result<()> {
+        match self {
+            Self::Spawned(child) => child.kill(),
+            Self::Adopted { pid, exit } => {
+                if exit.is_some() {
+                    return Ok(());
+                }
+                if unsafe { libc::kill(*pid as libc::pid_t, libc::SIGKILL) } == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// Reap `pid` when it has exited. `flags` is `WNOHANG` for a poll or 0 to block.
+fn reap(pid: u32, flags: libc::c_int) -> std::io::Result<Option<ExitStatus>> {
+    let mut status = 0;
+    loop {
+        let reaped = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, flags) };
+        if reaped == -1 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if reaped == 0 {
+            return Ok(None);
+        }
+        return Ok(Some(ExitStatus::from_raw(status)));
+    }
+}
 
 extern "C" fn on_stop_signal(_signal: libc::c_int) {
     STOP.store(true, Ordering::SeqCst);
@@ -31,6 +184,12 @@ extern "C" fn on_interrupt_signal(_signal: libc::c_int) {}
 
 pub(crate) fn install_signal_handler() {
     STOP.store(false, Ordering::SeqCst);
+    install_stop_handlers();
+}
+
+/// Install the stop handlers without clearing a stop that already arrived. A re-executed driver
+/// installs them before it unblocks the signals its predecessor blocked across the exec.
+pub fn install_stop_handlers() {
     let handler = on_stop_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
     let interrupt = on_interrupt_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;
     unsafe {
@@ -54,6 +213,8 @@ pub(crate) enum ProviderOutcome {
     /// grace window. `None` means the SIGKILL escalation ran — and since that kill targets the
     /// wrapper's own group, code after it usually never runs at all.
     Stopped(Option<ExitStatus>),
+    /// [`DETACH`] released this still-running provider for adoption by the next driver image.
+    Detached(u32),
 }
 
 /// The observed-harness-state handle a wrapper threads through its poll loop. Every operation
@@ -113,6 +274,27 @@ impl SessionObserver {
             session,
             heartbeats: true,
         })
+    }
+
+    /// Resume observing a session a predecessor driver image claimed. The ownership claim is
+    /// already on disk under this token and sequence, so adopting it writes nothing.
+    pub(crate) fn adopt(
+        agent_dir: &Path,
+        identity: &str,
+        harness: &'static str,
+        pty_session: &str,
+        session: &str,
+        seq: u64,
+    ) -> Self {
+        Self {
+            agent_dir: agent_dir.to_path_buf(),
+            identity: identity.to_string(),
+            harness,
+            pty_session: pty_session.to_string(),
+            session: session.to_string(),
+            seq,
+            heartbeats: true,
+        }
     }
 
     /// An observer that records only how the session ended: `heartbeat` is a no-op because a
@@ -203,8 +385,8 @@ pub(crate) fn describe_exit(exit: ExitStatus) -> String {
 
 /// Run one interactive provider in this wrapper's terminal process group, refreshing presence on
 /// `refresh_interval` for exactly as long as the spawned child lives. Fails on a nonzero exit;
-/// wrappers that need the exit itself use [`run_provider_observed`]. With an observer, the
-/// terminal record lands on every exit path this process survives.
+/// wrappers that need the exit itself use [`run_provider_observed_with_env_removals`]. With an
+/// observer, the terminal record lands on every exit path this process survives.
 #[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_provider(
@@ -242,7 +424,7 @@ pub(crate) fn run_provider_with_env_removals(
     stop: &AtomicBool,
     observed: Option<&SessionObserver>,
 ) -> Result<()> {
-    match run_provider_observed_with_env_removals(
+    let outcome = run_provider_observed_with_env_removals(
         provider,
         status_path,
         argv,
@@ -252,7 +434,41 @@ pub(crate) fn run_provider_with_env_removals(
         poll,
         stop,
         observed,
-    )? {
+    )?;
+    finish_provider(provider, outcome, observed)
+}
+
+/// Supervise a provider a predecessor driver image spawned, exactly as the wrapper that spawned
+/// it would have: the same presence refresh, stop path, and terminal record.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn adopt_provider(
+    provider: &str,
+    status_path: &Path,
+    pid: u32,
+    refresh_interval: Duration,
+    poll: Duration,
+    stop: &AtomicBool,
+    observed: Option<&SessionObserver>,
+) -> Result<()> {
+    let outcome = supervise_provider(
+        provider,
+        status_path,
+        ProviderProcess::adopted(pid),
+        refresh_interval,
+        poll,
+        stop,
+        &DETACH,
+        observed,
+    )?;
+    finish_provider(provider, outcome, observed)
+}
+
+fn finish_provider(
+    provider: &str,
+    outcome: ProviderOutcome,
+    observed: Option<&SessionObserver>,
+) -> Result<()> {
+    match outcome {
         ProviderOutcome::Exited(exit) => {
             if let Some(observed) = observed {
                 observed.ended(&describe_exit(exit));
@@ -260,6 +476,20 @@ pub(crate) fn run_provider_with_env_removals(
             completed_provider(provider, exit)
         }
         ProviderOutcome::Stopped(_) => Ok(()),
+        ProviderOutcome::Detached(pid) => Err(detached_provider(pid, observed).into()),
+    }
+}
+
+/// The adoption record for one provider child and the session incarnation observing it.
+pub(crate) fn detached_provider(pid: u32, observed: Option<&SessionObserver>) -> Detached {
+    Detached {
+        session: DetachedSession::Provider {
+            pid,
+            session: observed
+                .map(|observed| observed.session().to_owned())
+                .unwrap_or_default(),
+            seq: observed.map(SessionObserver::seq).unwrap_or_default(),
+        },
     }
 }
 
@@ -267,6 +497,7 @@ pub(crate) fn run_provider_with_env_removals(
 /// record its own terminal observation before deciding what the exit means. The stop path still
 /// writes the observer's terminal record in-line, because after SIGKILL escalation no caller code
 /// is guaranteed to run.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn run_provider_observed(
     provider: &str,
@@ -323,7 +554,7 @@ pub(crate) fn run_provider_observed_with_env_removals(
     // The error arms are terminal outcomes too: the claim placeholder must not stand as the
     // visible state after a launch that never ran — while the ordinary nonzero-exit path keeps
     // its real exit and is deliberately not covered here.
-    let mut child = match command.spawn() {
+    let child = match command.spawn() {
         Ok(child) => child,
         Err(error) => {
             if let Some(observed) = observed {
@@ -332,10 +563,62 @@ pub(crate) fn run_provider_observed_with_env_removals(
             return Err(error).with_context(|| format!("starting {provider} provider {program}"));
         }
     };
+    supervise_provider(
+        provider,
+        status_path,
+        ProviderProcess::Spawned(child),
+        refresh_interval,
+        poll,
+        stop,
+        &DETACH,
+        observed,
+    )
+}
+
+/// [`adopt_provider`], reporting how the session ended instead of judging it.
+pub(crate) fn adopt_provider_observed(
+    provider: &str,
+    status_path: &Path,
+    pid: u32,
+    refresh_interval: Duration,
+    poll: Duration,
+    stop: &AtomicBool,
+    observed: Option<&SessionObserver>,
+) -> Result<ProviderOutcome> {
+    supervise_provider(
+        provider,
+        status_path,
+        ProviderProcess::adopted(pid),
+        refresh_interval,
+        poll,
+        stop,
+        &DETACH,
+        observed,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn supervise_provider(
+    provider: &str,
+    status_path: &Path,
+    mut child: ProviderProcess,
+    refresh_interval: Duration,
+    poll: Duration,
+    stop: &AtomicBool,
+    detach: &AtomicBool,
+    observed: Option<&SessionObserver>,
+) -> Result<ProviderOutcome> {
     let mut next_refresh = Instant::now();
     loop {
         if stop.load(Ordering::SeqCst) {
             return stop_provider_group(&mut child, observed).map(ProviderOutcome::Stopped);
+        }
+        if detach.load(Ordering::SeqCst) {
+            // A provider that exited at the same moment is reported as the exit it was.
+            if let Some(exit) = child.try_wait().ok().flatten() {
+                return Ok(ProviderOutcome::Exited(exit));
+            }
+            return Ok(ProviderOutcome::Detached(child.id()));
         }
         match child.try_wait() {
             Ok(Some(exit)) => return Ok(ProviderOutcome::Exited(exit)),
@@ -378,7 +661,7 @@ pub(crate) fn completed_provider(provider: &str, exit: ExitStatus) -> Result<()>
 }
 
 pub(crate) fn stop_provider_group(
-    child: &mut Child,
+    child: &mut ProviderProcess,
     observed: Option<&SessionObserver>,
 ) -> Result<Option<ExitStatus>> {
     let process_group = unsafe { libc::getpgrp() };
@@ -476,6 +759,140 @@ mod tests {
         let stopped = ExitStatus::from_raw(0x7f);
         assert_eq!((stopped.code(), stopped.signal()), (None, None));
     }
+    fn spawn_sleeper(seconds: &str) -> u32 {
+        // Dropping the handle neither kills nor reaps the child, exactly like a predecessor image
+        // that re-executed: the PID stays this process's child.
+        Command::new("sleep").arg(seconds).spawn().unwrap().id()
+    }
+
+    #[test]
+    fn an_adopted_provider_is_supervised_to_its_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid = spawn_sleeper("0.2");
+        let outcome = supervise_provider(
+            "test",
+            &crate::status::status_path(tmp.path()),
+            ProviderProcess::adopted(pid),
+            Duration::from_millis(20),
+            Duration::from_millis(5),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            None,
+        )
+        .unwrap();
+        match outcome {
+            ProviderOutcome::Exited(exit) => assert!(exit.success(), "{exit:?}"),
+            other => panic!("expected an exit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn detaching_releases_a_live_provider_with_its_observed_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let observer =
+            SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker").unwrap();
+        let pid = spawn_sleeper("30");
+        let outcome = supervise_provider(
+            "test",
+            &crate::status::status_path(tmp.path()),
+            ProviderProcess::adopted(pid),
+            Duration::from_secs(60),
+            Duration::from_millis(5),
+            &AtomicBool::new(false),
+            &AtomicBool::new(true),
+            Some(&observer),
+        )
+        .unwrap();
+        assert_eq!(outcome, ProviderOutcome::Detached(pid));
+        assert_eq!(
+            unsafe { libc::kill(pid as libc::pid_t, 0) },
+            0,
+            "the provider must survive"
+        );
+        let error = anyhow::Error::from(detached_provider(pid, Some(&observer)))
+            .context("running interactive Claude driver");
+        let detached = error
+            .downcast_ref::<Detached>()
+            .expect("a detached session");
+        assert_eq!(
+            detached.session,
+            DetachedSession::Provider {
+                pid,
+                session: observer.session().to_owned(),
+                seq: observer.seq(),
+            }
+        );
+        // The next image adopts the same child and sees its real end.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        let adopted = SessionObserver::adopt(
+            tmp.path(),
+            "hetz.worker",
+            "claude",
+            "hetz.worker",
+            observer.session(),
+            observer.seq(),
+        );
+        let outcome = supervise_provider(
+            "test",
+            &crate::status::status_path(tmp.path()),
+            ProviderProcess::adopted(pid),
+            Duration::from_secs(60),
+            Duration::from_millis(5),
+            &AtomicBool::new(false),
+            &AtomicBool::new(false),
+            Some(&adopted),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome,
+            ProviderOutcome::Exited(ExitStatus::from_raw(libc::SIGKILL))
+        );
+    }
+
+    #[test]
+    fn a_detached_session_round_trips_through_resume_state() {
+        for session in [
+            DetachedSession::Provider {
+                pid: 7,
+                session: "token".into(),
+                seq: 3,
+            },
+            DetachedSession::OpenCode {
+                pid: 7,
+                session: "token".into(),
+                seq: 3,
+                port: 4096,
+                password: "secret".into(),
+                version_ok: true,
+                producer_version: Some("1.18.19".into()),
+            },
+            DetachedSession::Codex {
+                tui_pid: 7,
+                server_pid: 8,
+                watchdog_pid: 9,
+                owner_write_fd: 11,
+                socket_path: "/tmp/app-server.sock".into(),
+                safe_fallback: false,
+            },
+        ] {
+            let json = serde_json::to_string(&session).unwrap();
+            let back: DetachedSession = serde_json::from_str(&json).unwrap();
+            assert_eq!(back, session);
+        }
+        assert_eq!(
+            DetachedSession::Codex {
+                tui_pid: 7,
+                server_pid: 8,
+                watchdog_pid: 9,
+                owner_write_fd: 11,
+                socket_path: "/tmp/app-server.sock".into(),
+                safe_fallback: false,
+            }
+            .inherited_descriptors(),
+            [11]
+        );
+    }
+
     #[test]
     fn an_explicit_session_incarnation_is_claimed_exactly() {
         let tmp = tempfile::tempdir().unwrap();

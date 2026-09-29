@@ -36,8 +36,8 @@ use crate::model::{
     GateResultRequest, HumanReviewView, IntentInput, LaunchApproveAndStartRequest,
     LaunchApproveAndStartView, LaunchDecisionAnswerRequest, LaunchDecisionOption,
     LaunchDecisionRequest, LaunchDecisionResponse, LaunchDecisionType, LaunchStartRequest,
-    MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendRequest, MessageView,
-    MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
+    LocalTerminal, MAX_EVAL_TIMEOUT_MS, MessageLifecycleRequest, MessagePage, MessageSendRequest,
+    MessageView, MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
     MissionRevisionRequest, MissionRunRequest, MissionRunView, OperationalRepairApplyRequest,
     OperationalRepairPlan, OperationalRepairResult, PlannerSpec, PlanningApprovalRequest,
     PlanningCancelRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
@@ -53,6 +53,7 @@ use crate::model::{
 use crate::store::Store;
 
 mod client_v0;
+mod delivery_presence;
 mod terminal_view;
 
 #[derive(Clone)]
@@ -240,6 +241,7 @@ impl IntoResponse for ApiError {
 }
 
 pub fn router(state: AppState) -> Router {
+    delivery_presence::start();
     router_for_transport(state, ClientTransportBoundary::Unix)
 }
 
@@ -437,6 +439,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/internal/replication/peer-failure",
             post(replication_peer_failure),
         )
+        .route(
+            "/v1/internal/replication/checkpoint",
+            post(replication_checkpoint_manifest),
+        )
         .route("/v1/internal/fleet/membership", get(fleet_membership_view))
         .route("/v1/internal/fleet/status", get(fleet_status))
         .route(
@@ -502,6 +508,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/sessions/screen/{*subject}", get(screen_session))
         .route("/v1/sessions/attach/{*subject}", post(attach_session))
         .route("/v1/sessions/{subject}/attach", post(attach_session))
+        .route(
+            "/v1/sessions/local-terminal/{*subject}",
+            get(local_terminal),
+        )
         .route("/v1/sessions/terminal/{*subject}", get(terminal_session))
         .route(
             "/v1/hosts/{host}/agent-workspace",
@@ -533,6 +543,22 @@ async fn response_envelope(
 ) -> Response {
     let started = Instant::now();
     let request_path = request.uri().path().to_owned();
+    // Keep these small control-plane reads out of the pool used by potentially
+    // long client projections and history queries. In particular, authentication
+    // and snapshot admission must use the same reserved lane as the handler.
+    let read_class = if request.method() == axum::http::Method::GET
+        && (request_path == "/v1/status"
+            || request_path == "/v1/client/agents"
+            || request_path.starts_with("/v1/client/agents/"))
+    {
+        crate::store::ReadClass::Critical
+    } else if request.method() == axum::http::Method::GET
+        && request_path == "/v1/client/machines"
+    {
+        crate::store::ReadClass::Operational
+    } else {
+        crate::store::ReadClass::Interactive
+    };
     let request_route = request
         .extensions()
         .get::<axum::extract::MatchedPath>()
@@ -572,7 +598,7 @@ async fn response_envelope(
         let auth_state = state.clone();
         let transport = transport.as_str();
         let admitted = tokio::task::spawn_blocking(move || {
-            crate::store::with_interactive_reads(|| {
+            crate::store::with_read_class(read_class, || {
                 let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
                 let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
                 (authentication, snapshot)
@@ -601,7 +627,7 @@ async fn response_envelope(
         (None, Ok(_)) => {
             let runtime = tokio::runtime::Handle::current();
             match tokio::task::spawn_blocking(move || {
-                crate::store::with_interactive_reads(|| runtime.block_on(next.run(request)))
+                crate::store::with_read_class(read_class, || runtime.block_on(next.run(request)))
             })
             .await
             {
@@ -884,6 +910,8 @@ fn client_error_code(code: Option<&str>) -> String {
         | "invalid-lane-anchor"
         | "invalid-lane-state"
         | "invalid-lane-change" => "validation-failed".into(),
+        // A retry of a request whose claim a checkpoint dropped cannot be answered again.
+        "claim-checkpointed" => "idempotency-conflict".into(),
         _ => "internal".into(),
     }
 }
@@ -1480,12 +1508,46 @@ fn client_agent_resources(
     let mut items = store.cached_agent_resources(snapshot_index, history, || {
         client_agent_resources_uncached(store, history, snapshot_index)
     })?;
+    let local_host = client_host_id(store.origin());
     for item in &mut items {
         if item.get("updated_at").and_then(Value::as_str) == Some("") {
             item["updated_at"] = Value::String(at.to_owned());
         }
+        overlay_delivery_presence(item, &local_host);
     }
     Ok(items)
+}
+
+/// Graph state says whether a harness took its ready turn; only this daemon can say whether the
+/// process that carries the seat's messages is still polling and runs its binary. A running local
+/// native seat with a stale delivery path is `waiting`, with the reason, rather than `running`.
+fn overlay_delivery_presence(item: &mut Value, local_host: &str) {
+    const NATIVE_DRIVERS: [&str; 5] = ["claude", "codex", "opencode", "pi", "omp"];
+    let Some(driver) = item
+        .get("driver")
+        .and_then(Value::as_str)
+        .filter(|driver| NATIVE_DRIVERS.contains(driver))
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let local = item.get("host_id").and_then(Value::as_str) == Some(local_host);
+    let takes_work = item.get("state").and_then(Value::as_str) == Some("running")
+        && matches!(
+            item.get("harness_state").and_then(Value::as_str),
+            Some("ready" | "working" | "idle")
+        );
+    if !local || !takes_work {
+        return;
+    }
+    let Some(recipient) = item.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let assessment = delivery_presence::assess(recipient, &driver);
+    if assessment.stale() {
+        item["state"] = Value::String("waiting".into());
+    }
+    item["delivery"] = assessment.to_value();
 }
 
 fn client_agent_resources_uncached(
@@ -3494,7 +3556,12 @@ where
     T: Send + 'static,
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || crate::store::with_interactive_reads(operation))
+    let read_class = match crate::store::read_class() {
+        crate::store::ReadClass::Critical => crate::store::ReadClass::Critical,
+        crate::store::ReadClass::Operational => crate::store::ReadClass::Operational,
+        _ => crate::store::ReadClass::Interactive,
+    };
+    tokio::task::spawn_blocking(move || crate::store::with_read_class(read_class, operation))
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::internal)
@@ -3505,7 +3572,12 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, St3Error> + Send + 'static,
 {
-    tokio::task::spawn_blocking(move || crate::store::with_interactive_reads(operation))
+    let read_class = match crate::store::read_class() {
+        crate::store::ReadClass::Critical => crate::store::ReadClass::Critical,
+        crate::store::ReadClass::Operational => crate::store::ReadClass::Operational,
+        _ => crate::store::ReadClass::Interactive,
+    };
+    tokio::task::spawn_blocking(move || crate::store::with_read_class(read_class, operation))
         .await
         .map_err(ApiError::internal)?
         .map_err(ApiError::bad)
@@ -4484,6 +4556,17 @@ async fn replication_export(
     .await
 }
 
+/// One page of a checkpoint's manifest, for the replication worker to answer a peer with.
+async fn replication_checkpoint_manifest(
+    State(state): State<AppState>,
+    Json(request): Json<crate::store::CheckpointManifestRequest>,
+) -> Result<Json<crate::store::CheckpointManifestPage>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.checkpoint_manifest_page(&request))
+        .await
+        .map(Json)
+}
+
 async fn replication_receive(
     State(state): State<AppState>,
     Json(request): Json<ReplicationReceiveRequest>,
@@ -4989,6 +5072,7 @@ async fn refuse_while_leaving(
                 | "/v1/internal/replication/export"
                 | "/v1/internal/replication/receive"
                 | "/v1/internal/replication/peer-failure"
+                | "/v1/internal/replication/checkpoint"
                 | "/v1/internal/replication-wake"
         );
     if mutating && !allowed && state.store.fleet_leaving().unwrap_or(false) {
@@ -7503,6 +7587,8 @@ struct MessagesPageQuery {
     include_closed: bool,
     cursor: Option<String>,
     limit: Option<usize>,
+    /// A seat delivery process's report; see [`delivery_presence`].
+    delivery: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -7520,6 +7606,9 @@ async fn list_messages_page(
 ) -> Result<Json<MessagePage>, ApiError> {
     let limit = query.limit.unwrap_or(100).clamp(1, 200);
     let to = query.to.as_deref().map(normalize_message_party);
+    if let (Some(to), Some(report)) = (to.as_deref(), query.delivery.as_deref()) {
+        delivery_presence::record(to, report);
+    }
     let cursor = query
         .cursor
         .as_deref()
@@ -9814,10 +9903,19 @@ async fn attach_session(
             "terminal attachment requires a terminal session",
         )));
     }
-    let (capability, expires_at_unix_ms) = state
-        .store
-        .issue_capability("terminal", &subject, Some(&session.incarnation_id), 30_000)
-        .map_err(ApiError::internal)?;
+    // Issuing a capability waits for the store writer, which a reconcile pass can hold for
+    // seconds; the wait must not hold a runtime worker.
+    let store = state.store.clone();
+    let (capability_subject, incarnation_id) = (subject.clone(), session.incarnation_id.clone());
+    let (capability, expires_at_unix_ms) = blocking_store(move || {
+        store.issue_capability(
+            "terminal",
+            &capability_subject,
+            Some(&incarnation_id),
+            30_000,
+        )
+    })
+    .await?;
     Ok(Json(Attachment {
         websocket_path: format!(
             "/v1/sessions/terminal/{}?capability={}",
@@ -9829,6 +9927,35 @@ async fn attach_session(
         incarnation_id: Some(session.incarnation_id),
         capability,
         expires_at_unix_ms,
+    }))
+}
+
+/// Name the PTY session of a running terminal on this host, so `st terminals attach` can connect
+/// to it directly. It checks what an attachment checks but issues no capability: it only reads,
+/// so it answers while a busy reconciler holds the writer, and the attach never waits for this
+/// daemon again. The caller proves the incarnation against the PTY itself before attaching.
+async fn local_terminal(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+) -> Result<Json<LocalTerminal>, ApiError> {
+    // A read can still wait on a saturated disk; it must not hold a runtime worker meanwhile.
+    let (lookup, lookup_subject) = (state.clone(), subject.clone());
+    let session = tokio::task::spawn_blocking(move || live_session(&lookup, &lookup_subject, None))
+        .await
+        .map_err(ApiError::internal)??;
+    if !session.terminal {
+        return Err(ApiError::bad(St3Error::new(
+            "unsupported-capability",
+            "terminal attachment requires a terminal session",
+        )));
+    }
+    // An isolated daemon may run with a relative PTY root; the client resolves nothing itself.
+    let pty_root = std::path::absolute(&state.pty_root).map_err(ApiError::internal)?;
+    Ok(Json(LocalTerminal {
+        subject,
+        runtime_id: session.runtime_id,
+        incarnation_id: session.incarnation_id,
+        pty_root,
     }))
 }
 
@@ -9943,11 +10070,10 @@ async fn post_gate_result(
         .validate_claim_input(&input)
         .map_err(ApiError::bad)?;
     for evidence in &input.evidence {
-        if state
+        if !state
             .store
-            .claim_by_id(evidence)
+            .evidence_exists(evidence)
             .map_err(ApiError::internal)?
-            .is_none()
         {
             return Err(ApiError::bad(St3Error::new(
                 "missing-evidence",
@@ -10001,10 +10127,9 @@ async fn terminal_session(
     AxumPath(subject): AxumPath<String>,
     Query(query): Query<TerminalQuery>,
 ) -> Result<Response, ApiError> {
-    let capability = state
-        .store
-        .consume_capability(&query.capability, "terminal")
-        .map_err(ApiError::bad)?;
+    let store = state.store.clone();
+    let secret = query.capability;
+    let capability = blocking_action(move || store.consume_capability(&secret, "terminal")).await?;
     if capability.used || capability.subject != subject {
         return Err(ApiError::bad(St3Error::new(
             "invalid-capability",
@@ -10632,6 +10757,50 @@ mod tests {
         assert!(!status.is_success());
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn control_reads_answer_during_a_long_write_and_busy_query_pool() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        // A disk-backed store uses WAL like the daemon. Shared-cache memory stores
+        // deliberately make readers wait for an uncommitted writer.
+        state.store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), "node").unwrap());
+        let store = state.store.clone();
+        let (read_ready_tx, read_ready_rx) = std::sync::mpsc::channel();
+        let read_holder = std::thread::spawn(move || {
+            store.hold_interactive_read_connections_for_test(|| {
+                read_ready_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(30));
+            });
+        });
+        read_ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let store = state.store.clone();
+        let (write_ready_tx, write_ready_rx) = std::sync::mpsc::channel();
+        let write_holder = std::thread::spawn(move || {
+            store.hold_write_transaction_for_test(|| {
+                write_ready_tx.send(()).unwrap();
+                std::thread::sleep(Duration::from_secs(30));
+            });
+        });
+        write_ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+
+        let app = router(state);
+        for path in ["/v1/status", "/v1/client/agents", "/v1/client/machines"] {
+            let started = Instant::now();
+            let response =
+                tokio::time::timeout(Duration::from_millis(100), get_request(app.clone(), path))
+                    .await;
+            assert!(
+                response.is_ok(),
+                "{path} waited {:?} behind a long write or query",
+                started.elapsed()
+            );
+            assert_eq!(response.unwrap().0, StatusCode::OK);
+        }
+        read_holder.join().unwrap();
+        write_holder.join().unwrap();
+    }
+
     #[test]
     fn health_response_does_not_queue_for_a_blocking_thread() {
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -10949,6 +11118,127 @@ mod tests {
         assert_eq!(second["items"][0]["name"], "doc/late/target");
         assert_ne!(first["items"][0]["hash"], second["items"][0]["hash"]);
         assert_eq!(second["has_more"], false);
+    }
+
+    fn observe_terminal(store: &Store, subject: &str, incarnation: &str, terminal: bool) {
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("runtime_id".into(), Value::String("worker-runtime".into())),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ("status".into(), Value::String("running".into())),
+                    ("terminal".into(), Value::Bool(terminal)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+
+    /// Hetz, 2026-09-29: under CI load an attach waited behind the store writer until its
+    /// WebSocket handshake gave up. Naming a local terminal must not wait for the writer.
+    #[tokio::test]
+    async fn a_local_terminal_is_named_by_reads_alone_while_the_writer_is_busy() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        // An isolated daemon may be started with a relative PTY root.
+        state.pty_root = PathBuf::from("isolated/pty");
+        observe_terminal(
+            &state.store,
+            "agent/worker",
+            "4242:2026-09-29T08:00:00.000Z",
+            true,
+        );
+        let store = state.store.clone();
+        let index = store.index().unwrap();
+        let app = router(state);
+        let (held, holding) = std::sync::mpsc::channel();
+        let holder_store = store.clone();
+        let holder = std::thread::spawn(move || {
+            holder_store.hold_writer_for_test(|| {
+                held.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(1_500));
+            });
+        });
+        holding.recv().unwrap();
+
+        let started = std::time::Instant::now();
+        let (status, terminal) = get_request(app, "/v1/sessions/local-terminal/agent/worker").await;
+        let elapsed = started.elapsed();
+        holder.join().unwrap();
+
+        assert_eq!(status, StatusCode::OK, "{terminal}");
+        assert!(
+            elapsed < Duration::from_millis(750),
+            "naming a local terminal waited {elapsed:?} for the writer"
+        );
+        assert_eq!(terminal["subject"], "agent/worker");
+        assert_eq!(terminal["runtime_id"], "worker-runtime");
+        assert_eq!(terminal["incarnation_id"], "4242:2026-09-29T08:00:00.000Z");
+        assert_eq!(
+            terminal["pty_root"],
+            std::env::current_dir()
+                .unwrap()
+                .join("isolated/pty")
+                .display()
+                .to_string()
+        );
+        assert_eq!(store.index().unwrap(), index, "it must write nothing");
+    }
+
+    #[tokio::test]
+    async fn a_local_terminal_keeps_the_attachment_checks() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        observe_terminal(
+            &state.store,
+            "agent/headless",
+            "1:2026-09-29T08:00:00.000Z",
+            false,
+        );
+        let owner = Store::open_memory("owner-node").unwrap();
+        observe_terminal(&owner, "agent/remote", "2:2026-09-29T08:00:00.000Z", true);
+        state
+            .store
+            .import_replication("owner-node", &owner.export_replication(0).unwrap())
+            .unwrap();
+        observe_terminal(
+            &state.store,
+            "agent/local",
+            "3:2026-09-29T08:00:00.000Z",
+            true,
+        );
+        // A paired client never learns a PTY path: the gateway serves only client v0.
+        let (status, refused) = get_request(
+            fabric_router(state.clone()),
+            "/v1/sessions/local-terminal/agent/local",
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{refused}");
+        let app = router(state);
+
+        let (status, refused) =
+            get_request(app.clone(), "/v1/sessions/local-terminal/agent/headless").await;
+        assert!(status.is_client_error(), "{refused}");
+        assert_eq!(refused["code"], "unsupported-capability");
+
+        let (status, refused) =
+            get_request(app.clone(), "/v1/sessions/local-terminal/agent/remote").await;
+        assert!(status.is_client_error(), "{refused}");
+        assert_eq!(refused["code"], "runtime-not-local");
+
+        // An unknown subject is refused exactly as its WebSocket attachment is.
+        let (status, refused) =
+            get_request(app.clone(), "/v1/sessions/local-terminal/agent/missing").await;
+        let (attach_status, attach_refused) =
+            json_request(app, "/v1/sessions/attach/agent/missing", json!({})).await;
+        assert!(status.is_client_error(), "{refused}");
+        assert_eq!(status, attach_status);
+        assert_eq!(refused["code"], attach_refused["code"], "{refused}");
     }
 
     #[tokio::test]
