@@ -5,7 +5,8 @@
 Small Talk runs pull request and main branch CI on our own Linux and macOS machines through
 `st`. The `st/ci` commit status reports the Linux debug workspace tests and Clippy;
 `st/ci-macos` reports the same checks on macOS. GitHub Actions handles tags and forked
-pull requests. See [CI operations](docs/ci.md) to inspect a failing run.
+pull requests. A ready pull request merges through the merge train: `st lanes join smalltalk
+NUMBER`. See [CI operations](docs/ci.md) for the train and to inspect a failing run.
 
 Small Talk (`st`) runs coding agents as durable seats and hands them work as missions. The graph
 records every seat, mission, step, message, and decision, so the state of your agents survives
