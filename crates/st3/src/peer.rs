@@ -748,7 +748,12 @@ impl PeerBackend {
                     store.record_replication_round_trip(round_trip);
                 }
                 let receipt = store
-                    .receive_replication_exchange(peer, fleet_id, exchange)
+                    .receive_replication_exchange_asking(
+                        peer,
+                        fleet_id,
+                        exchange,
+                        round_trip.is_some(),
+                    )
                     .map_err(anyhow::Error::msg)?;
                 store.record_transport_observation(peer, "up", None, None)?;
                 let admission = store.validate_replication_backlog()?;

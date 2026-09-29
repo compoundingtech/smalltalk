@@ -517,6 +517,16 @@ async fn invite_and_join_sync_full_history() {
     }
 
     let b = joined(root.path(), &a, "b", &[]).await;
+    // A newcomer's first sync ends by checking that it projects its sponsor's graph.
+    let waited = b.st_ok(&["fleet", "wait", "--timeout", "90s"]);
+    assert!(waited.contains("first sync verified"), "{waited}");
+    let first = b.st_json(&["replication", "status"])["first_sync"].clone();
+    assert_eq!(first["state"], "verified", "{first}");
+    assert_eq!(first["healed"], false, "{first}");
+    assert_eq!(
+        first["graph_digest"], first["peer_graph_digest"],
+        "{first}"
+    );
     wait_for_notes(&b, &expected, 60, &[&a, &b]).await;
     b.wait_listening().await;
     b.note("b-0").await;
@@ -582,10 +592,11 @@ fn peer_sync(node: &Node, peer: &str) -> Value {
 /// Two members can hold the same envelopes and still project different graphs, as when one of
 /// them lost claims it had admitted. No exchange fixes that, so neither may call the pair in
 /// sync: replication status says diverged, doctor fails, and every client page carries it.
+/// Then they heal: they find the claims one lacks and admit their envelopes again.
 #[tokio::test(flavor = "multi_thread")]
-async fn members_with_the_same_envelopes_but_different_claims_report_divergence() {
+async fn members_with_the_same_envelopes_but_different_claims_report_divergence_and_heal() {
     let root = tempfile::tempdir().unwrap();
-    let a = anchor(root.path(), "a").await;
+    let mut a = anchor(root.path(), "a").await;
     let mut b = joined(root.path(), &a, "b", &[]).await;
     let mission = root.path().join("probe.kdl");
     fs::write(
@@ -616,6 +627,13 @@ async fn members_with_the_same_envelopes_but_different_claims_report_divergence(
         },
     )
     .await;
+
+    let in_sync_graph = a.st_json(&["replication", "status"])["graph_digest"].clone();
+    // Heals wait while the divergence is inspected.
+    let hold = ("ST3_REPLICATION_HEAL_AFTER_MS".to_owned(), "3600000".to_owned());
+    a.env.push(hold.clone());
+    a.restart().await;
+    b.env.push(hold);
 
     // B loses the mission's claims but keeps their envelopes, so both inventories still match.
     b.stop();
@@ -682,6 +700,61 @@ async fn members_with_the_same_envelopes_but_different_claims_report_divergence(
             )),
             "{machines}"
         );
+    }
+
+    // Without the hold, the members heal soon after they find the graphs different.
+    for node in [&mut a, &mut b] {
+        node.env = vec![(
+            "ST3_REPLICATION_HEAL_AFTER_MS".to_owned(),
+            "1000".to_owned(),
+        )];
+        node.restart().await;
+    }
+    wait_until("the members heal", 120, || async {
+        a.st_json(&["replication", "status"])["graph_digest"]
+            == b.st_json(&["replication", "status"])["graph_digest"]
+            && [(&a, "b"), (&b, "a")]
+                .iter()
+                .all(|(node, peer)| peer_sync(node, peer)["diverged"] != true)
+    })
+    .await;
+    assert_eq!(
+        b.st_json(&["replication", "status"])["graph_digest"],
+        in_sync_graph,
+        "b projects the graph both showed before it lost the claims"
+    );
+    let heals = [(&a, "b"), (&b, "a")]
+        .iter()
+        .filter_map(|(node, peer)| {
+            let heal = peer_sync(node, peer)["heal"].clone();
+            (!heal.is_null()).then_some((node.name.clone(), heal))
+        })
+        .collect::<Vec<_>>();
+    assert!(
+        heals
+            .iter()
+            .any(|(_, heal)| heal["healed"] == true
+                && heal["refetched"].as_u64().unwrap_or(0) + heal["pushed"].as_u64().unwrap_or(0) > 0),
+        "{heals:?}"
+    );
+    let restored = b
+        .claims()
+        .await
+        .into_iter()
+        .filter(|claim| claim["subject"].as_str().unwrap_or("").contains("divergence-probe"))
+        .count();
+    assert!(restored > 0, "b admitted the mission's claims again");
+    for node in [&a, &b] {
+        let doctor = node.st(&["--json", "doctor"]);
+        let report: Value = serde_json::from_slice(&doctor.stdout).unwrap();
+        let check = report["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "replication")
+            .cloned()
+            .unwrap();
+        assert_ne!(check["status"], "fail", "{check}");
     }
 }
 

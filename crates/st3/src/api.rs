@@ -4526,10 +4526,12 @@ async fn replication_receive(
         if let Some(round_trip_ms) = request.round_trip_ms {
             store.record_replication_round_trip(Duration::from_millis(round_trip_ms));
         }
-        let receipt = store.receive_replication_exchange(
+        // Only the worker's own requests carry a round trip, and only they heal.
+        let receipt = store.receive_replication_exchange_asking(
             &request.peer,
             &request.fleet_id,
             &request.exchange,
+            request.round_trip_ms.is_some(),
         )?;
         if store
             .observes_transport_to(&request.peer)

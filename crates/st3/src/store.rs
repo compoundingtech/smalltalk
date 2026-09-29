@@ -12162,6 +12162,19 @@ impl Store {
         fleet_id: &str,
         input: &ReplicationExchange,
     ) -> Result<ReplicationReceipt, St3Error> {
+        self.receive_replication_exchange_asking(relay, fleet_id, input, false)
+    }
+
+    /// Receive an exchange. `asks` says the exchange answers this node's own request, so the
+    /// worker that made it heals with the peer when the receipt says so; an exchange the peer
+    /// started leaves the heal to this node's own requests.
+    pub fn receive_replication_exchange_asking(
+        &self,
+        relay: &str,
+        fleet_id: &str,
+        input: &ReplicationExchange,
+        asks: bool,
+    ) -> Result<ReplicationReceipt, St3Error> {
         if input.peer != relay {
             return Err(St3Error::new(
                 "peer-label-mismatch",
@@ -12296,7 +12309,7 @@ impl Store {
         let heal = match graph_equal {
             Some(equal) => {
                 progress.compare_graphs(equal, now);
-                progress.heal_due(now, first_sync_differs)
+                asks && progress.heal_due(now, first_sync_differs)
             }
             None => false,
         };
@@ -32873,7 +32886,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
 
         let summary = source.export_replication_summary(TEST_FLEET).unwrap();
         let receipt = newcomer
-            .receive_replication_exchange("source", TEST_FLEET, &summary)
+            .receive_replication_exchange_asking("source", TEST_FLEET, &summary, true)
             .unwrap();
 
         assert!(!receipt.heal);
@@ -32894,12 +32907,13 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         let (source, newcomer, _) = synced_takeover_pair();
         newcomer.begin_first_sync("source").unwrap();
         misproject_a_step(&newcomer);
+        let summary = source.export_replication_summary(TEST_FLEET).unwrap();
+        let inbound = newcomer
+            .receive_replication_exchange("source", TEST_FLEET, &summary)
+            .unwrap();
+        assert!(!inbound.heal, "an exchange the peer started leaves the heal to this node");
         let receipt = newcomer
-            .receive_replication_exchange(
-                "source",
-                TEST_FLEET,
-                &source.export_replication_summary(TEST_FLEET).unwrap(),
-            )
+            .receive_replication_exchange_asking("source", TEST_FLEET, &summary, true)
             .unwrap();
         assert!(receipt.heal, "the end of a first sync does not wait to diverge");
         let report = heal_between(&newcomer, "newcomer", &source, "source");
@@ -32915,7 +32929,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         let mut summary = source.export_replication_summary(TEST_FLEET).unwrap();
         summary.graph_digest = unmatched.clone();
         let receipt = newcomer
-            .receive_replication_exchange("source", TEST_FLEET, &summary)
+            .receive_replication_exchange_asking("source", TEST_FLEET, &summary, true)
             .unwrap();
         assert!(receipt.heal);
         let report = heal_between_through(&newcomer, "source", |query| {
