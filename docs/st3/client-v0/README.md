@@ -381,16 +381,19 @@ offers the same bounded change read for clients that cannot open WebSockets.
 
 Terminal access is a client protocol, not raw PTY ownership. The server sends screens, never PTY
 bytes: each screen is complete and replaces every earlier one, so nothing is replayed and a client
-that falls behind skips to the latest screen. Interactive attach from a terminal (`pty attach`,
-`st terminals attach`) is a different, privileged path that passes raw bytes. For a terminal on the
-same host, `st terminals attach` reads the PTY session from the local daemon
+that falls behind skips to the latest screen. Interactive attach from a terminal on the owning host
+(`pty attach`, `st terminals attach`) is a different, privileged path that passes raw bytes. On that
+host, `st terminals attach` reads the PTY session from the local daemon
 (`GET /v1/sessions/local-terminal/{subject}`, which writes nothing) and connects to that session
 itself. Before it sends a byte, the socket's kernel-reported peer and the PTY record must match the
-runtime incarnation. Only a terminal reached through an HTTP endpoint uses the daemon's WebSocket
-bridge, with a single-use capability. The Fabric-loopback gateway refuses the local-terminal route,
-as it refuses every route outside `/v1/client/`. When the local daemon does not answer, the CLI does
-not attach: it lists the subject's running PTY sessions from the registry so a person can run
-`pty attach --no-restart` on one.
+runtime incarnation. Through an HTTP endpoint, or with a daemon that lacks that route, it uses the
+daemon's WebSocket bridge with a single-use capability. The Fabric-loopback gateway refuses the
+local-terminal route, as it refuses every route outside `/v1/client/`. When the local daemon does
+not answer, the CLI does not attach: it lists the subject's running PTY sessions from the registry
+so a person can run `pty attach --no-restart` on one. `st terminals attach` to a terminal on another
+fleet host uses this protocol as the configured person: it paints each screen into the local
+terminal and sends keystrokes and size changes as `terminal.input` (raw mode) and `terminal.resize`
+actions.
 
 `terminal.attach` returns a short-lived, single-use stream capability and URL bound to the
 authenticated session, terminal, and runtime incarnation; `terminal.detach` idempotently invalidates

@@ -129,6 +129,25 @@ Lists show current state. Add `--all` for history. Every command has `--help`, a
 `--json` flag prints the stable client format that the apps read. Run `stui` for the same views
 in a terminal app.
 
+## Start an agent
+
+One command declares a seat on any fleet machine, waits until its harness is ready, and attaches
+this terminal to it:
+
+```sh
+st agents new site --host builder --harness claude --model claude-opus-5-5 --attach
+```
+
+It writes the same declaration a person writes by hand, with the harness defaults of the fleet's
+Claude and Codex seats, and applies it as the `person` in your st config (or `--as`). Without
+`--workspace`, the agent gets a new directory below that host's home, `~/st/agents/site`, which the
+host creates. The command prints the agent's subject, here `agent/builder.site`. `--print-kdl` shows
+the declaration without applying it, and `--description` says what the agent is for.
+
+Ctrl+\\ detaches and leaves the agent running. `st terminals attach agent/builder.site` attaches
+again later, from any machine in the fleet: a terminal on another host goes through the client
+gateway as your person, the same path the apps use.
+
 ## Declare a seat
 
 A seat is a durable agent: a harness, a model, and a workspace, kept running by st. Write its
@@ -171,9 +190,9 @@ st usage --hours 24 --by host
 
 The seat starts its harness in the workspace. Its first turn reads the generated
 `.st3/boot.md`, checks for work, and waits. `st terminals attach agent/example/worker` opens its
-terminal; Ctrl+\\ detaches without stopping it. On the seat's own host it connects straight to the
-PTY session, so a busy daemon cannot stall it. If the daemon does not answer at all, st does not
-attach and instead prints the `pty attach --no-restart` command for that session.
+terminal from any fleet machine; Ctrl+\\ detaches without stopping it. On the seat's own host it
+connects straight to the PTY session, so a busy daemon cannot stall it. If the daemon does not answer
+at all, st does not attach and instead prints the `pty attach --no-restart` command for that session.
 
 A running seat keeps its current process when you apply a changed declaration; the change takes
 effect the next time it starts. To use it now, stop the seat and apply again. `st agents stop

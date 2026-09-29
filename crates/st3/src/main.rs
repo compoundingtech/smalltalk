@@ -38,7 +38,7 @@ use st3::reconcile::Reconciler;
 use st3::store::Store;
 use st3_client::{
     API_VERSION as CLIENT_V0_API_VERSION, Client as GeneratedClient,
-    ClientError as GeneratedClientError, Envelope as ClientEnvelope,
+    ClientError as GeneratedClientError, Envelope as ClientEnvelope, ErrorCode as ClientErrorCode,
     EventPage as ClientEventPage, EventType as ClientEventType, Fence as ClientFence,
     Page as ClientPage, PairingBegin, Resource as ClientResource,
     TargetParameters as ClientTargetParameters, TerminalInputMode as ClientTerminalInputMode,
@@ -1711,8 +1711,9 @@ enum PtyCommand {
     /// Attach this terminal interactively to one running terminal member.
     ///
     /// A terminal on this host is attached through its PTY session, fenced to the incarnation st
-    /// selected, so a busy daemon cannot block it. Through an HTTP endpoint the attach goes over
-    /// the daemon's WebSocket. Attaching never starts or restarts a session.
+    /// selected, so a busy daemon cannot block it. A terminal on another fleet host is reached
+    /// through the client gateway, the path paired clients use, as the person from `--as` or the
+    /// st config. Attaching never starts or restarts a session. Detach with Ctrl+\.
     Attach(PtyAttachArgs),
     /// Read one terminal's current screen without taking control.
     Peek(PtySubjectArgs),
@@ -1788,6 +1789,10 @@ struct PtyAttachArgs {
     /// Allow an attachment from inside another PTY session.
     #[arg(long)]
     force: bool,
+    /// The person attaching to a terminal another fleet host owns; defaults to `person` in the st
+    /// config. A terminal on this host needs no person.
+    #[arg(long = "as", value_parser = parse_person_subject)]
+    person: Option<String>,
 }
 
 #[derive(Args)]
@@ -2168,6 +2173,12 @@ enum AgentsCommand {
         #[arg(long)]
         all: bool,
     },
+    /// Declare one new agent seat, start its harness, and wait until it is ready.
+    ///
+    /// The declaration is the one a person writes by hand, with the harness defaults of the
+    /// fleet's Claude and Codex seats; `--print-kdl` shows it without applying it. With
+    /// `--attach`, this terminal attaches once the harness is ready, from any fleet host.
+    New(AgentNewArgs),
     /// Preview and apply one KDL file containing durable agent seats.
     Apply(AgentApplyArgs),
     /// Start or update one durable typed-harness seat.
@@ -2350,6 +2361,43 @@ struct AgentStartArgs {
     /// Print the exact seat KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
+}
+
+#[derive(Args)]
+struct AgentNewArgs {
+    /// Stable seat identity. A slash-qualified identity is kept exactly after `agent/`; a simple
+    /// name is prefixed with its host, as in `agent/HOST.NAME`.
+    name: String,
+    /// Fleet host that runs the agent; defaults to this host.
+    #[arg(long)]
+    host: Option<String>,
+    #[arg(long, default_value = "claude", value_parser = ["claude", "codex", "pi", "omp", "opencode"])]
+    harness: String,
+    /// Model the harness runs, such as `claude-opus-5-5`; defaults to the harness's own.
+    #[arg(long)]
+    model: Option<String>,
+    /// Reasoning effort the harness runs with, such as `high`.
+    #[arg(long)]
+    effort: Option<String>,
+    /// Directory the agent works in on its host; the host creates it when it is missing. Defaults
+    /// to a new directory for the agent below that host's home, `~/st/agents/NAME`.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    /// What the agent is for.
+    #[arg(long)]
+    description: Option<String>,
+    /// Attach this terminal to the agent once its harness is ready. Detach with Ctrl+\.
+    #[arg(long, conflicts_with = "print_kdl")]
+    attach: bool,
+    /// Print the declaration without applying it.
+    #[arg(long)]
+    print_kdl: bool,
+    /// How long to wait for the harness to become ready.
+    #[arg(long, default_value = "10m")]
+    timeout: String,
+    /// Person or agent publishing the declaration; defaults to `person` in the st config.
+    #[arg(long = "as", value_parser = parse_publication_actor)]
+    actor: Option<String>,
 }
 
 #[derive(Args)]
@@ -3051,6 +3099,9 @@ fn guard_mutating_cli_actor(
             _ => None,
         },
         Command::Agents { command } => match command {
+            AgentsCommand::New(args) => Some(args.actor.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("a harness `st agents new` needs explicit --as {own}; it cannot use the configured person")
+            })?),
             AgentsCommand::Apply(args) => Some(args.actor.as_str()),
             AgentsCommand::Start(args) => Some(args.actor.as_str()),
             AgentsCommand::Stop(args) => Some(args.actor.as_str()),
@@ -4370,7 +4421,8 @@ async fn run_pty(
         }
         PtyCommand::Attach(args) => {
             let subject = normalize_member_subject(&args.subject, "pty");
-            attach_terminal(client, pty_root, &subject, args.force).await
+            let person = args.person.as_deref().or(configured_person);
+            attach_terminal(client, endpoint, pty_root, person, &subject, args.force).await
         }
         PtyCommand::Peek(args) => {
             let subject = normalize_member_subject(&args.subject, "pty");
@@ -4579,9 +4631,14 @@ fn render_terminal_screen(screen: &ClientTerminalScreen) -> String {
     output
 }
 
+/// Attach this terminal to one terminal member. A terminal on this host is attached through its
+/// PTY session; one that another fleet host owns goes through the client gateway, the path paired
+/// clients use, as `person`.
 async fn attach_terminal(
     client: &Client,
+    endpoint: &Endpoint,
     pty_root: Option<&Path>,
+    person: Option<&str>,
     subject: &str,
     force: bool,
 ) -> Result<()> {
@@ -4594,9 +4651,32 @@ async fn attach_terminal(
         );
     }
     // A terminal on this host is attached through its PTY session, so a daemon too busy to write
-    // cannot keep anyone from debugging. The WebSocket bridge is for a terminal elsewhere.
-    let local = match client.local_terminal(subject).await {
-        Ok(local) => local,
+    // cannot keep anyone from debugging.
+    let code = match client.local_terminal(subject).await {
+        Ok(Some(terminal)) => st3::client::attach_local_terminal(&terminal).await?,
+        Ok(None) => {
+            // An HTTP endpoint, or a daemon from before direct attachment: its WebSocket bridge.
+            let attached: Result<Attachment> = client
+                .post(
+                    &format!("/v1/sessions/attach/{}", urlencoding::encode(subject)),
+                    &AttachRequest::default(),
+                )
+                .await;
+            match attached {
+                Ok(attachment) => {
+                    client
+                        .proxy_terminal_resilient(subject, &attachment)
+                        .await?
+                }
+                Err(error) if st3::client::api_error_code(&error) == Some("runtime-not-local") => {
+                    attach_remote_terminal(endpoint, person, subject, error).await?
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) if st3::client::api_error_code(&error) == Some("runtime-not-local") => {
+            attach_remote_terminal(endpoint, person, subject, error).await?
+        }
         Err(error) => {
             if let Some(pty_root) = pty_root
                 && st3::client::daemon_did_not_answer(&error)
@@ -4606,24 +4686,29 @@ async fn attach_terminal(
             return Err(error);
         }
     };
-    let code = if let Some(terminal) = local {
-        st3::client::attach_local_terminal(&terminal).await?
-    } else {
-        let attachment: Attachment = client
-            .post(
-                &format!("/v1/sessions/attach/{}", urlencoding::encode(subject)),
-                &AttachRequest::default(),
-            )
-            .await?;
-        client
-            .proxy_terminal_resilient(subject, &attachment)
-            .await?
-    };
     if code == 0 {
         Ok(())
     } else {
         Err(CommandExit(code.clamp(1, 255) as u8).into())
     }
+}
+
+/// Attach to a terminal that another fleet host owns through the client gateway, as `person`.
+/// `not_local` is the local daemon's refusal, which names the owner.
+async fn attach_remote_terminal(
+    endpoint: &Endpoint,
+    person: Option<&str>,
+    subject: &str,
+    not_local: anyhow::Error,
+) -> Result<i32> {
+    let person = person.with_context(|| {
+        format!(
+            "{not_local:#}. Attaching to it from this host needs `--as person/NAME` or `person = \"person/NAME\"` in the st config"
+        )
+    })?;
+    let person = parse_person_subject(person).map_err(anyhow::Error::msg)?;
+    let gateway = generated_client(endpoint, Some(&person))?;
+    st3::remote_terminal::attach(&gateway, subject, subject).await
 }
 
 /// Without its daemon, st cannot say which incarnation of `subject` it selected, so it does not
@@ -7015,6 +7100,9 @@ async fn run_agents(
         AgentsCommand::Queue(args) => {
             run_agent_queue(endpoint, configured_person, args, json_output).await
         }
+        AgentsCommand::New(args) => {
+            run_agent_new(endpoint, configured_person, args, json_output).await
+        }
         AgentsCommand::Apply(args) => {
             let client = cli_client(endpoint);
             let (kdl, source_name) = read_intent(Some(&args.file))?;
@@ -7112,6 +7200,314 @@ fn agent_start_document(args: &AgentStartArgs) -> Result<String> {
     Ok(publication_document(agent))
 }
 
+/// The Claude settings the fleet's Claude seats run with: st's channel plugin on and the older
+/// st2 channel plugin off.
+const CLAUDE_SEAT_SETTINGS: &str =
+    r#"{"enabledPlugins":{"st2-channel@st2":false,"st3-channel@st2":true}}"#;
+
+/// The declaration `st agents new` publishes: what a person writes by hand for a fleet seat.
+/// Claude and Codex seats get the harness defaults the fleet's existing seats run with.
+fn agent_new_document(args: &AgentNewArgs, workspace: &str, create_workspace: bool) -> String {
+    let mut body = KdlDocument::new();
+    if let Some(description) = &args.description {
+        body.nodes_mut()
+            .push(kdl_node("description", [description.as_str()]));
+    }
+    if let Some(host) = &args.host {
+        body.nodes_mut().push(kdl_node("host", [host.as_str()]));
+    }
+    let mut workspace = kdl_node("workspace", [workspace]);
+    if create_workspace {
+        workspace
+            .entries_mut()
+            .push(KdlEntry::new_prop("create", true));
+    }
+    body.nodes_mut().push(workspace);
+    let arguments: &[&str] = match args.harness.as_str() {
+        "claude" => {
+            let mut environment = KdlNode::new("env");
+            let mut variables = KdlDocument::new();
+            variables
+                .nodes_mut()
+                .push(kdl_node("CLAUDE_CODE_CHILD_SESSION", ["0"]));
+            environment.set_children(variables);
+            body.nodes_mut().push(environment);
+            body.nodes_mut().push(render_node(&[
+                kdl_node("git-exclude", [".st3/", ".claude/"]),
+                kdl_node(
+                    "json-upsert",
+                    [".claude/settings.local.json", CLAUDE_SEAT_SETTINGS],
+                ),
+            ]));
+            &[
+                "--dangerously-skip-permissions",
+                "--settings",
+                CLAUDE_SEAT_SETTINGS,
+            ]
+        }
+        "codex" => {
+            body.nodes_mut()
+                .push(render_node(&[kdl_node("git-exclude", [".st3/"])]));
+            &[
+                "--dangerously-bypass-approvals-and-sandbox",
+                "--dangerously-bypass-hook-trust",
+            ]
+        }
+        _ => &[],
+    };
+    let mut harness = kdl_node("harness", [args.harness.as_str()]);
+    let mut harness_body = KdlDocument::new();
+    if let Some(model) = &args.model {
+        harness_body
+            .nodes_mut()
+            .push(kdl_node("model", [model.as_str()]));
+    }
+    if let Some(effort) = &args.effort {
+        harness_body
+            .nodes_mut()
+            .push(kdl_node("effort", [effort.as_str()]));
+    }
+    if !arguments.is_empty() {
+        harness_body
+            .nodes_mut()
+            .push(kdl_node("args", arguments.iter().copied()));
+    }
+    if !harness_body.nodes().is_empty() {
+        harness.set_children(harness_body);
+    }
+    body.nodes_mut().push(harness);
+    body.nodes_mut().push(kdl_node("restart", ["always"]));
+    let mut agent = kdl_node("agent", [args.name.as_str()]);
+    agent.set_children(body);
+    publication_document(agent)
+}
+
+fn render_node(operations: &[KdlNode]) -> KdlNode {
+    let mut render = KdlNode::new("render");
+    let mut body = KdlDocument::new();
+    body.nodes_mut().extend(operations.iter().cloned());
+    render.set_children(body);
+    render
+}
+
+async fn run_agent_new(
+    endpoint: &Endpoint,
+    configured_person: Option<&str>,
+    args: AgentNewArgs,
+    json_output: bool,
+) -> Result<()> {
+    let client = cli_client(endpoint);
+    let actor = match &args.actor {
+        Some(actor) => actor.clone(),
+        None => configured_human(None, configured_person, "agents new")?,
+    };
+    // Another host's workspace and terminal are reached as a person, like any client.
+    let person = Some(actor.as_str())
+        .filter(|actor| actor.starts_with("person/"))
+        .or(configured_person);
+    let timeout = parse_timeout(&args.timeout)?;
+    let (workspace, create_workspace) =
+        agent_new_workspace(&client, endpoint, &args, person).await?;
+    let kdl = agent_new_document(&args, &workspace, create_workspace);
+    if args.print_kdl {
+        print!("{kdl}");
+        return Ok(());
+    }
+    let source_name = format!("st agents new {}", args.name);
+    let preview: MissionResponse = client
+        .post(
+            "/v1/intent/mission",
+            &MissionRequest {
+                intent: IntentInput {
+                    kdl: kdl.clone(),
+                    source_name: Some(source_name.clone()),
+                },
+                at_index: None,
+            },
+        )
+        .await?;
+    anyhow::ensure!(
+        preview.blockers.is_empty(),
+        "{}",
+        preview.blockers.join("; ")
+    );
+    let subject = preview
+        .subject_tokens
+        .keys()
+        .find(|subject| subject.starts_with("agent/"))
+        .cloned()
+        .context("the declaration names no agent")?;
+    let gateway = generated_client(endpoint, None)?;
+    match gateway.agents_get(&subject).await {
+        Ok(existing) => {
+            if let ClientResource::Agent(agent) = existing.value
+                && agent.state != "stopped"
+            {
+                anyhow::bail!(
+                    "`{subject}` already exists and is {}; change it with `st agents apply`, or stop it with `st agents stop` first",
+                    agent.state
+                );
+            }
+        }
+        Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => {}
+        Err(error) => return Err(error.into()),
+    }
+    publish_text(&client, kdl, source_name, actor.clone()).await?;
+    if !json_output {
+        eprintln!("Declared {subject} in {workspace}; waiting for its harness.");
+    }
+    let agent = match tokio::time::timeout(
+        timeout,
+        wait_for_agent_harness(&client, &gateway, &subject, args.attach),
+    )
+    .await
+    {
+        Ok(agent) => agent?,
+        Err(_) => anyhow::bail!(
+            "`{subject}` was declared, but its harness was not ready after {}; see `st agents show {subject}`",
+            args.timeout
+        ),
+    };
+    if json_output {
+        print_value(
+            &json!({
+                "subject": subject,
+                "host_id": agent.host_id,
+                "workspace": workspace,
+                "state": agent.state,
+                "harness_state": agent.harness_state,
+            }),
+            true,
+        )?;
+    } else {
+        println!("{subject}");
+    }
+    if args.attach {
+        // The daemon has just answered for the new agent, so there is no registry fallback to name.
+        attach_terminal(&client, endpoint, None, person, &subject, false).await?;
+    }
+    Ok(())
+}
+
+/// The workspace for a new agent and whether its host creates it when it is missing. A named
+/// workspace on another host is taken as written. With none named, the agent's host names a new
+/// directory for it below its own home.
+async fn agent_new_workspace(
+    client: &Client,
+    endpoint: &Endpoint,
+    args: &AgentNewArgs,
+    person: Option<&str>,
+) -> Result<(String, bool)> {
+    let health: Value = client.get("/v1/health").await?;
+    let local = health["node"]
+        .as_str()
+        .context("the daemon health response has no node")?
+        .to_owned();
+    let host = args.host.clone().unwrap_or_else(|| local.clone());
+    if let Some(workspace) = &args.workspace {
+        if host == local {
+            if let Ok(existing) = fs::canonicalize(workspace) {
+                return Ok((existing.display().to_string(), false));
+            }
+            let workspace = std::path::absolute(workspace)
+                .with_context(|| format!("resolve workspace {}", workspace.display()))?;
+            return Ok((workspace.display().to_string(), true));
+        }
+        anyhow::ensure!(
+            workspace.is_absolute(),
+            "a workspace on {host} must be an absolute path on that host"
+        );
+        return Ok((workspace.display().to_string(), true));
+    }
+    let path = format!(
+        "/v1/hosts/{}/agent-workspace?identity={}",
+        urlencoding::encode(&host),
+        urlencoding::encode(&args.name)
+    );
+    let answer: Result<Value> = if host == local {
+        client.get(&path).await
+    } else {
+        let Endpoint::Unix(socket) = endpoint else {
+            anyhow::bail!(
+                "asking {host} for a workspace needs the local Unix endpoint; pass --workspace"
+            );
+        };
+        let person = person.with_context(|| {
+            format!(
+                "asking {host} for a new workspace needs `--as person/NAME` or `person = \"person/NAME\"` in the st config; or pass --workspace"
+            )
+        })?;
+        Client::unix_as(socket.clone(), person)?
+            .with_outage_wait(DAEMON_WAIT.get().copied().unwrap_or_default(), true)
+            .get(&path)
+            .await
+    };
+    let answer = answer.with_context(|| {
+        format!(
+            "{host} did not name a workspace for `{}`; pass --workspace",
+            args.name
+        )
+    })?;
+    let workspace = answer["workspace"]
+        .as_str()
+        .with_context(|| format!("{host} returned no workspace"))?;
+    Ok((workspace.to_owned(), true))
+}
+
+/// Wait until the agent's current harness is ready. A harness that waits on a person, such as at
+/// a login prompt, is ready enough to attach to, so `attach` accepts it.
+async fn wait_for_agent_harness(
+    client: &Client,
+    gateway: &GeneratedClient,
+    subject: &str,
+    attach: bool,
+) -> Result<st3_client::Agent> {
+    let health: Value = client.get("/v1/health").await?;
+    let mut cursor = health["store_index"]
+        .as_u64()
+        .context("the daemon health response has no store index")?;
+    let mut reported = String::new();
+    loop {
+        let agent = match gateway.agents_get(subject).await {
+            Ok(response) => match response.value {
+                ClientResource::Agent(agent) => Some(agent),
+                _ => None,
+            },
+            Err(GeneratedClientError::Api(ClientErrorCode::NotFound, _, _)) => None,
+            Err(error) => return Err(error.into()),
+        };
+        if let Some(agent) = agent {
+            let harness = agent.harness_state.as_deref().unwrap_or("unobserved");
+            match agent.state.as_str() {
+                "running" => return Ok(agent),
+                "waiting" if attach && agent.reachability == "reachable" => return Ok(agent),
+                "waiting" if agent.reachability == "reachable" => anyhow::bail!(
+                    "`{subject}` started, but its harness is {harness} and waits on a person; attach with `st terminals attach {subject}`"
+                ),
+                "failed" => anyhow::bail!(
+                    "`{subject}` failed to start: {}",
+                    agent.fault.as_deref().unwrap_or(harness)
+                ),
+                _ => {}
+            }
+            let progress = format!("{} · harness {harness}", agent.state);
+            if progress != reported {
+                eprintln!("{subject}: {progress}");
+                reported = progress;
+            }
+        }
+        let events: Vec<EventRecord> = client
+            .get(&format!(
+                "/v1/events?after={cursor}&subject={}&wait=true&timeout_ms=30000",
+                urlencoding::encode(subject)
+            ))
+            .await?;
+        for event in events {
+            cursor = cursor.max(event.store_index);
+        }
+    }
+}
+
 async fn run_agent_inspection(
     endpoint: &Endpoint,
     command: AgentsCommand,
@@ -7161,7 +7557,8 @@ async fn run_agent_inspection(
             );
             return Ok(());
         }
-        AgentsCommand::Apply(_)
+        AgentsCommand::New(_)
+        | AgentsCommand::Apply(_)
         | AgentsCommand::Start(_)
         | AgentsCommand::Stop(_)
         | AgentsCommand::Queue(_) => {
@@ -14516,6 +14913,147 @@ mod tests {
                 command: AgentsCommand::Stop(_)
             }
         ));
+    }
+
+    fn agent_new_args(arguments: &[&str]) -> AgentNewArgs {
+        let cli = Cli::try_parse_from(
+            ["st3", "agents", "new"]
+                .into_iter()
+                .chain(arguments.iter().copied()),
+        )
+        .unwrap();
+        let Command::Agents {
+            command: AgentsCommand::New(args),
+        } = cli.command
+        else {
+            panic!("agents new did not parse");
+        };
+        args
+    }
+
+    #[test]
+    fn a_new_claude_agent_is_the_fleet_claude_seat() {
+        let args = agent_new_args(&[
+            "site",
+            "--host",
+            "builder",
+            "--model",
+            "claude-opus-5-5",
+            "--effort",
+            "high",
+            "--description",
+            "Builds the example site.",
+            "--attach",
+        ]);
+        assert!(args.attach && args.actor.is_none() && args.workspace.is_none());
+        let kdl = agent_new_document(&args, "/home/avery/st/agents/site", true);
+        assert!(kdl.contains(r#"workspace "/home/avery/st/agents/site" create=#true"#));
+        let intent = st3::parse_intent(&kdl, "laptop").unwrap();
+        let seat = &intent.subjects["agent/builder.site"];
+        assert!(seat.owner_run.is_none());
+        let member = seat.member.as_ref().unwrap();
+        assert_eq!(member.host, "builder");
+        assert_eq!(member.workspace, "/home/avery/st/agents/site");
+        assert!(member.workspace_create);
+        assert_eq!(member.driver.as_deref(), Some("claude"));
+        assert_eq!(member.restart, st3::model::RestartType::Always);
+        assert_eq!(member.environment["CLAUDE_CODE_CHILD_SESSION"], "0");
+        let st3::model::LaunchSpec::Argv(argv) = &member.launch else {
+            panic!("a harness seat launches an argv");
+        };
+        let joined = argv.join(" ");
+        for expected in [
+            "--channels plugin:st3-channel@st3",
+            "--model claude-opus-5-5",
+            "--effort high",
+            "--dangerously-skip-permissions",
+            CLAUDE_SEAT_SETTINGS,
+        ] {
+            assert!(
+                joined.contains(expected),
+                "{expected} is missing from {joined}"
+            );
+        }
+        let render = seat.desired["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|child| child["name"] == "render")
+            .unwrap();
+        assert_eq!(
+            render["children"][0]["arguments"],
+            json!([".st3/", ".claude/"])
+        );
+        assert_eq!(
+            render["children"][1]["arguments"],
+            json!([".claude/settings.local.json", CLAUDE_SEAT_SETTINGS])
+        );
+    }
+
+    #[test]
+    fn a_new_codex_agent_is_the_fleet_codex_seat() {
+        let args = agent_new_args(&[
+            "fleet/example/codex",
+            "--harness",
+            "codex",
+            "--model",
+            "gpt-example",
+            "--effort",
+            "medium",
+            "--workspace",
+            "/srv/example",
+            "--print-kdl",
+            "--as",
+            "person/avery",
+        ]);
+        assert_eq!(args.actor.as_deref(), Some("person/avery"));
+        let kdl = agent_new_document(&args, "/srv/example", false);
+        assert!(!kdl.contains("create="));
+        assert!(!kdl.contains("host "));
+        let intent = st3::parse_intent(&kdl, "laptop").unwrap();
+        let member = intent.subjects["agent/fleet/example/codex"]
+            .member
+            .as_ref()
+            .unwrap();
+        assert_eq!(member.host, "laptop");
+        assert!(!member.workspace_create);
+        assert!(member.environment.is_empty());
+        let st3::model::LaunchSpec::Argv(argv) = &member.launch else {
+            panic!("a harness seat launches an argv");
+        };
+        let joined = argv.join(" ");
+        for expected in [
+            "--model gpt-example",
+            "-c model_reasoning_effort=medium",
+            "--dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust",
+        ] {
+            assert!(
+                joined.contains(expected),
+                "{expected} is missing from {joined}"
+            );
+        }
+        assert!(kdl.contains(r#"git-exclude ".st3/""#) && !kdl.contains(".claude/"));
+    }
+
+    #[test]
+    fn a_new_agent_needs_its_own_identity_inside_a_harness() {
+        let command = Cli::try_parse_from(["st3", "agents", "new", "site"])
+            .unwrap()
+            .command;
+        let refused = guard_mutating_cli_actor(&command, Some("agent/seat"), None).unwrap_err();
+        assert!(
+            refused
+                .to_string()
+                .contains("needs explicit --as agent/seat")
+        );
+        let command = Cli::try_parse_from(["st3", "agents", "new", "site", "--as", "agent/seat"])
+            .unwrap()
+            .command;
+        guard_mutating_cli_actor(&command, Some("agent/seat"), None).unwrap();
+        assert!(
+            Cli::try_parse_from(["st3", "agents", "new", "site", "--attach", "--print-kdl"])
+                .is_err()
+        );
     }
 
     #[test]
