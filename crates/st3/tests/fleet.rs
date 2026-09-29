@@ -196,7 +196,7 @@ impl Node {
         // The pinned compatibility build may be cold while other CI lanes compile.
         // Give startup room for that load. Bound each health probe as well: a request
         // stalled behind startup must not consume the whole startup deadline.
-        let deadline = Instant::now() + Duration::from_secs(90);
+        let deadline = Instant::now() + Duration::from_secs(150);
         loop {
             let health_error = match tokio::time::timeout(
                 Duration::from_secs(3),
