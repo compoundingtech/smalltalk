@@ -688,6 +688,15 @@ fn mission_resources_filtered(
         .map(|seat| seat.subject.clone())
         .collect::<Vec<_>>();
     let usage_summaries = store.usage_summaries_at(&usage_subjects, Some(snapshot_index))?;
+    let mut usage_by_run = BTreeMap::<&str, Vec<&crate::model::UsageSummary>>::new();
+    for seat in &desired {
+        if let (Some(run), Some(usage)) = (
+            seat.owner_run.as_deref(),
+            usage_summaries.get(&seat.subject),
+        ) {
+            usage_by_run.entry(run).or_default().push(usage);
+        }
+    }
     let state_times = store.mission_run_state_times()?;
     let mut values = missions
         .into_iter()
@@ -832,14 +841,10 @@ fn mission_resources_filtered(
                 .find(|kind| run_details.iter().any(|run| run["must_act"] == *kind))
                 .unwrap_or("nobody");
             let usage = aggregate_usage_values(
-                desired
+                run_ids
                     .iter()
-                    .filter(|seat| {
-                        seat.owner_run
-                            .as_deref()
-                            .is_some_and(|run| run_ids.contains(run))
-                    })
-                    .filter_map(|seat| usage_summaries.get(&seat.subject)),
+                    .filter_map(|run| usage_by_run.get(run))
+                    .flat_map(|summaries| summaries.iter().copied()),
             );
             let revision = latest
                 .map(|run| run.revision.as_str())

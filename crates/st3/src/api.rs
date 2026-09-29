@@ -1169,40 +1169,41 @@ fn client_work_resources(
         .map(|seat| seat.subject.clone())
         .collect::<Vec<_>>();
     let usage_summaries = store.usage_summaries_at(&usage_subjects, Some(snapshot_index))?;
-    let mut step_specs = BTreeMap::<String, BTreeMap<String, crate::model::StepSpec>>::new();
-    for run_id in work
+    let mut usage_by_step = BTreeMap::<&str, Vec<&crate::model::UsageSummary>>::new();
+    for seat in &desired {
+        if let (Some(step), Some(usage)) = (
+            seat.owner_step.as_deref(),
+            usage_summaries.get(&seat.subject),
+        ) {
+            usage_by_step.entry(step).or_default().push(usage);
+        }
+    }
+    let agentless_runs = work
         .iter()
         .filter(|item| item.agentless)
-        .map(|item| &item.run)
-    {
-        if step_specs.contains_key(run_id) {
-            continue;
-        }
-        let Some(run) = store.mission_run(run_id)? else {
-            continue;
-        };
-        let Some(mission) = store.mission_spec(
-            run.mission.trim_start_matches("mission/"),
-            Some(&run.revision),
-        )?
-        else {
-            continue;
-        };
-        step_specs.insert(run_id.clone(), mission.steps);
-    }
+        .map(|item| item.run.clone())
+        .collect::<Vec<_>>();
+    let step_specs = store
+        .mission_specs_for_runs(&agentless_runs)?
+        .into_iter()
+        .map(|(run, mission)| (run, mission.steps))
+        .collect::<BTreeMap<_, _>>();
+    let work_annotations = store.work_annotations(&work)?;
     work.into_iter()
         .map(|work| {
-            let operational = store.work_annotation(&work)?;
+            let operational = work_annotations
+                .get(&work.subject)
+                .expect("every work item has an annotation");
             let state = match work.status.as_str() {
                 "pending" => "waiting",
                 "working" => "claimed",
                 other => other,
             };
             let usage = aggregate_usage_values(
-                desired
-                    .iter()
-                    .filter(|seat| seat.owner_step.as_deref() == Some(work.subject.as_str()))
-                    .filter_map(|seat| usage_summaries.get(&seat.subject)),
+                usage_by_step
+                    .get(work.subject.as_str())
+                    .into_iter()
+                    .flat_map(|summaries| summaries.iter().copied()),
             );
             let gate_kind = if work.agentless {
                 let spec = step_specs

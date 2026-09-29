@@ -1697,6 +1697,38 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Load the definitions behind a collection of runs in one read.
+    pub fn mission_specs_for_runs(
+        &self,
+        runs: &[String],
+    ) -> Result<BTreeMap<String, MissionSpec>> {
+        if runs.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let ids = runs
+            .iter()
+            .map(|run| run.strip_prefix("mission-run/").unwrap_or(run))
+            .collect::<Vec<_>>();
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT mission_runs.id, mission_revisions.body
+             FROM mission_runs
+             JOIN run_generations ON run_generations.id=mission_runs.current_generation_id
+             JOIN mission_revisions ON mission_revisions.mission_id=mission_runs.mission_id
+              AND mission_revisions.revision=run_generations.revision
+             WHERE mission_runs.id IN (SELECT value FROM json_each(?1))",
+        )?;
+        statement
+            .query_map([serde_json::to_string(&ids)?], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .map(|row| {
+                let (id, body) = row?;
+                Ok((format!("mission-run/{id}"), serde_json::from_str(&body)?))
+            })
+            .collect()
+    }
+
     /// Return every current published mission definition, including definitions with no runs.
     pub fn mission_definitions(&self) -> Result<Vec<MissionDefinitionView>> {
         let connection = self.readers.get();
@@ -4449,6 +4481,16 @@ impl Store {
                 .filter(|view| view.status == "ready" && view.assigned_to.is_some())
                 .map(|view| view.subject.as_str()),
         )?;
+        let run_ids = views
+            .iter()
+            .map(|view| view.run.strip_prefix("mission-run/").unwrap_or(&view.run))
+            .collect::<BTreeSet<_>>();
+        let run_phases = connection
+            .prepare("SELECT id, phase FROM mission_runs WHERE id IN (SELECT value FROM json_each(?1))")?
+            .query_map([serde_json::to_string(&run_ids)?], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
         let mut visible = Vec::with_capacity(views.len());
         for mut view in views {
             if detailed {
@@ -4457,12 +4499,9 @@ impl Store {
                 enrich_step_queue_for_reconcile_at(&connection, &mut view, snapshot_unix_ms)?;
             }
             view.carried_claimant = carried_claimants.get(&view.subject).cloned();
-            let run_phase: String = connection.query_row(
-                "SELECT phase FROM mission_runs WHERE id=?1",
-                [view.run.strip_prefix("mission-run/").unwrap_or(&view.run)],
-                |row| row.get(0),
-            )?;
-            if run_phase == "revision-draining"
+            if run_phases
+                .get(view.run.strip_prefix("mission-run/").unwrap_or(&view.run))
+                .is_some_and(|phase| phase == "revision-draining")
                 && !matches!(view.status.as_str(), "claimed" | "working" | "verifying")
             {
                 continue;
@@ -4568,6 +4607,63 @@ impl Store {
                 },
             )
             .optional()?;
+        Ok(Self::work_annotation_with_owner(work, owner))
+    }
+
+    /// Hydrate owner state once for a collection instead of querying each step.
+    pub fn work_annotations(
+        &self,
+        work: &[StepRunView],
+    ) -> Result<BTreeMap<String, OperationalAnnotation>> {
+        let runs = work
+            .iter()
+            .map(|step| step.run.strip_prefix("mission-run/").unwrap_or(&step.run))
+            .collect::<BTreeSet<_>>();
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT mission_runs.id, run_generations.id, mission_runs.status,
+                    mission_runs.current_generation_id, mission_runs.mode,
+                    run_generations.status, root_runs.status, root_runs.phase
+             FROM mission_runs
+             JOIN run_generations ON run_generations.run_id=mission_runs.id
+             JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
+             WHERE mission_runs.id IN (SELECT value FROM json_each(?1))",
+        )?;
+        let owners = statement
+            .query_map([serde_json::to_string(&runs)?], |row| {
+                Ok((
+                    (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
+                    (
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ),
+                ))
+            })?
+            .collect::<rusqlite::Result<BTreeMap<_, _>>>()?;
+        Ok(work
+            .iter()
+            .map(|step| {
+                let run = step.run.strip_prefix("mission-run/").unwrap_or(&step.run);
+                let generation = generation_id_from_subject(&step.generation);
+                let owner = owners
+                    .get(&(run.to_owned(), generation.to_owned()))
+                    .cloned();
+                (
+                    step.subject.clone(),
+                    Self::work_annotation_with_owner(step, owner),
+                )
+            })
+            .collect())
+    }
+
+    fn work_annotation_with_owner(
+        work: &StepRunView,
+        owner: Option<(String, String, String, String, String, String)>,
+    ) -> OperationalAnnotation {
         let mut reasons: Vec<String> = Vec::new();
         if let Some((
             run_status,
@@ -4616,14 +4712,14 @@ impl Store {
                 "terminal-owner" | "terminal-root-owner" | "superseded" | "eval" | "terminal-work"
             )
         });
-        Ok(OperationalAnnotation {
+        OperationalAnnotation {
             layer: if historical { "history" } else { "current" }.into(),
             actionable: !historical
                 && matches!(work.status.as_str(), "ready" | "claimed" | "working"),
             reasons,
             owner_generation: Some(work.generation.clone()),
             runtime_incarnation: work.claim_incarnation.clone(),
-        })
+        }
     }
 
     pub fn active_step_blockers_at(
@@ -33187,6 +33283,11 @@ mission "external-blocker" state="ready" {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0].status, "blocked");
         let annotation = store.work_annotation(&blocked).unwrap();
+        let batched = store.work_annotations(&[blocked.clone()]).unwrap();
+        assert_eq!(
+            serde_json::to_value(&annotation).unwrap(),
+            serde_json::to_value(&batched[&blocked.subject]).unwrap()
+        );
         assert!(!annotation.actionable);
         assert!(annotation.reasons.contains(&"external-blocker".into()));
         assert_eq!(
@@ -33542,6 +33643,11 @@ version 2
                 .unwrap()
                 .reasons
                 .contains(&"terminal-root-owner".to_owned())
+        );
+        let batched = store.work_annotations(&history).unwrap();
+        assert_eq!(
+            serde_json::to_value(store.work_annotation(nested).unwrap()).unwrap(),
+            serde_json::to_value(&batched[&nested.subject]).unwrap()
         );
 
         let fresh = store
@@ -35986,6 +36092,13 @@ version 2
 
         assert_ne!(revised.generation, run.generation);
         assert_eq!(revised.initial_revision, run.revision);
+        assert_eq!(
+            store
+                .mission_specs_for_runs(&[revised.subject.clone()])
+                .unwrap()[&revised.subject]
+                .revision,
+            revised.revision
+        );
         let generations = store.run_generations(&run.id).unwrap();
         assert_eq!(generations.len(), 2);
         assert_eq!(generations[0].subject, run.generation);
