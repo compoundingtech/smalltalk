@@ -413,7 +413,8 @@ impl ClientReadOperation {
     /// How long the owner may hold this read open before it answers.
     fn wait(&self) -> Duration {
         match self {
-            Self::ConversationChanges { wait_ms, .. } | Self::TerminalScreenChange { wait_ms, .. } => {
+            Self::ConversationChanges { wait_ms, .. }
+            | Self::TerminalScreenChange { wait_ms, .. } => {
                 Duration::from_millis((*wait_ms).min(CLIENT_READ_MAX_WAIT_MS))
             }
             _ => Duration::ZERO,
@@ -598,7 +599,11 @@ impl ClientRelay {
         }))
     }
 
-    async fn send(&self, peer: &PeerConfig, request: &ClientReadRequest) -> Result<serde_json::Value> {
+    async fn send(
+        &self,
+        peer: &PeerConfig,
+        request: &ClientReadRequest,
+    ) -> Result<serde_json::Value> {
         let name = peer.name.as_str();
         // A relayed read may pass through more nodes, each waiting a little less than the last.
         let timeout = CLIENT_READ_TIMEOUT
@@ -726,7 +731,11 @@ pub(crate) fn client_read_next_hops(
     let mut routed = dialable
         .iter()
         .filter(|name| name.as_str() != target && !blocked(name))
-        .filter_map(|name| distance.get(name.as_str()).map(|hops| (*hops, name.clone())))
+        .filter_map(|name| {
+            distance
+                .get(name.as_str())
+                .map(|hops| (*hops, name.clone()))
+        })
         .collect::<Vec<_>>();
     routed.sort();
     ordered.extend(routed.into_iter().map(|(_, name)| name));
@@ -2665,8 +2674,14 @@ mod tests {
                     };
                     let mut peek = [0_u8; 6];
                     if stream.read_exact(&mut peek).await.is_err()
-                        || stream.write_all(&packet(10, &[0, 24, 0, 80])).await.is_err()
-                        || stream.write_all(&packet(5, b"far shell\r\n$ ")).await.is_err()
+                        || stream
+                            .write_all(&packet(10, &[0, 24, 0, 80]))
+                            .await
+                            .is_err()
+                        || stream
+                            .write_all(&packet(5, b"far shell\r\n$ "))
+                            .await
+                            .is_err()
                     {
                         return;
                     }
@@ -2833,9 +2848,10 @@ mod tests {
         })
         .unwrap();
         let served = socket.clone();
-        let server = tokio::spawn(async move {
-            crate::api::serve_unix(&served, crate::api::router(main)).await
-        });
+        let server =
+            tokio::spawn(
+                async move { crate::api::serve_unix(&served, crate::api::router(main)).await },
+            );
         for _ in 0..200 {
             if tokio::net::UnixStream::connect(&socket).await.is_ok() {
                 break;
@@ -2924,7 +2940,12 @@ mod tests {
                 .map(|(from, to)| (from.to_string(), to.to_string()))
                 .collect::<Vec<_>>()
         };
-        let names = |names: &[&str]| names.iter().map(|name| name.to_string()).collect::<Vec<_>>();
+        let names = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
         // A laptop that dials only a desktop reaches a server the desktop observes, in either
         // direction the observation was made.
         assert_eq!(
