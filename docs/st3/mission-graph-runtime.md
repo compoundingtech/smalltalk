@@ -1321,7 +1321,11 @@ agent "planner" {
 
 Each rule accepts an exact mission ID or a terminal `/*` namespace. The value omits the `mission/` subject prefix.
 
-No agent receives mission authority by default. `publish`, `start`, and `revise` are separate permissions.
+A mission-scoped agent, such as this planner, receives no mission authority by default. A
+top-level seat named `fleet/PROJECT/...` that a person declared holds `publish`, `start`, and
+`revise` for `fleet/PROJECT/*` unless its declaration carries `mission-authority`; see
+[agent mission authority](kdl-lifecycle.md#agent-mission-authority). `publish`, `start`, and
+`revise` are separate permissions.
 
 Mission publication requires a claimed step with the exact `produces-mission` declaration. The agent must use `st work publish-mission`.
 

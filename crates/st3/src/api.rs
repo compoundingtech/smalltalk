@@ -1381,6 +1381,17 @@ fn client_agent_resources_uncached(
             Some((desired.subject, client_host_id(&host)))
         })
         .collect::<BTreeMap<_, _>>();
+    let mission_authorities = store
+        .agent_declarations_with_writers()?
+        .into_iter()
+        .map(|(desired, writer)| {
+            let effective = crate::graph::effective_agent_mission_authority(
+                &desired,
+                declared_by_agent(writer.as_deref()),
+            );
+            (desired.subject, effective)
+        })
+        .collect::<BTreeMap<_, _>>();
     let agent_subjects = status
         .subjects
         .iter()
@@ -1562,6 +1573,7 @@ fn client_agent_resources_uncached(
                 "upcoming_work_ids": queue.upcoming_work_ids,
                 "queued_work_count": queue.queued_work_count,
                 "usage": usage,
+                "mission_authority": mission_authorities.get(&subject.subject),
                 "under": subject.under.into_iter().map(|relationship| json!({
                     "agent_id": relationship.agent,
                     "reason": relationship.reason
@@ -8525,16 +8537,37 @@ fn require_agent_mission_authority(
         return Ok(());
     };
     let mission = mission.strip_prefix("mission/").unwrap_or(mission);
-    let desired = current_agent_declaration(state, &actor, "missing-agent-mission-authority")?;
-    let authority = crate::graph::agent_mission_authority(&desired);
-    if authority.allows(action, mission) {
+    let (desired, writer) = state
+        .store
+        .desired_subject_with_writer(&actor)
+        .map_err(ApiError::internal)?
+        .filter(|(desired, _)| desired.kind == "agent")
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "missing-agent-mission-authority",
+                format!("`{actor}` has no current desired agent declaration"),
+            ))
+        })?;
+    let effective = crate::graph::effective_agent_mission_authority(
+        &desired,
+        declared_by_agent(writer.as_deref()),
+    );
+    if effective.authority.allows(action, mission) {
         Ok(())
     } else {
-        Err(ApiError::bad(St3Error::new(
-            "mission-authority-denied",
-            format!("`{actor}` cannot {action} mission `{mission}`"),
-        )))
+        Err(ApiError::bad(
+            St3Error::new(
+                "mission-authority-denied",
+                format!("`{actor}` cannot {action} mission `{mission}`"),
+            )
+            .with_detail("authority_source", json!(effective.source)),
+        ))
     }
+}
+
+/// Whether an agent wrote a declaration, from the actor its claim records.
+fn declared_by_agent(writer: Option<&str>) -> bool {
+    writer.and_then(normalized_agent_actor).is_some()
 }
 
 /// An agent may reorder a seat's queue only when its current declaration grants
@@ -13735,6 +13768,319 @@ agent "fleet/builder" {
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
         assert_eq!(body["code"], "agent-seat-publication-denied");
+    }
+
+    /// The mission authority `st agents show` reports for `agent`.
+    fn shown_mission_authority(state: &AppState, agent: &str) -> Value {
+        let index = state.store.index().unwrap();
+        client_agent_resources(&state.store, true, "snapshot", index)
+            .unwrap()
+            .into_iter()
+            .find(|resource| resource["id"] == agent)
+            .unwrap_or_else(|| panic!("`{agent}` has no agent resource"))["mission_authority"]
+            .clone()
+    }
+
+    /// A person declares a top-level project seat without `mission-authority`, as a person did
+    /// for a website seat that st then refused its own mission with `mission-authority-denied`.
+    /// The seat now publishes, starts, and revises missions under `fleet/website/*`, and still
+    /// reaches no other project's missions and cannot rewrite its own declaration.
+    #[tokio::test]
+    async fn a_person_declared_project_seat_holds_its_own_mission_namespace() {
+        const SEAT: &str = "agent/fleet/website/standing/website";
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        let apply = |source: &str, actor: &str, key: &str| {
+            serde_json::to_value(apply_request(&state, source, actor, key)).unwrap()
+        };
+        let person = r#"
+version 2
+agent "fleet/website/standing/website" { workspace "."; command "true"; }
+mission "fleet/other/deploy" state="ready" {
+  concurrent-runs
+  goal "Belong to another project."
+  step "ship" { goal "Ship the other project." }
+}
+"#;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            apply(person, "person/operator", "person-declares-website"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let namespace = json!(["fleet/website/*"]);
+        assert_eq!(
+            shown_mission_authority(&state, SEAT),
+            json!({
+                "source": "default",
+                "publish": namespace, "start": namespace, "revise": namespace,
+            })
+        );
+
+        let own = r#"
+version 2
+mission "fleet/website/refresh" state="ready" {
+  concurrent-runs
+  goal "Refresh the website."
+  step "build" { goal "Build the website." }
+}
+"#;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            apply(own, SEAT, "website-publishes-own"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "publish: {body}");
+        let run = |id: &str, mission: &str| {
+            let revision = state
+                .store
+                .mission_spec(mission, None)
+                .unwrap()
+                .unwrap()
+                .revision;
+            format!(
+                "version 2\nmission-run {id:?} {{\n  mission \"mission/{mission}@{revision}\"\n  workspace {:?}\n  requester {SEAT:?}\n}}\n",
+                root.path().display().to_string(),
+            )
+        };
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            apply(
+                &run("fleet/website/refresh/one", "fleet/website/refresh"),
+                SEAT,
+                "website-starts-own",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "start: {body}");
+        let retry = |run: &str, key: &str| {
+            let step = state.store.mission_run(run).unwrap().unwrap().steps[0]
+                .subject
+                .clone();
+            state
+                .store
+                .set_step_state(&step, "failed", Some("the build host went away"))
+                .unwrap();
+            (
+                format!("/v1/work/retry/{}", urlencoding::encode(&step)),
+                serde_json::to_value(WorkRetryRequest {
+                    actor: SEAT.into(),
+                    reason: "the build host is back".into(),
+                    idempotency_key: key.into(),
+                })
+                .unwrap(),
+            )
+        };
+        let (path, request) = retry("fleet/website/refresh/one", "website-revises-own");
+        let (status, body) = json_request(app.clone(), &path, request).await;
+        assert_eq!(status, StatusCode::OK, "revise: {body}");
+
+        // Another project's missions stay out of reach for every verb.
+        let other = r#"
+version 2
+mission "fleet/other/deploy" state="ready" {
+  concurrent-runs
+  goal "Rewrite another project's mission."
+}
+"#;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            apply(other, SEAT, "website-publishes-other"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "mission-authority-denied");
+        assert_eq!(body["details"]["authority_source"], "default", "{body}");
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            apply(
+                &run("fleet/other/deploy/one", "fleet/other/deploy"),
+                SEAT,
+                "website-starts-other",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "mission-authority-denied");
+        let other_run = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "fleet/other/deploy".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/operator".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "person-starts-other".into(),
+            })
+            .unwrap();
+        let (path, request) = retry(&other_run.id, "website-revises-other");
+        let (status, body) = json_request(app.clone(), &path, request).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "mission-authority-denied");
+
+        // The seat cannot rewrite its own declaration, with or without authority in it.
+        for (source, key, code) in [
+            (
+                "version 2\nagent \"fleet/website/standing/website\" { workspace \".\"; command \"sh -c 'echo mine'\"; }\n",
+                "website-redeclares-itself",
+                "agent-seat-publication-denied",
+            ),
+            (
+                "version 2\nagent \"fleet/website/standing/website\" {\n  workspace \".\"\n  command \"true\"\n  mission-authority { publish \"fleet/*\"; start \"fleet/*\"; revise \"fleet/*\" }\n}\n",
+                "website-widens-itself",
+                "agent-authority-grant-denied",
+            ),
+        ] {
+            let (status, body) =
+                json_request(app.clone(), "/v1/intent/apply", apply(source, SEAT, key)).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{key}: {body}");
+            assert_eq!(body["code"], code, "{key}: {body}");
+        }
+        assert_eq!(shown_mission_authority(&state, SEAT)["source"], "default");
+    }
+
+    /// The default belongs to person-declared top-level seats only. A declaration's own
+    /// `mission-authority`, narrower or `"none"`, replaces it; a mission-scoped seat and a seat an
+    /// agent declared hold nothing by default.
+    #[tokio::test]
+    async fn default_mission_authority_is_overridable_and_never_lent_by_an_agent() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        let apply = |source: &str, actor: &str, key: &str| {
+            serde_json::to_value(apply_request(&state, source, actor, key)).unwrap()
+        };
+        let person = r#"
+version 2
+agent "fleet/docs/standing/docs" {
+  workspace "."
+  command "true"
+  mission-authority { publish "fleet/docs/guides/*" }
+}
+agent "fleet/quiet/standing/quiet" {
+  workspace "."
+  command "true"
+  mission-authority "none"
+}
+agent "fleet/builder" {
+  workspace "."
+  command "true"
+  seat-authority { declare "fleet/workers/*" }
+}
+mission "fleet/crew/host" state="ready" {
+  goal "Hold one mission-scoped seat in the crew project."
+  agent "helper" { workspace "."; command "true"; }
+}
+"#;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            apply(person, "person/operator", "person-declares-seats"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            apply(
+                "version 2\nagent \"fleet/workers/one\" { workspace \".\"; command \"true\"; }\n",
+                "agent/fleet/builder",
+                "builder-declares-worker",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let revision = state
+            .store
+            .mission_spec("fleet/crew/host", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            apply(
+                &format!(
+                    "version 2\nmission-run \"fleet/crew/host/one\" {{\n  mission \"mission/fleet/crew/host@{revision}\"\n  workspace {:?}\n  requester \"person/operator\"\n}}\n",
+                    root.path().display().to_string(),
+                ),
+                "person/operator",
+                "person-starts-crew-host",
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let host = state
+            .store
+            .mission_run("fleet/crew/host/one")
+            .unwrap()
+            .unwrap();
+        materialize_run_agents(&state, &host);
+        // Named like a project seat, but owned by its mission run.
+        let helper = "agent/fleet/crew/host/one/helper".to_owned();
+
+        let publish = |mission: &str| {
+            format!(
+                "version 2\nmission {mission:?} state=\"ready\" {{\n  goal \"Publish one mission.\"\n}}\n"
+            )
+        };
+        for (actor, mission, allowed, source) in [
+            (
+                "agent/fleet/docs/standing/docs",
+                "fleet/docs/guides/intro",
+                true,
+                "declared",
+            ),
+            (
+                "agent/fleet/docs/standing/docs",
+                "fleet/docs/release",
+                false,
+                "declared",
+            ),
+            (
+                "agent/fleet/quiet/standing/quiet",
+                "fleet/quiet/anything",
+                false,
+                "declared",
+            ),
+            (
+                "agent/fleet/workers/one",
+                "fleet/workers/job",
+                false,
+                "none",
+            ),
+            ("agent/fleet/builder", "fleet/builder/job", true, "default"),
+            (helper.as_str(), "fleet/crew/job", false, "none"),
+        ] {
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/intent/apply",
+                apply(&publish(mission), actor, &format!("{actor}:{mission}")),
+            )
+            .await;
+            if allowed {
+                assert_eq!(status, StatusCode::OK, "{actor} {mission}: {body}");
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "{actor} {mission}: {body}"
+                );
+                assert_eq!(body["code"], "mission-authority-denied", "{body}");
+            }
+            assert_eq!(
+                shown_mission_authority(&state, actor)["source"],
+                source,
+                "{actor}"
+            );
+        }
     }
 
     /// Review 2026-09-27 area 1: an agent with a namespace publish grant must not be able to

@@ -7160,6 +7160,13 @@ fn render_client_agent(
     if let Some(owner) = &agent.owner_run_id {
         let _ = writeln!(output, "MISSION      {owner}");
     }
+    if let Some(authority) = &agent.mission_authority {
+        let _ = writeln!(
+            output,
+            "AUTHORITY    {}",
+            render_mission_authority(authority)
+        );
+    }
     if let Some(usage) = &agent.usage {
         let _ = writeln!(output, "USAGE        {}", render_usage(usage));
         if usage.incarnation_count > 0 {
@@ -7213,6 +7220,36 @@ fn render_client_agent(
         let _ = writeln!(output, "RUNTIME      {runtime}");
     }
     output
+}
+
+/// Each mission pattern with the verbs it allows, then where the authority comes from.
+fn render_mission_authority(authority: &st3_client::AgentMissionAuthority) -> String {
+    let mut patterns: Vec<(&str, Vec<&str>)> = Vec::new();
+    for (verb, rules) in [
+        ("publish", &authority.publish),
+        ("start", &authority.start),
+        ("revise", &authority.revise),
+    ] {
+        for pattern in rules {
+            match patterns.iter_mut().find(|(known, _)| known == pattern) {
+                Some((_, verbs)) => verbs.push(verb),
+                None => patterns.push((pattern, vec![verb])),
+            }
+        }
+    }
+    let rules = if patterns.is_empty() {
+        "no missions".to_owned()
+    } else {
+        patterns
+            .iter()
+            .map(|(pattern, verbs)| format!("{} mission/{pattern}", verbs.join(", ")))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    match authority.source.as_str() {
+        "none" => rules,
+        source => format!("{rules} ({source})"),
+    }
 }
 
 fn render_client_agents(
@@ -11622,6 +11659,42 @@ mod tests {
         assert!(card.contains(
             "FAULT        render refuses to change tracked file .claude/settings.local.json"
         ));
+    }
+
+    #[test]
+    fn agent_card_shows_mission_authority_and_its_source() {
+        let card = |authority: serde_json::Value| {
+            let agent: st3_client::Agent = serde_json::from_value(serde_json::json!({
+                "kind": "agent", "id": "agent/fleet/website/standing/website", "revision": "one",
+                "updated_at": "2026-09-29T12:00:00Z", "name": "Website",
+                "state": "running", "reachability": "local", "runtime_ids": [],
+                "mission_authority": authority
+            }))
+            .unwrap();
+            render_client_agent(&agent, &[], 0)
+        };
+        let namespace = serde_json::json!(["fleet/website/*"]);
+        assert!(
+            card(serde_json::json!({
+                "source": "default",
+                "publish": namespace, "start": namespace, "revise": namespace
+            }))
+            .contains("AUTHORITY    publish, start, revise mission/fleet/website/* (default)")
+        );
+        assert!(
+            card(serde_json::json!({
+                "source": "declared",
+                "publish": ["fleet/website/docs/*"], "start": ["fleet/website/docs/*", "fleet/website/deploy"]
+            }))
+            .contains(
+                "AUTHORITY    publish, start mission/fleet/website/docs/*; start mission/fleet/website/deploy (declared)"
+            )
+        );
+        assert!(
+            card(serde_json::json!({"source": "declared"}))
+                .contains("AUTHORITY    no missions (declared)")
+        );
+        assert!(card(serde_json::json!({"source": "none"})).contains("AUTHORITY    no missions\n"));
     }
 
     #[test]

@@ -170,7 +170,9 @@ st usage --hours 24 --by host
 ```
 
 The seat starts its harness in the workspace. Its first turn reads the generated
-`.st3/boot.md`, checks for work, and waits. `st terminals attach agent/example/worker` opens its
+`.st3/boot.md`, checks for work, and waits. A seat you declare as `fleet/PROJECT/...` may also
+publish, start, and revise missions under `fleet/PROJECT/*`; `st agents show` prints that
+authority. `st terminals attach agent/example/worker` opens its
 terminal; Ctrl+\\ detaches without stopping it.
 
 A running seat keeps its current process when you apply a changed declaration; the change takes

@@ -547,10 +547,23 @@
             "upcoming_work_ids": { "type": "array", "items": { "$ref": "#/$defs/Id" } },
             "queued_work_count": { "type": "integer", "minimum": 0 },
             "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] },
+            "mission_authority": { "oneOf": [{ "$ref": "#/$defs/AgentMissionAuthority" }, { "type": "null" }] },
             "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } }
           }
         }
       ]
+    },
+    "AgentMissionAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source"],
+      "description": "Missions the agent may publish, start, and revise. Patterns are exact mission IDs or terminal `/*` namespaces without `mission/`.",
+      "properties": {
+        "source": { "enum": ["declared", "default", "none"], "description": "`declared`: the declaration's `mission-authority`. `default`: a person-declared top-level seat `fleet/PROJECT/...` holds `fleet/PROJECT/*`. `none`: neither." },
+        "publish": { "type": "array", "items": { "type": "string" } },
+        "start": { "type": "array", "items": { "type": "string" } },
+        "revise": { "type": "array", "items": { "type": "string" } }
+      }
     },
     "AgentRelationship": {
       "type": "object",

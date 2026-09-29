@@ -2430,7 +2430,9 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
     ] {
         unique_child(document, child)?;
     }
-    if let Some(authority) = unique_child(document, "mission-authority")? {
+    if let Some(authority) = unique_child(document, "mission-authority")?
+        && !declares_no_mission_authority(authority)?
+    {
         validate_authority_block(
             authority,
             AuthorityBlock {
@@ -2606,6 +2608,23 @@ fn validate_queue_authority_pattern(pattern: &str) -> Result<(), St3Error> {
     validate_name(seat, false).map_err(|_| invalid())
 }
 
+/// Whether `mission-authority "none"` withholds all mission authority, including the default
+/// of a top-level project seat. Any other value is refused; a block of rules is not a value.
+fn declares_no_mission_authority(authority: &KdlNode) -> Result<bool, St3Error> {
+    if authority.entries().is_empty() {
+        return Ok(false);
+    }
+    ensure_no_properties(authority)?;
+    if one_string(authority)? == "none" {
+        Ok(true)
+    } else {
+        Err(St3Error::new(
+            "invalid-mission-authority",
+            "mission authority needs a block of rules or the value \"none\"",
+        ))
+    }
+}
+
 /// One kind of authority an agent declaration can grant: a block of `VERB "PATTERN"` rules.
 struct AuthorityBlock {
     name: &'static str,
@@ -2698,6 +2717,61 @@ pub fn agent_mission_authority(desired: &Value) -> crate::model::MissionAuthorit
         }
     }
     authority
+}
+
+/// The mission authority a current agent declaration holds. A `mission-authority` block, or
+/// `mission-authority "none"`, is the whole grant. Without one, a top-level seat named
+/// `fleet/PROJECT` or `fleet/PROJECT/...` may publish, start and revise missions under
+/// `fleet/PROJECT/*` while its current declaration is a person's. A mission-scoped seat, or a seat
+/// whose declaration an agent wrote, holds nothing by default: declaring a seat never lends an
+/// agent authority it lacks.
+pub fn effective_agent_mission_authority(
+    desired: &crate::model::DesiredSubject,
+    declared_by_agent: bool,
+) -> crate::model::EffectiveMissionAuthority {
+    use crate::model::{EffectiveMissionAuthority, MissionAuthority, MissionAuthoritySource};
+
+    let none = EffectiveMissionAuthority {
+        source: MissionAuthoritySource::None,
+        authority: MissionAuthority::default(),
+    };
+    if desired.kind != "agent" {
+        return none;
+    }
+    let declared = desired
+        .desired
+        .get("children")
+        .and_then(Value::as_array)
+        .is_some_and(|children| {
+            children
+                .iter()
+                .any(|child| child.get("name").and_then(Value::as_str) == Some("mission-authority"))
+        });
+    if declared {
+        return EffectiveMissionAuthority {
+            source: MissionAuthoritySource::Declared,
+            authority: agent_mission_authority(&desired.desired),
+        };
+    }
+    let project = desired
+        .subject
+        .strip_prefix("agent/fleet/")
+        .and_then(|rest| rest.split('/').next())
+        .filter(|project| !project.is_empty());
+    match project {
+        Some(project) if desired.owner_run.is_none() && !declared_by_agent => {
+            let namespace = vec![format!("fleet/{project}/*")];
+            EffectiveMissionAuthority {
+                source: MissionAuthoritySource::Default,
+                authority: MissionAuthority {
+                    publish: namespace.clone(),
+                    start: namespace.clone(),
+                    revise: namespace,
+                },
+            }
+        }
+        _ => none,
+    }
 }
 
 pub fn agent_queue_authority(desired: &Value) -> crate::model::QueueAuthority {

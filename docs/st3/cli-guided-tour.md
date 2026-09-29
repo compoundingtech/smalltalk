@@ -232,6 +232,8 @@ st machines
 Copy an agent ID into `show`. Check tree nesting, durable seats versus mission-owned agents, current
 runtime, host, work, conversation, stale state, and whether stopped history stays out of the default.
 For a working agent, check that `show` names its current step and its last progress summary.
+Check that `AUTHORITY` lists `fleet/PROJECT/*` with `(default)` for a durable seat a person
+declared under `fleet/`, and `no missions` for a mission-owned agent.
 
 Copy a durable seat into `agents queue`. Check that the current claim comes first, then each queued
 mission run in order with `claimed`, `ready`, or `waiting`, and that `NEXT WORK` matches
