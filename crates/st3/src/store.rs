@@ -554,9 +554,9 @@ CREATE TABLE IF NOT EXISTS checkpoint_claims (
     accepted_at_unix_ms INTEGER NOT NULL,
     checkpoint TEXT NOT NULL
 );
--- The checkpoints this node sealed, verified or adopted. `seal_rowid` is the `replica_envelopes`
--- high water of the set it sealed or verified, so it can read exactly that set again. Every
--- write this node makes is dated at or after the highest cut here.
+-- The checkpoints this node sealed, verified, trimmed or adopted. `seal_rowid` is the
+-- `replica_envelopes` high water of the set it sealed or verified, so it can read exactly that
+-- set again. Every write this node makes is dated at or after the highest cut here.
 CREATE TABLE IF NOT EXISTS checkpoints (
     id TEXT PRIMARY KEY,
     cut_unix_ms INTEGER NOT NULL,
@@ -564,6 +564,8 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     seal_rowid INTEGER,
     sealed_digest TEXT,
     drop_digest TEXT,
+    graph_digest TEXT,
+    detail TEXT NOT NULL DEFAULT '{}',
     updated_at_unix_ms INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);
