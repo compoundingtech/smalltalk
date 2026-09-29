@@ -18,7 +18,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::{FileTypeExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -34,6 +34,7 @@ use tungstenite::{Message as WebSocketMessage, WebSocket};
 // Bound unexpected provider frames independently of the size of a saved thread.
 const CODEX_CONTROL_MAX_MESSAGE_BYTES: usize = 64 * 1024 * 1024;
 
+use crate::provider_session::ProviderProcess;
 use crate::{
     delivery_ledger, ding, driver_diagnostic, harness_context, harness_state, message, run, status,
 };
@@ -2352,12 +2353,215 @@ pub fn run_controlled_paths(
             diagnostics.record("completed", json!({}))?;
             Ok(())
         }
+        Err(error)
+            if error
+                .downcast_ref::<crate::provider_session::Detached>()
+                .is_some() =>
+        {
+            Err(error)
+        }
         Err(error) => {
             let text = format!("{error:#}");
             let _ = diagnostics.record("failed", json!({ "error": text }));
             Err(error)
         }
     }
+}
+
+/// Resume a Codex session a predecessor driver image launched through [`run_controlled_paths`]
+/// and released for adoption: take over its app-server group, reconnect a control observer to
+/// the bound thread, and supervise the running TUI to its end.
+#[allow(clippy::too_many_arguments)]
+pub fn adopt_controlled_paths(
+    driver_root: &Path,
+    state_dir: &Path,
+    agent_dir: &Path,
+    identity: String,
+    runtime_id: String,
+    codex_argv: Vec<String>,
+    tui_pid: u32,
+    server_pid: u32,
+    watchdog_pid: u32,
+    owner_write_fd: i32,
+    socket_path: PathBuf,
+    safe_fallback: bool,
+) -> Result<()> {
+    anyhow::ensure!(
+        !codex_argv.is_empty(),
+        "Codex controlled launch argv is empty"
+    );
+    // SAFETY: the predecessor released this descriptor for exactly this adoption.
+    let mut server = unsafe {
+        OwnedProcessGroup::adopt(
+            server_pid,
+            watchdog_pid,
+            owner_write_fd,
+            socket_path.clone(),
+        )
+    };
+    let producer_version = ensure_supported_protocol(&codex_argv[0])?;
+    let inbox = message::inbox_dir(agent_dir);
+    let delivery = CodexDeliveryConfig {
+        catalog_root: driver_root.to_path_buf(),
+        agent_dir: agent_dir.to_path_buf(),
+        inbox,
+        identity: identity.clone(),
+        this_host: run::detect_host(),
+        supervisor: None,
+        producer_version: Some(producer_version),
+        model: declared_codex_model(&codex_argv[1..]),
+    };
+    let _owner_lock = acquire_owner_lock(state_dir)?;
+    let mut diagnostics = WrapperDiagnostics::open(state_dir, &identity, &runtime_id)?;
+    diagnostics.record(
+        "adoptedFromPredecessor",
+        json!({ "tuiPid": tui_pid, "serverPid": server_pid }),
+    )?;
+    let runtime = load_runtime(&state_dir.join("runtime.json"), &identity, &runtime_id)?;
+    let binding = load_current_binding(&state_dir.join("binding.json"), &runtime)?
+        .context("the adopted Codex session has no thread binding")?;
+    let safe_fallback_active = Arc::new(AtomicBool::new(safe_fallback));
+    let result = run_adopted(
+        server.child_mut(),
+        &socket_path,
+        state_dir,
+        &runtime,
+        binding.thread_id().to_owned(),
+        ProviderProcess::adopted(tui_pid),
+        delivery,
+        safe_fallback_active.clone(),
+        &mut diagnostics,
+    );
+    if let Err(error) = &result
+        && let Some(detached) = error.downcast_ref::<TuiDetached>()
+    {
+        let tui_pid = detached.tui_pid;
+        let released = server
+            .release()
+            .context("the Codex app-server group has no watchdog pipe to hand over")?;
+        diagnostics.record(
+            "detachedForAdoption",
+            json!({ "tuiPid": tui_pid, "serverPid": released.server_pid }),
+        )?;
+        return Err(crate::provider_session::Detached {
+            session: crate::provider_session::DetachedSession::Codex {
+                tui_pid,
+                server_pid: released.server_pid,
+                watchdog_pid: released.watchdog_pid,
+                owner_write_fd: released.owner_write_fd,
+                socket_path,
+                safe_fallback: safe_fallback_active.load(Ordering::SeqCst),
+            },
+        }
+        .into());
+    }
+    server.terminate();
+    match result {
+        Ok(()) => {
+            diagnostics.record("completed", json!({}))?;
+            Ok(())
+        }
+        Err(error) => {
+            let text = format!("{error:#}");
+            let _ = diagnostics.record("failed", json!({ "error": text }));
+            Err(error)
+        }
+    }
+}
+
+/// The adopted counterpart of [`run_connected`]: the TUI already owns the bound thread, so the new
+/// control observer resumes that thread and the monitor starts from the binding wait.
+#[allow(clippy::too_many_arguments)]
+fn run_adopted(
+    server: &mut ProviderProcess,
+    socket_path: &Path,
+    state_dir: &Path,
+    runtime: &CodexRuntime,
+    thread_id: String,
+    mut tui: ProviderProcess,
+    delivery: CodexDeliveryConfig,
+    safe_fallback_active: Arc<AtomicBool>,
+    diagnostics: &mut WrapperDiagnostics,
+) -> Result<()> {
+    let harness_agent_dir = delivery.agent_dir.clone();
+    let harness_identity = delivery.identity.clone();
+    diagnostics.record("waitingForControlSocket", json!({ "pid": server.id() }))?;
+    let connected = connect_control(server, socket_path, STARTUP_TIMEOUT)?;
+    let websocket = match connected {
+        Some(control) => {
+            let shutdown = control.try_clone()?;
+            initialize_control(control)?.map(|websocket| (websocket, shutdown))
+        }
+        None => None,
+    };
+    let Some((websocket, shutdown)) = websocket else {
+        // A stop raised before the observer reconnected still ends this session.
+        terminate_child(&mut tui);
+        let status = tui.try_wait().ok().flatten();
+        let mut writer = harness_state::Writer::new(
+            &harness_agent_dir,
+            harness_identity,
+            "codex",
+            Some(runtime.runtime_id().to_string()),
+        )
+        .with_session(runtime.incarnation());
+        let _ = writer.ended(describe_tui_exit(status));
+        return Ok(());
+    };
+    diagnostics.record("controlInitialized", json!({ "adopted": true }))?;
+    let (events_tx, events_rx) = mpsc::channel();
+    let binding_path = state_dir.join("binding.json");
+    let control_state_path = state_dir.join("control-state.json");
+    let runtime_for_reader = runtime.clone();
+    // The TUI is already running and already loaded the thread, so the resume gate opens at once.
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let _ = ready_tx.send(());
+    let event_thread = thread::spawn(move || {
+        let resume = ControlResume {
+            thread_id: &thread_id,
+            ready: ready_rx,
+            tui_loaded_timeout: TUI_LOADED_TIMEOUT,
+            permission_overrides: None,
+            preload: false,
+            preloaded: None,
+        };
+        pump_control(
+            websocket,
+            &binding_path,
+            &control_state_path,
+            &runtime_for_reader,
+            Some(resume),
+            Some(delivery),
+            safe_fallback_active,
+            events_tx,
+        )
+    });
+    let result = (|| -> Result<TuiEnd> {
+        diagnostics.record("waitingForThreadBinding", json!({ "pid": tui.id() }))?;
+        match wait_for_binding(&mut tui, &events_rx, STARTUP_TIMEOUT, diagnostics)? {
+            BindingWait::Bound => {
+                diagnostics.record("threadBound", json!({ "pid": tui.id(), "adopted": true }))?;
+                monitor_bound_tui(&mut tui, &events_rx)
+            }
+            BindingWait::Stopped => {
+                terminate_child(&mut tui);
+                Ok(TuiEnd::Stopped(tui.try_wait().ok().flatten()))
+            }
+            BindingWait::TuiExited(status) => Ok(TuiEnd::Exited(status)),
+        }
+    })();
+    if result.is_err() {
+        terminate_child(&mut tui);
+    }
+    finish_tui_session(
+        result,
+        &mut tui,
+        shutdown,
+        event_thread,
+        runtime,
+        &harness_agent_dir,
+        &harness_identity,
+    )
 }
 
 fn run_controlled_owned(
@@ -2503,6 +2707,29 @@ fn run_controlled_owned(
                 )
             });
     }
+    if let Err(error) = &result
+        && let Some(detached) = error.downcast_ref::<TuiDetached>()
+    {
+        let tui_pid = detached.tui_pid;
+        let released = server
+            .release()
+            .context("the Codex app-server group has no watchdog pipe to hand over")?;
+        diagnostics.record(
+            "detachedForAdoption",
+            json!({ "tuiPid": tui_pid, "serverPid": released.server_pid }),
+        )?;
+        return Err(crate::provider_session::Detached {
+            session: crate::provider_session::DetachedSession::Codex {
+                tui_pid,
+                server_pid: released.server_pid,
+                watchdog_pid: released.watchdog_pid,
+                owner_write_fd: released.owner_write_fd,
+                socket_path,
+                safe_fallback: safe_fallback_active.load(Ordering::SeqCst),
+            },
+        }
+        .into());
+    }
     server.terminate();
     result
 }
@@ -2582,13 +2809,14 @@ fn spawn_controlled_app_server(
         .with_context(|| format!("starting {codex} app-server"))
 }
 
-fn spawn_controlled_tui(codex: &str, args: &[String]) -> std::io::Result<Child> {
+fn spawn_controlled_tui(codex: &str, args: &[String]) -> std::io::Result<ProviderProcess> {
     Command::new(codex)
         .args(args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .spawn()
+        .map(ProviderProcess::Spawned)
 }
 
 fn claim_safe_fallback_attempt(attempted: &mut bool) -> bool {
@@ -2600,7 +2828,7 @@ fn claim_safe_fallback_attempt(attempted: &mut bool) -> bool {
 }
 
 fn run_connected(
-    server: &mut Child,
+    server: &mut ProviderProcess,
     socket_path: &Path,
     state_dir: &Path,
     runtime: &CodexRuntime,
@@ -2799,8 +3027,34 @@ fn run_connected(
         terminate_child(&mut tui);
     }
     drop(resume_ready_tx);
+    finish_tui_session(
+        result,
+        &mut tui,
+        shutdown,
+        event_thread,
+        runtime,
+        &harness_agent_dir,
+        &harness_identity,
+    )
+}
+
+/// End one controlled TUI session after its monitor returned: stop the control pump, then publish
+/// the terminal observation. A detached session skips the terminal record, because its TUI and
+/// app-server keep running under the driver's next image.
+fn finish_tui_session(
+    result: Result<TuiEnd>,
+    tui: &mut ProviderProcess,
+    shutdown: UnixStream,
+    event_thread: thread::JoinHandle<()>,
+    runtime: &CodexRuntime,
+    harness_agent_dir: &Path,
+    harness_identity: &str,
+) -> Result<()> {
     let _ = shutdown.shutdown(Shutdown::Both);
     let _ = event_thread.join();
+    if matches!(result, Ok(TuiEnd::Detached)) {
+        return Err(TuiDetached { tui_pid: tui.id() }.into());
+    }
     // The pump is gone, so nothing can observe this session again: publish the terminal
     // observation with the outcome the wrapper actually saw, before any staleness horizon.
     // Consumers must not branch on `reason`, so the observed exit always lands in `exit`.
@@ -2808,8 +3062,8 @@ fn run_connected(
     // of its writes) put this token on disk, so token-only adoption resolves to this session's
     // claimed sequence — and the terminal record fences exactly the records this session wrote.
     let mut harness_writer = harness_state::Writer::new(
-        &harness_agent_dir,
-        harness_identity.clone(),
+        harness_agent_dir,
+        harness_identity.to_owned(),
         "codex",
         Some(runtime.runtime_id().to_string()),
     )
@@ -2817,6 +3071,7 @@ fn run_connected(
     let _ = match &result {
         Ok(TuiEnd::Exited(status)) => harness_writer.ended(describe_tui_exit(Some(*status))),
         Ok(TuiEnd::Stopped(status)) => harness_writer.ended(describe_tui_exit(*status)),
+        Ok(TuiEnd::Detached) => Ok(()),
         Err(error) => {
             let observed_exit = tui.try_wait().ok().flatten();
             harness_writer.observe(
@@ -2833,7 +3088,7 @@ fn run_connected(
     match result {
         Ok(TuiEnd::Exited(status)) => completed_tui(status),
         // The wrapper stopped its own session: not a failure, mirroring the shared wrapper body.
-        Ok(TuiEnd::Stopped(_)) => Ok(()),
+        Ok(TuiEnd::Stopped(_)) | Ok(TuiEnd::Detached) => Ok(()),
         Err(error) => Err(error),
     }
 }
@@ -2844,7 +3099,27 @@ enum TuiEnd {
     Exited(ExitStatus),
     /// The wrapper's stop flag ended the session; the reaped status when one was observable.
     Stopped(Option<ExitStatus>),
+    /// [`crate::provider_session::DETACH`] released the live TUI to the next driver image.
+    Detached,
 }
+
+/// The TUI was released for adoption; the launch path adds its app-server group.
+#[derive(Debug)]
+struct TuiDetached {
+    tui_pid: u32,
+}
+
+impl fmt::Display for TuiDetached {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "the Codex TUI {} was released for adoption",
+            self.tui_pid
+        )
+    }
+}
+
+impl std::error::Error for TuiDetached {}
 
 /// The label for a TUI end whose status may not have been observable at all. A status that WAS
 /// reaped is spelled by the one shared exit-label map; no status is the same "unknown" the map's
@@ -3701,7 +3976,7 @@ fn diagnostic_option_name(argument: &str) -> String {
 }
 
 fn connect_control(
-    server: &mut Child,
+    server: &mut crate::provider_session::ProviderProcess,
     socket_path: &Path,
     timeout: Duration,
 ) -> Result<Option<UnixStream>> {
@@ -4640,7 +4915,7 @@ enum BindingWait {
 }
 
 fn wait_for_binding(
-    tui: &mut Child,
+    tui: &mut ProviderProcess,
     events: &Receiver<ControlEvent>,
     timeout: Duration,
     diagnostics: &mut WrapperDiagnostics,
@@ -4700,7 +4975,7 @@ fn wait_for_binding(
     }
 }
 
-fn monitor_bound_tui(tui: &mut Child, events: &Receiver<ControlEvent>) -> Result<TuiEnd> {
+fn monitor_bound_tui(tui: &mut ProviderProcess, events: &Receiver<ControlEvent>) -> Result<TuiEnd> {
     loop {
         if crate::provider_session::STOP.load(std::sync::atomic::Ordering::SeqCst) {
             // st2's stop path: end the session and return through the ordinary terminal-write
@@ -4710,6 +4985,11 @@ fn monitor_bound_tui(tui: &mut Child, events: &Receiver<ControlEvent>) -> Result
         }
         if let Some(status) = tui.try_wait()? {
             return Ok(TuiEnd::Exited(status));
+        }
+        // Only a bound session detaches: its binding and control state are on disk, so the next
+        // image can resubscribe to exactly this thread.
+        if crate::provider_session::DETACH.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(TuiEnd::Detached);
         }
         match events.recv_timeout(CONTROL_POLL) {
             Ok(ControlEvent::TuiThreadLoaded(acknowledge)) => {
@@ -5203,7 +5483,7 @@ fn poll_json_message(websocket: &mut WebSocket<UnixStream>) -> Result<ControlRea
 mod process_group;
 use self::process_group::*;
 
-fn terminate_child(child: &mut Child) {
+fn terminate_child(child: &mut ProviderProcess) {
     match child.try_wait() {
         Ok(Some(_)) => {}
         _ => {

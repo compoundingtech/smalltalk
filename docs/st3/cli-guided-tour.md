@@ -68,10 +68,13 @@ st missions show mission-run/64bcc9227e0166a571e09117d35c572e
 st missions publish --help
 st missions start --help
 st missions cancel --help
+st missions outcome --help
+st missions retire --help
 ```
 
-`ls` and `show` are live reads. Publication, start, and cancel are reviewed through help here and
-are mutation-tested only in the disposable fixture run.
+`ls` and `show` are live reads. Publication, start, cancel, setting a finished run's outcome, and
+retirement are reviewed through help here and are mutation-tested only in the disposable fixture
+run.
 
 ### 3. `work` — the truthful queue and worker lifecycle
 
