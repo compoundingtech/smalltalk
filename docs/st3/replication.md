@@ -282,6 +282,62 @@ repair "record/HASH" {
 
 A replacement must already be a valid admitted claim. The original record remains visible with state `repaired`.
 
+## Checkpoints
+
+A checkpoint deletes replicated claims that no longer change any answer. Checkpoint
+`checkpoint/D` covers claims dated before the start of UTC day `D`, its cut, and becomes due at
+the start of day `D+2`. Each daemon does the checkpoint work that is due every ten minutes.
+
+A checkpoint drops only claims of these kinds, and only when a later claim of the same slot that
+it keeps sets every field a reader takes from the dropped one:
+
+- `harness.observed`, `harness.timeline`, `loop.state`, `observer.observed`,
+  `transport.observed`, `daemon.diagnostic` and `subscription.mission-deferred`;
+- `render.applied`, `runtime.readiness-deadline-reached`, and the runtime's own
+  `runtime.action.*` claims.
+
+It never drops a claim a person wrote or a claim another claim cites as evidence. Mission run,
+step, membership and message claims are never dropped. Each node proves the drops before it agrees to
+them, and every node deletes the same ones:
+
+1. **Seal.** Each participant publishes `checkpoint.sealed`, naming the envelopes it holds from
+   before the cut. The participants are every writer the node has heard of, less those that left
+   the fleet and those a person excused.
+2. **Verify.** Once every participant has sealed the same envelopes, each node plans the drops. It
+   proves on a copy of its store that deleting them changes neither the graph nor any reader's
+   answer, then publishes `checkpoint.verified` with the digest of the drops.
+3. **Trim.** When every participant verified the same drops, the checkpoint is stable. Each node
+   first records a tombstone for every envelope and claim it drops, then deletes them in chunks.
+   After a crash, the next pass finishes the trim. The tombstones stand in for the dropped
+   envelopes in the inventory. The authority digest does not change, and peers, including builds
+   without checkpoints, never send those envelopes again.
+
+A node that did not verify a stable checkpoint, such as one that joined later, adopts it. A peer
+lists the newest checkpoint it trimmed in its inventory. The node fetches the manifest of
+tombstones from that peer and checks the whole manifest against the verified drop digest before
+it stores anything. Then it trims to the same tombstones. A heal never fetches back what a
+checkpoint dropped.
+
+A participant that does not seal holds up every checkpoint, whether it is away or runs a build
+without checkpoints. Three days after a checkpoint became due, a participant asks a person in
+`st now` to bring the machine back or excuse it:
+
+```sh
+st replication checkpoint status                  # the newest stable checkpoint, and who sealed the next
+st replication checkpoint plan --cut 2026-09-27    # what it would drop here, proved on a copy
+st replication checkpoint excuse node-c --reason "away for a week" --as person/operator
+```
+
+An excusal fences nothing. What the excused writer wrote while away still replicates when it
+returns, and its next seal ends the excusal.
+
+If a trim finds that a deletion would change the graph, it rolls that deletion back and stops. It
+records a `checkpoint-trim-graph-changed` diagnostic, and the node seals nothing more until a
+person runs `st replication checkpoint resume --reason ...`.
+
+Checkpoints are on by default. `[checkpoint] enabled = false` in a node's config stops that node
+sealing. Every participant must seal, so this stops trimming for the whole fleet.
+
 ## Recovery
 
 Replication never changes a source SQLite file directly. It exchanges immutable authority records through the signed protocol.
