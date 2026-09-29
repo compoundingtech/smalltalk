@@ -739,6 +739,11 @@ const ACTIONS: &[&str] = &[
     "work.retry",
     "work.publish-mission",
     "agent.queue-move",
+    "lane.join",
+    "lane.leave",
+    "lane.move",
+    "lane.mark",
+    "lane.approve",
     "runtime.stop",
     "runtime.restart",
     "runtime.reset",
@@ -776,6 +781,11 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "work.release",
     "work.retry",
     "agent.queue-move",
+    "lane.join",
+    "lane.leave",
+    "lane.move",
+    "lane.mark",
+    "lane.approve",
     "runtime.stop",
     "runtime.restart",
     "runtime.reset",
@@ -1578,6 +1588,85 @@ fn observer_subscription_resources(
     Ok(values)
 }
 
+/// Every open lane, or every declared lane with history, in client form.
+pub(super) async fn lanes(
+    State(state): State<AppState>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let store = state.store.clone();
+    let history = query.history;
+    let items = super::blocking_store(move || {
+        Ok(store.lanes(history)?.iter().map(lane_resource).collect())
+    })
+    .await?;
+    client_page(&state, &snapshot, "lanes", items, &query).map(Json)
+}
+
+pub(super) async fn lane_detail(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    let store = state.store.clone();
+    let lane = client_detail_id("lane", &id);
+    let view = super::blocking_store(move || store.lane(&lane)).await?;
+    view.map(|view| Json(lane_resource(&view)))
+        .ok_or_else(|| ApiError::not_found(format!("lane `{id}` does not exist")))
+}
+
+/// One lane as a client resource: its declaration, its entries in order, and recent changes.
+pub(super) fn lane_resource(lane: &crate::model::LaneView) -> Value {
+    let prefix = lane.entries_prefix.as_deref();
+    let timestamp = |at: Option<u128>| at.map(client_timestamp);
+    json!({
+        "id": lane.subject,
+        "kind": "lane",
+        "revision": lane.revision,
+        "updated_at": client_timestamp(lane.updated_at_unix_ms.unwrap_or_default()),
+        "name": lane.name,
+        "mission_run_id": lane.run,
+        "mission_id": lane.mission,
+        "entries_prefix": lane.entries_prefix,
+        "approver_id": lane.approver,
+        "state": if lane.open { "open" } else { "closed" },
+        "entries": lane.entries.iter().map(|entry| json!({
+            "entry_id": entry.entry,
+            "label": crate::lane::short_entry(prefix, &entry.entry),
+            "position": entry.position,
+            "state": entry.state,
+            "detail": entry.detail,
+            "head": entry.head,
+            "marked_by_id": entry.marked_by,
+            "marked_at": timestamp(entry.marked_at_unix_ms),
+            "joined_by_id": entry.joined_by,
+            "joined_at": client_timestamp(entry.joined_at_unix_ms),
+            "join_reason": entry.join_reason,
+            "approved_by_id": entry.approved_by,
+            "approved_at": timestamp(entry.approved_at_unix_ms),
+        })).collect::<Vec<_>>(),
+        "recent": lane.recent.iter().map(|recent| json!({
+            "change": recent.kind,
+            "entry_id": recent.entry,
+            "label": crate::lane::short_entry(prefix, &recent.entry),
+            "actor_id": recent.actor,
+            "at": client_timestamp(recent.at_unix_ms),
+            "outcome": recent.outcome,
+            "placement": recent.placement,
+            "anchor_id": recent.anchor,
+            "reason": recent.reason,
+        })).collect::<Vec<_>>(),
+        "operational": {
+            "layer": if lane.open { "current" } else { "history" },
+            "actionable": lane.open,
+            "reasons": if lane.open { Vec::<&str>::new() } else { vec!["closed"] }
+        }
+    })
+}
+
 pub(super) async fn observers(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
@@ -2194,8 +2283,13 @@ fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Va
         );
         queues.push(agent_queue_value(&queue));
     }
+    let lanes = store
+        .lanes(false)?
+        .iter()
+        .map(lane_resource)
+        .collect::<Vec<_>>();
     Ok(json!({ "runs": run_values, "standing_queues": queues,
-        "unstarted_missions": unstarted, "agents": agents }))
+        "unstarted_missions": unstarted, "agents": agents, "lanes": lanes }))
 }
 
 pub(super) async fn mission_detail(
@@ -5521,6 +5615,7 @@ fn action_scope(action: &str) -> Option<&'static str> {
         "session" => "control.missions",
         "work" => "control.work",
         "agent" => "control.work",
+        "lane" => "control.work",
         "runtime" => "control.runtimes",
         "terminal" => {
             if matches!(action, "terminal.attach" | "terminal.detach") {
@@ -6378,6 +6473,29 @@ async fn dispatch_action(
             blocking_action(move || store.move_seat_queue_run(&move_request)).await?;
             signal_changed(state);
             Ok(vec![agent])
+        }
+        action @ ("lane.join" | "lane.leave" | "lane.move" | "lane.mark" | "lane.approve") => {
+            let optional = |key: &str| p.get(key).map(|_| parameter_string(p, key)).transpose();
+            let change_request = crate::model::LaneChangeRequest {
+                lane: parameter_string(p, "lane_id")?,
+                change: action.trim_start_matches("lane.").to_owned(),
+                entry: parameter_string(p, "entry_id")?,
+                reason: optional("reason")?,
+                outcome: optional("outcome")?,
+                placement: optional("placement")?,
+                anchor: optional("anchor_id")?,
+                state: optional("state")?,
+                detail: optional("detail")?,
+                head: optional("head")?,
+                actor: authority_actor.clone(),
+                idempotency_key: request.idempotency_key.clone(),
+            };
+            let store = state.store.clone();
+            let response = blocking_action(move || store.change_lane(&change_request)).await?;
+            if response.claim.is_some() {
+                signal_changed(state);
+            }
+            Ok(vec![response.lane.subject])
         }
         action @ ("runtime.stop" | "runtime.restart" | "runtime.reset") => {
             let runtime = runtime_control_target(state, snapshot, session, request)?;
