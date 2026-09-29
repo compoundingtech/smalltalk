@@ -18,5 +18,5 @@ The gates prove these results:
 
 This eval uses one Codex planning run.
 
-Validate its graph contract with `cargo test -p st3 --test examples`; live orchestration uses the
+Validate its graph contract with `cargo test -p st3 --test integration examples::`; live orchestration uses the
 repository's internal eval controller, not the public CLI.
