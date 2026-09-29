@@ -2,8 +2,8 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
@@ -27,11 +27,11 @@ use crate::model::{
     PlanningSessionView, PlanningVariantView, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId,
     ReplicaRecordView, ReplicaRepairDeclaration, ReplicationExchange, ReplicationInventory,
     ReplicationInventoryBucket, ReplicationPeerStatus, ReplicationPeerSync, ReplicationReceipt,
-    ReplicationStatus, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
-    RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
-    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
-    SubscriptionRequestDecision, SubscriptionRequestView, SubscriptionSpec, UsageSummary,
-    WorkRequest, WorkSelector, WorkWakeView,
+    ReplicationStatus, ReplicationTimings, ResourceObservationOutcome, ResourceRefreshOperation,
+    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
+    RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus,
+    SubscriptionConditionSpec, SubscriptionRequestDecision, SubscriptionRequestView,
+    SubscriptionSpec, UsageSummary, WorkRequest, WorkSelector, WorkWakeView,
 };
 #[cfg(test)]
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
@@ -93,6 +93,12 @@ CREATE INDEX IF NOT EXISTS claims_subject_kind_index ON claims(subject, kind, st
 CREATE INDEX IF NOT EXISTS claims_message_to_index
 ON claims(json_extract(body, '$.fields.to'), subject)
 WHERE kind='message.sent';
+CREATE INDEX IF NOT EXISTS claims_message_from_index
+ON claims(json_extract(body, '$.fields.from'), store_index)
+WHERE kind='message.sent';
+CREATE INDEX IF NOT EXISTS claims_actor_progress_index
+ON claims(actor, store_index)
+WHERE kind IN ('work.progress', 'work.submitted');
 CREATE INDEX IF NOT EXISTS claims_timeline_incarnation_index
 ON claims(subject, kind, json_extract(body, '$.fields.incarnation_id'), store_index)
 WHERE kind='harness.timeline';
@@ -106,6 +112,12 @@ WHERE kind IN (
     'subscription.mission-failed',
     'subscription.mission-request-cancelled'
 );
+CREATE INDEX IF NOT EXISTS claims_subscription_deferred_request_index
+ON claims(subject, json_extract(body, '$.fields.request'), store_index)
+WHERE kind='subscription.mission-deferred';
+CREATE INDEX IF NOT EXISTS claims_subscription_deferred_deadline_index
+ON claims(CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER))
+WHERE kind='subscription.mission-deferred';
 CREATE INDEX IF NOT EXISTS claims_schedule_started_request_index
 ON claims(subject, json_extract(body, '$.fields.request'))
 WHERE kind='schedule.work-started';
@@ -368,6 +380,37 @@ ON local_observations(dedupe_key) WHERE dedupe_key IS NOT NULL;
 CREATE INDEX IF NOT EXISTS local_observations_timeline_index
 ON local_observations(subject, json_extract(body, '$.fields.incarnation_id'), id)
 WHERE kind='harness.timeline';
+CREATE TABLE IF NOT EXISTS local_usage_totals (
+    subject TEXT NOT NULL,
+    incarnation_id TEXT NOT NULL,
+    model TEXT NOT NULL,
+    owner_run TEXT NOT NULL,
+    owner_step TEXT NOT NULL,
+    host TEXT NOT NULL,
+    input_tokens INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cached_tokens INTEGER NOT NULL DEFAULT 0,
+    total_tokens INTEGER NOT NULL DEFAULT 0,
+    observed_at_unix_ms INTEGER NOT NULL,
+    PRIMARY KEY(subject, incarnation_id, model, owner_run, owner_step, host)
+);
+CREATE TABLE IF NOT EXISTS local_usage_seen (
+    subject TEXT NOT NULL,
+    source_id TEXT NOT NULL,
+    PRIMARY KEY(subject, source_id)
+);
+-- The last replicated observation of each `latest` slot this node wrote, and the newest
+-- local observation of the slot that no replicated claim carries yet.
+CREATE TABLE IF NOT EXISTS local_latest_slots (
+    subject TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    slot TEXT NOT NULL,
+    published_at_unix_ms INTEGER NOT NULL,
+    published_fields TEXT NOT NULL,
+    pending_local_id INTEGER,
+    PRIMARY KEY (subject, kind, slot)
+);
 CREATE TABLE IF NOT EXISTS revision_proposals (
     id TEXT PRIMARY KEY,
     run_id TEXT NOT NULL REFERENCES mission_runs(id),
@@ -491,14 +534,22 @@ impl WriterConnection {
         }
     }
 
+    /// The writer. A panic while the writer was held cannot leave a half-written database: its
+    /// open transaction rolls back as the panic unwinds. So a poisoned lock is recovered, rather
+    /// than turning every later write into a panic while the daemon keeps running.
+    fn write(&self) -> WriterGuard<'_> {
+        WriterGuard {
+            connection: self
+                .connection
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+            committed_index: &self.committed_index,
+        }
+    }
+
+    #[cfg(test)]
     fn lock(&self) -> Result<WriterGuard<'_>, &'static str> {
-        self.connection
-            .lock()
-            .map(|connection| WriterGuard {
-                connection,
-                committed_index: &self.committed_index,
-            })
-            .map_err(|_| "store mutex poisoned")
+        Ok(self.write())
     }
 }
 
@@ -546,12 +597,12 @@ impl ReadPool {
         let mut connections = self
             .connections
             .lock()
-            .expect("store read-pool mutex poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         while connections.is_empty() {
             connections = self
                 .available
                 .wait(connections)
-                .expect("store read-pool mutex poisoned");
+                .unwrap_or_else(PoisonError::into_inner);
         }
         ReadGuard {
             pool: self,
@@ -576,7 +627,7 @@ impl Drop for ReadGuard<'_> {
             .pool
             .connections
             .lock()
-            .expect("store read-pool mutex poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         connections.push(
             self.connection
                 .take()
@@ -598,6 +649,11 @@ pub struct Store {
     replica_generation: AtomicU64,
     replication_snapshot: Mutex<Option<Arc<ReplicationSnapshot>>>,
     replication_sync: Mutex<BTreeMap<String, PeerSyncProgress>>,
+    replication_timers: ReplicationTimers,
+    /// Admitted replicated claims wait for a projection a catching-up node deferred.
+    replication_projection_deferred: AtomicBool,
+    /// When this process last projected replicated claims, in Unix milliseconds.
+    last_replication_projection_unix_ms: AtomicU64,
     /// This node's fleet member key. Set, it signs every envelope of this node's writer.
     member_key: std::sync::RwLock<Option<Arc<crate::fleet::MemberKey>>>,
     origin: String,
@@ -657,6 +713,11 @@ impl Store {
         let _guards: Vec<_> = (0..READ_CONNECTIONS).map(|_| self.readers.get()).collect();
         hold();
     }
+
+    pub(crate) fn hold_writer_for_test(&self, hold: impl FnOnce()) {
+        let _writer = self.connection.write();
+        hold();
+    }
 }
 
 #[derive(Clone)]
@@ -671,6 +732,56 @@ struct ReplicationSnapshot {
     authority_digest: String,
     graph_generation: i64,
     graph_digest: String,
+}
+
+/// Nanoseconds every SQLite statement in this process has taken, from SQLite's profile hook.
+static SQLITE_NANOS: AtomicU64 = AtomicU64::new(0);
+/// The part of that time, and the count, of `COMMIT` statements, which wait for a disk flush.
+static SQLITE_COMMITS: AtomicU64 = AtomicU64::new(0);
+static SQLITE_COMMIT_NANOS: AtomicU64 = AtomicU64::new(0);
+
+fn record_sqlite_time(statement: &str, duration: std::time::Duration) {
+    SQLITE_NANOS.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    if statement == "COMMIT" {
+        SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);
+        SQLITE_COMMIT_NANOS.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// Cumulative replication time by stage, in nanoseconds.
+#[derive(Default)]
+struct ReplicationTimers {
+    exchanges: AtomicU64,
+    envelopes_received: AtomicU64,
+    round_trip: AtomicU64,
+    export: AtomicU64,
+    snapshot: AtomicU64,
+    receipt: AtomicU64,
+    admission: AtomicU64,
+    verify: AtomicU64,
+    projection: AtomicU64,
+    repair: AtomicU64,
+    signing: AtomicU64,
+}
+
+/// Adds the time until it drops to one stage counter.
+struct StageTimer<'a> {
+    counter: &'a AtomicU64,
+    started: std::time::Instant,
+}
+
+fn time_stage(counter: &AtomicU64) -> StageTimer<'_> {
+    StageTimer {
+        counter,
+        started: std::time::Instant::now(),
+    }
+}
+
+impl Drop for StageTimer<'_> {
+    fn drop(&mut self) {
+        self.counter
+            .fetch_add(self.started.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
 }
 
 /// Live sync measurements for one peer. They are rebuilt by the first exchange after a restart,
@@ -996,6 +1107,9 @@ pub struct ReplicationAdmission {
     /// Envelopes held as `unsigned` or `fenced` by the fleet membership rules.
     pub held: usize,
     pub changed: bool,
+    /// Time spent decoding envelopes, checking their hashes and claim schemas, and looking up
+    /// their stored signatures.
+    pub verify: std::time::Duration,
 }
 
 enum ReplicatedClaimAdmission {
@@ -1182,10 +1296,6 @@ fn discovered_collection_items(
     else {
         return Vec::new();
     };
-    let prior_numbers = previous_items
-        .iter()
-        .filter_map(|item| item.get("number").and_then(Value::as_u64))
-        .collect::<BTreeSet<_>>();
     let Some(current_items) = current.get(field).and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -1193,7 +1303,15 @@ fn discovered_collection_items(
         .iter()
         .filter_map(|item| {
             let number = item.get("number")?.as_u64()?;
-            if prior_numbers.contains(&number) {
+            let prior = previous_items
+                .iter()
+                .find(|old| old.get("number").and_then(Value::as_u64) == Some(number));
+            if prior.is_some_and(|old| match field {
+                "pull_requests" => ["head", "state", "draft"]
+                    .iter()
+                    .all(|name| old.get(*name) == item.get(*name)),
+                _ => true,
+            }) {
                 return None;
             }
             let (segment, kind) = match field {
@@ -1204,7 +1322,12 @@ fn discovered_collection_items(
             let mut facts = serde_json::Map::from_iter([
                 ("repository".into(), Value::String(repository.into())),
                 ("number".into(), Value::from(number)),
-                ("state".into(), Value::String("open".into())),
+                (
+                    "state".into(),
+                    item.get("state")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String("open".into())),
+                ),
             ]);
             for name in ["url", "title"] {
                 if let Some(value) = item.get(name).filter(|value| !value.is_null()) {
@@ -1212,8 +1335,14 @@ fn discovered_collection_items(
                 }
             }
             if field == "pull_requests" {
-                facts.insert("draft".into(), Value::Bool(false));
+                facts.insert(
+                    "draft".into(),
+                    item.get("draft").cloned().unwrap_or(Value::Bool(false)),
+                );
                 facts.insert("merged".into(), Value::Bool(false));
+                if let Some(head) = item.get("head").filter(|head| !head.is_null()) {
+                    facts.insert("head_sha".into(), head.clone());
+                }
             }
             Some((
                 format!("{repository}/{segment}/{number}"),
@@ -1232,8 +1361,9 @@ fn open_read_connections(path: &Path, shared_memory: bool) -> Result<Vec<Connect
     };
     (0..READ_CONNECTIONS)
         .map(|_| {
-            let connection = Connection::open_with_flags(path, flags)
+            let mut connection = Connection::open_with_flags(path, flags)
                 .with_context(|| format!("open st read connection {}", path.display()))?;
+            connection.profile(Some(record_sqlite_time));
             connection.execute_batch(
                 "PRAGMA busy_timeout = 5000;
                  PRAGMA foreign_keys = ON;
@@ -1253,6 +1383,7 @@ impl Store {
         }
         let mut connection = Connection::open(path)
             .with_context(|| format!("open st database {}", path.display()))?;
+        connection.profile(Some(record_sqlite_time));
         // Keep the hot graph and replication index pages in SQLite's bounded
         // page cache. The default (~2 MiB per connection) churns against the
         // large durable claim store during otherwise quiet replication.
@@ -1283,6 +1414,9 @@ impl Store {
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
             replication_sync: Mutex::new(BTreeMap::new()),
+            replication_timers: ReplicationTimers::default(),
+            replication_projection_deferred: AtomicBool::new(false),
+            last_replication_projection_unix_ms: AtomicU64::new(0),
             member_key: std::sync::RwLock::new(None),
             origin,
         })
@@ -1300,6 +1434,7 @@ impl Store {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
+        connection.profile(Some(record_sqlite_time));
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
@@ -1326,6 +1461,9 @@ impl Store {
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
             replication_sync: Mutex::new(BTreeMap::new()),
+            replication_timers: ReplicationTimers::default(),
+            replication_projection_deferred: AtomicBool::new(false),
+            last_replication_projection_unix_ms: AtomicU64::new(0),
             member_key: std::sync::RwLock::new(None),
             origin,
         })
@@ -1427,7 +1565,7 @@ impl Store {
     }
 
     pub fn rebuild_claim_projections(&self) -> Result<()> {
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         rebuild_operations_tx(&transaction)?;
         rebuild_planning_tx(&transaction)?;
@@ -1457,7 +1595,7 @@ impl Store {
         key: &str,
         response: &T,
     ) -> Result<()> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection.execute(
             "INSERT OR IGNORE INTO idempotency(operation_id, response) VALUES (?1, ?2)",
             params![opaque_cache_key(key), serde_json::to_string(response)?],
@@ -1534,7 +1672,7 @@ impl Store {
         source_generation: Option<&str>,
     ) -> Result<PlanningSessionView, St3Error> {
         let now = now_ms().to_string();
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection
             .execute(
                 "INSERT OR IGNORE INTO planning_sessions(id, mission_id, request_ref, workspace, requester, planner, planner_spec_json, status, target_run_id, source_generation_id, created_at_unix_ms, updated_at_unix_ms)
@@ -1578,7 +1716,7 @@ impl Store {
         mission_revision: &str,
     ) -> Result<PlanningSessionView, St3Error> {
         let id = id.strip_prefix("planning-session/").unwrap_or(id);
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction().map_err(internal)?;
         let (planner, status): (String, String) = transaction
             .query_row(
@@ -1680,7 +1818,7 @@ impl Store {
     ) -> Result<PlanningSessionView, St3Error> {
         let id = id.strip_prefix("planning-session/").unwrap_or(id);
         let now = now_ms().to_string();
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection
             .execute(
                 "INSERT INTO planning_previews(session_id, variant, candidate_revision, hash, store_index, graph, diff, mission_response, created_at_unix_ms)
@@ -1738,7 +1876,7 @@ impl Store {
         published_revision: Option<&str>,
     ) -> Result<PlanningSessionView, St3Error> {
         let id = id.strip_prefix("planning-session/").unwrap_or(id);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         let (requester, current): (String, String) = connection
             .query_row(
                 "SELECT requester, status FROM planning_sessions WHERE id=?1",
@@ -1874,7 +2012,7 @@ impl Store {
             }))
             .map_err(internal)?,
         ));
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some((response, stored_hash)) = connection
             .query_row(
                 "SELECT i.response, r.request_hash FROM idempotency i JOIN mission_run_requests r ON r.operation_id=i.operation_id WHERE i.operation_id=?1",
@@ -2081,7 +2219,7 @@ impl Store {
         let subject = normalize_step_run(subject);
         let actor = normalize_actor(actor, "agent");
         let now = now_ms();
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -2447,7 +2585,7 @@ impl Store {
             .map_err(internal)?,
         ));
         let now = now_ms();
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -2550,7 +2688,7 @@ impl Store {
             .strip_prefix("revision-proposal/")
             .unwrap_or(proposal);
         let actor = normalize_actor(actor, "person");
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -2686,7 +2824,7 @@ impl Store {
                 mission_run: run,
                 proposal: Some(applied),
             };
-            let connection = self.connection.lock().expect("store mutex poisoned");
+            let connection = self.connection.write();
             connection
                 .execute(
                     "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
@@ -2712,7 +2850,7 @@ impl Store {
             mission_run: run,
             proposal: Some(proposal),
         };
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection
             .execute(
                 "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
@@ -2743,7 +2881,7 @@ impl Store {
                 "agent"
             },
         );
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -2824,7 +2962,7 @@ impl Store {
     ) -> Result<Option<RevisionSubmissionView>, St3Error> {
         let run_id = run.strip_prefix("mission-run/").unwrap_or(run);
         let proposal = {
-            let connection = self.connection.lock().expect("store mutex poisoned");
+            let connection = self.connection.write();
             let active: u32 = connection
                 .query_row(
                     "SELECT COUNT(*) FROM step_runs
@@ -2954,7 +3092,7 @@ impl Store {
 
     pub fn mission_run_for_parent_step(&self, step: &str) -> Result<Option<MissionRunView>> {
         let step = normalize_step_run(step);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         let run_id = connection
             .query_row(
                 "SELECT id FROM mission_runs WHERE parent_step_run=?1 ORDER BY created_at_unix_ms DESC LIMIT 1",
@@ -3254,7 +3392,7 @@ impl Store {
         let mut new_steps = Vec::new();
         flatten_steps(mission, None, &[], &mut new_steps);
 
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -3641,7 +3779,8 @@ impl Store {
         let now = now_ms() as i64;
         let deadline: Option<i64> = connection.query_row(
             "SELECT MIN(CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER))
-             FROM claims WHERE kind='subscription.mission-deferred'
+             FROM claims INDEXED BY claims_subscription_deferred_deadline_index
+             WHERE kind='subscription.mission-deferred'
                AND CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER)>?1",
             [now],
             |row| row.get(0),
@@ -3659,7 +3798,7 @@ impl Store {
         } else {
             format!("mission-run/{run}")
         };
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction().map_err(internal)?;
         let claim_ids =
             cancel_mission_run_tx(&transaction, &self.origin, &run, reason, None, now_ms())?;
@@ -3669,7 +3808,7 @@ impl Store {
 
     pub fn terminate_mission_run_descendants(&self, run: &str, reason: &str) -> Result<bool> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let generation: Option<String> = transaction
             .query_row(
@@ -4295,6 +4434,16 @@ impl Store {
         Ok(view)
     }
 
+    pub fn fresh_context_ready(
+        &self,
+        step: &StepRunView,
+        actor: &str,
+        incarnation: &str,
+    ) -> Result<bool> {
+        let connection = self.readers.get();
+        fresh_context_ready_tx(&connection, step, actor, incarnation).map_err(Into::into)
+    }
+
     pub fn work_action(
         &self,
         subject: &str,
@@ -4319,7 +4468,7 @@ impl Store {
                 )
             })?;
         let now = now_ms();
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -4495,6 +4644,20 @@ impl Store {
                 ),
             )
             .with_detail("next_work_id", next));
+        }
+        if action == "claim" && current.status == "ready" {
+            let mut step = current.clone();
+            enrich_step_definition(&transaction, &mut step).map_err(internal)?;
+            if !fresh_context_ready_tx(&transaction, &step, &actor, requested_incarnation)
+                .map_err(internal)?
+            {
+                return Err(St3Error::new(
+                    "fresh-context-pending",
+                    format!(
+                        "`{actor}` must start a fresh harness session before claiming `{subject}`"
+                    ),
+                ));
+            }
         }
         let lease_valid = current
             .claim_expires_at_unix_ms
@@ -4690,7 +4853,7 @@ impl Store {
         reason: Option<&str>,
     ) -> Result<bool> {
         let subject = normalize_step_run(subject);
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let current: Option<StepStateRow> = transaction
             .query_row(
@@ -4779,7 +4942,7 @@ impl Store {
         backoff_ms: u64,
     ) -> Result<bool> {
         let subject = normalize_step_run(subject);
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let current: Option<StepRetryRow> = transaction
             .query_row(
@@ -4860,7 +5023,7 @@ impl Store {
         reviewer: &str,
     ) -> Result<bool> {
         let subject = normalize_step_run(subject);
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let current: Option<(String, u32, String)> = transaction
             .query_row(
@@ -4922,7 +5085,7 @@ impl Store {
     ) -> Result<bool> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
         let subject = format!("mission-run/{run}");
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let current: Option<(String, String)> = transaction
             .query_row(
@@ -5537,7 +5700,7 @@ impl Store {
         idempotency_key: &str,
         actor: Option<&str>,
     ) -> Result<ApplyResponse, St3Error> {
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id = ?1",
@@ -6352,7 +6515,7 @@ impl Store {
             St3Error::new("document-not-text", "a document must contain valid UTF-8")
         })?;
         let hash = hex::encode(Sha256::digest(bytes));
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -6513,11 +6676,16 @@ impl Store {
         input: &ClaimInput,
     ) -> Result<(ClaimRecord, bool), St3Error> {
         self.validate_claim_input(input)?;
-        if local_retention(&input.kind) {
+        if local_retention(&input.kind)
+            || (input.actor.is_none() && system_local_retention(&input.kind))
+        {
             return self.append_local_observation(input);
         }
+        if latest_retention(&input.kind) {
+            return self.append_latest_observation(input, now_ms());
+        }
         let operation = claim_operation(input)?;
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some((operation_id, request_digest)) = &operation
             && let Some((stored_digest, canonical_claim, state)) =
                 operation_tx(&connection, operation_id).map_err(internal)?
@@ -6670,122 +6838,107 @@ impl Store {
         &self,
         input: &ClaimInput,
     ) -> Result<(ClaimRecord, bool), St3Error> {
-        if input.expected_subject.is_some() {
-            return Err(St3Error::new(
-                "local-observation-head",
-                "a local observation does not take part in the subject's claim head",
-            ));
-        }
-        let body = json!({
-            "fields": &input.fields,
-            "evidence": input.evidence,
-        });
-        st3_schema::registry()
-            .validate_claim(&input.subject, &input.kind, &input.fields)
-            .map_err(|error| St3Error::new(error.code, error.message))?;
-        // A timeline entry keeps the sequence its driver gave it. A replicated claim could
-        // fall back to its unique store index, but local observations share the index of the
-        // claim they follow, so they could not order themselves.
-        if input.kind == "harness.timeline" && !input.fields.contains_key("sequence") {
-            return Err(St3Error::new(
-                "missing-claim-field",
-                "a local timeline observation needs the sequence its driver assigned",
-            ));
-        }
-        let dedupe_key = input
-            .idempotency_key
-            .as_deref()
-            .map(|key| local_observation_dedupe_key(&input.kind, key));
-        let request_digest = claim_operation(input)?.map(|(_, digest)| digest);
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        validate_local_observation(input)?;
+        let mut connection = self.connection.write();
         let transaction = connection.transaction().map_err(internal)?;
-        if let Some(key) = &dedupe_key
-            && let Some((existing, stored_digest)) = transaction
-                .query_row(
-                    &format!(
-                        "SELECT id, after_store_index, subject, kind, actor, body, observed_at_unix_ms, request_digest
-                         FROM local_observations WHERE dedupe_key=?1"
-                    ),
-                    [key],
-                    |row| {
-                        Ok((
-                            local_observation_from_row(&self.origin, row)?,
-                            row.get::<_, Option<String>>(7)?,
-                        ))
-                    },
-                )
-                .optional()
-                .map_err(internal)?
-        {
-            // A retry must repeat the original request exactly, as for a claim.
-            if stored_digest != request_digest {
-                return Err(St3Error::new(
-                    "idempotency-mismatch",
-                    "the idempotency key already identifies a different request",
-                )
-                .with_detail("stored_digest", json!(stored_digest))
-                .with_detail("request_digest", json!(request_digest)));
-            }
-            return Ok((existing, false));
-        }
-        for evidence in &input.evidence {
-            let exists = transaction
-                .query_row("SELECT 1 FROM claims WHERE id=?1", [evidence], |_| Ok(()))
-                .optional()
-                .map_err(internal)?
-                .is_some();
-            if !exists {
-                return Err(St3Error::new(
-                    "missing-evidence",
-                    format!("evidence claim `{evidence}` is not stored"),
-                ));
-            }
-        }
-        let after_store_index: u64 = transaction
-            .query_row(
-                "SELECT COALESCE(MAX(store_index), 0) FROM claims",
-                [],
-                |row| row.get(0),
-            )
-            .map_err(internal)?;
-        let observed_at = now_ms();
-        transaction
-            .execute(
-                "INSERT INTO local_observations(
-                    after_store_index, subject, kind, actor, body, dedupe_key, request_digest,
-                    observed_at_unix_ms
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                params![
-                    after_store_index,
-                    input.subject,
-                    input.kind,
-                    input.actor,
-                    canonical_json_text(&body).map_err(internal)?,
-                    dedupe_key,
-                    request_digest,
-                    observed_at as i64,
-                ],
-            )
-            .map_err(internal)?;
-        let id = transaction.last_insert_rowid();
+        let outcome = insert_local_observation_tx(&transaction, &self.origin, input, now_ms())?;
         transaction.commit().map_err(internal)?;
-        Ok((
-            ClaimRecord {
-                id: local_observation_id(&self.origin, id),
-                store_index: after_store_index,
-                batch_id: String::new(),
-                subject: input.subject.clone(),
-                kind: input.kind.clone(),
-                origin: self.origin.clone(),
-                actor: input.actor.clone(),
-                operation_id: None,
-                request_digest: None,
-                body,
-                predecessors: Vec::new(),
-                accepted_at_unix_ms: observed_at,
-            },
-            true,
-        ))
+        Ok(outcome)
+    }
+
+    /// Record an observation of `latest` retention. The local observation log keeps every
+    /// one. The replicated claim log gets a claim only when the observed state changes; the
+    /// returned record is that claim, or the local observation when nothing replicated.
+    fn append_latest_observation(
+        &self,
+        input: &ClaimInput,
+        now: u128,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
+        validate_local_observation(input)?;
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction().map_err(internal)?;
+        let (local, appended) =
+            insert_local_observation_tx(&transaction, &self.origin, input, now)?;
+        if !appended {
+            return Ok((local, false));
+        }
+        let published = match input.kind.as_str() {
+            "harness.observed" => {
+                publish_changed_harness_state_tx(&transaction, &self.origin, input, now)?
+            }
+            "harness.usage" => {
+                publish_due_usage_tx(&transaction, &self.origin, input, &local, now)?
+            }
+            _ => None,
+        };
+        transaction.commit().map_err(internal)?;
+        Ok((published.unwrap_or(local), true))
+    }
+
+    /// A replicated snapshot of the local response totals affected by one timeline entry.
+    /// The response itself stays in the local observation log.
+    pub fn usage_rollup_for_timeline(
+        &self,
+        observation: &ClaimRecord,
+    ) -> Result<Option<ClaimInput>> {
+        if observation.kind != "harness.timeline" {
+            return Ok(None);
+        }
+        let fields = &observation.body["fields"];
+        if fields["entry_type"] != "usage" || fields["body"]["semantics"] != "response" {
+            return Ok(None);
+        }
+        let incarnation = fields["incarnation_id"].as_str().unwrap_or("");
+        let model = fields["body"]["model"].as_str().unwrap_or("unknown");
+        let owner_run = fields["attribution"]["mission_run_id"]
+            .as_str()
+            .unwrap_or("");
+        let owner_step = fields["attribution"]["step_id"].as_str().unwrap_or("");
+        let host = fields["host"].as_str().unwrap_or(&self.origin);
+        let connection = self.readers.get();
+        let totals = connection.query_row(
+            "SELECT input_tokens, output_tokens, cache_write_tokens, cached_tokens, total_tokens, observed_at_unix_ms
+             FROM local_usage_totals WHERE subject=?1 AND incarnation_id=?2 AND model=?3 AND owner_run=?4 AND owner_step=?5 AND host=?6",
+            params![observation.subject, incarnation, model, owner_run, owner_step, host],
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?, row.get::<_, u64>(2)?,
+                row.get::<_, u64>(3)?, row.get::<_, u64>(4)?, row.get::<_, u64>(5)?)),
+        ).optional()?;
+        let Some((
+            input_tokens,
+            output_tokens,
+            cache_write_tokens,
+            cached_tokens,
+            total_tokens,
+            observed_at,
+        )) = totals
+        else {
+            return Ok(None);
+        };
+        let fields = BTreeMap::from([
+            ("semantics".into(), Value::String("response_rollup".into())),
+            ("driver".into(), fields["driver"].clone()),
+            ("incarnation_id".into(), Value::String(incarnation.into())),
+            ("model".into(), Value::String(model.into())),
+            ("owner_run".into(), Value::String(owner_run.into())),
+            ("owner_step".into(), Value::String(owner_step.into())),
+            ("host".into(), Value::String(host.into())),
+            ("input_tokens".into(), Value::from(input_tokens)),
+            ("output_tokens".into(), Value::from(output_tokens)),
+            ("cache_write_tokens".into(), Value::from(cache_write_tokens)),
+            ("cached_tokens".into(), Value::from(cached_tokens)),
+            ("total_tokens".into(), Value::from(total_tokens)),
+            ("observed_at_unix_ms".into(), Value::from(observed_at)),
+        ]);
+        let digest = hex::encode(Sha256::digest(serde_json::to_vec(&fields)?));
+        Ok(Some(ClaimInput {
+            subject: observation.subject.clone(),
+            kind: "harness.usage".into(),
+            actor: Some(observation.subject.clone()),
+            fields,
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("usage-rollup:{}:{digest}", observation.subject)),
+        }))
     }
 
     /// Local observations written after `after`, oldest first. The records carry the
@@ -6817,7 +6970,7 @@ impl Store {
     }
 
     pub fn set_otlp_export_cursor(&self, cursor: u64) -> Result<()> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection.execute(
             "INSERT INTO meta(key, value) VALUES ('otlp_export_cursor', ?1)
              ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -6867,7 +7020,7 @@ impl Store {
         let max_per_subject_kind = max_per_subject_kind.max(1).min(i64::MAX as usize) as i64;
         let mut deleted = 0;
         loop {
-            let connection = self.connection.lock().expect("store mutex poisoned");
+            let connection = self.connection.write();
             let removed = connection.execute(
                 "DELETE FROM local_observations WHERE id IN (
                     SELECT id FROM (
@@ -6952,7 +7105,7 @@ impl Store {
             ));
         }
         let repair_subject = format!("repair/{digest}");
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction().map_err(internal)?;
         if let Some(receipt) = transaction
             .query_row(
@@ -7604,7 +7757,7 @@ impl Store {
 
     #[cfg(test)]
     pub(crate) fn prune_events_before(&self, retain_from: u64) -> Result<usize> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection
             .execute("DELETE FROM events WHERE store_index < ?1", [retain_from])
             .map_err(Into::into)
@@ -7669,6 +7822,31 @@ impl Store {
         )?;
         let rows = statement.query_map([], desired_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Among `subjects`, each declaration whose member this build cannot read, with the reason.
+    /// `desired_subjects` gives such a declaration no member at all.
+    pub fn unreadable_members(&self, subjects: &[&str]) -> Result<Vec<(String, String)>> {
+        if subjects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, member FROM desired
+             WHERE member IS NOT NULL AND subject IN (SELECT value FROM json_each(?1))
+             ORDER BY subject",
+        )?;
+        let rows = statement.query_map([serde_json::to_string(subjects)?], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        let mut unreadable = Vec::new();
+        for row in rows {
+            let (subject, member) = row?;
+            if let Err(error) = serde_json::from_str::<crate::model::MemberSpec>(&member) {
+                unreadable.push((subject, error.to_string()));
+            }
+        }
+        Ok(unreadable)
     }
 
     pub fn desired_subjects_for_owner_step(&self, owner_step: &str) -> Result<Vec<DesiredSubject>> {
@@ -7751,7 +7929,7 @@ impl Store {
             format!("mission-run/{run}")
         };
         let run_id = run.strip_prefix("mission-run/").unwrap_or(&run);
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let mode: Option<String> = transaction
             .query_row(
@@ -7789,7 +7967,7 @@ impl Store {
     }
 
     pub fn discard_desired_owned_by(&self, owner_run: &str) -> Result<usize> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection
             .execute("DELETE FROM desired WHERE owner_run=?1", [owner_run])
             .map_err(Into::into)
@@ -7802,7 +7980,7 @@ impl Store {
             format!("mission-run/{run}")
         };
         let run_id = run.strip_prefix("mission-run/").unwrap_or(&run);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         let mode: Option<String> = connection
             .query_row(
                 "SELECT mode FROM mission_runs WHERE id=?1",
@@ -7981,7 +8159,7 @@ impl Store {
         if let Some(view) = self
             .message_cache
             .lock()
-            .expect("message cache mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(subject)
             .filter(|entry| {
                 entry.latest_claim_index == latest_claim_index
@@ -7996,7 +8174,7 @@ impl Store {
         let mut cache = self
             .message_cache
             .lock()
-            .expect("message cache mutex poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         if cache.len() >= MESSAGE_CACHE_LIMIT && !cache.contains_key(subject) {
             cache.clear();
         }
@@ -8207,6 +8385,39 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Every claim and local observation of `kind` for `subject`, in log order.
+    pub fn observations_for(&self, subject: &str, kind: &str) -> Result<Vec<ClaimRecord>> {
+        let mut records = self.claims_for(subject, Some(kind))?;
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(&format!(
+            "{LOCAL_OBSERVATION_COLUMNS} WHERE subject=?1 AND kind=?2 ORDER BY id"
+        ))?;
+        let rows = statement.query_map(params![subject, kind], |row| {
+            local_observation_from_row(&self.origin, row)
+        })?;
+        records.extend(rows.collect::<rusqlite::Result<Vec<_>>>()?);
+        records.sort_by_key(claim_log_order);
+        Ok(records)
+    }
+
+    /// The newest claim or local observation of `kind` for `subject`.
+    pub fn latest_observation(&self, subject: &str, kind: &str) -> Result<Option<ClaimRecord>> {
+        let claim = self.latest_claim(subject, Some(kind))?;
+        let local = {
+            let connection = self.readers.get();
+            connection
+                .query_row(
+                    &format!(
+                        "{LOCAL_OBSERVATION_COLUMNS} WHERE subject=?1 AND kind=?2 ORDER BY id DESC LIMIT 1"
+                    ),
+                    params![subject, kind],
+                    |row| local_observation_from_row(&self.origin, row),
+                )
+                .optional()?
+        };
+        Ok(claim.into_iter().chain(local).max_by_key(claim_log_order))
+    }
+
     pub fn pending_observer_refresh_attempt(&self, observer: &str) -> Result<Option<String>> {
         let connection = self.readers.get();
         connection
@@ -8352,6 +8563,66 @@ impl Store {
         } else {
             format!("attention/{subject}")
         };
+        if self
+            .attention_request(&subject)
+            .map_err(internal)?
+            .is_none()
+            && let Some(claim_id) = subject.strip_prefix("attention/subscription-failure-")
+        {
+            let failure = self
+                .claim_by_id(claim_id)
+                .map_err(internal)?
+                .filter(|claim| claim.kind == "subscription.mission-failed")
+                .ok_or_else(|| {
+                    St3Error::new(
+                        "missing-attention-request",
+                        format!("attention request `{subject}` does not exist"),
+                    )
+                })?;
+            let fields = failure.body.get("fields").unwrap_or(&failure.body);
+            let original_request = fields
+                .get("request")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let requester = self
+                .claim_by_id(original_request)
+                .map_err(internal)?
+                .and_then(|claim| {
+                    claim
+                        .body
+                        .pointer("/fields/requester")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_default();
+            let requester = if requester.is_empty() {
+                normalize_actor(&request.actor, "person")
+            } else {
+                requester
+            };
+            if requester != normalize_actor(&request.actor, "person") {
+                return Err(St3Error::new(
+                    "wrong-attention-reviewer",
+                    format!("attention request `{subject}` requires `{requester}`"),
+                ));
+            }
+            self.request_attention(
+                &subject,
+                &AttentionRequest {
+                    reviewer: requester,
+                    title: "Subscription mission failed".into(),
+                    reason: fields
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("Subscription mission failed")
+                        .into(),
+                    severity: "error".into(),
+                    targets: vec![failure.subject],
+                    actor: "agent/reconciler".into(),
+                    idempotency_key: format!("subscription-failure-attention:{claim_id}"),
+                },
+            )?;
+        }
         let current = self
             .attention_request(&subject)
             .map_err(internal)?
@@ -8704,6 +8975,12 @@ impl Store {
         {
             let connection = self.readers.get();
             for request in pending_attention_requests_tx(&connection, person)? {
+                if request
+                    .subject
+                    .starts_with("attention/subscription-failure-")
+                {
+                    continue;
+                }
                 if attention_request_is_current_tx(&connection, &request)? {
                     items.push(attention_item_from_request(request));
                 }
@@ -8720,6 +8997,12 @@ impl Store {
                 .query_map([], claim_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             for failure in failures {
+                let attention_subject = subscription_failure_attention_subject(&failure.id);
+                if attention_request_view_tx(&connection, &attention_subject)?
+                    .is_some_and(|request| request.status != "pending")
+                {
+                    continue;
+                }
                 let fields = failure.body.get("fields").unwrap_or(&failure.body);
                 let request = fields
                     .get("request")
@@ -8736,7 +9019,7 @@ impl Store {
                 let reviewer = requester
                     .filter(|value| value.starts_with("person/"))
                     .unwrap_or_default();
-                if person.is_some_and(|person| person != reviewer) {
+                if person.is_some_and(|person| !reviewer.is_empty() && person != reviewer) {
                     continue;
                 }
                 let code = fields
@@ -8750,9 +9033,12 @@ impl Store {
                 items.push(AttentionItemView {
                     kind: "fault".into(),
                     review_mode: None,
-                    subject: failure.id,
+                    subject: attention_subject,
                     person: reviewer,
                     requester_id: None,
+                    launch_id: None,
+                    variant_id: None,
+                    message_id: None,
                     title: "Subscription mission failed".into(),
                     detail: format!("{code}: {reason}"),
                     mission: None,
@@ -8874,7 +9160,7 @@ impl Store {
         ))
         .map_err(internal)?;
         let idempotency_key = format!("resource-observation:{operation_hash}");
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         if let Some(response) = connection
             .query_row(
                 "SELECT response FROM idempotency WHERE operation_id=?1",
@@ -9461,6 +9747,36 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Read only one pending request's retry history. The request index covers the count and
+    /// locates its newest deadline without materializing every deferral on the subscription.
+    pub fn subscription_mission_deferral(
+        &self,
+        subject: &str,
+        request: &str,
+    ) -> Result<Option<(u128, u32)>> {
+        let connection = self.readers.get();
+        let count: u32 = connection.query_row(
+            "SELECT COUNT(*) FROM claims
+             WHERE subject=?1 AND kind='subscription.mission-deferred'
+               AND json_extract(body, '$.fields.request')=?2",
+            params![subject, request],
+            |row| row.get(0),
+        )?;
+        if count == 0 {
+            return Ok(None);
+        }
+        let deadline: Option<u64> = connection.query_row(
+            "SELECT CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER)
+             FROM claims
+             WHERE subject=?1 AND kind='subscription.mission-deferred'
+               AND json_extract(body, '$.fields.request')=?2
+             ORDER BY store_index DESC LIMIT 1",
+            params![subject, request],
+            |row| row.get(0),
+        )?;
+        Ok(deadline.map(|deadline| (u128::from(deadline), count)))
+    }
+
     pub fn pending_schedule_work_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
@@ -9532,6 +9848,7 @@ impl Store {
         #[derive(Default)]
         struct Spend {
             cumulative: Option<CumulativeUsage>,
+            rollups: BTreeMap<String, (u64, u64, u64, u64, u64)>,
             response_total: u64,
             response_input: u64,
             response_output: u64,
@@ -9634,6 +9951,39 @@ impl Store {
                         group.cumulative = Some(candidate);
                     }
                 }
+                Some("response_rollup") => {
+                    let group = spend.entry(claim_incarnation.to_owned()).or_default();
+                    let key = ["model", "owner_run", "owner_step", "host"]
+                        .iter()
+                        .map(|key| fields.get(*key).and_then(Value::as_str).unwrap_or(""))
+                        .collect::<Vec<_>>()
+                        .join("\0");
+                    group.rollups.insert(
+                        key,
+                        (
+                            fields
+                                .get("total_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                            fields
+                                .get("input_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                            fields
+                                .get("output_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                            fields
+                                .get("cache_write_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                            fields
+                                .get("cached_tokens")
+                                .and_then(Value::as_u64)
+                                .unwrap_or(0),
+                        ),
+                    );
+                }
                 Some("response") => {
                     let Some(total) = fields.get("total_tokens").and_then(Value::as_u64) else {
                         continue;
@@ -9681,7 +10031,17 @@ impl Store {
         let mut has_cost = false;
         for group in spend.into_values() {
             summary.incarnation_count += 1;
-            if let Some((total, input, output, cached, group_cost, currency)) = group.cumulative {
+            if !group.rollups.is_empty() {
+                for (total, input, output, writes, reads) in group.rollups.into_values() {
+                    summary.total_tokens = summary.total_tokens.saturating_add(total);
+                    summary.input_tokens = summary.input_tokens.saturating_add(input);
+                    summary.output_tokens = summary.output_tokens.saturating_add(output);
+                    summary.cache_write_tokens = summary.cache_write_tokens.saturating_add(writes);
+                    summary.cached_tokens = summary.cached_tokens.saturating_add(reads);
+                }
+            } else if let Some((total, input, output, cached, group_cost, currency)) =
+                group.cumulative
+            {
                 summary.total_tokens = summary.total_tokens.saturating_add(total);
                 summary.input_tokens = summary.input_tokens.saturating_add(input);
                 summary.output_tokens = summary.output_tokens.saturating_add(output);
@@ -9705,6 +10065,93 @@ impl Store {
         }
         summary.cost = has_cost.then_some(cost);
         Ok(Some(summary))
+    }
+
+    /// Period spend from replicated cumulative snapshots. The snapshot immediately before the
+    /// start is the baseline, so a long-lived incarnation only contributes spend in the period.
+    pub fn usage_period_rows(&self, since_ms: u64, until_ms: u64) -> Result<Vec<Value>> {
+        #[derive(Clone, Copy, Default)]
+        struct Bucket {
+            at: u64,
+            index: u64,
+            total: u64,
+            input: u64,
+            output: u64,
+            writes: u64,
+            reads: u64,
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT subject, store_index, body FROM claims WHERE kind='harness.usage'
+             AND json_extract(body, '$.fields.semantics')='response_rollup'
+             ORDER BY store_index",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        let mut groups = BTreeMap::<
+            (String, String, String, String, String, String),
+            (Option<Bucket>, Option<Bucket>),
+        >::new();
+        for row in rows {
+            let (subject, index, body) = row?;
+            let body: Value = serde_json::from_str(&body)?;
+            let fields = &body["fields"];
+            let at = fields["observed_at_unix_ms"].as_u64().unwrap_or(0);
+            if at > until_ms {
+                continue;
+            }
+            let value = |name| fields[name].as_u64().unwrap_or(0);
+            let bucket = Bucket {
+                at,
+                index,
+                total: value("total_tokens"),
+                input: value("input_tokens"),
+                output: value("output_tokens"),
+                writes: value("cache_write_tokens"),
+                reads: value("cached_tokens"),
+            };
+            let text = |name| fields[name].as_str().unwrap_or("").to_owned();
+            let key = (
+                subject,
+                text("incarnation_id"),
+                text("model"),
+                text("owner_run"),
+                text("owner_step"),
+                text("host"),
+            );
+            let (baseline, latest) = groups.entry(key).or_default();
+            let target = if at <= since_ms { baseline } else { latest };
+            if target.is_none_or(|previous| (at, index) > (previous.at, previous.index)) {
+                *target = Some(bucket);
+            }
+        }
+        let mut result = Vec::new();
+        for ((agent, _incarnation, model, mission_run, step, host), (baseline, latest)) in groups {
+            let Some(latest) = latest else {
+                continue;
+            };
+            let baseline = baseline.unwrap_or_default();
+            let total = latest.total.saturating_sub(baseline.total);
+            if total == 0 {
+                continue;
+            }
+            result.push(json!({
+                "agent": agent, "mission_run": mission_run, "step": step,
+                "model": model, "host": host,
+                "total_tokens": total,
+                "input_tokens": latest.input.saturating_sub(baseline.input),
+                "output_tokens": latest.output.saturating_sub(baseline.output),
+                "cache_write_tokens": latest.writes.saturating_sub(baseline.writes),
+                "cached_tokens": latest.reads.saturating_sub(baseline.reads),
+            }));
+        }
+        result.sort_by(|a, b| b["total_tokens"].as_u64().cmp(&a["total_tokens"].as_u64()));
+        Ok(result)
     }
 
     pub fn claims_page(
@@ -9863,6 +10310,74 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Last substantive activity for an agent, excluding heartbeat and usage observations.
+    pub fn agent_last_activity_at(
+        &self,
+        agent: &str,
+        incarnation: Option<&str>,
+        snapshot_index: u64,
+    ) -> Result<Option<u128>> {
+        let connection = self.readers.get();
+        let mut times = Vec::new();
+        if let Some(incarnation) = incarnation {
+            let local: Option<i64> = connection.query_row(
+                "SELECT observed_at_unix_ms FROM local_observations
+                 WHERE subject=?1 AND kind='harness.timeline'
+                   AND json_extract(body, '$.fields.incarnation_id')=?2
+                   AND json_extract(body, '$.fields.entry_type') IN ('message','content','tool_call','tool_result')
+                   AND after_store_index<=?3 ORDER BY id DESC LIMIT 1",
+                params![agent, incarnation, snapshot_index], |row| row.get(0),
+            ).optional()?;
+            if let Some(time) = local {
+                times.push(time.max(0) as u128);
+            }
+            let replicated: Option<String> = connection.query_row(
+                "SELECT accepted_at_unix_ms FROM claims
+                 WHERE subject=?1 AND kind='harness.timeline'
+                   AND json_extract(body, '$.fields.incarnation_id')=?2
+                   AND json_extract(body, '$.fields.entry_type') IN ('message','content','tool_call','tool_result')
+                   AND store_index<=?3 ORDER BY store_index DESC LIMIT 1",
+                params![agent, incarnation, snapshot_index], |row| row.get(0),
+            ).optional()?;
+            times.extend(replicated.and_then(|time| time.parse::<u128>().ok()));
+        }
+        for query in [
+            "SELECT accepted_at_unix_ms FROM claims WHERE actor=?1 AND kind IN ('work.progress','work.submitted') AND store_index<=?2 ORDER BY store_index DESC LIMIT 1",
+            "SELECT accepted_at_unix_ms FROM claims WHERE kind='message.sent' AND json_extract(body, '$.fields.from')=?1 AND store_index<=?2 ORDER BY store_index DESC LIMIT 1",
+            "SELECT accepted_at_unix_ms FROM claims WHERE kind='message.sent' AND json_extract(body, '$.fields.to')=?1 AND store_index<=?2 ORDER BY store_index DESC LIMIT 1",
+        ] {
+            let time: Option<String> = connection
+                .query_row(query, params![agent, snapshot_index], |row| row.get(0))
+                .optional()?;
+            times.extend(time.and_then(|time| time.parse::<u128>().ok()));
+        }
+        Ok(times.into_iter().max())
+    }
+
+    pub fn agent_working_since(
+        &self,
+        agent: &str,
+        incarnation: &str,
+        snapshot_index: u64,
+    ) -> Result<Option<u128>> {
+        let connection = self.readers.get();
+        let previous: Option<u64> = connection.query_row(
+            "SELECT MAX(store_index) FROM claims WHERE subject=?1 AND kind='harness.observed'
+             AND json_extract(body, '$.fields.incarnation_id')=?2
+             AND json_extract(body, '$.fields.state')!='working' AND store_index<=?3",
+            params![agent, incarnation, snapshot_index],
+            |row| row.get(0),
+        )?;
+        let started: Option<String> = connection.query_row(
+            "SELECT accepted_at_unix_ms FROM claims WHERE subject=?1 AND kind='harness.observed'
+             AND json_extract(body, '$.fields.incarnation_id')=?2
+             AND json_extract(body, '$.fields.state')='working'
+             AND store_index>?3 AND store_index<=?4 ORDER BY store_index LIMIT 1",
+            params![agent, incarnation, previous.unwrap_or(0), snapshot_index], |row| row.get(0),
+        ).optional()?;
+        Ok(started.and_then(|time| time.parse().ok()))
+    }
+
     fn timeline_claim_rows_for_incarnation_at(
         &self,
         subject: &str,
@@ -9959,7 +10474,7 @@ impl Store {
         if let Some((_, value)) = self
             .actual_cache
             .lock()
-            .expect("actual cache mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .get(subject)
             .filter(|(index, _)| *index == newest)
         {
@@ -9971,7 +10486,7 @@ impl Store {
         let mut cache = self
             .actual_cache
             .lock()
-            .expect("actual cache mutex poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         if cache.len() >= ACTUAL_CACHE_LIMIT && !cache.contains_key(subject) {
             cache.clear();
         }
@@ -10104,7 +10619,7 @@ impl Store {
         let secret = hex::encode(bytes);
         let secret_hash = hex::encode(Sha256::digest(secret.as_bytes()));
         let expires = now_ms().saturating_add(lifetime_ms as u128);
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection.execute(
             "INSERT INTO capabilities(secret_hash, kind, subject, incarnation_id, expires_at_unix_ms, used)
              VALUES (?1, ?2, ?3, ?4, ?5, 0)",
@@ -10159,7 +10674,7 @@ impl Store {
             return Ok(capability);
         }
         let hash = hex::encode(Sha256::digest(secret.as_bytes()));
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         let changed = connection
             .execute(
                 "UPDATE capabilities SET used=1 WHERE secret_hash=?1 AND used=0",
@@ -10180,7 +10695,7 @@ impl Store {
 
     pub fn put_blob(&self, bytes: &[u8]) -> Result<String> {
         let hash = hex::encode(Sha256::digest(bytes));
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection.execute(
             "INSERT OR IGNORE INTO blobs(hash, bytes, size) VALUES (?1, ?2, ?3)",
             params![hash, bytes, bytes.len() as u64],
@@ -10199,7 +10714,7 @@ impl Store {
     }
 
     pub fn bind_fleet(&self, fleet_id: &str) -> Result<()> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         let stored = connection
             .query_row("SELECT value FROM meta WHERE key='fleet_id'", [], |row| {
                 row.get::<_, String>(0)
@@ -10229,7 +10744,7 @@ impl Store {
         if let Some(snapshot) = self
             .replication_snapshot
             .lock()
-            .expect("replication snapshot mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .filter(|snapshot| {
                 snapshot.store_index == store_index
@@ -10240,7 +10755,8 @@ impl Store {
             return Ok(snapshot);
         }
 
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
+        let _timing = time_stage(&self.replication_timers.snapshot);
         let seeded_through = self.seeded_batch_rowid.load(Ordering::Acquire);
         let latest_batch = max_batch_rowid(&connection)?;
         if latest_batch > seeded_through {
@@ -10255,7 +10771,7 @@ impl Store {
         let previous = self
             .replication_snapshot
             .lock()
-            .expect("replication snapshot mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .take();
         // Harness observations, timelines, usage and lease renewals change none of the digested
         // tables, so their writes leave the generation, and the graph digest, unchanged.
@@ -10372,12 +10888,13 @@ impl Store {
         *self
             .replication_snapshot
             .lock()
-            .expect("replication snapshot mutex poisoned") = Some(snapshot.clone());
+            .unwrap_or_else(PoisonError::into_inner) = Some(snapshot.clone());
         Ok(snapshot)
     }
 
     pub fn export_replication_summary(&self, fleet_id: &str) -> Result<ReplicationExchange> {
         let snapshot = self.replication_snapshot()?;
+        let _timing = time_stage(&self.replication_timers.export);
         let signature_requests = self.replication_signature_requests()?;
         Ok(ReplicationExchange {
             peer: self.origin.clone(),
@@ -10413,6 +10930,7 @@ impl Store {
         signature_requests: &[ReplicaEnvelopeId],
     ) -> Result<ReplicationExchange> {
         let mut exchange = self.export_replication_difference(fleet_id, remote)?;
+        let _timing = time_stage(&self.replication_timers.export);
         exchange.signatures = self.replication_signatures_for(signature_requests)?;
         exchange.signature_requests = self.replication_signature_requests()?;
         Ok(exchange)
@@ -10424,6 +10942,7 @@ impl Store {
         remote: &ReplicationInventory,
     ) -> Result<ReplicationExchange> {
         let snapshot = self.replication_snapshot()?;
+        let _timing = time_stage(&self.replication_timers.export);
         let same = !remote.digest.is_empty() && remote.digest == snapshot.inventory.digest;
         if !same && !remote.buckets.is_empty() {
             // The peer sent range digests, so only differing ranges need identities.
@@ -10548,7 +11067,8 @@ impl Store {
                 "the peer belongs to another fleet",
             ));
         }
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
+        let timing = time_stage(&self.replication_timers.receipt);
         let transaction = connection.transaction().map_err(internal)?;
         let mut received = 0;
         let mut duplicate = 0;
@@ -10619,6 +11139,13 @@ impl Store {
             )
             .map_err(internal)?;
         transaction.commit().map_err(internal)?;
+        drop(timing);
+        self.replication_timers
+            .exchanges
+            .fetch_add(1, Ordering::Relaxed);
+        self.replication_timers
+            .envelopes_received
+            .fetch_add(received as u64, Ordering::Relaxed);
         if received != 0 {
             self.replica_generation.fetch_add(1, Ordering::AcqRel);
         }
@@ -10631,7 +11158,7 @@ impl Store {
         );
         self.replication_sync
             .lock()
-            .expect("replication sync mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .entry(relay.to_owned())
             .or_default()
             .observe(received, difference, now_ms());
@@ -10650,7 +11177,8 @@ impl Store {
     pub fn validate_replication_backlog(&self) -> Result<ReplicationAdmission> {
         // Seed and sign local batches first, so local membership claims decide admission.
         self.replication_snapshot()?;
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
+        let _timing = time_stage(&self.replication_timers.admission);
         // Builds before the insertion-order hash fallback rejected genuine claims from
         // 2026-09-16 as hash mismatches. Check those records once more, once.
         let retry_hash_mismatches = connection
@@ -10702,32 +11230,40 @@ impl Store {
         loop {
             let mut held = Vec::new();
             let mut membership_changed = false;
+            // One transaction, and so one disk flush, per pass. Each envelope is admitted in its
+            // own savepoint, so an invalid one is rolled back and recorded alone.
+            let mut pass = connection.transaction()?;
             for envelope in pending {
-                if let Some(reason) = fleet_admission_hold(&connection, &membership, &envelope)? {
-                    hold_replica_envelope(&connection, &envelope, reason)?;
+                let started = std::time::Instant::now();
+                let hold = fleet_admission_hold(&pass, &membership, &envelope)?;
+                outcome.verify += started.elapsed();
+                if let Some(reason) = hold {
+                    hold_replica_envelope(&pass, &envelope, reason)?;
                     held.push(envelope);
                     continue;
                 }
-                let transaction = connection.transaction()?;
-                let result = validate_and_admit_envelope_tx(&transaction, &envelope, &mut outcome);
+                let mut savepoint = pass.savepoint()?;
+                let result = validate_and_admit_envelope_tx(&savepoint, &envelope, &mut outcome);
                 match result {
                     Ok(()) => {
-                        transaction.execute(
+                        savepoint.execute(
                             "DELETE FROM replica_envelope_holds
                              WHERE writer=?1 AND sequence=?2 AND envelope_hash=?3",
                             params![envelope.writer, envelope.sequence, envelope.hash],
                         )?;
                         membership_changed |=
-                            envelope_carries_fleet_claims(&transaction, &envelope)?;
-                        transaction.commit()?;
+                            envelope_carries_fleet_claims(&savepoint, &envelope)?;
+                        savepoint.commit()?;
                     }
                     Err(error) => {
-                        transaction.rollback()?;
-                        record_invalid_replica_envelope(&connection, &envelope, &error)?;
+                        savepoint.rollback()?;
+                        drop(savepoint);
+                        record_invalid_replica_envelope(&pass, &envelope, &error)?;
                         outcome.invalid += 1;
                     }
                 }
             }
+            pass.commit()?;
             if !membership_changed || held.is_empty() {
                 outcome.held = held.len();
                 break;
@@ -10735,6 +11271,9 @@ impl Store {
             membership = fleet_membership_tx(&connection)?;
             pending = held;
         }
+        self.replication_timers
+            .verify
+            .fetch_add(outcome.verify.as_nanos() as u64, Ordering::Relaxed);
         if retry_hash_mismatches {
             connection.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('legacy_claim_hash_retried', ?1)",
@@ -10744,11 +11283,60 @@ impl Store {
         Ok(outcome)
     }
 
+    /// Project admitted replicated claims, unless this node is catching up with a peer and
+    /// projected within the last `CATCH_UP_PROJECTION_INTERVAL_MS`. History arrives older than
+    /// this node's own claims, so a catching-up node cannot extend its projection and would
+    /// replay the whole graph after every exchange. It projects at most once per interval
+    /// instead, and again as soon as it has caught up. `None` means it deferred.
+    pub fn project_replication_backlog_unless_catching_up(&self) -> Result<Option<bool>> {
+        let since = (now_ms() as u64)
+            .saturating_sub(self.last_replication_projection_unix_ms.load(Ordering::Acquire));
+        if since < CATCH_UP_PROJECTION_INTERVAL_MS && self.replication_catching_up() {
+            self.replication_projection_deferred
+                .store(true, Ordering::Release);
+            return Ok(None);
+        }
+        self.project_replication_backlog().map(Some)
+    }
+
+    /// Whether admitted replicated claims wait for a deferred projection.
+    pub fn replication_projection_deferred(&self) -> bool {
+        self.replication_projection_deferred.load(Ordering::Acquire)
+    }
+
     pub fn project_replication_backlog(&self) -> Result<bool> {
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
+        let _timing = time_stage(&self.replication_timers.projection);
+        self.replication_projection_deferred
+            .store(false, Ordering::Release);
+        self.last_replication_projection_unix_ms
+            .store(now_ms() as u64, Ordering::Release);
         let transaction = connection.transaction()?;
         let result = (|| -> Result<(), St3Error> {
-            if !try_project_simple_replication_tx(&transaction)? {
+            // An incremental projection that fails is rolled back and replaced by a full replay,
+            // which quarantines the claim it cannot project instead of failing the graph.
+            transaction
+                .execute_batch("SAVEPOINT project_incremental")
+                .map_err(internal)?;
+            let projected = match try_project_simple_replication_tx(&transaction) {
+                Ok(projected) => {
+                    transaction
+                        .execute_batch("RELEASE project_incremental")
+                        .map_err(internal)?;
+                    projected
+                }
+                Err(_) => {
+                    transaction
+                        .execute_batch(
+                            "ROLLBACK TO project_incremental; RELEASE project_incremental",
+                        )
+                        .map_err(internal)?;
+                    false
+                }
+            };
+            if !projected {
+                #[cfg(test)]
+                FULL_REPLAYS.with(|replays| replays.set(replays.get() + 1));
                 rebuild_operations_tx(&transaction).map_err(internal)?;
                 project_replicated_base_claims(&transaction)?;
                 project_replicated_mission_runs(&transaction)?;
@@ -10853,8 +11441,11 @@ impl Store {
         Ok(total != 0 && other == 0)
     }
 
+    /// Apply each recorded repair on its own. A repair that cannot be applied is recorded as an
+    /// unhealthy projection that names it, so one bad repair never stops replication or startup.
     pub fn apply_replication_repairs(&self) -> Result<usize> {
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
+        let _timing = time_stage(&self.replication_timers.repair);
         let transaction = connection.transaction()?;
         let mut statement = transaction
             .prepare("SELECT id, body FROM claims WHERE kind='record.repaired' ORDER BY id")?;
@@ -10866,51 +11457,28 @@ impl Store {
         drop(statement);
         let mut changed = 0;
         for (repair_claim, body) in repairs {
-            let body: Value = serde_json::from_str(&body)?;
-            let fields = body.get("fields").unwrap_or(&body);
-            let Some(record_ref) = fields.get("record").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(replacement) = fields.get("replacement").and_then(Value::as_str) else {
-                continue;
-            };
-            let replacement_exists = transaction
-                .query_row(
-                    "SELECT 1 FROM claims WHERE id=?1",
-                    [replacement],
-                    |_| Ok(()),
-                )
-                .optional()?
-                .is_some();
-            if !replacement_exists {
-                continue;
+            transaction.execute_batch("SAVEPOINT apply_repair")?;
+            let result = apply_replication_repair_tx(&transaction, &repair_claim, &body);
+            match result {
+                Ok(applied) => {
+                    transaction.execute_batch("RELEASE apply_repair")?;
+                    changed += applied;
+                }
+                Err(error) => {
+                    transaction.execute_batch("ROLLBACK TO apply_repair; RELEASE apply_repair")?;
+                    transaction.execute(
+                        "INSERT INTO projection_health(aggregate, status, error_code, error_message, updated_at_unix_ms)
+                         VALUES (?1, 'stale', 'repair-failed', ?2, ?3)
+                         ON CONFLICT(aggregate) DO UPDATE SET status='stale', error_code=excluded.error_code,
+                            error_message=excluded.error_message, updated_at_unix_ms=excluded.updated_at_unix_ms",
+                        params![
+                            format!("repair:{repair_claim}"),
+                            format!("repair {repair_claim}: {error:#}"),
+                            now_ms().to_string()
+                        ],
+                    )?;
+                }
             }
-            let repaired_claim = transaction
-                .query_row(
-                    "SELECT claim_id FROM replica_records WHERE record_ref=?1",
-                    [record_ref],
-                    |row| row.get::<_, Option<String>>(0),
-                )
-                .optional()?
-                .flatten();
-            changed += transaction.execute(
-                "UPDATE replica_records SET state='repaired', replacement_claim_id=?2,
-                    error_code=NULL, error_message=NULL, updated_at_unix_ms=?3
-                 WHERE record_ref=?1 AND state IN ('valid','invalid','unknown','repaired')
-                   AND (replacement_claim_id IS NULL OR replacement_claim_id<>?2)",
-                params![record_ref, replacement, now_ms().to_string()],
-            )?;
-            if let Some(repaired_claim) = repaired_claim {
-                select_desired_repair_tx(&transaction, &repaired_claim, replacement)?;
-            }
-            transaction.execute(
-                "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
-                 VALUES (?1, 'healthy', ?2, ?3)
-                 ON CONFLICT(aggregate) DO UPDATE SET status='healthy',
-                    last_good_store_index=excluded.last_good_store_index, error_code=NULL,
-                    error_message=NULL, updated_at_unix_ms=excluded.updated_at_unix_ms",
-                params![format!("repair:{record_ref}:{repair_claim}"), current_index_tx(&transaction)?, now_ms().to_string()],
-            )?;
         }
         transaction.commit()?;
         Ok(changed)
@@ -10925,7 +11493,7 @@ impl Store {
         idempotency_key: &str,
     ) -> Result<ClaimRecord, St3Error> {
         {
-            let connection = self.connection.lock().expect("store mutex poisoned");
+            let connection = self.connection.write();
             let state = connection
                 .query_row(
                     "SELECT state FROM replica_records WHERE record_ref=?1",
@@ -11048,7 +11616,7 @@ impl Store {
             return Ok(true);
         }
         {
-            let connection = self.connection.lock().expect("store mutex poisoned");
+            let connection = self.connection.write();
             connection.execute(
                 "INSERT INTO replication_peers(peer, status, last_error, updated_at_unix_ms)
                  VALUES (?1, ?2, ?3, ?4)
@@ -11128,7 +11696,7 @@ impl Store {
         let now = now_ms();
         self.replication_sync
             .lock()
-            .expect("replication sync mutex poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .values()
             .any(|progress| progress.view(now).is_some_and(|sync| sync.catching_up))
     }
@@ -11142,11 +11710,23 @@ impl Store {
         let progress = self
             .replication_sync
             .lock()
-            .expect("replication sync mutex poisoned");
+            .unwrap_or_else(PoisonError::into_inner);
         configured_peers
             .iter()
             .filter_map(|peer| Some((peer.clone(), progress.get(peer)?.view(now)?)))
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn replace_desired_member_for_test(&self, subject: &str, member: &str) {
+        self.connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE desired SET member=?2 WHERE subject=?1",
+                params![subject, member],
+            )
+            .unwrap();
     }
 
     #[cfg(test)]
@@ -11159,6 +11739,35 @@ impl Store {
                 params![peer, now_ms().saturating_sub(86_400_000).to_string()],
             )
             .unwrap();
+    }
+
+    /// Count one of this node's requests to a peer, from send to response.
+    pub fn record_replication_round_trip(&self, duration: std::time::Duration) {
+        self.replication_timers
+            .round_trip
+            .fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
+    }
+
+    /// Where this process has spent replication time since it started.
+    pub fn replication_timings(&self) -> ReplicationTimings {
+        let timers = &self.replication_timers;
+        let ms = |counter: &AtomicU64| counter.load(Ordering::Relaxed) / 1_000_000;
+        ReplicationTimings {
+            exchanges: timers.exchanges.load(Ordering::Relaxed),
+            envelopes_received: timers.envelopes_received.load(Ordering::Relaxed),
+            round_trip_ms: ms(&timers.round_trip),
+            export_ms: ms(&timers.export),
+            snapshot_ms: ms(&timers.snapshot),
+            receipt_ms: ms(&timers.receipt),
+            admission_ms: ms(&timers.admission),
+            verify_ms: ms(&timers.verify),
+            projection_ms: ms(&timers.projection),
+            repair_ms: ms(&timers.repair),
+            signing_ms: ms(&timers.signing),
+            sqlite_ms: ms(&SQLITE_NANOS),
+            commits: SQLITE_COMMITS.load(Ordering::Relaxed),
+            commit_ms: ms(&SQLITE_COMMIT_NANOS),
+        }
     }
 
     pub fn replication_status(
@@ -11244,7 +11853,22 @@ impl Store {
                 [],
                 |row| row.get(0),
             )?,
+            unhealthy: connection
+                .prepare(
+                    "SELECT aggregate, status, error_code, error_message FROM projection_health
+                     WHERE status<>'healthy' ORDER BY aggregate LIMIT 50",
+                )?
+                .query_map([], |row| {
+                    Ok(crate::model::UnhealthyProjection {
+                        aggregate: row.get(0)?,
+                        status: row.get(1)?,
+                        error_code: row.get(2)?,
+                        error_message: row.get(3)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?,
             peers,
+            timings: self.replication_timings(),
         })
     }
 
@@ -11351,7 +11975,7 @@ impl Store {
                 ));
             }
         }
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        let mut connection = self.connection.write();
         let transaction = connection.transaction().map_err(internal)?;
         for (hash, bytes) in &input.blobs {
             transaction
@@ -13505,6 +14129,492 @@ fn local_retention(kind: &str) -> bool {
         .is_some_and(|spec| spec.retention == st3_schema::Retention::Local)
 }
 
+fn system_local_retention(kind: &str) -> bool {
+    st3_schema::registry()
+        .claim(kind)
+        .is_some_and(|spec| spec.retention == st3_schema::Retention::SystemLocal)
+}
+
+fn latest_retention(kind: &str) -> bool {
+    st3_schema::registry()
+        .claim(kind)
+        .is_some_and(|spec| spec.retention == st3_schema::Retention::Latest)
+}
+
+/// While a harness works, its usage replicates at most once in this window. Once it stops
+/// working, its newest usage replicates at once.
+const USAGE_PUBLISH_INTERVAL_MS: u128 = 5 * 60 * 1000;
+
+fn validate_local_observation(input: &ClaimInput) -> Result<(), St3Error> {
+    if input.expected_subject.is_some() {
+        return Err(St3Error::new(
+            "local-observation-head",
+            "a local observation does not take part in the subject's claim head",
+        ));
+    }
+    st3_schema::registry()
+        .validate_claim(&input.subject, &input.kind, &input.fields)
+        .map_err(|error| St3Error::new(error.code, error.message))?;
+    // A timeline entry keeps the sequence its driver gave it. A replicated claim could
+    // fall back to its unique store index, but local observations share the index of the
+    // claim they follow, so they could not order themselves.
+    if input.kind == "harness.timeline" && !input.fields.contains_key("sequence") {
+        return Err(St3Error::new(
+            "missing-claim-field",
+            "a local timeline observation needs the sequence its driver assigned",
+        ));
+    }
+    Ok(())
+}
+
+/// Insert one local observation. A repeated idempotency key returns the first observation
+/// and `false`.
+fn insert_local_observation_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    input: &ClaimInput,
+    observed_at: u128,
+) -> Result<(ClaimRecord, bool), St3Error> {
+    let mut body = json!({
+        "fields": &input.fields,
+        "evidence": input.evidence,
+    });
+    let dedupe_key = input
+        .idempotency_key
+        .as_deref()
+        .map(|key| local_observation_dedupe_key(&input.kind, key));
+    let request_digest = claim_operation(input)?.map(|(_, digest)| digest);
+    if let Some(key) = &dedupe_key
+        && let Some((existing, stored_digest)) = transaction
+            .query_row(
+                "SELECT id, after_store_index, subject, kind, actor, body, observed_at_unix_ms, request_digest
+                 FROM local_observations WHERE dedupe_key=?1",
+                [key],
+                |row| {
+                    Ok((
+                        local_observation_from_row(origin, row)?,
+                        row.get::<_, Option<String>>(7)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(internal)?
+    {
+        // A retry must repeat the original request exactly, as for a claim.
+        if stored_digest != request_digest {
+            return Err(St3Error::new(
+                "idempotency-mismatch",
+                "the idempotency key already identifies a different request",
+            )
+            .with_detail("stored_digest", json!(stored_digest))
+            .with_detail("request_digest", json!(request_digest)));
+        }
+        return Ok((existing, false));
+    }
+    // A local observation may cite a claim or another local observation of this node.
+    for evidence in &input.evidence {
+        let exists = match evidence
+            .strip_prefix(LOCAL_OBSERVATION_ID_PREFIX)
+            .and_then(|rest| rest.rsplit_once('/'))
+        {
+            Some((evidence_origin, position)) => {
+                evidence_origin == origin
+                    && transaction
+                        .query_row(
+                            "SELECT 1 FROM local_observations WHERE id=?1",
+                            [position],
+                            |_| Ok(()),
+                        )
+                        .optional()
+                        .map_err(internal)?
+                        .is_some()
+            }
+            None => transaction
+                .query_row("SELECT 1 FROM claims WHERE id=?1", [evidence], |_| Ok(()))
+                .optional()
+                .map_err(internal)?
+                .is_some(),
+        };
+        if !exists {
+            return Err(St3Error::new(
+                "missing-evidence",
+                format!("evidence claim `{evidence}` is not stored"),
+            ));
+        }
+    }
+    let after_store_index: u64 = transaction
+        .query_row(
+            "SELECT COALESCE(MAX(store_index), 0) FROM claims",
+            [],
+            |row| row.get(0),
+        )
+        .map_err(internal)?;
+    if input.kind == "harness.timeline"
+        && input.fields.get("entry_type").and_then(Value::as_str) == Some("usage")
+        && input.fields.get("operation").and_then(Value::as_str) == Some("append")
+        && input
+            .fields
+            .get("body")
+            .and_then(|body| body.get("semantics"))
+            .and_then(Value::as_str)
+            == Some("response")
+    {
+        let desired: Option<(Option<String>, Option<String>, Option<String>)> = transaction
+            .query_row(
+                "SELECT owner_run, owner_generation, owner_step FROM desired WHERE subject=?1",
+                [&input.subject],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        let incarnation = input
+            .fields
+            .get("incarnation_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let active_step: Option<(String, String, String)> = transaction
+            .query_row(
+                "SELECT subject, 'mission-run/' || run_id, 'run-generation/' || generation_id
+                 FROM step_runs WHERE lease_owner=?1 AND lease_incarnation=?2
+                   AND CAST(lease_expires_at_unix_ms AS INTEGER)>?3
+                   AND status IN ('claimed', 'working', 'submitted')
+                 ORDER BY updated_at_unix_ms DESC LIMIT 1",
+                params![input.subject, incarnation, observed_at as i64],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        let owner_run = active_step
+            .as_ref()
+            .map(|item| item.1.as_str())
+            .or_else(|| desired.as_ref().and_then(|item| item.0.as_deref()))
+            .unwrap_or("");
+        let owner_step = active_step
+            .as_ref()
+            .map(|item| item.0.as_str())
+            .or_else(|| desired.as_ref().and_then(|item| item.2.as_deref()))
+            .unwrap_or("");
+        let owner_generation = active_step
+            .as_ref()
+            .map(|item| item.2.as_str())
+            .or_else(|| desired.as_ref().and_then(|item| item.1.as_deref()));
+        let usage = &input.fields["body"];
+        let model = usage
+            .get("model")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let bucket = |key| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
+        let input_tokens = bucket("input_tokens");
+        let output_tokens = bucket("output_tokens");
+        let cache_write_tokens = bucket("cache_write_tokens");
+        let cached_tokens = bucket("cached_tokens");
+        let total_tokens = bucket("total_tokens");
+        body["fields"]["attribution"] = json!({
+            "agent_id": input.subject,
+            "mission_run_id": if owner_run.is_empty() { None } else { Some(owner_run) },
+            "generation_id": owner_generation,
+            "step_id": if owner_step.is_empty() { None } else { Some(owner_step) },
+        });
+        body["fields"]["host"] = Value::String(origin.to_owned());
+        let source_id = input
+            .fields
+            .get("source_id")
+            .and_then(Value::as_str)
+            .or_else(|| input.fields.get("entry_id").and_then(Value::as_str))
+            .unwrap_or("");
+        let new_response = transaction
+            .execute(
+                "INSERT OR IGNORE INTO local_usage_seen(subject, source_id) VALUES (?1, ?2)",
+                params![input.subject, source_id],
+            )
+            .map_err(internal)?
+            != 0;
+        if new_response {
+            transaction.execute(
+                "INSERT INTO local_usage_totals(subject, incarnation_id, model, owner_run, owner_step, host,
+                    input_tokens, output_tokens, cache_write_tokens, cached_tokens, total_tokens, observed_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                 ON CONFLICT(subject, incarnation_id, model, owner_run, owner_step, host) DO UPDATE SET
+                    input_tokens=input_tokens+excluded.input_tokens,
+                    output_tokens=output_tokens+excluded.output_tokens,
+                    cache_write_tokens=cache_write_tokens+excluded.cache_write_tokens,
+                    cached_tokens=cached_tokens+excluded.cached_tokens,
+                    total_tokens=total_tokens+excluded.total_tokens,
+                    observed_at_unix_ms=excluded.observed_at_unix_ms",
+                params![input.subject, incarnation, model, owner_run, owner_step, origin,
+                    input_tokens, output_tokens, cache_write_tokens, cached_tokens, total_tokens, observed_at as i64],
+            ).map_err(internal)?;
+        }
+    }
+    transaction
+        .execute(
+            "INSERT INTO local_observations(
+                after_store_index, subject, kind, actor, body, dedupe_key, request_digest,
+                observed_at_unix_ms
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                after_store_index,
+                input.subject,
+                input.kind,
+                input.actor,
+                canonical_json_text(&body).map_err(internal)?,
+                dedupe_key,
+                request_digest,
+                observed_at.min(i64::MAX as u128) as i64,
+            ],
+        )
+        .map_err(internal)?;
+    let id = transaction.last_insert_rowid();
+    Ok((
+        ClaimRecord {
+            id: local_observation_id(origin, id),
+            store_index: after_store_index,
+            batch_id: String::new(),
+            subject: input.subject.clone(),
+            kind: input.kind.clone(),
+            origin: origin.to_owned(),
+            actor: input.actor.clone(),
+            operation_id: None,
+            request_digest: None,
+            body,
+            predecessors: Vec::new(),
+            accepted_at_unix_ms: observed_at,
+        },
+        true,
+    ))
+}
+
+fn latest_claim_of_kind_tx(
+    transaction: &Transaction<'_>,
+    subject: &str,
+    kind: &str,
+) -> Result<Option<ClaimRecord>, St3Error> {
+    transaction
+        .query_row(
+            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+             FROM claims WHERE subject=?1 AND kind=?2 ORDER BY store_index DESC LIMIT 1",
+            params![subject, kind],
+            claim_from_row,
+        )
+        .optional()
+        .map_err(internal)
+}
+
+/// Replicate an observation of the same kind and subject as an ordinary claim.
+fn publish_latest_claim_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    subject: &str,
+    kind: &str,
+    actor: Option<&str>,
+    fields: &Value,
+) -> Result<ClaimRecord, St3Error> {
+    let predecessors = latest_claim_id_tx(transaction, subject)
+        .map_err(internal)?
+        .into_iter()
+        .collect::<Vec<_>>();
+    append_claim_tx(
+        transaction,
+        origin,
+        subject,
+        kind,
+        actor,
+        &json!({ "fields": fields, "evidence": [] }),
+        &predecessors,
+        None,
+    )
+    .map_err(claim_append_error)
+}
+
+/// Publish a harness observation when any field other than its observation time differs
+/// from the subject's latest replicated observation. When the harness stops working, its
+/// usage that is still only local replicates too.
+fn publish_changed_harness_state_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    input: &ClaimInput,
+    now: u128,
+) -> Result<Option<ClaimRecord>, St3Error> {
+    fn state_fields<'a>(
+        fields: impl IntoIterator<Item = (&'a String, &'a Value)>,
+    ) -> BTreeMap<&'a str, &'a Value> {
+        fields
+            .into_iter()
+            .filter(|(name, _)| name.as_str() != "observed_at_ms")
+            .map(|(name, value)| (name.as_str(), value))
+            .collect()
+    }
+    let latest = latest_claim_of_kind_tx(transaction, &input.subject, &input.kind)?;
+    let unchanged = latest.as_ref().is_some_and(|claim| {
+        claim
+            .body
+            .get("fields")
+            .and_then(Value::as_object)
+            .is_some_and(|fields| state_fields(fields) == state_fields(&input.fields))
+    });
+    if unchanged {
+        return Ok(None);
+    }
+    let claim = publish_latest_claim_tx(
+        transaction,
+        origin,
+        &input.subject,
+        &input.kind,
+        input.actor.as_deref(),
+        &json!(input.fields),
+    )?;
+    if input.fields.get("state").and_then(Value::as_str) != Some("working") {
+        publish_pending_usage_tx(transaction, origin, &input.subject, now)?;
+    }
+    Ok(Some(claim))
+}
+
+fn usage_slot(fields: &BTreeMap<String, Value>) -> String {
+    json!([fields.get("incarnation_id"), fields.get("semantics")]).to_string()
+}
+
+/// Publish a usage observation when its slot (incarnation and semantics) has no claim yet,
+/// its compactions or model changed, this node last replicated the slot at least
+/// `USAGE_PUBLISH_INTERVAL_MS` ago, or the harness is not working. Otherwise it stays local
+/// and pending until one of those holds or the harness stops working.
+fn publish_due_usage_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    input: &ClaimInput,
+    local: &ClaimRecord,
+    now: u128,
+) -> Result<Option<ClaimRecord>, St3Error> {
+    let slot = usage_slot(&input.fields);
+    let last = transaction
+        .query_row(
+            "SELECT published_at_unix_ms, published_fields FROM local_latest_slots
+             WHERE subject=?1 AND kind='harness.usage' AND slot=?2",
+            params![input.subject, slot],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+        )
+        .optional()
+        .map_err(internal)?;
+    let working = latest_claim_of_kind_tx(transaction, &input.subject, "harness.observed")?
+        .is_some_and(|claim| {
+            claim.body.pointer("/fields/state").and_then(Value::as_str) == Some("working")
+        });
+    let due = match &last {
+        None => true,
+        Some((published_at, published_fields)) => {
+            let published: BTreeMap<String, Value> =
+                serde_json::from_str(published_fields).unwrap_or_default();
+            !working
+                || now.saturating_sub((*published_at).max(0) as u128) >= USAGE_PUBLISH_INTERVAL_MS
+                || ["compactions", "model"]
+                    .iter()
+                    .any(|name| published.get(*name) != input.fields.get(*name))
+        }
+    };
+    if !due {
+        let local_id = local_observation_position(local)
+            .ok_or_else(|| St3Error::new("internal", "a local observation has no position"))?;
+        transaction
+            .execute(
+                "UPDATE local_latest_slots SET pending_local_id=?3
+                 WHERE subject=?1 AND kind='harness.usage' AND slot=?2",
+                params![input.subject, slot, local_id as i64],
+            )
+            .map_err(internal)?;
+        return Ok(None);
+    }
+    publish_usage_slot_tx(
+        transaction,
+        origin,
+        &input.subject,
+        input.actor.as_deref(),
+        &input.fields,
+        now,
+    )
+    .map(Some)
+}
+
+fn publish_usage_slot_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    subject: &str,
+    actor: Option<&str>,
+    fields: &BTreeMap<String, Value>,
+    now: u128,
+) -> Result<ClaimRecord, St3Error> {
+    let fields_text = canonical_json_text(&json!(fields)).map_err(internal)?;
+    transaction
+        .execute(
+            "INSERT INTO local_latest_slots(
+                subject, kind, slot, published_at_unix_ms, published_fields, pending_local_id
+             ) VALUES (?1, 'harness.usage', ?2, ?3, ?4, NULL)
+             ON CONFLICT(subject, kind, slot) DO UPDATE SET
+                published_at_unix_ms=excluded.published_at_unix_ms,
+                published_fields=excluded.published_fields,
+                pending_local_id=NULL",
+            params![
+                subject,
+                usage_slot(fields),
+                now.min(i64::MAX as u128) as i64,
+                fields_text
+            ],
+        )
+        .map_err(internal)?;
+    publish_latest_claim_tx(
+        transaction,
+        origin,
+        subject,
+        "harness.usage",
+        actor,
+        &json!(fields),
+    )
+}
+
+/// Replicate the newest local usage of each pending slot of `subject`.
+fn publish_pending_usage_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+    subject: &str,
+    now: u128,
+) -> Result<Vec<ClaimRecord>, St3Error> {
+    let pending = {
+        let mut statement = transaction
+            .prepare(&format!(
+                "{LOCAL_OBSERVATION_COLUMNS} WHERE id IN (
+                    SELECT pending_local_id FROM local_latest_slots
+                    WHERE subject=?1 AND kind='harness.usage' AND pending_local_id IS NOT NULL
+                 ) ORDER BY id"
+            ))
+            .map_err(internal)?;
+        let rows = statement
+            .query_map([subject], |row| local_observation_from_row(origin, row))
+            .map_err(internal)?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(internal)?
+    };
+    transaction
+        .execute(
+            "UPDATE local_latest_slots SET pending_local_id=NULL
+             WHERE subject=?1 AND kind='harness.usage'",
+            [subject],
+        )
+        .map_err(internal)?;
+    pending
+        .into_iter()
+        .map(|observation| {
+            let fields =
+                schema_fields_for_body("harness.usage", &observation.body).map_err(internal)?;
+            publish_usage_slot_tx(
+                transaction,
+                origin,
+                subject,
+                observation.actor.as_deref(),
+                &fields,
+                now,
+            )
+        })
+        .collect()
+}
+
 fn local_observation_id(origin: &str, id: i64) -> String {
     format!("{LOCAL_OBSERVATION_ID_PREFIX}{origin}/{id}")
 }
@@ -14591,7 +15701,7 @@ fn current_harness_at(
             "SELECT id, accepted_at_unix_ms, json_extract(body, '$.fields.code') FROM claims
              WHERE subject=?1 AND kind='harness.diagnostic' AND store_index<=?2
                AND json_extract(body, '$.fields.code')
-                   IN ('provider-auth-expired', 'provider-trust-prompt')
+                   IN ('provider-auth-expired', 'provider-auth-restored', 'provider-trust-prompt')
                AND json_extract(body, '$.fields.incarnation_id')=?3
              ORDER BY store_index DESC LIMIT 1",
             params![subject, at_index, incarnation_id],
@@ -14604,7 +15714,10 @@ fn current_harness_at(
             },
         )
         .optional()?;
-    if let Some((claim, observed_at_unix_ms, code)) = prompt_rejection {
+    // A lifted login fence no longer holds the incarnation.
+    if let Some((claim, observed_at_unix_ms, code)) = prompt_rejection
+        && code != "provider-auth-restored"
+    {
         let (state, reason) = if code == "provider-trust-prompt" {
             ("blocked", "providerTrustPrompt")
         } else {
@@ -15553,6 +16666,13 @@ fn attention_action(label: &str, argv: &[&str]) -> AttentionActionView {
     }
 }
 
+fn subscription_failure_attention_subject(claim_id: &str) -> String {
+    format!(
+        "attention/subscription-failure-{}",
+        claim_id.strip_prefix("claim/").unwrap_or(claim_id)
+    )
+}
+
 fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
     AttentionItemView {
         kind: "human-gate".into(),
@@ -15560,6 +16680,9 @@ fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
         subject: review.owner.clone(),
         person: review.reviewer.clone(),
         requester_id: None,
+        launch_id: None,
+        variant_id: None,
+        message_id: None,
         title: review
             .title
             .clone()
@@ -15616,7 +16739,13 @@ fn attention_item_from_planning(
         review_mode: None,
         subject: session.subject.clone(),
         person: session.requester.clone(),
-        requester_id: None,
+        requester_id: Some(session.requester.clone()),
+        launch_id: Some(format!("launch/{}", session.id)),
+        variant_id: Some(format!(
+            "launch-variant/{}/{}",
+            session.id, candidate.variant
+        )),
+        message_id: None,
         title: format!("Approve mission/{}", session.mission),
         detail: "The current launch preview is ready for approval.".into(),
         mission: Some(format!("mission/{}", session.mission)),
@@ -15669,6 +16798,9 @@ fn attention_item_from_revision(
         subject: proposal.subject.clone(),
         person: reviewer.to_owned(),
         requester_id: None,
+        launch_id: None,
+        variant_id: None,
+        message_id: None,
         title: format!("Approve a revision of {}", run.mission),
         detail: proposal.reason.clone(),
         mission: Some(run.mission.clone()),
@@ -15716,7 +16848,10 @@ fn attention_item_from_message(
         review_mode: None,
         subject: message.subject.clone(),
         person: message.to.clone(),
-        requester_id: None,
+        requester_id: Some(message.from.clone()),
+        launch_id: None,
+        variant_id: None,
+        message_id: Some(message.subject.clone()),
         title: message
             .title
             .unwrap_or_else(|| format!("Message from {}", message.from)),
@@ -15757,6 +16892,9 @@ fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemVi
         subject: request.subject.clone(),
         person: request.reviewer.clone(),
         requester_id: Some(request.actor.clone()),
+        launch_id: None,
+        variant_id: None,
+        message_id: None,
         title: request.title,
         detail: request.reason,
         mission: None,
@@ -16868,13 +18006,19 @@ impl Store {
     /// including envelopes written before the key existed. Returns the number signed now.
     pub fn set_member_key(&self, key: Option<Arc<crate::fleet::MemberKey>>) -> Result<usize> {
         if key.is_none() {
-            *self.member_key.write().expect("member key lock poisoned") = None;
+            *self
+                .member_key
+                .write()
+                .unwrap_or_else(PoisonError::into_inner) = None;
             return Ok(0);
         }
         // Seed envelopes for any local batch first, so the full pass below sees all of them.
         self.replication_snapshot()?;
-        *self.member_key.write().expect("member key lock poisoned") = key;
-        let mut connection = self.connection.lock().expect("store mutex poisoned");
+        *self
+            .member_key
+            .write()
+            .unwrap_or_else(PoisonError::into_inner) = key;
+        let mut connection = self.connection.write();
         let transaction = connection.transaction()?;
         let signed = self.sign_own_envelopes_tx(&transaction, None)?;
         transaction.commit()?;
@@ -16885,7 +18029,7 @@ impl Store {
     /// authenticated join or migration handshake, and never replaces it.
     pub fn pin_fleet_anchor(&self, anchor: &str) -> Result<()> {
         anyhow::ensure!(!anchor.is_empty(), "the fleet anchor key is empty");
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         let stored = connection
             .query_row(
                 "SELECT value FROM meta WHERE key='fleet_anchor_key'",
@@ -16913,7 +18057,7 @@ impl Store {
     /// Start this store's own writer above `floor`. A node that joins under a name the fleet
     /// has used before sets this before it writes anything.
     pub fn set_writer_floor(&self, floor: u64) -> Result<()> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection.execute(
             "INSERT INTO meta(key, value) VALUES ('writer_floor/' || ?1, ?2)
              ON CONFLICT(key) DO UPDATE SET value=MAX(CAST(value AS INTEGER), CAST(excluded.value AS INTEGER))",
@@ -16955,7 +18099,7 @@ impl Store {
     pub fn member_public_key(&self) -> Option<String> {
         self.member_key
             .read()
-            .expect("member key lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .as_ref()
             .map(|key| key.public().to_owned())
     }
@@ -17015,10 +18159,11 @@ impl Store {
         transaction: &Transaction<'_>,
         after_rowid: Option<i64>,
     ) -> Result<usize> {
+        let _timing = time_stage(&self.replication_timers.signing);
         let Some(key) = self
             .member_key
             .read()
-            .expect("member key lock poisoned")
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
         else {
             return Ok(0);
@@ -17500,7 +18645,7 @@ impl Store {
             idempotency_key: None,
         })?;
         {
-            let connection = self.connection.lock().expect("store mutex poisoned");
+            let connection = self.connection.write();
             connection
                 .execute(
                     "INSERT INTO fleet_invite_tokens(
@@ -17660,7 +18805,7 @@ impl Store {
 
     /// While leaving, this node refuses new local writes, so its leave stays its last.
     pub fn set_fleet_leaving(&self, leaving: bool) -> Result<()> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         if leaving {
             connection.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES ('fleet_leaving', '1')",
@@ -17719,7 +18864,7 @@ impl Store {
 
     /// Erase the tokens of invites that expired or were revoked anywhere in the fleet.
     pub fn sweep_fleet_invites(&self) -> Result<()> {
-        let connection = self.connection.lock().expect("store mutex poisoned");
+        let connection = self.connection.write();
         connection.execute(
             "UPDATE fleet_invite_tokens SET token=NULL
              WHERE token IS NOT NULL AND (
@@ -17812,7 +18957,7 @@ impl Store {
             Ok(()) => {}
             Err(RequestFault::Proof) => {
                 let failures = failures + 1;
-                let connection = self.connection.lock().expect("store mutex poisoned");
+                let connection = self.connection.write();
                 connection.execute(
                     "UPDATE fleet_invite_tokens SET failures=?2 WHERE invite_id=?1",
                     params![request.invite, failures],
@@ -17864,7 +19009,7 @@ impl Store {
                 Err(reason) => return Ok(FleetRedemption::Refused(reason)),
             };
         let bound = {
-            let connection = self.connection.lock().expect("store mutex poisoned");
+            let connection = self.connection.write();
             connection.execute(
                 "UPDATE fleet_invite_tokens SET bound_key=?2, bound_name=?3, writer_floor=?4
                  WHERE invite_id=?1 AND bound_key IS NULL AND token IS NOT NULL",
@@ -18001,7 +19146,7 @@ impl Store {
             idempotency_key: Some(format!("fleet-invite-admitted:{}", request.invite)),
         })?;
         {
-            let connection = self.connection.lock().expect("store mutex poisoned");
+            let connection = self.connection.write();
             connection.execute(
                 "UPDATE fleet_invite_tokens SET admitted_claim=?2 WHERE invite_id=?1",
                 params![request.invite, admitted.id],
@@ -18813,6 +19958,9 @@ fn full_compact_replication_inventory(
 /// divergent exchange lists beyond its first differing range.
 const REPLICATION_EXCHANGE_ENVELOPE_LIMIT: usize = 512;
 
+/// How often a node catching up with a peer projects the claims it has admitted.
+const CATCH_UP_PROJECTION_INTERVAL_MS: u64 = 30_000;
+
 /// The shortest span one sync rate sample covers.
 const REPLICATION_SYNC_WINDOW_MS: u128 = 10_000;
 
@@ -19041,6 +20189,7 @@ fn update_identity_digest(digest: &mut Sha256, writer: &str, sequence: u64, hash
 thread_local! {
     static INVENTORY_IDENTITIES_HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GRAPH_DIGESTS_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static FULL_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The projected tables the graph digest commits: digest label, table, digested columns in
@@ -19925,6 +21074,159 @@ fn a_receipt_measures_how_far_behind_this_node_is() {
     );
 }
 
+#[cfg(test)]
+impl Store {
+    /// The store index the replicated projection last reached.
+    fn projected_through(&self) -> u64 {
+        self.readers
+            .get()
+            .query_row(
+                "SELECT last_good_store_index FROM projection_health WHERE aggregate='graph'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn a_catching_up_node_projects_once_per_interval_and_again_when_caught_up() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    for index in 0..1_800 {
+        source
+            .append_client_claim(&ClaimInput {
+                subject: format!("resource/sync-{index}"),
+                kind: "resource.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([(
+                    "kind".into(),
+                    Value::String("custom.test.replication".into()),
+                )]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+    source.bind_fleet(FLEET).unwrap();
+    let target = Store::open_memory("target").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    let pull = || {
+        let summary = target.export_replication_summary(FLEET).unwrap();
+        let response = source
+            .export_replication_exchange(FLEET, &summary.inventory)
+            .unwrap();
+        target
+            .receive_replication_exchange("source", FLEET, &response)
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        target.project_replication_backlog_unless_catching_up().unwrap()
+    };
+
+    // The first exchange projects, so the node shows something at once.
+    assert_eq!(pull(), Some(true));
+    assert!(target.replication_catching_up());
+    let first = target.projected_through();
+    assert_eq!(first, target.index().unwrap());
+
+    // While more than one exchange remains, a node that just projected defers.
+    assert_eq!(pull(), None);
+    assert!(target.replication_catching_up());
+    assert!(target.replication_projection_deferred());
+    assert_eq!(target.projected_through(), first);
+
+    // Once the interval has passed, it projects again even while catching up.
+    target
+        .last_replication_projection_unix_ms
+        .store(0, Ordering::Release);
+    assert_eq!(
+        target.project_replication_backlog_unless_catching_up().unwrap(),
+        Some(true)
+    );
+    assert!(!target.replication_projection_deferred());
+    assert_eq!(target.projected_through(), target.index().unwrap());
+
+    // Once no more than one exchange remains, every exchange projects at once.
+    assert_eq!(pull(), Some(true));
+    assert!(!target.replication_catching_up());
+    assert_eq!(target.projected_through(), target.index().unwrap());
+    assert!(!target.replication_projection_deferred());
+}
+
+#[cfg(test)]
+#[test]
+fn batches_accepted_in_one_millisecond_extend_the_projection_without_a_replay() {
+    const FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+    let source = Store::open_memory("source").unwrap();
+    source.bind_fleet(FLEET).unwrap();
+    let target = Store::open_memory("target").unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    let sync = || {
+        let response = source
+            .export_replication_exchange(FLEET, &target.replication_inventory().unwrap())
+            .unwrap();
+        assert!(!response.envelopes.is_empty());
+        target
+            .receive_replication_exchange("source", FLEET, &response)
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        assert!(target.project_replication_backlog().unwrap());
+    };
+    let put = |index: usize| {
+        source
+            .put_document(
+                &format!("doc/same-millisecond-{index}"),
+                b"An invented document.",
+                &None,
+                &format!("same-millisecond-{index}"),
+            )
+            .unwrap();
+    };
+    // The first projection of an empty node is a full replay.
+    put(0);
+    sync();
+
+    // Write document bindings, each its own batch, until two share an accepted millisecond.
+    let bindings = |source: &Store| {
+        source
+            .claims_page(None, None, 0, None, false, 10_000)
+            .unwrap()
+            .claims
+            .into_iter()
+            .filter(|claim| claim.kind == "doc.bound")
+            .collect::<Vec<_>>()
+    };
+    let mut index = 1;
+    loop {
+        put(index);
+        index += 1;
+        let written = bindings(&source);
+        let [.., previous, last] = written.as_slice() else {
+            continue;
+        };
+        if previous.accepted_at_unix_ms == last.accepted_at_unix_ms {
+            assert_ne!(previous.batch_id, last.batch_id);
+            break;
+        }
+        assert!(index < 5_000, "no two bindings shared a millisecond");
+    }
+    FULL_REPLAYS.with(|replays| replays.set(0));
+    sync();
+    assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0);
+    assert_eq!(
+        target
+            .replication_status(true, Some(FLEET), &[])
+            .unwrap()
+            .graph_digest,
+        source
+            .replication_status(true, Some(FLEET), &[])
+            .unwrap()
+            .graph_digest
+    );
+}
+
 fn collect_referenced_blobs(
     connection: &Connection,
     claims: &[ClaimRecord],
@@ -20047,7 +21349,7 @@ fn canonical_child_strings(value: &Value, name: &str) -> Vec<String> {
         .collect()
 }
 
-fn ensure_claim_blobs(transaction: &Transaction<'_>, claim: &ClaimRecord) -> Result<(), St3Error> {
+fn ensure_claim_blobs(transaction: &Connection, claim: &ClaimRecord) -> Result<(), St3Error> {
     let mut hashes = BTreeSet::new();
     collect_hash_fields(&claim.body, &mut hashes);
     for hash in hashes {
@@ -20067,10 +21369,11 @@ fn ensure_claim_blobs(transaction: &Transaction<'_>, claim: &ClaimRecord) -> Res
 }
 
 fn validate_and_admit_envelope_tx(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     envelope: &ReplicaEnvelope,
     outcome: &mut ReplicationAdmission,
 ) -> Result<(), St3Error> {
+    let started = std::time::Instant::now();
     let payload_bytes = base64::engine::general_purpose::STANDARD
         .decode(envelope.payload.as_bytes())
         .map_err(|error| {
@@ -20111,6 +21414,7 @@ fn validate_and_admit_envelope_tx(
         ));
     }
     verify_replica_batch_header(batch)?;
+    outcome.verify += started.elapsed();
     let now = now_ms().to_string();
     let mut degraded = false;
     for (offset, (hash, bytes)) in payload.blobs.iter().enumerate() {
@@ -20223,7 +21527,9 @@ fn validate_and_admit_envelope_tx(
             )
             .optional()
             .map_err(internal)?;
+        let started = std::time::Instant::now();
         let classification = validate_replicated_claim(transaction, batch, claim);
+        outcome.verify += started.elapsed();
         match classification {
             Ok(ReplicatedClaimAdmission::Valid) => {
                 let inserted = transaction
@@ -20350,7 +21656,7 @@ fn verify_replica_batch_header(batch: &ReplicaBatch) -> Result<(), St3Error> {
 }
 
 fn validate_replicated_claim(
-    transaction: &Transaction<'_>,
+    transaction: &Connection,
     batch: &ReplicaBatch,
     claim: &ClaimRecord,
 ) -> Result<ReplicatedClaimAdmission, St3Error> {
@@ -20452,8 +21758,16 @@ fn reapply_local_work_lease_renewals_tx(transaction: &Transaction<'_>) -> Result
     Ok(())
 }
 
+/// A batch's writer and sequence from its ID, `batch/WRITER/SEQUENCE/HASH`.
+fn batch_order_key(batch_id: &str) -> Option<(String, u64)> {
+    let rest = batch_id.strip_prefix("batch/")?;
+    let (rest, _hash) = rest.rsplit_once('/')?;
+    let (writer, sequence) = rest.rsplit_once('/')?;
+    Some((writer.to_owned(), sequence.parse().ok()?))
+}
+
 /// Advance from a healthy frontier when the new claims have unambiguous operation IDs and
-/// structural claims are strictly newer than the previously projected accepted-time order.
+/// structural claims sort after everything projected, in the order the full replay uses.
 fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bool, St3Error> {
     let health: Option<(String, u64)> = transaction
         .query_row(
@@ -20488,12 +21802,15 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
         .filter(|claim| claim.kind.starts_with("work."))
         .collect::<Vec<_>>();
     work_claims.sort_by_key(|claim| claim.accepted_at_unix_ms);
-    let mut last_accepted: Option<u128> = None;
+    // The full replay orders claims by accepted time, then by batch writer and sequence. A
+    // structural claim extends the projection only when it sorts after everything projected
+    // so far; the claims of one batch share that key and keep their order within the batch.
+    let mut last_key: Option<(u128, String, u64)> = None;
     if claims
         .iter()
         .any(|claim| !Store::simple_replication_kind(&claim.kind))
     {
-        last_accepted = transaction
+        let last_accepted = transaction
             .query_row(
                 "SELECT accepted_at_unix_ms FROM claims WHERE store_index<=?1
                  ORDER BY length(accepted_at_unix_ms) DESC, accepted_at_unix_ms DESC LIMIT 1",
@@ -20501,8 +21818,28 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
                 |row| row.get::<_, String>(0),
             )
             .optional()
-            .map_err(internal)?
-            .and_then(|value| value.parse::<u128>().ok());
+            .map_err(internal)?;
+        if let Some(accepted) = last_accepted {
+            let mut statement = transaction
+                .prepare(
+                    "SELECT batch_id FROM claims WHERE store_index<=?1 AND accepted_at_unix_ms=?2",
+                )
+                .map_err(internal)?;
+            let batches = statement
+                .query_map(params![frontier, accepted], |row| row.get::<_, String>(0))
+                .map_err(internal)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(internal)?;
+            let Some((writer, sequence)) = batches
+                .iter()
+                .map(|batch| batch_order_key(batch))
+                .collect::<Option<Vec<_>>>()
+                .and_then(|keys| keys.into_iter().max())
+            else {
+                return Ok(false);
+            };
+            last_key = Some((accepted.parse().map_err(internal)?, writer, sequence));
+        }
     }
     for claim in &claims {
         let has_operation = claim.body.get("_operation").is_some();
@@ -20531,10 +21868,14 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
             return Ok(false);
         }
         if !Store::simple_replication_kind(&claim.kind) {
-            if last_accepted.is_some_and(|previous| claim.accepted_at_unix_ms <= previous) {
+            let Some((writer, sequence)) = batch_order_key(&claim.batch_id) else {
+                return Ok(false);
+            };
+            let key = (claim.accepted_at_unix_ms, writer, sequence);
+            if last_key.as_ref().is_some_and(|last| key < *last) {
                 return Ok(false);
             }
-            last_accepted = Some(claim.accepted_at_unix_ms);
+            last_key = Some(key);
             let repaired: bool = transaction
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM replica_records WHERE claim_id=?1 AND state='repaired')",
@@ -20706,6 +22047,7 @@ fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), S
         )
         .map_err(internal)?;
     let claims = statement.query_map([], claim_from_row).map_err(internal)?;
+    clear_quarantined_claims_tx(transaction, "projection:base")?;
     for claim in claims {
         let claim = claim.map_err(internal)?;
         insert_event(
@@ -20716,19 +22058,75 @@ fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), S
             &claim.body,
         )
         .map_err(internal)?;
-        match claim.kind.as_str() {
-            "intent.desired" => {
-                let desired = serde_json::from_value::<DesiredSubject>(claim.body.clone())
-                    .map_err(internal)?;
-                select_replicated_desired(transaction, &claim, &desired)?;
+        project_claim_isolated_tx(transaction, "projection:base", &claim, || {
+            match claim.kind.as_str() {
+                "intent.desired" => {
+                    let desired = serde_json::from_value::<DesiredSubject>(claim.body.clone())
+                        .map_err(internal)?;
+                    select_replicated_desired(transaction, &claim, &desired)?;
+                }
+                "doc.bound" => select_replicated_document(transaction, &claim, claim.store_index)?,
+                "mission.published" => {
+                    select_replicated_mission(transaction, &claim, claim.store_index)?
+                }
+                _ => {}
             }
-            "doc.bound" => select_replicated_document(transaction, &claim, claim.store_index)?,
-            "mission.published" => {
-                select_replicated_mission(transaction, &claim, claim.store_index)?
-            }
-            _ => {}
+            Ok(())
+        })?;
+    }
+    Ok(())
+}
+
+/// Project one replicated claim on its own. A claim whose projection fails is rolled back alone
+/// and recorded as an unhealthy projection that names it, so one claim a build cannot project
+/// never holds every later claim from every peer out of the graph.
+fn project_claim_isolated_tx(
+    transaction: &Transaction<'_>,
+    aggregate: &str,
+    claim: &ClaimRecord,
+    project: impl FnOnce() -> Result<(), St3Error>,
+) -> Result<(), St3Error> {
+    transaction
+        .execute_batch("SAVEPOINT project_claim")
+        .map_err(internal)?;
+    match project() {
+        Ok(()) => transaction
+            .execute_batch("RELEASE project_claim")
+            .map_err(internal),
+        Err(error) => {
+            transaction
+                .execute_batch("ROLLBACK TO project_claim; RELEASE project_claim")
+                .map_err(internal)?;
+            transaction
+                .execute(
+                    "INSERT INTO projection_health(aggregate, status, error_code, error_message, updated_at_unix_ms)
+                     VALUES (?1, 'stale', ?2, ?3, ?4)
+                     ON CONFLICT(aggregate) DO UPDATE SET status='stale', error_code=excluded.error_code,
+                        error_message=excluded.error_message, updated_at_unix_ms=excluded.updated_at_unix_ms",
+                    params![
+                        format!("{aggregate}:{}", claim.id),
+                        error.code,
+                        format!("{} on {}: {}", claim.kind, claim.subject, error.message),
+                        now_ms().to_string()
+                    ],
+                )
+                .map_err(internal)?;
+            Ok(())
         }
     }
+}
+
+/// A full replay decides every claim again, so it first forgets the claims it quarantined before.
+fn clear_quarantined_claims_tx(
+    transaction: &Transaction<'_>,
+    aggregate: &str,
+) -> Result<(), St3Error> {
+    transaction
+        .execute(
+            "DELETE FROM projection_health WHERE aggregate LIKE ?1",
+            [format!("{aggregate}:%")],
+        )
+        .map_err(internal)?;
     Ok(())
 }
 
@@ -20825,6 +22223,64 @@ fn select_replicated_desired(
     Ok(())
 }
 
+fn apply_replication_repair_tx(
+    transaction: &Transaction<'_>,
+    repair_claim: &str,
+    body: &str,
+) -> Result<usize> {
+    let body: Value = serde_json::from_str(body)?;
+    let fields = body.get("fields").unwrap_or(&body);
+    let Some(record_ref) = fields.get("record").and_then(Value::as_str) else {
+        return Ok(0);
+    };
+    let Some(replacement) = fields.get("replacement").and_then(Value::as_str) else {
+        return Ok(0);
+    };
+    let replacement_exists = transaction
+        .query_row(
+            "SELECT 1 FROM claims WHERE id=?1",
+            [replacement],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some();
+    if !replacement_exists {
+        return Ok(0);
+    }
+    let repaired_claim = transaction
+        .query_row(
+            "SELECT claim_id FROM replica_records WHERE record_ref=?1",
+            [record_ref],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    let changed = transaction.execute(
+        "UPDATE replica_records SET state='repaired', replacement_claim_id=?2,
+                error_code=NULL, error_message=NULL, updated_at_unix_ms=?3
+             WHERE record_ref=?1 AND state IN ('valid','invalid','unknown','repaired')
+               AND (replacement_claim_id IS NULL OR replacement_claim_id<>?2)",
+        params![record_ref, replacement, now_ms().to_string()],
+    )?;
+    if let Some(repaired_claim) = repaired_claim {
+        select_desired_repair_tx(transaction, &repaired_claim, replacement)?;
+    }
+    transaction.execute(
+            "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
+             VALUES (?1, 'healthy', ?2, ?3)
+             ON CONFLICT(aggregate) DO UPDATE SET status='healthy',
+                last_good_store_index=excluded.last_good_store_index, error_code=NULL,
+                error_message=NULL, updated_at_unix_ms=excluded.updated_at_unix_ms",
+            params![format!("repair:{record_ref}:{repair_claim}"), current_index_tx(transaction)?, now_ms().to_string()],
+        )?;
+    // A repair that failed before and applies now is no longer unhealthy.
+    transaction.execute(
+        "DELETE FROM projection_health WHERE aggregate=?1",
+        [format!("repair:{repair_claim}")],
+    )?;
+    Ok(changed)
+}
+
 fn select_desired_repair_tx(
     transaction: &Transaction<'_>,
     repaired_claim_id: &str,
@@ -20883,6 +22339,7 @@ fn select_desired_repair_tx(
 }
 
 fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), St3Error> {
+    clear_quarantined_claims_tx(transaction, "projection:runs")?;
     for pass in 0..3 {
         let filter = match pass {
             0 => "claims.kind='mission-run.created'",
@@ -20907,11 +22364,11 @@ fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), 
         let claims = statement.query_map([], claim_from_row).map_err(internal)?;
         for claim in claims {
             let claim = claim.map_err(internal)?;
-            match pass {
-                0 => project_mission_run_created(transaction, &claim)?,
-                1 => project_mission_run_update(transaction, &claim)?,
-                _ => reconcile_carried_step_tx(transaction, &claim)?,
-            }
+            project_claim_isolated_tx(transaction, "projection:runs", &claim, || match pass {
+                0 => project_mission_run_created(transaction, &claim),
+                1 => project_mission_run_update(transaction, &claim),
+                _ => reconcile_carried_step_tx(transaction, &claim),
+            })?;
         }
     }
     Ok(())
@@ -22946,6 +24403,7 @@ fn step_run_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StepRunView> {
         run: format!("mission-run/{}", row.get::<_, String>(1)?),
         generation,
         step: row.get(2)?,
+        fresh_context: false,
         queue: None,
         queue_position: None,
         definition_hash: row.get(3)?,
@@ -23093,8 +24551,52 @@ fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> ru
         view.queue.clone_from(&step.queue);
         view.queue_position = step.queue_position;
         view.timeout_ms = step.timeout_ms;
+        view.fresh_context = step.fresh_context;
     }
     Ok(())
+}
+
+fn fresh_context_ready_tx(
+    connection: &Connection,
+    step: &StepRunView,
+    actor: &str,
+    incarnation: &str,
+) -> rusqlite::Result<bool> {
+    let member: Option<String> = connection
+        .query_row(
+            "SELECT member FROM desired WHERE subject=?1",
+            [actor],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let seat_fresh = member
+        .as_deref()
+        .and_then(|member| serde_json::from_str::<Value>(member).ok())
+        .is_some_and(|member| {
+            member
+                .pointer("/tags/st3.fresh_context")
+                .and_then(Value::as_str)
+                == Some("true")
+        });
+    if !step.fresh_context && !seat_fresh {
+        return Ok(true);
+    }
+    let operation = crate::model::fresh_context_operation(step);
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM local_observations
+         WHERE subject=?1 AND kind='runtime.action.succeeded'
+           AND json_extract(body, '$.fields.action')='fresh-context'
+           AND json_extract(body, '$.fields.operation')=?2
+           AND json_extract(body, '$.fields.incarnation_id')=?3)
+         OR EXISTS(SELECT 1 FROM claims
+         WHERE subject=?1 AND kind='runtime.action.succeeded'
+           AND json_extract(body, '$.fields.action')='fresh-context'
+           AND json_extract(body, '$.fields.operation')=?2
+           AND json_extract(body, '$.fields.incarnation_id')=?3)",
+        params![actor, operation, incarnation],
+        |row| row.get(0),
+    )
 }
 
 fn enrich_step_wake_at(
@@ -24767,6 +26269,80 @@ mod tests {
     }
 
     #[test]
+    fn subscription_retry_queries_use_history_indexes() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "subscription/reviews";
+        let first = now_ms() as u64 + 10_000;
+        let second = first + 20_000;
+        for (request, deadline) in [
+            ("request-a", first),
+            ("request-b", first),
+            ("request-a", second),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "subscription.mission-deferred".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("request".into(), Value::String(request.into())),
+                        ("not_before_unix_ms".into(), Value::from(deadline)),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .subscription_mission_deferral(subject, "request-a")
+                .unwrap(),
+            Some((u128::from(second), 2)),
+        );
+        assert_eq!(
+            store
+                .subscription_mission_deferral(subject, "request-b")
+                .unwrap(),
+            Some((u128::from(first), 1)),
+        );
+        assert_eq!(
+            store
+                .subscription_mission_deferral(subject, "missing")
+                .unwrap(),
+            None,
+        );
+        let connection = store.readers.get();
+        let request_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM claims
+                 WHERE subject=?1 AND kind='subscription.mission-deferred'
+                   AND json_extract(body, '$.fields.request')=?2",
+                params![subject, "request-a"],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            request_plan.contains("claims_subscription_deferred_request_index"),
+            "{request_plan}"
+        );
+        let deadline_plan: String = connection
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT MIN(CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER))
+                 FROM claims INDEXED BY claims_subscription_deferred_deadline_index
+                 WHERE kind='subscription.mission-deferred'
+                   AND CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER)>?1",
+                [now_ms() as i64],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            deadline_plan.contains("claims_subscription_deferred_deadline_index"),
+            "{deadline_plan}"
+        );
+    }
+
+    #[test]
     fn replication_projection_retries_missing_and_stale_health_only() {
         let store = Store::open_memory("node").unwrap();
         assert!(store.replication_projection_needs_recovery().unwrap());
@@ -24964,6 +26540,231 @@ mod tests {
         let connection = store.connection.lock().unwrap();
         assert!(connection.total_changes() - before <= 2);
         assert!(operation_tx(&connection, "op/existing").unwrap().is_some());
+    }
+
+    /// A panic while the writer is held leaves no half-written transaction behind, so it must not
+    /// turn every later write into a panic while the daemon keeps running.
+    #[test]
+    fn a_panic_while_the_writer_is_held_does_not_disable_the_store() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let panicking = store.clone();
+        let panicked = std::thread::spawn(move || {
+            let _writer = panicking.connection.write();
+            panic!("a panic while the writer is held");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(store.connection.connection.is_poisoned());
+        store
+            .append_claim(&ClaimInput {
+                subject: "daemon/node".into(),
+                kind: "daemon.diagnostic".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("severity".into(), Value::String("error".into())),
+                    ("code".into(), Value::String("after-a-panic".into())),
+                    (
+                        "reason".into(),
+                        Value::String("the store still writes".into()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+
+    /// A claim this build cannot project, such as a desired body from another build, is
+    /// quarantined and named. Every other claim still reaches the graph.
+    #[test]
+    fn one_claim_that_cannot_be_projected_is_quarantined_while_the_rest_project() {
+        let store = Store::open_memory("node").unwrap();
+        let source = "version 2\nagent \"bad\" { workspace \"/tmp\"; command \"true\" }\nagent \"good\" { workspace \"/tmp\"; command \"true\" }\n";
+        let intent = parse_intent(source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "quarantine")
+            .unwrap();
+        let bad_claim = {
+            let connection = store.connection.lock().unwrap();
+            let bad_claim: String = connection
+                .query_row(
+                    "SELECT claim_id FROM desired WHERE subject='agent/node.bad'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE claims SET body='{\"from\":\"another build\"}' WHERE id=?1",
+                    [&bad_claim],
+                )
+                .unwrap();
+            connection.execute("DELETE FROM desired", []).unwrap();
+            connection
+                .execute(
+                    "UPDATE projection_health SET status='stale' WHERE aggregate='graph'",
+                    [],
+                )
+                .unwrap();
+            bad_claim
+        };
+        assert!(store.project_replication_backlog().unwrap());
+        let desired = store.desired_subjects().unwrap();
+        assert!(
+            desired
+                .iter()
+                .any(|subject| subject.subject == "agent/node.good")
+        );
+        assert!(
+            !desired
+                .iter()
+                .any(|subject| subject.subject == "agent/node.bad")
+        );
+        let status = store.replication_status(false, None, &[]).unwrap();
+        assert_eq!(status.unhealthy_projections, 1);
+        assert_eq!(
+            status.unhealthy[0].aggregate,
+            format!("projection:base:{bad_claim}")
+        );
+        assert!(
+            status.unhealthy[0]
+                .error_message
+                .as_deref()
+                .is_some_and(|message| message.contains("agent/node.bad"))
+        );
+        // A later full replay decides the claim again instead of keeping a stale quarantine.
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute("DELETE FROM claims WHERE id=?1", [&bad_claim])
+                .unwrap();
+            connection
+                .execute(
+                    "UPDATE projection_health SET status='stale' WHERE aggregate='graph'",
+                    [],
+                )
+                .unwrap();
+        }
+        assert!(store.project_replication_backlog().unwrap());
+        assert_eq!(
+            store
+                .replication_status(false, None, &[])
+                .unwrap()
+                .unhealthy_projections,
+            0
+        );
+    }
+
+    /// One repair that cannot be applied never stops the others, replication, or startup.
+    #[test]
+    fn one_repair_that_cannot_be_applied_is_named_and_the_rest_apply() {
+        let store = Store::open_memory("node").unwrap();
+        let source = "version 2\nagent \"one\" { workspace \"/tmp\"; command \"true\" }\nagent \"two\" { workspace \"/tmp\"; command \"true\" }\n";
+        let intent = parse_intent(source, "node").unwrap();
+        let preview = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &preview.subject_tokens, "repairs")
+            .unwrap();
+        let broken = {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let mut repairs = Vec::new();
+            for (position, agent) in ["one", "two"].into_iter().enumerate() {
+                let subject = format!("agent/node.{agent}");
+                let repaired: String = transaction
+                    .query_row(
+                        "SELECT claim_id FROM desired WHERE subject=?1",
+                        [&subject],
+                        |row| row.get(0),
+                    )
+                    .unwrap();
+                let body: String = transaction
+                    .query_row("SELECT body FROM claims WHERE id=?1", [&repaired], |row| {
+                        row.get(0)
+                    })
+                    .unwrap();
+                let replacement = append_claim_tx(
+                    &transaction,
+                    &store.origin,
+                    &subject,
+                    "intent.desired",
+                    None,
+                    &serde_json::from_str::<Value>(&body).unwrap(),
+                    &[],
+                    None,
+                )
+                .unwrap()
+                .id;
+                transaction
+                    .execute(
+                        "INSERT INTO replica_records(record_ref, writer, sequence, envelope_hash,
+                            position, raw, state, claim_id, updated_at_unix_ms)
+                         VALUES (?1, 'peer', 1, 'envelope', ?2, x'00', 'valid', ?3, '0')",
+                        params![format!("record/{agent}"), position as i64, repaired],
+                    )
+                    .unwrap();
+                repairs.push((
+                    replacement.clone(),
+                    append_claim_tx(
+                        &transaction,
+                        &store.origin,
+                        &format!("repair/{agent}"),
+                        "record.repaired",
+                        None,
+                        &json!({"fields": {
+                            "record": format!("record/{agent}"),
+                            "replacement": replacement,
+                            "reason": "a test repair"
+                        }}),
+                        &[],
+                        None,
+                    )
+                    .unwrap()
+                    .id,
+                ));
+            }
+            // The first replacement names a desired body that this build cannot read.
+            transaction
+                .execute(
+                    "UPDATE claims SET body='{\"from\":\"another build\"}' WHERE id=?1",
+                    [&repairs[0].0],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+            repairs[0].1.clone()
+        };
+        store.apply_replication_repairs().unwrap();
+        let status = store.replication_status(false, None, &[]).unwrap();
+        assert_eq!(
+            status
+                .unhealthy
+                .iter()
+                .map(|projection| projection.aggregate.clone())
+                .collect::<Vec<_>>(),
+            [format!("repair:{broken}")]
+        );
+        assert_eq!(
+            status.repaired_records, 1,
+            "the second repair still applied"
+        );
     }
 
     #[test]
@@ -30126,6 +31927,8 @@ version 2
         );
     }
 
+    /// A replicated harness observation. Each one is a new transition: a repeat that changed
+    /// only `observed_at_ms` would stay in the local observation log.
     fn observe_harness(store: &Store, observed_at_ms: u64) {
         store
             .append_claim(&ClaimInput {
@@ -30135,6 +31938,7 @@ version 2
                 fields: BTreeMap::from([
                     ("state".into(), json!("working")),
                     ("observed_at_ms".into(), json!(observed_at_ms)),
+                    ("transition_sequence".into(), json!(observed_at_ms)),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -30339,6 +32143,61 @@ version 2
 
         let reopened = Store::open(&path, "node").unwrap();
         assert!(reopened.operation_projection_drift().unwrap().is_empty());
+    }
+
+    #[test]
+    fn legacy_human_gate_mission_keeps_its_revision_during_replication() {
+        let store = Store::open_memory("node").unwrap();
+        assert!(store.project_replication_backlog().unwrap());
+        let intent = parse_intent(
+            "version 2\nmission \"sample/review\" state=\"ready\" {\n  goal \"Review a sample change.\"\n  step \"approval\" {\n    gate \"review\" type=\"human\" { reviewer \"person/reviewer\" }\n  }\n}\n",
+            "node",
+        )
+        .unwrap();
+        let mut mission = intent.missions["sample/review"].clone();
+        mission.revision.clear();
+        // This is the serialized form from before human gates had a mode field.
+        let current_json = serde_json::to_string(&mission).unwrap();
+        let legacy_json = current_json.replace(",\"mode\":\"approve\"", "");
+        assert_ne!(legacy_json, current_json);
+        let revision = hex::encode(Sha256::digest(legacy_json.as_bytes()));
+        let mut body: Value = serde_json::from_str(&legacy_json).unwrap();
+        body["revision"] = Value::String(revision.clone());
+        let claim = {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let claim = append_claim_tx(
+                &transaction,
+                &store.origin,
+                "mission/sample/review",
+                "mission.published",
+                None,
+                &body,
+                &[],
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+            claim
+        };
+        assert!(store.project_replication_backlog().unwrap());
+        let connection = store.connection.lock().unwrap();
+        let selected: String = connection
+            .query_row(
+                "SELECT revision FROM mission_revisions WHERE mission_id='sample/review'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(selected, revision);
+        assert!(store.operation_projection_drift().unwrap().is_empty());
+        assert!(!connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM projection_health WHERE aggregate=?1 AND status='stale')",
+                [format!("projection:base:{}", claim.id)],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap());
     }
 
     #[test]
@@ -31861,6 +33720,83 @@ mission "nested-work" state="ready" {
         }
     }
 
+    #[test]
+    fn agent_activity_ignores_timeline_status_and_tracks_content() {
+        let store = Store::open_memory("node").unwrap();
+        let agent = "agent/node.worker";
+        let mut status = timeline_observation(agent, "inc-1", "idle");
+        status
+            .fields
+            .insert("entry_type".into(), Value::String("status".into()));
+        store.append_claim(&status).unwrap();
+        assert_eq!(
+            store
+                .agent_last_activity_at(agent, Some("inc-1"), store.index().unwrap())
+                .unwrap(),
+            None
+        );
+        let content = store
+            .append_claim(&timeline_observation(agent, "inc-1", "answer"))
+            .unwrap();
+        assert_eq!(
+            store
+                .agent_last_activity_at(agent, Some("inc-1"), store.index().unwrap())
+                .unwrap(),
+            Some(content.accepted_at_unix_ms)
+        );
+        let mut later_status = timeline_observation(agent, "inc-1", "working");
+        later_status
+            .fields
+            .insert("entry_type".into(), Value::String("status".into()));
+        store.append_claim(&later_status).unwrap();
+        assert_eq!(
+            store
+                .agent_last_activity_at(agent, Some("inc-1"), store.index().unwrap())
+                .unwrap(),
+            Some(content.accepted_at_unix_ms)
+        );
+    }
+
+    #[test]
+    fn agent_silence_starts_at_the_latest_working_transition() {
+        let store = Store::open_memory("node").unwrap();
+        let agent = "agent/node.worker";
+        let observe = |state: &str, key: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: agent.into(),
+                    kind: "harness.observed".into(),
+                    actor: Some(agent.into()),
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String(state.into())),
+                        ("driver".into(), Value::String("codex".into())),
+                        ("incarnation_id".into(), Value::String("inc-1".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap()
+        };
+        observe("idle", "idle-one");
+        let first = observe("working", "work-one");
+        observe("working", "work-heartbeat");
+        assert_eq!(
+            store
+                .agent_working_since(agent, "inc-1", store.index().unwrap())
+                .unwrap(),
+            Some(first.accepted_at_unix_ms)
+        );
+        observe("idle", "idle-two");
+        let second = observe("working", "work-two");
+        assert_eq!(
+            store
+                .agent_working_since(agent, "inc-1", store.index().unwrap())
+                .unwrap(),
+            Some(second.accepted_at_unix_ms)
+        );
+    }
+
     fn timeline_entries(page: &ClaimsPage) -> Vec<String> {
         page.claims
             .iter()
@@ -31985,6 +33921,143 @@ mission "nested-work" state="ready" {
         assert_eq!(
             reopened.append_claim_outcome(&unnumbered).unwrap_err().code,
             "missing-claim-field"
+        );
+    }
+
+    #[test]
+    fn response_usage_stays_local_while_attributed_totals_replicate() {
+        let local = Store::open_memory("host-one").unwrap();
+        let subject = "agent/example.worker";
+        let seed = local
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "harness.observed".into(),
+                actor: Some(subject.into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("ready".into())),
+                    ("driver".into(), Value::String("claude".into())),
+                    ("incarnation_id".into(), Value::String("inc-one".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("usage-seed".into()),
+            })
+            .unwrap();
+        local.connection.lock().unwrap().execute(
+            "INSERT INTO desired(subject, kind, revision, claim_id, body, owner_run, owner_generation, owner_step)
+             VALUES (?1, 'agent', 'revision', ?2, '{}', 'mission-run/example', 'run-generation/example', 'step-run/example/record')",
+            params![subject, seed.id],
+        ).unwrap();
+        let record = |entry: &str, input: u64, output: u64, reads: u64, writes: u64| {
+            let mut claim = timeline_observation(subject, "inc-one", entry);
+            claim
+                .fields
+                .insert("entry_type".into(), Value::String("usage".into()));
+            claim
+                .fields
+                .insert("role".into(), Value::String("system".into()));
+            claim
+                .fields
+                .insert("driver".into(), Value::String("claude".into()));
+            claim.fields.insert(
+                "body".into(),
+                json!({
+                    "semantics": "response", "model": "claude-example", "turn_id": entry,
+                    "input_tokens": input, "output_tokens": output,
+                    "cached_tokens": reads, "cache_write_tokens": writes,
+                    "total_tokens": input + output + reads + writes,
+                }),
+            );
+            claim
+        };
+        let first = record("turn-a", 4, 2, 20, 3);
+        let (observation, appended) = local.append_claim_outcome(&first).unwrap();
+        assert!(appended);
+        assert_eq!(
+            observation.body["fields"]["attribution"]["mission_run_id"],
+            "mission-run/example"
+        );
+        assert_eq!(
+            observation.body["fields"]["attribution"]["step_id"],
+            "step-run/example/record"
+        );
+        let rollup = local
+            .usage_rollup_for_timeline(&observation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.fields["total_tokens"], 29);
+        assert_eq!(rollup.fields["host"], "host-one");
+        local.append_claim(&rollup).unwrap();
+        let baseline = rollup.fields["observed_at_unix_ms"].as_u64().unwrap();
+        let (repeated, appended) = local.append_claim_outcome(&first).unwrap();
+        assert!(!appended);
+        assert_eq!(
+            local
+                .usage_rollup_for_timeline(&repeated)
+                .unwrap()
+                .unwrap()
+                .fields["total_tokens"],
+            29
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let mut second = record("turn-b", 5, 1, 30, 0);
+        second
+            .fields
+            .insert("source_id".into(), Value::String("same-response".into()));
+        let (observation, appended) = local.append_claim_outcome(&second).unwrap();
+        assert!(appended);
+        let rollup = local
+            .usage_rollup_for_timeline(&observation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(rollup.fields["total_tokens"], 65);
+        local.append_claim(&rollup).unwrap();
+        let mut replay = second.clone();
+        replay
+            .fields
+            .insert("incarnation_id".into(), Value::String("inc-two".into()));
+        replay.idempotency_key = Some("replayed-after-restart".into());
+        let (second_replay, _) = local.append_claim_outcome(&replay).unwrap();
+        assert!(
+            local
+                .usage_rollup_for_timeline(&second_replay)
+                .unwrap()
+                .is_none()
+        );
+        let period = local
+            .usage_period_rows(baseline, baseline + 60_000)
+            .unwrap();
+        assert_eq!(period.len(), 1);
+        assert_eq!(period[0]["total_tokens"], 36);
+        assert_eq!(period[0]["cached_tokens"], 30);
+        assert_eq!(
+            local
+                .usage_summary_at(subject, None, None)
+                .unwrap()
+                .unwrap()
+                .total_tokens,
+            65
+        );
+
+        let peer = Store::open_memory("host-two").unwrap();
+        let exchange = exchange_from(&local, &ReplicationInventory::default());
+        receive_and_project(&peer, "host-one", &exchange);
+        assert!(
+            peer.timeline_claims_for_incarnation_at(subject, "inc-one", None, false, 10)
+                .unwrap()
+                .claims
+                .is_empty()
+        );
+        assert_eq!(
+            peer.usage_period_rows(baseline, baseline + 60_000).unwrap(),
+            period
+        );
+        assert_eq!(
+            peer.usage_summary_at(subject, None, None)
+                .unwrap()
+                .unwrap()
+                .total_tokens,
+            65
         );
     }
 
@@ -32143,6 +34216,329 @@ mission "nested-work" state="ready" {
                 .local_observation_floor_after_claim(store.index().unwrap() + 1)
                 .unwrap(),
             19
+        );
+    }
+
+    fn harness_state(subject: &str, state: &str, observed_at_ms: u64) -> ClaimInput {
+        ClaimInput {
+            subject: subject.into(),
+            kind: "harness.observed".into(),
+            actor: Some(subject.into()),
+            fields: BTreeMap::from([
+                ("state".into(), Value::String(state.into())),
+                ("incarnation_id".into(), Value::String("inc-1".into())),
+                ("observed_at_ms".into(), Value::from(observed_at_ms)),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("state:{subject}:{state}:{observed_at_ms}")),
+        }
+    }
+
+    fn harness_usage(subject: &str, semantics: &str, tokens: u64, compactions: u64) -> ClaimInput {
+        ClaimInput {
+            subject: subject.into(),
+            kind: "harness.usage".into(),
+            actor: Some(subject.into()),
+            fields: BTreeMap::from([
+                ("driver".into(), Value::String("codex".into())),
+                ("incarnation_id".into(), Value::String("inc-1".into())),
+                ("semantics".into(), Value::String(semantics.into())),
+                ("context_used_tokens".into(), Value::from(tokens)),
+                ("compactions".into(), Value::from(compactions)),
+                ("model".into(), Value::String("example-model".into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!(
+                "usage:{subject}:{semantics}:{tokens}:{compactions}"
+            )),
+        }
+    }
+
+    #[test]
+    fn a_harness_state_replicates_only_when_it_changes() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.worker";
+        let inventory_before = store.replication_inventory().unwrap().envelopes.len();
+        let mut replicated = Vec::new();
+        for (state, observed_at, expect_claim) in [
+            ("working", 1_000, true),
+            ("working", 301_000, false),
+            ("working", 601_000, false),
+            ("idle", 602_000, true),
+            ("idle", 902_000, false),
+            ("working", 903_000, true),
+        ] {
+            let (record, appended) = store
+                .append_claim_outcome(&harness_state(subject, state, observed_at))
+                .unwrap();
+            assert!(appended);
+            assert_eq!(
+                local_observation_position(&record).is_none(),
+                expect_claim,
+                "{state} at {observed_at}"
+            );
+            if expect_claim {
+                replicated.push(record.id);
+            }
+        }
+        let (repeated, appended) = store
+            .append_claim_outcome(&harness_state(subject, "idle", 902_000))
+            .unwrap();
+        assert!(!appended);
+        assert!(local_observation_position(&repeated).is_some());
+
+        let claims = store.claims_for(subject, Some("harness.observed")).unwrap();
+        assert_eq!(
+            claims
+                .iter()
+                .map(|claim| claim.id.clone())
+                .collect::<Vec<_>>(),
+            replicated
+        );
+        assert_eq!(
+            store.replication_inventory().unwrap().envelopes.len(),
+            inventory_before + 3
+        );
+        let local = store.local_observations_after(0, 100).unwrap();
+        assert_eq!(local.len(), 6, "the local log keeps every observation");
+        assert!(local.iter().all(|record| record.kind == "harness.observed"));
+        let latest = store
+            .latest_claim(subject, Some("harness.observed"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(latest.body["fields"]["state"], "working");
+        assert_eq!(latest.body["fields"]["observed_at_ms"], 903_000);
+
+        let replica = Store::open_memory("replica").unwrap();
+        receive_and_project(
+            &replica,
+            "node",
+            &exchange_from(&store, &ReplicationInventory::default()),
+        );
+        assert_eq!(
+            replica
+                .claims_for(subject, Some("harness.observed"))
+                .unwrap()
+                .len(),
+            3
+        );
+        assert!(replica.local_observations_after(0, 100).unwrap().is_empty());
+    }
+
+    #[test]
+    fn harness_usage_replicates_on_a_schedule_while_working_and_at_once_when_it_stops() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.worker";
+        let start = now_ms();
+        let minute = 60_000_u128;
+        let usage_claims = |store: &Store| {
+            store
+                .claims_for(subject, Some("harness.usage"))
+                .unwrap()
+                .iter()
+                .map(|claim| {
+                    (
+                        claim.body["fields"]["semantics"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned(),
+                        claim.body["fields"]["context_used_tokens"]
+                            .as_u64()
+                            .unwrap(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        let occupancy = |tokens: u64| ("context_occupancy".to_owned(), tokens);
+        store
+            .append_claim_outcome(&harness_state(subject, "working", 1))
+            .unwrap();
+        let usage = |semantics: &str, tokens: u64, compactions: u64, at: u128| {
+            store
+                .append_latest_observation(
+                    &harness_usage(subject, semantics, tokens, compactions),
+                    at,
+                )
+                .unwrap()
+        };
+
+        assert!(local_observation_position(&usage("context_occupancy", 10, 0, start).0).is_none());
+        assert!(
+            local_observation_position(&usage("context_occupancy", 20, 0, start + minute).0)
+                .is_some()
+        );
+        assert!(
+            local_observation_position(&usage("context_occupancy", 30, 0, start + 2 * minute).0)
+                .is_some()
+        );
+        assert_eq!(
+            usage_claims(&store),
+            [occupancy(10)],
+            "while working, a changed reading waits for the interval"
+        );
+        assert!(
+            local_observation_position(&usage("session_cumulative", 500, 0, start + 2 * minute).0)
+                .is_none(),
+            "each semantics has its own slot"
+        );
+        assert!(
+            local_observation_position(&usage("context_occupancy", 5, 1, start + 3 * minute).0)
+                .is_none(),
+            "a compaction replicates at once"
+        );
+        assert!(
+            local_observation_position(&usage("context_occupancy", 15, 1, start + 4 * minute).0)
+                .is_some()
+        );
+        assert!(
+            local_observation_position(&usage("context_occupancy", 25, 1, start + 9 * minute).0)
+                .is_none(),
+            "the interval has passed since the last replicated reading"
+        );
+        assert!(
+            local_observation_position(&usage("context_occupancy", 35, 1, start + 10 * minute).0)
+                .is_some()
+        );
+        assert_eq!(
+            usage_claims(&store),
+            [
+                occupancy(10),
+                ("session_cumulative".into(), 500),
+                occupancy(5),
+                occupancy(25),
+            ]
+        );
+
+        store
+            .append_claim_outcome(&harness_state(subject, "idle", 2))
+            .unwrap();
+        assert_eq!(
+            usage_claims(&store).last(),
+            Some(&occupancy(35)),
+            "the newest pending reading replicates when the harness stops working"
+        );
+        let settled = usage_claims(&store).len();
+        store
+            .append_claim_outcome(&harness_state(subject, "idle", 3))
+            .unwrap();
+        assert_eq!(usage_claims(&store).len(), settled, "nothing was pending");
+        assert!(
+            local_observation_position(&usage("context_occupancy", 36, 1, start + 11 * minute).0)
+                .is_none(),
+            "an idle harness replicates its usage at once"
+        );
+        assert_eq!(store.local_observations_after(0, 100).unwrap().len(), 12);
+    }
+
+    #[test]
+    fn a_system_runtime_action_stays_local_while_a_requested_one_replicates() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/node.worker";
+        let action =
+            |action: &str, actor: Option<&str>, evidence: Vec<String>, key: &str| ClaimInput {
+                subject: subject.into(),
+                kind: if action == "signal-result" {
+                    "runtime.action.succeeded".into()
+                } else {
+                    "runtime.action.requested".into()
+                },
+                actor: actor.map(str::to_owned),
+                fields: BTreeMap::from([(
+                    "action".into(),
+                    Value::String(
+                        if action == "signal-result" {
+                            "signal"
+                        } else {
+                            action
+                        }
+                        .into(),
+                    ),
+                )]),
+                evidence,
+                expected_subject: None,
+                idempotency_key: Some(key.into()),
+            };
+        let system = store
+            .append_claim(&action("terminate", None, Vec::new(), "system-stop"))
+            .unwrap();
+        assert!(local_observation_position(&system).is_some());
+        let deadline = store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.action.deadline-reached".into(),
+                actor: None,
+                fields: BTreeMap::from([("action".into(), Value::String("terminate".into()))]),
+                evidence: vec![system.id.clone()],
+                expected_subject: None,
+                idempotency_key: Some("system-deadline".into()),
+            })
+            .unwrap();
+        assert!(
+            local_observation_position(&deadline).is_some(),
+            "a local observation may cite another"
+        );
+
+        let requested = store
+            .append_claim(&action(
+                "signal",
+                Some("requester"),
+                Vec::new(),
+                "person-signal",
+            ))
+            .unwrap();
+        assert!(
+            local_observation_position(&requested).is_none(),
+            "a request that names its actor replicates"
+        );
+        let result = store
+            .append_claim(&action(
+                "signal-result",
+                Some("requester"),
+                vec![requested.id.clone()],
+                "person-signal-result",
+            ))
+            .unwrap();
+        assert!(local_observation_position(&result).is_none());
+        assert_eq!(
+            store
+                .append_claim(&action(
+                    "signal-result",
+                    Some("requester"),
+                    vec![system.id.clone()],
+                    "cites-local",
+                ))
+                .unwrap_err()
+                .code,
+            "missing-evidence",
+            "a replicated claim never cites a local observation"
+        );
+        assert_eq!(
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.action.deadline-reached".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("action".into(), Value::String("terminate".into()))]),
+                    evidence: vec!["local-observation/another-node/1".into()],
+                    expected_subject: None,
+                    idempotency_key: Some("foreign-local".into()),
+                })
+                .unwrap_err()
+                .code,
+            "missing-evidence",
+            "another node's local observation is never here"
+        );
+        let recorded = store
+            .observations_for(subject, "runtime.action.requested")
+            .unwrap();
+        assert_eq!(
+            recorded
+                .iter()
+                .map(|record| record.id.clone())
+                .collect::<Vec<_>>(),
+            [system.id, requested.id]
         );
     }
 
@@ -34161,6 +36557,61 @@ mission "review-guardrail" state="ready" {
         assert_eq!(issues[0].0, "resource/github/acme/demo/issue/8");
         assert_eq!(issues[0].1, "vcs.issue");
         assert_eq!(issues[0].2["repository"], "resource/github/acme/demo");
+    }
+
+    #[test]
+    fn repository_pull_head_changes_and_closure_emit_exact_item_claims() {
+        let before = json!({"repository_id": 7, "pull_requests": [{
+            "number": 4, "head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "state": "open", "draft": false,
+        }]});
+        let after = json!({"repository_id": 7, "pull_requests": [{
+            "number": 4, "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "state": "open", "draft": false,
+        }]});
+        let changes = discovered_collection_items(
+            "resource/github/acme/demo",
+            "pull_requests",
+            Some(&before),
+            &after,
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].0, "resource/github/acme/demo/pull-request/4");
+        assert_eq!(
+            changes[0].2["head_sha"],
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        let facts = changes[0]
+            .2
+            .as_object()
+            .unwrap()
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+        st3_schema::registry()
+            .validate_resource_facts("vcs.pull-request", &facts)
+            .unwrap();
+        assert!(
+            discovered_collection_items(
+                "resource/github/acme/demo",
+                "pull_requests",
+                Some(&after),
+                &after,
+            )
+            .is_empty()
+        );
+        let closed = json!({"repository_id": 7, "pull_requests": [{
+            "number": 4, "head": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "state": "closed", "draft": false,
+        }]});
+        let changes = discovered_collection_items(
+            "resource/github/acme/demo",
+            "pull_requests",
+            Some(&after),
+            &closed,
+        );
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].2["state"], "closed");
     }
 
     #[test]

@@ -127,6 +127,10 @@ resource claim.
 
 The refresh operation records `observer.refresh-requested`. Its matching `observer.observed` receipt completes the request.
 
+An observer whose revision met a permanent error, such as a rejected observation, is not polled again
+on that revision. A refresh request still polls it once, and the resulting `observer.state` carries
+the request's attempt, so the observer and its subscriptions can recover without a new revision.
+
 ## Provider contract
 
 A registered provider converts one locator into normalized resource fields.
@@ -150,6 +154,9 @@ Conditional requests use provider cursors such as an ETag. Cursors are local pro
 The daemon keeps each next-check deadline and cursor in local scheduler memory. A daemon restart performs one immediate observation.
 
 The provider applies bounded retries and backoff. It records authentication, rate-limit, and transport failures on the observer subject.
+
+Each GitHub request times out after one minute, so a connection that never answers cannot hold its
+observer.
 
 An unchanged failure creates no new claim. A later success replaces the complete observer health state and clears the old failure reason.
 

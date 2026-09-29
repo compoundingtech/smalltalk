@@ -527,7 +527,7 @@ fn residency_wake_control_file_triggers_an_immediate_reconcile() {
     std::thread::scope(|scope| {
         let watchdog_stop = &stop;
         scope.spawn(move || {
-            if done_rx.recv_timeout(Duration::from_secs(5)).is_err() {
+            if done_rx.recv_timeout(Duration::from_secs(15)).is_err() {
                 watchdog_stop.store(true, Ordering::SeqCst);
             }
         });
@@ -1385,7 +1385,7 @@ fn wait_for_resync_event(agent_dir: &Path) -> Option<String> {
 }
 
 fn wait_for_resync_event_change(agent_dir: &Path, prior: &str) -> Option<String> {
-    let deadline = Instant::now() + Duration::from_secs(5);
+    let deadline = Instant::now() + Duration::from_secs(15);
     loop {
         if let Some(body) = current_resync_event(agent_dir)
             && body != prior

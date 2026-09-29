@@ -232,6 +232,14 @@ pub struct Attention {
     pub source_id: String,
     pub person_id: String,
     pub requester_id: Option<String>,
+    pub launch_id: Option<String>,
+    pub variant_id: Option<String>,
+    pub message_id: Option<String>,
+    pub preview_token: Option<String>,
+    pub preview: Option<LaunchPreview>,
+    pub what: Option<String>,
+    pub because: Option<String>,
+    pub fix: Option<Value>,
     pub review_mode: Option<String>,
     pub mission_id: Option<String>,
     pub mission_run_id: Option<String>,
@@ -254,6 +262,20 @@ pub struct AttentionTargetState {
     pub state: String,
     #[serde(default)]
     pub since: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct DocumentContent {
+    pub reference: String,
+    pub bytes: Vec<u8>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct LaunchPreview {
+    pub goal: String,
+    pub steps: Vec<Value>,
+    pub agents: Vec<Value>,
+    pub gates: Value,
+    pub diagnostics_count: u64,
+    pub request_excerpt: String,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Message {
@@ -393,6 +415,8 @@ pub struct Launch {
     pub title: String,
     pub phase: String,
     pub request: String,
+    pub preview_token: Option<String>,
+    pub preview: Option<LaunchPreview>,
     pub planner: String,
     pub planner_config: PlannerConfig,
     pub target: Value,
@@ -494,6 +518,8 @@ pub struct UsageSummary {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    #[serde(default)]
+    pub cache_write_tokens: u64,
     pub cost: Option<f64>,
     pub currency: Option<String>,
     pub incarnation_count: usize,
@@ -512,6 +538,9 @@ pub struct Mission {
     #[serde(default)]
     pub runs: Vec<String>,
     #[serde(default)]
+    pub run_details: Vec<MissionRunSummary>,
+    pub must_act: Option<String>,
+    #[serde(default)]
     pub active_runs: Option<usize>,
     #[serde(default)]
     pub run_generations: BTreeMap<String, String>,
@@ -519,6 +548,22 @@ pub struct Mission {
     pub visualization: Option<Visualization>,
     #[serde(default)]
     pub usage: Option<UsageSummary>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MissionRunSummary {
+    pub id: String,
+    pub generation_id: Option<String>,
+    pub requester: String,
+    pub status: String,
+    pub phase: String,
+    pub progress: Value,
+    pub current_steps: Vec<Value>,
+    pub must_act: String,
+    pub state_since: String,
+    pub last_progress: Option<String>,
+    pub blocker: Option<Value>,
+    pub after: Option<String>,
+    pub deadline: Option<String>,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Work {
@@ -530,6 +575,9 @@ pub struct Work {
     pub generation_id: String,
     pub definition_id: String,
     pub path: String,
+    pub title: Option<String>,
+    pub assigned_to: Option<String>,
+    pub last_progress: Option<String>,
     pub state: String,
     pub gate_kind: Option<String>,
     pub attempt: u32,
@@ -568,6 +616,9 @@ pub struct Agent {
     pub driver: Option<String>,
     #[serde(default)]
     pub harness_state: Option<String>,
+    pub host_id: Option<String>,
+    pub last_activity_at: Option<String>,
+    pub silent_since: Option<String>,
     #[serde(default)]
     pub fault: Option<String>,
     #[serde(default)]
@@ -584,6 +635,8 @@ pub struct Agent {
     pub upcoming_work_ids: Vec<String>,
     #[serde(default)]
     pub queued_work_count: u64,
+    #[serde(default)]
+    pub usage: Option<UsageSummary>,
     #[serde(default)]
     pub under: Vec<AgentRelationship>,
 }
@@ -1107,6 +1160,10 @@ pub struct TimelineUsageBody {
     pub output_tokens: Option<u64>,
     #[serde(default)]
     pub cached_tokens: Option<u64>,
+    #[serde(default)]
+    pub cache_write_tokens: Option<u64>,
+    #[serde(default)]
+    pub turn_id: Option<String>,
     #[serde(default)]
     pub total_tokens: Option<u64>,
     #[serde(default)]

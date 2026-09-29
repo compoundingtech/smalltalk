@@ -4,6 +4,9 @@ use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::process::Command;
 
+#[path = "support/real_git.rs"]
+mod real_git;
+
 use st2::materialize::{
     materialize_catalog, materialize_catalog_against, parse_plan, validate_agent,
 };
@@ -1200,9 +1203,7 @@ fn up_materialize_only_writes_the_overlay_without_needing_pty() {
     );
     let bin = tmp.path().join("bin");
     fs::create_dir_all(&bin).unwrap();
-    let git = std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
-        .map(|directory| directory.join("git"))
-        .find(|candidate| candidate.is_file())
+    let git = real_git::on_path(&std::env::var_os("PATH").unwrap_or_default())
         .expect("git is available on the test runner's PATH");
     symlink(git, bin.join("git")).unwrap();
 

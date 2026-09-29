@@ -109,6 +109,8 @@ pub struct Writer {
     lock_path: PathBuf,
     driver: String,
     incarnation_id: String,
+    model: Option<String>,
+    turn_models: BTreeMap<String, String>,
 }
 
 impl Writer {
@@ -122,7 +124,21 @@ impl Writer {
             lock_path: agent_dir.join(LOCK_NAME),
             driver: driver.into(),
             incarnation_id: incarnation_id.into(),
+            model: None,
+            turn_models: BTreeMap::new(),
         }
+    }
+
+    pub fn with_model(mut self, model: Option<String>) -> Self {
+        self.model = model;
+        self
+    }
+
+    pub fn remember_turn_model(&mut self, turn_id: &str, model: &str) {
+        if self.turn_models.len() >= 128 {
+            self.turn_models.pop_first();
+        }
+        self.turn_models.insert(turn_id.into(), model.into());
     }
 
     pub fn append(
@@ -346,15 +362,34 @@ pub fn observe_codex(writer: &mut Writer, message: &Value, thread_id: &str) -> R
             .get("totalTokens")
             .and_then(Value::as_u64)
             .unwrap_or(0);
+        // A turn has several model responses. The session total advances for each
+        // response, so it distinguishes updates even when their last buckets match.
+        let session_total = message
+            .pointer("/params/tokenUsage/total/totalTokens")
+            .and_then(Value::as_u64)
+            .unwrap_or(total);
+        let turn_id = message
+            .pointer("/params/turnId")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let model = message
+            .pointer("/params/model")
+            .and_then(Value::as_str)
+            .or_else(|| writer.turn_models.get(turn_id).map(String::as_str))
+            .or(writer.model.as_deref())
+            .map(str::to_owned);
         return writer.append(
-            format!("codex:usage:{}", message.pointer("/params/turnId").and_then(Value::as_str).unwrap_or("unknown")),
+            format!("codex:usage:{}:{session_total}", message.pointer("/params/turnId").and_then(Value::as_str).unwrap_or("unknown")),
             Role::System,
             EntryType::Usage,
             json!({
                 "semantics": "response", "driver": "codex",
+                "model": model,
                 "input_tokens": usage.get("inputTokens").and_then(Value::as_u64).unwrap_or(0),
                 "output_tokens": usage.get("outputTokens").and_then(Value::as_u64).unwrap_or(0),
                 "cached_tokens": usage.get("cachedInputTokens").and_then(Value::as_u64).unwrap_or(0),
+                "cache_write_tokens": usage.get("cacheWriteInputTokens").and_then(Value::as_u64).unwrap_or(0),
+                "turn_id": message.pointer("/params/turnId"),
                 "total_tokens": total,
             }),
             true,
@@ -466,6 +501,12 @@ pub fn observe_claude(writer: &mut Writer, event: &str, payload: &Value) -> Resu
 /// Claude's Stop hook has the exact native transcript path, while its event
 /// payload does not contain the assistant's answer. Publish a small recent
 /// answer window only at turn boundaries; never poll the growing transcript.
+#[derive(Deserialize, Serialize)]
+struct ClaudeTranscriptCursor {
+    session_id: String,
+    offset: u64,
+}
+
 pub fn observe_claude_stop_transcript(
     writer: &mut Writer,
     payload: &Value,
@@ -490,18 +531,56 @@ pub fn observe_claude_stop_transcript(
         "Claude Stop transcript is not the exact session beneath the native projects directory"
     );
     let mut file = fs::File::open(&transcript)?;
-    let start = file.metadata()?.len().saturating_sub(2 * 1024 * 1024);
+    let length = file.metadata()?.len();
+    let cursor_path = writer
+        .path
+        .with_file_name(".harness-timeline-claude-cursor");
+    let start = fs::read(&cursor_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<ClaudeTranscriptCursor>(&bytes).ok())
+        .filter(|cursor| cursor.session_id == session_id && cursor.offset <= length)
+        .map(|cursor| cursor.offset)
+        .unwrap_or(0);
     file.seek(SeekFrom::Start(start))?;
     let mut reader = BufReader::new(file);
-    if start > 0 {
-        let mut partial = String::new();
-        reader.read_line(&mut partial)?;
-    }
+    let mut offset = start;
+    let mut index = 0_usize;
     let mut answers = BTreeMap::<String, (usize, String)>::new();
-    for (index, line) in reader.lines().enumerate() {
-        let Ok(value) = serde_json::from_str::<Value>(&line?) else {
+    let mut usage = BTreeMap::<String, (usize, Value)>::new();
+    let mut turn_id = String::new();
+    loop {
+        let mut line = String::new();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            break;
+        }
+        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+            // A growing transcript may end in a partial JSON line. Read it on the next Stop.
+            if !line.ends_with('\n') {
+                break;
+            }
+            offset = offset.saturating_add(bytes as u64);
             continue;
         };
+        offset = offset.saturating_add(bytes as u64);
+        index = index.saturating_add(1);
+        if value["type"] == "user"
+            && value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .is_none_or(|id| id == session_id)
+            && !value
+                .pointer("/message/content")
+                .and_then(Value::as_array)
+                .is_some_and(|parts| {
+                    !parts.is_empty() && parts.iter().all(|part| part["type"] == "tool_result")
+                })
+        {
+            if let Some(id) = value.get("uuid").and_then(Value::as_str) {
+                turn_id = id.to_owned();
+                usage.clear();
+            }
+        }
         if value["type"] != "assistant"
             || value
                 .get("sessionId")
@@ -517,6 +596,22 @@ pub fn observe_claude_stop_transcript(
         else {
             continue;
         };
+        if let Some(tokens) = value.pointer("/message/usage") {
+            let bucket = |key| tokens.get(key).and_then(Value::as_u64).unwrap_or(0);
+            let input = bucket("input_tokens");
+            let output = bucket("output_tokens");
+            let cache_writes = bucket("cache_creation_input_tokens");
+            let cache_reads = bucket("cache_read_input_tokens");
+            let body = json!({
+                "semantics": "response", "driver": "claude",
+                "model": value.pointer("/message/model"),
+                "turn_id": if turn_id.is_empty() { value.get("parentUuid").and_then(Value::as_str).unwrap_or("") } else { &turn_id },
+                "input_tokens": input, "output_tokens": output,
+                "cache_write_tokens": cache_writes, "cached_tokens": cache_reads,
+                "total_tokens": input.saturating_add(output).saturating_add(cache_writes).saturating_add(cache_reads),
+            });
+            usage.insert(message_id.to_owned(), (index, body));
+        }
         let text = value
             .pointer("/message/content")
             .and_then(Value::as_array)
@@ -528,6 +623,15 @@ pub fn observe_claude_stop_transcript(
             .join("\n");
         if !text.is_empty() {
             answers.insert(message_id.to_owned(), (index, text));
+            if answers.len() > 8 {
+                let oldest = answers
+                    .iter()
+                    .min_by_key(|(_, (at, _))| *at)
+                    .map(|(id, _)| id.clone());
+                if let Some(oldest) = oldest {
+                    answers.remove(&oldest);
+                }
+            }
         }
     }
     let mut answers = answers.into_iter().collect::<Vec<_>>();
@@ -541,6 +645,22 @@ pub fn observe_claude_stop_transcript(
             true,
         )?;
     }
+    for (message_id, (_, body)) in usage {
+        writer.append(
+            format!("claude:{session_id}:{message_id}:usage"),
+            Role::System,
+            EntryType::Usage,
+            body,
+            true,
+        )?;
+    }
+    fs::write(
+        &cursor_path,
+        serde_json::to_vec(&ClaudeTranscriptCursor {
+            session_id: session_id.into(),
+            offset,
+        })?,
+    )?;
     Ok(())
 }
 
@@ -880,6 +1000,8 @@ fn normalize_body(entry_type: EntryType, source_id: &str, value: Value) -> (Valu
                 "input_tokens",
                 "output_tokens",
                 "cached_tokens",
+                "cache_write_tokens",
+                "turn_id",
                 "total_tokens",
                 "context_used_tokens",
                 "context_window_tokens",
@@ -887,7 +1009,7 @@ fn normalize_body(entry_type: EntryType, source_id: &str, value: Value) -> (Valu
                 "cost",
                 "currency",
             ] {
-                if let Some(value) = value.get(key) {
+                if let Some(value) = value.get(key).filter(|value| !value.is_null()) {
                     body.insert(key.into(), value.clone());
                 }
             }
@@ -898,6 +1020,8 @@ fn normalize_body(entry_type: EntryType, source_id: &str, value: Value) -> (Valu
                 "input_tokens",
                 "output_tokens",
                 "cached_tokens",
+                "cache_write_tokens",
+                "turn_id",
                 "total_tokens",
                 "context_used_tokens",
                 "context_window_tokens",
@@ -1126,6 +1250,127 @@ mod tests {
         assert_eq!(content[0].body["text"], "Final answer");
         let wrong = json!({"session_id":"different","transcript_path":transcript});
         assert!(observe_claude_stop_transcript(&mut writer, &wrong, &home).is_err());
+    }
+
+    #[test]
+    fn claude_stop_records_each_final_response_usage_once_with_its_turn() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("home");
+        let projects = home.join(".claude/projects/workspace");
+        fs::create_dir_all(&projects).unwrap();
+        let transcript = projects.join("native-current.jsonl");
+        let lines = [
+            json!({"type":"user","uuid":"turn-a","sessionId":"native-current"}),
+            json!({"type":"assistant","sessionId":"native-current","message":{"id":"response-a","model":"claude-opus-example","usage":{"input_tokens":7,"output_tokens":2,"cache_creation_input_tokens":11,"cache_read_input_tokens":13}}}),
+            json!({"type":"user","uuid":"tool-result-a","sessionId":"native-current","message":{"content":[{"type":"tool_result","tool_use_id":"tool-a","content":"done"}]}}),
+            json!({"type":"assistant","sessionId":"native-current","message":{"id":"response-a","model":"claude-opus-example","usage":{"input_tokens":7,"output_tokens":5,"cache_creation_input_tokens":11,"cache_read_input_tokens":13}}}),
+            json!({"type":"user","uuid":"turn-b","sessionId":"native-current"}),
+            json!({"type":"assistant","sessionId":"native-current","message":{"id":"response-b","model":"claude-opus-example","usage":{"input_tokens":3,"output_tokens":4,"cache_creation_input_tokens":0,"cache_read_input_tokens":17}}}),
+        ];
+        fs::write(
+            &transcript,
+            lines[..4]
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let agent = temporary.path().join("agent");
+        let mut writer = Writer::new(&agent, "claude", "inc-current");
+        let payload = json!({"session_id":"native-current","transcript_path":transcript});
+        observe_claude_stop_transcript(&mut writer, &payload, &home).unwrap();
+        fs::write(
+            &transcript,
+            lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        observe_claude_stop_transcript(&mut writer, &payload, &home).unwrap();
+        let record = read(&timeline_path(&agent)).unwrap();
+        let usage = record
+            .operations
+            .iter()
+            .filter(|op| op.entry_type == "usage")
+            .collect::<Vec<_>>();
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage[0].body["turn_id"], "turn-a");
+        assert_eq!(usage[0].body["output_tokens"], 5);
+        assert_eq!(usage[0].body["cache_write_tokens"], 11);
+        assert_eq!(usage[0].body["cached_tokens"], 13);
+        assert_eq!(usage[0].body["total_tokens"], 36);
+        assert_eq!(usage[1].body["turn_id"], "turn-b");
+    }
+
+    #[test]
+    fn claude_stop_cursor_keeps_usage_before_large_tool_output() {
+        let temporary = tempfile::tempdir().unwrap();
+        let home = temporary.path().join("home");
+        let projects = home.join(".claude/projects/workspace");
+        fs::create_dir_all(&projects).unwrap();
+        let transcript = projects.join("native-current.jsonl");
+        let lines = [
+            json!({"type":"user","uuid":"turn-a","sessionId":"native-current"}),
+            json!({"type":"assistant","sessionId":"native-current","message":{"id":"response-a","model":"claude-example","usage":{"input_tokens":2,"output_tokens":3,"cache_read_input_tokens":5}}}),
+            json!({"type":"user","uuid":"tool-a","sessionId":"native-current","message":{"content":[{"type":"tool_result","content":"x".repeat(3 * 1024 * 1024)}]}}),
+            json!({"type":"assistant","sessionId":"native-current","message":{"id":"response-b","model":"claude-example","usage":{"input_tokens":7,"output_tokens":11,"cache_read_input_tokens":13}}}),
+        ];
+        fs::write(
+            &transcript,
+            format!(
+                "{}\n",
+                lines
+                    .iter()
+                    .map(Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ),
+        )
+        .unwrap();
+        let agent = temporary.path().join("agent");
+        let mut writer = Writer::new(&agent, "claude", "inc-current");
+        let payload = json!({"session_id":"native-current","transcript_path":transcript});
+        observe_claude_stop_transcript(&mut writer, &payload, &home).unwrap();
+        observe_claude_stop_transcript(&mut writer, &payload, &home).unwrap();
+        let record = read(&timeline_path(&agent)).unwrap();
+        let usage = record
+            .operations
+            .iter()
+            .filter(|op| op.entry_type == "usage")
+            .collect::<Vec<_>>();
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage[0].body["turn_id"], "turn-a");
+        assert_eq!(usage[1].body["turn_id"], "turn-a");
+        assert_eq!(usage[0].body["total_tokens"], 10);
+        assert_eq!(usage[1].body["total_tokens"], 31);
+    }
+
+    #[test]
+    fn codex_keeps_multiple_responses_in_one_turn() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut writer = Writer::new(temporary.path(), "codex", "inc-current")
+            .with_model(Some("gpt-example".into()));
+        for (last, total) in [(10, 10), (20, 30)] {
+            observe_codex(&mut writer, &json!({"method":"thread/tokenUsage/updated","params":{"threadId":"thread-a","turnId":"turn-a","tokenUsage":{"last":{"inputTokens":last,"outputTokens":0,"cachedInputTokens":0,"totalTokens":last},"total":{"totalTokens":total}}}}), "thread-a").unwrap();
+        }
+        let record = read(&timeline_path(temporary.path())).unwrap();
+        let usage = record
+            .operations
+            .iter()
+            .filter(|op| op.entry_type == "usage")
+            .collect::<Vec<_>>();
+        assert_eq!(usage.len(), 2);
+        assert_eq!(usage[0].body["model"], "gpt-example");
+        assert_eq!(
+            usage
+                .iter()
+                .map(|op| op.body["total_tokens"].as_u64().unwrap())
+                .sum::<u64>(),
+            30
+        );
     }
 
     #[test]

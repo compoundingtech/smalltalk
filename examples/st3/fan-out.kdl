@@ -94,7 +94,7 @@ mission "example/fan-out" state="ready" timeout="4h" {
       step "docs" completed
     }
     gate "all three branches are on origin" {
-      exec "for area in parser cli docs; do /usr/bin/git -C repo ls-remote --exit-code origin refs/heads/fan-out/$area >/dev/null || exit 1; done"
+      exec "for area in parser cli docs; do git -C repo ls-remote --exit-code origin refs/heads/fan-out/$area >/dev/null || exit 1; done"
       host "local"
       workspace "${ST_WORKSPACE}"
       time-limit "2m"
