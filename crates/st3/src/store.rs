@@ -897,6 +897,24 @@ impl Store {
         let _writer = self.connection.write();
         hold();
     }
+
+    /// Record local observations as `append_claim` does, in one transaction: one commit, and
+    /// so one sync to disk, instead of one for each observation.
+    pub(crate) fn append_local_observations_for_test(&self, inputs: &[ClaimInput]) {
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction().unwrap();
+        for input in inputs {
+            self.validate_claim_input(input).unwrap();
+            assert!(
+                local_retention(&input.kind),
+                "{} is not a local observation",
+                input.kind
+            );
+            validate_local_observation(input).unwrap();
+            insert_local_observation_tx(&transaction, &self.origin, input, now_ms()).unwrap();
+        }
+        transaction.commit().unwrap();
+    }
 }
 
 #[derive(Clone)]

@@ -9477,41 +9477,48 @@ mission "example/zero-run" state="ready" {
                 idempotency_key: Some("timeline-retention-runtime".into()),
             })
             .unwrap();
+        let entry = |sequence: u64, entry_type: &str, body: Value| ClaimInput {
+            subject: subject.into(),
+            kind: "harness.timeline".into(),
+            actor: Some(subject.into()),
+            fields: BTreeMap::from([
+                ("operation".into(), Value::String("append".into())),
+                (
+                    "entry_id".into(),
+                    Value::String(format!("timeline-entry/retention-{sequence}")),
+                ),
+                ("sequence".into(), Value::from(sequence)),
+                ("revision".into(), Value::from(1)),
+                ("role".into(), Value::String("system".into())),
+                ("entry_type".into(), Value::String(entry_type.into())),
+                ("final".into(), Value::Bool(true)),
+                ("body".into(), body),
+                ("driver".into(), Value::String("codex".into())),
+                ("incarnation_id".into(), Value::String(incarnation.into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("timeline-retention-{sequence}")),
+        };
         let append_entry = |sequence: u64, entry_type: &str, body: Value| {
             state
                 .store
-                .append_claim(&ClaimInput {
-                    subject: subject.into(),
-                    kind: "harness.timeline".into(),
-                    actor: Some(subject.into()),
-                    fields: BTreeMap::from([
-                        ("operation".into(), Value::String("append".into())),
-                        (
-                            "entry_id".into(),
-                            Value::String(format!("timeline-entry/retention-{sequence}")),
-                        ),
-                        ("sequence".into(), Value::from(sequence)),
-                        ("revision".into(), Value::from(1)),
-                        ("role".into(), Value::String("system".into())),
-                        ("entry_type".into(), Value::String(entry_type.into())),
-                        ("final".into(), Value::Bool(true)),
-                        ("body".into(), body),
-                        ("driver".into(), Value::String("codex".into())),
-                        ("incarnation_id".into(), Value::String(incarnation.into())),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some(format!("timeline-retention-{sequence}")),
-                })
+                .append_claim(&entry(sequence, entry_type, body))
                 .unwrap();
         };
-        for sequence in 1..=4_097 {
-            append_entry(
-                sequence,
-                "status",
-                json!({"status":"running", "detail":format!("event {sequence}")}),
-            );
-        }
+        // One entry more than a timeline read returns, in one commit: a commit for each entry
+        // took minutes on a busy disk.
+        state.store.append_local_observations_for_test(
+            &(1..=4_097)
+                .map(|sequence| {
+                    entry(
+                        sequence,
+                        "status",
+                        json!({"status":"running", "detail":format!("event {sequence}")}),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
         let session = ClientSession::local(None).unwrap();
         let snapshot = new_client_snapshot(&state);
         let session_id = client_session_resources(
