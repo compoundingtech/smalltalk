@@ -2339,6 +2339,10 @@ pub struct ReplicationInventory {
     /// ignore this field and exchange the full inventory.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub buckets: Vec<ReplicationInventoryBucket>,
+    /// The most envelopes the sending node takes in one exchange. Older peers leave it out and
+    /// are sent at most 512.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepts: Option<u32>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

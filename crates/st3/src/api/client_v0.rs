@@ -6240,9 +6240,12 @@ subscription "watch/source" {
         assert!(page(&state).sync.is_none(), "nothing is measured yet");
         let pull = |state: &AppState| {
             let summary = state.store.export_replication_summary(FLEET).unwrap();
-            let exchange = edge
-                .export_replication_exchange(FLEET, &summary.inventory)
-                .unwrap();
+            // Classic 512-envelope pages, so the backlog takes more than one exchange.
+            let inventory = crate::model::ReplicationInventory {
+                accepts: None,
+                ..summary.inventory
+            };
+            let exchange = edge.export_replication_exchange(FLEET, &inventory).unwrap();
             state
                 .store
                 .receive_replication_exchange("edge", FLEET, &exchange)

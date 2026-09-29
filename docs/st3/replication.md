@@ -75,9 +75,11 @@ The inventory is a set, not a high-water cursor. Sparse delivery and two candida
 
 The inventory is compact. It carries one digest per writer range of 256 sequences, and it lists identities only for ranges whose digests differ. A peer sends a range the other side lacks entirely, and it sends identities within a differing range only after the other side has listed that range. One two-phase exchange therefore converges both directions without sending the whole authority log. A peer without range digests receives and sends the full identity list, as before.
 
-One exchange carries at most 512 envelopes in each direction.
+Each inventory says how many envelopes its sender takes in one exchange, 4,096 for this build. A peer sends at most that many, and at most 512 to a peer whose inventory does not say, as older builds do not.
 
 Each missing envelope contains one base64-encoded CBOR payload. Receipt stores the outer envelope before it decodes the payload.
+
+An exchange body larger than 64 KiB travels deflate-compressed (`Content-Encoding: deflate`), which shrinks a page of envelopes to about a third. A requester asks for compressed answers with `Accept-Encoding: deflate`; a peer's answer carries the same header when it takes compressed requests, and the requester then compresses its push. Signatures cover the uncompressed JSON, and an inflated body may not exceed the 64 MB exchange limit. An older build neither asks nor says, so it exchanges plain JSON.
 
 The payload is only an immutable claim batch plus the content-addressed blobs those claims
 reference. Nodes do not send SQLite rows, leases, reducers, projections, or runtime snapshots.
@@ -162,7 +164,7 @@ Each store stage counts only the time it holds the store's write connection, so 
 not count another's wait. Round trips are this node's own requests to its peers, including the
 peer's work to answer them. SQLite time is every statement the daemon ran; each commit waits for
 a disk flush. `/v1/replication/status` carries the same numbers as `timings`.
-`crates/st3/tests/first_sync.rs` uses them to profile an empty node syncing from a peer.
+`crates/st3/tests/first_sync.rs` uses them to profile an empty node syncing from a peer; `cargo test --release -p st3 --test first_sync -- --nocapture` runs it.
 
 A node is catching up while a peer measured in the last five minutes holds more envelopes than one
 exchange carries. During that time its projections can show early history as current: a request

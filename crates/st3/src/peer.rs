@@ -56,6 +56,61 @@ const HEADER_MEMBER_SIGNATURE: &str = "x-st3-member-signature";
 const MEMBER_SIGNATURE_DOMAIN: &str = "st3-member-v1";
 pub(crate) const MAX_EXCHANGE_BYTES: usize = 64 * 1024 * 1024;
 
+/// The HTTP content coding for large exchange bodies: zlib-wrapped deflate. A requester asks
+/// for it with `Accept-Encoding`, and a peer says with the same header in its answer that it
+/// takes it in requests. Signatures cover the uncompressed JSON, so an older build, which
+/// neither asks nor says, exchanges plain JSON as before.
+const EXCHANGE_ENCODING: &str = "deflate";
+
+/// Bodies smaller than this go uncompressed: a quiet exchange is a few kilobytes, while a page
+/// of envelopes is megabytes and deflates to about a third.
+const DEFLATE_MIN_BYTES: usize = 64 * 1024;
+
+fn deflate(body: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Write as _;
+    let mut encoder = flate2::write::ZlibEncoder::new(
+        Vec::with_capacity(body.len() / 3),
+        flate2::Compression::fast(),
+    );
+    encoder.write_all(body)?;
+    Ok(encoder.finish()?)
+}
+
+/// Inflate an exchange body, refusing one that would expand past `MAX_EXCHANGE_BYTES`.
+fn inflate(body: &[u8]) -> Result<Vec<u8>> {
+    use std::io::Read as _;
+    let mut inflated = Vec::with_capacity(body.len() * 3);
+    flate2::read::ZlibDecoder::new(body)
+        .take(MAX_EXCHANGE_BYTES as u64 + 1)
+        .read_to_end(&mut inflated)
+        .context("inflate the exchange body")?;
+    anyhow::ensure!(
+        inflated.len() <= MAX_EXCHANGE_BYTES,
+        "the exchange body inflates past {MAX_EXCHANGE_BYTES} bytes"
+    );
+    Ok(inflated)
+}
+
+fn deflated(headers: &HeaderMap) -> bool {
+    headers
+        .get("content-encoding")
+        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(EXCHANGE_ENCODING.as_bytes()))
+}
+
+fn accepts_deflate(headers: &HeaderMap) -> bool {
+    headers
+        .get_all("accept-encoding")
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .flat_map(|value| value.split(','))
+        .any(|coding| {
+            coding
+                .split(';')
+                .next()
+                .is_some_and(|name| name.trim().eq_ignore_ascii_case(EXCHANGE_ENCODING))
+        })
+}
+
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
@@ -1611,6 +1666,20 @@ async fn receive_exchange(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let body = if deflated(&headers) {
+        match inflate(&body) {
+            Ok(body) => Bytes::from(body),
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("replication request body: {error:#}"),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        body
+    };
     let sender = match state
         .auth
         .verify_sender(&headers, "POST", EXCHANGE_PATH, &body, None, None)
@@ -1656,12 +1725,13 @@ async fn receive_exchange(
                 &request.signature_requests,
             )
             .await?;
-        signed_response(
+        let response = signed_response(
             &state,
             &request_digest,
             response.store_index,
             response.exchange,
-        )
+        )?;
+        deflate_response(response, accepts_deflate(&headers)).await
     }
     .await;
     match result {
@@ -1803,6 +1873,31 @@ fn signed_response_for<T: Serialize>(
     Ok(response)
 }
 
+/// Say that this node takes compressed requests, and compress a large signed response body
+/// for a requester that asked. The signature covers the uncompressed JSON.
+async fn deflate_response(response: Response, requested: bool) -> Result<Response> {
+    let (mut parts, body) = response.into_parts();
+    parts.headers.insert(
+        "accept-encoding",
+        HeaderValue::from_static(EXCHANGE_ENCODING),
+    );
+    let body = axum::body::to_bytes(body, usize::MAX)
+        .await
+        .context("read the signed response body")?;
+    if !requested || body.len() < DEFLATE_MIN_BYTES {
+        return Ok(Response::from_parts(parts, axum::body::Body::from(body)));
+    }
+    parts.headers.insert(
+        "content-encoding",
+        HeaderValue::from_static(EXCHANGE_ENCODING),
+    );
+    parts.headers.remove("content-length");
+    Ok(Response::from_parts(
+        parts,
+        axum::body::Body::from(deflate(&body)?),
+    ))
+}
+
 fn signed_error_response(
     state: &PeerState,
     request_digest: &str,
@@ -1869,7 +1964,7 @@ async fn exchange(
         ..first
     };
     let started = std::time::Instant::now();
-    let remote = post_signed(http, peer, node, auth, fleet, &query).await?;
+    let (remote, peer_inflates) = post_signed(http, peer, node, auth, fleet, &query, false).await?;
     let round_trip = started.elapsed();
     let different = remote.inventory.digest != local_digest;
     let received = backend
@@ -1896,7 +1991,9 @@ async fn exchange(
             .await?
             .exchange;
         let started = std::time::Instant::now();
-        let response = post_signed(http, peer, node, auth, fleet, &push).await?;
+        // A peer that says it takes compressed requests gets a large push compressed.
+        let (response, _) =
+            post_signed(http, peer, node, auth, fleet, &push, peer_inflates).await?;
         let round_trip = started.elapsed();
         // The peer stores a push before it answers, so its inventory moved if the push landed.
         pushed = !push.envelopes.is_empty() && response.inventory.digest != remote.inventory.digest;
@@ -1911,6 +2008,8 @@ async fn exchange(
     Ok(pulled || pulled_follow_up || pushed)
 }
 
+/// Send one signed exchange, compressed when `compress` is set and the body is large, and return
+/// the peer's verified answer and whether the peer takes compressed requests.
 async fn post_signed(
     http: &reqwest::Client,
     peer: &PeerConfig,
@@ -1918,17 +2017,26 @@ async fn post_signed(
     auth: &FleetAuth,
     fleet: &FleetContext,
     exchange: &ReplicationExchange,
-) -> Result<ReplicationExchange> {
+    compress: bool,
+) -> Result<(ReplicationExchange, bool)> {
     let body = serde_json::to_vec(exchange)?;
     let request_digest = FleetAuth::body_digest(&body);
     let headers = auth.request_headers(node, &body)?;
     let endpoint = format!("{}{}", peer.url.trim_end_matches('/'), EXCHANGE_PATH);
     let started = std::time::Instant::now();
-    let response = http
+    let mut request = http
         .post(&endpoint)
         .headers(headers)
         .header("content-type", "application/json")
-        .body(body)
+        .header("accept-encoding", EXCHANGE_ENCODING);
+    request = if compress && body.len() >= DEFLATE_MIN_BYTES {
+        request
+            .header("content-encoding", EXCHANGE_ENCODING)
+            .body(deflate(&body)?)
+    } else {
+        request.body(body)
+    };
+    let response = request
         .send()
         .await
         .with_context(|| {
@@ -1951,6 +2059,11 @@ async fn post_signed(
             )
         })?
         .to_vec();
+    let bytes = if deflated(&headers) {
+        inflate(&bytes)?
+    } else {
+        bytes
+    };
     let responder = auth.verify_sender(
         &headers,
         "RESPONSE",
@@ -1995,7 +2108,7 @@ async fn post_signed(
         response.api_version == "st3.v1",
         "the peer API version differs"
     );
-    Ok(response.value)
+    Ok((response.value, accepts_deflate(&headers)))
 }
 
 async fn wake_main(socket: &Path) {
@@ -2677,6 +2790,118 @@ mod tests {
             Some(&request_digest),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn exchange_bodies_deflate_and_refuse_a_body_that_inflates_too_far() {
+        let body = serde_json::to_vec(&serde_json::json!({"envelopes": vec!["same"; 1_000]})).unwrap();
+        let compressed = deflate(&body).unwrap();
+        assert!(compressed.len() * 10 < body.len());
+        assert_eq!(inflate(&compressed).unwrap(), body);
+
+        let bomb = deflate(&vec![0_u8; MAX_EXCHANGE_BYTES + 1]).unwrap();
+        assert!(bomb.len() < 1024 * 1024);
+        assert!(inflate(&bomb).is_err());
+        assert!(inflate(b"not deflate").is_err());
+
+        let mut headers = HeaderMap::new();
+        assert!(!accepts_deflate(&headers));
+        headers.insert("accept-encoding", HeaderValue::from_static("gzip, Deflate;q=0.5"));
+        assert!(accepts_deflate(&headers));
+        headers.insert("accept-encoding", HeaderValue::from_static("gzip, deflated"));
+        assert!(!accepts_deflate(&headers));
+    }
+
+    #[tokio::test]
+    async fn the_peer_route_deflates_only_for_a_requester_that_asks() {
+        let fleet = "1f91ca65-7793-48cc-866e-ac15690130e1";
+        let auth = FleetAuth::test(fleet, &[5; 32]);
+        // Enough envelopes that the answer to an empty inventory is worth compressing.
+        let target = Arc::new(Store::open_memory("target").unwrap());
+        target.bind_fleet(fleet).unwrap();
+        for index in 0..300 {
+            target
+                .append_claim(&ClaimInput {
+                    subject: format!("host/peer-{index}"),
+                    kind: "transport.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([("status".into(), Value::String("up".into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        }
+        let state = PeerState {
+            backend: PeerBackend::Local(target),
+            node: "target".into(),
+            auth: auth.clone(),
+            fleet: FleetContext::legacy(BTreeSet::from(["source".into()])),
+            main_socket: PathBuf::from("/no/such/socket"),
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let exchange = ReplicationExchange {
+            peer: "source".into(),
+            fleet_id: fleet.into(),
+            schema_digest: st3_schema::registry().digest(),
+            authority_digest: String::new(),
+            graph_digest: String::new(),
+            inventory: ReplicationInventory::default(),
+            envelopes: Vec::new(),
+            signature_requests: Vec::new(),
+            signatures: Vec::new(),
+        };
+        let body = serde_json::to_vec(&exchange).unwrap();
+        let request_digest = FleetAuth::body_digest(&body);
+        // An older build sends plain JSON and does not ask for compression; a new one sends a
+        // compressed request once the peer has answered compressed, and always asks.
+        for (compress, ask) in [(false, false), (false, true), (true, true)] {
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(EXCHANGE_PATH)
+                .body(Body::from(if compress {
+                    deflate(&body).unwrap()
+                } else {
+                    body.clone()
+                }))
+                .unwrap();
+            request
+                .headers_mut()
+                .extend(auth.request_headers("source", &body).unwrap());
+            if compress {
+                request.headers_mut().insert(
+                    "content-encoding",
+                    HeaderValue::from_static(EXCHANGE_ENCODING),
+                );
+            }
+            if ask {
+                request.headers_mut().insert(
+                    "accept-encoding",
+                    HeaderValue::from_static(EXCHANGE_ENCODING),
+                );
+            }
+            let response = peer_router(state.clone()).oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let headers = response.headers().clone();
+            assert!(accepts_deflate(&headers), "a new build takes compressed requests");
+            assert_eq!(deflated(&headers), ask);
+            let response_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let response_body = if ask {
+                inflate(&response_body).unwrap()
+            } else {
+                response_body.to_vec()
+            };
+            assert!(response_body.len() >= DEFLATE_MIN_BYTES);
+            auth.verify(
+                &headers,
+                "RESPONSE",
+                EXCHANGE_PATH,
+                &response_body,
+                Some("target"),
+                Some(&request_digest),
+            )
+            .unwrap();
+        }
     }
 
     #[tokio::test]
