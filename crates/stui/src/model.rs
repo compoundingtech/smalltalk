@@ -187,7 +187,9 @@ impl Model {
             let full_work_history = kind != Kind::Work
                 || self
                     .last_work_history_refresh
-                    .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(30));
+                    // Work history is a full scan on the daemon; current work covers what
+                    // screens show, so history refreshes rarely.
+                    .is_none_or(|last| last.elapsed() >= std::time::Duration::from_secs(600));
             let collection = match read_pages_mode(client, kind, full_work_history).await {
                 Ok(collection) => collection,
                 Err(error) => {
@@ -590,7 +592,20 @@ async fn read_pages_once(
         if !include_work_history {
             return Ok(current);
         }
-        let history = read_pages_once_inner(client, kind, true).await?;
+        // Work history is a slow read on a busy daemon and can fail when the graph moves
+        // mid-page. Current work is what the screens need first: never let history block it.
+        let history = match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            read_pages_once_inner(client, kind, true),
+        )
+        .await
+        {
+            Ok(Ok(history)) => history,
+            _ => {
+                current.truncated = true;
+                return Ok(current);
+            }
+        };
         let mut seen = current
             .items
             .iter()

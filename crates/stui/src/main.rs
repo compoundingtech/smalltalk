@@ -625,7 +625,9 @@ impl App {
                             } else {
                                 String::new()
                             },
-                            v.usage.as_ref().filter(|usage| usage.incarnation_count > 0)
+                            v.usage
+                                .as_ref()
+                                .filter(|usage| usage.incarnation_count > 0)
                                 .map(|usage| format!(" · {} tokens", usage.total_tokens))
                                 .unwrap_or_default(),
                             v.reachability
