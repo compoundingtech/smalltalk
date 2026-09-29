@@ -683,8 +683,8 @@ impl Drop for WriterGuard<'_> {
     }
 }
 
-/// Which of the store's read lanes a thread's reads use. Each lane has its own four connections,
-/// so work in one lane never waits for a connection another lane holds.
+/// Which of the store's read lanes a thread's reads use. Each lane has its own connections, so
+/// work in one lane never waits for a connection another lane holds.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReadClass {
     /// The reconciler and other daemon tasks.
@@ -699,6 +699,21 @@ pub(crate) enum ReadClass {
     /// Projections rebuilt from history, such as a work item's detail or every subject's status.
     /// At most `PROJECTION_CONCURRENCY` requests run in this class at once.
     Projection,
+}
+
+impl ReadClass {
+    /// The connections the lane holds. Every connection opens its own files, and the daemon's
+    /// processes run under a limit of 1024 open files by default, so the lanes share sixteen.
+    /// The small reads and the projections that wait for a turn need fewer than the lanes whose
+    /// requests divide one projection across four connections.
+    fn connections(self) -> usize {
+        match self {
+            ReadClass::Critical | ReadClass::Projection => 2,
+            ReadClass::Background | ReadClass::Interactive | ReadClass::Operational => {
+                READ_CONNECTIONS
+            }
+        }
+    }
 }
 
 /// How many history-sized projections run at once. The rest wait for one of them to finish
@@ -732,6 +747,8 @@ pub(crate) fn with_interactive_reads<T>(read: impl FnOnce() -> T) -> T {
 
 struct ReadLane {
     connections: Mutex<Vec<Connection>>,
+    /// How many connections the lane has.
+    size: usize,
     available: Condvar,
     /// How many connections `Store::read_snapshot` holds. At least one always stays unpinned,
     /// so a pinned read that fans out to worker threads can never wait on itself.
@@ -742,6 +759,7 @@ struct ReadLane {
 impl ReadLane {
     fn new(connections: Vec<Connection>) -> Self {
         Self {
+            size: connections.len(),
             connections: Mutex::new(connections),
             available: Condvar::new(),
             pinned: Mutex::new(0),
@@ -808,13 +826,14 @@ impl Drop for PinnedRead<'_> {
 }
 
 impl ReadPool {
-    fn new(mut open: impl FnMut() -> Result<Vec<Connection>>) -> Result<Self> {
+    fn new(mut open: impl FnMut(usize) -> Result<Vec<Connection>>) -> Result<Self> {
+        let mut lane = |class: ReadClass| open(class.connections()).map(ReadLane::new);
         Ok(Self {
-            background: ReadLane::new(open()?),
-            interactive: ReadLane::new(open()?),
-            operational: ReadLane::new(open()?),
-            critical: ReadLane::new(open()?),
-            projection: ReadLane::new(open()?),
+            background: lane(ReadClass::Background)?,
+            interactive: lane(ReadClass::Interactive)?,
+            operational: lane(ReadClass::Operational)?,
+            critical: lane(ReadClass::Critical)?,
+            projection: lane(ReadClass::Projection)?,
         })
     }
 
@@ -998,7 +1017,9 @@ struct MessageCacheEntry {
 #[cfg(test)]
 impl Store {
     pub(crate) fn hold_read_connections_for_test(&self, hold: impl FnOnce()) {
-        let _guards: Vec<_> = (0..READ_CONNECTIONS).map(|_| self.readers.get()).collect();
+        let _guards: Vec<_> = (0..self.readers.lane().size)
+            .map(|_| self.readers.get())
+            .collect();
         hold();
     }
 
@@ -1954,13 +1975,17 @@ fn authoring_pull_request_runs_tx(
     Ok(runs)
 }
 
-fn open_read_connections(path: &Path, shared_memory: bool) -> Result<Vec<Connection>> {
+fn open_read_connections(
+    path: &Path,
+    shared_memory: bool,
+    count: usize,
+) -> Result<Vec<Connection>> {
     let flags = if shared_memory {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI
     } else {
         OpenFlags::SQLITE_OPEN_READ_ONLY
     };
-    (0..READ_CONNECTIONS)
+    (0..count)
         .map(|_| {
             let mut connection = Connection::open_with_flags(path, flags)
                 .with_context(|| format!("open st read connection {}", path.display()))?;
@@ -2013,7 +2038,7 @@ impl Store {
         }
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
-        let readers = ReadPool::new(|| open_read_connections(path, false))?;
+        let readers = ReadPool::new(|count| open_read_connections(path, false, count))?;
         Ok(Self {
             connection: WriterConnection::new(connection, committed_index.clone()),
             readers,
@@ -2067,7 +2092,7 @@ impl Store {
         }
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
-        let readers = ReadPool::new(|| open_read_connections(&uri, true))?;
+        let readers = ReadPool::new(|count| open_read_connections(&uri, true, count))?;
         Ok(Self {
             connection: WriterConnection::new(connection, committed_index.clone()),
             readers,
@@ -2123,7 +2148,7 @@ impl Store {
         let lane = self.readers.lane();
         {
             let mut pinned = lane.pinned.lock().unwrap_or_else(PoisonError::into_inner);
-            while *pinned + 1 >= READ_CONNECTIONS {
+            while *pinned + 1 >= lane.size {
                 pinned = lane
                     .unpinned
                     .wait(pinned)
@@ -8738,7 +8763,9 @@ impl Store {
         store_index: u64,
         include_history: bool,
     ) -> Result<StatusResponse> {
-        if subjects.len() <= 64 {
+        // A lane of two connections lets one read pin a snapshot, so a worker there could wait
+        // forever for the pin this thread holds. Such a lane answers on this thread.
+        if subjects.len() <= 64 || self.readers.lane().size < READ_CONNECTIONS {
             return self.status_at_view_for_names(
                 None,
                 None,
@@ -8747,8 +8774,8 @@ impl Store {
                 Some(subjects),
             );
         }
-        // The read pool has four connections. Divide a large bounded projection across them;
-        // each worker holds one snapshot connection for its slice, then merge in subject order.
+        // The lane has four connections. Divide a large bounded projection across them; each
+        // worker holds one snapshot connection for its slice, then merge in subject order.
         let subjects = subjects.into_iter().collect::<Vec<_>>();
         let chunk_size = subjects.len().div_ceil(READ_CONNECTIONS);
         let read_class = read_class();

@@ -35,16 +35,21 @@ The cold batch has less headroom than the warm batch; a larger graph or higher C
 
 ## Read lanes
 
-The store reads through five lanes of four connections each, so a read waits only for work in its
-own lane:
+The store reads through five lanes, so a read waits only for work in its own lane. Every
+connection opens its own files, and the daemon runs under a default limit of 1024 open files, so
+the lanes share sixteen connections:
 
-| Lane | Reads |
-| --- | --- |
-| Critical | Seat message polls (`GET /v1/messages/page`), one message, one subject's status (`GET /v1/status?subject=`), and the admission of every client request: its credential and its graph snapshot. |
-| Operational | The agent list and agent details, which divide one projection across all four connections of the lane. |
-| Projection | Projections rebuilt from history on every request: every subject's status or a status history, a work item's detail, sessions, machines, and the missions tree. At most two such requests run at once. The rest wait for a turn before they take any connection. |
-| Interactive | Every other request. |
-| Background | The reconciler and other daemon tasks. |
+| Lane | Connections | Reads |
+| --- | ---: | --- |
+| Critical | 2 | Seat message polls (`GET /v1/messages/page`), one message, one subject's status (`GET /v1/status?subject=`), and the admission of every client request: its credential and its graph snapshot. |
+| Operational | 4 | The agent list and agent details, which divide one projection across the four connections of the lane. |
+| Projection | 2 | Projections rebuilt from history on every request: every subject's status or a status history, a work item's detail, sessions, machines, and the missions tree. At most two such requests run at once. The rest wait for a turn before they take any connection. |
+| Interactive | 4 | Every other request. |
+| Background | 4 | The reconciler and other daemon tasks. |
+
+A projection divides across connections only in a lane of four. In a lane of two, only one read
+at a time may pin a snapshot, so a worker thread could wait forever for the pin its caller
+holds.
 
 On hetz on 2026-09-29, before the projection lane existed, four concurrent work-item details held
 all four interactive connections for 36 seconds. Every seat's message poll waited 5.0 to
