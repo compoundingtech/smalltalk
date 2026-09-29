@@ -1238,6 +1238,9 @@ fn client_work_resources(
                 "generation_id": work.generation,
                 "definition_id": work.definition_hash,
                 "path": work.step,
+                "title": work.title,
+                "assigned_to": work.assigned_to,
+                "last_progress": work.progress_summary,
                 "state": state,
                 "agentless": work.agentless,
                 "gate_kind": gate_kind,
@@ -1352,6 +1355,14 @@ fn client_agent_resources_uncached(
     // history. Scan both, then keep current-layer agents below.
     let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), true)?;
     let work_queues = store.agent_work_queues()?;
+    let desired_hosts = store
+        .desired_subjects()?
+        .into_iter()
+        .filter_map(|desired| {
+            let host = desired.member.map(|member| member.host)?;
+            Some((desired.subject, client_host_id(&host)))
+        })
+        .collect::<BTreeMap<_, _>>();
     let mut agents = status
         .subjects
         .into_iter()
@@ -1377,6 +1388,33 @@ fn client_agent_resources_uncached(
                 .harness
                 .as_ref()
                 .map(|harness| harness.state.clone());
+            let last_activity_at = store.agent_last_activity_at(
+                &subject.subject,
+                subject
+                    .harness
+                    .as_ref()
+                    .map(|harness| harness.incarnation_id.as_str()),
+                snapshot_index,
+            )?;
+            let silent_since = if harness_state.as_deref() == Some("working") {
+                let working_since = match subject.harness.as_ref() {
+                    Some(harness) => store
+                        .agent_working_since(
+                            &subject.subject,
+                            &harness.incarnation_id,
+                            snapshot_index,
+                        )?
+                        .or(Some(harness.observed_at_unix_ms)),
+                    None => None,
+                };
+                match (last_activity_at, working_since) {
+                    (Some(activity), Some(start)) => Some(activity.max(start)),
+                    (Some(activity), None) => Some(activity),
+                    (None, start) => start,
+                }
+            } else {
+                None
+            };
             // A live wrapper is necessary but not sufficient for a running agent. Native
             // harnesses only become running once the current runtime incarnation has produced a
             // ready observation; an ended or indeterminate harness must never be painted green
@@ -1482,6 +1520,9 @@ fn client_agent_resources_uncached(
                 "owner_run_id": subject.owner_run,
                 "driver": driver,
                 "harness_state": harness_state,
+                "host_id": desired_hosts.get(&subject.subject),
+                "last_activity_at": last_activity_at.map(client_timestamp),
+                "silent_since": silent_since.map(client_timestamp),
                 "fault": fault,
                 "incarnation_id": incarnation_id,
                 "current_session_id": current_session_id,
@@ -4554,31 +4595,32 @@ async fn fleet_membership_view(
 }
 
 async fn replication_wake(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let admission = state
-        .store
-        .validate_replication_backlog()
-        .map_err(ApiError::internal)?;
-    let repairs = state
-        .store
-        .apply_replication_repairs()
-        .map_err(ApiError::internal)?;
-    let was_deferred = state.store.replication_projection_deferred();
-    let projection_attempted = admission.changed
-        || repairs != 0
-        || was_deferred
-        || state
-            .store
-            .replication_projection_needs_recovery()
-            .map_err(ApiError::internal)?;
-    let projection = if projection_attempted {
-        state
-            .store
-            .project_replication_backlog_unless_catching_up()
-            .map_err(ApiError::internal)?
-    } else {
-        Some(true)
-    };
-    let projected = projection.unwrap_or(false);
+    let store = state.store.clone();
+    let (admission, repairs, projection_attempted, projected, was_deferred) =
+        blocking_store(move || {
+            let admission = store.validate_replication_backlog()?;
+            let repairs = store.apply_replication_repairs()?;
+            let was_deferred = store.replication_projection_deferred();
+            let projection_attempted = admission.changed
+                || repairs != 0
+                || was_deferred
+                || store.replication_projection_needs_recovery()?;
+            let projected = if projection_attempted {
+                store
+                    .project_replication_backlog_unless_catching_up()?
+                    .unwrap_or(false)
+            } else {
+                true
+            };
+            Ok((
+                admission,
+                repairs,
+                projection_attempted,
+                projected,
+                was_deferred,
+            ))
+        })
+        .await?;
     if projected && (admission.changed || repairs != 0 || was_deferred) {
         signal_changed(&state);
     }
@@ -6350,14 +6392,16 @@ async fn post_claim(
     State(state): State<AppState>,
     Json(request): Json<ClaimInput>,
 ) -> Result<Json<ClaimRecord>, ApiError> {
-    let (response, appended) = state
-        .store
-        .append_client_claim_outcome(&request)
-        .map_err(ApiError::bad)?;
+    // A write can wait for the store's writer. It waits on the blocking pool, so the API's
+    // workers keep answering other requests meanwhile.
+    let store = state.store.clone();
+    let kind = request.kind.clone();
+    let (response, appended) =
+        blocking_action(move || store.append_client_claim_outcome(&request)).await?;
     if appended {
         if crate::store::local_observation_position(&response).is_some() {
             signal_local_change(&state);
-        } else if request.kind == "harness.usage" {
+        } else if kind == "harness.usage" {
             signal_visible_change(&state);
         } else {
             signal_changed(&state);
@@ -10049,6 +10093,47 @@ mod tests {
         assert_eq!(second["has_more"], false);
     }
 
+    #[tokio::test]
+    async fn a_claim_waiting_for_the_store_writer_leaves_the_api_answering() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let app = router(state);
+        let (held, holding) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            store.hold_writer_for_test(|| {
+                held.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(1_500));
+            });
+        });
+        holding.recv().unwrap();
+
+        // This test runs on one thread. A claim that waited for the writer on it would hold the
+        // whole runtime, even this sleep, until the writer was released.
+        let started = std::time::Instant::now();
+        let claim = tokio::spawn(json_request(
+            app.clone(),
+            "/v1/claims",
+            json!({
+                "subject": "custom/acme/fact",
+                "kind": "custom.acme.found",
+                "fields": {},
+            }),
+        ));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let (status, _) = get_request(app, "/v1/health").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            started.elapsed() < Duration::from_millis(750),
+            "health waited {:?} behind a claim that was waiting for the writer",
+            started.elapsed()
+        );
+
+        holder.join().unwrap();
+        let (status, body) = claim.await.unwrap();
+        assert_eq!(status, StatusCode::OK, "{body}");
+    }
+
     async fn json_request(app: Router, path: &str, value: Value) -> (StatusCode, Value) {
         let response = app
             .oneshot(
@@ -11479,7 +11564,7 @@ mission "planned/direct" state="ready" {
         let kdl = r#"version 2
 mission "visible-agentless" state="ready" {
   goal "Keep agentless work visible in Control."
-  step "steward" { agentless }
+  step "steward" { title "Keep watch"; agentless }
 }"#;
         let intent = parse_intent(kdl, "node").unwrap();
         let preview = state
@@ -11521,6 +11606,9 @@ mission "visible-agentless" state="ready" {
             .find(|item| item["mission_run_id"] == run.subject)
             .unwrap();
         assert_eq!(step["path"], "steward");
+        assert_eq!(step["title"], "Keep watch");
+        assert_eq!(step["assigned_to"], Value::Null);
+        assert_eq!(step["last_progress"], Value::Null);
         assert_eq!(step["agentless"], true);
         assert!(
             client_work_resources(
@@ -12728,6 +12816,8 @@ mission "agent-health" state="ready" {
         let resources =
             client_agent_resources(&store, false, "snapshot", store.index().unwrap()).unwrap();
         assert_eq!(resources[0]["state"], "starting");
+        assert_eq!(resources[0]["host_id"], "host/node");
+        assert!(resources[0]["last_activity_at"].is_null());
         assert_eq!(resources[0]["next_work_id"], queued);
         assert_eq!(resources[0]["upcoming_work_ids"], json!([queued]));
         assert_eq!(resources[0]["queued_work_count"], 1);

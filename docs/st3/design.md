@@ -83,9 +83,12 @@ a missing desired member. Final work and explicit cancellation stop owned member
 
 A Claude harness can stop at a screen that no hook reports: an expired login or the workspace trust
 prompt. The reconciler reads the terminal screen for both. Either one fences that incarnation as not
-ready with its reason (`providerAuth` or `providerTrustPrompt`). A login needs a person. A trust
-prompt does not: the reconciler stops that exact incarnation and starts a replacement, whose driver
-admits the workspace again before Claude starts. Nothing is typed into the terminal. After three
+ready with its reason (`providerAuth` or `providerTrustPrompt`). A login needs a person. When the
+login prompt leaves the screen, because a person ran `/login` or the match was wrong, the reconciler
+records `provider-auth-restored`, lifts the fence, and resolves the person's request. If the prompt
+returns, it fences the incarnation again. A trust prompt does not need a person: the reconciler stops
+that exact incarnation and starts a replacement, whose driver admits the workspace again before
+Claude starts. Nothing is typed into the terminal. After three
 trust prompts in ten minutes the reconciler stops replacing the seat and asks the operator.
 
 The driver admits a workspace under Claude's own config lock (`.claude.json.lock`). Every Claude
@@ -116,6 +119,20 @@ on with every other item:
 
 A fault is recorded again only when its cause changes. The item's next success records its
 recovery.
+
+Sometimes a fault cannot be recorded on its item, for example when a store write fails. The item
+was still skipped on its own and the pass carried on. The daemon then records `daemon.diagnostic`
+with the code `fault-record-failed` and status `faulted`, and the host is not reported as
+unreachable.
+
+A member declaration that this build cannot read is not skipped silently. The host that published it
+records a member fault naming the parse error, until a build that can read it takes it up.
+
+The reconciler reads each source of its next wake-up time on its own: mission deadlines, work wakes,
+provider-capacity retries, and subscription retries. A source that fails records a stage fault
+named `deadline/SOURCE` and is read again within five seconds, and the other sources keep their
+deadlines. A step whose wake cannot be read loses only its own wake-up, with a `wake-deadline`
+fault on its step-run.
 
 A running member whose workspace or render fails is still observed, checked, and woken for its
 work. The failure blocks only its start and restart.
@@ -153,6 +170,9 @@ The daemon's other loops keep the same rule:
   whose document is not on this host, is recorded once as a `harness.diagnostic` with the code
   `message-unforwarded`. The recipient's other messages keep arriving.
 - A driver skips renewing a step whose claim ended in the meantime, and keeps running.
+- A claim write, a replication wake and each reconcile pass run on the blocking pool. One that waits
+  for the store's writer does not hold an async worker, so the API, its health check and timers
+  keep answering.
 - A panic while the store's writer is held does not disable the store. The panic rolls back its
   open transaction as it unwinds, and the next write proceeds. The reconciler's own locks recover
   the same way.
