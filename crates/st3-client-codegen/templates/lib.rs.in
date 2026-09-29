@@ -150,6 +150,15 @@ impl CollectionStream {
     ) -> Result<(), ClientError> {
         self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":"terminal", "terminal":terminal_id, "incarnation":incarnation, "capability":capability})).await
     }
+    /// Follow an agent's or a session's conversation: st joins its transcript and its Small
+    /// Talk and sends the newest page, then each change.
+    pub async fn subscribe_conversation(
+        &mut self,
+        id: &str,
+        conversation: &str,
+    ) -> Result<(), ClientError> {
+        self.send(&serde_json::json!({"kind":"subscribe", "id":id, "collection":"conversation", "conversation":conversation})).await
+    }
     pub async fn unsubscribe(&mut self, id: &str) -> Result<(), ClientError> {
         self.send(&serde_json::json!({"kind":"unsubscribe", "id":id}))
             .await
@@ -233,6 +242,15 @@ pub enum CollectionEvent {
         id: String,
         screen: Box<Envelope<TerminalScreen>>,
     },
+    /// A conversation's entries. `replace` means these are its newest page and every earlier
+    /// entry is gone; otherwise they are new or revised entries, matched by ID.
+    Conversation {
+        id: String,
+        session_id: String,
+        replace: bool,
+        items: Vec<TimelineEntry>,
+        has_more: bool,
+    },
     /// Subscribe again: the server could not bring this subscription up to date.
     Resync { id: String },
     /// The subscription failed or ended; the socket and other subscriptions continue.
@@ -273,6 +291,13 @@ impl CollectionEvent {
                     snapshot: field(&frame, "snapshot")?,
                     value: field(&frame, "value")?,
                 }),
+                id,
+            }),
+            Some("conversation") => Ok(Self::Conversation {
+                session_id: field(&frame, "session_id")?,
+                replace: field(&frame, "replace")?,
+                items: field(&frame, "items")?,
+                has_more: field::<Option<bool>>(&frame, "has_more")?.unwrap_or(false),
                 id,
             }),
             Some("resync") => Ok(Self::Resync { id }),
