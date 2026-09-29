@@ -30,10 +30,11 @@ use crate::fleet::transport::{
 use crate::fleet::{Acceptance, FleetView, MemberKey, Refusal, Sender, verify_signature};
 use crate::model::{
     ApiResponse, ReplicaEnvelopeId, ReplicationExchange, ReplicationExportRequest,
-    ReplicationExportResponse, ReplicationInventory, ReplicationPeerFailureRequest,
-    ReplicationReceiveRequest, ReplicationReceiveResponse,
+    ReplicationExportResponse, ReplicationHealAnswer, ReplicationHealAnswerRequest,
+    ReplicationHealNextRequest, ReplicationHealQuery, ReplicationHealRequest, ReplicationHealStep,
+    ReplicationInventory, ReplicationPeerFailureRequest, ReplicationReceiveRequest,
+    ReplicationReceiveResponse,
 };
-#[cfg(test)]
 use crate::store::Store;
 use crate::store::{CheckpointManifest, CheckpointManifestPage, CheckpointManifestRequest};
 
@@ -45,11 +46,28 @@ const CHECKPOINT_PATH: &str = "/v1/peer/checkpoint";
 const REPLICATION_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
 const REPLICATION_WAKE_COALESCE: Duration = Duration::from_secs(1);
 const CLIENT_READ_PATH: &str = "/v1/peer/client-read";
+const HEAL_PATH: &str = "/v1/peer/heal";
+/// A heal question can make the peer replay its graph from nothing, which takes 41 seconds on a
+/// 2 GB store and longer under load.
+const HEAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+/// Questions one heal asks before it gives up until the next.
+const HEAL_QUESTION_LIMIT: usize = 48;
 const JOIN_PATH: &str = "/v1/fleet/join";
 const MAX_JOIN_BYTES: usize = 4096;
 const MAX_CLIENT_READ_BYTES: usize = 1_048_576;
 /// A relayed long poll must answer well inside the relay's 15-second request timeout.
 const CLIENT_READ_MAX_WAIT_MS: u64 = 10_000;
+/// How long one hop waits for an owner's answer beyond the read's own long poll.
+const CLIENT_READ_TIMEOUT: Duration = Duration::from_secs(15);
+/// The most nodes a client read may be forwarded through on its way to its owner.
+pub const CLIENT_READ_MAX_HOPS: u8 = 4;
+/// Each node on a relayed read waits this much longer than the node after it, so an answer on its
+/// way back is never cut short by an earlier hop giving up first.
+const CLIENT_READ_HOP_MARGIN: Duration = Duration::from_secs(10);
+/// How long a relay reuses the fleet's observed links before it reads them again.
+const CLIENT_READ_LINKS_TTL: Duration = Duration::from_secs(5);
+/// The daemon route a replication worker hands a read to when it must forward it.
+pub const CLIENT_READ_FORWARD_PATH: &str = "/v1/internal/client-read/forward";
 const HEADER_FLEET: &str = "x-st3-fleet";
 const HEADER_NODE: &str = "x-st3-node";
 const HEADER_BODY: &str = "x-st3-body-sha256";
@@ -230,6 +248,7 @@ impl FleetAuth {
         hex::encode(mac.finalize().into_bytes())
     }
 
+    #[cfg(test)]
     fn request_headers(&self, node: &str, body: &[u8]) -> Result<HeaderMap> {
         self.request_headers_for(EXCHANGE_PATH, node, body)
     }
@@ -390,6 +409,36 @@ pub enum ClientReadOperation {
 pub struct ClientReadRequest {
     pub authority_actor: String,
     pub request: ClientReadOperation,
+    /// Set only while the read travels through nodes that do not own what it reads. A read sent
+    /// straight to its owner carries none, so an owner that predates relaying still answers it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<ClientReadRoute>,
+}
+
+/// Where a relayed client read is going and where it has been.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ClientReadRoute {
+    /// The owner's host, such as `host/owner`.
+    pub target: String,
+    /// The nodes the read has passed through, starting with the one it began on. The last is
+    /// the node that sent it to the receiver.
+    pub path: Vec<String>,
+    /// How many more nodes may forward it.
+    pub hops_left: u8,
+}
+
+impl ClientReadOperation {
+    /// How long the owner may hold this read open before it answers.
+    fn wait(&self) -> Duration {
+        match self {
+            Self::ConversationChanges { wait_ms, .. }
+            | Self::TerminalScreenChange { wait_ms, .. } => {
+                Duration::from_millis((*wait_ms).min(CLIENT_READ_MAX_WAIT_MS))
+            }
+            _ => Duration::ZERO,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -411,21 +460,86 @@ impl std::fmt::Display for ClientReadRejected {
 
 impl std::error::Error for ClientReadRejected {}
 
+/// Up links as `(observer, observed)`, and when they were read.
+type ObservedLinks = (std::time::Instant, Arc<[(String, String)]>);
+
 /// A paired gateway uses this for bounded owner-local client operations. The peer worker
 /// authenticates both ends and the owner daemon rechecks the requested resource and fences.
+///
+/// An owner this node cannot dial is reached through the peers it can: each node on the way
+/// forwards the read to the next, choosing by the links the fleet has observed, and relays the
+/// owner's answer back. Every hop checks that its sender is a fleet member, and the owner applies
+/// its own grants to the person the read carries.
 #[derive(Clone)]
 pub struct ClientRelay {
     node: String,
     peers: Vec<PeerConfig>,
     auth: FleetAuth,
     http: reqwest::Client,
+    /// The store whose replicated transport observations say which nodes reach which.
+    links: Option<Arc<Store>>,
+    /// The links last read from that store, and when, so a busy gateway reads them rarely.
+    observed: Arc<std::sync::Mutex<Option<ObservedLinks>>>,
 }
 
 impl ClientRelay {
-    pub fn has_peer(&self, host_id: &str) -> bool {
-        host_id
-            .strip_prefix("host/")
-            .is_some_and(|name| self.peers.iter().any(|peer| peer.name == name))
+    /// Choose routes by the transport observations in this store.
+    pub fn with_links(mut self, store: Arc<Store>) -> Self {
+        self.links = Some(store);
+        self
+    }
+
+    /// Whether a read for this host has somewhere to go: the host itself, or a peer that can
+    /// carry it on.
+    pub fn reaches(&self, host_id: &str) -> bool {
+        host_id.strip_prefix("host/").is_some_and(|name| {
+            name != self.node
+                && (self
+                    .peers
+                    .iter()
+                    .any(|peer| peer.name == name && !peer.url.is_empty())
+                    || !self.next_hops(name, &[]).is_empty())
+        })
+    }
+
+    /// The fleet's observed up links, read again once the last reading is a few seconds old.
+    fn observed_links(&self) -> Arc<[(String, String)]> {
+        let Some(store) = &self.links else {
+            return Arc::from([]);
+        };
+        let mut observed = self
+            .observed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some((read_at, links)) = observed.as_ref()
+            && read_at.elapsed() < CLIENT_READ_LINKS_TTL
+        {
+            return links.clone();
+        }
+        let links: Arc<[(String, String)]> = store.transport_links().unwrap_or_default().into();
+        *observed = Some((std::time::Instant::now(), links.clone()));
+        links
+    }
+
+    /// The peers to try, in order, for a read bound for `target`: the target itself when it is a
+    /// peer, then the peers with the shortest observed path to it. With no observation of the
+    /// target at all, every peer is worth a try. Nodes the read already passed are never chosen.
+    fn next_hops(&self, target: &str, visited: &[String]) -> Vec<&PeerConfig> {
+        let dialable = self
+            .peers
+            .iter()
+            .filter(|peer| !peer.url.is_empty() && peer.name != self.node)
+            .filter(|peer| !visited.contains(&peer.name))
+            .collect::<Vec<_>>();
+        let links = self.observed_links();
+        let names = dialable
+            .iter()
+            .map(|peer| peer.name.clone())
+            .collect::<Vec<_>>();
+        client_read_next_hops(&self.node, target, &names, visited, &links)
+            .into_iter()
+            .filter_map(|name| dialable.iter().copied().find(|peer| peer.name == name))
+            .collect()
     }
 
     pub fn from_config(config: &Config) -> Result<Option<Self>> {
@@ -441,28 +555,107 @@ impl ClientRelay {
             auth: FleetAuth::load(fleet, secret)?,
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(3))
-                .timeout(Duration::from_secs(15))
                 .build()?,
+            links: None,
+            observed: Arc::default(),
         }))
     }
 
+    /// Read from the owner of `host_id`, directly or through the peers that can reach it.
     pub async fn read(
         &self,
         host_id: &str,
         request: &ClientReadRequest,
     ) -> Result<serde_json::Value> {
-        let name = host_id
+        let target = host_id
             .strip_prefix("host/")
             .context("the owner host ID is invalid")?;
-        let peer = self
-            .peers
-            .iter()
-            .find(|peer| peer.name == name)
-            .with_context(|| format!("owner `{host_id}` is not a configured peer"))?;
-        anyhow::ensure!(
-            !peer.url.is_empty(),
-            "owner `{host_id}` has no configured dial URL"
-        );
+        self.send_toward(
+            target,
+            request,
+            vec![self.node.clone()],
+            CLIENT_READ_MAX_HOPS,
+        )
+        .await
+    }
+
+    /// Carry on a read a peer relayed here because this node is on its way to the owner.
+    pub async fn forward(&self, request: &ClientReadRequest) -> Result<serde_json::Value> {
+        let route = request
+            .relay
+            .as_ref()
+            .context("only a relayed client read can be forwarded")?;
+        let target = route
+            .target
+            .strip_prefix("host/")
+            .context("the relayed owner host ID is invalid")?;
+        if route.hops_left == 0 || route.path.contains(&self.node) {
+            return Err(ClientReadRejected {
+                code: "remote-unavailable".into(),
+                status: StatusCode::LOOP_DETECTED.as_u16(),
+                message: format!("{} cannot carry this read any further", self.node),
+            }
+            .into());
+        }
+        let mut path = route.path.clone();
+        path.push(self.node.clone());
+        self.send_toward(target, request, path, route.hops_left - 1)
+            .await
+    }
+
+    /// Try each next hop in turn. An owner's own answer, including a refusal such as a stale
+    /// fence, ends the attempt; a hop that cannot be reached, or cannot reach further, does not.
+    async fn send_toward(
+        &self,
+        target: &str,
+        request: &ClientReadRequest,
+        path: Vec<String>,
+        hops_left: u8,
+    ) -> Result<serde_json::Value> {
+        let mut last = None;
+        for peer in self.next_hops(target, &path) {
+            let relay = (peer.name != target).then(|| ClientReadRoute {
+                target: format!("host/{target}"),
+                path: path.clone(),
+                hops_left,
+            });
+            if relay.as_ref().is_some_and(|relay| relay.hops_left == 0) {
+                continue;
+            }
+            let outgoing = ClientReadRequest {
+                authority_actor: request.authority_actor.clone(),
+                request: request.request.clone(),
+                relay,
+            };
+            match self.send(peer, &outgoing).await {
+                Ok(value) => return Ok(value),
+                Err(error)
+                    if error
+                        .downcast_ref::<ClientReadRejected>()
+                        .is_some_and(|rejected| rejected.code != "remote-unavailable") =>
+                {
+                    return Err(error);
+                }
+                Err(error) => last = Some(error),
+            }
+        }
+        Err(last.unwrap_or_else(|| {
+            anyhow::anyhow!("no peer of {} can reach owner host/{target}", self.node)
+        }))
+    }
+
+    async fn send(
+        &self,
+        peer: &PeerConfig,
+        request: &ClientReadRequest,
+    ) -> Result<serde_json::Value> {
+        let name = peer.name.as_str();
+        // A relayed read may pass through more nodes, each waiting a little less than the last.
+        let timeout = CLIENT_READ_TIMEOUT
+            + request.request.wait()
+            + request.relay.as_ref().map_or(Duration::ZERO, |relay| {
+                CLIENT_READ_HOP_MARGIN * (u32::from(relay.hops_left) + 1)
+            });
         let body = serde_json::to_vec(request)?;
         anyhow::ensure!(
             body.len() <= 16_384,
@@ -481,6 +674,7 @@ impl ClientRelay {
             ))
             .headers(headers)
             .header("content-type", "application/json")
+            .timeout(timeout)
             .body(body)
             .send()
             .await?;
@@ -529,6 +723,68 @@ impl ClientRelay {
         }
         Ok(envelope.value)
     }
+}
+
+/// Order the dialable peers for a read from `node` bound for `target`. Links are the fleet's
+/// observed up transports, `(observer, observed)`, taken as usable either way. The target comes
+/// first when it is dialable; then every dialable peer with a path to the target that avoids this
+/// node and the nodes already visited, nearest first. When the observations never name the target,
+/// every dialable peer is tried, since none can be ruled out.
+pub(crate) fn client_read_next_hops(
+    node: &str,
+    target: &str,
+    dialable: &[String],
+    visited: &[String],
+    links: &[(String, String)],
+) -> Vec<String> {
+    let blocked = |name: &str| name == node || visited.iter().any(|seen| seen == name);
+    let mut neighbours = BTreeMap::<&str, BTreeSet<&str>>::new();
+    for (from, to) in links {
+        if from != to {
+            neighbours.entry(from).or_default().insert(to);
+            neighbours.entry(to).or_default().insert(from);
+        }
+    }
+    let mut ordered = dialable
+        .iter()
+        .filter(|name| name.as_str() == target)
+        .cloned()
+        .collect::<Vec<_>>();
+    if !neighbours.contains_key(target) {
+        let mut rest = dialable
+            .iter()
+            .filter(|name| name.as_str() != target && !blocked(name))
+            .cloned()
+            .collect::<Vec<_>>();
+        rest.sort();
+        ordered.extend(rest);
+        return ordered;
+    }
+    // Distances to the target, walking out from it through nodes the read may still visit.
+    let mut distance = BTreeMap::from([(target, 0_usize)]);
+    let mut frontier = std::collections::VecDeque::from([target]);
+    while let Some(current) = frontier.pop_front() {
+        let next = distance[current] + 1;
+        for &neighbour in neighbours.get(current).into_iter().flatten() {
+            if blocked(neighbour) || distance.contains_key(neighbour) {
+                continue;
+            }
+            distance.insert(neighbour, next);
+            frontier.push_back(neighbour);
+        }
+    }
+    let mut routed = dialable
+        .iter()
+        .filter(|name| name.as_str() != target && !blocked(name))
+        .filter_map(|name| {
+            distance
+                .get(name.as_str())
+                .map(|hops| (*hops, name.clone()))
+        })
+        .collect::<Vec<_>>();
+    routed.sort();
+    ordered.extend(routed.into_iter().map(|(_, name)| name));
+    ordered
 }
 
 fn headers(
@@ -743,7 +999,12 @@ impl PeerBackend {
                     store.record_replication_round_trip(round_trip);
                 }
                 let receipt = store
-                    .receive_replication_exchange(peer, fleet_id, exchange)
+                    .receive_replication_exchange_asking(
+                        peer,
+                        fleet_id,
+                        exchange,
+                        round_trip.is_some(),
+                    )
                     .map_err(anyhow::Error::msg)?;
                 store.record_transport_observation(peer, "up", None, None)?;
                 let admission = store.validate_replication_backlog()?;
@@ -755,6 +1016,54 @@ impl PeerBackend {
                     store_index: store.index()?,
                 })
             }
+        }
+    }
+
+    /// Answer a peer's heal question from this node's claims.
+    async fn heal_answer(
+        &self,
+        peer: &str,
+        fleet_id: &str,
+        query: &ReplicationHealQuery,
+    ) -> Result<ReplicationHealAnswer> {
+        match self {
+            Self::Main(client) => {
+                client
+                    .post(
+                        "/v1/internal/replication/heal/answer",
+                        &ReplicationHealAnswerRequest {
+                            peer: peer.to_owned(),
+                            fleet_id: fleet_id.to_owned(),
+                            query: query.clone(),
+                        },
+                    )
+                    .await
+            }
+            #[cfg(test)]
+            Self::Local(store) => store.heal_answer(peer, query),
+        }
+    }
+
+    /// Compare a peer's heal answer with this node's claims and learn what to ask next.
+    async fn heal_next(
+        &self,
+        peer: &str,
+        answer: ReplicationHealAnswer,
+    ) -> Result<ReplicationHealStep> {
+        match self {
+            Self::Main(client) => {
+                client
+                    .post(
+                        "/v1/internal/replication/heal/next",
+                        &ReplicationHealNextRequest {
+                            peer: peer.to_owned(),
+                            answer,
+                        },
+                    )
+                    .await
+            }
+            #[cfg(test)]
+            Self::Local(store) => store.heal_next(peer, answer),
         }
     }
 
@@ -1244,6 +1553,7 @@ async fn keep_fleet_view_current(
 fn peer_router(state: PeerState) -> Router {
     Router::new()
         .route(EXCHANGE_PATH, post(receive_exchange))
+        .route(HEAL_PATH, post(receive_heal))
         .route(
             CHECKPOINT_PATH,
             post(receive_checkpoint_request).layer(DefaultBodyLimit::max(16_384)),
@@ -1258,6 +1568,27 @@ fn peer_router(state: PeerState) -> Router {
         )
         .layer(DefaultBodyLimit::max(MAX_EXCHANGE_BYTES))
         .with_state(state)
+}
+
+/// Hand a read bound for another owner to this node's daemon, which knows the routes and the
+/// peers to carry it on. Its answer, or the owner's refusal, comes back unchanged.
+async fn forward_client_read(
+    state: &PeerState,
+    request: &ClientReadRequest,
+) -> Result<serde_json::Value> {
+    let daemon = Client::unix(state.main_socket.clone());
+    daemon
+        .post::<_, serde_json::Value>(CLIENT_READ_FORWARD_PATH, request)
+        .await
+        .map_err(|error| match crate::client::api_error_parts(&error) {
+            Some((status, code, message)) => ClientReadRejected {
+                code: code.to_owned(),
+                status,
+                message: message.to_owned(),
+            }
+            .into(),
+            None => error,
+        })
 }
 
 async fn receive_client_read(
@@ -1285,6 +1616,17 @@ async fn receive_client_read(
                 && request.authority_actor.matches('/').count() == 1,
             "a fleet client read needs one concrete person"
         );
+        if let Some(route) = &request.relay {
+            // The path names the member that sent it last, and never this node again.
+            anyhow::ensure!(
+                route.path.last() == Some(&sender)
+                    && route.path.len() <= usize::from(CLIENT_READ_MAX_HOPS) + 1,
+                "the relayed client read's path does not end at its sender"
+            );
+            if route.target != format!("host/{}", state.node) {
+                return forward_client_read(&state, &request).await;
+            }
+        }
         let client = st3_client::Client::unix_as(&state.main_socket, &request.authority_actor);
         match request.request {
             ClientReadOperation::ConversationChanges {
@@ -1632,8 +1974,11 @@ async fn dial_peer(
             url,
         };
         match exchange(&http, &backend, &node, &peer, &auth, &fleet, &main_socket).await {
-            Ok(moved) => {
+            Ok((moved, heal_now)) => {
                 backoff = Duration::from_secs(1);
+                if heal_now {
+                    heal(&backend, &node, &peer, &auth, &fleet, &main_socket).await;
+                }
                 if moved {
                     // One exchange carries a bounded batch. Keep going at once while envelopes
                     // still move instead of leaving the rest of a backlog to the timer.
@@ -1787,6 +2132,74 @@ async fn receive_exchange(
             .unwrap_or_else(|_| (StatusCode::INTERNAL_SERVER_ERROR, message).into_response())
         }
     }
+}
+
+/// A peer's heal question, answered from this node's claims by the main daemon.
+async fn receive_heal(State(state): State<PeerState>, headers: HeaderMap, body: Bytes) -> Response {
+    let body = if deflated(&headers) {
+        match inflate(&body) {
+            Ok(body) => Bytes::from(body),
+            Err(error) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("heal request body: {error:#}"),
+                )
+                    .into_response();
+            }
+        }
+    } else {
+        body
+    };
+    let sender = match state
+        .auth
+        .verify_sender(&headers, "POST", HEAL_PATH, &body, None, None)
+    {
+        Ok(sender) => sender,
+        Err(error) => {
+            return (
+                StatusCode::UNAUTHORIZED,
+                format!("heal authentication failed: {error:#}"),
+            )
+                .into_response();
+        }
+    };
+    let request_digest = FleetAuth::body_digest(&body);
+    if let Err(refusal) = state.fleet.accept(&sender) {
+        return signed_refusal(&state, &request_digest, &refusal)
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+    let result = async {
+        let request: ReplicationHealRequest =
+            serde_json::from_slice(&body).context("decode the heal request")?;
+        anyhow::ensure!(
+            request.fleet_id == state.auth.fleet_id(),
+            "the peer belongs to another fleet"
+        );
+        let answer = state
+            .backend
+            .heal_answer(&sender.name, state.auth.fleet_id(), &request.query)
+            .await?;
+        if matches!(
+            answer,
+            ReplicationHealAnswer::Swapped { .. } | ReplicationHealAnswer::Replayed { .. }
+        ) {
+            wake_main(&state.main_socket).await;
+        }
+        let response = signed_response_for(&state, HEAL_PATH, &request_digest, 0, answer)?;
+        deflate_response(response, accepts_deflate(&headers)).await
+    }
+    .await;
+    result.unwrap_or_else(|error| {
+        signed_error_response_for(
+            &state,
+            HEAL_PATH,
+            &request_digest,
+            0,
+            StatusCode::UNPROCESSABLE_ENTITY,
+            &format!("heal request failed: {error:#}"),
+        )
+        .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
+    })
 }
 
 /// Answer a member or config peer with one page of a checkpoint's manifest. It is authenticated
@@ -2127,7 +2540,7 @@ async fn exchange(
     auth: &FleetAuth,
     fleet: &FleetContext,
     main_socket: &Path,
-) -> Result<bool> {
+) -> Result<(bool, bool)> {
     let first = backend
         .export(auth.fleet_id(), &ReplicationInventory::default(), true, &[])
         .await?
@@ -2147,6 +2560,7 @@ async fn exchange(
     // Progress means new envelopes stored on one side or the other. A peer that keeps sending,
     // or keeps being sent, envelopes that are never stored must not keep the worker busy.
     let pulled = received.receipt.received != 0;
+    let mut heal_now = received.receipt.heal;
     if received.changed {
         wake_main(main_socket).await;
     }
@@ -2175,11 +2589,52 @@ async fn exchange(
             .receive(&peer.name, auth.fleet_id(), &response, Some(round_trip))
             .await?;
         pulled_follow_up = received.receipt.received != 0;
+        heal_now |= received.receipt.heal;
         if received.changed {
             wake_main(main_socket).await;
         }
     }
-    Ok(pulled || pulled_follow_up || pushed)
+    Ok((pulled || pulled_follow_up || pushed, heal_now))
+}
+
+/// Heal with one peer: carry each question the main daemon asks to the peer, and each answer
+/// back, until the main daemon reports the heal. A peer that cannot be asked ends the heal with
+/// the reason, which the main daemon reports.
+async fn heal(
+    backend: &PeerBackend,
+    node: &str,
+    peer: &PeerConfig,
+    auth: &FleetAuth,
+    fleet: &FleetContext,
+    main_socket: &Path,
+) {
+    let http = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(3))
+        .timeout(HEAL_TIMEOUT)
+        .build()
+        .expect("the heal HTTP client configuration is valid");
+    let mut query = ReplicationHealQuery::Ranges;
+    for _ in 0..HEAL_QUESTION_LIMIT {
+        let request = ReplicationHealRequest {
+            fleet_id: auth.fleet_id().to_owned(),
+            query,
+        };
+        let answer = match post_signed_to::<_, ReplicationHealAnswer>(
+            &http, peer, node, auth, fleet, HEAL_PATH, &request, true,
+        )
+        .await
+        {
+            Ok((answer, _)) => answer,
+            Err(error) => ReplicationHealAnswer::Failed {
+                message: format!("{} could not answer: {error:#}", peer.name),
+            },
+        };
+        match backend.heal_next(&peer.name, answer).await {
+            Ok(ReplicationHealStep::Ask { query: next }) => query = next,
+            Ok(ReplicationHealStep::Done { .. }) | Err(_) => break,
+        }
+    }
+    wake_main(main_socket).await;
 }
 
 /// Send one signed exchange, compressed when `compress` is set and the body is large, and return
@@ -2193,10 +2648,36 @@ async fn post_signed(
     exchange: &ReplicationExchange,
     compress: bool,
 ) -> Result<(ReplicationExchange, bool)> {
-    let body = serde_json::to_vec(exchange)?;
+    post_signed_to(
+        http,
+        peer,
+        node,
+        auth,
+        fleet,
+        EXCHANGE_PATH,
+        exchange,
+        compress,
+    )
+    .await
+}
+
+/// Send one signed request to a peer path and return the peer's verified answer, as
+/// `post_signed` does for an exchange.
+#[allow(clippy::too_many_arguments)]
+async fn post_signed_to<B: Serialize, R: serde::de::DeserializeOwned>(
+    http: &reqwest::Client,
+    peer: &PeerConfig,
+    node: &str,
+    auth: &FleetAuth,
+    fleet: &FleetContext,
+    path: &str,
+    request: &B,
+    compress: bool,
+) -> Result<(R, bool)> {
+    let body = serde_json::to_vec(request)?;
     let request_digest = FleetAuth::body_digest(&body);
-    let headers = auth.request_headers(node, &body)?;
-    let endpoint = format!("{}{}", peer.url.trim_end_matches('/'), EXCHANGE_PATH);
+    let headers = auth.request_headers_for(path, node, &body)?;
+    let endpoint = format!("{}{}", peer.url.trim_end_matches('/'), path);
     let started = std::time::Instant::now();
     let mut request = http
         .post(&endpoint)
@@ -2233,6 +2714,10 @@ async fn post_signed(
             )
         })?
         .to_vec();
+    // A build older than a path answers an unsigned 404.
+    if status == StatusCode::NOT_FOUND && headers.get(HEADER_SIGNATURE).is_none() {
+        anyhow::bail!("peer {} runs a build without `{path}`", peer.name);
+    }
     let bytes = if deflated(&headers) {
         inflate(&bytes)?
     } else {
@@ -2241,7 +2726,7 @@ async fn post_signed(
     let responder = auth.verify_sender(
         &headers,
         "RESPONSE",
-        EXCHANGE_PATH,
+        path,
         &bytes,
         Some(&peer.name),
         Some(&request_digest),
@@ -2276,7 +2761,7 @@ async fn post_signed(
             String::from_utf8_lossy(&bytes)
         );
     }
-    let response: ApiResponse<ReplicationExchange> =
+    let response: ApiResponse<R> =
         serde_json::from_slice(&bytes).context("decode the signed peer response")?;
     anyhow::ensure!(
         response.api_version == "st3.v1",
@@ -2818,6 +3303,435 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_read_reaches_an_owner_through_a_peer_that_can_dial_it() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        // A chain of isolated daemons: the gateway dials only the relay, and only the relay
+        // dials the owner. The gateway knows the relay reaches the owner from the relay's
+        // replicated transport observation.
+        let roots = [(); 3].map(|()| tempfile::tempdir().unwrap());
+        let make_state = |root: &Path, node: &str| crate::api::AppState {
+            store: Arc::new(Store::open(&root.join("graph.db"), node).unwrap()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: node.into(),
+            state_dir: root.to_path_buf(),
+            pty_root: root.join("pty"),
+            pty_binary: root.join("unused-pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
+        };
+        let mut gateway = make_state(roots[0].path(), "chain-gateway");
+        let mut relay = make_state(roots[1].path(), "chain-relay");
+        let owner = make_state(roots[2].path(), "chain-owner");
+        let agent = "agent/chain-worker";
+        let incarnation = "chain-runtime:i1";
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "runtime.observed".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    ("runtime_id".into(), Value::String("chain-runtime".into())),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                    ("status".into(), Value::String("running".into())),
+                    ("terminal".into(), Value::Bool(true)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("chain-worker-running".into()),
+            })
+            .unwrap();
+        relay
+            .store
+            .record_transport_observation("chain-owner", "up", None, None)
+            .unwrap();
+        gateway
+            .store
+            .import_replication("chain-owner", &owner.store.export_replication(0).unwrap())
+            .unwrap();
+        gateway
+            .store
+            .import_replication("chain-relay", &relay.store.export_replication(0).unwrap())
+            .unwrap();
+        // The transcript line is written after replication, so only the owner can answer it.
+        owner
+            .store
+            .append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "harness.timeline".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    ("operation".into(), serde_json::json!("append")),
+                    ("entry_id".into(), serde_json::json!("timeline-entry/chain-answer")),
+                    ("revision".into(), serde_json::json!(1)),
+                    ("role".into(), serde_json::json!("assistant")),
+                    ("entry_type".into(), serde_json::json!("content")),
+                    ("final".into(), serde_json::json!(true)),
+                    (
+                        "body".into(),
+                        serde_json::json!({"media_type":"text/plain","text":"answered two hops away"}),
+                    ),
+                    ("driver".into(), serde_json::json!("codex")),
+                    ("incarnation_id".into(), serde_json::json!(incarnation)),
+                    ("sequence".into(), serde_json::json!(1)),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("chain-answer".into()),
+            })
+            .unwrap();
+
+        // The owner's PTY session: a replay on PEEK, then whatever output the test writes.
+        fs::create_dir_all(&owner.pty_root).unwrap();
+        let sessions =
+            tokio::net::UnixListener::bind(owner.pty_root.join("chain-runtime.sock")).unwrap();
+        let (output, _) = tokio::sync::broadcast::channel::<Vec<u8>>(16);
+        let session_output = output.clone();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = sessions.accept().await {
+                let mut output = session_output.subscribe();
+                tokio::spawn(async move {
+                    let packet = |kind: u8, payload: &[u8]| {
+                        let mut packet = vec![kind];
+                        packet.extend((payload.len() as u32).to_be_bytes());
+                        packet.extend(payload);
+                        packet
+                    };
+                    let mut peek = [0_u8; 6];
+                    if stream.read_exact(&mut peek).await.is_err()
+                        || stream
+                            .write_all(&packet(10, &[0, 24, 0, 80]))
+                            .await
+                            .is_err()
+                        || stream
+                            .write_all(&packet(5, b"far shell\r\n$ "))
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
+                    while let Ok(bytes) = output.recv().await {
+                        if stream.write_all(&packet(0, &bytes)).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let secret = roots[0].path().join("fleet-secret");
+        fs::write(&secret, [7_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let relay_config = |node: &str, peer: &str, address: SocketAddr| {
+            ClientRelay::from_config(&Config {
+                node: node.into(),
+                fleet_id: Some("fleet-test".into()),
+                shared_secret_file: Some(secret.clone()),
+                peers: vec![PeerConfig {
+                    name: peer.into(),
+                    url: format!("http://{address}"),
+                }],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap()
+        };
+        // Each node: its daemon on a Unix socket, and a replication worker that accepts the
+        // node before it in the chain.
+        let serve_worker = |node: &str, accepts: &str, socket: &Path| {
+            let peer = PeerState {
+                backend: PeerBackend::Main(Client::unix(socket)),
+                node: node.into(),
+                auth: FleetAuth::test("fleet-test", &[7; 32]),
+                fleet: FleetContext::legacy(BTreeSet::from([accepts.into()])),
+                main_socket: socket.to_path_buf(),
+                outbound_notify: watch::channel(0_u64).0,
+            };
+            async move {
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let address = listener.local_addr().unwrap();
+                tokio::spawn(async move { axum::serve(listener, peer_router(peer)).await });
+                address
+            }
+        };
+        let sockets = roots.each_ref().map(|root| root.path().join("st3.sock"));
+        let owner_worker = serve_worker("chain-owner", "chain-relay", &sockets[2]).await;
+        let relay_worker = serve_worker("chain-relay", "chain-gateway", &sockets[1]).await;
+        relay.client_relay = Some(relay_config("chain-relay", "chain-owner", owner_worker));
+        gateway.client_relay = Some(
+            relay_config("chain-gateway", "chain-relay", relay_worker)
+                .with_links(gateway.store.clone()),
+        );
+        for (socket, state) in sockets.iter().zip([gateway, relay, owner.clone()]) {
+            let socket = socket.clone();
+            tokio::spawn(async move {
+                crate::api::serve_unix(&socket, crate::api::router(state)).await
+            });
+        }
+        for socket in &sockets {
+            for _ in 0..200 {
+                if tokio::net::UnixStream::connect(socket).await.is_ok() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        let client = st3_client::Client::unix_as(&sockets[0], "person/avery");
+        let session_id = format!(
+            "session/{}",
+            &hex::encode(sha2::Sha256::digest(
+                format!("{agent}:{incarnation}").as_bytes()
+            ))[..24]
+        );
+        let timeline = client
+            .timeline(&session_id, None, Some(20))
+            .await
+            .unwrap()
+            .value;
+        assert!(
+            timeline.items.iter().any(
+                |entry| serde_json::to_value(&entry.body).unwrap()["body"]["text"]
+                    == "answered two hops away"
+            ),
+            "the owner's transcript must reach the gateway through the relay"
+        );
+
+        let capabilities = client.capabilities().await.unwrap();
+        let attachment = client
+            .terminal_attach(
+                "action/chain-terminal-attach",
+                "chain-terminal-attach-00000001",
+                st3_client::Fence {
+                    snapshot_id: capabilities.snapshot.id,
+                    runtime_incarnation: Some(incarnation.into()),
+                    terminal_sequence: Some(capabilities.snapshot.store_index),
+                    ..st3_client::Fence::default()
+                },
+                st3_client::TargetParameters {
+                    target_id: format!("terminal/{agent}"),
+                    ..st3_client::TargetParameters::default()
+                },
+            )
+            .await
+            .unwrap()
+            .value
+            .terminal_attachment
+            .unwrap();
+        assert_eq!(attachment.owner_host_id, "host/chain-owner");
+        let mut stream = client
+            .terminal_stream(
+                &attachment.terminal_id,
+                Some(incarnation),
+                attachment.stream_capability.as_deref().unwrap(),
+            )
+            .await
+            .unwrap();
+        let first = stream.next().await.unwrap().unwrap();
+        assert_eq!(first.value.lines[0].text, "far shell");
+        output.send(b"echo far".to_vec()).unwrap();
+        let changed = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("the relayed long poll must return the change promptly")
+            .unwrap()
+            .unwrap();
+        assert_eq!(changed.value.lines[1].text, "$ echo far");
+    }
+
+    #[tokio::test]
+    async fn a_relaying_worker_refuses_a_forged_path_and_a_spent_hop_limit() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("st3.sock");
+        let main = crate::api::AppState {
+            store: Arc::new(Store::open_memory("middle").unwrap()),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: watch::channel(0_u64).0,
+            node: "middle".into(),
+            state_dir: root.path().to_path_buf(),
+            pty_root: root.path().join("pty"),
+            pty_binary: PathBuf::from("pty"),
+            fleet_id: None,
+            configured_peers: Vec::new(),
+            client_relay: None,
+            native_session_home: None,
+            planner_default: crate::model::PlannerSpec::default(),
+        };
+        let secret = root.path().join("fleet-secret");
+        fs::write(&secret, [5_u8; 32]).unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+        let mut main = main;
+        main.client_relay = ClientRelay::from_config(&Config {
+            node: "middle".into(),
+            fleet_id: Some("fleet-test".into()),
+            shared_secret_file: Some(secret),
+            peers: vec![PeerConfig {
+                name: "far".into(),
+                url: "http://127.0.0.1:9".into(),
+            }],
+            ..Default::default()
+        })
+        .unwrap();
+        let served = socket.clone();
+        let server =
+            tokio::spawn(
+                async move { crate::api::serve_unix(&served, crate::api::router(main)).await },
+            );
+        for _ in 0..200 {
+            if tokio::net::UnixStream::connect(&socket).await.is_ok() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let auth = FleetAuth::test("fleet-test", &[5; 32]);
+        let peer = PeerState {
+            backend: PeerBackend::Main(Client::unix(&socket)),
+            node: "middle".into(),
+            auth: auth.clone(),
+            fleet: FleetContext::legacy(BTreeSet::from(["near".into()])),
+            main_socket: socket,
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let send = |route: ClientReadRoute| {
+            let body = serde_json::to_vec(&ClientReadRequest {
+                authority_actor: "person/test".into(),
+                request: ClientReadOperation::TerminalScreen {
+                    terminal_id: "terminal/agent/far".into(),
+                },
+                relay: Some(route),
+            })
+            .unwrap();
+            let mut request = Request::builder()
+                .method("POST")
+                .uri(CLIENT_READ_PATH)
+                .body(Body::from(body.clone()))
+                .unwrap();
+            *request.headers_mut() = auth
+                .request_headers_for(CLIENT_READ_PATH, "near", &body)
+                .unwrap();
+            let router = peer_router(peer.clone());
+            async move {
+                let response = router.oneshot(request).await.unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), MAX_CLIENT_READ_BYTES)
+                    .await
+                    .unwrap();
+                let value: ApiResponse<Value> = serde_json::from_slice(&bytes).unwrap();
+                (status, value.value)
+            }
+        };
+        // A path that does not end at the member that sent it is someone else's claim.
+        let (status, _) = send(ClientReadRoute {
+            target: "host/far".into(),
+            path: vec!["elsewhere".into()],
+            hops_left: 2,
+        })
+        .await;
+        assert!(!status.is_success());
+        // A read that has used its hops, or has passed this node before, goes no further.
+        for route in [
+            ClientReadRoute {
+                target: "host/far".into(),
+                path: vec!["near".into()],
+                hops_left: 0,
+            },
+            ClientReadRoute {
+                target: "host/far".into(),
+                path: vec!["middle".into(), "near".into()],
+                hops_left: 2,
+            },
+        ] {
+            let (status, value) = send(route).await;
+            assert_eq!(status, StatusCode::LOOP_DETECTED);
+            assert_eq!(value["code"], "remote-unavailable");
+        }
+        // A read it can carry on reaches for the next hop; here nothing listens there.
+        let (status, value) = send(ClientReadRoute {
+            target: "host/far".into(),
+            path: vec!["near".into()],
+            hops_left: 2,
+        })
+        .await;
+        assert!(!status.is_success());
+        assert_eq!(value["code"], "remote-unavailable");
+        server.abort();
+    }
+
+    #[test]
+    fn next_hops_prefer_the_owner_then_the_nearest_peer_that_reaches_it() {
+        let links = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(from, to)| (from.to_string(), to.to_string()))
+                .collect::<Vec<_>>()
+        };
+        let names = |names: &[&str]| {
+            names
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        };
+        // A laptop that dials only a desktop reaches a server the desktop observes, in either
+        // direction the observation was made.
+        assert_eq!(
+            client_read_next_hops(
+                "laptop",
+                "server",
+                &names(&["desktop"]),
+                &names(&["laptop"]),
+                &links(&[("desktop", "server"), ("laptop", "desktop")])
+            ),
+            names(&["desktop"])
+        );
+        assert_eq!(
+            client_read_next_hops(
+                "laptop",
+                "server",
+                &names(&["desktop"]),
+                &names(&["laptop"]),
+                &links(&[("server", "desktop")])
+            ),
+            names(&["desktop"])
+        );
+        // The owner itself first, then peers nearest to it; a peer with no path is left out.
+        assert_eq!(
+            client_read_next_hops(
+                "a",
+                "d",
+                &names(&["d", "c", "b", "island"]),
+                &names(&["a"]),
+                &links(&[("b", "d"), ("c", "b"), ("island", "elsewhere")])
+            ),
+            names(&["d", "b", "c"])
+        );
+        // A path through a node the read already passed is no path at all.
+        assert_eq!(
+            client_read_next_hops(
+                "b",
+                "d",
+                &names(&["a", "c"]),
+                &names(&["a", "b"]),
+                &links(&[("a", "d"), ("c", "a")])
+            ),
+            Vec::<String>::new()
+        );
+        // With no observation of the owner, every peer not yet visited is worth a try.
+        assert_eq!(
+            client_read_next_hops(
+                "a",
+                "unseen",
+                &names(&["c", "b", "a"]),
+                &names(&["a", "b"]),
+                &links(&[("a", "c")])
+            ),
+            names(&["c"])
+        );
+    }
+
+    #[tokio::test]
     async fn a_gateway_receives_remote_conversation_changes_without_idle_data() {
         let owner_root = tempfile::tempdir().unwrap();
         let gateway_root = tempfile::tempdir().unwrap();
@@ -3080,6 +3994,7 @@ mod tests {
         };
         let body = serde_json::to_vec(&ClientReadRequest {
             authority_actor: "person/test".into(),
+            relay: None,
             request: ClientReadOperation::Timeline {
                 session_id: session.id,
                 limit: 20,
@@ -3560,7 +4475,8 @@ mod tests {
             Path::new("/no/such/socket"),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(pushed, "the peer stored what this node pushed");
         assert!(
             target
@@ -3590,7 +4506,8 @@ mod tests {
             Path::new("/no/such/socket"),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(pulled, "this node stored what the peer sent");
         assert!(
             source
@@ -3619,7 +4536,8 @@ mod tests {
             Path::new("/no/such/socket"),
         )
         .await
-        .unwrap();
+        .unwrap()
+        .0;
         assert!(!moved, "converged nodes store nothing, so the worker may rest");
         assert_eq!(
             connection_ports.lock().unwrap().len(),
@@ -3634,6 +4552,118 @@ mod tests {
             .unwrap();
         assert!(converged.inventory.envelopes.is_empty());
         assert!(converged.envelopes.is_empty());
+        server.abort();
+    }
+
+    /// A first sync that ends with different graphs heals at once over the signed heal route:
+    /// the node that lost claims asks the peer that holds them and admits their envelopes again.
+    #[tokio::test]
+    async fn a_first_sync_heals_a_node_that_lost_claims_over_the_signed_route() {
+        let fleet = "1f91ca65-7793-48cc-866e-ac15690130e1";
+        let auth = FleetAuth::test(fleet, &[6; 32]);
+        let root = tempfile::tempdir().unwrap();
+        let target_path = root.path().join("target.sqlite3");
+        let source = Arc::new(Store::open_memory("source").unwrap());
+        let target = Arc::new(Store::open(&target_path, "target").unwrap());
+        source.bind_fleet(fleet).unwrap();
+        target.bind_fleet(fleet).unwrap();
+        target.begin_first_sync("source").unwrap();
+        let intent = crate::graph::parse_test_intent(
+            "version 2\n exec \"work\" { command \"true\"; restart \"never\" } ",
+            "source",
+        )
+        .unwrap();
+        let preview = source
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: "work".into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        source
+            .apply(&intent, &preview.subject_tokens, "work")
+            .unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let state = PeerState {
+            backend: PeerBackend::Local(source.clone()),
+            node: "source".into(),
+            auth: auth.clone(),
+            fleet: FleetContext::legacy(BTreeSet::from(["target".into()])),
+            main_socket: PathBuf::from("/no/such/socket"),
+            outbound_notify: watch::channel(0_u64).0,
+        };
+        let server = tokio::spawn(async move { axum::serve(listener, peer_router(state)).await });
+        let peer = PeerConfig {
+            name: "source".into(),
+            url: format!("http://{address}"),
+        };
+        let backend = PeerBackend::Local(target.clone());
+        let context = FleetContext::legacy(BTreeSet::from(["source".into()]));
+        let socket = Path::new("/no/such/socket");
+        let http = replication_http_client();
+        // The target stores the source's envelopes, which compares nothing yet.
+        target
+            .receive_replication_exchange(
+                "source",
+                fleet,
+                &source
+                    .export_replication_exchange(fleet, &target.replication_inventory().unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        target.project_replication_backlog().unwrap();
+        assert_eq!(target.first_sync().unwrap().unwrap().state, "syncing");
+
+        // The target loses the desired claim but keeps its envelope, before its first sync ends.
+        {
+            let connection = rusqlite::Connection::open(&target_path).unwrap();
+            connection
+                .execute_batch(
+                    "PRAGMA foreign_keys=OFF;
+                     DELETE FROM claims WHERE kind='intent.desired';",
+                )
+                .unwrap();
+        }
+        target.replay_replication_graph().unwrap();
+        let graph = |store: &Store| {
+            store
+                .replication_status(true, Some(fleet), &[])
+                .unwrap()
+                .graph_digest
+        };
+        assert_ne!(graph(&target), graph(&source));
+
+        // Transport observations move for an exchange or two before the envelopes match.
+        let mut heal_now = false;
+        for _ in 0..4 {
+            heal_now = exchange(&http, &backend, "target", &peer, &auth, &context, socket)
+                .await
+                .unwrap()
+                .1;
+            if heal_now {
+                break;
+            }
+        }
+        assert!(
+            heal_now,
+            "the first comparison of a first sync heals at once"
+        );
+        heal(&backend, "target", &peer, &auth, &context, socket).await;
+
+        let status = target
+            .replication_status(true, Some(fleet), &["source".into()])
+            .unwrap();
+        let report = status.peers[0].sync.as_ref().unwrap().heal.clone().unwrap();
+        assert!(report.healed, "{report:?}");
+        assert_eq!(graph(&target), graph(&source));
+        assert_eq!((report.refetched, report.pushed), (1, 0));
+        let first = status.first_sync.unwrap();
+        assert_eq!((first.state.as_str(), first.healed), ("verified", true));
         server.abort();
     }
 
