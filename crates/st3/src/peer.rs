@@ -28,6 +28,7 @@ use crate::fleet::transport::{
     local_addresses, resolve_tool, routes_from_endpoints, tailscale_addresses,
 };
 use crate::fleet::{Acceptance, FleetView, MemberKey, Refusal, Sender, verify_signature};
+use crate::model::InventoryCheckpoint;
 use crate::model::{
     ApiResponse, ReplicaEnvelopeId, ReplicationExchange, ReplicationExportRequest,
     ReplicationExportResponse, ReplicationHealAnswer, ReplicationHealAnswerRequest,
@@ -36,7 +37,6 @@ use crate::model::{
     ReplicationReceiveResponse,
 };
 use crate::store::Store;
-use crate::model::InventoryCheckpoint;
 use crate::store::{
     CheckpointAction, CheckpointManifest, CheckpointManifestNeed, CheckpointManifestPage,
     CheckpointManifestRequest,

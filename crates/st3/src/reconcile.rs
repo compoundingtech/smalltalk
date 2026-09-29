@@ -204,8 +204,10 @@ fn local_process_is_alive(_pid: u32) -> bool {
 
 impl RuntimeControl for NativeRuntime {
     fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
-        self.pty()?
-            .snapshot()?
+        let observations = self.pty()?.snapshot()?;
+        // A PTY server started before st moved servers out of their harness's scope moves here.
+        st_runtime::protect_servers(&observations);
+        observations
             .into_iter()
             .map(|item| {
                 let incarnation_id = match (&item.pid, &item.created_at) {
@@ -1127,9 +1129,22 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     /// A request that declared `until` closes on its own once every target meets that `trace
-    /// wait` condition. The host that accepted the request evaluates it, so it closes once.
+    /// wait` condition, and one tied to a step closes once that step ends. The host that accepted
+    /// the request evaluates it, so it closes once.
     fn resolve_attention_whose_until_holds(&self) -> Result<()> {
-        for request in self.store.pending_attention_with_until(&self.host)? {
+        for request in self
+            .store
+            .pending_attention_closed_by_condition(&self.host)?
+        {
+            if let Some(ended) = self.store.attention_step_ended(&request)? {
+                self.store.resolve_attention_automatically(
+                    &request.subject,
+                    &format!("the step that raised it ended: {ended}"),
+                    &format!("{}:step", request.request),
+                )?;
+                self.signal_changed();
+                continue;
+            }
             let Some(until) = request.until.as_deref() else {
                 continue;
             };
@@ -15233,7 +15248,7 @@ mission "publish" state="ready" {
             .unwrap();
         let request = |subject: &str, until: Option<&str>| {
             store
-                .request_attention_until(
+                .request_attention_closing(
                     subject,
                     &AttentionRequest {
                         reviewer: "person/nathan".into(),
@@ -15244,7 +15259,10 @@ mission "publish" state="ready" {
                         actor: "agent/node.requester".into(),
                         idempotency_key: format!("{subject}:requested"),
                     },
-                    until,
+                    &crate::model::AttentionClosing {
+                        until: until.map(str::to_owned),
+                        ..Default::default()
+                    },
                 )
                 .unwrap()
         };
@@ -15284,6 +15302,88 @@ mission "publish" state="ready" {
             status(&plain.subject),
             "pending",
             "a request without until waits for a person"
+        );
+    }
+
+    #[test]
+    fn an_agents_attention_request_resolves_once_the_step_that_raised_it_ends() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+mission "asks" state="ready" {
+  goal "Ask a person for a decision while working."
+  step "work" { assigned-to "agent/asker" }
+}
+"#,
+            "asks-mission",
+        );
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "asks".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/nathan".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "asks-run".into(),
+            })
+            .unwrap();
+        let step = run.steps[0].subject.clone();
+        store.set_step_state(&step, "ready", None).unwrap();
+        store
+            .work_action(
+                &step,
+                "claim",
+                &crate::model::WorkRequest {
+                    actor: Some("agent/node.asker".into()),
+                    incarnation: Some("asker-one".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "asks-claim".into(),
+                },
+            )
+            .unwrap();
+        let asked = store
+            .request_attention_closing(
+                "attention/asked",
+                &AttentionRequest {
+                    reviewer: "person/nathan".into(),
+                    title: "Decide the rollout".into(),
+                    reason: "A person needs to decide before the rollout.".into(),
+                    severity: "warning".into(),
+                    targets: Vec::new(),
+                    actor: "agent/node.asker".into(),
+                    idempotency_key: "asked".into(),
+                },
+                &crate::model::AttentionClosing::default(),
+            )
+            .unwrap();
+        assert_eq!(asked.step.as_deref(), Some(step.as_str()));
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.resolve_attention_whose_until_holds().unwrap();
+        assert_eq!(
+            store
+                .attention_request(&asked.subject)
+                .unwrap()
+                .unwrap()
+                .status,
+            "pending"
+        );
+
+        store.set_step_state(&step, "failed", None).unwrap();
+        reconciler.resolve_attention_whose_until_holds().unwrap();
+        let resolved = store.attention_request(&asked.subject).unwrap().unwrap();
+        assert_eq!(resolved.status, "resolved");
+        assert_eq!(
+            resolved.resolution_reason,
+            Some(format!("the step that raised it ended: `{step}` failed"))
         );
     }
 

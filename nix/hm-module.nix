@@ -125,7 +125,9 @@ in
           Restart = "on-failure";
           RestartSec = "5s";
           Nice = 0;
-          CPUWeight = 100;
+          # The daemon answers every command and attach, ahead of harness builds at the default 100.
+          CPUWeight = 1000;
+          IOWeight = 1000;
           KillMode = "control-group";
           MemoryMax = "1024M";
         };

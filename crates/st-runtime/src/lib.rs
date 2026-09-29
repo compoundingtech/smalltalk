@@ -6,6 +6,7 @@
 
 mod environment;
 mod isolate;
+mod priority;
 mod process;
 mod pty;
 
@@ -16,6 +17,10 @@ pub use environment::{
 pub use isolate::{
     Isolation, initialize_isolation, mode as isolation_mode, scope_unit, systemd_user_available,
     warn_if_degraded, wrap as wrap_isolated,
+};
+pub use priority::{
+    LIVE_WEIGHT, ServerPlacement, protect_server, protect_servers, report as priority_report,
+    server_unit, work_prefix,
 };
 pub use process::{ExecGeneration, ExecObservation, ExecRuntime, process_start_token};
 pub use pty::{Launch, PtyObservation, PtyRuntime, PtySpawnTimeout, PtySpawnTimeoutPhase};
