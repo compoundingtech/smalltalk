@@ -646,6 +646,7 @@ fn all_missions() -> Vec<Mission> {
             parent: None,
             system: false,
             kdl: Some(s(ATLAS_KDL)),
+            outcome: None,
         },
         Mission {
             id: s("mission/fleet/site/pricing-page"),
@@ -678,6 +679,7 @@ fn all_missions() -> Vec<Mission> {
             parent: None,
             system: false,
             kdl: None,
+            outcome: None,
         },
         Mission {
             id: s("mission/fleet/release/weekly"),
@@ -718,6 +720,7 @@ fn all_missions() -> Vec<Mission> {
             parent: None,
             system: false,
             kdl: None,
+            outcome: None,
         },
         Mission {
             id: s("mission/fleet/harbor/pull-request-review"),
@@ -750,6 +753,7 @@ fn all_missions() -> Vec<Mission> {
             parent: None,
             system: false,
             kdl: None,
+            outcome: None,
         },
         Mission {
             id: s("mission/fleet/rekey"),
@@ -792,6 +796,7 @@ fn all_missions() -> Vec<Mission> {
             parent: None,
             system: false,
             kdl: None,
+            outcome: None,
         },
         Mission {
             id: s("mission/fleet/docs/handbook"),
@@ -816,6 +821,7 @@ fn all_missions() -> Vec<Mission> {
             parent: None,
             system: false,
             kdl: None,
+            outcome: None,
         },
         Mission {
             id: s("mission/fleet/atlas/nightly"),
@@ -848,6 +854,7 @@ fn all_missions() -> Vec<Mission> {
             parent: None,
             system: false,
             kdl: None,
+            outcome: None,
         },
     ]
 }

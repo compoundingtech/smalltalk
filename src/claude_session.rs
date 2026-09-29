@@ -182,6 +182,29 @@ pub fn run_controlled_paths(
     .with_context(|| format!("running interactive Claude driver '{runtime_id}'"))
 }
 
+/// Resume supervising an interactive Claude provider a predecessor driver image launched through
+/// [`run_controlled_paths`] and released with [`crate::provider_session::Detached`].
+pub fn adopt_controlled_paths(
+    agent_dir: &Path,
+    identity: &str,
+    runtime_id: &str,
+    pid: u32,
+    session: &str,
+    seq: u64,
+) -> Result<()> {
+    let observer = SessionObserver::adopt(agent_dir, identity, "claude", runtime_id, session, seq);
+    crate::provider_session::adopt_provider(
+        "Claude",
+        &status::status_path(agent_dir),
+        pid,
+        status::STATUS_REFRESH,
+        PROVIDER_POLL,
+        &STOP,
+        Some(&observer),
+    )
+    .with_context(|| format!("supervising adopted interactive Claude driver '{runtime_id}'"))
+}
+
 fn requires_st2_channel(argv: &[String]) -> bool {
     argv.windows(2)
         .any(|pair| pair[0] == "--channels" && pair[1] == crate::claude_channel::CHANNEL)
@@ -1875,14 +1898,30 @@ mod tests {
     fn idle_provider_refreshes_presence_without_mcp_input() {
         let tmp = tempfile::tempdir().unwrap();
         let presence = status::status_path(tmp.path());
-        status::set_state(&presence, status::State::Available).unwrap();
-        let before = fs::read_to_string(&presence).unwrap();
+        // Seed a heartbeat from long ago so any refresh rewrites different bytes, whatever the
+        // clock resolution. The provider then stays alive until the file changes, so the test
+        // neither races the first write nor depends on the wrapper getting CPU before the child
+        // exits; a refresh that never comes fails the bounded wait instead of hanging.
+        fs::create_dir_all(presence.parent().unwrap()).unwrap();
+        let now_ms = crate::message::now_ms();
+        fs::write(&presence, format!("available\nv1 {}\n", now_ms - 1_000)).unwrap();
+        let seed = tmp.path().join("presence-seed");
+        fs::copy(&presence, &seed).unwrap();
+        let wait_for_refresh = "i=0; while cmp -s \"$1\" \"$2\"; do i=$((i+1)); \
+                                [ \"$i\" -lt 3000 ] || exit 1; sleep 0.01; done";
         let stop = AtomicBool::new(false);
 
         run_provider(
             "Claude",
             &presence,
-            &["sh".into(), "-c".into(), "sleep 0.12".into()],
+            &[
+                "sh".into(),
+                "-c".into(),
+                wait_for_refresh.into(),
+                "sh".into(),
+                presence.display().to_string(),
+                seed.display().to_string(),
+            ],
             &[],
             Duration::from_millis(25),
             Duration::from_millis(5),
@@ -1891,8 +1930,10 @@ mod tests {
         )
         .unwrap();
 
-        let after = fs::read_to_string(&presence).unwrap();
-        assert_ne!(after, before);
+        assert_ne!(
+            fs::read_to_string(&presence).unwrap(),
+            fs::read_to_string(&seed).unwrap()
+        );
         assert_eq!(status::read_state(&presence), status::State::Available);
     }
 
