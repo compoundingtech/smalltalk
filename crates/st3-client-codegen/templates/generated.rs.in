@@ -127,15 +127,22 @@ pub struct Page {
     pub items: Vec<Resource>,
     pub page: PageInfo,
     /// Present while this host is catching up with a peer, so the page can show early history
-    /// as current.
+    /// as current, and while its graph has diverged from a peer's, so the page can be wrong.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<SyncNotice>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct SyncNotice {
+    /// `diverged` when any peer has diverged, else `catching-up`.
     pub state: String,
     pub peers: Vec<SyncPeer>,
+}
+
+impl SyncNotice {
+    pub fn diverged(&self) -> bool {
+        self.state == "diverged"
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -149,14 +156,22 @@ pub struct SyncPeer {
     pub last_exchange_at: Option<String>,
     #[serde(default)]
     pub estimated_catch_up_seconds: Option<u64>,
+    /// Since when this host and the peer hold the same envelopes but project different graphs.
+    /// More exchanges cannot fix that, so this host's pages can be wrong until it is repaired.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diverged_since: Option<String>,
 }
 
 impl SyncPeer {
-    /// `Silber has 124,384 envelopes this host lacks · caught up in about 14m`
+    /// `Silber has 124,384 envelopes this host lacks · caught up in about 14m`, or
+    /// `Silber projects a different graph from the same envelopes` once they diverged.
     pub fn summary(&self) -> String {
+        let host = self.host_id.strip_prefix("host/").unwrap_or(&self.host_id);
+        if self.diverged_since.is_some() {
+            return format!("{host} projects a different graph from the same envelopes");
+        }
         format!(
-            "{} has {} this host lacks · {}",
-            self.host_id.strip_prefix("host/").unwrap_or(&self.host_id),
+            "{host} has {} this host lacks · {}",
             envelope_count(self.peer_only_envelopes),
             catch_up_estimate(self.estimated_catch_up_seconds)
         )
