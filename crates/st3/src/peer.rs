@@ -1541,22 +1541,22 @@ async fn dial_peer(
         match exchange(&http, &backend, &node, &peer, &auth, &fleet, &main_socket).await {
             Ok(moved) => {
                 backoff = Duration::from_secs(1);
-                // A busy harness can write several observations while one exchange is in
-                // flight. Keep the first exchange immediate, then coalesce the resulting wake
-                // burst without disabling the 30-second retry path. The window stays short so a
-                // publish is startable on every peer within seconds.
-                let not_before = tokio::time::Instant::now() + REPLICATION_WAKE_COALESCE;
                 if moved {
-                    // One exchange carries a bounded batch. Keep going while envelopes still
-                    // move instead of leaving the rest of a backlog to the timer.
+                    // One exchange carries a bounded batch. Keep going at once while envelopes
+                    // still move instead of leaving the rest of a backlog to the timer.
                     notify.borrow_and_update();
                 } else {
+                    // A busy harness can write several observations while one exchange is in
+                    // flight. Keep the first exchange immediate, then coalesce the resulting
+                    // wake burst without disabling the 30-second retry path. The window stays
+                    // short so a publish is startable on every peer within seconds.
+                    let not_before = tokio::time::Instant::now() + REPLICATION_WAKE_COALESCE;
                     tokio::select! {
                         _ = notify.changed() => {}
                         _ = tokio::time::sleep(worker_interval(Duration::from_secs(30))) => {}
                     }
+                    tokio::time::sleep_until(not_before).await;
                 }
-                tokio::time::sleep_until(not_before).await;
             }
             Err(error) => {
                 if let Some(removed) = error.downcast_ref::<RemovedFromFleet>() {
@@ -1872,10 +1872,12 @@ async fn exchange(
     let remote = post_signed(http, peer, node, auth, fleet, &query).await?;
     let round_trip = started.elapsed();
     let different = remote.inventory.digest != local_digest;
-    let pulled = !remote.envelopes.is_empty();
     let received = backend
         .receive(&peer.name, auth.fleet_id(), &remote, Some(round_trip))
         .await?;
+    // Progress means new envelopes stored on one side or the other. A peer that keeps sending,
+    // or keeps being sent, envelopes that are never stored must not keep the worker busy.
+    let pulled = received.receipt.received != 0;
     if received.changed {
         wake_main(main_socket).await;
     }
@@ -1893,14 +1895,15 @@ async fn exchange(
             )
             .await?
             .exchange;
-        pushed = !push.envelopes.is_empty();
         let started = std::time::Instant::now();
         let response = post_signed(http, peer, node, auth, fleet, &push).await?;
         let round_trip = started.elapsed();
-        pulled_follow_up = !response.envelopes.is_empty();
+        // The peer stores a push before it answers, so its inventory moved if the push landed.
+        pushed = !push.envelopes.is_empty() && response.inventory.digest != remote.inventory.digest;
         let received = backend
             .receive(&peer.name, auth.fleet_id(), &response, Some(round_trip))
             .await?;
+        pulled_follow_up = received.receipt.received != 0;
         if received.changed {
             wake_main(main_socket).await;
         }
@@ -2737,7 +2740,7 @@ mod tests {
             url: format!("http://{address}"),
         };
         let http = replication_http_client();
-        exchange(
+        let pushed = exchange(
             &http,
             &PeerBackend::Local(source.clone()),
             "source",
@@ -2748,6 +2751,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(pushed, "the peer stored what this node pushed");
         assert!(
             target
                 .latest_claim("host/source", Some("transport.observed"))
@@ -2766,7 +2770,7 @@ mod tests {
                 idempotency_key: Some("target-up".into()),
             })
             .unwrap();
-        exchange(
+        let pulled = exchange(
             &http,
             &PeerBackend::Local(source.clone()),
             "source",
@@ -2777,6 +2781,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(pulled, "this node stored what the peer sent");
         assert!(
             source
                 .latest_claim("host/target", Some("transport.observed"))
@@ -2794,7 +2799,7 @@ mod tests {
             1,
             "the two-phase exchanges and later wakeup should reuse one TCP connection"
         );
-        exchange(
+        let moved = exchange(
             &replication_http_client(),
             &PeerBackend::Local(source.clone()),
             "source",
@@ -2805,6 +2810,7 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(!moved, "converged nodes store nothing, so the worker may rest");
         assert_eq!(
             connection_ports.lock().unwrap().len(),
             2,
