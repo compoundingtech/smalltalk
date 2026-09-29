@@ -14,7 +14,7 @@ use st3::api::AppState;
 use st3::model::{AttentionRequest, ClaimInput};
 use st3::store::Store;
 use st3_client::{
-    AttentionResolveParameters, Capabilities, Client, ClientError, Envelope, ErrorCode, Fence,
+    AttentionResolveParameters, Capabilities, Client, ClientError, CollectionEvent, Envelope, ErrorCode, Fence,
     LaunchVariantParameters, PairingBegin, PairingComplete, Resource, TargetParameters,
     TerminalAttachment, TerminalColor, TerminalInputMode, TerminalInputParameters,
     TerminalResizeParameters, TerminalRun, TerminalScreen, TerminalStream, TimelineBody,
@@ -281,6 +281,107 @@ async fn terminal_stream_sends_changed_screens_and_nothing_while_idle() {
     assert!(
         matches!(ended, Err(ClientError::Api(ErrorCode::StaleFence, _, _))),
         "an exited terminal must close the stream with stale-fence: {ended:?}"
+    );
+    server.abort();
+}
+
+/// The next collection event, or a panic naming what did not arrive.
+async fn next_collection_event(
+    stream: &mut st3_client::CollectionStream,
+    waiting_for: &str,
+) -> CollectionEvent {
+    tokio::time::timeout(Duration::from_secs(5), stream.next_event())
+        .await
+        .unwrap_or_else(|_| panic!("{waiting_for} did not arrive"))
+        .unwrap()
+        .unwrap()
+}
+
+#[tokio::test]
+async fn a_terminal_rides_the_collection_socket_and_its_end_leaves_the_rest() {
+    let (_root, state, pty, client, server) =
+        serve_terminal_state("client-collection-terminal", 24, 80).await;
+    let attachment = attach_terminal(&client, "collection-terminal").await;
+    let mut stream = client.collection_stream().await.unwrap();
+    stream
+        .subscribe("agents", "agents", 20, None, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_collection_event(&mut stream, "the agents snapshot").await,
+        CollectionEvent::Snapshot { id, .. } if id == "agents"
+    ));
+    stream
+        .subscribe_terminal(
+            "screen",
+            &attachment.terminal_id,
+            Some("terminal-demo-runtime:i1"),
+            attachment.stream_capability.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+    let first = loop {
+        match next_collection_event(&mut stream, "the first screen").await {
+            CollectionEvent::Screen { id, screen } if id == "screen" => break screen,
+            // The attach and the observation behind it may still move the agents window.
+            CollectionEvent::Changes { id, .. } if id == "agents" => {}
+            other => panic!("expected the first screen, got {other:?}"),
+        }
+    };
+    assert_eq!(first.value.lines[0].text, "terminal ready");
+
+    // The capability is single use: a second subscription with it is refused on its own.
+    stream
+        .subscribe_terminal(
+            "again",
+            &attachment.terminal_id,
+            Some("terminal-demo-runtime:i1"),
+            attachment.stream_capability.as_deref().unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(matches!(
+        next_collection_event(&mut stream, "the refused reuse").await,
+        CollectionEvent::Error { id, .. } if id == "again"
+    ));
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1_500), stream.next_event())
+            .await
+            .is_err(),
+        "an idle terminal and an unchanged collection must send nothing"
+    );
+
+    pty.write(b"\x1b[1;32mecho\x1b[0m hi");
+    let changed = match next_collection_event(&mut stream, "the changed screen").await {
+        CollectionEvent::Screen { id, screen } if id == "screen" => screen,
+        other => panic!("expected the changed screen, got {other:?}"),
+    };
+    assert_eq!(changed.value.lines[1].text, "$ echo hi");
+    assert_ne!(changed.value.revision, first.value.revision);
+
+    // A new incarnation ends the terminal subscription with stale-fence. The agents
+    // subscription on the same socket sees the observation and keeps going.
+    publish_terminal(&state, "terminal-demo-runtime:i2");
+    let mut ended = false;
+    let mut agents_changed = false;
+    while !(ended && agents_changed) {
+        match next_collection_event(&mut stream, "the stale-fence end and the agents change").await
+        {
+            CollectionEvent::Error { id, code, .. } if id == "screen" => {
+                assert_eq!(code, Some(ErrorCode::StaleFence));
+                ended = true;
+            }
+            CollectionEvent::Changes { id, .. } if id == "agents" => agents_changed = true,
+            other => panic!("unexpected frame after a new incarnation: {other:?}"),
+        }
+    }
+    pty.write(b"!");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(1_000), stream.next_event())
+            .await
+            .is_err(),
+        "an ended terminal subscription must send nothing more"
     );
     server.abort();
 }

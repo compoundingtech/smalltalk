@@ -643,6 +643,18 @@ impl Drop for ReadGuard<'_> {
     }
 }
 
+/// A step as a person reads it in a list: which mission, which step, and what it is for.
+#[derive(Clone, Debug)]
+pub struct StepLabel {
+    pub run: String,
+    pub mission: String,
+    pub path: String,
+    pub title: Option<String>,
+    pub goal: Option<String>,
+    pub status: String,
+    pub updated_at_unix_ms: u128,
+}
+
 pub struct Store {
     connection: WriterConnection,
     readers: ReadPool,
@@ -1863,6 +1875,76 @@ impl Store {
                 Ok((format!("mission-run/{id}"), serde_json::from_str(&body)?))
             })
             .collect()
+    }
+
+    /// Name steps for display in one read: each step's mission, run, path, title, first goal,
+    /// status and last change. Unknown subjects are left out.
+    pub fn step_labels(&self, subjects: &[String]) -> Result<BTreeMap<String, StepLabel>> {
+        if subjects.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT s.subject, s.run_id, r.mission_id, s.step_path, s.title, s.goals, s.status,
+                    s.updated_at_unix_ms
+             FROM step_runs s
+             JOIN mission_runs r ON r.id=s.run_id
+             WHERE s.subject IN (SELECT value FROM json_each(?1))",
+        )?;
+        statement
+            .query_map([serde_json::to_string(subjects)?], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })?
+            .map(|row| {
+                let (subject, run, mission, path, title, goals, status, updated_at) = row?;
+                let goals: Vec<String> = serde_json::from_str(&goals)?;
+                Ok((
+                    subject,
+                    StepLabel {
+                        run: format!("mission-run/{run}"),
+                        mission: format!("mission/{mission}"),
+                        path,
+                        title,
+                        goal: goals.into_iter().next(),
+                        status,
+                        updated_at_unix_ms: updated_at.parse()?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// The mission behind each of these runs, in one read.
+    pub fn run_missions(&self, runs: &[String]) -> Result<BTreeMap<String, String>> {
+        if runs.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let ids = runs
+            .iter()
+            .map(|run| run.strip_prefix("mission-run/").unwrap_or(run))
+            .collect::<Vec<_>>();
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT id, mission_id FROM mission_runs WHERE id IN (SELECT value FROM json_each(?1))",
+        )?;
+        statement
+            .query_map([serde_json::to_string(&ids)?], |row| {
+                Ok((
+                    format!("mission-run/{}", row.get::<_, String>(0)?),
+                    format!("mission/{}", row.get::<_, String>(1)?),
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(Into::into)
     }
 
     /// Return every current published mission definition, including definitions with no runs.

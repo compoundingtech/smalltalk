@@ -1189,6 +1189,14 @@ fn client_work_resources(
         .map(|(run, mission)| (run, mission.steps))
         .collect::<BTreeMap<_, _>>();
     let work_annotations = store.work_annotations(&work)?;
+    let run_missions = store.run_missions(
+        &work
+            .iter()
+            .map(|item| item.run.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>(),
+    )?;
     work.into_iter()
         .map(|work| {
             let operational = work_annotations
@@ -1258,6 +1266,7 @@ fn client_work_resources(
                 "kind": "work",
                 "revision": work.definition_hash,
                 "updated_at": client_timestamp(work.updated_at_unix_ms),
+                "mission_id": run_missions.get(&work.run),
                 "mission_run_id": work.run,
                 "generation_id": work.generation,
                 "definition_id": work.definition_hash,
@@ -1410,6 +1419,34 @@ fn client_agent_resources_uncached(
         .collect::<Vec<_>>();
     let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
     let member_faults = store.member_reconcile_faults_at(snapshot_index)?;
+    let queued_steps = work_queues
+        .values()
+        .flat_map(|queue| {
+            queue
+                .current_work_ids
+                .iter()
+                .chain(queue.next_work_id.iter())
+                .chain(queue.upcoming_work_ids.iter())
+                .cloned()
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let step_labels = store.step_labels(&queued_steps)?;
+    let label = |id: &String| {
+        step_labels.get(id).map(|step| {
+            json!({
+                "id": id,
+                "mission_id": step.mission,
+                "mission_run_id": step.run,
+                "path": step.path,
+                "title": step.title,
+                "goal": step.goal,
+                "state": step.status,
+                "since": client_timestamp(step.updated_at_unix_ms),
+            })
+        })
+    };
     let mut agents = status
         .subjects
         .into_iter()
@@ -1579,6 +1616,9 @@ fn client_agent_resources_uncached(
                 "next_work_id": queue.next_work_id,
                 "upcoming_work_ids": queue.upcoming_work_ids,
                 "queued_work_count": queue.queued_work_count,
+                "current_work": queue.current_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
+                "next_work": queue.next_work_id.as_ref().and_then(label),
+                "upcoming_work": queue.upcoming_work_ids.iter().filter_map(label).collect::<Vec<_>>(),
                 "usage": usage,
                 "under": subject.under.into_iter().map(|relationship| json!({
                     "agent_id": relationship.agent,
@@ -12936,6 +12976,81 @@ mission "wake" state="ready" {
             "manual wakes must not use automatic attempts"
         );
         assert_eq!(wake.assignee_state, "idle");
+    }
+
+    #[test]
+    fn agents_name_their_queued_steps_and_missions_carry_open_run_steps() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let source = r#"
+version 2
+mission "labelled" state="ready" {
+  goal "Name steps where clients read them."
+  agent "worker" { workspace "/tmp"; harness "codex" {} }
+  step "first" { title "Say hello"; goal "Greet the fleet."; assigned-to "agent/${ST_MISSION_RUN}/worker" }
+  step "second" { goal "Wave goodbye."; depends-on "first"; assigned-to "agent/${ST_MISSION_RUN}/worker" }
+}
+"#;
+        let intent = parse_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "labelled-source")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "labelled".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "labelled-run".into(),
+            })
+            .unwrap();
+        materialize_run_agents(&state, &run);
+        let first = run
+            .steps
+            .iter()
+            .find(|step| step.step == "first")
+            .unwrap()
+            .subject
+            .clone();
+        store.set_step_state(&first, "ready", None).unwrap();
+        let index = store.index().unwrap();
+
+        let agents = client_agent_resources(&store, false, "snapshot", index).unwrap();
+        let next = &agents[0]["next_work"];
+        assert_eq!(next["id"], first);
+        assert_eq!(next["mission_id"], "mission/labelled");
+        assert_eq!(next["mission_run_id"], run.subject);
+        assert_eq!(next["path"], "first");
+        assert_eq!(next["title"], "Say hello");
+        assert_eq!(next["goal"], "Greet the fleet.");
+        assert_eq!(next["state"], "ready");
+        assert_eq!(agents[0]["upcoming_work"], json!([next]));
+        assert_eq!(agents[0]["current_work"], json!([]));
+
+        // The list carries the open run's steps, so a client never joins work to missions.
+        let missions = client_v0::mission_resources(&store, index, false, None).unwrap();
+        let steps = missions[0]["run_details"][0]["steps"].as_array().unwrap();
+        assert_eq!(
+            steps
+                .iter()
+                .map(|step| (step["path"].as_str().unwrap(), step["state"].as_str().unwrap()))
+                .collect::<Vec<_>>(),
+            [("first", "ready"), ("second", "pending")]
+        );
+        assert_eq!(steps[0]["goals"], json!(["Greet the fleet."]));
+        assert_eq!(steps[0]["assignee"], format!("agent/{}/worker", run.id));
     }
 
     #[test]

@@ -564,6 +564,49 @@ pub struct MissionRunSummary {
     pub blocker: Option<Value>,
     pub after: Option<String>,
     pub deadline: Option<String>,
+    /// The run's steps: for an open run or a mission's latest run, and every run in a detail read.
+    #[serde(default)]
+    pub steps: Option<Vec<MissionStep>>,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct MissionStep {
+    pub id: String,
+    pub path: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    pub state: String,
+    pub attempt: u32,
+    #[serde(default)]
+    pub assignee: Option<String>,
+    #[serde(default)]
+    pub claimant: Option<String>,
+    #[serde(default)]
+    pub agentless: bool,
+    pub since: String,
+    #[serde(default)]
+    pub last_progress: Option<String>,
+    #[serde(default)]
+    pub blocked_reason: Option<String>,
+    #[serde(default)]
+    pub blockers: Vec<String>,
+    #[serde(default)]
+    pub goals: Vec<String>,
+    #[serde(default)]
+    pub constraints: Vec<String>,
+}
+/// A step named for display: its mission, run, path, title and first goal.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct WorkLabel {
+    pub id: String,
+    pub mission_id: String,
+    pub mission_run_id: String,
+    pub path: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub goal: Option<String>,
+    pub state: String,
+    pub since: String,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Work {
@@ -571,6 +614,9 @@ pub struct Work {
     pub header: ResourceHeader,
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
+    /// The mission this work's run belongs to.
+    #[serde(default)]
+    pub mission_id: Option<String>,
     pub mission_run_id: String,
     pub generation_id: String,
     pub definition_id: String,
@@ -635,6 +681,13 @@ pub struct Agent {
     pub upcoming_work_ids: Vec<String>,
     #[serde(default)]
     pub queued_work_count: u64,
+    /// `current_work_ids` named for display, in the same order.
+    #[serde(default)]
+    pub current_work: Vec<WorkLabel>,
+    #[serde(default)]
+    pub next_work: Option<WorkLabel>,
+    #[serde(default)]
+    pub upcoming_work: Vec<WorkLabel>,
     #[serde(default)]
     pub usage: Option<UsageSummary>,
     #[serde(default)]

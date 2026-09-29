@@ -10,7 +10,8 @@ const TERMINAL_CAPABILITY_PROTOCOL_PREFIX: &str = "st3.cap.";
 const LOCAL_PERSON_HEADER: &str = "x-st3-person";
 
 // A client holds one socket for all its current collection views. A subscription
-// is a bounded window; history stays on the paged HTTP endpoints.
+// is a bounded window; history stays on the paged HTTP endpoints. A terminal is one
+// more subscription on the same socket: whole screens, the latest only.
 #[derive(Clone, Deserialize)]
 struct CollectionSubscribe {
     kind: String,
@@ -21,14 +22,28 @@ struct CollectionSubscribe {
     person: Option<String>,
     actor: Option<String>,
     status: Option<String>,
+    /// A terminal subscription names the terminal, the incarnation `terminal.attach` fenced,
+    /// and the single-use stream capability that attach returned.
+    terminal: Option<String>,
+    incarnation: Option<String>,
+    capability: Option<String>,
 }
 
 struct CollectionSubscription {
     request: CollectionSubscribe,
+    /// Whether the client has this subscription's first snapshot.
+    delivered: bool,
     previous: BTreeMap<String, Value>,
     order: Vec<String>,
     has_more: bool,
 }
+
+const COLLECTION_MAX_SUBSCRIPTIONS: usize = 8;
+/// A read that a commit raced is read again this many times before the subscription waits.
+const COLLECTION_SNAPSHOT_ATTEMPTS: usize = 3;
+/// A subscription whose reads kept racing commits reads again after this long, even when no
+/// further change arrives. A race is never the client's problem.
+const COLLECTION_RACE_RETRY: Duration = Duration::from_millis(250);
 
 pub(super) async fn collection_stream(
     websocket: WebSocketUpgrade,
@@ -55,11 +70,13 @@ pub(super) async fn collection_stream(
         .on_upgrade(move |socket| collection_stream_socket(socket, state, session)))
 }
 
-async fn collection_items(
+/// Read one bounded window. `None` means a commit landed while it was read; the rows could
+/// be newer than the snapshot, so they are never sent.
+async fn collection_items_once(
     state: &AppState,
     session: &ClientSession,
     request: &CollectionSubscribe,
-) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
+) -> Result<Option<(ClientSnapshot, Vec<Value>, bool)>, ApiError> {
     if !matches!(
         request.collection.as_str(),
         "missions" | "attention" | "agents" | "work"
@@ -118,12 +135,23 @@ async fn collection_items(
         .await?;
     // A read that raced a commit must never pair newer rows with an older fence.
     if state.store.index().map_err(ApiError::internal)? != index {
-        return Err(client_page_expired(
-            "collection changed during snapshot; resubscribe",
-        ));
+        return Ok(None);
     }
     items.truncate(limit);
-    Ok((snapshot, items, has_more))
+    Ok(Some((snapshot, items, has_more)))
+}
+
+async fn collection_items(
+    state: &AppState,
+    session: &ClientSession,
+    request: &CollectionSubscribe,
+) -> Result<Option<(ClientSnapshot, Vec<Value>, bool)>, ApiError> {
+    for _ in 0..COLLECTION_SNAPSHOT_ATTEMPTS {
+        if let Some(read) = collection_items_once(state, session, request).await? {
+            return Ok(Some(read));
+        }
+    }
+    Ok(None)
 }
 
 async fn send_collection(socket: &mut WebSocket, value: Value) -> bool {
@@ -136,12 +164,148 @@ async fn send_collection(socket: &mut WebSocket, value: Value) -> bool {
     socket.send(WsMessage::Text(payload.into())).await.is_ok()
 }
 
+enum Refreshed {
+    /// Up to date, whether or not anything was sent.
+    Current,
+    /// Every read raced a commit; read again soon.
+    Raced,
+    /// The subscription failed before its first snapshot and is gone.
+    Dropped,
+    /// The socket closed.
+    Closed,
+}
+
+/// Bring one subscription up to date: its snapshot first, then only what changed.
+async fn refresh_collection(
+    socket: &mut WebSocket,
+    state: &AppState,
+    session: &ClientSession,
+    subscription: &mut CollectionSubscription,
+) -> Refreshed {
+    let request = &subscription.request;
+    let (snapshot, items, has_more) = match collection_items(state, session, request).await {
+        Ok(Some(read)) => read,
+        Ok(None) => return Refreshed::Raced,
+        Err(error) if !subscription.delivered => {
+            let sent = send_collection(socket, json!({"kind":"error", "id":request.id, "code":error.code, "message":error.message})).await;
+            return if sent {
+                Refreshed::Dropped
+            } else {
+                Refreshed::Closed
+            };
+        }
+        Err(_) => {
+            let sent = send_collection(socket, json!({"kind":"resync", "id":request.id})).await;
+            return if sent {
+                Refreshed::Current
+            } else {
+                Refreshed::Closed
+            };
+        }
+    };
+    let order = items
+        .iter()
+        .filter_map(|item| item["id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let current: BTreeMap<String, Value> = items
+        .iter()
+        .filter_map(|item| Some((item["id"].as_str()?.to_owned(), item.clone())))
+        .collect();
+    let sent = if !subscription.delivered {
+        send_collection(socket, json!({"kind":"snapshot", "id":request.id, "collection":request.collection, "snapshot":snapshot, "items":items, "order":order, "has_more":has_more})).await
+    } else {
+        let upserts = current
+            .iter()
+            .filter(|(id, value)| subscription.previous.get(*id) != Some(*value))
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        let removes = subscription
+            .previous
+            .keys()
+            .filter(|id| !current.contains_key(*id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if upserts.is_empty()
+            && removes.is_empty()
+            && order == subscription.order
+            && has_more == subscription.has_more
+        {
+            true
+        } else {
+            send_collection(socket, json!({"kind":"changes", "id":request.id, "collection":request.collection, "snapshot":snapshot, "upserts":upserts, "removes":removes, "order":order, "has_more":has_more})).await
+        }
+    };
+    if !sent {
+        return Refreshed::Closed;
+    }
+    subscription.delivered = true;
+    subscription.previous = current;
+    subscription.order = order;
+    subscription.has_more = has_more;
+    Refreshed::Current
+}
+
+/// Wait for the next frame from any held terminal. `None` means its follower stopped.
+async fn next_terminal_frame(
+    terminals: &mut BTreeMap<String, watch::Receiver<TerminalFrame>>,
+) -> (String, Option<TerminalFrame>) {
+    let changes = terminals.iter_mut().map(|(id, receiver)| {
+        Box::pin(async move {
+            let frame = match receiver.changed().await {
+                Ok(()) => Some(receiver.borrow_and_update().clone()),
+                Err(_) => None,
+            };
+            (id.clone(), frame)
+        })
+    });
+    futures_util::future::select_all(changes).await.0
+}
+
+async fn open_terminal_subscription(
+    state: &AppState,
+    session: &ClientSession,
+    request: &CollectionSubscribe,
+) -> Result<watch::Receiver<TerminalFrame>, ApiError> {
+    let id = request
+        .terminal
+        .as_deref()
+        .map(|terminal| terminal.trim_start_matches("terminal/"))
+        .filter(|terminal| !terminal.is_empty())
+        .ok_or_else(|| validation("a terminal subscription names its terminal"))?
+        .to_owned();
+    let follow = {
+        let state = state.clone();
+        let session = session.clone();
+        let incarnation = request.incarnation.clone();
+        let capability = request.capability.clone();
+        tokio::task::spawn_blocking(move || {
+            prepare_terminal_follow(
+                &state,
+                &session,
+                &id,
+                incarnation.as_deref(),
+                capability.as_deref(),
+            )
+        })
+        .await
+        .map_err(ApiError::internal)??
+    };
+    let (sender, receiver) = watch::channel(TerminalFrame::Waiting);
+    let state = state.clone();
+    tokio::spawn(follow.run(state, TerminalSink::Subscription(sender)));
+    Ok(receiver)
+}
+
 async fn collection_stream_socket(mut socket: WebSocket, state: AppState, session: ClientSession) {
     // Subscribe before the first snapshot, so a commit while building it wakes
     // the next loop and is reflected in a following change frame.
     let mut changed = state.event_notify.subscribe();
     let mut subscriptions = BTreeMap::<String, CollectionSubscription>::new();
+    let mut terminals = BTreeMap::<String, watch::Receiver<TerminalFrame>>::new();
+    let mut retry_at = None::<tokio::time::Instant>;
     loop {
+        // The subscriptions to read after this wake-up.
+        let mut refresh = Vec::<String>::new();
         tokio::select! {
             incoming = socket.recv() => {
                 let Some(Ok(message)) = incoming else { return; };
@@ -155,45 +319,72 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
                 };
                 if request.kind == "unsubscribe" {
                     subscriptions.remove(&request.id);
+                    terminals.remove(&request.id);
                     continue;
                 }
-                if request.kind != "subscribe" || request.id.is_empty() || request.id.len() > 128 || subscriptions.len() >= 8 && !subscriptions.contains_key(&request.id) {
+                let held = subscriptions.contains_key(&request.id) || terminals.contains_key(&request.id);
+                if request.kind != "subscribe" || request.id.is_empty() || request.id.len() > 128 || subscriptions.len() + terminals.len() >= COLLECTION_MAX_SUBSCRIPTIONS && !held {
                     if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "message":"invalid subscription or subscription limit exceeded"})).await { return; }
                     continue;
                 }
-                match collection_items(&state, &session, &request).await {
-                    Ok((snapshot, items, has_more)) => {
-                        let order = items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned)).collect::<Vec<_>>();
-                        let previous = items.iter().filter_map(|item| Some((item["id"].as_str()?.to_owned(), item.clone()))).collect();
-                        if !send_collection(&mut socket, json!({"kind":"snapshot", "id":request.id, "collection":request.collection, "snapshot":snapshot, "items":items, "order":order, "has_more":has_more})).await { return; }
-                        subscriptions.insert(request.id.clone(), CollectionSubscription { request, previous, order, has_more });
+                // A subscription with a held ID replaces it.
+                subscriptions.remove(&request.id);
+                terminals.remove(&request.id);
+                if request.collection == "terminal" {
+                    match open_terminal_subscription(&state, &session, &request).await {
+                        Ok(receiver) => {
+                            terminals.insert(request.id.clone(), receiver);
+                        }
+                        Err(error) => {
+                            if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "collection":"terminal", "code":error.code, "message":error.message})).await { return; }
+                        }
                     }
-                    Err(error) => {
-                        if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "code":error.code, "message":error.message})).await { return; }
-                    }
+                    continue;
                 }
+                refresh.push(request.id.clone());
+                subscriptions.insert(request.id.clone(), CollectionSubscription { request, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false });
             }
             result = changed.changed() => {
                 if result.is_err() { return; }
-                for subscription in subscriptions.values_mut() {
-                    let (snapshot, items, has_more) = match collection_items(&state, &session, &subscription.request).await {
-                        Ok(value) => value,
-                        Err(_) => {
-                            if !send_collection(&mut socket, json!({"kind":"resync", "id":subscription.request.id})).await { return; }
-                            continue;
-                        }
-                    };
-                    let order = items.iter().filter_map(|item| item["id"].as_str().map(str::to_owned)).collect::<Vec<_>>();
-                    let current: BTreeMap<String, Value> = items.into_iter().filter_map(|item| Some((item["id"].as_str()?.to_owned(), item))).collect();
-                    let upserts = current.iter().filter(|(id, value)| subscription.previous.get(*id) != Some(*value)).map(|(_, value)| value.clone()).collect::<Vec<_>>();
-                    let removes = subscription.previous.keys().filter(|id| !current.contains_key(*id)).cloned().collect::<Vec<_>>();
-                    if !upserts.is_empty() || !removes.is_empty() || order != subscription.order || has_more != subscription.has_more {
-                        if !send_collection(&mut socket, json!({"kind":"changes", "id":subscription.request.id, "collection":subscription.request.collection, "snapshot":snapshot, "upserts":upserts, "removes":removes, "order":order, "has_more":has_more})).await { return; }
+                refresh.extend(subscriptions.keys().cloned());
+            }
+            _ = tokio::time::sleep_until(retry_at.unwrap_or_else(tokio::time::Instant::now)), if retry_at.is_some() => {
+                refresh.extend(subscriptions.keys().cloned());
+            }
+            (id, frame) = next_terminal_frame(&mut terminals), if !terminals.is_empty() => {
+                let message = match frame {
+                    Some(TerminalFrame::Waiting) => continue,
+                    Some(TerminalFrame::Screen(envelope)) => json!({"kind":"screen", "id":id, "collection":"terminal", "snapshot":envelope["snapshot"], "value":envelope["value"]}),
+                    Some(TerminalFrame::Ended(error)) => {
+                        terminals.remove(&id);
+                        json!({"kind":"error", "id":id, "collection":"terminal", "code":error["code"], "message":error["message"]})
                     }
-                    subscription.previous = current;
-                    subscription.order = order;
-                    subscription.has_more = has_more;
+                    None => {
+                        terminals.remove(&id);
+                        json!({"kind":"error", "id":id, "collection":"terminal", "code":"internal", "message":"the terminal stream stopped"})
+                    }
+                };
+                if !send_collection(&mut socket, message).await { return; }
+                continue;
+            }
+        }
+        if refresh.is_empty() {
+            continue;
+        }
+        retry_at = None;
+        for id in refresh {
+            let Some(subscription) = subscriptions.get_mut(&id) else {
+                continue;
+            };
+            match refresh_collection(&mut socket, &state, &session, subscription).await {
+                Refreshed::Current => {}
+                Refreshed::Raced => {
+                    retry_at = Some(tokio::time::Instant::now() + COLLECTION_RACE_RETRY);
                 }
+                Refreshed::Dropped => {
+                    subscriptions.remove(&id);
+                }
+                Refreshed::Closed => return,
             }
         }
     }
@@ -624,7 +815,7 @@ fn mission_visualization(
     })))
 }
 
-fn mission_resources(
+pub(super) fn mission_resources(
     store: &Store,
     snapshot_index: u64,
     history: bool,
@@ -819,6 +1010,34 @@ fn mission_resources_filtered(
                         run.steps.iter().find(|step| step.status == "blocked").map(
                             |step| json!({"step": step.subject, "reason": step.blocked_reason}),
                         );
+                    // A mission carries the steps of its open runs and its latest run, and its
+                    // detail carries every run's steps, so a client never joins work to missions.
+                    let shows_steps = selected_id.is_some()
+                        || !matches!(run.status.as_str(), "completed" | "failed" | "cancelled")
+                        || latest.is_some_and(|latest| latest.subject == run.subject);
+                    let steps = shows_steps.then(|| {
+                        run.steps
+                            .iter()
+                            .map(|step| {
+                                json!({
+                                    "id": step.subject,
+                                    "path": step.step,
+                                    "title": step.title,
+                                    "state": step.status,
+                                    "attempt": step.attempt,
+                                    "assignee": step.assigned_to,
+                                    "claimant": step.claimant,
+                                    "agentless": step.agentless,
+                                    "since": client_timestamp(step.updated_at_unix_ms),
+                                    "last_progress": step.progress_summary,
+                                    "blocked_reason": step.blocked_reason,
+                                    "blockers": step.blockers,
+                                    "goals": step.goals,
+                                    "constraints": step.constraints,
+                                })
+                            })
+                            .collect::<Vec<_>>()
+                    });
                     Ok::<Value, anyhow::Error>(json!({
                         "id": run.subject,
                         "generation_id": run.generation,
@@ -833,6 +1052,7 @@ fn mission_resources_filtered(
                         "blocker": blocker,
                         "after": run.after,
                         "deadline": run.deadline_at_unix_ms.map(client_timestamp),
+                        "steps": steps,
                     }))
                 })
                 .collect::<anyhow::Result<Vec<_>>>()?;
@@ -3939,7 +4159,6 @@ pub(super) async fn terminal_stream(
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
     require_scope(&session, "terminal.read")?;
-    let subject = terminal_subject(&id);
     let protocols = headers
         .get_all(SEC_WEBSOCKET_PROTOCOL)
         .iter()
@@ -3971,9 +4190,64 @@ pub(super) async fn terminal_stream(
             details: Box::default(),
         });
     }
-    let live = match query.incarnation.as_deref() {
-        Some(incarnation) => remote_terminal_live_session(&state, &subject, incarnation)?,
-        None => terminal_live_session(&state, &subject, None)?,
+    let follow = prepare_terminal_follow(
+        &state,
+        &session,
+        &id,
+        query.incarnation.as_deref(),
+        stream_capability,
+    )?;
+    Ok(websocket
+        .protocols([TERMINAL_SUBPROTOCOL])
+        .on_upgrade(move |socket| follow.run(state, TerminalSink::Socket(socket))))
+}
+
+/// A terminal viewer, checked and holding its consumed attachment, ready to follow.
+enum TerminalFollow {
+    Local {
+        id: String,
+        incarnation: String,
+    },
+    Remote {
+        id: String,
+        owner: String,
+        authority_actor: String,
+        incarnation: String,
+    },
+}
+
+impl TerminalFollow {
+    async fn run(self, state: AppState, sink: TerminalSink) {
+        match self {
+            Self::Local { id, incarnation } => {
+                terminal_stream_socket(sink, state, id, incarnation).await;
+            }
+            Self::Remote {
+                id,
+                owner,
+                authority_actor,
+                incarnation,
+            } => {
+                remote_terminal_stream_socket(sink, state, id, owner, authority_actor, incarnation)
+                    .await;
+            }
+        }
+    }
+}
+
+/// Check a viewer's right to follow a terminal and consume its single-use attachment.
+fn prepare_terminal_follow(
+    state: &AppState,
+    session: &ClientSession,
+    id: &str,
+    incarnation: Option<&str>,
+    capability: Option<&str>,
+) -> Result<TerminalFollow, ApiError> {
+    require_scope(session, "terminal.read")?;
+    let subject = terminal_subject(id);
+    let live = match incarnation {
+        Some(incarnation) => remote_terminal_live_session(state, &subject, incarnation)?,
+        None => terminal_live_session(state, &subject, None)?,
     };
     if !live.terminal {
         return Err(validation(
@@ -3987,40 +4261,100 @@ pub(super) async fn terminal_stream(
             "remote terminal stream requires a concrete person",
         ));
     }
-    let expected_incarnation = live.incarnation_id;
     consume_terminal_attachment(
-        &state,
-        &session,
-        &client_detail_id("terminal", &id),
-        &expected_incarnation,
-        stream_capability,
+        state,
+        session,
+        &client_detail_id("terminal", id),
+        &live.incarnation_id,
+        capability,
     )?;
-    if live.owner_host_id != client_host_id(&state.node) {
-        let owner = live.owner_host_id;
-        let authority_actor = session.authority_actor;
-        return Ok(websocket
-            .protocols([TERMINAL_SUBPROTOCOL])
-            .on_upgrade(move |socket| {
-                remote_terminal_stream_socket(
-                    socket,
-                    state,
-                    id,
-                    owner,
-                    authority_actor,
-                    expected_incarnation,
-                )
-            }));
+    Ok(if live.owner_host_id != client_host_id(&state.node) {
+        TerminalFollow::Remote {
+            id: id.to_owned(),
+            owner: live.owner_host_id,
+            authority_actor: session.authority_actor.clone(),
+            incarnation: live.incarnation_id,
+        }
+    } else {
+        TerminalFollow::Local {
+            id: id.to_owned(),
+            incarnation: live.incarnation_id,
+        }
+    })
+}
+
+/// The latest thing a terminal subscription has to say: whole screens replace each other, so
+/// a slow client skips to the newest one.
+#[derive(Clone)]
+enum TerminalFrame {
+    Waiting,
+    /// A screen envelope, as the dedicated terminal socket sends it.
+    Screen(Value),
+    /// The error envelope that ended the stream.
+    Ended(Value),
+}
+
+/// Where a followed terminal's screens go: its own WebSocket, or one subscription on a
+/// client's collection socket.
+enum TerminalSink {
+    Socket(WebSocket),
+    Subscription(watch::Sender<TerminalFrame>),
+}
+
+impl TerminalSink {
+    async fn send(&mut self, value: &Value) -> bool {
+        match self {
+            Self::Socket(socket) => send_terminal_stream_value(socket, value).await,
+            Self::Subscription(sender) => {
+                serde_json::to_vec(value)
+                    .is_ok_and(|bytes| bytes.len() <= CLIENT_MAX_RESPONSE_BYTES)
+                    && sender.send(TerminalFrame::Screen(value.clone())).is_ok()
+            }
+        }
     }
-    Ok(websocket
-        .protocols([TERMINAL_SUBPROTOCOL])
-        .on_upgrade(move |socket| terminal_stream_socket(socket, state, id, expected_incarnation)))
+
+    async fn close(&mut self, code: u16, reason: &str) {
+        match self {
+            Self::Socket(socket) => close_terminal_stream(socket, code, reason).await,
+            Self::Subscription(sender) => {
+                sender.send_replace(TerminalFrame::Ended(terminal_stream_error(
+                    &ApiError::internal(reason),
+                )));
+            }
+        }
+    }
+
+    /// End with one error: an error envelope and a close frame, or the subscription's end.
+    async fn fail(&mut self, error: &ApiError) {
+        match self {
+            Self::Socket(socket) => close_terminal_stream_with_error(socket, error).await,
+            Self::Subscription(sender) => {
+                sender.send_replace(TerminalFrame::Ended(terminal_stream_error(error)));
+            }
+        }
+    }
+
+    /// Resolves once nobody watches any more.
+    async fn gone(&mut self) {
+        match self {
+            Self::Socket(socket) => loop {
+                if matches!(
+                    socket.recv().await,
+                    None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))
+                ) {
+                    return;
+                }
+            },
+            Self::Subscription(sender) => sender.closed().await,
+        }
+    }
 }
 
 /// Relay a terminal another host owns. Each owner long poll returns as soon as the owner
 /// publishes a screen whose revision differs from the last one sent, so an idle terminal
 /// costs one request per relay wait and sends the client nothing.
 async fn remote_terminal_stream_socket(
-    mut socket: WebSocket,
+    mut sink: TerminalSink,
     state: AppState,
     id: String,
     owner: String,
@@ -4028,7 +4362,7 @@ async fn remote_terminal_stream_socket(
     incarnation: String,
 ) {
     let Some(relay) = state.client_relay.as_ref() else {
-        close_terminal_stream(&mut socket, 1012, "terminal owner unavailable").await;
+        sink.close(1012, "terminal owner unavailable").await;
         return;
     };
     let terminal_id = client_detail_id("terminal", &id);
@@ -4053,11 +4387,7 @@ async fn remote_terminal_stream_socket(
         let read = loop {
             tokio::select! {
                 read = &mut read => break read,
-                message = socket.recv() => {
-                    if matches!(message, None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))) {
-                        return;
-                    }
-                }
+                () = sink.gone() => return,
             }
         };
         let screen = match read {
@@ -4069,38 +4399,29 @@ async fn remote_terminal_stream_socket(
                     tokio::time::sleep(Duration::from_millis(500 * u64::from(failures))).await;
                     continue;
                 }
-                close_terminal_stream_with_error(&mut socket, &error).await;
+                sink.fail(&error).await;
                 return;
             }
         };
         failures = 0;
         if screen["runtime_incarnation"].as_str() != Some(incarnation.as_str()) {
-            close_terminal_stream_with_error(
-                &mut socket,
-                &stale("the terminal incarnation fence is stale"),
-            )
-            .await;
+            sink.fail(&stale("the terminal incarnation fence is stale"))
+                .await;
             return;
         }
         let Some(revision) = screen["revision"].as_str().map(str::to_owned) else {
-            close_terminal_stream_with_error(
-                &mut socket,
-                &ApiError::internal("the terminal owner does not publish screen revisions"),
-            )
+            sink.fail(&ApiError::internal(
+                "the terminal owner does not publish screen revisions",
+            ))
             .await;
             return;
         };
         if sent.as_deref() == Some(revision.as_str()) {
             continue;
         }
-        if !send_terminal_stream_value(&mut socket, &terminal_stream_envelope(&state, screen)).await
-        {
-            close_terminal_stream(
-                &mut socket,
-                1009,
-                "terminal screen exceeds the client limit",
-            )
-            .await;
+        if !sink.send(&terminal_stream_envelope(&state, screen)).await {
+            sink.close(1009, "terminal screen exceeds the client limit")
+                .await;
             return;
         }
         sent = Some(revision);
@@ -4612,7 +4933,7 @@ async fn close_terminal_stream_with_error(socket: &mut WebSocket, error: &ApiErr
 /// later message is a newer screen that replaces it. The shared watcher publishes changes at a
 /// capped rate, and a viewer busy sending reads only the latest screen when it is ready.
 async fn terminal_stream_socket(
-    mut socket: WebSocket,
+    mut sink: TerminalSink,
     state: AppState,
     id: String,
     expected_incarnation: String,
@@ -4621,7 +4942,7 @@ async fn terminal_stream_socket(
     let live = match terminal_live_session(&state, &subject, Some(&expected_incarnation)) {
         Ok(live) => live,
         Err(error) => {
-            close_terminal_stream_with_error(&mut socket, &error).await;
+            sink.fail(&error).await;
             return;
         }
     };
@@ -4633,15 +4954,12 @@ async fn terminal_stream_socket(
     let mut screen = match terminal_view::next_screen(&mut screens, None, first).await {
         Ok(Some(screen)) => Some(screen),
         Ok(None) => {
-            close_terminal_stream_with_error(
-                &mut socket,
-                &ApiError::internal("the terminal screen did not arrive"),
-            )
-            .await;
+            sink.fail(&ApiError::internal("the terminal screen did not arrive"))
+                .await;
             return;
         }
         Err(end) => {
-            close_terminal_stream_with_error(&mut socket, &terminal_view_error(end)).await;
+            sink.fail(&terminal_view_error(end)).await;
             return;
         }
     };
@@ -4653,9 +4971,7 @@ async fn terminal_stream_socket(
             screen = tokio::select! {
                 changed = screens.changed() => {
                     if changed.is_err() {
-                        close_terminal_stream_with_error(
-                            &mut socket,
-                            &terminal_view_error(terminal_view::ViewEnd::Exited),
+                        sink.fail(&terminal_view_error(terminal_view::ViewEnd::Exited),
                         )
                         .await;
                         return;
@@ -4664,7 +4980,7 @@ async fn terminal_stream_socket(
                     match latest {
                         terminal_view::ViewState::Screen(screen) => Some(screen),
                         terminal_view::ViewState::Ended(end) => {
-                            close_terminal_stream_with_error(&mut socket, &terminal_view_error(end))
+                            sink.fail(&terminal_view_error(end))
                                 .await;
                             return;
                         }
@@ -4686,17 +5002,12 @@ async fn terminal_stream_socket(
                     if let Err(error) =
                         terminal_live_session(&state, &subject, Some(&expected_incarnation))
                     {
-                        close_terminal_stream_with_error(&mut socket, &error).await;
+                        sink.fail(&error).await;
                         return;
                     }
                     None
                 }
-                message = socket.recv() => {
-                    if matches!(message, None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))) {
-                        return;
-                    }
-                    None
-                }
+                () = sink.gone() => return,
             };
         }
         let Some(screen) = screen.take() else {
@@ -4706,22 +5017,14 @@ async fn terminal_stream_socket(
             continue;
         }
         let Ok(next_sequence) = state.store.index() else {
-            close_terminal_stream_with_error(
-                &mut socket,
-                &ApiError::internal("the store index is unavailable"),
-            )
-            .await;
+            sink.fail(&ApiError::internal("the store index is unavailable"))
+                .await;
             return;
         };
         let value = screen.value(&terminal_id, &live.incarnation_id, next_sequence);
-        if !send_terminal_stream_value(&mut socket, &terminal_stream_envelope(&state, value)).await
-        {
-            close_terminal_stream(
-                &mut socket,
-                1009,
-                "terminal screen exceeds the client limit",
-            )
-            .await;
+        if !sink.send(&terminal_stream_envelope(&state, value)).await {
+            sink.close(1009, "terminal screen exceeds the client limit")
+                .await;
             return;
         }
         sent = Some(screen.revision().to_owned());
