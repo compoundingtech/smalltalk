@@ -575,6 +575,9 @@ pub struct MissionRunSummary {
     pub current_steps: Vec<Value>,
     pub must_act: String,
     pub state_since: String,
+    /// The outcome a person or an authorized agent set after the run finished.
+    #[serde(default)]
+    pub outcome: Option<MissionRunOutcome>,
     pub last_progress: Option<String>,
     pub blocker: Option<Value>,
     pub after: Option<String>,
@@ -582,6 +585,15 @@ pub struct MissionRunSummary {
     /// The run's steps: for an open run or a mission's latest run, and every run in a detail read.
     #[serde(default)]
     pub steps: Option<Vec<MissionStep>>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct MissionRunOutcome {
+    pub status: String,
+    #[serde(default)]
+    pub previous_status: Option<String>,
+    pub reason: String,
+    pub actor: String,
+    pub at: String,
 }
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct MissionStep {
@@ -706,7 +718,35 @@ pub struct Agent {
     #[serde(default)]
     pub usage: Option<UsageSummary>,
     #[serde(default)]
+    pub mission_authority: Option<AgentMissionAuthority>,
+    #[serde(default)]
     pub under: Vec<AgentRelationship>,
+    #[serde(default)]
+    pub delivery: Option<AgentDelivery>,
+}
+/// Whether the process that carries a local seat's messages is live and current.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentDelivery {
+    pub state: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub polled_seconds_ago: Option<u64>,
+    #[serde(default)]
+    pub transport: Option<String>,
+}
+/// The missions an agent may publish, start, and revise, and where that authority comes from:
+/// `declared` (its `mission-authority`), `default` (a person-declared top-level seat
+/// `fleet/PROJECT/...` holds `fleet/PROJECT/*`), or `none`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentMissionAuthority {
+    pub source: String,
+    #[serde(default)]
+    pub publish: Vec<String>,
+    #[serde(default)]
+    pub start: Vec<String>,
+    #[serde(default)]
+    pub revise: Vec<String>,
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

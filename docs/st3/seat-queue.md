@@ -111,7 +111,9 @@ is refused with `agent-authority-grant-denied` when it carries `queue-authority`
 `mission-authority`, or `seat-authority`. Agents may declare or stop a top-level seat only when a
 person grants `seat-authority { declare "NAMESPACE/*"; stop "NAMESPACE/*" }` in the agent's
 current declaration. A seat with authority cannot be re-declared by an agent, because that would
-remove its person's grant.
+remove its person's grant. A person-declared top-level seat named `fleet/PROJECT/...` also holds
+mission authority for `fleet/PROJECT/*` by default, and loses it while an agent's declaration of the
+seat is current ([agent mission authority](kdl-lifecycle.md#agent-mission-authority)).
 The agent's move goes to `POST /v1/agent-queue-moves`, because client-v0 actions carry only
 person authority. That route also accepts a person. With `--json`, it prints the move claim.
 
@@ -227,9 +229,9 @@ others.
   now refuses that. Inside one run, the mission's dependencies still decide. `available-to` work
   is not queued, so it is not refused. An agent that wants another run first needs a person, or
   an agent with queue authority for the seat, to move it.
-- **The boot contract lists fleet work.** Agents are told to run `st work ls` without `--as`. That
-  list is in creation order, not seat order, and it includes steps the agent cannot claim. The
-  claim check makes the seat order hold anyway. Changing the boot contract is left to its owner.
+- **`st work ls` without `--as` lists fleet work.** That list is in creation order, not seat
+  order, and it includes steps the agent cannot claim. The claim check makes the seat order hold
+  anyway, and the seat's next step also arrives as a message that names it.
 - **Agents move runs only with a declared grant.** A person grants `queue-authority` in the
   agent's declaration, and the daemon checks it on each move, as it checks `mission-authority`.
   As there, the local socket trusts the actor named by `--as`, so the grant keeps well-behaved

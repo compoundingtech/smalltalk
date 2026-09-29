@@ -14,8 +14,16 @@
 //! its gate, so it understates main.
 //!
 //! Both counts start after the workload's missions are published, which main and this build
-//! record alike. The suite runs the workload for 90 seconds. The measurement in
-//! `doc/fleet/smalltalk/claim-log-diet` is the ten-minute run:
+//! record alike.
+//!
+//! The workload keeps its own clock and does not wait for the wall clock: each simulated second
+//! posts that second's driver output, then runs four reconcile passes, the daemon's least rate
+//! while it idles. The file observer polls every second instead of every minute, and the
+//! workload waits until it records each change. Only a changed observation writes claims, so
+//! both give the claims of the minute polls. The daemon keeps its store in memory: the diet
+//! counts claims, and on a disk shared with other builds each of the workload's thousand
+//! durable writes waited tens of milliseconds. The suite runs 90 simulated seconds. The
+//! measurement in `doc/fleet/smalltalk/claim-log-diet` is the ten-minute run:
 //!
 //! ```sh
 //! cargo test -p st3 --test integration log_diet:: -- --ignored --nocapture
@@ -27,11 +35,11 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use st3::api::AppState;
 use st3::client::{Client, Endpoint};
 use st3::model::{ClaimInput, ClaimRecord, IntentInput, MissionRunRequest};
@@ -46,6 +54,8 @@ const LOOPS: usize = 2;
 /// A harness works for 30 seconds of each 40.
 const TURN_SECONDS: u64 = 40;
 const WORKING_SECONDS: u64 = 30;
+/// Reconcile passes in each simulated second.
+const PASSES_PER_SECOND: usize = 4;
 
 /// A runtime that starts nothing: the workload drives the harness API directly.
 struct NoRuntime;
@@ -93,6 +103,7 @@ fn workload_source(workspace: &Path) -> String {
     locator "{}/config.toml"
     field "status"
     field "content_hash"
+    every "1s"
   }}
   step "wait" {{
     agentless
@@ -132,13 +143,12 @@ struct Daemon {
     store: Arc<Store>,
     client: Client,
     server: tokio::task::JoinHandle<()>,
-    reconciling: Arc<AtomicBool>,
-    reconciler: tokio::task::JoinHandle<()>,
+    reconciler: Arc<Reconciler<NoRuntime>>,
 }
 
 impl Daemon {
     async fn start(root: &Path) -> Self {
-        let store = Arc::new(Store::open(&root.join("claims.sqlite3"), NODE).unwrap());
+        let store = Arc::new(Store::open_memory(NODE).unwrap());
         let notify = Arc::new(Notify::new());
         let state_dir = root.join("state");
         std::fs::create_dir_all(&state_dir).unwrap();
@@ -161,26 +171,13 @@ impl Daemon {
         let server = tokio::spawn(async move {
             let _ = st3::api::serve_unix(&server_socket, st3::api::router(state)).await;
         });
-        // Reconcile off the async runtime after each change, and at least four times a second,
-        // until `stop`.
+        // The workload runs every reconcile pass itself; see `reconcile`.
         let reconciler = Arc::new(Reconciler::new(
             store.clone(),
             Arc::new(NoRuntime),
             NODE.into(),
-            notify.clone(),
+            notify,
         ));
-        let reconciling = Arc::new(AtomicBool::new(true));
-        let running = reconciling.clone();
-        let reconciler = tokio::spawn(async move {
-            while running.load(Ordering::SeqCst) {
-                let pass = reconciler.clone();
-                tokio::task::spawn_blocking(move || pass.reconcile_once())
-                    .await
-                    .unwrap()
-                    .unwrap();
-                let _ = tokio::time::timeout(Duration::from_millis(250), notify.notified()).await;
-            }
-        });
         let started = Instant::now();
         while std::os::unix::net::UnixStream::connect(&socket).is_err() {
             assert!(
@@ -193,15 +190,43 @@ impl Daemon {
             store,
             client: Client::new(Endpoint::Unix(socket)),
             server,
-            reconciling,
             reconciler,
         }
     }
 
-    /// Stop reconciling and serving before the store's directory goes away.
+    /// One reconcile pass, off the async runtime, as the daemon runs it.
+    async fn reconcile(&self) {
+        let reconciler = self.reconciler.clone();
+        tokio::task::spawn_blocking(move || reconciler.reconcile_once())
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    /// Reconcile until the file observer records `content` as the file's content.
+    async fn observe(&self, content: &str) {
+        let hash = hex::encode(Sha256::digest(content));
+        let started = Instant::now();
+        loop {
+            self.reconcile().await;
+            let observed = self
+                .store
+                .latest_actual_value("resource/diet/config")
+                .unwrap()
+                .and_then(|actual| actual.pointer("/facts/content_hash").cloned());
+            if observed == Some(Value::String(hash.clone())) {
+                return;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(60),
+                "the observer never recorded the change; it last recorded {observed:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    /// Stop serving before the socket's directory goes away.
     async fn stop(self) {
-        self.reconciling.store(false, Ordering::SeqCst);
-        self.reconciler.await.unwrap();
         self.server.abort();
         let _ = self.server.await;
     }
@@ -466,7 +491,7 @@ async fn run_workload(seconds: u64) -> Report {
     let mut harnesses = (0..HARNESSES).map(Harness::new).collect::<Vec<_>>();
     let mut state_changes = BTreeMap::<String, Vec<ClaimRecord>>::new();
     let mut messages = Vec::new();
-    let started = Instant::now();
+    daemon.observe("version = 0\n").await;
     for second in 0..=seconds {
         let last = second == seconds;
         for harness in &mut harnesses {
@@ -486,16 +511,13 @@ async fn run_workload(seconds: u64) -> Report {
                 }
             }
         }
-        if second % 90 == 45 {
-            std::fs::write(
-                workspace.join("config.toml"),
-                format!("version = {second}\n"),
-            )
-            .unwrap();
+        for _ in 0..PASSES_PER_SECOND {
+            daemon.reconcile().await;
         }
-        let next = Duration::from_secs(second + 1);
-        if let Some(wait) = next.checked_sub(started.elapsed()) {
-            tokio::time::sleep(wait).await;
+        if second % 90 == 45 {
+            let content = format!("version = {second}\n");
+            std::fs::write(workspace.join("config.toml"), &content).unwrap();
+            daemon.observe(&content).await;
         }
     }
 

@@ -37,8 +37,9 @@ that represents a database transaction.
 
 `st launch preview` validates and renders a planner-authored launch candidate.
 `st missions publish FILE --as ACTOR` previews and then atomically applies exact authored mission
-KDL. Agents must already hold matching `mission-authority { publish ... }`; a declaration cannot
-self-grant that authority. A failed declaration rejects the complete publication.
+KDL. Agents must already hold matching `publish` authority, from `mission-authority` or the
+default of a person-declared `fleet/PROJECT/...` seat; a declaration cannot self-grant that
+authority. A failed declaration rejects the complete publication.
 
 Removing a prior declaration from a later file has no effect. A cancellation, stop, repair, or new
 desired declaration must state the change.
@@ -95,8 +96,9 @@ The driver admits a workspace under Claude's own config lock (`.claude.json.lock
 process re-reads and replaces `.claude.json` under that lock, so no running Claude can publish an
 older copy of the config that lacks the new workspace.
 
-Native harnesses receive the same generated `.st3/boot.md`. A harness prompt can add stable
-repository context. It cannot replace the runtime contract.
+A native harness starts with no prompt and takes no turn until a person types or a message is
+posted. Its driver installs the skill that `st skill` prints, which describes how to use st. A
+harness declaration cannot carry a `prompt`.
 
 ## Fault isolation
 
@@ -249,7 +251,8 @@ The local API uses a Unix socket. Peer HTTP listeners and peer URLs must use loo
 Fleet messages use a shared secret and request-bound signatures.
 
 Each member’s render transaction refuses symbolic-link escapes and conflicting file ownership.
-It refuses to replace a tracked `.st3/boot.md` with different bytes. Additive Git excludes combine
+It refuses to change a tracked file. st removes the `.st3` directory that older releases wrote
+for a native harness only when Git tracks nothing in it. Additive Git excludes combine
 across operations and worktrees sharing an exclude file. A failed member pass records a fault
 without blocking other members; stopping a member does not require its render to succeed.
 

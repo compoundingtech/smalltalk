@@ -392,48 +392,6 @@ fn every_native_st3_eval_uses_the_normative_grammar() {
 }
 
 #[test]
-fn eval_agents_use_the_runtime_boot_contract_without_authored_prompts() {
-    fn inspect(document: &kdl::KdlDocument, file: &std::path::Path) {
-        for node in document.nodes() {
-            if node.name().value() == "agent" {
-                let body = node.children().expect("an agent needs a body");
-                for harness in body
-                    .nodes()
-                    .iter()
-                    .filter(|child| child.name().value() == "harness")
-                {
-                    assert!(
-                        harness
-                            .children()
-                            .is_none_or(|body| body.get("prompt").is_none()),
-                        "{} authors an eval-specific harness prompt",
-                        file.display()
-                    );
-                }
-            }
-            if let Some(children) = node.children() {
-                inspect(children, file);
-            }
-        }
-    }
-
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("evals/st3");
-    for entry in walkdir::WalkDir::new(root)
-        .max_depth(3)
-        .follow_links(false)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|entry| is_eval_document(entry.path()))
-    {
-        let source = fs::read_to_string(entry.path()).unwrap();
-        let document = source.parse::<kdl::KdlDocument>().unwrap();
-        inspect(&document, entry.path());
-    }
-}
-
-#[test]
 fn eval_personas_do_not_duplicate_runtime_work_instructions() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")

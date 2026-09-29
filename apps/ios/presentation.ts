@@ -95,7 +95,11 @@ export function missionDetail(mission: Pick<Mission, 'run_details' | 'runs' | 'v
   const planned = mission.visualization?.nodes.filter(node => node.kind === 'step').length;
   const steps = missionSteps(mission);
   const current = steps.find(step => step.state === 'blocked') ?? steps.find(step => step.state === 'claimed' || step.state === 'ready') ?? steps[0];
-  return `${mission.runs.length} runs${planned === undefined ? '' : ` · ${planned} planned steps`}${current ? ` · ${current.path} (${current.state})` : ''}`;
+  // Someone set the latest run's outcome after it finished: say what, who, and why.
+  const runs = mission.run_details ?? [];
+  const outcome = runs[runs.length - 1]?.outcome;
+  const set = outcome ? ` · set ${outcome.status}${outcome.previous_status ? ` (was ${outcome.previous_status})` : ''} by ${outcome.actor}: ${outcome.reason}` : '';
+  return `${mission.runs.length} runs${planned === undefined ? '' : ` · ${planned} planned steps`}${current ? ` · ${current.path} (${current.state})` : ''}${set}`;
 }
 
 type HealthAgent = Pick<Agent, 'state' | 'harness_state'>;

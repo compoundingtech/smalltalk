@@ -9,6 +9,13 @@ const COLLECTION_SUBPROTOCOL: &str = "st3.client.collections.v0";
 const TERMINAL_CAPABILITY_PROTOCOL_PREFIX: &str = "st3.cap.";
 const LOCAL_PERSON_HEADER: &str = "x-st3-person";
 
+pub(super) async fn request_latency(
+    Extension(session): Extension<ClientSession>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.projections")?;
+    Ok(Json(json!({ "routes": super::request_latency_snapshot() })))
+}
+
 // A client holds one socket for all its current collection views. A subscription
 // is a bounded window; history stays on the paged HTTP endpoints. A terminal is one
 // more subscription on the same socket: whole screens, the latest only.
@@ -1171,7 +1178,7 @@ fn mission_resources_filtered(
             usage_by_run.entry(run).or_default().push(usage);
         }
     }
-    let state_times = store.mission_run_state_times()?;
+    let run_states = store.mission_run_states()?;
     let mut values = missions
         .into_iter()
         .filter(|(mission, _)| selected_id.is_none_or(|selected| mission == selected))
@@ -1195,6 +1202,10 @@ fn mission_resources_filtered(
                 "running"
             } else if runs.iter().any(|run| run.status == "standing") {
                 "standing"
+            } else if definition.is_some_and(|(definition, _)| {
+                definition.state == crate::model::MissionState::Retired
+            }) {
+                "retired"
             } else {
                 match latest
                     .expect("a nonempty run list has a latest run")
@@ -1290,10 +1301,23 @@ fn mission_resources_filtered(
                         } else {
                             "system"
                         };
-                    let state_since = state_times
-                        .get(&run.subject)
-                        .copied()
+                    let run_state = run_states.get(&run.subject);
+                    let state_since = run_state
+                        .map(|state| state.since_unix_ms)
                         .unwrap_or(run.created_at_unix_ms);
+                    // An outcome counts only while the run is still over.
+                    let outcome = run_state
+                        .and_then(|state| state.outcome.as_ref())
+                        .filter(|_| run.phase == "terminal")
+                        .map(|outcome| {
+                            json!({
+                                "status": outcome.status,
+                                "previous_status": outcome.previous_status,
+                                "reason": outcome.reason,
+                                "actor": outcome.actor,
+                                "at": client_timestamp(outcome.at_unix_ms),
+                            })
+                        });
                     let blocker =
                         run.steps.iter().find(|step| step.status == "blocked").map(
                             |step| json!({"step": step.subject, "reason": step.blocked_reason}),
@@ -1336,6 +1360,7 @@ fn mission_resources_filtered(
                         "current_steps": current_steps,
                         "must_act": must_act,
                         "state_since": client_timestamp(state_since),
+                        "outcome": outcome,
                         "last_progress": last_progress,
                         "blocker": blocker,
                         "after": run.after,
@@ -1771,44 +1796,47 @@ fn machine_resources(
         }
     }
 
-    let work = super::client_work_resources(
-        &state.store,
-        None,
-        history,
-        client_snapshot_time(snapshot),
-        snapshot.store_index,
-    )?;
+    // Machines need only the claimant, subject, and update time. Building full
+    // client work resources also reduces usage history and mission annotations
+    // for every step, which makes this small host list expensive during the
+    // startup burst when many seats connect at once.
+    let work = if history {
+        state
+            .store
+            .client_work_history_at_snapshot(None, client_snapshot_time(snapshot))?
+    } else {
+        state
+            .store
+            .client_work_at_snapshot(None, false, client_snapshot_time(snapshot))?
+    };
     let mut host_work = BTreeMap::<String, BTreeSet<String>>::new();
     for item in work {
-        let Some(claimant) = item["claimant"].as_str() else {
+        let Some(claimant) = item.claimant.as_deref() else {
             continue;
         };
         let Some(host_id) = runtime_owner_hosts.get(claimant) else {
             continue;
         };
-        if let Some(work_id) = item["id"].as_str() {
-            host_work
-                .entry(host_id.clone())
-                .or_default()
-                .insert(work_id.to_owned());
-        }
-        if let Some(updated_at) = item["updated_at"].as_str() {
-            host_updated_at
-                .entry(host_id.clone())
-                .and_modify(|current| {
-                    if updated_at > current.as_str() {
-                        *current = updated_at.to_owned();
-                    }
-                })
-                .or_insert_with(|| updated_at.to_owned());
-        }
+        host_work
+            .entry(host_id.clone())
+            .or_default()
+            .insert(item.subject);
+        let updated_at = client_timestamp(item.updated_at_unix_ms);
+        host_updated_at
+            .entry(host_id.clone())
+            .and_modify(|current| {
+                if updated_at > *current {
+                    *current = updated_at.clone();
+                }
+            })
+            .or_insert(updated_at);
     }
 
     let local_host = client_host_id(&state.node);
     let mut host_ids = BTreeSet::from([local_host.clone()]);
     // Fleet members count as configured hosts; ended members are history. A config peer that
     // ended as a member is history too, even while its [[peers]] entry remains.
-    let fleet = state.store.fleet_view()?;
+    let fleet = state.store.fleet_view_for_client()?;
     let dial_out_hosts = fleet
         .members
         .iter()
@@ -7704,7 +7732,7 @@ mission "example/looped" state="ready" {
                 .unwrap()
         };
         let first = start("first");
-        start("second");
+        let second = start("second");
         state
             .store
             .set_mission_run_state(&first.id, "cancelled", "terminal", Some("no longer needed"))
@@ -7743,6 +7771,65 @@ mission "example/looped" state="ready" {
         assert_eq!(current_run["progress"]["total"], 1);
         assert_eq!(current_run["current_steps"].as_array().unwrap().len(), 0);
         assert!(current_run["state_since"].is_string());
+        assert!(current_run["outcome"].is_null());
+
+        state
+            .store
+            .set_mission_run_outcome(
+                &first.subject,
+                "completed",
+                "person/operator",
+                "its work shipped before it was cancelled",
+                "looped-first-outcome",
+            )
+            .unwrap();
+        let current =
+            mission_resources(&state.store, state.store.index().unwrap(), false, None).unwrap();
+        let looped = current
+            .iter()
+            .find(|value| value["id"] == "mission/example/looped")
+            .unwrap();
+        let finished = looped["run_details"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|run| run["id"] == first.subject)
+            .unwrap();
+        assert_eq!(finished["status"], "completed");
+        assert_eq!(finished["must_act"], "nobody");
+        assert_eq!(finished["outcome"]["status"], "completed");
+        assert_eq!(finished["outcome"]["previous_status"], "cancelled");
+        assert_eq!(finished["outcome"]["actor"], "person/operator");
+        assert_eq!(
+            finished["outcome"]["reason"],
+            "its work shipped before it was cancelled"
+        );
+        assert_eq!(finished["state_since"], finished["outcome"]["at"]);
+
+        // Retired once no run is open, the mission leaves the current view at once, even with
+        // a run that ended moments ago, and its history names it retired.
+        state
+            .store
+            .set_mission_run_state(&second.id, "failed", "terminal", Some("a check failed"))
+            .unwrap();
+        state
+            .store
+            .retire_mission("example/looped", "person/operator", "retire-looped")
+            .unwrap();
+        let current =
+            mission_resources(&state.store, state.store.index().unwrap(), false, None).unwrap();
+        assert!(
+            current
+                .iter()
+                .all(|value| value["id"] != "mission/example/looped")
+        );
+        let history =
+            mission_resources(&state.store, state.store.index().unwrap(), true, None).unwrap();
+        let retired = history
+            .iter()
+            .find(|value| value["id"] == "mission/example/looped")
+            .unwrap();
+        assert_eq!(retired["state"], "retired");
     }
 
     #[test]
@@ -9485,41 +9572,48 @@ mission "example/zero-run" state="ready" {
                 idempotency_key: Some("timeline-retention-runtime".into()),
             })
             .unwrap();
+        let entry = |sequence: u64, entry_type: &str, body: Value| ClaimInput {
+            subject: subject.into(),
+            kind: "harness.timeline".into(),
+            actor: Some(subject.into()),
+            fields: BTreeMap::from([
+                ("operation".into(), Value::String("append".into())),
+                (
+                    "entry_id".into(),
+                    Value::String(format!("timeline-entry/retention-{sequence}")),
+                ),
+                ("sequence".into(), Value::from(sequence)),
+                ("revision".into(), Value::from(1)),
+                ("role".into(), Value::String("system".into())),
+                ("entry_type".into(), Value::String(entry_type.into())),
+                ("final".into(), Value::Bool(true)),
+                ("body".into(), body),
+                ("driver".into(), Value::String("codex".into())),
+                ("incarnation_id".into(), Value::String(incarnation.into())),
+            ]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(format!("timeline-retention-{sequence}")),
+        };
         let append_entry = |sequence: u64, entry_type: &str, body: Value| {
             state
                 .store
-                .append_claim(&ClaimInput {
-                    subject: subject.into(),
-                    kind: "harness.timeline".into(),
-                    actor: Some(subject.into()),
-                    fields: BTreeMap::from([
-                        ("operation".into(), Value::String("append".into())),
-                        (
-                            "entry_id".into(),
-                            Value::String(format!("timeline-entry/retention-{sequence}")),
-                        ),
-                        ("sequence".into(), Value::from(sequence)),
-                        ("revision".into(), Value::from(1)),
-                        ("role".into(), Value::String("system".into())),
-                        ("entry_type".into(), Value::String(entry_type.into())),
-                        ("final".into(), Value::Bool(true)),
-                        ("body".into(), body),
-                        ("driver".into(), Value::String("codex".into())),
-                        ("incarnation_id".into(), Value::String(incarnation.into())),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some(format!("timeline-retention-{sequence}")),
-                })
+                .append_claim(&entry(sequence, entry_type, body))
                 .unwrap();
         };
-        for sequence in 1..=4_097 {
-            append_entry(
-                sequence,
-                "status",
-                json!({"status":"running", "detail":format!("event {sequence}")}),
-            );
-        }
+        // One entry more than a timeline read returns, in one commit: a commit for each entry
+        // took minutes on a busy disk.
+        state.store.append_local_observations_for_test(
+            &(1..=4_097)
+                .map(|sequence| {
+                    entry(
+                        sequence,
+                        "status",
+                        json!({"status":"running", "detail":format!("event {sequence}")}),
+                    )
+                })
+                .collect::<Vec<_>>(),
+        );
         let session = ClientSession::local(None).unwrap();
         let snapshot = new_client_snapshot(&state);
         let session_id = client_session_resources(

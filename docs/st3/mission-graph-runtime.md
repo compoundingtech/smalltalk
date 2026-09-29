@@ -213,6 +213,18 @@ A completion dependency cannot reference a final step.
 Omitting `completion` means `all-steps-exhausted`. Long-lived harness availability is modeled by a
 top-level agent seat, not by omission on a mission.
 
+A mission that should no longer start leaves every list when it is retired:
+
+```sh
+st missions retire mission/MISSION_ID --as person/operator
+```
+
+Retirement publishes the current definition again with `state="retired"`, naming who retired it.
+The mission leaves `st missions ls`, `st missions tree` and every client, and cannot start. Its
+revisions and runs stay in its history (`st missions ls --all`, `st missions show`). A person, or an
+agent with `publish` authority for the mission, can retire it once no run of it is active. Publishing
+a ready revision brings it back.
+
 ## Run ownership and concurrency
 
 A mission run owns the execution state declared inside that run. A top-level `agent` is instead a
@@ -280,7 +292,7 @@ step "STEP_ID" timeout="20m" revisions="human-only" revision-reviewer="person/re
 
 `title`, `assigned-to`, `agentless`, `fresh-context`, `mission`, `retry`, `produces`, `produces-mission`, `uses-mission`, and `after-run` are single fields.
 
-`fresh-context` is a bare node. Before the daemon wakes a seat for that step, it stops the old harness session and starts a new one with the seat's normal boot context. The step goals arrive in the new session. A claim from the old incarnation is refused while the reset is pending. Steps without this option keep the current session unless the seat opts in for every step. A retry is a new attempt and receives its own fresh session.
+`fresh-context` is a bare node. Before the daemon wakes a seat for that step, it stops the old harness session and starts a new, idle one. The step's work message arrives in the new session. A claim from the old incarnation is refused while the reset is pending. Steps without this option keep the current session unless the seat opts in for every step. A retry is a new attempt and receives its own fresh session.
 
 A retry repeats one failed step attempt. It handles a bounded transient failure.
 
@@ -518,7 +530,7 @@ A top-level agent seat has no mission steps, so it cannot declare a constraint. 
 
 st shows the effective list when an agent shows or claims work.
 
-Do not repeat universal st behavior as a mission constraint. The generated boot file defines that behavior.
+Do not repeat universal st behavior as a mission constraint. The skill that `st skill` prints describes how an agent uses st.
 
 Do not disable harness features to make an eval pass. A mission constraint must describe a real mission requirement.
 
@@ -719,6 +731,9 @@ gate "the release is approved" type="human" {
 A human gate requires a full `person/...` reviewer. The question and repeated review targets are optional.
 
 st creates one `gate.requested` claim for the exact mission or step revision and attempt. A review decision must match that request.
+A newer st build can word the same gate's request differently and ask again for the same attempt.
+The reviewer then sees one review: the newest request, which is the one the gate waits on, aged
+from the first request, on every node.
 
 `st attention ls --as person/NAME` shows the selected person's pending KDL human gates together
 with their other current decisions and faults.
@@ -819,10 +834,24 @@ While its run is active, the step starts its next attempt in place. When that st
 reason its root run failed, the retry reopens the run in a successor generation of the same
 revision. Completed normal work carries forward. The failed step starts its next attempt. Work that
 the failure cancelled and every final step start again. The old generation becomes superseded.
+The run's state claims record who reopened it and why, and its state dates from the reopening.
 
 A failed run does not reopen when several steps failed, when work was cancelled for a reason other
 than the failure, when a mission gate or the mission timeout failed it, when it is a nested or eval
 run, or when its mission deadline has passed. Revise the run instead to restart several failed steps.
+
+A finished root run can show another outcome than the one st recorded, for example when its work
+shipped after a gate failed. A person, the agent that requested the run, or an agent with `revise`
+authority for its mission sets it with a reason:
+
+```sh
+st missions outcome RUN completed --reason "the change merged after the gate was fixed" --as person/operator
+```
+
+The outcome is `completed`, `failed`, or `cancelled`. The run keeps its steps as they ended. Its
+latest state claim records the new outcome, who set it, and why; `st missions show` prints it with
+the outcome it replaced, and every client shows it on every node. An active run is cancelled with
+`st missions cancel` instead, and nested and eval runs keep their outcome.
 
 The `completion` frontier selects when st checks mission products and gates. st then enters the final phase when one exists.
 
@@ -951,23 +980,17 @@ person, exec, or other non-agent actor that the work names.
 
 An unknown variable or a variable that is not available in the current phase is an error.
 
-## Agent boot contract
+## Agent start
 
-An agent harness prompt is optional.
+A native harness starts with no prompt. A started or restarted seat takes no turn until a person types or a graph message is posted.
 
-st appends this exact text once to every agent launch:
+A harness block cannot declare `prompt`. Parsing refuses it with `harness-prompt-removed`. Put the instruction in a step goal or send the seat a message.
 
-```text
-Read @.st3/boot.md completely. Then list, claim, do, and finish your current st work.
-```
+Each native harness driver installs the skill that `st skill` prints before it starts the harness. The skill describes how to use st: messages, work, and attention requests. It contains no mission goal and sets no rules of conduct.
 
-Each member’s render transaction writes the canonical `.st3/boot.md` before its native harness starts.
+st no longer writes a `.st3` directory into a native harness workspace. For each one, it removes a `.st3` directory that older releases wrote, unless Git tracks something in it, and removes the `.st3/` line from the Git exclude file once no worktree sharing that file still has a `.st3` directory. A declared `render { git-exclude ".st3/" }` adds nothing.
 
-The file explains graph work, Small Talk, wait behavior, and diagnostics. It does not contain a mission goal.
-
-An authored prompt can add stable harness context. It cannot replace or duplicate the boot contract.
-
-A tracked `.st3/boot.md` with different bytes fails that member’s render transaction and prevents its runtime from starting. Other members continue rendering and reconciling. Render, start, observation, and stop failures appear as the member’s fault in `st agents show` and `st doctor`; a successful pass clears the fault. Stopped and superseded members bypass rendering.
+A declared `render` operation that would change a tracked file fails that member’s render transaction and prevents its runtime from starting. Other members continue rendering and reconciling. Render, start, observation, and stop failures appear as the member’s fault in `st agents show` and `st doctor`; a successful pass clears the fault. Stopped and superseded members bypass rendering.
 
 Repeated `git-exclude` operations build on one another. Seats in worktrees sharing a repository’s exclude file contribute their paths to one combined update. Conflicting ordinary file owners are still rejected, without blocking unrelated members.
 
@@ -989,7 +1012,6 @@ An agent can declare a Git checkout instead. st then creates the agent's workspa
 agent "parser" {
   workspace "${ST_WORKSPACE}/parser"
   checkout "${ST_WORKSPACE}/repo" base="origin/main" branch="fan-out/parser" remove-at-run-end=#true
-  render { git-exclude ".st3/" }
   harness "omp" {}
 }
 ```
@@ -1001,7 +1023,6 @@ agent "parser" {
 - When the checkout fails, the agent does not start. st records a `workspace-unavailable` diagnostic and retries after 30 seconds.
 - With `remove-at-run-end=#true`, st removes the worktree after the agent's run ends and its runtime stops. The branch stays in the repository.
 - st keeps a worktree that has uncommitted or untracked changes, and records a `checkout-kept` warning. It also keeps a worktree whose workspace a current member still uses.
-- `render { git-exclude ".st3/" }` keeps the files st writes for each harness out of Git, so a finished worktree is clean.
 
 [`fan-out.kdl`](../../examples/st3/fan-out.kdl) gives three parallel workers one checkout each.
 
@@ -1039,7 +1060,7 @@ nested steps is still ready does not occupy the seat; that nested step is woken.
 in the seat queue described below. Only the seat's next work is woken when the seat is free.
 Queued steps do not consume wake attempts or arm retry timers while the agent is busy. Delivery is
 acknowledged by a new working turn, by a native read or close, by a delivery into a turn that is
-still working, or by claiming the step. Pi and OMP steer a wake into the running turn, so a boot
+still working, or by claiming the step. Pi and OMP steer a wake into the running turn, so a
 turn that started before the wake still acknowledges it. An unacknowledged delivery is retried
 after 15 seconds, at most three times. Exhaustion writes a `work-wake-exhausted` harness
 diagnostic naming the step, incarnation, and attempt count.
@@ -1133,9 +1154,7 @@ host "local" {
 
 The host document gives stable host facts to agents on that host. It must not contain current work.
 
-st renders each exact document under `.st3/host/` for every native harness on that host.
-
-The generated `.st3/boot.md` lists each exact reference and rendered path. A missing document, invalid text, or path collision refuses the render transaction.
+st writes no file for a host document. `st work claim` on that host prints each exact document after the claimed step, under a `HOST  NODE` heading, each under its exact reference.
 
 Publication fails with `missing-document` until the exact document bytes exist in the local store.
 
@@ -1329,7 +1348,11 @@ agent "planner" {
 
 Each rule accepts an exact mission ID or a terminal `/*` namespace. The value omits the `mission/` subject prefix.
 
-No agent receives mission authority by default. `publish`, `start`, and `revise` are separate permissions.
+A mission-scoped agent, such as this planner, receives no mission authority by default. A
+top-level seat named `fleet/PROJECT/...` that a person declared holds `publish`, `start`, and
+`revise` for `fleet/PROJECT/*` unless its declaration carries `mission-authority`; see
+[agent mission authority](kdl-lifecycle.md#agent-mission-authority). `publish`, `start`, and
+`revise` are separate permissions.
 
 Mission publication requires a claimed step with the exact `produces-mission` declaration. The agent must use `st work publish-mission`.
 

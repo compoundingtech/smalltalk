@@ -214,21 +214,92 @@ pub(crate) fn run_for_with_environment(
         Some(&observer),
     )
     .with_context(|| format!("running {label} driver '{runtime_id}'"))?;
-    record_session_end(
+    finish_session(
         &agent_dir,
         &identity,
         &runtime_id,
         &session,
         seq,
-        &outcome,
+        outcome,
         kind,
+    )
+}
+
+/// Resume supervising a pi-family provider a predecessor driver image launched and released for
+/// adoption. The channel the extension spawned keeps the live record; this image keeps presence
+/// and the terminal record, exactly as the launching image did.
+pub(crate) fn adopt_for(
+    catalog_root: &Path,
+    identity: String,
+    runtime_id: String,
+    kind: &HarnessKind,
+    pid: u32,
+    session: String,
+    seq: u64,
+) -> Result<()> {
+    let label = kind.label;
+    let agent_dir =
+        message::resolve_declared_dir(catalog_root, &identity, &crate::run::detect_host())?
+            .with_context(|| format!("{label} driver agent '{identity}' is not declared"))?;
+    let observer = crate::provider_session::SessionObserver::terminal_only(
+        &agent_dir,
+        &identity,
+        label,
+        &runtime_id,
+        &session,
+        seq,
+    );
+    let outcome = crate::provider_session::adopt_provider_observed(
+        label,
+        &status::status_path(&agent_dir),
+        pid,
+        status::STATUS_REFRESH,
+        PROVIDER_POLL,
+        &STOP,
+        Some(&observer),
+    )
+    .with_context(|| format!("supervising adopted {label} driver '{runtime_id}'"))?;
+    finish_session(
+        &agent_dir,
+        &identity,
+        &runtime_id,
+        &session,
+        seq,
+        outcome,
+        kind,
+    )
+}
+
+fn finish_session(
+    agent_dir: &Path,
+    identity: &str,
+    runtime_id: &str,
+    session: &str,
+    seq: u64,
+    outcome: ProviderOutcome,
+    kind: &HarnessKind,
+) -> Result<()> {
+    let label = kind.label;
+    if let ProviderOutcome::Detached(pid) = outcome {
+        // The provider keeps running under the next driver image; it has not ended.
+        return Err(crate::provider_session::Detached {
+            session: crate::provider_session::DetachedSession::Provider {
+                pid,
+                session: session.to_owned(),
+                seq,
+            },
+        }
+        .into());
+    }
+    record_session_end(
+        agent_dir, identity, runtime_id, session, seq, &outcome, kind,
     );
     match outcome {
         ProviderOutcome::Exited(exit) => {
             anyhow::ensure!(exit.success(), "{label} provider exited with {exit}");
             Ok(())
         }
-        ProviderOutcome::Stopped(_) => Ok(()),
+        ProviderOutcome::Stopped(_) | ProviderOutcome::Detached(_) => Ok(()),
     }
 }
 
@@ -252,6 +323,7 @@ fn record_session_end(
             describe_exit(*exit)
         }
         ProviderOutcome::Stopped(None) => "stopped".to_string(),
+        ProviderOutcome::Detached(_) => return,
     };
     let mut writer = harness_state::Writer::new(
         agent_dir,

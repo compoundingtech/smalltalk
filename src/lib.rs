@@ -59,6 +59,7 @@ pub mod pi_session;
 pub mod pretrust;
 pub mod provider_session;
 pub mod reconcile;
+pub mod reexec;
 pub mod request;
 pub mod residency;
 pub mod residency_host;
