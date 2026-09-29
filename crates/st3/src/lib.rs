@@ -22,6 +22,8 @@ pub mod reconcile;
 pub mod recorder;
 /// Summarizes command recorder logs from one or more hosts.
 pub mod recorder_report;
+/// Finds references a publication or the graph names that do not resolve.
+pub(crate) mod references;
 /// Attaches a local terminal to a terminal another fleet host owns.
 pub mod remote_terminal;
 pub mod render;

@@ -4107,6 +4107,39 @@ fn daemon_pty(state: &AppState) -> anyhow::Result<st_runtime::PtyRuntime> {
         .with_environment(crate::environment::snapshot()?))
 }
 
+/// The references already in the graph that no longer resolve. Publication refuses new ones, so
+/// each of these was published before that check, or its target was removed later.
+fn graph_references_check(unresolved: &[String]) -> DoctorCheck {
+    const LISTED: usize = 20;
+    let mut listed = unresolved.iter().take(LISTED).cloned().collect::<Vec<_>>();
+    if unresolved.len() > LISTED {
+        listed.push(format!("and {} more", unresolved.len() - LISTED));
+    }
+    DoctorCheck {
+        name: "graph-references".into(),
+        status: if unresolved.is_empty() {
+            "pass"
+        } else {
+            "warn"
+        }
+        .into(),
+        message: if unresolved.is_empty() {
+            "every reference in the ready missions, declarations and active runs resolves".into()
+        } else {
+            let (noun, verb) = if unresolved.len() == 1 {
+                ("reference", "resolves")
+            } else {
+                ("references", "resolve")
+            };
+            format!(
+                "{} {noun} no longer {verb}: {}",
+                unresolved.len(),
+                listed.join("; ")
+            )
+        },
+    }
+}
+
 fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     let mut checks = Vec::new();
     match state.store.index() {
@@ -4281,6 +4314,12 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             format!("duplicate runtime owners: {}", duplicates.join("; "))
         },
     });
+    checks.push(graph_references_check(
+        &state
+            .store
+            .unresolved_graph_references()
+            .map_err(ApiError::bad)?,
+    ));
     let terminal_owned = state
         .store
         .terminal_owned_runtime_subjects()
@@ -6882,11 +6921,80 @@ async fn mission(
         kdl: resolved_kdl,
         source_name: request.intent.source_name,
     };
-    state
+    let mut response = state
         .store
         .mission_at(&intent, resolved, request.at_index)
-        .map(Json)
-        .map_err(ApiError::bad)
+        .map_err(ApiError::bad)?;
+    publication_refusals(&state, &intent)
+        .await?
+        .block(&mut response);
+    Ok(Json(response))
+}
+
+/// What a publication route refuses besides its own checks: each reference in the publication
+/// that does not resolve, and each render a member it declares on this host would refuse.
+#[derive(Default)]
+struct PublicationRefusals {
+    references: Vec<String>,
+    renders: Vec<String>,
+}
+
+impl PublicationRefusals {
+    /// The error that refuses the publication, if anything does.
+    fn error(self) -> Option<St3Error> {
+        let (code, refusals) = if !self.references.is_empty() {
+            ("unresolved-reference", self.references)
+        } else if !self.renders.is_empty() {
+            ("render-refused", self.renders)
+        } else {
+            return None;
+        };
+        Some(St3Error::new(code, refusals.join("; ")).with_detail("refusals", json!(refusals)))
+    }
+
+    /// Lists the refusals as the preview's blockers, where each replaces a warning of the same
+    /// text.
+    fn block(self, response: &mut MissionResponse) {
+        let refusals = self
+            .references
+            .into_iter()
+            .chain(self.renders)
+            .collect::<Vec<_>>();
+        response
+            .warnings
+            .retain(|warning| !refusals.contains(warning));
+        response.blockers.extend(refusals);
+        response.blockers.sort();
+        response.blockers.dedup();
+    }
+}
+
+async fn publication_refusals(
+    state: &AppState,
+    intent: &crate::model::NormalizedIntent,
+) -> Result<PublicationRefusals, ApiError> {
+    let store = state.store.clone();
+    let node = state.node.clone();
+    let intent = intent.clone();
+    blocking_action(move || {
+        let references = store.unresolved_references(&intent)?;
+        let publication = intent.subjects.values().collect::<Vec<_>>();
+        // Render reads the workspace and asks git about tracked files, so it runs only for a
+        // publication that declares a member.
+        let renders = if publication.iter().any(|subject| subject.member.is_some()) {
+            let current = store
+                .desired_subjects()
+                .map_err(|error| St3Error::new("internal", error.to_string()))?;
+            crate::render::publication_refusals(&store, &publication, &current, &node)
+        } else {
+            Vec::new()
+        };
+        Ok(PublicationRefusals {
+            references,
+            renders,
+        })
+    })
+    .await
 }
 
 async fn apply(
@@ -6962,6 +7070,9 @@ async fn apply(
         for revision in declaration.revisions.values() {
             require_agent_mission_authority(&state, actor, "revise", &revision.mission)?;
         }
+    }
+    if let Some(error) = publication_refusals(&state, &intent).await?.error() {
+        return Err(ApiError::bad(error));
     }
     let mut response = state
         .store
@@ -8577,7 +8688,7 @@ async fn revise_mission_run(
     .map_err(ApiError::bad)?;
     let mut publication = intent.clone();
     publication.subjects.clear();
-    let planned = state
+    let mut planned = state
         .store
         .mission(
             &publication,
@@ -8587,6 +8698,9 @@ async fn revise_mission_run(
             },
         )
         .map_err(ApiError::bad)?;
+    publication_refusals(&state, &publication)
+        .await?
+        .block(&mut planned);
     if !planned.blockers.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "mission-revision-blocked",
@@ -9148,7 +9262,7 @@ async fn publish_work_mission(
     }
     let mut publication = intent.clone();
     publication.subjects.clear();
-    let planned = state
+    let mut planned = state
         .store
         .mission(
             &publication,
@@ -9158,6 +9272,9 @@ async fn publish_work_mission(
             },
         )
         .map_err(ApiError::bad)?;
+    publication_refusals(&state, &publication)
+        .await?
+        .block(&mut planned);
     if !planned.blockers.is_empty() {
         return Err(ApiError::bad(St3Error::new(
             "mission-output-blocked",
@@ -12308,6 +12425,169 @@ agent "good" {{ workspace {:?}; command "true" }}
         );
     }
 
+    async fn preview_and_apply(app: Router, kdl: &str) -> (Value, StatusCode, Value) {
+        let (status, preview) = json_request(
+            app.clone(),
+            "/v1/intent/mission",
+            serde_json::to_value(MissionRequest {
+                intent: crate::model::IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+                at_index: None,
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{preview}");
+        let (status, applied) = json_request(
+            app,
+            "/v1/intent/apply",
+            serde_json::to_value(ApplyRequest {
+                intent: crate::model::IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+                expected_subjects: serde_json::from_value(preview["subject_tokens"].clone())
+                    .unwrap(),
+                idempotency_key: format!("apply-{}", hex::encode(Sha256::digest(kdl))),
+                actor: Some("person/nathan".into()),
+            })
+            .unwrap(),
+        )
+        .await;
+        (preview, status, applied)
+    }
+
+    #[tokio::test]
+    async fn publication_refuses_a_reference_that_does_not_resolve_without_a_write() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let app = router(state);
+        let before = store.index().unwrap();
+        let kdl = r#"version 2
+mission "work" state="ready" {
+  goal "Complete the work."
+  step "do-work" { assigned-to "agent/fleet/nobody" }
+}"#;
+        let refusal =
+            "mission `mission/work` references missing eligible agent `agent/fleet/nobody`";
+
+        let (preview, status, error) = preview_and_apply(app.clone(), kdl).await;
+        assert_eq!(preview["blockers"], json!([refusal]));
+        assert_eq!(preview["warnings"], json!([]));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        assert_eq!(error["code"], "unresolved-reference");
+        assert_eq!(error["details"]["refusals"], json!([refusal]));
+        assert_eq!(store.index().unwrap(), before);
+
+        let declared =
+            format!("{kdl}\nagent \"fleet/nobody\" {{ workspace \"/tmp\"; command \"true\" }}");
+        let (preview, status, applied) = preview_and_apply(app, &declared).await;
+        assert_eq!(preview["blockers"], json!([]));
+        assert_eq!(status, StatusCode::OK, "{applied}");
+    }
+
+    #[tokio::test]
+    async fn publication_refuses_a_render_that_would_fail_on_this_host() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let store = state.store.clone();
+        let app = router(state);
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace_path = workspace.path().display().to_string();
+        for args in [&["init", "-q"][..], &["add", "tracked"][..]] {
+            if args[0] == "add" {
+                std::fs::write(workspace.path().join("tracked"), "original\n").unwrap();
+            }
+            assert!(
+                std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(workspace.path())
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+
+        let (_, status, applied) = preview_and_apply(
+            app.clone(),
+            &format!(
+                "version 2\nagent \"one\" {{ workspace {workspace_path:?}; command \"true\"; render {{ file \"shared\" \"one\" }} }}"
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{applied}");
+        let before = store.index().unwrap();
+
+        let kdl = format!(
+            r#"version 2
+agent "two" {{ workspace {workspace_path:?}; command "true"; render {{ file "shared" "two" }} }}
+agent "three" {{ workspace {workspace_path:?}; command "true"; render {{ file "tracked" "changed" }} }}
+agent "four" {{ workspace {workspace_path:?}; command "true"; render {{ file "own" "a"; file "own" "b" }} }}
+"#
+        );
+        let (preview, status, error) = preview_and_apply(app, &kdl).await;
+        let shared = workspace.path().join("shared");
+        let own = workspace.path().join("own");
+        let tracked = workspace.path().join("tracked");
+        let refusals = json!([
+            format!(
+                "prepare render for agent/node.four in {workspace_path}: render operations disagree about {}",
+                own.display()
+            ),
+            format!(
+                "prepare render for agent/node.three in {workspace_path}: render refuses to change tracked file {}",
+                tracked.display()
+            ),
+            format!(
+                "render owners agent/node.one and agent/node.two disagree about {}",
+                shared.display()
+            ),
+        ]);
+        assert_eq!(preview["blockers"], refusals);
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        assert_eq!(error["code"], "render-refused");
+        assert_eq!(error["details"]["refusals"], refusals);
+        assert_eq!(store.index().unwrap(), before);
+        assert!(!shared.exists());
+    }
+
+    #[tokio::test]
+    async fn st_doctor_reports_graph_references_that_no_longer_resolve() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        state
+            .store
+            .apply_internal(
+                &crate::graph::parse_intent(
+                    r#"version 2
+mission "work" state="ready" {
+  goal "Complete the work."
+  step "do-work" { assigned-to "agent/fleet/nobody" }
+}"#,
+                    "node",
+                )
+                .unwrap(),
+                "published before the reference checks",
+            )
+            .unwrap();
+        let (status, doctor) = get_request(router(state), "/v1/doctor").await;
+        assert_eq!(status, StatusCode::OK, "{doctor}");
+        let check = doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "graph-references")
+            .expect("doctor checks graph references");
+        assert_eq!(check["status"], "warn");
+        assert_eq!(
+            check["message"],
+            "1 reference no longer resolves: mission `mission/work` references missing eligible agent `agent/fleet/nobody`"
+        );
+    }
+
     #[tokio::test]
     async fn preview_and_publish_reject_invalid_nested_declarations_without_a_write() {
         let root = tempfile::tempdir().unwrap();
@@ -14821,6 +15101,58 @@ version 2
         assert_eq!(revised["mission_run"]["root_revision"], run.root_revision);
         assert_eq!(revised["mission_run"]["steps"][0]["status"], "pending");
         assert_eq!(state.store.desired_subjects().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_mission_revision_refuses_a_reference_that_does_not_resolve() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"version 2
+mission "revision" state="ready" {
+  goal "Complete mission revision."
+  step "work" { agentless }
+}"#;
+        state
+            .store
+            .apply_internal(&parse_intent(source, "node").unwrap(), "revision-mission")
+            .unwrap();
+        let run = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "revision".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "revision-run".into(),
+            })
+            .unwrap();
+        let before = state.store.index().unwrap();
+        let (status, error) = json_request(
+            router(state.clone()),
+            &format!("/v1/mission-runs/{}/revision", run.id),
+            serde_json::to_value(MissionRevisionRequest {
+                intent: crate::model::IntentInput {
+                    kdl: source.replace("agentless", r#"assigned-to "agent/fleet/nobody""#),
+                    source_name: None,
+                },
+                actor: "person/test".into(),
+                reason: "hand the work to an agent".into(),
+                idempotency_key: "revision-missing-agent".into(),
+            })
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        assert_eq!(error["code"], "mission-revision-blocked");
+        assert!(
+            error["message"].as_str().unwrap().contains(
+                "mission `mission/revision` references missing eligible agent `agent/fleet/nobody`"
+            ),
+            "{error}"
+        );
+        assert_eq!(state.store.index().unwrap(), before);
     }
 
     #[tokio::test]
