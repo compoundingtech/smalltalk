@@ -2048,6 +2048,21 @@ enum ReplicationCommand {
         #[arg(long)]
         idempotency_key: Option<String>,
     },
+    /// Plan checkpoints that trim replicated history.
+    Checkpoint {
+        #[command(subcommand)]
+        command: CheckpointCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum CheckpointCommand {
+    /// Show what a checkpoint would drop from this node's store, proved on a copy. Changes nothing.
+    Plan {
+        /// The UTC day that names the checkpoint, such as 2026-09-27. Defaults to the newest due one.
+        #[arg(long)]
+        cut: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -6140,7 +6155,67 @@ async fn run_replication(
                 Ok(())
             }
         }
+        ReplicationCommand::Checkpoint {
+            command: CheckpointCommand::Plan { cut },
+        } => {
+            let request = st3::store::CheckpointPlanRequest { day: cut };
+            let plan: st3::store::CheckpointPlanView =
+                client.post("/v1/checkpoint/plan", &request).await?;
+            if json_output {
+                return print_value(&plan, true);
+            }
+            print!("{}", render_checkpoint_plan(&plan));
+            Ok(())
+        }
     }
+}
+
+fn render_checkpoint_plan(plan: &st3::store::CheckpointPlanView) -> String {
+    let mut output = String::new();
+    let percent = |part: usize, whole: usize| {
+        if whole == 0 {
+            0.0
+        } else {
+            part as f64 * 100.0 / whole as f64
+        }
+    };
+    output.push_str(&format!(
+        "CHECKPOINT  {} · dry run, nothing changed\n",
+        plan.checkpoint
+    ));
+    output.push_str(&format!(
+        "before the cut  {} envelopes · {} claims\n",
+        plan.sealed_envelopes, plan.sealed_claims
+    ));
+    output.push_str(&format!(
+        "would drop      {} envelopes · {} claims ({:.1}%)\n",
+        plan.dropped_envelopes,
+        plan.dropped_claims,
+        percent(plan.dropped_claims, plan.sealed_claims)
+    ));
+    for (kind, count) in &plan.by_kind {
+        output.push_str(&format!(
+            "  {kind}  {} of {}\n",
+            count.dropped, count.sealed
+        ));
+    }
+    let proof = &plan.proof;
+    if proof.passed {
+        output.push_str(&format!(
+            "proof           passed · graph and {} subjects' readers unchanged\n",
+            proof.subjects
+        ));
+    } else {
+        output.push_str(&format!(
+            "proof           FAILED · a checkpoint would not verify: {}\n",
+            proof.mismatches.join(", ")
+        ));
+    }
+    output.push_str(&format!("rules-digest    {}\n", plan.rules_digest));
+    output.push_str(&format!("sealed-digest   {}\n", plan.sealed_digest));
+    output.push_str(&format!("drop-digest     {}\n", plan.drop_digest));
+    output.push_str(&format!("graph-digest    {}\n", proof.graph_digest));
+    output
 }
 
 fn run_service(command: ServiceCommand, json_output: bool) -> Result<()> {
