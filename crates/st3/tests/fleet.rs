@@ -1586,19 +1586,20 @@ async fn the_fabric_transport_works_through_the_worker_alone() {
     wait_for_notes(&b, &expected, 60, &[&a, &b]).await;
 
     let calls = fs::read_to_string(registry.join("calls")).unwrap();
-    for (node, peer) in [("a", "b"), ("b", "a")] {
+    for node in ["a", "b"] {
         assert!(
             calls.contains(&format!("{node}-fabric-id expose st3/fleet/"))
                 && calls.contains("--ephemeral"),
             "{node} did not expose itself ephemerally:\n{calls}"
         );
-        assert!(
-            calls.contains(&format!(
-                "{node}-fabric-id dial {peer}-fabric-id st3/fleet/"
-            )),
-            "{node} never dialed {peer} through Fabric:\n{calls}"
-        );
     }
+    // An exchange synchronizes both directions, so the first successful dial can
+    // drain both notes before the other worker has any reason to dial.
+    assert!(
+        calls.contains("a-fabric-id dial b-fabric-id st3/fleet/")
+            || calls.contains("b-fabric-id dial a-fabric-id st3/fleet/"),
+        "neither node dialed through Fabric:\n{calls}"
+    );
     let inbox = registry.join("home-b/inbox");
     assert!(
         walkdir::WalkDir::new(&inbox)
