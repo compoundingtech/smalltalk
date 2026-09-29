@@ -1193,6 +1193,111 @@ fn a_runtime_that_never_stops_ends_its_run_at_the_cleanup_deadline() {
     );
 }
 
+/// Replicate `source`, which runs as `label`, into `target` until both hold the same claims, and
+/// project what arrived.
+fn replicate(source: &Store, label: &str, target: &Store) {
+    const FLEET: &str = "fault-isolation";
+    source.bind_fleet(FLEET).unwrap();
+    target.bind_fleet(FLEET).unwrap();
+    for _ in 0..100 {
+        let inventory = target.replication_inventory().unwrap();
+        if inventory.digest == source.replication_inventory().unwrap().digest {
+            break;
+        }
+        let exchange = source
+            .export_replication_exchange(FLEET, &inventory)
+            .unwrap();
+        target
+            .receive_replication_exchange(label, FLEET, &exchange)
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        target.apply_replication_repairs().unwrap();
+    }
+    assert!(
+        target.project_replication_backlog().unwrap(),
+        "the graph is stale: {:?}",
+        quarantined(target)
+    );
+}
+
+/// The quarantined claims a store names, as `(aggregate, message)`.
+fn quarantined(store: &Store) -> Vec<(String, String)> {
+    store
+        .replication_status(false, None, &[])
+        .unwrap()
+        .unhealthy
+        .into_iter()
+        .map(|projection| {
+            (
+                projection.aggregate,
+                projection.error_message.unwrap_or_default(),
+            )
+        })
+        .collect()
+}
+
+/// A planning claim that admission accepts but the planning projection cannot read, such as one
+/// from a faulty or older producer, is quarantined on its own. The peer that receives it still
+/// projects every other claim and starts their work, and the store that holds it still opens.
+#[test]
+fn a_planning_claim_that_cannot_be_projected_holds_back_nothing_else() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("source.sqlite3");
+    let source = Store::open(&path, "source").unwrap();
+    let bad = source
+        .append_claim(&ClaimInput {
+            subject: "planning-session/bad".into(),
+            kind: "planning-session.started".into(),
+            actor: Some("person/operator".into()),
+            fields: BTreeMap::new(),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: None,
+        })
+        .unwrap();
+    let healthy = r#"version 2
+mission "healthy" state="ready" {
+  goal "Run beside a planning claim that cannot be projected."
+  agent "worker" { workspace "${ST_WORKSPACE}"; command "sleep 600"; restart "never" }
+  step "wait" { assigned-to "agent/${ST_MISSION_RUN}/worker"; goal "Wait." }
+}"#;
+    let intent = st3::parse_intent(healthy, "source").unwrap();
+    let preview = source
+        .mission(
+            &intent,
+            IntentInput {
+                kdl: healthy.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    source
+        .apply(&intent, &preview.subject_tokens, "publish-healthy")
+        .unwrap();
+    let expected = |store: &Store| {
+        let quarantined = quarantined(store);
+        assert_eq!(quarantined.len(), 1, "{quarantined:?}");
+        assert_eq!(quarantined[0].0, format!("projection:planning:{}", bad.id));
+        assert!(
+            quarantined[0].1.contains("planning-session/bad"),
+            "{quarantined:?}"
+        );
+    };
+
+    let host = Host::new();
+    replicate(&source, "source", &host.store);
+    let run = host.start_mission("healthy", "healthy");
+    host.pass(4);
+    assert!(host.runtime.running(&host.worker(&run)));
+    expected(&host.store);
+
+    drop(source);
+    let source = Store::open(&path, "source").unwrap();
+    expected(&source);
+    source.rebuild_claim_projections().unwrap();
+    expected(&source);
+}
+
 /// Two missions in one document start separate runs, so an agent one of them declares for its run
 /// never resolves the other's reference. Publication refuses the mission that declares nothing,
 /// and when such a mission was published before that check, its run waits while the other runs.
