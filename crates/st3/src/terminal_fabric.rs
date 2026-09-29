@@ -280,7 +280,11 @@ pub async fn serve_stdio(pty_root: &Path) -> Result<()> {
         .send(stream.try_clone()?)
         .context("the tunnel closed before the splice")?;
     let mut from_session = stream;
-    tokio::task::spawn_blocking(move || std::io::copy(&mut from_session, &mut stdout)).await??;
+    // A closed tunnel is how the attach client leaves, so neither direction's end is an error.
+    tokio::task::spawn_blocking(move || {
+        let _ = std::io::copy(&mut from_session, &mut stdout);
+    })
+    .await?;
     Ok(())
 }
 
