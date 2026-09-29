@@ -912,6 +912,9 @@ fn request_deadline(path: &str, deadlines: ClientDeadlines) -> Duration {
         || path.starts_with("/v1/internal/replication/checkpoint")
     {
         deadlines.bulk
+    } else if path.starts_with("/v1/internal/replication/heal/") {
+        // A heal can replay the graph from nothing, 41 seconds on a 2 GB store.
+        Duration::from_secs(10 * 60)
     } else if path.starts_with("/v1/checkpoint/plan") || path.starts_with("/v1/checkpoint/status")
     {
         // A dry run copies the store and replays it twice; status reads what is sealed.
