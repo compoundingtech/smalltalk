@@ -2140,7 +2140,7 @@ mod tests {
             ..claim.clone()
         };
         assert_eq!(
-            drop_digest(&[envelope.clone()], &[claim.clone(), other.clone()]),
+            drop_digest(std::slice::from_ref(&envelope), &[claim.clone(), other.clone()]),
             drop_digest(&[envelope], &[other, claim])
         );
     }
@@ -2470,8 +2470,8 @@ mod tests {
                 "alder-runtime",
             ))
             .unwrap();
-        assert_eq!(middle.predecessors, [older.id.clone()]);
-        assert_eq!(newest.predecessors, [middle.id.clone()]);
+        assert_eq!(middle.predecessors, std::slice::from_ref(&older.id));
+        assert_eq!(newest.predecessors, std::slice::from_ref(&middle.id));
         let source = |store: &Store| {
             selected_actual_source_at(&store.readers.get(), AGENT, None, None).unwrap()
         };
