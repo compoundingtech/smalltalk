@@ -193,11 +193,24 @@ impl Node {
             .unwrap();
         self.daemon = Some(daemon);
         let client = self.client();
-        wait_until(&format!("{} daemon starts", self.name), 30, || {
-            let client = client.clone();
-            async move { client.get::<Value>("/v1/health").await.is_ok() }
-        })
-        .await;
+        // The pinned compatibility build may be cold while other CI lanes compile.
+        // Give startup room for that load, and preserve its logs if it fails to start.
+        let deadline = Instant::now() + Duration::from_secs(90);
+        loop {
+            if client.get::<Value>("/v1/health").await.is_ok() {
+                break;
+            }
+            if let Some(status) = self.daemon.as_mut().unwrap().try_wait().unwrap() {
+                panic!("{} daemon exited with {status}:\n{}", self.name, self.logs());
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting until {} daemon starts:\n{}",
+                self.name,
+                self.logs()
+            );
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
         let legacy = fs::read_to_string(self.root.join("config/st3/config.toml"))
             .is_ok_and(|config| config.contains("fleet_id"));
         if legacy || self.state_dir().join("fleet/fleet.toml").exists() {
