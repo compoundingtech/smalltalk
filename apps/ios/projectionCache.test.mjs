@@ -7,6 +7,8 @@ const data = {
   ...emptyData,
   attention: [{ id: 'attention/1', kind: 'attention', title: 'Review', credential: 'must-not-persist', nested: { preview_token: 'also-secret' } }],
   sessions: [{ id: 'session/1', kind: 'session', owner_id: 'agent/one', state: 'running' }],
+  missions: [{ id: 'mission/1', kind: 'mission', title: 'fleet/app/release', run_details: [{ id: 'mission-run/1', steps: [{ id: 'step-run/1/build', path: 'build', state: 'claimed' }] }] }],
+  agents: [{ id: 'agent/one', kind: 'agent', name: 'fleet/app', next_work: { id: 'step-run/1/ship', path: 'ship', state: 'ready' } }],
 };
 const encoded = encodeProjectionCache(gateway, 'person/one', 'host/hetz', 42, data, now);
 assert.ok(encoded);
@@ -16,12 +18,17 @@ const hydrated = decodeProjectionCache(encoded, gateway, now + 1000);
 assert.equal(hydrated?.actor, 'person/one');
 assert.equal(hydrated?.storeIndex, 42);
 assert.equal(hydrated?.data.sessions[0].id, 'session/1');
+// Rows keep what st joined into them, so a cached Control or Chat tab draws without a work list.
+assert.equal(hydrated?.data.missions[0].run_details[0].steps[0].path, 'build');
+assert.equal(hydrated?.data.agents[0].next_work.path, 'ship');
 assert.equal(hydrateProjectionForPairedDevice(encoded, gateway, false, now), null);
 assert.equal(hydrateProjectionForPairedDevice(encoded, gateway, true, now)?.data.attention[0].title, 'Review');
 assert.equal(decodeProjectionCache(encoded, 'https://other.invalid', now), null);
 assert.equal(decodeProjectionCache(encoded, gateway, now + 8 * 24 * 60 * 60 * 1000), null);
 assert.equal(decodeProjectionCache(encoded, gateway, now - 6 * 60 * 1000), null);
-assert.equal(decodeProjectionCache(encoded.replace('"version":2', '"version":1'), gateway, now), null);
+// A cache from before rows carried their steps is dropped rather than drawn without them.
+assert.ok(encoded.includes('"version":3'));
+assert.equal(decodeProjectionCache(encoded.replace('"version":3', '"version":2'), gateway, now), null);
 assert.equal(decodeProjectionCache('{bad json', gateway, now), null);
 assert.equal(decodeProjectionCache(encoded.replace('"kind":"session"', '"kind":"terminal-attachment"'), gateway, now), null);
 assert.equal(offlinePresentation(false).title, 'Offline');

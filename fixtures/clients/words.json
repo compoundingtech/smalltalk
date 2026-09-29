@@ -102,14 +102,19 @@
       "glyph": "✕",
       "id": "failed",
       "name": "failed"
+    },
+    {
+      "explain": "it was stopped before it finished",
+      "glyph": "⊘",
+      "id": "cancelled",
+      "name": "cancelled"
     }
   ],
   "tabs": [
     "Home",
     "Agents",
     "Missions",
-    "Fleet",
-    "Worktrees"
+    "Fleet"
   ],
   "tier": [
     {
