@@ -227,7 +227,14 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str) -> Doc {
             let bar = run("▎ ", theme::fg(theme::SAPPHIRE));
             doc.lines(text::wrap(
                 &[
-                    run(format!("{from} → {to}"), theme::strong(theme::SAPPHIRE)),
+                    run(
+                        if to.is_empty() {
+                            from.clone()
+                        } else {
+                            format!("{from} → {to}")
+                        },
+                        theme::strong(theme::SAPPHIRE),
+                    ),
                     run(format!("  {}", text::sanitize(subject)), theme::bold()),
                     run(format!("  {}", entry.at), theme::dim()),
                 ],

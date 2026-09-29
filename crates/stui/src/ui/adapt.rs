@@ -766,12 +766,17 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
     };
     let mut stamped: Vec<(String, Entry)> = Vec::new();
     let mut tools: BTreeMap<String, usize> = BTreeMap::new();
-    // A Small Talk message is two entries: who wrote to whom, then what they wrote.
+    // A Small Talk message is two entries: who wrote to whom, then what they wrote. A
+    // harness transcript heads its own turns with message entries too; only a graph message,
+    // `message/…`, is Small Talk.
     let mut mail: Option<&st3_client::TimelineMessageBody> = None;
     for entry in timeline {
         let at = clock(&entry.timestamp);
         if let TimelineBody::Message(message) = &entry.body {
-            mail = Some(message);
+            mail = message
+                .message_id
+                .starts_with("message/")
+                .then_some(message);
             continue;
         }
         if let (Some(message), TimelineBody::Content(content)) = (mail.take(), &entry.body) {
@@ -786,9 +791,14 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                         .unwrap_or_else(|| body.lines().next().unwrap_or("").to_owned()),
                 )
             } else {
+                // An older st sends neither side; say what it is rather than draw a blank.
+                let (from, to) = match (from, message.to.as_deref()) {
+                    ("", None) => ("Small Talk".to_owned(), String::new()),
+                    (from, to) => (name(from), name(to.unwrap_or_default())),
+                };
                 Body::Mail {
-                    from: name(from),
-                    to: name(message.to.as_deref().unwrap_or_default()),
+                    from,
+                    to,
                     subject: message.title.clone().unwrap_or_default(),
                     body: if body.is_empty() {
                         "(notification)".into()
@@ -1153,6 +1163,8 @@ mod tests {
              "body":{"message_id":"message/two","from":"daemon/runtime","to":"agent/fleet/cos","title":"Mission step ready: review"}},
             {"id":"e4","sequence":9,"revision":1,"timestamp":"2026-09-29T10:01:00Z","role":"user","type":"content","final":true,
              "body":{"media_type":"text/plain","text":"A mission step is ready."}},
+            {"id":"e5a","sequence":11,"revision":1,"timestamp":"2026-09-29T10:02:00Z","role":"assistant","type":"message","final":true,
+             "body":{"message_id":"msg_harness_turn"}},
             {"id":"e5","sequence":12,"revision":1,"timestamp":"2026-09-29T10:02:00Z","role":"assistant","type":"content","final":true,
              "body":{"media_type":"text/plain","text":"On it."}}
         ]))
@@ -1178,6 +1190,7 @@ mod tests {
         assert!(
             matches!(&entries[1].body, Body::Event(title) if title == "Mission step ready: review")
         );
+        // A harness turn's own message header is not Small Talk.
         assert!(matches!(&entries[2].body, Body::Assistant(text) if text == "On it."));
     }
 
