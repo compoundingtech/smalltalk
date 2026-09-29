@@ -1,5 +1,7 @@
-// Shared by several test binaries; each one uses only the parts it needs.
+// Shared by the integration test modules; each one uses only the parts it needs.
 #![allow(dead_code)]
+
+pub mod real_git;
 
 use std::io;
 use std::ops::{Deref, DerefMut};

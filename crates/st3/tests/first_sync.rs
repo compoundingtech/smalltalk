@@ -2,7 +2,7 @@
 //! loopback, with the time split by stage on both nodes.
 //!
 //! ```sh
-//! TMPDIR=/var/tmp cargo test --release -p st3 --test first_sync -- --nocapture
+//! TMPDIR=/var/tmp cargo test --release -p st3 --test integration first_sync:: -- --nocapture
 //! ```
 //!
 //! A debug build skips it, as does a Nix build, whose sandbox is no place to time a sync.

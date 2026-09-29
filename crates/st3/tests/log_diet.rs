@@ -18,7 +18,7 @@
 //! `doc/fleet/smalltalk/claim-log-diet` is the ten-minute run:
 //!
 //! ```sh
-//! cargo test -p st3 --test log_diet -- --ignored --nocapture
+//! cargo test -p st3 --test integration log_diet:: -- --ignored --nocapture
 //! ```
 //!
 //! Inside an st3 harness, unset `ST_AGENT` first: the local API binds a caller to the agent in

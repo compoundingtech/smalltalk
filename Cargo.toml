@@ -52,6 +52,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Harness-agnostic runner: reconcile a unified catalog+inbox folder of rendered agent specs, keep their ptys running, and deliver messages by moving inbox files."
 license = "MIT"
+# Every file in tests/ is a module of one test binary; see tests/integration.rs.
+autotests = false
 
 [[bin]]
 name = "st2"
@@ -60,6 +62,27 @@ path = "src/main.rs"
 [lib]
 name = "st2"
 path = "src/lib.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+# These set process-wide environment variables, so each stays a test binary of its own.
+[[test]]
+name = "agent_resource"
+path = "tests/agent_resource.rs"
+
+[[test]]
+name = "driver_expansion"
+path = "tests/driver_expansion.rs"
+
+[[test]]
+name = "event_e2e"
+path = "tests/event_e2e.rs"
+
+[[test]]
+name = "resource_profile_supervisor_e2e"
+path = "tests/resource_profile_supervisor_e2e.rs"
 
 [dependencies]
 # Sync by design: the runner is I/O-light (shell-outs to `pty` plus a

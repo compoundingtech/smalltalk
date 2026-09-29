@@ -41,6 +41,6 @@ jobs:
       - name: Replicate between the baseline and new members
         run: |
           test -n "$ST3_COMPAT_BIN"
-          nix develop --command cargo test -p st3 --test fleet -- --ignored --exact \
-            an_old_build_config_peer_replicates_with_new_members 2>&1 | tee compat.log
+          nix develop --command cargo test -p st3 --test integration -- --ignored --exact \
+            fleet::an_old_build_config_peer_replicates_with_new_members 2>&1 | tee compat.log
           grep -q "test result: ok. 1 passed" compat.log

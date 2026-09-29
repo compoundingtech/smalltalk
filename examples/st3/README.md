@@ -4,7 +4,7 @@ Each KDL file here is a complete, runnable example. Its header comment says what
 commands that run it. Every file passes the normative st parser in the test suite:
 
 ```sh
-cargo test -p st3 --test examples
+cargo test -p st3 --test integration examples::
 ```
 
 All names, repositories, paths, and people are invented. Replace them before you use an example.
