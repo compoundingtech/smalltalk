@@ -11932,6 +11932,9 @@ impl Store {
     fn replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
         let store_index = self.index()?;
         let replica_generation = self.replica_generation.load(Ordering::Acquire);
+        // The store index never moves back, so deleting the newest claim leaves it unchanged.
+        // The graph generation moves with every change to a digested table.
+        let current_graph_generation = graph_generation(&self.readers.get())?;
         if let Some(snapshot) = self
             .replication_snapshot
             .lock()
@@ -11940,6 +11943,7 @@ impl Store {
             .filter(|snapshot| {
                 snapshot.store_index == store_index
                     && snapshot.replica_generation == replica_generation
+                    && snapshot.graph_generation == current_graph_generation
             })
             .cloned()
         {
