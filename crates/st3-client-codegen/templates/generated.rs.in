@@ -718,6 +718,8 @@ pub struct Agent {
     #[serde(default)]
     pub usage: Option<UsageSummary>,
     #[serde(default)]
+    pub mission_authority: Option<AgentMissionAuthority>,
+    #[serde(default)]
     pub under: Vec<AgentRelationship>,
     #[serde(default)]
     pub delivery: Option<AgentDelivery>,
@@ -732,6 +734,19 @@ pub struct AgentDelivery {
     pub polled_seconds_ago: Option<u64>,
     #[serde(default)]
     pub transport: Option<String>,
+}
+/// The missions an agent may publish, start, and revise, and where that authority comes from:
+/// `declared` (its `mission-authority`), `default` (a person-declared top-level seat
+/// `fleet/PROJECT/...` holds `fleet/PROJECT/*`), or `none`.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct AgentMissionAuthority {
+    pub source: String,
+    #[serde(default)]
+    pub publish: Vec<String>,
+    #[serde(default)]
+    pub start: Vec<String>,
+    #[serde(default)]
+    pub revise: Vec<String>,
 }
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]

@@ -189,6 +189,12 @@ at most five items each. Ready work follows the agent's seat queue: mission runs
 then step creation time and subject ID inside one run. These fields describe the queue and do not
 imply that an active claim is making progress.
 
+`mission_authority` lists the missions the agent may publish, start, and revise, as exact mission
+IDs or terminal `/*` namespaces. Its `source` is `declared` when the declaration carries
+`mission-authority`, `default` for a person-declared top-level seat `fleet/PROJECT/...` (which
+holds `fleet/PROJECT/*`), and `none` otherwise. It is `null` for an agent with no current
+declaration.
+
 `GET /v1/client/agent-queues/{agent_id}` returns one `AgentQueue` value for a seat: its
 `current_work_ids`, its `next_work_id`, each queued mission run in order with `position`, `state`
 (`claimed`, `ready`, or `waiting`), the run's own state, its join time, and its claimed, ready, and

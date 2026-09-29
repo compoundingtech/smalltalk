@@ -158,6 +158,11 @@ Use `st agents apply`, or `st agents start ... --print-kdl` followed by the same
 the preview flag. Stop a seat explicitly with `st agents stop`. Mission revisions change mission
 work and generations without changing the seat's identity.
 
+A seat named `fleet/PROJECT/...` that a person declares may publish, start, and revise its
+project's missions under `fleet/PROJECT/*`, so it can put person-authorized work in the graph
+itself. [Agent mission authority](#agent-mission-authority) describes the default and how a
+declaration narrows or withholds it.
+
 ## Ordered queue authoring
 
 Use `queue` when source order is an intentional one-at-a-time workflow.
@@ -221,7 +226,22 @@ A human-protected revision creates a durable revision proposal. The named operat
 
 ## Agent mission authority
 
-An agent has no mission publication, start, or revision authority by default.
+A top-level seat named `fleet/PROJECT` or `fleet/PROJECT/...` that a person declared may publish,
+start, and revise missions under `fleet/PROJECT/*` by default. The seat
+`fleet/website/standing/website` may publish `fleet/website/refresh` and start and revise its runs,
+and no mission of another project. `st agents show` prints the authority and its source:
+
+```text
+AUTHORITY    publish, start, revise mission/fleet/website/* (default)
+```
+
+No other agent holds mission authority by default. An agent declared inside a mission stays bounded
+by that mission, even when its run ID puts it under `fleet/PROJECT/`. A seat whose current
+declaration an agent wrote with `seat-authority` holds nothing by default, so an agent never lends
+a seat authority it lacks; the seat regains the default when a person declares it again. st records
+the writer on each declaration; a declaration from before st recorded writers counts as a person's.
+
+A `mission-authority` block in the declaration replaces the default:
 
 ```kdl
 mission-authority {
@@ -231,7 +251,9 @@ mission-authority {
 }
 ```
 
-Put this block inside the agent declaration. Use exact mission IDs or terminal `/*` namespaces without the `mission/` prefix.
+Use exact mission IDs or terminal `/*` namespaces without the `mission/` prefix. Name narrower
+rules than the default, such as `publish "fleet/website/docs/*"`, or withhold all mission authority
+with `mission-authority "none"`. Only a person writes either form into a top-level seat.
 
 An agent publishing a generated nested mission needs `publish` authority, a claimed producing step,
 and an exact `produces-mission` match. Use `st work publish-mission` for that case.

@@ -3838,6 +3838,107 @@ mission "bad" state="ready" { goal "Reject a duplicate rule."; agent "bad" { wor
     }
 
     #[test]
+    fn a_top_level_project_seat_holds_its_namespace_unless_its_declaration_says_otherwise() {
+        use crate::model::MissionAuthoritySource::{Declared, Default, None};
+
+        let intent = crate::graph::parse_intent(
+            r#"version 2
+agent "fleet/website/standing/website" { workspace "."; command "true"; }
+agent "fleet/website" { workspace "."; command "true"; }
+agent "fleet/docs/standing/docs" {
+  workspace "."
+  command "true"
+  mission-authority { publish "fleet/docs/guides/*" }
+}
+agent "fleet/quiet/standing/quiet" { workspace "."; command "true"; mission-authority "none"; }
+agent "planner" { workspace "."; command "true"; }
+mission "fleet/crew/host" state="ready" {
+  goal "Hold one mission-scoped seat."
+  agent "helper" { workspace "."; command "true"; }
+}"#,
+            "node",
+        )
+        .unwrap();
+        let effective = |subject: &str, declared_by_agent: bool| {
+            crate::graph::effective_agent_mission_authority(
+                &intent.subjects[subject],
+                declared_by_agent,
+            )
+        };
+
+        let website = effective("agent/fleet/website/standing/website", false);
+        assert_eq!(website.source, Default);
+        for verb in ["publish", "start", "revise"] {
+            assert!(website.authority.allows(verb, "fleet/website/refresh"));
+            assert!(
+                website
+                    .authority
+                    .allows(verb, "fleet/website/refresh/nightly")
+            );
+            assert!(!website.authority.allows(verb, "fleet/website"));
+            assert!(!website.authority.allows(verb, "fleet/websites/refresh"));
+            assert!(!website.authority.allows(verb, "fleet/other/refresh"));
+        }
+        let project = effective("agent/fleet/website", false);
+        assert_eq!(project.source, Default);
+        assert_eq!(project.authority, website.authority);
+
+        let docs = effective("agent/fleet/docs/standing/docs", false);
+        assert_eq!(docs.source, Declared);
+        assert!(docs.authority.allows("publish", "fleet/docs/guides/intro"));
+        assert!(!docs.authority.allows("publish", "fleet/docs/release"));
+        assert!(!docs.authority.allows("start", "fleet/docs/guides/intro"));
+        let quiet = effective("agent/fleet/quiet/standing/quiet", false);
+        assert_eq!(quiet.source, Declared);
+        assert_eq!(quiet.authority, crate::model::MissionAuthority::default());
+
+        for (source, declared_by_agent) in [
+            ("agent/fleet/website/standing/website", true),
+            ("agent/node.planner", false),
+        ] {
+            let effective = effective(source, declared_by_agent);
+            assert_eq!(effective.source, None, "{source}");
+            assert_eq!(
+                effective.authority,
+                crate::model::MissionAuthority::default()
+            );
+        }
+
+        // A run's seat is named under the run, here a project namespace, and still holds nothing.
+        let runtime = crate::graph::parse_execution_intent(
+            intent.missions["fleet/crew/host"]
+                .declarations_kdl
+                .as_deref()
+                .unwrap(),
+            "node",
+            "fleet/crew/host/one",
+        )
+        .unwrap();
+        let helper = crate::graph::effective_agent_mission_authority(
+            &runtime.subjects["agent/fleet/crew/host/one/helper"],
+            false,
+        );
+        assert_eq!(helper.source, None);
+        assert_eq!(helper.authority, crate::model::MissionAuthority::default());
+
+        for source in [
+            r#"version 2
+agent "fleet/bad/seat" { workspace "."; command "true"; mission-authority "all"; }"#,
+            r#"version 2
+agent "fleet/bad/seat" { workspace "."; command "true"; mission-authority "none" { publish "fleet/bad/*" } }"#,
+            r#"version 2
+agent "fleet/bad/seat" { workspace "."; command "true"; mission-authority "none" "none"; }"#,
+            r#"version 2
+agent "fleet/bad/seat" { workspace "."; command "true"; mission-authority none=#true; }"#,
+        ] {
+            assert!(
+                crate::graph::parse_intent(source, "node").is_err(),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
     fn agent_queue_authority_uses_exact_and_terminal_seat_rules() {
         let intent = crate::graph::parse_intent(
             r#"version 2
