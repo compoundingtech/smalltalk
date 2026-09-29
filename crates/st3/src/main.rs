@@ -1451,6 +1451,9 @@ enum MissionViewCommand {
     Tree,
     /// List current missions; use --all for historical terminal missions.
     Ls {
+        /// Follow current collection changes.
+        #[arg(long, conflicts_with_all = ["all", "cursor"])]
+        watch: bool,
         #[arg(long)]
         all: bool,
         #[arg(long)]
@@ -2098,6 +2101,9 @@ enum ImportCommand {
 
 #[derive(Args)]
 struct AgentsArgs {
+    /// Follow current collection changes.
+    #[arg(long, conflicts_with_all = ["all", "cursor"])]
+    watch: bool,
     #[arg(long)]
     status: Option<String>,
     #[arg(long)]
@@ -2290,6 +2296,9 @@ struct SubscriptionRequestArgs {
 enum AttentionCommand {
     /// List all current human attention items.
     Ls {
+        /// Follow current collection changes.
+        #[arg(long, conflicts_with_all = ["all", "cursor"])]
+        watch: bool,
         #[arg(long = "as", value_parser = parse_person_subject)]
         actor: Option<String>,
         /// Include resolved and historical attention.
@@ -2381,6 +2390,9 @@ struct AttentionWithdrawArgs {
 enum WorkCommand {
     /// List current actionable work; use --as to filter one agent or --all for history.
     Ls {
+        /// Follow current collection changes.
+        #[arg(long, conflicts_with_all = ["all", "cursor"])]
+        watch: bool,
         #[arg(long = "as")]
         actor: Option<String>,
         #[arg(long)]
@@ -3589,11 +3601,29 @@ async fn run_mission_view(
                 Ok(())
             }
         }
-        MissionViewCommand::Ls { all, cursor, limit } => {
+        MissionViewCommand::Ls {
+            watch,
+            all,
+            cursor,
+            limit,
+        } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
                 "the mission limit must be 1 through 200"
             );
+            if watch {
+                return run_collection_watch(
+                    endpoint,
+                    None,
+                    "missions",
+                    None,
+                    None,
+                    limit,
+                    "MISSIONS",
+                    json_output,
+                )
+                .await;
+            }
             let response = generated_client(endpoint, None)?
                 .missions_list(cursor.as_deref(), Some(limit), all)
                 .await?;
@@ -4840,6 +4870,113 @@ fn print_product_page(
     Ok(())
 }
 
+async fn run_collection_watch(
+    endpoint: &Endpoint,
+    person: Option<&str>,
+    collection: &str,
+    actor: Option<&str>,
+    status: Option<&str>,
+    limit: usize,
+    title: &str,
+    json_output: bool,
+) -> Result<()> {
+    let client = generated_client(endpoint, person)?;
+    let mut rows = BTreeMap::<String, Value>::new();
+    loop {
+        let mut stream = match client.collection_stream().await {
+            Ok(stream) => stream,
+            Err(GeneratedClientError::Transport(_) | GeneratedClientError::Unreachable(_)) => {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                continue;
+            }
+            Err(error) => return Err(error.into()),
+        };
+        stream
+            .subscribe("list", collection, limit, actor, status)
+            .await?;
+        loop {
+            let frame = match stream.next().await {
+                Ok(Some(frame)) => frame,
+                Ok(None)
+                | Err(GeneratedClientError::Transport(_))
+                | Err(GeneratedClientError::Unreachable(_)) => break,
+                Err(error) => return Err(error.into()),
+            };
+            match frame["kind"].as_str() {
+                Some("error") => anyhow::bail!(
+                    "collection watch: {}",
+                    frame["message"].as_str().unwrap_or("unknown error")
+                ),
+                Some("resync") => break,
+                Some("snapshot") => {
+                    rows.clear();
+                    for item in frame["items"].as_array().into_iter().flatten() {
+                        if let Some(id) = item["id"].as_str() {
+                            rows.insert(id.to_owned(), item.clone());
+                        }
+                    }
+                }
+                Some("changes") => {
+                    for id in frame["removes"]
+                        .as_array()
+                        .into_iter()
+                        .flatten()
+                        .filter_map(Value::as_str)
+                    {
+                        rows.remove(id);
+                    }
+                    for item in frame["upserts"].as_array().into_iter().flatten() {
+                        if let Some(id) = item["id"].as_str() {
+                            rows.insert(id.to_owned(), item.clone());
+                        }
+                    }
+                }
+                _ => continue,
+            }
+            let order = frame["order"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if json_output {
+                print_value(&frame, true)?;
+                continue;
+            }
+            let items = order
+                .iter()
+                .filter_map(|id| rows.get(id).cloned())
+                .collect::<Vec<_>>();
+            let page: ClientEnvelope<ClientPage> = serde_json::from_value(json!({
+                "api_version": CLIENT_V0_API_VERSION,
+                "request_id": "watch",
+                "snapshot": frame["snapshot"],
+                "value": {
+                    "kind": "page", "collection": collection, "filters": {}, "items": items,
+                    "page": {"limit":limit, "has_more":frame["has_more"], "next_cursor":null},
+                    "sync": null
+                }
+            }))?;
+            if std::io::stdout().is_terminal() {
+                print!("\x1b[2J\x1b[H");
+            }
+            if collection == "agents" {
+                print!(
+                    "{}",
+                    render_client_agents(&page.value, false, false, "st agents ls --watch")
+                );
+            } else {
+                print_product_page(title, &page, false, &format!("st {collection} ls --watch"))?;
+            }
+            std::io::stdout().flush()?;
+        }
+        // The socket ended (including daemon restart). Reopen and subscribe for
+        // a fresh snapshot rather than attempting to resume a stale projection.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
 /// A host catching up with a peer shows early history as current, so say so before the items.
 fn render_sync_notice(sync: &st3_client::SyncNotice, now: u128) -> String {
     use std::fmt::Write as _;
@@ -5144,7 +5281,9 @@ async fn run_usage(client: &Client, args: UsageArgs, json_output: bool) -> Resul
     anyhow::ensure!(args.hours > 0, "usage hours must be positive");
     let until = current_unix_ms()? as u64;
     let since = until.saturating_sub(args.hours.saturating_mul(3_600_000));
-    let report: Value = client.get(&format!("/v1/usage?since_ms={since}&until_ms={until}")).await?;
+    let report: Value = client
+        .get(&format!("/v1/usage?since_ms={since}&until_ms={until}"))
+        .await?;
     if json_output {
         println!("{}", serde_json::to_string_pretty(&report)?);
         return Ok(());
@@ -5158,7 +5297,12 @@ fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> Str
 
     let mut output = String::new();
     let groups = only.map(|by| vec![by]).unwrap_or_else(|| {
-        vec![UsageBy::Agent, UsageBy::Mission, UsageBy::Model, UsageBy::Host]
+        vec![
+            UsageBy::Agent,
+            UsageBy::Mission,
+            UsageBy::Model,
+            UsageBy::Host,
+        ]
     });
     for by in groups {
         let mut totals = BTreeMap::<String, [u64; 5]>::new();
@@ -5188,7 +5332,11 @@ fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> Str
             }
         }
         let mut totals = totals.into_iter().collect::<Vec<_>>();
-        totals.sort_by(|left, right| right.1[0].cmp(&left.1[0]).then_with(|| left.0.cmp(&right.0)));
+        totals.sort_by(|left, right| {
+            right.1[0]
+                .cmp(&left.1[0])
+                .then_with(|| left.0.cmp(&right.0))
+        });
         let by = match by {
             UsageBy::Agent => "agent",
             UsageBy::Mission => "mission",
@@ -5199,7 +5347,10 @@ fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> Str
             output.push('\n');
         }
         let _ = writeln!(output, "USAGE  {} · {}h · by {by}", totals.len(), hours);
-        let _ = writeln!(output, "TOTAL  INPUT  OUTPUT  CACHE WRITE  CACHE READ  {by}");
+        let _ = writeln!(
+            output,
+            "TOTAL  INPUT  OUTPUT  CACHE WRITE  CACHE READ  {by}"
+        );
         for (name, values) in totals {
             let _ = writeln!(
                 output,
@@ -6575,6 +6726,20 @@ async fn run_agent_inspection(
         args.limit > 0 && args.limit <= 200,
         "the agent limit must be 1 through 200"
     );
+    if args.watch {
+        anyhow::ensure!(!tree, "--watch applies to agents ls");
+        return run_collection_watch(
+            endpoint,
+            None,
+            "agents",
+            None,
+            args.status.as_deref(),
+            args.limit,
+            "AGENTS",
+            json_output,
+        )
+        .await;
+    }
     let generated = generated_client(endpoint, None)?;
     let response = if let Some(status) = args.status.as_deref() {
         generated
@@ -6988,8 +7153,14 @@ fn render_client_agent(
     if let Some(usage) = &agent.usage {
         let _ = writeln!(output, "USAGE        {}", render_usage(usage));
         if usage.incarnation_count > 0 {
-            let _ = writeln!(output, "TOKENS       input {} · output {} · cache write {} · cache read {}",
-                usage.input_tokens, usage.output_tokens, usage.cache_write_tokens, usage.cached_tokens);
+            let _ = writeln!(
+                output,
+                "TOKENS       input {} · output {} · cache write {} · cache read {}",
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.cache_write_tokens,
+                usage.cached_tokens
+            );
         }
     }
     for current in &agent.current_work_ids {
@@ -7416,6 +7587,7 @@ async fn run_attention(
 ) -> Result<()> {
     match command {
         AttentionCommand::Ls {
+            watch,
             actor,
             all,
             cursor,
@@ -7426,6 +7598,19 @@ async fn run_attention(
                 limit > 0 && limit <= 200,
                 "the attention limit must be 1 through 200"
             );
+            if watch {
+                return run_collection_watch(
+                    endpoint,
+                    Some(&actor),
+                    "attention",
+                    None,
+                    None,
+                    limit,
+                    &format!("HUMAN ATTENTION FOR {actor}"),
+                    json_output,
+                )
+                .await;
+            }
             let response = generated_client(endpoint, Some(&actor))?
                 .attention_list(cursor.as_deref(), Some(limit), all)
                 .await?;
@@ -7565,6 +7750,7 @@ async fn run_work(
 ) -> Result<()> {
     match command {
         WorkCommand::Ls {
+            watch,
             actor,
             all,
             cursor,
@@ -7577,6 +7763,19 @@ async fn run_work(
                 limit > 0 && limit <= 200,
                 "the work limit must be 1 through 200"
             );
+            if watch {
+                return run_collection_watch(
+                    endpoint,
+                    None,
+                    "work",
+                    actor.as_deref(),
+                    None,
+                    limit,
+                    "WORK",
+                    json_output,
+                )
+                .await;
+            }
             let generated = generated_client(endpoint, None)?;
             let response = if let Some(actor) = actor.as_deref() {
                 generated
@@ -9567,7 +9766,9 @@ fn timeline_claim_fields(
             Value::from(operation.observed_at_unix_ms),
         ),
     ]);
-    if fields["entry_type"] == "usage" && let Some(source_id) = operation.source_id {
+    if fields["entry_type"] == "usage"
+        && let Some(source_id) = operation.source_id
+    {
         fields.insert("source_id".into(), Value::String(source_id));
     }
     fields
@@ -11229,8 +11430,10 @@ mod tests {
         ]});
         let output = render_usage_report(&report, 24, None);
         assert_eq!(output.matches("USAGE  ").count(), 4);
-        assert!(output.find("40  7  3  4  26  agent/large").unwrap()
-            < output.find("9  2  1  0  6  agent/small").unwrap());
+        assert!(
+            output.find("40  7  3  4  26  agent/large").unwrap()
+                < output.find("9  2  1  0  6  agent/small").unwrap()
+        );
         assert!(output.contains("40  7  3  4  26  mission-run/two"));
         assert!(output.contains("40  7  3  4  26  model-b"));
         assert!(output.contains("40  7  3  4  26  host/b"));

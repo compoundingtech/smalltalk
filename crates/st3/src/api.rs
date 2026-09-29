@@ -323,6 +323,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             get(client_v0::operation_detail),
         )
         .route("/v1/client/events", get(client_v0::events))
+        .route(
+            "/v1/client/collections/stream",
+            get(client_v0::collection_stream),
+        )
         .route("/v1/client/actions", post(client_v0::action))
         .route("/v1/client/pairings", post(client_v0::pairing_begin))
         .route(

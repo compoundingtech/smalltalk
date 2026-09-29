@@ -380,6 +380,166 @@ fn test_state(root: &Path) -> AppState {
 }
 
 #[tokio::test]
+async fn collection_socket_multiplexes_snapshot_then_changes_and_resubscribes() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("client.sock");
+    let state = test_state(root.path());
+    let server_state = state.clone();
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move {
+        st3::api::serve_unix(&server_socket, st3::api::router(server_state))
+            .await
+            .unwrap();
+    });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let client = st3_client::Client::unix(&socket);
+    let mut stream = client.collection_stream().await.unwrap();
+    stream
+        .subscribe("missions", "missions", 20, None, None)
+        .await
+        .unwrap();
+    stream
+        .subscribe("agents", "agents", 20, None, None)
+        .await
+        .unwrap();
+    let first = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let second = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first["kind"], "snapshot");
+    assert_eq!(second["kind"], "snapshot");
+    assert_eq!(first["id"], "missions");
+    assert_eq!(second["id"], "agents");
+
+    let source =
+        "version 2\nmission \"socket-test\" state=\"ready\" { goal \"Test collection changes\" }\n";
+    let intent = st3::graph::parse_intent(source, "client-v0-baseline").unwrap();
+    let planned = state
+        .store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    state
+        .store
+        .apply(&intent, &planned.subject_tokens, "socket-test-definition")
+        .unwrap();
+    state
+        .event_notify
+        .send(state.store.index().unwrap())
+        .unwrap();
+    let change = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(change["kind"], "changes");
+    assert_eq!(change["id"], "missions");
+    assert!(
+        change["upserts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "mission/socket-test")
+    );
+
+    stream.close().await;
+    let mut replacement = client.collection_stream().await.unwrap();
+    replacement
+        .subscribe("missions", "missions", 20, None, None)
+        .await
+        .unwrap();
+    let fresh = tokio::time::timeout(std::time::Duration::from_secs(5), replacement.next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(fresh["kind"], "snapshot");
+    assert!(
+        fresh["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|item| item["id"] == "mission/socket-test")
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn missions_first_page_stays_under_100ms_with_thousands_of_definitions() {
+    let root = tempfile::tempdir().unwrap();
+    let db = root.path().join("large.sqlite");
+    let store = Arc::new(Store::open(&db, "client-v0-baseline").unwrap());
+    let source = "version 2\nmission \"base\" state=\"ready\" { goal \"Page quickly\" }\n";
+    let intent = st3::graph::parse_intent(source, "client-v0-baseline").unwrap();
+    let planned = store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    store
+        .apply(&intent, &planned.subject_tokens, "large-page-base")
+        .unwrap();
+    let base = store.mission_definitions().unwrap().remove(0).mission;
+    let claim_id: String = rusqlite::Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT claim_id FROM mission_definitions WHERE mission_id='base'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut connection = rusqlite::Connection::open(&db).unwrap();
+    let transaction = connection.transaction().unwrap();
+    for index in 0..3000 {
+        let id = format!("large-{index:04}");
+        let mut mission = base.clone();
+        mission.id = id.clone();
+        mission.subject = format!("mission/{id}");
+        transaction.execute(
+            "INSERT INTO mission_revisions(mission_id,revision,state,body,claim_id,created_index) VALUES(?1,?2,'ready',?3,?4,1)",
+            rusqlite::params![id, mission.revision, serde_json::to_string(&mission).unwrap(), claim_id],
+        ).unwrap();
+        transaction.execute(
+            "INSERT INTO mission_definitions(mission_id,revision,state,claim_id) VALUES(?1,?2,'ready',?3)",
+            rusqlite::params![id, mission.revision, claim_id],
+        ).unwrap();
+    }
+    transaction.commit().unwrap();
+    let mut state = test_state(root.path());
+    state.store = store;
+    let app = st3::api::router(state);
+    let started = std::time::Instant::now();
+    let (status, page) = client_json(app, "/v1/client/missions?limit=50").await;
+    let elapsed = started.elapsed();
+    assert_eq!(status, StatusCode::OK, "{page}");
+    assert_eq!(page["value"]["items"].as_array().unwrap().len(), 50);
+    assert!(
+        elapsed < std::time::Duration::from_millis(100),
+        "mission page over 3000 rows took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn client_v0_read_routes_conform_to_the_manifest() {
     let root = tempfile::tempdir().unwrap();
     let app = st3::api::router(test_state(root.path()));
