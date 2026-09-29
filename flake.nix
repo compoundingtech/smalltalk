@@ -33,6 +33,33 @@
       system:
       let
         pkgs = import nixpkgs { inherit system; };
+        hmModuleEval = nixpkgs.lib.evalModules {
+          specialArgs = {
+            inherit pkgs;
+            lib = pkgs.lib // { hm.dag.entryAfter = _: value: value; };
+          };
+          modules = [
+            self.homeManagerModules.default
+            ({ lib, ... }: {
+              options = {
+                xdg.configHome = lib.mkOption { type = lib.types.str; default = "/home/test/.config"; };
+                xdg.stateHome = lib.mkOption { type = lib.types.str; default = "/home/test/.local/state"; };
+                xdg.configFile = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
+                home.packages = lib.mkOption { type = lib.types.listOf lib.types.package; default = [ ]; };
+                home.activation = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
+                systemd.user.services = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
+                launchd.agents = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
+              };
+              config.services.smalltalk = {
+                enable = true;
+                person = "person/ada";
+                socket = "/tmp/smalltalk-test.sock";
+                ptyPackage = ptyPackage;
+                declarations.seats = [ ./examples/st3/seats/claude.kdl ];
+              };
+            })
+          ];
+        };
         providerRustToolchain = fenix.packages.${system}.combine [
           fenix.packages.${system}.stable.cargo
           fenix.packages.${system}.stable.rustc
@@ -632,6 +659,23 @@
         checks.install-layout = installLayout;
         checks.release-integration = st2ReleaseIntegration;
         checks.debug-assertions = st2DebugAssertions;
+        checks.hm-module-eval =
+          let
+            rendered = hmModuleEval.config;
+            args = if pkgs.stdenv.hostPlatform.isLinux then
+              rendered.systemd.user.services.smalltalk.Service.ExecStart
+            else
+              builtins.concatStringsSep " " rendered.launchd.agents.smalltalk.config.ProgramArguments;
+          in
+          assert pkgs.lib.hasInfix ''person = "person/ada"'' rendered.xdg.configFile."st3/config.toml".text;
+          assert pkgs.lib.hasInfix "/tmp/smalltalk-test.sock" args;
+          assert pkgs.lib.hasInfix "--pty-binary" args;
+          assert builtins.length rendered.home.packages == 1;
+          assert builtins.deepSeq (if pkgs.stdenv.hostPlatform.isLinux then
+            rendered.systemd.user.services.smalltalk-apply.Service.ExecStart
+          else
+            rendered.launchd.agents.smalltalk-apply.config.ProgramArguments) true;
+          pkgs.runCommand "smalltalk-hm-module-eval" { } "touch $out";
         checks.wasm-resolver-feature = st2WasmResolver;
         checks.wasip2-resource-providers = st2ProviderRuntime;
         checks.provider-components = st2ProviderComponents;
@@ -910,5 +954,8 @@
           RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
         };
       }
-    );
+    ) // {
+      homeManagerModules.smalltalk = import ./nix/hm-module.nix { inherit self; };
+      homeManagerModules.default = self.homeManagerModules.smalltalk;
+    };
 }
