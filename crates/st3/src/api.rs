@@ -3931,6 +3931,54 @@ fn github_usage_checks(usage: &crate::resource::GithubUsageReport, now: u128) ->
     checks
 }
 
+/// Every person's open attention items that have waited more than a day, oldest first.
+fn stale_attention_check(items: &[crate::model::AttentionItemView], now: u128) -> DoctorCheck {
+    const DAY_MS: u128 = 86_400_000;
+    const LISTED: usize = 20;
+    let mut stale = items
+        .iter()
+        .filter(|item| now.saturating_sub(item.requested_at_unix_ms) > DAY_MS)
+        .collect::<Vec<_>>();
+    if stale.is_empty() {
+        return DoctorCheck {
+            name: "attention-age".into(),
+            status: "pass".into(),
+            message: "no attention item has been open for more than a day".into(),
+        };
+    }
+    stale.sort_by(|left, right| {
+        (left.requested_at_unix_ms, &left.subject)
+            .cmp(&(right.requested_at_unix_ms, &right.subject))
+    });
+    let mut listed = stale
+        .iter()
+        .take(LISTED)
+        .map(|item| {
+            let hours = now.saturating_sub(item.requested_at_unix_ms) / 3_600_000;
+            format!(
+                "{} for {}, open {}d {}h: {}",
+                item.subject,
+                item.person,
+                hours / 24,
+                hours % 24,
+                item.title
+            )
+        })
+        .collect::<Vec<_>>();
+    if stale.len() > LISTED {
+        listed.push(format!("and {} more", stale.len() - LISTED));
+    }
+    DoctorCheck {
+        name: "attention-age".into(),
+        status: "warn".into(),
+        message: format!(
+            "{} attention items have been open for more than a day; `st attention ls --as PERSON` shows how to close each: {}",
+            stale.len(),
+            listed.join("; ")
+        ),
+    }
+}
+
 fn build_tools_check(tools: &crate::environment::BuildTools) -> DoctorCheck {
     use crate::environment::LinkResult;
     let mut problems = Vec::new();
@@ -4403,6 +4451,13 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             message: error.to_string(),
         }),
     }
+    checks.push(stale_attention_check(
+        &state
+            .store
+            .attention_items(None)
+            .map_err(ApiError::internal)?,
+        client_now_ms(),
+    ));
     let report_status = if checks.iter().any(|check| check.status == "fail") {
         "fail"
     } else if checks.iter().any(|check| check.status == "warn") {
@@ -7141,11 +7196,17 @@ async fn request_attention(
     Json(post): Json<crate::model::AttentionRequestPost>,
 ) -> Result<Json<AttentionRequestView>, ApiError> {
     let request: &AttentionRequest = &post.request;
+    if post.closing.closed_by.as_deref() == Some("st") {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-attention-closed-by",
+            "only st closes the requests it raises for conditions it watches; name a target, --until, --step or --person-closes",
+        )));
+    }
     let id = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()));
     let subject = format!("attention/{}", &id[..32]);
     let response = state
         .store
-        .request_attention_until(&subject, request, post.until.as_deref())
+        .request_attention_closing(&subject, request, &post.closing)
         .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(response))
@@ -11751,6 +11812,68 @@ agent "good" {{ workspace {:?}; command "true" }}
     }
 
     #[test]
+    fn doctor_lists_attention_items_open_for_more_than_a_day() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        for (key, title) in [
+            ("first", "Renew the signing key"),
+            ("second", "Pick a region"),
+        ] {
+            state
+                .store
+                .request_attention(
+                    &format!("attention/{key}"),
+                    &AttentionRequest {
+                        reviewer: "person/nathan".into(),
+                        title: title.into(),
+                        reason: "A person needs to decide.".into(),
+                        severity: "warning".into(),
+                        targets: Vec::new(),
+                        actor: "agent/fleet/worker".into(),
+                        idempotency_key: key.into(),
+                    },
+                )
+                .unwrap();
+        }
+        let items = state.store.attention_items(None).unwrap();
+        assert_eq!(items.len(), 2);
+        let requested = items
+            .iter()
+            .map(|item| item.requested_at_unix_ms)
+            .max()
+            .unwrap();
+
+        let fresh = stale_attention_check(&items, requested + 3_600_000);
+        assert_eq!(fresh.status, "pass");
+        let stale = stale_attention_check(&items, requested + 2 * 86_400_000 + 3 * 3_600_000);
+        assert_eq!(
+            (stale.name.as_str(), stale.status.as_str()),
+            ("attention-age", "warn")
+        );
+        assert!(
+            stale
+                .message
+                .starts_with("2 attention items have been open for more than a day"),
+            "{}",
+            stale.message
+        );
+        assert!(
+            stale
+                .message
+                .contains("attention/first for person/nathan, open 2d 3h: Renew the signing key"),
+            "{}",
+            stale.message
+        );
+        let report = doctor_report(&state).unwrap().0;
+        assert!(
+            report
+                .checks
+                .iter()
+                .any(|check| check.name == "attention-age" && check.status == "pass")
+        );
+    }
+
+    #[test]
     fn doctor_shows_what_spends_the_shared_github_budget() {
         use crate::resource::{
             GithubBudget, GithubBudgetReport, GithubSpenderReport, GithubUsageReport,
@@ -16221,6 +16344,16 @@ version 2
             idempotency_key: "api-attention-fabric".into(),
         })
         .unwrap();
+        let mut refused = request.clone();
+        refused["closed_by"] = json!("st");
+        let (status, error) = json_request(app.clone(), "/v1/attention", refused).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        assert_eq!(error["code"], "invalid-attention-closed-by");
+        let (status, error) = json_request(app.clone(), "/v1/attention", request.clone()).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+        assert_eq!(error["code"], "attention-closes-never");
+        let mut request = request;
+        request["closed_by"] = json!("person");
         let (status, created) = json_request(app.clone(), "/v1/attention", request).await;
         assert_eq!(status, StatusCode::OK, "{created}");
         assert_eq!(created["reviewer"], "person/nathan");
@@ -16448,6 +16581,8 @@ agent "seat" { workspace "/tmp"; command "true" }
                 idempotency_key: key.into(),
             })
             .unwrap();
+            let mut request = request;
+            request["closed_by"] = json!("person");
             let (status, created) = json_request(app.clone(), "/v1/attention", request).await;
             assert_eq!(status, StatusCode::OK, "{created}");
         }
@@ -16487,6 +16622,8 @@ agent "seat" { workspace "/tmp"; command "true" }
             idempotency_key: "withdraw-old-blocker".into(),
         })
         .unwrap();
+        let mut request = request;
+        request["closed_by"] = json!("person");
         let (_, created) = json_request(app.clone(), "/v1/attention", request).await;
         let subject = created["subject"].as_str().unwrap();
         let path = format!("/v1/attention/withdraw/{}", urlencoding::encode(subject));

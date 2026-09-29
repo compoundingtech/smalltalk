@@ -463,7 +463,20 @@ st attention request \
 
 The idempotency key gives one stable `attention/ID` subject. A retry with the same key returns the same request.
 
-Only the selected person can close the request. The person records whether the fault was resolved or dismissed:
+A request names what closes it, so no item waits in an inbox after its cause is gone:
+
+- a target that can end, such as a step, run, generation, mission, agent, observer, subscription,
+  loop run, message, another attention item, or an observed pull request;
+- `--until CONDITION`, which st re-checks against every target;
+- `--step STEP_RUN`, which closes it when that step completes, fails, is cancelled, starts another
+  attempt, or leaves its run's current generation;
+- `--person-closes`, when nothing st observes can say the item is done.
+
+An agent's request that names none of these closes when the step that agent has claimed ends. st
+refuses any other request that names nothing, with `attention-closes-never`. `st doctor` lists every
+attention item that has been open for more than a day as `attention-age`.
+
+Any person can close a request. The person records whether the fault was resolved or dismissed:
 
 ```sh
 st attention resolve attention/REQUEST_ID \
