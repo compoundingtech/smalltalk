@@ -28,6 +28,8 @@ pub mod render;
 pub mod resource;
 pub mod seat_queue;
 pub mod service;
+/// The st agent skill bundled in this binary and installed for each harness.
+pub mod skill;
 pub mod store;
 /// Attaches a local terminal to another fleet host's PTY session over Fabric, without st daemons.
 pub mod terminal_fabric;

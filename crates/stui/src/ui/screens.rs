@@ -1169,6 +1169,15 @@ pub fn mission_detail(
         span(format!(" {}", mission.id), theme::dim()),
         span(format!("  ·  {}", mission.word.explain()), theme::fg(color)),
     ]));
+    if let Some(outcome) = &mission.outcome {
+        doc.lines(text::wrap(
+            &text::inline(outcome, theme::text()),
+            inner,
+            &[run(" outcome ", theme::dim())],
+            &[run("         ", theme::dim())],
+            None,
+        ));
+    }
     doc.blank();
     let mut goals = Doc::new();
     for goal in &mission.goals {

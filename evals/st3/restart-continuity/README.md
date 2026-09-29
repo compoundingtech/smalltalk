@@ -11,7 +11,6 @@ A mechanical injector restarts `rc.dev` after item 2. It sends one repeated Smal
 The worker must use the graph, `PROGRESS.md`, and git history to resume with item 3. The gates reject a skipped item, a repeated stable item result, a missing product, incorrect ownership, or an invalid message sequence.
 
 The injector reads the agent card for the replacement incarnation and records the exact duplicate
-message subject. The ledger repository excludes st3's `.st3/` boot directory from its status.
-`variants/` changes only rc.dev to omp on `openai-codex/gpt-5.6-luna` or Codex `gpt-6-luna`; the
-committed `eval.kdl` is the Claude `claude-sonnet-5` form. The reports from 2026-09-26 record paid
-runs of all three.
+message subject. `variants/` changes only rc.dev to omp on `openai-codex/gpt-5.6-luna` or Codex
+`gpt-6-luna`; the committed `eval.kdl` is the Claude `claude-sonnet-5` form. The reports from
+2026-09-26 record paid runs of all three.

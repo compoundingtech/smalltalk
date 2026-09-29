@@ -68,10 +68,13 @@ st missions show mission-run/64bcc9227e0166a571e09117d35c572e
 st missions publish --help
 st missions start --help
 st missions cancel --help
+st missions outcome --help
+st missions retire --help
 ```
 
-`ls` and `show` are live reads. Publication, start, and cancel are reviewed through help here and
-are mutation-tested only in the disposable fixture run.
+`ls` and `show` are live reads. Publication, start, cancel, setting a finished run's outcome, and
+retirement are reviewed through help here and are mutation-tested only in the disposable fixture
+run.
 
 ### 3. `work` — the truthful queue and worker lifecycle
 
@@ -449,7 +452,20 @@ st diagnostic --help
 This is agent-only and mutating, so the live human tour reviews help and the already automated
 failure tests rather than publishing a fake fault.
 
-### 19. `completions` — shell discoverability
+### 19. `skill` — how an agent seat uses st
+
+Why: an agent seat starts with no prompt, so the only st text an agent sees is the skill its driver
+installs. It must match the binary that serves the commands it names.
+
+```sh
+st skill
+st skill install --help
+```
+
+Check that the skill describes st without rules of conduct, that its description applies only when
+`ST_AGENT` is set, and that `install` names each harness directory it writes.
+
+### 20. `completions` — shell discoverability
 
 Why: generated completion keeps the large but intentional command surface navigable.
 

@@ -1766,8 +1766,6 @@ pub struct QuickAgentRequest {
     #[serde(default)]
     pub effort: Option<String>,
     #[serde(default)]
-    pub prompt: Option<String>,
-    #[serde(default)]
     pub arguments: Vec<String>,
     #[serde(default)]
     pub expected_subject: Vec<String>,
@@ -2007,12 +2005,26 @@ pub struct MissionRunView {
     pub after: Option<String>,
     pub status: String,
     pub phase: String,
+    /// The outcome a person or an authorized agent set after the run finished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<MissionRunOutcomeView>,
     pub created_at_unix_ms: u128,
     pub updated_at_unix_ms: u128,
     #[serde(default)]
     pub steps: Vec<StepRunView>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub loops: Vec<LoopRunView>,
+}
+
+/// Who set a finished run's outcome, from what, and why.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MissionRunOutcomeView {
+    pub status: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub previous_status: Option<String>,
+    pub reason: String,
+    pub actor: String,
+    pub at_unix_ms: u128,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -2278,6 +2290,20 @@ pub struct WorkRequest {
 pub struct WorkWakeRequest {
     pub actor: String,
     pub reason: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MissionRunOutcomeRequest {
+    pub actor: String,
+    pub status: String,
+    pub reason: String,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct MissionRetireRequest {
+    pub actor: String,
     pub idempotency_key: String,
 }
 
