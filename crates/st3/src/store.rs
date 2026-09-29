@@ -1,6 +1,6 @@
+use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
-use std::cell::Cell;
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
@@ -18,17 +18,17 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::model::{
-    ApplyResponse, AttentionActionView, AttentionItemView, AttentionRequest, AttentionRequestView,
-    AttentionResolveRequest, AttentionWithdrawRequest, Capability, ClaimInput, ClaimRecord,
-    ClaimsPage, ContextUsage, DependencySpec, DesiredSubject, DocumentVersion, EventRecord,
-    HumanReviewView, IntentInput, LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS, MessageView,
-    MissionDefinitionView, MissionInputKind, MissionOutputView, MissionResponse,
-    MissionRevisionOperation, MissionRunDeclaration, MissionRunInput, MissionRunOutcomeView,
-    MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent,
-    OperationalAnnotation, OperationalRepairItem, OperationalRepairPlan, OperationalRepairResult,
-    PlannedAction, PlannerSpec, PlanningCandidateView, PlanningPreviewView,
-    PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView, ReplicaBatch,
-    ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView, ReplicaRepairDeclaration,
+    ApplyResponse, AttentionActionView, AttentionClosing, AttentionItemView, AttentionRequest,
+    AttentionRequestView, AttentionResolveRequest, AttentionWithdrawRequest, Capability,
+    ClaimInput, ClaimRecord, ClaimsPage, ContextUsage, DependencySpec, DesiredSubject,
+    DocumentVersion, EventRecord, HumanReviewView, IntentInput, LoopRoundView, LoopRunView,
+    MAX_EVAL_TIMEOUT_MS, MessageView, MissionDefinitionView, MissionInputKind, MissionOutputView,
+    MissionResponse, MissionRevisionOperation, MissionRunDeclaration, MissionRunInput,
+    MissionRunOutcomeView, MissionRunRequest, MissionRunView, MissionSpec, MissionState,
+    NormalizedIntent, OperationalAnnotation, OperationalRepairItem, OperationalRepairPlan,
+    OperationalRepairResult, PlannedAction, PlannerSpec, PlanningCandidateView,
+    PlanningPreviewView, PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView,
+    ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRecordView, ReplicaRepairDeclaration,
     ReplicationExchange, ReplicationHealReport, ReplicationInventory, ReplicationInventoryBucket,
     ReplicationPeerStatus, ReplicationPeerSync, ReplicationReceipt, ReplicationStatus,
     ReplicationTimings, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
@@ -49,20 +49,20 @@ mod convergence;
 mod heal;
 mod lanes;
 
-pub use checkpoint_agreement::{
-    CHECKPOINT_ATTENTION_AFTER_MS, CHECKPOINT_EXCUSED, CHECKPOINT_PROTOCOL, CHECKPOINT_SEALED,
-    CHECKPOINT_VERIFIED, Certificate, CheckpointAction, CheckpointClaim, CheckpointContext,
-    CheckpointExcuseRequest, CheckpointStatusView, PendingCheckpointView, SealTerms,
-    VerifiedTerms, certificates, checkpoint_build, excused_writers, first_verifications,
-    newest_seals, participants as checkpoint_participants, stable_checkpoints,
-};
-use checkpoint_agreement::write_time;
 pub use checkpoint::{
     CHECKPOINT_MANIFEST_PAGE_LIMIT, CheckpointManifest, CheckpointManifestCursor,
     CheckpointManifestPage, CheckpointManifestRequest, CheckpointPlanRequest, CheckpointPlanView,
     CheckpointProof, ClaimTombstone, DropCount, DropPlan, EnvelopeKey, EnvelopeTombstone,
     SealedSet, checkpoint_cut, checkpoint_name, drop_digest, newest_due_cut, rules_digest,
     verify_checkpoint_manifest,
+};
+use checkpoint_agreement::write_time;
+pub use checkpoint_agreement::{
+    CHECKPOINT_ATTENTION_AFTER_MS, CHECKPOINT_EXCUSED, CHECKPOINT_PROTOCOL, CHECKPOINT_SEALED,
+    CHECKPOINT_VERIFIED, Certificate, CheckpointAction, CheckpointClaim, CheckpointContext,
+    CheckpointExcuseRequest, CheckpointStatusView, PendingCheckpointView, SealTerms, VerifiedTerms,
+    certificates, checkpoint_build, excused_writers, first_verifications, newest_seals,
+    participants as checkpoint_participants, stable_checkpoints,
 };
 
 type StepStateRow = (String, bool, u32, String, String, String, String, String);
@@ -596,7 +596,8 @@ PRAGMA user_version = 13;
 "#;
 
 /// The writer connection's clock offset. Only a simulation sets it; see `write_time`.
-const WRITE_CLOCK: &str = "CREATE TEMP TABLE IF NOT EXISTS write_clock(offset_ms INTEGER NOT NULL);";
+const WRITE_CLOCK: &str =
+    "CREATE TEMP TABLE IF NOT EXISTS write_clock(offset_ms INTEGER NOT NULL);";
 
 const READ_CONNECTIONS: usize = 4;
 
@@ -763,7 +764,11 @@ impl Drop for PinnedRead<'_> {
     fn drop(&mut self) {
         PINNED_READER.with(|slot| slot.borrow_mut().take());
         {
-            let mut pinned = self.lane.pinned.lock().unwrap_or_else(PoisonError::into_inner);
+            let mut pinned = self
+                .lane
+                .pinned
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             *pinned -= 1;
             self.lane.unpinned.notify_one();
         }
@@ -2064,17 +2069,13 @@ impl Store {
     /// index, however many commits land meanwhile. A nested call joins the outer snapshot.
     pub fn read_snapshot<T>(&self, read: impl FnOnce(u64) -> Result<T>) -> Result<T> {
         let key = self.readers.key();
-        if PINNED_READER.with(|slot| slot.borrow().as_ref().is_some_and(|(pool, _)| *pool == key))
-        {
+        if PINNED_READER.with(|slot| slot.borrow().as_ref().is_some_and(|(pool, _)| *pool == key)) {
             let index = current_index(&self.readers.get())?;
             return read(index);
         }
         let lane = self.readers.lane();
         {
-            let mut pinned = lane
-                .pinned
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
+            let mut pinned = lane.pinned.lock().unwrap_or_else(PoisonError::into_inner);
             while *pinned + 1 >= READ_CONNECTIONS {
                 pinned = lane
                     .unpinned
@@ -2096,7 +2097,10 @@ impl Store {
             )),
         };
         drop(guard);
-        let connection = pinned.connection.clone().expect("the pin holds its connection");
+        let connection = pinned
+            .connection
+            .clone()
+            .expect("the pin holds its connection");
         connection.execute_batch("BEGIN")?;
         // The first read starts the snapshot; every later read in `read` sees the same one.
         let index = current_index(&connection)?;
@@ -2279,10 +2283,7 @@ impl Store {
     }
 
     /// Load the definitions behind a collection of runs in one read.
-    pub fn mission_specs_for_runs(
-        &self,
-        runs: &[String],
-    ) -> Result<BTreeMap<String, MissionSpec>> {
+    pub fn mission_specs_for_runs(&self, runs: &[String]) -> Result<BTreeMap<String, MissionSpec>> {
         if runs.is_empty() {
             return Ok(BTreeMap::new());
         }
@@ -5020,7 +5021,11 @@ impl Store {
             [now],
             |row| row.get(0),
         )?;
-        Ok(local.into_iter().chain(legacy).min().map(|value| value as u128))
+        Ok(local
+            .into_iter()
+            .chain(legacy)
+            .min()
+            .map(|value| value as u128))
     }
 
     pub fn request_mission_run_cancellation(
@@ -5468,7 +5473,9 @@ impl Store {
             .map(|view| view.run.strip_prefix("mission-run/").unwrap_or(&view.run))
             .collect::<BTreeSet<_>>();
         let run_phases = connection
-            .prepare("SELECT id, phase FROM mission_runs WHERE id IN (SELECT value FROM json_each(?1))")?
+            .prepare(
+                "SELECT id, phase FROM mission_runs WHERE id IN (SELECT value FROM json_each(?1))",
+            )?
             .query_map([serde_json::to_string(&run_ids)?], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })?
@@ -9734,22 +9741,42 @@ impl Store {
         pending_human_reviews_tx(&connection, reviewer)
     }
 
+    /// Request attention for a condition the daemon watches itself. The daemon closes it once
+    /// that condition clears.
     pub fn request_attention(
         &self,
         subject: &str,
         request: &AttentionRequest,
     ) -> Result<AttentionRequestView, St3Error> {
-        self.request_attention_until(subject, request, None)
+        self.request_attention_closing(
+            subject,
+            request,
+            &AttentionClosing {
+                closed_by: Some("st".into()),
+                ..AttentionClosing::default()
+            },
+        )
     }
 
-    /// Request attention that the daemon resolves on its own once every target meets `until`,
-    /// one of the `st trace wait` status conditions.
-    pub fn request_attention_until(
+    /// Request attention that names what closes it: a target that can end, an `until` condition
+    /// over its targets, a step whose end closes it, or a person. An agent's request that names
+    /// none of these closes when the step that agent has claimed ends; a request with nothing
+    /// that could close it is refused.
+    pub fn request_attention_closing(
         &self,
         subject: &str,
         request: &AttentionRequest,
-        until: Option<&str>,
+        closing: &AttentionClosing,
     ) -> Result<AttentionRequestView, St3Error> {
+        let until = closing.until.as_deref();
+        if let Some(closed_by) = closing.closed_by.as_deref()
+            && !matches!(closed_by, "person" | "st")
+        {
+            return Err(St3Error::new(
+                "invalid-attention-closed-by",
+                format!("`{closed_by}` cannot close an attention request; use `person`"),
+            ));
+        }
         if let Some(until) = until {
             if !crate::model::STATUS_WAIT_CONDITIONS.contains(&until) {
                 return Err(St3Error::new(
@@ -9792,6 +9819,7 @@ impl Store {
                 .map_err(|error| St3Error::new(error.code, error.message))?;
         }
         let actor = normalize_actor(&request.actor, "agent");
+        let step = attention_closing_step(&self.readers.get(), &actor, request, closing)?;
         let mut fields = BTreeMap::from([
             ("reviewer".into(), Value::String(reviewer)),
             ("title".into(), Value::String(request.title.clone())),
@@ -9804,6 +9832,13 @@ impl Store {
         ]);
         if let Some(until) = until {
             fields.insert("until".into(), Value::String(until.into()));
+        }
+        if let Some((step, attempt)) = step {
+            fields.insert("step".into(), Value::String(step));
+            fields.insert("step_attempt".into(), Value::from(attempt));
+        }
+        if let Some(closed_by) = &closing.closed_by {
+            fields.insert("closed_by".into(), Value::String(closed_by.clone()));
         }
         self.append_claim(&ClaimInput {
             subject: subject.to_owned(),
@@ -9991,13 +10026,19 @@ impl Store {
     }
 
     /// Pending requests from `origin` that declared an `until` condition.
-    pub fn pending_attention_with_until(&self, origin: &str) -> Result<Vec<AttentionRequestView>> {
+    /// Open requests accepted on `origin` that the daemon closes on its own: those with an
+    /// `until` condition or a step whose end closes them.
+    pub fn pending_attention_closed_by_condition(
+        &self,
+        origin: &str,
+    ) -> Result<Vec<AttentionRequestView>> {
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "SELECT request.subject FROM claims request
              WHERE request.kind='attention.requested'
                AND request.origin=?1
-               AND json_extract(request.body, '$.fields.until') IS NOT NULL
+               AND (json_extract(request.body, '$.fields.until') IS NOT NULL
+                    OR json_extract(request.body, '$.fields.step') IS NOT NULL)
                AND NOT EXISTS (
                  SELECT 1 FROM claims resolution
                  WHERE resolution.subject=request.subject
@@ -10012,6 +10053,14 @@ impl Store {
             .iter()
             .filter_map(|subject| attention_request_view_tx(&connection, subject).transpose())
             .collect()
+    }
+
+    /// Why the step whose end closes `request` has ended, or `None` while it runs.
+    pub fn attention_step_ended(&self, request: &AttentionRequestView) -> Result<Option<String>> {
+        let (Some(step), Some(attempt)) = (&request.step, request.step_attempt) else {
+            return Ok(None);
+        };
+        attention_step_ended_tx(&self.readers.get(), step, attempt)
     }
 
     pub(crate) fn resolve_attention_automatically(
@@ -18218,6 +18267,15 @@ fn attention_request_view_tx(
             .get("until")
             .and_then(Value::as_str)
             .map(str::to_owned),
+        step: fields
+            .get("step")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        step_attempt: fields.get("step_attempt").and_then(Value::as_u64),
+        closed_by: fields
+            .get("closed_by")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
     }))
 }
 
@@ -18277,6 +18335,145 @@ fn selected_actionable_messages(messages: Vec<MessageView>) -> Vec<MessageView> 
     selected
 }
 
+/// Target kinds whose own state can end an attention request; see
+/// `attention_request_is_current_tx` and `attention_target_moved_on_tx`. A pull request resource
+/// can end one too, once st has observed it.
+const ATTENTION_ENDING_TARGETS: &[&str] = &[
+    "step-run/",
+    "run-generation/",
+    "mission/",
+    "mission-run/",
+    "attention/",
+    "agent/",
+    "observer/",
+    "subscription/",
+    "loop-run/",
+    "message/",
+];
+
+fn attention_target_can_end(connection: &Connection, target: &str) -> Result<bool> {
+    Ok(ATTENTION_ENDING_TARGETS
+        .iter()
+        .any(|prefix| target.starts_with(prefix))
+        || pull_request_state_tx(connection, target)?.is_some())
+}
+
+/// The step, with its current attempt, whose end closes a new attention request: the step the
+/// request names, or, when an agent's request names nothing else that could close it, the step
+/// that agent has claimed. A request that nothing could close is refused.
+fn attention_closing_step(
+    connection: &Connection,
+    actor: &str,
+    request: &AttentionRequest,
+    closing: &AttentionClosing,
+) -> Result<Option<(String, u64)>, St3Error> {
+    if let Some(step) = &closing.step {
+        let row = connection
+            .query_row(
+                "SELECT status, attempt FROM step_runs WHERE subject=?1",
+                [step],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+            )
+            .optional()
+            .map_err(internal)?;
+        let Some((status, attempt)) = row else {
+            return Err(St3Error::new(
+                "invalid-attention-step",
+                format!("`{step}` is not a step run on this host"),
+            ));
+        };
+        if matches!(status.as_str(), "completed" | "failed" | "cancelled") {
+            return Err(St3Error::new(
+                "attention-step-ended",
+                format!("`{step}` already {status}, so its end cannot close a new request"),
+            ));
+        }
+        return Ok(Some((step.clone(), attempt)));
+    }
+    if closing.until.is_some() || closing.closed_by.is_some() {
+        return Ok(None);
+    }
+    for target in &request.targets {
+        if attention_target_can_end(connection, target).map_err(internal)? {
+            return Ok(None);
+        }
+    }
+    let claimed = if actor.starts_with("agent/") {
+        connection
+            .query_row(
+                "SELECT subject, attempt FROM step_runs
+                 WHERE lease_owner=?1
+                   AND status IN ('claimed','working')
+                   AND CAST(lease_expires_at_unix_ms AS INTEGER)>?2
+                 ORDER BY CAST(updated_at_unix_ms AS INTEGER) DESC, subject
+                 LIMIT 1",
+                params![actor, now_ms() as i64],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, u64>(1)?)),
+            )
+            .optional()
+            .map_err(internal)?
+    } else {
+        None
+    };
+    claimed.map(Some).ok_or_else(|| {
+        let who = if actor.starts_with("agent/") {
+            format!("`{actor}` has no claimed step whose end could close it, and it names")
+        } else {
+            "it names".into()
+        };
+        St3Error::new(
+            "attention-closes-never",
+            format!(
+                "attention request `{}` would stay open forever: {who} no target that can end (a step, run generation, mission, run, agent, observer, subscription, loop run, message, attention item or observed pull request), no --until condition and no --step; pass --person-closes when only a person can close it",
+                request.title
+            ),
+        )
+    })
+}
+
+/// Why the step whose end closes an attention request has ended since `attempt`, or `None`
+/// while that attempt still runs. A step st no longer knows has not ended.
+fn attention_step_ended_tx(
+    connection: &Connection,
+    step: &str,
+    attempt: u64,
+) -> Result<Option<String>> {
+    let row = connection
+        .query_row(
+            "SELECT step_runs.status, step_runs.attempt,
+                    step_runs.generation_id=mission_runs.current_generation_id,
+                    mission_runs.status
+             FROM step_runs
+             JOIN mission_runs ON mission_runs.id=step_runs.run_id
+             WHERE step_runs.subject=?1",
+            [step],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u64>(1)?,
+                    row.get::<_, bool>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((status, current_attempt, current_generation, run_status)) = row else {
+        return Ok(None);
+    };
+    let terminal = |status: &str| matches!(status, "completed" | "failed" | "cancelled");
+    Ok(if current_attempt != attempt {
+        Some(format!("`{step}` started attempt {current_attempt}"))
+    } else if terminal(&status) {
+        Some(format!("`{step}` {status}"))
+    } else if !current_generation {
+        Some(format!("`{step}` left its run's current generation"))
+    } else if terminal(&run_status) {
+        Some(format!("the run of `{step}` {run_status}"))
+    } else {
+        None
+    })
+}
+
 /// A fault request stays current until a target that owns its lifecycle ends it. A stale
 /// `run-generation/` or `step-run/` target ends it at once, and so does a pull request that is
 /// merged or closed. Otherwise it ends once every target that is not context has moved on after
@@ -18288,6 +18485,11 @@ fn attention_request_is_current_tx(
     request: &AttentionRequestView,
 ) -> Result<bool> {
     if request.reason.to_ascii_lowercase().contains("superseded") {
+        return Ok(false);
+    }
+    if let (Some(step), Some(attempt)) = (&request.step, request.step_attempt)
+        && attention_step_ended_tx(connection, step, attempt)?.is_some()
+    {
         return Ok(false);
     }
     // A decision about a pull request has nothing left to decide once it is merged or closed,
@@ -28919,7 +29121,11 @@ mod tests {
                 let nested = store.read_snapshot(|nested| {
                     Ok((nested, store.claims_for("resource/pinned", None)?.len()))
                 })?;
-                assert_eq!(nested, (index, claims), "a nested read joins the outer snapshot");
+                assert_eq!(
+                    nested,
+                    (index, claims),
+                    "a nested read joins the outer snapshot"
+                );
                 Ok(claims)
             })
             .unwrap();
@@ -28949,7 +29155,11 @@ mod tests {
                     std::thread::sleep(std::time::Duration::from_millis(50));
                     std::thread::scope(|scope| {
                         scope
-                            .spawn(|| store.claims_for("resource/pinned", None).map(|claims| claims.len()))
+                            .spawn(|| {
+                                store
+                                    .claims_for("resource/pinned", None)
+                                    .map(|claims| claims.len())
+                            })
                             .join()
                             .unwrap()
                     })
@@ -28958,9 +29168,11 @@ mod tests {
             });
         }
         for _ in 0..READ_CONNECTIONS {
-            assert!(finished
-                .recv_timeout(std::time::Duration::from_secs(10))
-                .expect("a pinned read waited forever for a connection"));
+            assert!(
+                finished
+                    .recv_timeout(std::time::Duration::from_secs(10))
+                    .expect("a pinned read waited forever for a connection")
+            );
         }
     }
 
@@ -28971,9 +29183,11 @@ mod tests {
             .record_transport_observation("target", "up", None, None)
             .unwrap();
         assert_eq!(store.replication_peer_last_success("target").unwrap(), None);
-        assert!(!store
-            .record_peer_failure("target", "down", "request timed out")
-            .unwrap());
+        assert!(
+            !store
+                .record_peer_failure("target", "down", "request timed out")
+                .unwrap()
+        );
         assert_eq!(
             store
                 .latest_claim("host/target", Some("transport.observed"))
@@ -28992,9 +29206,11 @@ mod tests {
                 Some(now_ms().saturating_sub(91_000)),
             )
             .unwrap();
-        assert!(stale
-            .record_peer_failure("target", "down", "request timed out")
-            .unwrap());
+        assert!(
+            stale
+                .record_peer_failure("target", "down", "request timed out")
+                .unwrap()
+        );
 
         // Once an exchange has recorded a success, that row is the evidence, since every
         // exchange updates it. When it is old, a timeout goes through even though the newest
@@ -29012,9 +29228,11 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert!(store
-            .record_peer_failure("target", "down", "request timed out")
-            .unwrap());
+        assert!(
+            store
+                .record_peer_failure("target", "down", "request timed out")
+                .unwrap()
+        );
     }
 
     #[test]
@@ -35948,6 +36166,181 @@ version 2
     }
 
     #[test]
+    fn an_attention_request_names_what_closes_it_and_an_agents_closes_with_its_step() {
+        let store = Store::open_memory("source").unwrap();
+        let source = r#"
+version 2
+
+mission "asks" state="ready" {
+  goal "Ask a person for a decision while working."
+  step "work" { assigned-to "agent/asker" }
+}
+"#;
+        let intent = crate::graph::parse_test_intent(source, "source").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "asks-mission")
+            .unwrap();
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "asks".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/nathan".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "asks-run".into(),
+            })
+            .unwrap();
+        let step = run.steps[0].subject.clone();
+        store.set_step_state(&step, "ready", None).unwrap();
+        let agent = "agent/source.asker";
+        let ask = |key: &str, actor: &str, targets: &[&str], closing: AttentionClosing| {
+            store.request_attention_closing(
+                &format!("attention/{key}"),
+                &AttentionRequest {
+                    reviewer: "person/nathan".into(),
+                    title: format!("Decide {key}"),
+                    reason: "A person needs to decide before the work goes on.".into(),
+                    severity: "warning".into(),
+                    targets: targets.iter().map(|target| (*target).to_owned()).collect(),
+                    actor: actor.into(),
+                    idempotency_key: key.into(),
+                },
+                &closing,
+            )
+        };
+        let open = |subject: &str| {
+            store
+                .attention_items(Some("person/nathan"))
+                .unwrap()
+                .iter()
+                .any(|item| item.subject == subject)
+        };
+        let context = ["resource/fabric/queue", "host/silber"];
+
+        // Context and hosts never end an item, so a request naming only those is refused.
+        for (key, actor) in [("agent-unclaimed", agent), ("person", "person/nathan")] {
+            assert_eq!(
+                ask(key, actor, &context, AttentionClosing::default())
+                    .unwrap_err()
+                    .code,
+                "attention-closes-never",
+                "{key}"
+            );
+        }
+        assert_eq!(
+            ask(
+                "someone",
+                agent,
+                &context,
+                AttentionClosing {
+                    closed_by: Some("someone".into()),
+                    ..AttentionClosing::default()
+                },
+            )
+            .unwrap_err()
+            .code,
+            "invalid-attention-closed-by"
+        );
+        assert_eq!(
+            ask(
+                "nowhere",
+                agent,
+                &context,
+                AttentionClosing {
+                    step: Some("step-run/missing/work".into()),
+                    ..AttentionClosing::default()
+                },
+            )
+            .unwrap_err()
+            .code,
+            "invalid-attention-step"
+        );
+        let person = ask(
+            "person-closes",
+            agent,
+            &context,
+            AttentionClosing {
+                closed_by: Some("person".into()),
+                ..AttentionClosing::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(person.closed_by.as_deref(), Some("person"));
+        assert_eq!(person.step, None);
+        let targeted = ask(
+            "targeted",
+            agent,
+            &[run.subject.as_str()],
+            AttentionClosing::default(),
+        )
+        .unwrap();
+        assert_eq!(targeted.step, None, "a run target that can end closes it");
+
+        // Once the agent has claimed a step, a request that names nothing else closes with it.
+        store
+            .work_action(
+                &step,
+                "claim",
+                &WorkRequest {
+                    actor: Some(agent.into()),
+                    incarnation: Some("asker-one".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "asks-claim".into(),
+                },
+            )
+            .unwrap();
+        let attempt = store.step_run(&step).unwrap().unwrap().attempt;
+        let asked = ask("asked", agent, &context, AttentionClosing::default()).unwrap();
+        assert_eq!(asked.step.as_deref(), Some(step.as_str()));
+        assert_eq!(asked.step_attempt, Some(u64::from(attempt)));
+        assert!(open(&asked.subject));
+        assert_eq!(store.attention_step_ended(&asked).unwrap(), None);
+        assert_eq!(
+            store
+                .pending_attention_closed_by_condition("source")
+                .unwrap()
+                .iter()
+                .map(|request| request.subject.as_str())
+                .collect::<Vec<_>>(),
+            [asked.subject.as_str()]
+        );
+
+        store.set_step_state(&step, "completed", None).unwrap();
+        assert_eq!(
+            store.attention_step_ended(&asked).unwrap().as_deref(),
+            Some(format!("`{step}` completed").as_str())
+        );
+        assert!(!open(&asked.subject), "the step that raised it ended");
+        assert!(open(&person.subject), "only a person closes this one");
+        assert_eq!(
+            ask(
+                "late",
+                "person/nathan",
+                &context,
+                AttentionClosing {
+                    step: Some(step.clone()),
+                    ..AttentionClosing::default()
+                },
+            )
+            .unwrap_err()
+            .code,
+            "attention-step-ended"
+        );
+    }
+
+    #[test]
     fn released_work_with_open_external_attention_is_blocked_until_resolution() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("external-blocker.sqlite3");
@@ -38665,7 +39058,11 @@ mission "takeover" state="ready" {
         for (status, reason, key) in [
             ("completed", "the deploy shipped", "outcome-completed"),
             ("failed", "the deploy was rolled back", "outcome-failed"),
-            ("completed", "the deploy shipped again", "outcome-completed-again"),
+            (
+                "completed",
+                "the deploy shipped again",
+                "outcome-completed-again",
+            ),
         ] {
             source
                 .set_mission_run_outcome(&failed.subject, status, "person/operator", reason, key)
@@ -41759,7 +42156,10 @@ mission "asked-again" state="ready" {
                     ]),
                 ),
                 ("operation".into(), Value::String(operation.into())),
-                ("mission_revision".into(), Value::String(run.revision.clone())),
+                (
+                    "mission_revision".into(),
+                    Value::String(run.revision.clone()),
+                ),
                 (
                     "step_definition".into(),
                     Value::String(step.definition_hash.clone()),
@@ -42396,37 +42796,46 @@ mission "typecase" state="ready" {
         };
         let target = vec!["mission-run/release".to_owned()];
         let unknown = store
-            .request_attention_until(
+            .request_attention_closing(
                 "attention/unknown",
                 &request(target.clone(), "unknown"),
-                Some("published"),
+                &crate::model::AttentionClosing {
+                    until: Some("published".into()),
+                    ..Default::default()
+                },
             )
             .unwrap_err();
         assert_eq!(unknown.code, "invalid-attention-until");
         let untargeted = store
-            .request_attention_until(
+            .request_attention_closing(
                 "attention/untargeted",
                 &request(Vec::new(), "untargeted"),
-                Some("completed"),
+                &crate::model::AttentionClosing {
+                    until: Some("completed".into()),
+                    ..Default::default()
+                },
             )
             .unwrap_err();
         assert_eq!(untargeted.code, "invalid-attention-until");
 
         let stored = store
-            .request_attention_until(
+            .request_attention_closing(
                 "attention/until",
                 &request(target, "until"),
-                Some("completed"),
+                &crate::model::AttentionClosing {
+                    until: Some("completed".into()),
+                    ..Default::default()
+                },
             )
             .unwrap();
         assert_eq!(stored.until.as_deref(), Some("completed"));
         assert_eq!(
-            store.pending_attention_with_until("node").unwrap()[0].subject,
+            store.pending_attention_closed_by_condition("node").unwrap()[0].subject,
             "attention/until"
         );
         assert!(
             store
-                .pending_attention_with_until("other-host")
+                .pending_attention_closed_by_condition("other-host")
                 .unwrap()
                 .is_empty()
         );

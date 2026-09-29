@@ -1614,15 +1614,32 @@ pub struct AttentionRequest {
     pub idempotency_key: String,
 }
 
-/// An attention request as it is posted, with an optional condition that closes it.
+/// An attention request as it is posted, with what closes it.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttentionRequestPost {
     #[serde(flatten)]
     pub request: AttentionRequest,
+    #[serde(flatten)]
+    pub closing: AttentionClosing,
+}
+
+/// What closes an attention request besides a target that can end. A request names at least one
+/// of these or such a target; an agent's request that names none closes when the step that agent
+/// has claimed ends.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct AttentionClosing {
     /// One of [`STATUS_WAIT_CONDITIONS`]. The daemon resolves the request once every target
     /// meets it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until: Option<String>,
+    /// A `step-run/` subject. The daemon resolves the request once that step completes, fails or
+    /// is cancelled, starts another attempt, or leaves the run's current generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    /// `person` when only a person closes the request. `st` when the daemon closes it once the
+    /// condition that raised it clears; only the daemon itself raises those.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_by: Option<String>,
 }
 
 /// One mission request that a subscription recorded, with its current disposition: `pending`,
@@ -1693,6 +1710,13 @@ pub struct AttentionRequestView {
     pub resolved_at_unix_ms: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until: Option<String>,
+    /// The step whose end closes the request, and its attempt when the request was made.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_attempt: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub closed_by: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

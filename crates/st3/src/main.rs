@@ -2595,9 +2595,15 @@ enum AttentionCommand {
     },
     /// Request attention after an explicit fault.
     ///
-    /// The item stays in `st now` until a person resolves it or you withdraw it with
-    /// `st attention withdraw` once the condition clears. It also leaves `now` on its own:
+    /// A request names what closes it. The item stays in `st now` until a person resolves it or
+    /// you withdraw it with `st attention withdraw` once the condition clears. It also leaves
+    /// `now` on its own:
     ///
+    /// - when the step you have claimed ends, if the request names no target that can end, no
+    ///   --until and no --person-closes; the step ends when it completes, fails, is cancelled,
+    ///   starts another attempt or leaves its run's current generation, and --step names
+    ///   another step;
+    /// - once every target meets its --until condition;
     /// - at once, when a `step-run/` or `run-generation/` target is no longer current, or a
     ///   pull request target is merged or closed;
     /// - otherwise, once every other target has ended after the request: a `mission/` retired or
@@ -2608,6 +2614,9 @@ enum AttentionCommand {
     ///
     /// Other `resource/` targets and `doc/` targets are context and never end an item. A target
     /// of any other kind, or one that had already ended when you made the request, keeps it open.
+    ///
+    /// st refuses a request that nothing could close. Pass --person-closes when only a person
+    /// can say it is done.
     #[command(verbatim_doc_comment)]
     Request(AttentionRequestArgs),
     /// Resolve or dismiss any attention request, as any person.
@@ -2644,6 +2653,12 @@ struct AttentionRequestArgs {
     /// such as `completed` or `stopped`; it needs at least one --target.
     #[arg(long, value_name = "CONDITION")]
     until: Option<String>,
+    /// Resolve the item on its own once this step ends, instead of the step you have claimed.
+    #[arg(long, value_name = "STEP_RUN")]
+    step: Option<String>,
+    /// Only a person closes the item, because nothing st observes can say it is done.
+    #[arg(long, conflicts_with_all = ["until", "step"])]
+    person_closes: bool,
 }
 
 #[derive(Args)]
@@ -9430,7 +9445,11 @@ async fn run_attention(
                             actor,
                             idempotency_key,
                         },
-                        until: args.until,
+                        closing: st3::model::AttentionClosing {
+                            until: args.until,
+                            step: args.step,
+                            closed_by: args.person_closes.then(|| "person".into()),
+                        },
                     },
                 )
                 .await?;
@@ -9438,6 +9457,9 @@ async fn run_attention(
                 print_value(&response, true)
             } else {
                 println!("{}\t{}", response.status, response.subject);
+                if let Some(step) = &response.step {
+                    eprintln!("It closes on its own when `{step}` ends.");
+                }
                 Ok(())
             }
         }
@@ -15319,6 +15341,9 @@ mod tests {
             "a `loop-run/` running again",
             "Other `resource/` targets and `doc/` targets are context",
             "had already ended when you made the request, keeps it open",
+            "when the step you have claimed ends",
+            "st refuses a request that nothing could close",
+            "--person-closes",
         ] {
             assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
         }
