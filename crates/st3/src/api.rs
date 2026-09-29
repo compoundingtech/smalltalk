@@ -53,6 +53,7 @@ use crate::model::{
 use crate::store::Store;
 
 mod client_v0;
+mod delivery_presence;
 mod terminal_view;
 
 #[derive(Clone)]
@@ -237,6 +238,7 @@ impl IntoResponse for ApiError {
 }
 
 pub fn router(state: AppState) -> Router {
+    delivery_presence::start();
     router_for_transport(state, ClientTransportBoundary::Unix)
 }
 
@@ -1369,12 +1371,46 @@ fn client_agent_resources(
     let mut items = store.cached_agent_resources(snapshot_index, history, || {
         client_agent_resources_uncached(store, history, snapshot_index)
     })?;
+    let local_host = client_host_id(store.origin());
     for item in &mut items {
         if item.get("updated_at").and_then(Value::as_str) == Some("") {
             item["updated_at"] = Value::String(at.to_owned());
         }
+        overlay_delivery_presence(item, &local_host);
     }
     Ok(items)
+}
+
+/// Graph state says whether a harness took its ready turn; only this daemon can say whether the
+/// process that carries the seat's messages is still polling and runs its binary. A running local
+/// native seat with a stale delivery path is `waiting`, with the reason, rather than `running`.
+fn overlay_delivery_presence(item: &mut Value, local_host: &str) {
+    const NATIVE_DRIVERS: [&str; 5] = ["claude", "codex", "opencode", "pi", "omp"];
+    let Some(driver) = item
+        .get("driver")
+        .and_then(Value::as_str)
+        .filter(|driver| NATIVE_DRIVERS.contains(driver))
+        .map(str::to_owned)
+    else {
+        return;
+    };
+    let local = item.get("host_id").and_then(Value::as_str) == Some(local_host);
+    let takes_work = item.get("state").and_then(Value::as_str) == Some("running")
+        && matches!(
+            item.get("harness_state").and_then(Value::as_str),
+            Some("ready" | "working" | "idle")
+        );
+    if !local || !takes_work {
+        return;
+    }
+    let Some(recipient) = item.get("id").and_then(Value::as_str) else {
+        return;
+    };
+    let assessment = delivery_presence::assess(recipient, &driver);
+    if assessment.stale() {
+        item["state"] = Value::String("waiting".into());
+    }
+    item["delivery"] = assessment.to_value();
 }
 
 fn client_agent_resources_uncached(
@@ -7322,6 +7358,8 @@ struct MessagesPageQuery {
     include_closed: bool,
     cursor: Option<String>,
     limit: Option<usize>,
+    /// A seat delivery process's report; see [`delivery_presence`].
+    delivery: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -7339,6 +7377,9 @@ async fn list_messages_page(
 ) -> Result<Json<MessagePage>, ApiError> {
     let limit = query.limit.unwrap_or(100).clamp(1, 200);
     let to = query.to.as_deref().map(normalize_message_party);
+    if let (Some(to), Some(report)) = (to.as_deref(), query.delivery.as_deref()) {
+        delivery_presence::record(to, report);
+    }
     let cursor = query
         .cursor
         .as_deref()
