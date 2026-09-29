@@ -725,6 +725,79 @@ mod tests {
         }
     }
 
+    /// A heal between a node that trimmed and one that did not never fetches back what the
+    /// checkpoint dropped, even when the peer offers it.
+    #[test]
+    fn a_heal_never_fetches_back_what_a_checkpoint_dropped() {
+        use crate::model::{ReplicationHealAnswer, ReplicationHealQuery, ReplicationHealStep};
+
+        let (alder, plan) = store_with_drops("alder");
+        let birch = Store::open_memory("birch").unwrap();
+        birch.bind_fleet(FLEET).unwrap();
+        while sync(&alder, "alder", &birch, false).received != 0 {}
+        trim(&alder, &plan);
+        let dropped = dropped_keys(&plan);
+
+        // As if the graphs differed for another reason, alder narrows to the claims it lacks,
+        // which are only the ones its checkpoint dropped.
+        let mut query = ReplicationHealQuery::Ranges;
+        let mut report = None;
+        for _ in 0..16 {
+            let mut answer = birch.heal_answer("alder", &query).unwrap();
+            if let ReplicationHealAnswer::Ranges { graph_digest, .. } = &mut answer {
+                *graph_digest = "another graph".into();
+            }
+            match alder.heal_next("birch", answer).unwrap() {
+                ReplicationHealStep::Ask { query: next } => query = next,
+                ReplicationHealStep::Done { report: done } => {
+                    report = Some(done);
+                    break;
+                }
+            }
+            if let ReplicationHealQuery::Swap { want, .. } = &query {
+                assert!(identity_keys(want).is_disjoint(&dropped), "{want:?}");
+            }
+        }
+        let report = report.expect("the heal ended");
+        assert!(report.subjects > 0, "{report:?}");
+        assert_eq!(report.refetched, 0);
+        assert!(
+            report
+                .unresolved
+                .as_deref()
+                .is_some_and(|reason| reason.contains("a checkpoint dropped here")),
+            "{report:?}"
+        );
+
+        // Offered the dropped envelopes anyway, alder stores none of them.
+        let offered = birch
+            .replica_envelopes(
+                plan.envelopes
+                    .iter()
+                    .map(|envelope| ReplicaEnvelopeId {
+                        writer: envelope.writer.clone(),
+                        sequence: envelope.sequence,
+                        hash: envelope.envelope_hash.clone(),
+                    })
+                    .collect(),
+            )
+            .unwrap();
+        assert_eq!(offered.len(), plan.envelopes.len());
+        alder
+            .heal_answer(
+                "birch",
+                &ReplicationHealQuery::Swap {
+                    push: offered,
+                    want: Vec::new(),
+                },
+            )
+            .unwrap();
+        assert!(held(&alder).is_disjoint(&dropped));
+        for claim in &plan.claims {
+            assert!(alder.claim_by_id(&claim.id).unwrap().is_none());
+        }
+    }
+
     #[test]
     fn the_inventory_follows_deletions_and_later_envelopes() {
         let (store, plan) = store_with_drops("alder");

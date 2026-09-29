@@ -182,11 +182,18 @@ pub struct Config {
 }
 
 /// Whether this node takes part in checkpoints. A node that does not never seals, and every
-/// participant must seal, so turning it off anywhere stops trimming for the whole fleet.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+/// participant must seal, so turning it off anywhere stops trimming for the whole fleet: the
+/// kill switch while checkpoints roll out.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct CheckpointConfig {
     pub enabled: bool,
+}
+
+impl Default for CheckpointConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 impl CheckpointConfig {
@@ -555,7 +562,10 @@ mod tests {
             .to_string();
         assert!(error.contains(&rejected.display().to_string()), "{error}");
         assert!(error.contains(&format!("{} bytes", limit + 2)), "{error}");
-        assert!(error.contains(&format!("sun_path limit: {SUN_PATH_BYTES}")), "{error}");
+        assert!(
+            error.contains(&format!("sun_path limit: {SUN_PATH_BYTES}")),
+            "{error}"
+        );
         assert!(error.contains("--client-gateway-socket"), "{error}");
         assert!(error.contains("XDG_RUNTIME_DIR"), "{error}");
     }
@@ -595,13 +605,15 @@ mod tests {
     }
 
     #[test]
-    fn checkpoints_are_off_until_enabled_and_absent_from_a_written_default_config() {
+    fn checkpoints_are_on_unless_disabled_and_absent_from_a_written_default_config() {
         let config = Config::default();
-        assert!(!config.checkpoint.enabled);
+        assert!(config.checkpoint.enabled);
         // An older build refuses unknown sections, so a default config never names it.
         assert!(!toml::to_string(&config).unwrap().contains("checkpoint"));
-        let config: Config = toml::from_str("[checkpoint]\nenabled = true\n").unwrap();
+        let config: Config = toml::from_str("").unwrap();
         assert!(config.checkpoint.enabled);
+        let config: Config = toml::from_str("[checkpoint]\nenabled = false\n").unwrap();
+        assert!(!config.checkpoint.enabled);
         assert!(toml::to_string(&config).unwrap().contains("[checkpoint]"));
         assert!(toml::from_str::<Config>("[checkpoint]\nenabled = true\nlag = 3\n").is_err());
     }

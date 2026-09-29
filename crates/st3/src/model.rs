@@ -2497,6 +2497,19 @@ pub struct ReplicationInventory {
     /// are sent at most 512.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepts: Option<u32>,
+    /// The newest stable checkpoint the sending node has trimmed or adopted. A node that has
+    /// not applied it fetches its manifest from this peer. Older peers leave it out and ignore
+    /// it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<InventoryCheckpoint>,
+}
+
+/// A checkpoint as an inventory advertises it.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct InventoryCheckpoint {
+    pub id: String,
+    pub cut_unix_ms: u128,
+    pub drop_digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

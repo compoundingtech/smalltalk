@@ -430,6 +430,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/checkpoint/plan", post(checkpoint_plan))
         .route("/v1/checkpoint/status", get(checkpoint_status))
         .route("/v1/checkpoint/excuse", post(checkpoint_excuse))
+        .route("/v1/checkpoint/resume", post(checkpoint_resume))
         .route(
             "/v1/internal/replication/export",
             post(replication_export).layer(DefaultBodyLimit::max(crate::peer::MAX_EXCHANGE_BYTES)),
@@ -445,6 +446,15 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route(
             "/v1/internal/replication/checkpoint",
             post(replication_checkpoint_manifest),
+        )
+        .route(
+            "/v1/internal/replication/checkpoint-need",
+            post(replication_checkpoint_need),
+        )
+        .route(
+            "/v1/internal/replication/checkpoint-adopt",
+            post(replication_checkpoint_adopt)
+                .layer(DefaultBodyLimit::max(crate::peer::MAX_MANIFEST_BYTES)),
         )
         .route(
             "/v1/internal/replication/heal/answer",
@@ -4708,6 +4718,20 @@ async fn checkpoint_excuse(
     Ok(Json(claim))
 }
 
+async fn checkpoint_resume(
+    State(state): State<AppState>,
+    Json(request): Json<crate::store::CheckpointResumeRequest>,
+) -> Result<Json<crate::store::CheckpointStatusView>, ApiError> {
+    let store = state.store.clone();
+    blocking_action(move || store.resume_checkpoints(&request.actor, &request.reason)).await?;
+    signal_changed(&state);
+    let store = state.store.clone();
+    let peers = state.configured_peers.clone();
+    blocking_store(move || store.checkpoint_status(client_now_ms(), &peers))
+        .await
+        .map(Json)
+}
+
 async fn repair_replication_record(
     State(state): State<AppState>,
     Json(request): Json<ReplicationRepairRequest>,
@@ -4758,6 +4782,29 @@ async fn replication_checkpoint_manifest(
     blocking_store(move || store.checkpoint_manifest_page(&request))
         .await
         .map(Json)
+}
+
+/// The newest stable checkpoint this node needs a peer's manifest for, if any.
+async fn replication_checkpoint_need(
+    State(state): State<AppState>,
+) -> Result<Json<Option<crate::store::CheckpointManifestNeed>>, ApiError> {
+    let store = state.store.clone();
+    blocking_store(move || store.checkpoint_manifest_need())
+        .await
+        .map(Json)
+}
+
+/// Adopt a checkpoint from the manifest the replication worker fetched from a peer.
+async fn replication_checkpoint_adopt(
+    State(state): State<AppState>,
+    Json(manifest): Json<crate::store::CheckpointManifest>,
+) -> Result<Json<Vec<crate::store::CheckpointAction>>, ApiError> {
+    let store = state.store.clone();
+    let actions = blocking_action(move || store.adopt_checkpoint(&manifest)).await?;
+    if !actions.is_empty() {
+        signal_changed(&state);
+    }
+    Ok(Json(actions))
 }
 
 async fn replication_receive(
@@ -12278,6 +12325,54 @@ agent "good" {{ workspace {:?}; command "true" }}
             .await
             .unwrap();
         assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    /// The replication worker asks the daemon whether it needs a checkpoint's manifest, and
+    /// hands it a whole manifest to adopt, which can be far above axum's default body limit.
+    #[tokio::test]
+    async fn the_worker_asks_for_and_hands_over_checkpoint_manifests() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let post = |uri: &str, body: Vec<u8>| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(post(
+                "/v1/internal/replication/checkpoint-need",
+                b"{}".to_vec(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let need: Value = serde_json::from_slice(&body).unwrap();
+        assert!(need["value"].is_null(), "{need}");
+
+        let manifest = crate::store::CheckpointManifest {
+            checkpoint: "checkpoint/2026-09-27".into(),
+            cut_unix_ms: crate::store::checkpoint_cut("checkpoint/2026-09-27").unwrap(),
+            ..Default::default()
+        };
+        let mut body = serde_json::to_vec(&manifest).unwrap();
+        body.resize(8 * 1024 * 1024, b' ');
+        let response = app
+            .oneshot(post("/v1/internal/replication/checkpoint-adopt", body))
+            .await
+            .unwrap();
+        // Well past the default limit, and refused only because nothing certified it here.
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(
+            error.to_string().contains("checkpoint-not-stable"),
+            "{error}"
+        );
     }
 
     #[tokio::test]
