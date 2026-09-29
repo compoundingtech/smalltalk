@@ -17,6 +17,7 @@ mod log_diet;
 mod operational_state_contract;
 mod recorder_report;
 mod seat_queue_perf;
+mod terminal_attach;
 
 #[test]
 fn every_test_file_is_built() {
