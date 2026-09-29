@@ -2311,12 +2311,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             .iter()
             .filter(|step| Some(step.subject.as_str()) == next_wake)
         {
+            if defers_inherited_work_wake(step, &work, harness.as_ref()) {
+                continue;
+            }
             if let Some(member) = member
                 && !self.prepare_fresh_context(agent, incarnation, step, member)?
             {
-                continue;
-            }
-            if defers_inherited_work_wake(step, &work, harness.as_ref()) {
                 continue;
             }
             let tag_value = format!(
