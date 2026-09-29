@@ -22,7 +22,7 @@ for (const rejected of [
 // LAN gateways: .local names and RFC1918 IPv4 over plain HTTP, labelled so the UI can warn.
 const { gatewayTransport } = await import('./gatewayUrl.ts');
 for (const [url, normalized] of [
-  ['http://ExampleMac.local:4102/', 'http://example-mac.local:4102'],
+  ['http://Example-Mac.local:4102/', 'http://example-mac.local:4102'],
   ['http://example-mac.local:4102', 'http://example-mac.local:4102'],
   ['http://10.0.0.5:4102', 'http://10.0.0.5:4102'],
   ['http://172.16.0.1:4102', 'http://172.16.0.1:4102'],
