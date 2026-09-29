@@ -133,6 +133,11 @@ enum Command {
         #[command(subcommand)]
         command: WorkCommand,
     },
+    /// Show and change the ordered lanes that mission runs work through, such as a merge train.
+    Lanes {
+        #[command(subcommand)]
+        command: LaneCommand,
+    },
     /// Inspect and control terminal members.
     Terminals {
         #[command(subcommand)]
@@ -2218,6 +2223,97 @@ struct AgentQueueMoveArgs {
     actor: Option<String>,
 }
 
+#[derive(Subcommand)]
+enum LaneCommand {
+    /// List open lanes; `--all` also lists lanes whose run ended.
+    Ls {
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show one lane's entries in order and its recent changes.
+    Show {
+        /// A `lane/RUN/NAME` subject, a run or mission with one lane, or a unique lane name.
+        lane: String,
+    },
+    /// Add an entry at the back of a lane. An entry already in the lane stays where it is.
+    Join(LaneEntryArgs),
+    /// Take an entry out of a lane.
+    Leave(LaneLeaveArgs),
+    /// Move an entry to the top, to the bottom, or next to another entry.
+    Move(LaneMoveArgs),
+    /// Record the status the lane's run found for an entry.
+    Mark(LaneMarkArgs),
+    /// Approve an entry as the lane's approver.
+    Approve(LaneEntryArgs),
+}
+
+#[derive(Args)]
+struct LaneEntryArgs {
+    /// A `lane/RUN/NAME` subject, a run or mission with one lane, or a unique lane name.
+    lane: String,
+    /// The entry subject, or the part after the lane's entry prefix, such as a pull request number.
+    entry: String,
+    /// Why; recorded with the change.
+    #[arg(long)]
+    reason: Option<String>,
+    /// Person or agent making the change. A harness acts as its own seat (`ST_AGENT`); otherwise
+    /// this defaults to `person` in the st config.
+    #[arg(long = "as", value_parser = parse_queue_move_actor)]
+    actor: Option<String>,
+}
+
+#[derive(Args)]
+struct LaneLeaveArgs {
+    #[command(flatten)]
+    entry: LaneEntryArgs,
+    /// `completed` when the lane's work for the entry is done, or `removed` when it was dropped.
+    #[arg(long, default_value = "removed", value_parser = ["completed", "removed"])]
+    outcome: String,
+}
+
+#[derive(Args)]
+#[command(group(
+    clap::ArgGroup::new("placement")
+        .required(true)
+        .args(["top", "bottom", "before", "after"])
+))]
+struct LaneMoveArgs {
+    #[command(flatten)]
+    entry: LaneEntryArgs,
+    /// Put the entry first.
+    #[arg(long)]
+    top: bool,
+    /// Put the entry last.
+    #[arg(long)]
+    bottom: bool,
+    /// Put the entry directly before another entry.
+    #[arg(long, value_name = "ENTRY")]
+    before: Option<String>,
+    /// Put the entry directly after another entry.
+    #[arg(long, value_name = "ENTRY")]
+    after: Option<String>,
+}
+
+#[derive(Args)]
+struct LaneMarkArgs {
+    /// A `lane/RUN/NAME` subject, a run or mission with one lane, or a unique lane name.
+    lane: String,
+    /// The entry subject, or the part after the lane's entry prefix.
+    entry: String,
+    /// What the run found: waiting, held, ready, or running.
+    #[arg(long, value_parser = ["waiting", "held", "ready", "running"])]
+    state: String,
+    /// A short explanation shown next to the status.
+    #[arg(long)]
+    detail: Option<String>,
+    /// The exact head or version the status applies to.
+    #[arg(long)]
+    head: Option<String>,
+    /// Person or agent recording the status. A harness acts as its own seat (`ST_AGENT`).
+    #[arg(long = "as", value_parser = parse_queue_move_actor)]
+    actor: Option<String>,
+}
+
 #[derive(Args)]
 struct AgentApplyArgs {
     /// KDL file to publish; use `-` to read standard input.
@@ -2881,6 +2977,9 @@ async fn run(cli: Cli) -> Result<()> {
             run_devices(endpoint.clone(), config.person.as_deref(), args, cli.json).await
         }
         Command::Work { command } => run_work(&client, &endpoint, command, cli.json).await,
+        Command::Lanes { command } => {
+            run_lanes(&client, config.person.as_deref(), command, cli.json).await
+        }
         Command::Terminals { command } => {
             run_pty(
                 &client,
@@ -2961,6 +3060,13 @@ fn guard_mutating_cli_actor(
                 _ => None,
             },
             _ => None,
+        },
+        Command::Lanes { command } => match command {
+            LaneCommand::Join(args) | LaneCommand::Approve(args) => args.actor.as_deref(),
+            LaneCommand::Leave(args) => args.entry.actor.as_deref(),
+            LaneCommand::Move(args) => args.entry.actor.as_deref(),
+            LaneCommand::Mark(args) => args.actor.as_deref(),
+            LaneCommand::Ls { .. } | LaneCommand::Show { .. } => None,
         },
         Command::Attention { command } => match command {
             AttentionCommand::Request(args) => args.actor.as_deref(),
@@ -3714,10 +3820,21 @@ async fn run_mission_view(
                 return print_value(&run, true);
             }
             let runs = load_mission_run_tree(client, &run).await?;
+            let now = current_unix_ms()?;
             print!(
                 "{}",
-                render_mission_run(&run, &runs, OutputStyle::stdout(), current_unix_ms()?)
+                render_mission_run(&run, &runs, OutputStyle::stdout(), now)
             );
+            // A daemon without lanes answers 404; the run itself is still shown.
+            if let Ok(lanes) = client
+                .get::<Vec<st3::model::LaneView>>(&format!(
+                    "/v1/lanes?run={}",
+                    urlencoding::encode(&run.subject)
+                ))
+                .await
+            {
+                print!("{}", render_run_lanes(&lanes, now));
+            }
             Ok(())
         }
         MissionViewCommand::Publish(args) => publish_mission_file(client, args, json_output).await,
@@ -7078,6 +7195,297 @@ async fn run_agent_queue(
     Ok(())
 }
 
+/// A lane change is made by `--as`, else by the harness's own seat, else by the configured person.
+fn lane_actor(explicit: Option<&str>, configured_person: Option<&str>) -> Result<String> {
+    if let Some(actor) = explicit {
+        return Ok(actor.to_owned());
+    }
+    if let Some(own) = std::env::var("ST_AGENT")
+        .ok()
+        .map(|own| own.trim().to_owned())
+        .filter(|own| !own.is_empty())
+    {
+        return Ok(seat_subject(&own));
+    }
+    configured_person.map(str::to_owned).context(
+        "st lanes needs `--as person/NAME`, `--as agent/PATH`, or `person = \"person/NAME\"` in the st config",
+    )
+}
+
+async fn run_lanes(
+    client: &Client,
+    configured_person: Option<&str>,
+    command: LaneCommand,
+    json_output: bool,
+) -> Result<()> {
+    let change =
+        |lane: String, change: &str, entry: String, actor: String| st3::model::LaneChangeRequest {
+            lane,
+            change: change.into(),
+            entry,
+            reason: None,
+            outcome: None,
+            placement: None,
+            anchor: None,
+            state: None,
+            detail: None,
+            head: None,
+            actor,
+            idempotency_key: format!("lane-change:{}", uuid::Uuid::now_v7().simple()),
+        };
+    let request = match command {
+        LaneCommand::Ls { all } => {
+            let lanes: Vec<st3::model::LaneView> =
+                client.get(&format!("/v1/lanes?all={all}")).await?;
+            if json_output {
+                return print_value(&lanes, true);
+            }
+            print!("{}", render_lanes(&lanes));
+            return Ok(());
+        }
+        LaneCommand::Show { lane } => {
+            let lane: st3::model::LaneView = client
+                .get(&format!("/v1/lanes/{}", urlencoding::encode(&lane)))
+                .await?;
+            if json_output {
+                return print_value(&lane, true);
+            }
+            print!("{}", render_lane(&lane, current_unix_ms()?));
+            return Ok(());
+        }
+        LaneCommand::Join(args) => {
+            let actor = lane_actor(args.actor.as_deref(), configured_person)?;
+            let mut request = change(args.lane, "join", args.entry, actor);
+            request.reason = args.reason;
+            request
+        }
+        LaneCommand::Approve(args) => {
+            let actor = lane_actor(args.actor.as_deref(), configured_person)?;
+            let mut request = change(args.lane, "approve", args.entry, actor);
+            request.reason = args.reason;
+            request
+        }
+        LaneCommand::Leave(args) => {
+            let actor = lane_actor(args.entry.actor.as_deref(), configured_person)?;
+            let mut request = change(args.entry.lane, "leave", args.entry.entry, actor);
+            request.reason = args.entry.reason;
+            request.outcome = Some(args.outcome);
+            request
+        }
+        LaneCommand::Move(args) => {
+            let actor = lane_actor(args.entry.actor.as_deref(), configured_person)?;
+            let mut request = change(args.entry.lane, "move", args.entry.entry, actor);
+            request.reason = args.entry.reason;
+            let (placement, anchor) = if args.top {
+                ("top", None)
+            } else if args.bottom {
+                ("bottom", None)
+            } else if let Some(before) = args.before {
+                ("before", Some(before))
+            } else if let Some(after) = args.after {
+                ("after", Some(after))
+            } else {
+                anyhow::bail!("choose one of --top, --bottom, --before ENTRY, or --after ENTRY");
+            };
+            request.placement = Some(placement.into());
+            request.anchor = anchor;
+            request
+        }
+        LaneCommand::Mark(args) => {
+            let actor = lane_actor(args.actor.as_deref(), configured_person)?;
+            let mut request = change(args.lane, "mark", args.entry, actor);
+            request.state = Some(args.state);
+            request.detail = args.detail;
+            request.head = args.head;
+            request
+        }
+    };
+    let response: st3::model::LaneChangeResponse =
+        client.post("/v1/lane-changes", &request).await?;
+    if json_output {
+        return print_value(&response, true);
+    }
+    let lane = &response.lane;
+    let entry = st3::lane::entry_subject(lane.entries_prefix.as_deref(), &request.entry);
+    let short = st3::lane::short_entry(lane.entries_prefix.as_deref(), &entry);
+    let summary = match (request.change.as_str(), response.claim.is_some()) {
+        ("join", false) => format!("{short} is already in {}", lane.subject),
+        ("join", true) => format!("{short} joined {}", lane.subject),
+        ("leave", _) => format!("{short} left {}", lane.subject),
+        ("move", _) => format!("moved {short} in {}", lane.subject),
+        ("mark", _) => format!("marked {short} {}", request.state.as_deref().unwrap_or("")),
+        ("approve", _) => format!("approved {short} in {}", lane.subject),
+        (other, _) => format!("{other} {short}"),
+    };
+    println!("{summary}");
+    print!("{}", render_lane(lane, current_unix_ms()?));
+    Ok(())
+}
+
+fn render_lanes(lanes: &[st3::model::LaneView]) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    let _ = writeln!(output, "LANES  {}", lanes.len());
+    if lanes.is_empty() {
+        let _ = writeln!(output, "  No mission run declares an open lane.");
+    }
+    for lane in lanes {
+        let prefix = lane.entries_prefix.as_deref();
+        let front = lane.entries.first().map(|entry| {
+            format!(
+                " · front {} {}",
+                st3::lane::short_entry(prefix, &entry.entry),
+                entry.state
+            )
+        });
+        let _ = writeln!(
+            output,
+            "  {}  {} {}{}{}",
+            lane.subject,
+            lane.entries.len(),
+            if lane.entries.len() == 1 {
+                "entry"
+            } else {
+                "entries"
+            },
+            front.unwrap_or_default(),
+            if lane.open { "" } else { " · closed" }
+        );
+    }
+    output
+}
+
+/// One lane entry on one line: position, short entry, status, detail, and who joined it.
+fn render_lane_entry(
+    output: &mut String,
+    indent: &str,
+    prefix: Option<&str>,
+    entry: &st3::lane::Entry,
+    now: u128,
+) {
+    use std::fmt::Write as _;
+
+    let _ = write!(
+        output,
+        "{indent}{}. {}  {}",
+        entry.position,
+        st3::lane::short_entry(prefix, &entry.entry),
+        entry.state
+    );
+    if let Some(detail) = entry.detail.as_deref() {
+        let _ = write!(output, "  {detail}");
+    }
+    let _ = write!(
+        output,
+        "  joined by {} {}",
+        entry.joined_by,
+        presentation::relative_time(entry.joined_at_unix_ms, now)
+    );
+    if let Some(approver) = entry.approved_by.as_deref() {
+        let _ = write!(output, ", approved by {approver}");
+    }
+    let _ = writeln!(output);
+}
+
+fn render_lane(lane: &st3::model::LaneView, now: u128) -> String {
+    use std::fmt::Write as _;
+
+    let prefix = lane.entries_prefix.as_deref();
+    let mut output = String::new();
+    let _ = writeln!(output, "LANE      {}", lane.subject);
+    if let Some(run) = lane.run.as_deref() {
+        let _ = writeln!(output, "RUN       {run}");
+    }
+    if !lane.open {
+        let _ = writeln!(
+            output,
+            "STATE     closed: its run ended or a revision dropped it"
+        );
+    }
+    if let Some(prefix) = prefix {
+        let _ = writeln!(output, "ENTRIES   {prefix}");
+    }
+    if let Some(approver) = lane.approver.as_deref() {
+        let _ = writeln!(output, "APPROVER  {approver}");
+    }
+    let _ = writeln!(output, "QUEUE     {}", lane.entries.len());
+    if lane.entries.is_empty() {
+        let _ = writeln!(output, "  The lane is empty.");
+    }
+    for entry in &lane.entries {
+        render_lane_entry(&mut output, "  ", prefix, entry, now);
+    }
+    if !lane.recent.is_empty() {
+        let _ = writeln!(output, "RECENT");
+    }
+    for recent in &lane.recent {
+        let short = st3::lane::short_entry(prefix, &recent.entry);
+        let change = match recent.kind.as_str() {
+            "left" => format!(
+                "{short} left ({})",
+                recent.outcome.as_deref().unwrap_or("removed")
+            ),
+            "moved" => match (recent.placement.as_deref(), recent.anchor.as_deref()) {
+                (Some("top"), _) => format!("moved {short} to the top"),
+                (Some("bottom"), _) => format!("moved {short} to the bottom"),
+                (Some(placement), Some(anchor)) => format!(
+                    "moved {short} {placement} {}",
+                    st3::lane::short_entry(prefix, anchor)
+                ),
+                _ => format!("moved {short}"),
+            },
+            kind => format!("{kind} {short}"),
+        };
+        let _ = write!(
+            output,
+            "  {change} by {} {}",
+            recent.actor,
+            presentation::relative_time(recent.at_unix_ms, now)
+        );
+        if let Some(reason) = recent.reason.as_deref() {
+            let _ = write!(output, ": {reason}");
+        }
+        let _ = writeln!(output);
+    }
+    output
+}
+
+/// The lanes a mission run owns, for `st missions show`.
+fn render_run_lanes(lanes: &[st3::model::LaneView], now: u128) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::new();
+    if lanes.is_empty() {
+        return output;
+    }
+    let _ = writeln!(output, "\nLANES");
+    for lane in lanes {
+        let _ = writeln!(
+            output,
+            "  {}  {} {}{}",
+            lane.subject,
+            lane.entries.len(),
+            if lane.entries.len() == 1 {
+                "entry"
+            } else {
+                "entries"
+            },
+            if lane.open { "" } else { " · closed" }
+        );
+        for entry in &lane.entries {
+            render_lane_entry(
+                &mut output,
+                "    ",
+                lane.entries_prefix.as_deref(),
+                entry,
+                now,
+            );
+        }
+    }
+    output
+}
+
 fn render_missions_tree(response: &Value) -> String {
     use std::fmt::Write as _;
     let value = &response["value"];
@@ -7162,6 +7570,31 @@ fn render_missions_tree(response: &Value) -> String {
                 waiting.join(", ")
             }
         );
+    }
+    // A daemon without lanes sends no `lanes` field; show the section only when it does.
+    if let Some(lanes) = value["lanes"].as_array() {
+        output.push_str("LANES\n");
+        if lanes.is_empty() {
+            output.push_str("  none\n");
+        }
+        for lane in lanes {
+            let entries = lane["entries"].as_array().map_or(0, Vec::len);
+            let _ = write!(
+                output,
+                "  {}  {entries} {}",
+                lane["id"].as_str().unwrap_or("unknown"),
+                if entries == 1 { "entry" } else { "entries" }
+            );
+            if let Some(front) = lane["entries"].get(0) {
+                let _ = write!(
+                    output,
+                    " · front {} {}",
+                    front["label"].as_str().unwrap_or("unknown"),
+                    front["state"].as_str().unwrap_or("unknown")
+                );
+            }
+            output.push('\n');
+        }
     }
     output.push_str("UNSTARTED MISSIONS\n");
     let unstarted = value["unstarted_missions"].as_array();

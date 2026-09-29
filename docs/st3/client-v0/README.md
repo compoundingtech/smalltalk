@@ -144,6 +144,7 @@ the stable `id` ascending. No locale-sensitive ordering is permitted.
 | Work | `/work`, `/work/{id}` | ready first, readiness epoch, path, ID |
 | Agents | `/agents`, `/agents/{id}` | presentation name, ID |
 | Runtimes | `/runtimes`, `/runtimes/{id}` | owning agent, runtime kind, ID |
+| Lanes | `/lanes`, `/lanes/{id}` | open lanes first, ID |
 | Operations | `/operations`, `/operations/{id}` | severity descending, component, ID |
 | History | `/history`, `/history/{id}` | occurred time descending, store index descending, ID |
 | Sessions | `/sessions`, `/sessions/{id}` | updated time descending, ID |
@@ -189,6 +190,15 @@ waiting step IDs, and then the recent moves, newest first, with `move_count` for
 Each move names its run, placement, optional anchor run, actor, optional reason, and time. A run
 joins the queue when it first has a step assigned to the seat and leaves when it is terminal. An
 unknown agent returns `not-found`.
+
+A lane is one ordered line of entries that a mission run works through front first, such as a merge
+train of pull requests. `/v1/client/lanes` lists open lanes; `history=true` adds lanes whose run
+ended. Each `Lane` resource names its `mission_run_id`, `mission_id`, optional `entries_prefix`
+and `approver_id`, and `state` (`open` or `closed`). `entries` are in lane order: each has its
+`entry_id`, a short `label` without the prefix, `position`, the status the run recorded (`waiting`,
+`held`, `ready`, or `running`) with its `detail`, exact `head`, marker, and time, who joined it and
+when, and who approved it. `recent` lists joins, leaves, moves, and approvals, newest first. The
+`st missions tree` view carries the open lanes as `lanes`. [Lanes](../lanes.md) explains the model.
 
 Observer and subscription lists and details are available at `/v1/client/observers` and
 `/v1/client/subscriptions`. Each resource includes its normalized specification, current state,
@@ -277,6 +287,7 @@ The v0 action discriminators are:
 | Sessions | `session.import` | exact native-session revision; an exact running-process fingerprint is revalidated server-side |
 | Work | `work.claim`, `work.renew`, `work.progress`, `work.complete`, `work.fail`, `work.release`, `work.retry`, `work.publish-mission` | generation, definition, attempt, readiness epoch, and claimant incarnation after claim |
 | Seat queues | `agent.queue-move` | snapshot; the run and any anchor run must be queued for the seat |
+| Lanes | `lane.join`, `lane.leave`, `lane.move`, `lane.mark`, `lane.approve` | snapshot; the lane must be open and a named entry or anchor must be in it |
 | Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation; stop, restart, and reset also require `runtime_desired_revision` from the runtime resource |
 | Terminals | `terminal.input`, `terminal.resize`, `terminal.attach`, `terminal.detach` | runtime incarnation and terminal sequence |
 | Pairing | `pairing.begin`, `pairing.complete`, `pairing.revoke` | pairing/device revision where applicable |
@@ -292,6 +303,14 @@ submits the runtime resource ID as `target_id` and copies its `incarnation_id` a
 `after`), `anchor_run_id` for `before` and `after`, and an optional `reason`. It records one
 `agent.queue.moved` claim with the session's person as actor. It never changes a step the seat
 already holds. A run or anchor that is not queued for the seat returns `validation-failed`.
+
+The lane actions take `lane_id` and `entry_id`. `lane.join` and `lane.approve` take an optional
+`reason`; `lane.leave` takes an optional `outcome` (`completed` or `removed`, default `removed`) and
+`reason`; `lane.move` takes `placement` and, for `before` and `after`, `anchor_id`; `lane.mark` takes
+`state` and optional `detail` and `head`. Each records one `lane.*` claim with the session's person
+as actor, and affects the lane's ID. A join of an entry already in the lane records nothing. Only
+the lane's `approver_id` can approve (`forbidden` otherwise). An entry or anchor that is not in the
+lane, or a closed lane, returns `validation-failed`.
 
 An accepted action returns one stable operation ID and status. `202 accepted` means the command is
 durable, not complete; clients follow operation events or read `/operations/{id}`. Result objects

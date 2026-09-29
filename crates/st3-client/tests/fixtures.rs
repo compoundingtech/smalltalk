@@ -66,7 +66,11 @@ fn generated_models_decode_every_stream_fixture() {
     assert_eq!(screen.value.cursor.style, TerminalCursorStyle::Block);
     assert!(screen.value.modes.bracketed_paste);
     for line in &screen.value.lines {
-        let spelled = line.runs.iter().map(|run| run.text.as_str()).collect::<String>();
+        let spelled = line
+            .runs
+            .iter()
+            .map(|run| run.text.as_str())
+            .collect::<String>();
         assert_eq!(spelled.trim_end_matches(' '), line.text);
     }
     assert_eq!(
@@ -94,7 +98,16 @@ fn generated_models_decode_every_stream_fixture() {
 #[test]
 fn generated_resource_union_decodes_all_kinds() {
     let resources: Vec<Resource> = serde_json::from_slice(&fixture("resources.json")).unwrap();
-    assert_eq!(resources.len(), 17);
+    assert_eq!(resources.len(), 18);
+    let lane = resources
+        .iter()
+        .find_map(|resource| match resource {
+            Resource::Lane(lane) => Some(lane),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(lane.entries[0].label, "42");
+    assert_eq!(lane.recent[0].placement, Some(AgentQueuePlacement::Bottom));
     assert!(
         resources
             .iter()

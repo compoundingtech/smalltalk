@@ -11,6 +11,7 @@ pub mod environment;
 pub(crate) mod external_sessions;
 pub mod fleet;
 pub mod graph;
+pub mod lane;
 pub mod mission;
 pub mod model;
 pub mod otlp;

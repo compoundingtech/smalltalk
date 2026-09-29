@@ -848,6 +848,16 @@ pub struct ResourceRefreshOperation {
     pub timeout_ms: u64,
 }
 
+/// A lane's declared settings, read from its `intent.desired` body.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct LaneSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entries: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<String>,
+    pub stopped: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ObserverSpec {
     pub resource: String,
@@ -2173,6 +2183,63 @@ pub struct SeatQueueMoveRequest {
     pub reason: Option<String>,
     pub actor: String,
     pub idempotency_key: String,
+}
+
+/// One lane as st shows it: its declaration and its entries in order.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct LaneView {
+    pub subject: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mission: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entries_prefix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approver: Option<String>,
+    /// False once its run ended or a revision dropped it.
+    pub open: bool,
+    /// The newest lane claim, or `empty` before the first one; it changes with every claim.
+    pub revision: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at_unix_ms: Option<u128>,
+    pub entries: Vec<crate::lane::Entry>,
+    /// Joins, leaves, moves, and approvals, newest first.
+    pub recent: Vec<crate::lane::Recent>,
+}
+
+/// One change to a lane. `change` is `join`, `leave`, `move`, `mark`, or `approve`; the other
+/// optional fields belong to the change that uses them.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LaneChangeRequest {
+    pub lane: String,
+    pub change: String,
+    pub entry: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub outcome: Option<String>,
+    #[serde(default)]
+    pub placement: Option<String>,
+    #[serde(default)]
+    pub anchor: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub head: Option<String>,
+    pub actor: String,
+    pub idempotency_key: String,
+}
+
+/// The claim a lane change recorded, or none when it changed nothing, and the lane after it.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct LaneChangeResponse {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub claim: Option<ClaimRecord>,
+    pub lane: LaneView,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

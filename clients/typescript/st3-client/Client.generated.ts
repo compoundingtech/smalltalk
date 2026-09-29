@@ -231,6 +231,8 @@ export class St3Client {
     async observersGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/observers/${encodeURIComponent(routedId(id))}`); }
     async subscriptionsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/subscriptions' + query(options)); }
     async subscriptionsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/subscriptions/${encodeURIComponent(routedId(id))}`); }
+    async lanesList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/lanes' + query(options)); }
+    async lanesGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/lanes/${encodeURIComponent(routedId(id))}`); }
     async terminalsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/terminals' + query(options)); }
     async operationsList(options: ListOptions = {}): Promise<EnvelopeOf<Page>> { return this.get('/v1/client/operations' + query(options)); }
     async operationsGet(id: string): Promise<EnvelopeOf<Resource>> { return this.get(`/v1/client/operations/${encodeURIComponent(routedId(id))}`); }
@@ -244,6 +246,11 @@ export class St3Client {
     async terminalScreen(id: string): Promise<EnvelopeOf<TerminalScreen>> { return this.get(`/v1/client/terminals/${encodeURIComponent(routedId(id))}/screen`); }
     async agentQueueMove(input: Omit<ActionOf<'agent.queue-move'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'agent.queue-move' } as ActionOf<'agent.queue-move'>); }
     async attentionResolve(input: Omit<ActionOf<'attention.resolve'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'attention.resolve' } as ActionOf<'attention.resolve'>); }
+    async laneApprove(input: Omit<ActionOf<'lane.approve'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.approve' } as ActionOf<'lane.approve'>); }
+    async laneJoin(input: Omit<ActionOf<'lane.join'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.join' } as ActionOf<'lane.join'>); }
+    async laneLeave(input: Omit<ActionOf<'lane.leave'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.leave' } as ActionOf<'lane.leave'>); }
+    async laneMark(input: Omit<ActionOf<'lane.mark'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.mark' } as ActionOf<'lane.mark'>); }
+    async laneMove(input: Omit<ActionOf<'lane.move'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'lane.move' } as ActionOf<'lane.move'>); }
     async launchApprove(input: Omit<ActionOf<'launch.approve'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'launch.approve' } as ActionOf<'launch.approve'>); }
     async launchCancel(input: Omit<ActionOf<'launch.cancel'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'launch.cancel' } as ActionOf<'launch.cancel'>); }
     async launchCreate(input: Omit<ActionOf<'launch.create'>, 'api_version' | 'type'>): Promise<EnvelopeOf<ActionResult>> { return this.submitAction({ ...input, api_version: API_VERSION, type: 'launch.create' } as ActionOf<'launch.create'>); }

@@ -7314,8 +7314,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok((changed, complete))
     }
 
-    /// Stop owned observers, subscriptions, and schedules durably. Each one remains a stopped
-    /// declaration of its own kind, so it settles its state and starts no more work.
+    /// Stop owned lanes, observers, subscriptions, and schedules durably. Each one remains a
+    /// stopped declaration of its own kind, so it settles its state and starts no more work, and a
+    /// stopped lane is no longer listed.
     fn stop_owned_intake(
         &self,
         subjects: &[&DesiredSubject],
@@ -7326,7 +7327,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         for subject in subjects {
             if !matches!(
                 subject.kind.as_str(),
-                "observer" | "subscription" | "schedule"
+                "lane" | "observer" | "subscription" | "schedule"
             ) || intake_is_stopped(subject, &self.host)
             {
                 continue;
@@ -8966,6 +8967,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     cursor,
                     previous_facts: previous_facts.clone(),
                     every_ms: spec.every_ms,
+                    refresh: refresh_attempt.is_some(),
                 };
                 let observed =
                     crate::resource::spend_as(observer_subject.clone(), provider.observe(request))
@@ -10467,9 +10469,10 @@ fn expand_gate(
     Ok(())
 }
 
-/// Report whether an observer, subscription, or schedule declaration is a stop.
+/// Report whether a lane, observer, subscription, or schedule declaration is a stop.
 fn intake_is_stopped(subject: &DesiredSubject, host: &str) -> bool {
     match subject.kind.as_str() {
+        "lane" => crate::graph::lane_spec(&subject.desired).is_some_and(|spec| spec.stopped),
         "observer" => {
             crate::graph::observer_spec(&subject.desired).is_some_and(|spec| spec.stopped)
         }

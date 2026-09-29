@@ -278,7 +278,9 @@ resource "release-pr" {
 
 The resource must already have an active observer. Refresh is a declarative mission operation; the
 current public CLI does not expose a standalone resource-refresh shortcut. An unchanged observation
-is a successful refresh.
+is a successful refresh. A refresh always asks the provider again, even inside the window in which
+a GitHub observer reuses its last responses; GitHub answers an unchanged conditional request
+without spending rate limit.
 
 ## Agent queue authority
 
