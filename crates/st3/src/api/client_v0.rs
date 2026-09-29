@@ -279,8 +279,13 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
     loop {
         // The subscriptions to read after this wake-up.
         let mut refresh = Vec::<String>::new();
+        // A command already waiting goes first: under steady commits a commit wake is almost
+        // always ready too, and a fair pick could keep rereading the held windows while a new
+        // subscription waits. Otherwise every source gets a fair pick.
+        let waiting = futures_util::FutureExt::now_or_never(socket.recv());
+        let command_waiting = waiting.is_some();
         tokio::select! {
-            incoming = socket.recv() => {
+            incoming = async { match waiting { Some(incoming) => incoming, None => socket.recv().await } } => {
                 // Take every command already waiting, so subscriptions sent together are read
                 // together below.
                 let mut next = Some(incoming);
@@ -326,11 +331,11 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
                     next = futures_util::FutureExt::now_or_never(socket.recv());
                 }
             }
-            result = changed.changed() => {
+            result = changed.changed(), if !command_waiting => {
                 if result.is_err() { return; }
                 refresh.extend(subscriptions.keys().cloned());
             }
-            (id, frame) = next_terminal_frame(&mut terminals), if !terminals.is_empty() => {
+            (id, frame) = next_terminal_frame(&mut terminals), if !command_waiting && !terminals.is_empty() => {
                 let message = match frame {
                     Some(TerminalFrame::Waiting) => continue,
                     Some(TerminalFrame::Screen(envelope)) => json!({"kind":"screen", "id":id, "collection":"terminal", "snapshot":envelope["snapshot"], "value":envelope["value"]}),
