@@ -4382,7 +4382,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                         return Ok(changed);
                     }
                     if let Some(loop_spec) = &step.spec.loop_spec {
-                        changed |= self.evaluate_loop_step(run, &step, view, loop_spec)?;
+                        if self.evaluate_loop_step(run, &step, view, loop_spec)? {
+                            changed = true;
+                            self.request_stopped_loop_attention(run, view, loop_spec)?;
+                        }
                         return Ok(changed);
                     }
                     if let Some(nested) = &step.spec.nested_mission {
@@ -6784,7 +6787,6 @@ impl<R: RuntimeControl> Reconciler<R> {
     ) -> Result<bool> {
         match &loop_spec.on_exhausted {
             LoopExhaustionSpec::Fail => {
-                self.request_loop_exhaustion_attention(run, loop_spec, loop_subject, reason)?;
                 self.record_once(
                     loop_subject,
                     "loop.state",
@@ -6856,19 +6858,47 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
     }
 
-    fn request_loop_exhaustion_attention(
+    /// Raise one attention item for a loop whose step just failed or was cancelled: it failed
+    /// at exhaustion or in its human review, or a round or branch mission stopped it. The item
+    /// names the loop, the cause and the command that continues or ends it. It closes when the
+    /// loop runs again, a revision replaces its generation, or its run is cancelled. A loop that
+    /// declares `on-exhausted { attention }` names its title, reviewer and severity; any other
+    /// loop asks the person who requested the run.
+    fn request_stopped_loop_attention(
         &self,
         run: &MissionRunView,
+        view: &crate::model::StepRunView,
         loop_spec: &LoopSpec,
-        loop_subject: &str,
-        reason: &str,
     ) -> Result<()> {
-        let Some(attention) = &loop_spec.exhaustion_attention else {
+        let Some(state) = self
+            .store
+            .latest_claim(&view.subject, Some("step-run.state"))?
+        else {
             return Ok(());
         };
+        let status = state
+            .body
+            .pointer("/fields/status")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if !matches!(status, "failed" | "cancelled") {
+            return Ok(());
+        }
+        let reason = state
+            .body
+            .pointer("/fields/reason")
+            .and_then(Value::as_str)
+            .unwrap_or("the loop stopped");
+        let loop_subject = format!(
+            "loop-run/{}/{}",
+            run.generation
+                .strip_prefix("run-generation/")
+                .unwrap_or(&run.generation),
+            loop_spec.path
+        );
         let feedback = self
             .store
-            .claims_for(loop_subject, Some("loop.round-result"))?
+            .claims_for(&loop_subject, Some("loop.round-result"))?
             .into_iter()
             .rev()
             .find_map(|claim| {
@@ -6876,25 +6906,63 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .body
                     .pointer("/fields/feedback")
                     .and_then(Value::as_str)
+                    .filter(|feedback| !feedback.is_empty())
                     .map(str::to_owned)
             });
-        let detail = feedback.as_deref().map_or_else(
-            || format!("Loop `{loop_subject}` failed: {reason}."),
-            |feedback| {
-                format!("Loop `{loop_subject}` failed: {reason}. Latest feedback: `{feedback}`.")
-            },
+        let mission = run.mission.strip_prefix("mission/").unwrap_or(&run.mission);
+        let remedy = if status == "failed" {
+            format!(
+                "`st work retry {} --reason \"...\"` runs round {} after you address the cause; `st missions cancel {} --reason \"...\"` ends the run.",
+                view.subject,
+                view.attempt.saturating_add(1),
+                run.subject
+            )
+        } else {
+            format!(
+                "st cannot retry a cancelled step. Correct the mission, then end this run with `st missions cancel {} --reason \"...\"` if it still runs, and start a new one with `st missions start {mission}`.",
+                run.subject
+            )
+        };
+        let mut detail = format!(
+            "Loop `{loop_subject}` stopped in round {}: {reason}.",
+            view.attempt
         );
-        let idempotency_key = format!("loop-exhausted-attention:{loop_subject}");
+        if let Some(feedback) = feedback {
+            detail.push_str(&format!(" Latest feedback: `{feedback}`."));
+        }
+        detail.push(' ');
+        detail.push_str(&remedy);
+        detail.push_str(
+            " This item closes when the loop runs again or its run is revised or cancelled.",
+        );
+        let (title, reviewer, severity) = match &loop_spec.exhaustion_attention {
+            Some(attention) => (
+                attention.title.clone(),
+                attention.reviewer.clone(),
+                attention.severity.clone(),
+            ),
+            None => (
+                format!("Loop `{}` stopped", loop_spec.id),
+                if run.requester.starts_with("person/") {
+                    run.requester.clone()
+                } else {
+                    "person/operator".into()
+                },
+                "error".into(),
+            ),
+        };
+        // One item per stop. A retry runs the next round, so a later stop raises a new item.
+        let idempotency_key = format!("loop-stopped-attention:{loop_subject}:{}", view.attempt);
         let digest = hex::encode(sha2::Sha256::digest(idempotency_key.as_bytes()));
         self.store.request_attention(
             &format!("attention/{}", &digest[..32]),
             &AttentionRequest {
-                reviewer: attention.reviewer.clone(),
-                title: attention.title.clone(),
+                reviewer,
+                title,
                 reason: detail,
-                severity: attention.severity.clone(),
-                targets: vec![loop_subject.into(), run.subject.clone()],
-                actor: "agent/st3/reconciler".into(),
+                severity,
+                targets: vec![loop_subject, run.subject.clone()],
+                actor: RECONCILER_ACTOR.into(),
                 idempotency_key,
             },
         )?;
@@ -17866,6 +17934,11 @@ mission "alert-exhaustion" state="ready" {
         assert_eq!(attention[0].title, "Automatic review failed");
         assert_eq!(attention[0].kind, "fault");
         assert!(attention[0].targets.contains(&run.subject));
+        assert!(
+            attention[0].detail.contains("`st work retry step-run/"),
+            "{}",
+            attention[0].detail
+        );
         for _ in 0..5 {
             reconciler.reconcile_once().unwrap();
         }
@@ -17873,6 +17946,151 @@ mission "alert-exhaustion" state="ready" {
             store.attention_items(Some("person/nathan")).unwrap().len(),
             1
         );
+    }
+
+    fn stopping_loop_run(
+        requester: &str,
+        round: &str,
+        idempotency_key: &str,
+    ) -> (Arc<Store>, Reconciler<FakeRuntime>, MissionRunView) {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let source = format!(
+            r#"
+version 2
+resource "result" {{ kind "custom.test.loop-result" }}
+resource "never" {{ kind "custom.test.loop-result" }}
+mission "stopping" state="ready" {{
+  goal "Stop a bounded loop."
+  completion {{ when "all-steps-exhausted" }}
+  loop "review" {{
+    max-rounds 3
+    until {{ gate "ready" {{ field "state" "resource/result" is "ready" }} }}
+    round {{
+      completion {{ when "all-steps-exhausted" }}
+      {round}
+    }}
+  }}
+}}
+"#
+        );
+        apply_source(&store, &source, idempotency_key);
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "stopping".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some(requester.into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: format!("{idempotency_key}-run"),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        (store, reconciler, run)
+    }
+
+    #[test]
+    fn every_stopped_loop_asks_its_requester_once_per_stop_until_it_runs_again() {
+        let (store, reconciler, run) = stopping_loop_run(
+            "person/lichen",
+            r#"step "work" { agentless; goal "Round ${loop.round} finds nothing ready." }"#,
+            "stopping-loop",
+        );
+        for _ in 0..30 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let failed = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(failed.status, "failed");
+        let step = failed.steps[0].subject.clone();
+        let loop_run = format!(
+            "loop-run/{}/review",
+            failed.generation.strip_prefix("run-generation/").unwrap()
+        );
+        let items = store.attention_items(Some("person/lichen")).unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        let first = &items[0];
+        assert_eq!(first.title, "Loop `review` stopped");
+        assert_eq!(first.kind, "fault");
+        assert_eq!(first.targets, vec![loop_run.clone(), run.subject.clone()]);
+        for expected in [
+            format!("Loop `{loop_run}` stopped in round 3"),
+            format!("`st work retry {step} --reason"),
+            "runs round 4".into(),
+            format!("`st missions cancel {} --reason", run.subject),
+        ] {
+            assert!(first.detail.contains(&expected), "{}", first.detail);
+        }
+        for _ in 0..5 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(
+            store.attention_items(Some("person/lichen")).unwrap().len(),
+            1
+        );
+
+        // A retry reopens the run in a new generation, which ends the item. The loop stops
+        // again there, and that stop raises its own item.
+        store
+            .retry_failed_step(&step, "person/lichen", "try the loop again", "retry-loop")
+            .unwrap();
+        for _ in 0..30 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let items = store.attention_items(Some("person/lichen")).unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert_ne!(items[0].subject, first.subject);
+        assert!(!items[0].targets.contains(&loop_run));
+    }
+
+    #[test]
+    fn a_loop_stopped_by_a_cancelled_round_says_how_to_start_over() {
+        let (store, reconciler, run) = stopping_loop_run(
+            "agent/fleet/orchid",
+            r#"step "wait" {
+        agentless
+        gate "never" { field "status" "resource/never" "is" "ready" }
+      }"#,
+            "cancelled-round",
+        );
+        for _ in 0..10 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let current = store.mission_run(&run.id).unwrap().unwrap();
+        let round = store
+            .mission_run(&store.mission_run_subject_for_idempotency_key(&format!(
+                "loop-round:{}:1",
+                current.steps[0].subject
+            )))
+            .unwrap()
+            .unwrap();
+        store
+            .set_mission_run_state(
+                &round.id,
+                "cancelled",
+                "terminal",
+                Some("cancelled by test"),
+            )
+            .unwrap();
+        for _ in 0..10 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let stopped = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(stopped.steps[0].status, "cancelled");
+        // The requester is not a person, so the operator is asked.
+        let items = store.attention_items(Some("person/operator")).unwrap();
+        assert_eq!(items.len(), 1, "{items:?}");
+        for expected in [
+            "stopped in round 1: the loop round mission had a structural failure.",
+            "st cannot retry a cancelled step.",
+            "`st missions start stopping`",
+        ] {
+            assert!(items[0].detail.contains(expected), "{}", items[0].detail);
+        }
     }
 
     #[test]

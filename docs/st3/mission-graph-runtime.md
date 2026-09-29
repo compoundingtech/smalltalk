@@ -435,7 +435,15 @@ The loop has no built-in Git behavior. A failed keep or discard mission stops th
 
 `on-exhausted` defaults to `fail`. It can contain `succeed` or one human gate instead.
 
-A failed loop can also request human attention:
+Every loop that stops short raises one attention item: a loop that fails at exhaustion or in its
+human review, and a loop that a cancelled round or a failed keep or discard branch stops. The item
+targets the loop and its run. It names the cause and the command that continues or ends the loop:
+`st work retry STEP` for a failed step, which runs the next round, or `st missions cancel RUN` and
+`st missions start MISSION` for a cancelled one. It asks the person who requested the run, or
+`person/operator` when an agent requested it. Each stop raises its own item, and an item closes
+when the loop runs again, a revision replaces its generation, or its run is cancelled.
+
+A failed loop can name the item's title, reviewer, and severity:
 
 ```kdl
 on-exhausted {
@@ -447,9 +455,7 @@ on-exhausted {
 }
 ```
 
-The attention request targets the loop and its root mission run. Reconciliation creates it once for that loop.
-
-The severity can be `warning` or `error`. An attention request is not valid after `succeed` or a human gate.
+The severity can be `warning` or `error`. An attention block is not valid after `succeed` or a human gate.
 
 A human exhaustion approval accepts the current best result. More rounds require a published mission revision.
 
