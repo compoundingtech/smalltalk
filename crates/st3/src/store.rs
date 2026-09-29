@@ -10256,7 +10256,12 @@ impl Store {
     ) -> Result<BTreeMap<String, UsageSummary>> {
         let connection = self.readers.get();
         let mut grouped = BTreeMap::<String, Vec<rusqlite::Result<(u64, String, String)>>>::new();
-        for chunk in subjects.chunks(500) {
+        let unique_subjects = subjects
+            .iter()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        for chunk in unique_subjects.chunks(500) {
             if chunk.is_empty() {
                 continue;
             }
@@ -38956,7 +38961,10 @@ message "human-attention" {
             .unwrap()
             .unwrap();
         let batch = store
-            .usage_summaries_at(&[subject.into(), "agent/missing".into()], None)
+            .usage_summaries_at(
+                &[subject.into(), "agent/missing".into(), subject.into()],
+                None,
+            )
             .unwrap();
         assert_eq!(batch.get(subject), Some(&usage));
         assert!(!batch.contains_key("agent/missing"));
