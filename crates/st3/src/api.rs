@@ -10907,6 +10907,48 @@ agent "good" {{ workspace {:?}; command "true" }}
         assert_ne!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
     }
 
+    /// The replication worker asks the daemon whether it needs a checkpoint's manifest, and
+    /// hands it a whole manifest to adopt, which can be far above axum's default body limit.
+    #[tokio::test]
+    async fn the_worker_asks_for_and_hands_over_checkpoint_manifests() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        let post = |uri: &str, body: Vec<u8>| {
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let response = app
+            .clone()
+            .oneshot(post("/v1/internal/replication/checkpoint-need", b"{}".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let need: Value = serde_json::from_slice(&body).unwrap();
+        assert!(need["value"].is_null(), "{need}");
+
+        let manifest = crate::store::CheckpointManifest {
+            checkpoint: "checkpoint/2026-09-27".into(),
+            cut_unix_ms: crate::store::checkpoint_cut("checkpoint/2026-09-27").unwrap(),
+            ..Default::default()
+        };
+        let mut body = serde_json::to_vec(&manifest).unwrap();
+        body.resize(8 * 1024 * 1024, b' ');
+        let response = app
+            .oneshot(post("/v1/internal/replication/checkpoint-adopt", body))
+            .await
+            .unwrap();
+        // Well past the default limit, and refused only because nothing certified it here.
+        assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let error: Value = serde_json::from_slice(&body).unwrap();
+        assert!(error.to_string().contains("checkpoint-not-stable"), "{error}");
+    }
+
     #[tokio::test]
     async fn api_rejects_the_removed_plan_routes() {
         let root = tempfile::tempdir().unwrap();
