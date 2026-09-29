@@ -826,8 +826,9 @@ it asks first.
 2. Stop owned runtimes, as `st service reset` does.
 3. Remove the services (`st service uninstall`).
 4. Remove the Fabric exposure (`fabric unexpose PROTOCOL`), if this node made one.
-5. For each workspace of a seat declared on this host, remove the files `render.rs` generated under
-   `.st3/` and the Git exclude lines it added. The list comes from the local graph before step 7.
+5. For each workspace of a seat declared on this host, remove the Git exclude lines `render.rs`
+   added. st no longer writes `.st3/` there, and the daemon removes one that an older release
+   wrote. The list comes from the local graph before step 7.
 6. Remove the st3 Claude channel marketplace and plugin registration.
 7. Delete `$XDG_STATE_HOME/st3`, `$XDG_CONFIG_HOME/st3`, `$XDG_DATA_HOME/st3`, and the sockets in
    `$XDG_RUNTIME_DIR`.
@@ -1412,8 +1413,8 @@ differences, found while building it or raised by intake reviews:
 - **`st fleet remove` does not look at seats.** It removes the member and revokes its invites;
   seats declared on that host stay declared and resume if a machine joins again under the name.
   Stop them first with `st3 agents stop`. `--stop-seats` is not built.
-- **`st uninstall` leaves two things for later:** the generated `.st3/` files in seat workspaces
-  and the st3 Claude channel registration. The isolated tests have no seats; both need the seat
+- **`st uninstall` leaves two things for later:** the Git exclude lines in seat workspaces and
+  the st3 Claude channel registration. The isolated tests have no seats; both need the seat
   declarations read before the state directory goes. It prints what needs root. `--no-service`
   keeps it (and every other fleet command that has the flag) away from service managers, which
   macOS does not isolate by `HOME`.

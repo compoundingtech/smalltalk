@@ -394,6 +394,11 @@ fn rewrite_harness_nodes(document: &mut KdlDocument) {
         if let Some(provider) = provider {
             node.set_name("harness");
             node.entries_mut().insert(0, KdlEntry::new(provider));
+            // An st seat starts idle and takes no startup prompt.
+            if let Some(body) = node.children_mut() {
+                body.nodes_mut()
+                    .retain(|child| child.name().value() != "prompt");
+            }
         }
     }
 }
@@ -733,8 +738,21 @@ fn transform_eval_checkpoint(
     output.push_str(&format!("checkpoints {sequence:?} {{\n"));
     let mut team_checkpoint = String::new();
     team_checkpoint.push_str("  checkpoint \"The eval team is running\" {\n");
+    let mut start_messages = Vec::new();
     for agent in spec.agents.iter().chain(eval.agents.iter()) {
-        write_eval_agent(&mut team_checkpoint, agent, restart, host);
+        if let Some(prompt) = write_eval_agent(&mut team_checkpoint, agent, restart, host) {
+            start_messages.push((eval_agent_identity(&agent.id, host), prompt));
+        }
+    }
+    // An st seat starts idle, so each legacy driver prompt reaches its agent as a message.
+    let requester = eval.message.as_ref().map_or_else(
+        || "requester".to_owned(),
+        |kick| eval_agent_identity(&kick.from, host),
+    );
+    for (ordinal, (identity, prompt)) in start_messages.into_iter().enumerate() {
+        team_checkpoint.push_str(&format!(
+            "        message \"start/${{ST_MISSION_RUN}}/{ordinal}\" {{\n          from {requester:?}\n          to {identity:?}\n          content {prompt:?}\n        }}\n"
+        ));
     }
     if let Some(kick) = &eval.message {
         let content = if cell.join(&kick.content).is_file() {
@@ -1045,12 +1063,14 @@ fn slug(value: &str) -> String {
     output.trim_matches('-').chars().take(80).collect()
 }
 
+/// Write one eval agent and return its legacy driver prompt, rewritten for st, which the caller
+/// sends as a message because an st harness takes no startup prompt.
 fn write_eval_agent(
     output: &mut String,
     agent: &st2::eval_spec::SpecAgent,
     restart: &str,
     host: &str,
-) {
+) -> Option<String> {
     output.push_str(&format!(
         "    agent {:?} {{\n",
         eval_agent_identity(&agent.id, host)
@@ -1069,9 +1089,10 @@ fn write_eval_agent(
             rewrite_bus_command(command)
         ));
     }
-    if let Some(driver) = &agent.driver {
-        write_eval_driver(output, driver);
-    }
+    let prompt = agent
+        .driver
+        .as_ref()
+        .map(|driver| write_eval_driver(output, driver));
     output.push_str(&format!("      restart {restart:?}\n"));
     output.push_str("      env {\n");
     for (key, value) in &agent.env {
@@ -1098,9 +1119,10 @@ fn write_eval_agent(
         ));
     }
     output.push_str("    }\n");
+    prompt
 }
 
-fn write_eval_driver(output: &mut String, driver: &Driver) {
+fn write_eval_driver(output: &mut String, driver: &Driver) -> String {
     let (name, model, effort, prompt, args, dev_channels) = match driver {
         Driver::Claude(driver) => (
             "claude",
@@ -1132,10 +1154,6 @@ fn write_eval_driver(output: &mut String, driver: &Driver) {
     if dev_channels == Some(true) {
         output.push_str("        dev-channels #true\n");
     }
-    output.push_str(&format!(
-        "        prompt {:?}\n",
-        rewrite_eval_prompt(prompt)
-    ));
     if !args.is_empty() {
         output.push_str("        args");
         for arg in args {
@@ -1144,6 +1162,7 @@ fn write_eval_driver(output: &mut String, driver: &Driver) {
         output.push('\n');
     }
     output.push_str("      }\n");
+    rewrite_eval_prompt(prompt)
 }
 
 fn eval_agent_identity(identity: &str, host: &str) -> String {
@@ -1591,6 +1610,7 @@ agent "worker" {
         assert!(!translated.contains("$PATH"));
         assert!(translated.contains("${PATH}"));
         assert!(translated.contains("harness omp"));
+        assert!(!translated.contains("prompt"));
         assert!(translated.contains("exec ding"));
         assert!(translated.contains("argv st3 driver ding"));
         let intent = st3::parse_intent(&translated, "local").unwrap();
@@ -1685,6 +1705,7 @@ agent "worker" {
         );
         assert!(translated.contains("harness codex"));
         assert!(!translated.contains("harness claude"));
+        assert!(!translated.contains("prompt"));
     }
 
     #[test]
@@ -1803,6 +1824,12 @@ agent "worker" {
         assert!(team_graph.contains("agent local.judge"));
         assert!(team_graph.contains("message \"kickoff/${ST_MISSION_RUN}\""));
         assert!(team_graph.contains("to \"agent/${ST_MISSION_RUN}/mix.sup\""));
+        // Each harness starts idle; its legacy driver prompt arrives as a start message.
+        assert!(!team_graph.contains("prompt "));
+        assert!(team_graph.contains("message \"start/${ST_MISSION_RUN}/0\""));
+        assert!(team_graph.contains("message \"start/${ST_MISSION_RUN}/1\""));
+        assert!(team_graph.contains("content \"Coordinate the task."));
+        assert!(team_graph.contains("to \"agent/${ST_MISSION_RUN}/local.judge\""));
         assert!(translated.contains("model gpt-5.6-sol"));
         assert!(translated.contains("${ST_WORKSPACE}"));
         assert!(!translated.contains("${EVAL_ROOT}"));

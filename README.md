@@ -189,19 +189,29 @@ st usage --hours 24 --by model
 st usage --hours 24 --by host
 ```
 
-The seat starts its harness in the workspace. Its first turn reads the generated
-`.st3/boot.md`, checks for work, and waits. A seat you declare as `fleet/PROJECT/...` may also
-publish, start, and revise missions under `fleet/PROJECT/*`; `st agents show` prints that
-authority. `st terminals attach agent/example/worker` opens its terminal from any fleet machine;
-Ctrl+\\ detaches without stopping it. On the seat's own host it connects straight to the PTY
-session, so a busy daemon cannot stall it. If the daemon does not answer within a second, st
-attaches to the seat's newest PTY session on that host without it and says so.
+The seat starts its harness in the workspace with no prompt. It stays idle, taking no turn, until
+a person types in its terminal or a message is posted to it. A seat you declare as
+`fleet/PROJECT/...` may also publish, start, and revise missions under `fleet/PROJECT/*`;
+`st agents show` prints that authority. `st terminals attach agent/example/worker` opens its
+terminal from any fleet machine; Ctrl+\\ detaches without stopping it. On the seat's own host it
+connects straight to the PTY session, so a busy daemon cannot stall it. If the daemon does not
+answer within a second, st attaches to the seat's newest PTY session on that host without it and
+says so.
 
 A running seat keeps its current process when you apply a changed declaration; the change takes
 effect the next time it starts. To use it now, stop the seat and apply again. `st agents stop
 agent/example/worker --as person/ada` stops a seat until you apply its file again.
 
 [`examples/st3/seats`](examples/st3/seats) has a seat file for each harness.
+
+## Observe, don't instruct
+
+st records what an agent does; it does not tell the agent how to behave. Each harness driver
+reports what it can see: sessions, turns, plan mode, subagents, tool calls, token usage, and what
+the seat is blocked on. st never asks an agent to report on itself. A seat starts idle with no
+prompt. Besides the messages and step goals that carry work, st's only text for agents is the
+skill that `st skill` prints, which describes how to use st. Each harness driver installs that
+skill when its seat starts; `st skill install` writes the same files directly.
 
 ## Give it work
 
@@ -230,7 +240,8 @@ st missions show mission-run/example/first-note/1
 ```
 
 Publishing stores an immutable definition. Each `missions start` is one run. The run joins the
-seat's queue, st wakes the seat, and the seat claims the step, does it, and completes it.
+seat's queue. When the step is ready, st posts the seat a message that names it, and the seat
+claims the step, does it, and completes it.
 `--follow` returns when the run ends. While it runs:
 
 ```sh

@@ -229,9 +229,9 @@ others.
   now refuses that. Inside one run, the mission's dependencies still decide. `available-to` work
   is not queued, so it is not refused. An agent that wants another run first needs a person, or
   an agent with queue authority for the seat, to move it.
-- **The boot contract lists fleet work.** Agents are told to run `st work ls` without `--as`. That
-  list is in creation order, not seat order, and it includes steps the agent cannot claim. The
-  claim check makes the seat order hold anyway. Changing the boot contract is left to its owner.
+- **`st work ls` without `--as` lists fleet work.** That list is in creation order, not seat
+  order, and it includes steps the agent cannot claim. The claim check makes the seat order hold
+  anyway, and the seat's next step also arrives as a message that names it.
 - **Agents move runs only with a declared grant.** A person grants `queue-authority` in the
   agent's declaration, and the daemon checks it on each move, as it checks `mission-authority`.
   As there, the local socket trusts the actor named by `--as`, so the grant keeps well-behaved

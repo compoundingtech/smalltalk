@@ -1786,8 +1786,6 @@ pub struct QuickAgentRequest {
     #[serde(default)]
     pub effort: Option<String>,
     #[serde(default)]
-    pub prompt: Option<String>,
-    #[serde(default)]
     pub arguments: Vec<String>,
     #[serde(default)]
     pub expected_subject: Vec<String>,

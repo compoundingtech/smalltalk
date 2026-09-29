@@ -981,6 +981,24 @@ impl Store {
         hold();
     }
 
+    /// Record local observations as `append_claim` does, in one transaction: one commit, and
+    /// so one sync to disk, instead of one for each observation.
+    pub(crate) fn append_local_observations_for_test(&self, inputs: &[ClaimInput]) {
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction().unwrap();
+        for input in inputs {
+            self.validate_claim_input(input).unwrap();
+            assert!(
+                local_retention(&input.kind),
+                "{} is not a local observation",
+                input.kind
+            );
+            validate_local_observation(input).unwrap();
+            insert_local_observation_tx(&transaction, &self.origin, input, now_ms()).unwrap();
+        }
+        transaction.commit().unwrap();
+    }
+
     pub(crate) fn hold_write_transaction_for_test(&self, hold: impl FnOnce()) {
         let mut writer = self.connection.write();
         let transaction = writer.transaction().unwrap();
@@ -15054,6 +15072,30 @@ fn apply_planning_session_declaration_tx(
         )
         .map_err(internal)?;
         claim_ids.push(claim.id);
+        // The planner seat starts idle, so its instructions arrive as the request message.
+        let request = append_claim_tx(
+            transaction,
+            origin,
+            &format!(
+                "message/{}",
+                &hex::encode(Sha256::digest(format!("planning-request:{id}").as_bytes()))[..16]
+            ),
+            "message.sent",
+            Some(&creation.requester),
+            &json!({"fields": {
+                "from": creation.requester,
+                "to": planner,
+                "content": crate::graph::planning_planner_request(id, creation),
+                "status": "sent",
+                "title": "Launch request",
+                "in_reply_to": null,
+                "tags": ["launch"],
+            }}),
+            &[],
+            Some(batch_id),
+        )
+        .map_err(internal)?;
+        claim_ids.push(request.id);
         receipts.push(PlannedAction {
             subject: declaration.subject.clone(),
             action: "start-launch".into(),
@@ -31466,6 +31508,18 @@ planning-session "planning/release/one" {{
                 .any(|operation| operation.action == "start-launch")
         );
         assert!(store.selected_desired_token(&planner).unwrap().is_some());
+        // The planner seat starts idle; its instructions arrive as one launch request message.
+        let requests = store.messages(Some(&planner), false).unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].from, "person/operator");
+        assert_eq!(requests[0].title.as_deref(), Some("Launch request"));
+        assert!(
+            requests[0]
+                .content
+                .contains("st launch submit planning/release/one"),
+            "{}",
+            requests[0].content
+        );
 
         let replay_preview = store
             .mission(

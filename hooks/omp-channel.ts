@@ -890,13 +890,15 @@ export default function (pi: ExtensionAPI) {
     // prompt rather than the turn after it.
     const restored = await open(ctx);
     const opened = state.child;
-    // Do not seed an idle state here. `session_start` precedes a positional boot prompt, and an
-    // idle frame would authorize the channel to inject mail before omp has created the transcript
-    // for that prompt. The post-`agent_end` idle proof is the first transcript-ready edge.
     if (opened) {
-      // Seed only the context record, so a resumed session publishes the window it resumed INTO
+      // Seed the context record, so a resumed session publishes the window it resumed INTO
       // rather than waiting for its first turn boundary.
       sendContext(ctx);
+      // st starts a seat with no prompt, so no turn follows and no `agent_end` would ever report
+      // the idle edge that lets the channel deliver mail. Prove idle with the same bounded poll,
+      // which first samples after this handler has returned. A turn a person or a positional
+      // prompt already started keeps the proof false and reports itself through `agent_start`.
+      watchSettle(ctx);
     }
     if (restored.trim()) {
       // A custom message participates in LLM context without triggering a turn of its own.

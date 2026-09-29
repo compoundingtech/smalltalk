@@ -12455,7 +12455,7 @@ version 2
         apply_source(
             &store,
             &format!(
-                "version 2\nexec \"task\" {{ workspace {:?}; command \"true\"; render {{ git-exclude \".st3/\" }} }}\n",
+                "version 2\nexec \"task\" {{ workspace {:?}; command \"true\"; render {{ git-exclude \".cache/\" }} }}\n",
                 workspace.path().display().to_string()
             ),
             "exec-render-warning",
@@ -13545,7 +13545,7 @@ mission "feedback-review" state="ready" {
 
               agent "worker" {{
                 workspace {:?}
-                harness "codex" {{ prompt "Wait for work." }}
+                harness "codex" {{}}
               }}
 
         "#,
@@ -13639,7 +13639,7 @@ mission "feedback-review" state="ready" {
     }
 
     #[test]
-    fn a_boot_render_refusal_prevents_the_agent_start() {
+    fn a_repository_owned_st3_directory_is_kept_and_the_agent_starts() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
         std::process::Command::new("git")
@@ -13662,7 +13662,7 @@ mission "feedback-review" state="ready" {
             "version 2\nagent \"worker\" {{ workspace {:?}; harness \"codex\" {{}} }}\n",
             workspace.path().display().to_string()
         );
-        apply_source(&store, &source, "boot-render-refusal");
+        apply_source(&store, &source, "tracked-st3-directory");
         let runtime = Arc::new(FakeRuntime::default());
         let reconciler = Reconciler::new(
             store.clone(),
@@ -13672,14 +13672,17 @@ mission "feedback-review" state="ready" {
         );
 
         reconciler.reconcile_once().unwrap();
-        assert!(
+        assert_eq!(
             store
                 .member_reconcile_fault("agent/node.worker", None)
-                .unwrap()
-                .unwrap()
-                .contains("tracked file")
+                .unwrap(),
+            None
         );
-        assert!(runtime.starts.lock().unwrap().is_empty());
+        assert_eq!(runtime.starts.lock().unwrap().len(), 1);
+        assert_eq!(
+            fs::read_to_string(workspace.path().join(".st3/boot.md")).unwrap(),
+            "repository-owned boot text\n"
+        );
     }
 
     #[test]
@@ -14160,7 +14163,7 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
                   title "The native agent is ready"
 
                     agent "worker" {
-                      harness "codex" { prompt "Do the work." }
+                      harness "codex" {}
                     }
                     message "kick" {
                       from "requester"
@@ -14269,7 +14272,7 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
                 step "start-agent" timeout="10m" {
                   title "The native agent is ready"
                   agent "worker" {
-                    harness "codex" { prompt "Do the work." }
+                    harness "codex" {}
                     restart "never"
                   }
                 }
@@ -14337,11 +14340,11 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
                   title "The Codex team is ready"
 
                     agent "sup" {
-                      harness "codex" { prompt "Coordinate the work." }
+                      harness "codex" {}
                       restart "never"
                     }
                     agent "worker" {
-                      harness "codex" { prompt "Do the work." }
+                      harness "codex" {}
                       restart "never"
                     }
                     message "kickoff" {
@@ -15294,7 +15297,7 @@ version 2
 agent "worker" {
   workspace "."
   restart "always"
-  harness "codex" { prompt "Wait for work." }
+  harness "codex" {}
 }
 "#,
             "codex-start-failures",
@@ -15356,7 +15359,7 @@ version 2
 agent "worker" {
   workspace "."
   restart "always"
-  harness "codex" { prompt "Wait for work." }
+  harness "codex" {}
 }
 "#,
             "codex-short-lived-exits",
@@ -16357,7 +16360,7 @@ mission "scheduled-cycle" state="ready" {
               }
               agent "worker" {
                 supervisor "watch"
-                harness "codex" { prompt "Do the work." }
+                harness "codex" {}
               }
 
         "#;
@@ -22497,9 +22500,9 @@ version 2
         let workspace = workspace.path().display().to_string();
         let source = format!(
             "version 2\n\
-             agent \"seat-a\" {{ workspace {workspace:?}; harness \"claude\" {{ prompt \"Work.\" }} }}\n\
-             agent \"seat-b\" {{ workspace {workspace:?}; harness \"claude\" {{ prompt \"Work.\" }} }}\n\
-             agent \"seat-c\" {{ workspace {workspace:?}; restart \"never\"; harness \"claude\" {{ prompt \"Work.\" }} }}\n"
+             agent \"seat-a\" {{ workspace {workspace:?}; harness \"claude\" {{}} }}\n\
+             agent \"seat-b\" {{ workspace {workspace:?}; harness \"claude\" {{}} }}\n\
+             agent \"seat-c\" {{ workspace {workspace:?}; restart \"never\"; harness \"claude\" {{}} }}\n"
         );
         apply_source(&store, &source, "claude-trust-prompt");
         let runtime = Arc::new(FakeRuntime::default());
@@ -22609,8 +22612,8 @@ version 2
         let workspace = workspace.path().display().to_string();
         let source = format!(
             "version 2\n\
-             agent \"seat-a\" {{ workspace {workspace:?}; harness \"claude\" {{ prompt \"Work.\" }} }}\n\
-             agent \"seat-b\" {{ workspace {workspace:?}; harness \"claude\" {{ prompt \"Work.\" }} }}\n"
+             agent \"seat-a\" {{ workspace {workspace:?}; harness \"claude\" {{}} }}\n\
+             agent \"seat-b\" {{ workspace {workspace:?}; harness \"claude\" {{}} }}\n"
         );
         apply_source(&store, &source, "claude-login-line");
         let runtime = Arc::new(FakeRuntime::default());
@@ -22672,7 +22675,7 @@ version 2
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
         let source = format!(
-            "version 2\nagent \"seat\" {{ workspace {:?}; harness \"claude\" {{ prompt \"Work.\" }} }}\n",
+            "version 2\nagent \"seat\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
             workspace.path().display().to_string()
         );
         apply_source(&store, &source, "claude-login-lift");
@@ -22747,7 +22750,7 @@ version 2
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
         let source = format!(
-            "version 2\nagent \"seat\" {{ workspace {:?}; harness \"claude\" {{ prompt \"Work.\" }} }}\n",
+            "version 2\nagent \"seat\" {{ workspace {:?}; harness \"claude\" {{}} }}\n",
             workspace.path().display().to_string()
         );
         apply_source(&store, &source, "claude-trust-prompt-repeated");
@@ -22808,14 +22811,15 @@ version 2
         let directory = tempfile::tempdir().unwrap();
         let database = directory.path().join("state.sqlite3");
         let workspace = tempfile::tempdir().unwrap();
-        let source = ["running", "starting", "vanished"]
-            .iter()
-            .fold(String::from("version 2\n"), |source, name| {
+        let source = ["running", "starting", "vanished"].iter().fold(
+            String::from("version 2\n"),
+            |source, name| {
                 format!(
-                    "{source}agent {name:?} {{ workspace {:?}; harness \"codex\" {{ prompt \"Wait.\" }} }}\n",
+                    "{source}agent {name:?} {{ workspace {:?}; harness \"codex\" {{}} }}\n",
                     workspace.path().display().to_string()
                 )
-            });
+            },
+        );
         let pty = |name: &str| RuntimeObservation {
             runtime_id: format!("node.{name}"),
             terminal: true,
@@ -22947,7 +22951,7 @@ version 2
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
         let source = format!(
-            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"codex\" {{ prompt \"Wait.\" }} }}\n",
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"codex\" {{}} }}\n",
             workspace.path().display().to_string()
         );
         apply_source(&store, &source, "superseded-readiness");
@@ -23049,7 +23053,7 @@ version 2
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
         let source = format!(
-            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"codex\" {{ prompt \"Wait.\" }} }}\n",
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"codex\" {{}} }}\n",
             workspace.path().display().to_string()
         );
         apply_source(&store, &source, "readiness-deadline");
@@ -23217,7 +23221,7 @@ version 2
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
         let source = format!(
-            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"codex\" {{ prompt \"Wait.\" }} }}\n",
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"codex\" {{}} }}\n",
             workspace.path().display().to_string()
         );
         apply_source(&store, &source, "restarted-seat");
@@ -23290,13 +23294,13 @@ version 2
     fn a_new_desired_revision_that_becomes_ready_resolves_the_codex_crash_loop_alert() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
-        let source = |prompt: &str| {
+        let source = |model: &str| {
             format!(
-                "version 2\nagent \"worker\" {{ workspace {:?}; harness \"codex\" {{ prompt {prompt:?} }} }}\n",
+                "version 2\nagent \"worker\" {{ workspace {:?}; harness \"codex\" {{ model {model:?} }} }}\n",
                 workspace.path().display().to_string()
             )
         };
-        apply_source(&store, &source("Wait."), "crash-loop-a");
+        apply_source(&store, &source("gpt-5.6-luna"), "crash-loop-a");
         let token_a = store
             .selected_desired_token("agent/node.worker")
             .unwrap()
@@ -23314,7 +23318,7 @@ version 2
         assert_eq!(alert_resolution_actor(&store, &key), None);
 
         // A person revises the declaration, and the new revision's incarnation becomes ready.
-        apply_source(&store, &source("Wait for work."), "crash-loop-b");
+        apply_source(&store, &source("gpt-5.6-sol"), "crash-loop-b");
         assert_ne!(
             store.selected_desired_token("agent/node.worker").unwrap(),
             Some(token_a.clone())
@@ -23416,7 +23420,7 @@ agent "keeper" { workspace "/tmp"; command "true"; restart "never" }
         let store = Arc::new(Store::open_memory("node").unwrap());
         let workspace = tempfile::tempdir().unwrap();
         let source = format!(
-            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"omp\" {{ prompt \"Wait.\" }} }}\n",
+            "version 2\nagent \"worker\" {{ workspace {:?}; harness \"omp\" {{}} }}\n",
             workspace.path().display().to_string()
         );
         apply_source(&store, &source, "ready-before-degraded");
@@ -24944,7 +24948,10 @@ mission "context-wake" state="ready" {
         let LaunchSpec::Argv(argv) = &launched.last().unwrap().launch else {
             panic!("the replacement harness must have an argv launch");
         };
-        assert!(argv.iter().any(|arg| arg == crate::boot::BOOT_PROMPT));
+        assert!(
+            !argv.iter().any(|arg| arg.contains("boot.md")),
+            "a replacement harness starts without a prompt"
+        );
         assert!(
             !argv
                 .iter()
