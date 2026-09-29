@@ -413,6 +413,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/replication/records", get(replication_records))
         .route("/v1/replication/records/{*record}", get(replication_record))
         .route("/v1/replication/repair", post(repair_replication_record))
+        .route("/v1/checkpoint/plan", post(checkpoint_plan))
         .route(
             "/v1/internal/replication/export",
             post(replication_export).layer(DefaultBodyLimit::max(crate::peer::MAX_EXCHANGE_BYTES)),
@@ -4112,6 +4113,21 @@ async fn replication_record(
         .await?
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("replica record `{record}` does not exist")))
+}
+
+async fn checkpoint_plan(
+    State(state): State<AppState>,
+    Json(request): Json<crate::store::CheckpointPlanRequest>,
+) -> Result<Json<crate::store::CheckpointPlanView>, ApiError> {
+    let cut = match request.day.as_deref() {
+        Some(day) => crate::store::checkpoint_cut(day).map_err(ApiError::bad)?,
+        None => crate::store::newest_due_cut(client_now_ms()),
+    };
+    let store = state.store.clone();
+    let scratch = state.state_dir.join("checkpoint");
+    blocking_store(move || store.checkpoint_plan_view(cut, &scratch))
+        .await
+        .map(Json)
 }
 
 async fn repair_replication_record(

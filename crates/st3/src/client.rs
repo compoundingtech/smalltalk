@@ -724,6 +724,9 @@ fn request_deadline(path: &str, deadlines: ClientDeadlines) -> Duration {
         || path.starts_with("/v1/internal/replication/receive")
     {
         deadlines.bulk
+    } else if path.starts_with("/v1/checkpoint/plan") {
+        // A dry run copies the store and replays it twice.
+        Duration::from_secs(30 * 60)
     } else if path.starts_with("/v1/events?") && path.contains("wait=true") {
         deadlines.event
     } else {
