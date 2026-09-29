@@ -27,9 +27,10 @@ To merge, update the branch with `main` (`gh pr update-branch NUMBER`, or merge 
 wait for `st/ci` on the new head, and merge while the pull request is still not behind. Merge
 one pull request at a time.
 
-- A head that is not up to date is refused with "Head branch is not up to date with the base
-  branch", and a head without a passing `st/ci` is refused with "Required status check st/ci is
-  expected", however the merge is attempted.
+- A head that is behind `main` is refused even when `st/ci` succeeded on it. `gh pr merge` says
+  "the head branch is not up to date with the base branch"; the REST API says `Required status
+  check "st/ci" is expected`, because a status on an out-of-date head does not count. A head
+  without a passing `st/ci` gets the same status-check message.
 - A failed run, or a head whose run was skipped, is re-run by pushing a new head; merging
   `main` into the branch is enough. A closed pull request and a draft get no `st/ci` status. The
   observed head of a reopened or ready pull request is only run again when it changes.
