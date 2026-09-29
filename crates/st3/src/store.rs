@@ -39,7 +39,16 @@ use crate::model::{SeatQueueMoveRequest, SeatQueueMoveView, SeatQueueRunView, Se
 use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
 mod checkpoint;
+mod checkpoint_agreement;
 
+pub use checkpoint_agreement::{
+    CHECKPOINT_ATTENTION_AFTER_MS, CHECKPOINT_EXCUSED, CHECKPOINT_PROTOCOL, CHECKPOINT_SEALED,
+    CHECKPOINT_VERIFIED, Certificate, CheckpointAction, CheckpointClaim, CheckpointContext,
+    CheckpointExcuseRequest, CheckpointStatusView, PendingCheckpointView, SealTerms,
+    VerifiedTerms, certificates, checkpoint_build, excused_writers, first_verifications,
+    newest_seals, participants as checkpoint_participants, stable_checkpoints,
+};
+use checkpoint_agreement::write_time;
 pub use checkpoint::{
     CheckpointPlanRequest, CheckpointPlanView, CheckpointProof, ClaimTombstone, DropCount,
     DropPlan, EnvelopeKey, EnvelopeTombstone, SealedSet, checkpoint_cut, checkpoint_name,
@@ -545,11 +554,26 @@ CREATE TABLE IF NOT EXISTS checkpoint_claims (
     accepted_at_unix_ms INTEGER NOT NULL,
     checkpoint TEXT NOT NULL
 );
+-- The checkpoints this node sealed, verified or adopted. `seal_rowid` is the `replica_envelopes`
+-- high water of the set it sealed or verified, so it can read exactly that set again. Every
+-- write this node makes is dated at or after the highest cut here.
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id TEXT PRIMARY KEY,
+    cut_unix_ms INTEGER NOT NULL,
+    state TEXT NOT NULL,
+    seal_rowid INTEGER,
+    sealed_digest TEXT,
+    drop_digest TEXT,
+    updated_at_unix_ms INTEGER NOT NULL
+);
 CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);
 CREATE INDEX IF NOT EXISTS checkpoint_claims_operation
 ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
 PRAGMA user_version = 13;
 "#;
+
+/// The writer connection's clock offset. Only a simulation sets it; see `write_time`.
+const WRITE_CLOCK: &str = "CREATE TEMP TABLE IF NOT EXISTS write_clock(offset_ms INTEGER NOT NULL);";
 
 const READ_CONNECTIONS: usize = 4;
 
@@ -1649,6 +1673,7 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(&connection)?;
         {
             let transaction = connection.transaction()?;
@@ -1698,6 +1723,7 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(&connection)?;
         {
             let transaction = connection.transaction()?;
@@ -6578,7 +6604,7 @@ impl Store {
             transaction.commit().map_err(internal)?;
             return Ok(response);
         }
-        let now = now_ms();
+        let now = write_time(&transaction).map_err(internal)?;
         let sequence = next_replica_sequence(&transaction, &self.origin).map_err(internal)?;
         let previous_hash = previous_batch_hash(&transaction, &self.origin).map_err(internal)?;
         let batch_hash = batch_header_hash(&self.origin, sequence, previous_hash.as_deref(), now)
@@ -9847,7 +9873,7 @@ impl Store {
                 message_subjects: Vec::new(),
             });
         }
-        let now = now_ms();
+        let now = write_time(&transaction).map_err(internal)?;
         let sequence = next_replica_sequence(&transaction, &self.origin).map_err(internal)?;
         let previous_hash = previous_batch_hash(&transaction, &self.origin).map_err(internal)?;
         let batch_hash = batch_header_hash(&self.origin, sequence, previous_hash.as_deref(), now)
@@ -16045,7 +16071,7 @@ fn append_claim_tx(
         &claim_spec.cardinality,
     )
     .map_err(anyhow::Error::new)?;
-    let now = now_ms();
+    let now = write_time(transaction)?;
     let batch_id = if let Some(batch) = forced_batch {
         batch.to_owned()
     } else {
