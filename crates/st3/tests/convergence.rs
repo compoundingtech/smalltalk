@@ -15,9 +15,13 @@
 //! 2. the oracle's graph digest;
 //! 3. the oracle's reader answers, for every subject;
 //! 4. every claim of a kind no rule drops, and every person's claim, with the oracle's body;
-//! 5. the same trimmed checkpoint and the same tombstones, field by field;
+//! 5. the same trimmed checkpoint and the same tombstones, field by field, and tombstones
+//!    that match the drop digest of the certificate it trimmed;
 //! 6. no invalid record, and no record still pending;
-//! 7. for every claim it lacks, a tombstone, and only for claims a rule may drop.
+//! 7. for every claim it lacks, a tombstone, and only for claims a rule may drop. When people
+//!    excused each side of a partition, one side's certificate may have dropped a claim the
+//!    chosen one keeps, so a node may lack a claim without a tombstone, but only a claim some
+//!    node tombstoned.
 //!
 //! Also, no cut has two certificates unless people excused each side of a partition, no proof
 //! fails, no trim finds the graph changed, and no node's committed index ever moves back.
@@ -42,12 +46,16 @@ use serde_json::{Map, Value, json};
 use st3::model::{ClaimInput, ClaimRecord};
 use st3::store::{
     CheckpointAction, CheckpointContext, CheckpointExcuseRequest, Store, TrimFault, certificates,
-    checkpoint_name, stable_checkpoints,
+    checkpoint_name, stable_checkpoints, verify_checkpoint_manifest,
 };
 use st3_schema::{FieldSpec, Retention, ValueType};
 
 const FLEET: &str = "7d3f9a2e-5b6c-4e1d-8a0f-2c9b8e7d6f5a";
 const DAY_MS: i64 = 24 * 60 * 60 * 1_000;
+/// Every run starts at this time of day, UTC. Cuts fall at midnight UTC, so a seed drops the
+/// same claims whenever it runs. Clock skews are whole hours, so no node starts within half
+/// an hour of a cut.
+const START_TIME_OF_DAY_MS: i64 = (12 * 60 + 30) * 60 * 1_000;
 const PERSON: &str = "person/operator";
 
 /// The seeds CI runs. Every failing seed found by hand is added here.
@@ -142,6 +150,9 @@ struct World {
     oracle: Store,
     /// The partition group of each node, by index. Nodes exchange only within a group.
     groups: Vec<usize>,
+    /// How far the simulation's clock runs ahead of this host's: the run starts at
+    /// `START_TIME_OF_DAY_MS` today.
+    start_offset_ms: i64,
     /// Simulated days since the run started.
     days: i64,
     schedule: Vec<String>,
@@ -151,6 +162,10 @@ struct World {
     person_claims: BTreeSet<String>,
     /// Whether a person excused a writer while the fleet was partitioned.
     excused_while_partitioned: bool,
+    /// Every claim any node has tombstoned.
+    tombstoned: BTreeSet<String>,
+    /// Whether the deliberate bug happened in this run.
+    sabotaged: bool,
     written: BTreeMap<String, usize>,
     sabotage: Sabotage,
 }
@@ -167,12 +182,15 @@ impl World {
             nodes: Vec::new(),
             oracle,
             groups: Vec::new(),
+            start_offset_ms: START_TIME_OF_DAY_MS - now_ms().rem_euclid(DAY_MS),
             days: 0,
             schedule: Vec::new(),
             failures: Vec::new(),
             serial: 0,
             person_claims: BTreeSet::new(),
             excused_while_partitioned: false,
+            tombstoned: BTreeSet::new(),
+            sabotaged: false,
             written: BTreeMap::new(),
             sabotage,
         };
@@ -225,7 +243,7 @@ impl World {
     }
 
     fn offset(&self, index: usize) -> i64 {
-        self.days * DAY_MS + self.nodes[index].skew_ms
+        self.start_offset_ms + self.days * DAY_MS + self.nodes[index].skew_ms
     }
 
     fn set_clock(&self, index: usize) {
@@ -375,6 +393,8 @@ impl World {
                 .store
                 .adopt_checkpoint_unverified_for_tests(&manifest)
                 .unwrap();
+            self.sabotaged = true;
+            self.remember_tombstones(to);
             self.note(format!(
                 "{} adopted a partial {} from {}",
                 self.nodes[to].name, need.checkpoint, self.nodes[from].name
@@ -384,6 +404,7 @@ impl World {
         }
         match self.nodes[to].store.adopt_checkpoint(&manifest) {
             Ok(actions) => {
+                self.remember_tombstones(to);
                 self.note(format!(
                     "{} adopts {} from {}",
                     self.nodes[to].name, need.checkpoint, self.nodes[from].name
@@ -480,6 +501,7 @@ impl World {
                 .collect::<Vec<_>>()
                 .join(",");
             self.note(format!("{} checkpoint: {summary}", self.nodes[index].name));
+            self.remember_tombstones(index);
         }
         if self.sabotage == Sabotage::ForgetTombstones
             && actions
@@ -490,11 +512,24 @@ impl World {
                 .store
                 .forget_tombstones_for_tests()
                 .unwrap();
+            self.sabotaged = true;
         }
         self.check_actions(index, &actions);
         self.check_index(index);
         self.tap(index);
         actions
+    }
+
+    fn remember_tombstones(&mut self, index: usize) {
+        let store = &self.nodes[index].store;
+        let Some(trimmed) = store.trimmed_checkpoint().unwrap() else {
+            return;
+        };
+        let manifest = store
+            .checkpoint_manifest(&trimmed.id, trimmed.cut_unix_ms)
+            .unwrap();
+        self.tombstoned
+            .extend(manifest.claims.into_iter().map(|claim| claim.id));
     }
 
     fn write(&mut self, index: usize) {
@@ -620,7 +655,7 @@ impl World {
                         subject,
                         "subscription.mission-deferred",
                         None,
-                        json!({"request": request, "not_before_unix_ms": now_ms() + self.rng.below(100_000) as i64}),
+                        json!({"request": request, "not_before_unix_ms": now_ms() + self.offset(index) + self.rng.below(100_000) as i64}),
                     )
                 }
             }
@@ -985,7 +1020,7 @@ impl World {
             .map(|claim| claim.subject.clone())
             .collect::<BTreeSet<_>>();
         // A fixed time, far enough ahead that every reader looks at every claim.
-        let now = (now_ms() + (self.days + 10) * DAY_MS) as u128;
+        let now = (now_ms() + self.start_offset_ms + (self.days + 10) * DAY_MS) as u128;
         let oracle_answers = self
             .oracle
             .checkpoint_reader_answers(&subjects, now)
@@ -1073,7 +1108,9 @@ impl World {
                             claim.kind, claim.subject
                         ));
                     }
-                    None if !tombstones.contains(id) && !self.excused_while_partitioned => {
+                    None if !tombstones.contains(id)
+                        && !(self.excused_while_partitioned && self.tombstoned.contains(id)) =>
+                    {
                         failures.push(format!(
                             "{name}: lacks {id} ({} on {}) without a tombstone",
                             claim.kind, claim.subject
@@ -1089,6 +1126,14 @@ impl World {
             }
             if node.old_build {
                 continue;
+            }
+            if let (Some(trimmed), Some(manifest)) = (&trimmed, &manifest)
+                && let Err(error) = verify_checkpoint_manifest(manifest, &trimmed.drop_digest)
+            {
+                failures.push(format!(
+                    "{name}: its tombstones do not match {}: {}",
+                    trimmed.id, error.message
+                ));
             }
             if let Some((authority, reference_trimmed)) = &reference {
                 if &own.authority_digest != authority {
@@ -1165,6 +1210,7 @@ struct Outcome {
     failure: Option<String>,
     written: BTreeMap<String, usize>,
     trimmed: bool,
+    sabotaged: bool,
 }
 
 fn run(seed: u64, sabotage: Sabotage) -> Outcome {
@@ -1183,6 +1229,7 @@ fn run(seed: u64, sabotage: Sabotage) -> Outcome {
         failure: (!world.failures.is_empty()).then(|| world.report()),
         written: world.written,
         trimmed,
+        sabotaged: world.sabotaged,
     }
 }
 
@@ -1217,14 +1264,25 @@ fn every_seed_converges() {
     run_seeds(SEEDS.iter().copied());
 }
 
-/// Each deliberate bug must make at least one seed fail, or the checks cannot see it.
+/// Each deliberate bug must fail the first runs it happens in, not just some run.
 #[test]
 fn the_checks_catch_each_deliberate_bug() {
     for sabotage in [Sabotage::ForgetTombstones, Sabotage::PartialAdoption] {
-        let caught = SEEDS
-            .iter()
-            .find(|seed| run(**seed, sabotage).failure.is_some());
-        assert!(caught.is_some(), "no seed caught {sabotage:?}");
+        let mut happened = 0;
+        for seed in SEEDS {
+            let outcome = run(*seed, sabotage);
+            if outcome.sabotaged {
+                assert!(
+                    outcome.failure.is_some(),
+                    "seed {seed} ran into {sabotage:?} and passed"
+                );
+                happened += 1;
+                if happened == 2 {
+                    break;
+                }
+            }
+        }
+        assert!(happened > 0, "no seed ran into {sabotage:?}");
     }
 }
 
@@ -1247,4 +1305,43 @@ fn explore() {
         .unwrap_or(100);
     let start = now_ms() as u64;
     run_seeds((0..runs).map(|offset| start.wrapping_add(offset)));
+}
+
+#[test]
+#[ignore = "temporary timing probe"]
+fn probe_sabotage_timing() {
+    let from: u64 = std::env::var("PROBE_FROM").map_or(0, |v| v.parse().unwrap());
+    let count: u64 = std::env::var("PROBE_COUNT").map_or(0, |v| v.parse().unwrap());
+    let seeds: Vec<u64> = if count == 0 { SEEDS.to_vec() } else { (from..from + count).collect() };
+    let sabotages = match std::env::var("PROBE_SABOTAGE").as_deref() {
+        Ok("all") => vec![Sabotage::None, Sabotage::ForgetTombstones, Sabotage::PartialAdoption],
+        _ => vec![Sabotage::None],
+    };
+    for sabotage in sabotages {
+        for seed in &seeds {
+            let started = std::time::Instant::now();
+            let mut world = World::new(*seed, sabotage);
+            let steps = 300 + world.rng.below(300);
+            world.run_schedule(steps);
+            if !world.quiesce() {
+                world.fail("the nodes did not stop moving".into());
+            }
+            world.check();
+            let adopts = world.schedule.iter().filter(|line| line.contains(" adopts ")).count();
+            let trimmed = world
+                .nodes
+                .iter()
+                .any(|node| node.store.trimmed_checkpoint().unwrap().is_some());
+            eprintln!(
+                "PROBE {sabotage:?} seed={seed} failed={} sabotaged={} trimmed={trimmed} adopts={adopts} excused={} ms={}",
+                !world.failures.is_empty(),
+                world.sabotaged,
+                world.excused_while_partitioned,
+                started.elapsed().as_millis()
+            );
+            if !world.failures.is_empty() && sabotage == Sabotage::None {
+                eprintln!("{}", world.report());
+            }
+        }
+    }
 }
