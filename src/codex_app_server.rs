@@ -464,6 +464,7 @@ struct CodexDeliveryConfig {
     /// The codex-cli version the protocol gate admitted, carried for the native-driver
     /// diagnostic's `producerVersion`. `None` only in tests that build a config without a gate.
     producer_version: Option<String>,
+    model: Option<String>,
 }
 
 impl CodexDeliveryConfig {
@@ -489,6 +490,7 @@ impl CodexDeliveryConfig {
             this_host,
             supervisor,
             producer_version: None,
+            model: None,
         })
     }
 
@@ -639,6 +641,7 @@ struct CodexInboxDelivery {
     context: Option<CodexContextProducer>,
     /// Crash-safe normalized conversation operations for the client-v0 timeline.
     timeline: crate::harness_timeline::Writer,
+    model_attempted: BTreeSet<String>,
     /// The native-driver boundary record. Codex publishes exactly one stage on it — the provider
     /// credential — because every earlier boundary is already fail-closed at admission: an
     /// incompatible protocol refuses the launch instead of degrading into an observation.
@@ -725,7 +728,8 @@ impl CodexInboxDelivery {
             }
         };
         let timeline =
-            crate::harness_timeline::Writer::new(&config.agent_dir, "codex", runtime.incarnation());
+            crate::harness_timeline::Writer::new(&config.agent_dir, "codex", runtime.incarnation())
+                .with_model(config.model.clone());
         // The record belongs to this incarnation: the protocol gate already admitted the version
         // it names, so `support` is a measured fact rather than a probe result.
         let mut diagnostics = driver_diagnostic::Publisher::new(
@@ -769,6 +773,7 @@ impl CodexInboxDelivery {
             pending_observation: None,
             context,
             timeline,
+            model_attempted: BTreeSet::new(),
             diagnostics,
             safe_fallback_active,
             safe_fallback_diagnostic_published,
@@ -813,11 +818,33 @@ impl CodexInboxDelivery {
     /// delivery. Unlike the state record there is nothing to retain and retry — the next model
     /// response carries another reading, and the record ages visibly through `ageMs` until it
     /// lands (HC-R06, HC-T05).
-    fn observe_context(&mut self, message: &Value, thread_id: &str) {
-        if let Err(error) =
-            crate::harness_timeline::observe_codex(&mut self.timeline, message, thread_id)
-        {
-            tracing::warn!("st2 codex: harness-timeline write failed: {error:#}");
+    fn observe_context(&mut self, message: &Value, thread_id: &str, active_turn_id: Option<&str>) {
+        let is_usage =
+            message.get("method").and_then(Value::as_str) == Some("thread/tokenUsage/updated");
+        let track_usage = should_track_timeline_usage(message, active_turn_id);
+        if is_usage && track_usage {
+            if let Some(turn_id) = message.pointer("/params/turnId").and_then(Value::as_str)
+                && !self.model_attempted.contains(turn_id)
+            {
+                if self.model_attempted.len() >= 128 {
+                    self.model_attempted.pop_first();
+                }
+                self.model_attempted.insert(turn_id.into());
+                match codex_turn_model(thread_id, turn_id) {
+                    Ok(Some(model)) => self.timeline.remember_turn_model(turn_id, &model),
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::debug!("st2 codex: bounded turn model read failed: {error:#}")
+                    }
+                }
+            }
+        }
+        if track_usage {
+            if let Err(error) =
+                crate::harness_timeline::observe_codex(&mut self.timeline, message, thread_id)
+            {
+                tracing::warn!("st2 codex: harness-timeline write failed: {error:#}");
+            }
         }
         if let Some(context) = self.context.as_mut()
             && let Err(error) = context.observe(message, thread_id)
@@ -1484,6 +1511,16 @@ impl CodexInboxDelivery {
         }
         Ok(())
     }
+}
+
+fn should_track_timeline_usage(message: &Value, active_turn_id: Option<&str>) -> bool {
+    if message.get("method").and_then(Value::as_str) != Some("thread/tokenUsage/updated") {
+        return true;
+    }
+    message
+        .pointer("/params/turnId")
+        .and_then(Value::as_str)
+        .is_some_and(|turn_id| active_turn_id == Some(turn_id))
 }
 
 fn stable_client_user_message_id(recipient: &str, thread_id: &str, filename: &str) -> String {
@@ -2287,6 +2324,7 @@ pub fn run_controlled_paths(
         this_host: run::detect_host(),
         supervisor: None,
         producer_version: Some(producer_version),
+        model: None,
     };
     let _owner_lock = acquire_owner_lock(state_dir)?;
     let mut diagnostics = WrapperDiagnostics::open(state_dir, &identity, &runtime_id)?;
@@ -2328,12 +2366,13 @@ fn run_controlled_owned(
     identity: String,
     runtime_id: String,
     codex_argv: Vec<String>,
-    delivery: CodexDeliveryConfig,
+    mut delivery: CodexDeliveryConfig,
     resume_thread: Option<String>,
     required_incarnation: Option<String>,
     allow_safe_fallback: bool,
     diagnostics: &mut WrapperDiagnostics,
 ) -> Result<()> {
+    delivery.model = declared_codex_model(&codex_argv[1..]);
     let socket_path = socket_path(catalog_root, &identity)?;
     let socket_dir = socket_path
         .parent()
@@ -2466,6 +2505,23 @@ fn run_controlled_owned(
     }
     server.terminate();
     result
+}
+
+fn declared_codex_model(args: &[String]) -> Option<String> {
+    let mut selected = None;
+    let mut index = 0;
+    while index < args.len() && args[index] != "--" {
+        if matches!(args[index].as_str(), "-m" | "--model") {
+            selected = args.get(index + 1).cloned();
+            index += 2;
+            continue;
+        }
+        if let Some(value) = args[index].strip_prefix("--model=") {
+            selected = Some(value.to_owned());
+        }
+        index += 1;
+    }
+    selected.filter(|model| !model.is_empty())
 }
 
 fn prepare_socket_for_launch(socket_path: &Path) -> Result<()> {
@@ -4062,7 +4118,7 @@ fn pump_control(
                         // until `binding_candidate` names one, and a thread starting now has no
                         // history to replay.
                         if let Some(delivery) = delivery.as_mut() {
-                            delivery.observe_context(&message, thread_id);
+                            delivery.observe_context(&message, thread_id, None);
                         }
                         continue;
                     }
@@ -4184,7 +4240,15 @@ fn pump_control(
             // is honest about the gap through `ageMs` meanwhile, which is cheaper than teaching the
             // binding handshake to hold observability frames it has no state to attribute yet.
             if let Some(delivery) = delivery.as_mut() {
-                delivery.observe_context(&message, state.thread_id());
+                let active_turn = match &state.observed {
+                    CodexObservedState::Active { turn_id } => Some(turn_id.as_str()),
+                    CodexObservedState::Held {
+                        turn_id: Some(turn_id),
+                        ..
+                    } => Some(turn_id.as_str()),
+                    _ => None,
+                };
+                delivery.observe_context(&message, state.thread_id(), active_turn);
                 // The credential axis, taken here for the same reason: it reads a typed turn
                 // result no branch below looks at, and every one of them may `continue`.
                 delivery.observe_provider_auth(&message, state.thread_id());
@@ -4363,6 +4427,24 @@ fn recover_transcript_turn_if_due(
         delivery.accept_transcript_recovery(state.observed.clone());
     }
     Ok(())
+}
+
+fn codex_turn_model(thread_id: &str, turn_id: &str) -> Result<Option<String>> {
+    let Some(path) = latest_codex_transcript(thread_id)? else {
+        return Ok(None);
+    };
+    let frames = codex_transcript_tail(&path)?;
+    Ok(model_from_codex_frames(&frames, turn_id))
+}
+
+fn model_from_codex_frames(frames: &[Value], turn_id: &str) -> Option<String> {
+    frames.iter().rev().find_map(|frame| {
+        (frame.get("type").and_then(Value::as_str) == Some("turn_context")
+            && frame.pointer("/payload/turn_id").and_then(Value::as_str) == Some(turn_id))
+        .then(|| frame.pointer("/payload/model").and_then(Value::as_str))
+        .flatten()
+        .map(str::to_owned)
+    })
 }
 
 fn latest_codex_transcript(thread_id: &str) -> Result<Option<PathBuf>> {
