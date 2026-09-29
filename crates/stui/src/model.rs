@@ -572,6 +572,22 @@ fn tree_resource(id: &str) -> bool {
     .any(|prefix| id.starts_with(prefix))
 }
 
+/// Harness sessions on this machine that st did not start. Nothing announces them, so the
+/// screens read them when the Agents tab opens.
+pub async fn read_native_sessions(client: &Client) -> Result<Collection> {
+    read_pages(client, Kind::NativeSessions).await
+}
+
+/// The Fleet tab's machines, read when it opens.
+pub async fn read_machines(client: &Client) -> Result<Collection> {
+    read_pages(client, Kind::Machines).await
+}
+
+/// The Fleet tab's paired devices, read when it opens.
+pub async fn read_devices(client: &Client) -> Result<Collection> {
+    read_pages(client, Kind::Devices).await
+}
+
 async fn read_tree(client: &Client) -> Result<crate::tree::MissionsTree> {
     crate::tree::MissionsTree::from_response(client.missions_tree().await?)
 }

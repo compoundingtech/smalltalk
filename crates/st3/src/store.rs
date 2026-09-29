@@ -1,7 +1,9 @@
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fs;
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -674,11 +676,55 @@ impl Drop for WriterGuard<'_> {
 struct ReadPool {
     connections: Mutex<Vec<Connection>>,
     available: Condvar,
+    /// How many connections `Store::read_snapshot` holds. At least one always stays unpinned,
+    /// so a pinned read that fans out to worker threads can never wait on itself.
+    pinned: Mutex<usize>,
+    unpinned: Condvar,
 }
 
 struct ReadGuard<'a> {
     pool: &'a ReadPool,
     connection: Option<Connection>,
+    /// The connection `Store::read_snapshot` pinned for this thread, shared by every read in it.
+    pinned: Option<Rc<Connection>>,
+}
+
+thread_local! {
+    /// While `Store::read_snapshot` runs on this thread: the pool it pinned a connection from,
+    /// and that connection, held inside one read transaction.
+    static PINNED_READER: RefCell<Option<(usize, Rc<Connection>)>> = const { RefCell::new(None) };
+}
+
+/// Ends a pinned read on every exit path, panics included.
+struct PinnedRead<'a> {
+    pool: &'a ReadPool,
+    connection: Option<Rc<Connection>>,
+}
+
+impl Drop for PinnedRead<'_> {
+    fn drop(&mut self) {
+        PINNED_READER.with(|slot| slot.borrow_mut().take());
+        {
+            let mut pinned = self.pool.pinned.lock().unwrap_or_else(PoisonError::into_inner);
+            *pinned -= 1;
+            self.pool.unpinned.notify_one();
+        }
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        let _ = connection.execute_batch("COMMIT");
+        // Every guard lent from the pin is gone by now; if one escaped, the pool loses that
+        // connection rather than sharing it.
+        if let Ok(connection) = Rc::try_unwrap(connection) {
+            let mut connections = self
+                .pool
+                .connections
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            connections.push(connection);
+            self.pool.available.notify_one();
+        }
+    }
 }
 
 impl ReadPool {
@@ -686,10 +732,29 @@ impl ReadPool {
         Self {
             connections: Mutex::new(connections),
             available: Condvar::new(),
+            pinned: Mutex::new(0),
+            unpinned: Condvar::new(),
         }
     }
 
+    fn key(&self) -> usize {
+        std::ptr::from_ref(self) as usize
+    }
+
     fn get(&self) -> ReadGuard<'_> {
+        let pinned = PINNED_READER.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .filter(|(pool, _)| *pool == self.key())
+                .map(|(_, connection)| connection.clone())
+        });
+        if pinned.is_some() {
+            return ReadGuard {
+                pool: self,
+                connection: None,
+                pinned,
+            };
+        }
         let mut connections = self
             .connections
             .lock()
@@ -703,6 +768,7 @@ impl ReadPool {
         ReadGuard {
             pool: self,
             connection: connections.pop(),
+            pinned: None,
         }
     }
 }
@@ -711,26 +777,39 @@ impl Deref for ReadGuard<'_> {
     type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
-        self.connection
-            .as_ref()
+        self.pinned
+            .as_deref()
+            .or(self.connection.as_ref())
             .expect("a read guard always has a connection")
     }
 }
 
 impl Drop for ReadGuard<'_> {
     fn drop(&mut self) {
+        // A pinned connection goes back when its snapshot ends, not here.
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
         let mut connections = self
             .pool
             .connections
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        connections.push(
-            self.connection
-                .take()
-                .expect("a read guard always returns its connection"),
-        );
+        connections.push(connection);
         self.pool.available.notify_one();
     }
+}
+
+/// A step as a person reads it in a list: which mission, which step, and what it is for.
+#[derive(Clone, Debug)]
+pub struct StepLabel {
+    pub run: String,
+    pub mission: String,
+    pub path: String,
+    pub title: Option<String>,
+    pub goal: Option<String>,
+    pub status: String,
+    pub updated_at_unix_ms: u128,
 }
 
 pub struct Store {
@@ -1800,6 +1879,52 @@ impl Store {
         Ok(self.committed_index.load(Ordering::Acquire))
     }
 
+    /// Run `read` with every read this thread makes through the store seeing one SQLite
+    /// snapshot, and give it that snapshot's store index. Rows read inside always match the
+    /// index, however many commits land meanwhile. A nested call joins the outer snapshot.
+    pub fn read_snapshot<T>(&self, read: impl FnOnce(u64) -> Result<T>) -> Result<T> {
+        let key = self.readers.key();
+        if PINNED_READER.with(|slot| slot.borrow().as_ref().is_some_and(|(pool, _)| *pool == key))
+        {
+            let index = current_index(&self.readers.get())?;
+            return read(index);
+        }
+        {
+            let mut pinned = self
+                .readers
+                .pinned
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            while *pinned + 1 >= READ_CONNECTIONS {
+                pinned = self
+                    .readers
+                    .unpinned
+                    .wait(pinned)
+                    .unwrap_or_else(PoisonError::into_inner);
+            }
+            *pinned += 1;
+        }
+        let mut guard = self.readers.get();
+        // Declared first so it drops last: on every exit it ends the transaction, releases the
+        // pin, and returns the connection to the pool.
+        let pinned = PinnedRead {
+            pool: &self.readers,
+            connection: Some(Rc::new(
+                guard
+                    .connection
+                    .take()
+                    .expect("an unpinned read guard holds a pooled connection"),
+            )),
+        };
+        drop(guard);
+        let connection = pinned.connection.clone().expect("the pin holds its connection");
+        connection.execute_batch("BEGIN")?;
+        // The first read starts the snapshot; every later read in `read` sees the same one.
+        let index = current_index(&connection)?;
+        PINNED_READER.with(|slot| *slot.borrow_mut() = Some((key, connection)));
+        read(index)
+    }
+
     /// Diagnostic claims on the daemon cannot change agent cards. Ignore them when deciding
     /// whether an agent projection must be rebuilt, including diagnostics raised by a slow
     /// agent-list request itself.
@@ -1809,6 +1934,26 @@ impl Store {
             .query_row(
                 "SELECT store_index FROM claims WHERE store_index<=?1
                  AND kind!='daemon.diagnostic' ORDER BY store_index DESC LIMIT 1",
+                [snapshot_index],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or_default())
+    }
+
+    /// The last claim that can change an agent's status: one about an agent, or about the run
+    /// or generation that owns it, whose row decides the agent's projection layer. Steps,
+    /// gates, subscriptions and diagnostics commit far more often and change no agent status.
+    fn agent_status_index(&self, snapshot_index: u64) -> Result<u64> {
+        // Walk back from the snapshot: about one recent claim in ten matches, so this stops
+        // after a few rows instead of scanning every agent observation.
+        let connection = self.readers.get();
+        Ok(connection
+            .query_row(
+                "SELECT store_index FROM claims WHERE store_index<=?1
+                 AND (subject GLOB 'agent/*' OR subject GLOB 'mission-run/*'
+                      OR subject GLOB 'run-generation/*')
+                 ORDER BY store_index DESC LIMIT 1",
                 [snapshot_index],
                 |row| row.get(0),
             )
@@ -1986,6 +2131,76 @@ impl Store {
             .collect()
     }
 
+    /// Name steps for display in one read: each step's mission, run, path, title, first goal,
+    /// status and last change. Unknown subjects are left out.
+    pub fn step_labels(&self, subjects: &[String]) -> Result<BTreeMap<String, StepLabel>> {
+        if subjects.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT s.subject, s.run_id, r.mission_id, s.step_path, s.title, s.goals, s.status,
+                    s.updated_at_unix_ms
+             FROM step_runs s
+             JOIN mission_runs r ON r.id=s.run_id
+             WHERE s.subject IN (SELECT value FROM json_each(?1))",
+        )?;
+        statement
+            .query_map([serde_json::to_string(subjects)?], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, String>(7)?,
+                ))
+            })?
+            .map(|row| {
+                let (subject, run, mission, path, title, goals, status, updated_at) = row?;
+                let goals: Vec<String> = serde_json::from_str(&goals)?;
+                Ok((
+                    subject,
+                    StepLabel {
+                        run: format!("mission-run/{run}"),
+                        mission: format!("mission/{mission}"),
+                        path,
+                        title,
+                        goal: goals.into_iter().next(),
+                        status,
+                        updated_at_unix_ms: updated_at.parse()?,
+                    },
+                ))
+            })
+            .collect()
+    }
+
+    /// The mission behind each of these runs, in one read.
+    pub fn run_missions(&self, runs: &[String]) -> Result<BTreeMap<String, String>> {
+        if runs.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let ids = runs
+            .iter()
+            .map(|run| run.strip_prefix("mission-run/").unwrap_or(run))
+            .collect::<Vec<_>>();
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT id, mission_id FROM mission_runs WHERE id IN (SELECT value FROM json_each(?1))",
+        )?;
+        statement
+            .query_map([serde_json::to_string(&ids)?], |row| {
+                Ok((
+                    format!("mission-run/{}", row.get::<_, String>(0)?),
+                    format!("mission/{}", row.get::<_, String>(1)?),
+                ))
+            })?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(Into::into)
+    }
+
     /// Return every current published mission definition, including definitions with no runs.
     pub fn mission_definitions(&self) -> Result<Vec<MissionDefinitionView>> {
         let connection = self.readers.get();
@@ -2021,6 +2236,7 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<String>> {
+        let ended_since = recently_ended_since();
         let connection = self.readers.get();
         let mut statement = connection.prepare(
             "WITH ids AS (
@@ -2045,15 +2261,21 @@ impl Store {
                    WHEN COALESCE(run_states.running,0)>0 THEN 'running'
                    WHEN COALESCE(run_states.standing,0)>0 THEN 'standing'
                    WHEN latest.status IS NOT NULL THEN latest.status
-                   ELSE def.state END NOT IN ('completed','failed','cancelled','retired'))
+                   ELSE def.state END NOT IN ('completed','failed','cancelled','retired')
+                   -- A run that failed or was cancelled stays in view for a while with its
+                   -- outcome, instead of vanishing the moment it ends.
+                   OR (latest.status IN ('failed','cancelled')
+                       AND COALESCE(run_states.running,0)=0 AND COALESCE(run_states.standing,0)=0
+                       AND CAST(latest.updated_at_unix_ms AS INTEGER)>=?4))
              ORDER BY CAST(COALESCE(latest.updated_at_unix_ms,published.accepted_at_unix_ms) AS INTEGER) DESC,
                       ids.mission_id ASC
              LIMIT ?2 OFFSET ?3",
         )?;
         statement
-            .query_map(params![history, limit as i64, offset as i64], |row| {
-                row.get::<_, String>(0).map(|id| format!("mission/{id}"))
-            })?
+            .query_map(
+                params![history, limit as i64, offset as i64, ended_since as i64],
+                |row| row.get::<_, String>(0).map(|id| format!("mission/{id}")),
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(Into::into)
     }
@@ -7891,7 +8113,7 @@ impl Store {
                 result.store_index = index;
                 return Ok(result);
             }
-            let projection_index = self.agent_projection_index(index)?;
+            let projection_index = self.agent_status_index(index)?;
             if let Some((cached_index, _, status)) = cache
                 .iter_mut()
                 .find(|(_, cached_projection, _)| *cached_projection == projection_index)
@@ -9480,7 +9702,32 @@ impl Store {
             }
         }
 
-        let messages = selected_actionable_messages(self.messages(person, false)?);
+        // Only a person's messages need attention. Without a person, read each person's
+        // mailbox through the recipient index instead of every open message in the fleet.
+        let messages = match person {
+            Some(person) => self.messages(Some(person), false)?,
+            None => {
+                let people = {
+                    let connection = self.readers.get();
+                    let mut statement = connection.prepare(
+                        "SELECT DISTINCT json_extract(body, '$.fields.to')
+                         FROM claims INDEXED BY claims_message_to_index
+                         WHERE kind='message.sent'
+                           AND json_extract(body, '$.fields.to') >= 'person/'
+                           AND json_extract(body, '$.fields.to') < 'person0'",
+                    )?;
+                    statement
+                        .query_map([], |row| row.get::<_, String>(0))?
+                        .collect::<Result<Vec<_>, _>>()?
+                };
+                let mut messages = Vec::new();
+                for person in people {
+                    messages.extend(self.messages(Some(&person), false)?);
+                }
+                messages
+            }
+        };
+        let messages = selected_actionable_messages(messages);
         if !messages.is_empty() {
             let connection = self.readers.get();
             for message in messages.into_iter().filter(|message| {
@@ -9565,7 +9812,13 @@ impl Store {
                     review_mode: None,
                     subject: attention_subject,
                     person: reviewer,
-                    requester_id: None,
+                    // st's subscription observer raised it.
+                    requester_id: Some(
+                        failure
+                            .actor
+                            .clone()
+                            .unwrap_or_else(|| "agent/st3/reconciler".into()),
+                    ),
                     launch_id: None,
                     variant_id: None,
                     message_id: None,
@@ -16989,6 +17242,8 @@ fn current_human_review(
     else {
         return Ok(None);
     };
+    // Only the run's header decides whether a review is current: its steps' queue and wake
+    // enrichment is the costliest read in st and would run for every open review.
     let (run, step, title) = if owner.starts_with("step-run/") {
         let step = connection
             .query_row(
@@ -17005,7 +17260,7 @@ fn current_human_review(
         let Some(step) = step else {
             return Ok(None);
         };
-        let run = mission_run_view_tx(
+        let run = mission_run_header_tx(
             connection,
             step.run.strip_prefix("mission-run/").unwrap_or(&step.run),
         )
@@ -17025,7 +17280,7 @@ fn current_human_review(
         let title = step.title.clone();
         (run, Some(step.step), title)
     } else if owner.starts_with("mission-run/") {
-        let run = mission_run_view_tx(
+        let run = mission_run_header_tx(
             connection,
             owner.strip_prefix("mission-run/").unwrap_or(owner),
         )
@@ -19025,6 +19280,14 @@ fn canonical_json_text(value: &Value) -> Result<String> {
 
 fn canonical_serialized_json_text(value: &impl Serialize) -> Result<String> {
     canonical_json_text(&serde_json::to_value(value)?)
+}
+
+/// How long a mission whose run failed or was cancelled stays in the current missions view.
+pub(crate) const RECENTLY_ENDED_MS: u128 = 24 * 60 * 60 * 1000;
+
+/// The earliest end that still counts as recent.
+pub(crate) fn recently_ended_since() -> u128 {
+    now_ms().saturating_sub(RECENTLY_ENDED_MS)
 }
 
 fn now_ms() -> u128 {
@@ -27729,6 +27992,83 @@ mod tests {
     use proptest::prelude::*;
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
+
+    #[test]
+    fn a_pinned_read_sees_one_snapshot_while_commits_land() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(&directory.path().join("state.sqlite3"), "node").unwrap();
+        let observe = |n: u64| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: "resource/pinned".into(),
+                    kind: "resource.observed".into(),
+                    actor: Some("person/avery".into()),
+                    fields: BTreeMap::from([
+                        ("kind".into(), Value::String("human.review".into())),
+                        ("reason".into(), Value::String(format!("change {n}"))),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        observe(0);
+        let before = store.index().unwrap();
+        let seen = store
+            .read_snapshot(|index| {
+                assert_eq!(index, before);
+                // A commit lands in the middle of the read. The writer sees it; the read does not.
+                observe(1);
+                assert!(store.index().unwrap() > index);
+                let claims = store.claims_for("resource/pinned", None)?.len();
+                let nested = store.read_snapshot(|nested| {
+                    Ok((nested, store.claims_for("resource/pinned", None)?.len()))
+                })?;
+                assert_eq!(nested, (index, claims), "a nested read joins the outer snapshot");
+                Ok(claims)
+            })
+            .unwrap();
+        assert_eq!(seen, 1);
+        assert_eq!(store.claims_for("resource/pinned", None).unwrap().len(), 2);
+        // Every pinned connection went back to the pool, even after a failed read.
+        for _ in 0..32 {
+            let _ = store.read_snapshot(|_| -> Result<()> { anyhow::bail!("a failed read") });
+            store.read_snapshot(|_| Ok(())).unwrap();
+        }
+        assert_eq!(store.claims_for("resource/pinned", None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn pinned_reads_that_fan_out_never_wait_on_each_other() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&directory.path().join("state.sqlite3"), "node").unwrap());
+        // Every pinned read holds its connection while a worker thread, like the agent status
+        // reduction's, needs another one from the pool.
+        let (done, finished) = std::sync::mpsc::channel();
+        let barrier = Arc::new(std::sync::Barrier::new(READ_CONNECTIONS));
+        for _ in 0..READ_CONNECTIONS {
+            let (store, done, barrier) = (store.clone(), done.clone(), barrier.clone());
+            std::thread::spawn(move || {
+                barrier.wait();
+                let result = store.read_snapshot(|_| {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    std::thread::scope(|scope| {
+                        scope
+                            .spawn(|| store.claims_for("resource/pinned", None).map(|claims| claims.len()))
+                            .join()
+                            .unwrap()
+                    })
+                });
+                done.send(result.is_ok()).unwrap();
+            });
+        }
+        for _ in 0..READ_CONNECTIONS {
+            assert!(finished
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .expect("a pinned read waited forever for a connection"));
+        }
+    }
 
     #[test]
     fn recent_up_observation_prevents_a_transport_timeout_flap() {
@@ -36691,6 +37031,31 @@ mission "takeover" state="ready" {
             .retry_failed_step(&old_check, "person/operator", "again", "retry-stale")
             .unwrap_err();
         assert_eq!(stale.code, "stale-run-generation");
+    }
+
+    #[test]
+    fn a_failed_mission_stays_in_the_current_view_for_a_day() {
+        let store = Store::open_memory("node").unwrap();
+        let failed = failed_takeover_run(&store, &["deploy-check"]);
+        assert_eq!(failed.status, "failed");
+        let current = store.mission_collection_ids(false, 0, 50).unwrap();
+        assert!(current.contains(&failed.mission), "{current:?}");
+
+        // A day later it is history only.
+        let old = crate::store::recently_ended_since().saturating_sub(1_000);
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE id=?1",
+                params![failed.id, old.to_string()],
+            )
+            .unwrap();
+        let current = store.mission_collection_ids(false, 0, 50).unwrap();
+        assert!(!current.contains(&failed.mission), "{current:?}");
+        let history = store.mission_collection_ids(true, 0, 50).unwrap();
+        assert!(history.contains(&failed.mission), "{history:?}");
     }
 
     #[test]

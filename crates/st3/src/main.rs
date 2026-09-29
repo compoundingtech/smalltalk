@@ -38,7 +38,7 @@ use st3::reconcile::Reconciler;
 use st3::store::Store;
 use st3_client::{
     API_VERSION as CLIENT_V0_API_VERSION, Client as GeneratedClient,
-    ClientError as GeneratedClientError, Envelope as ClientEnvelope, ErrorCode as ClientErrorCode,
+    ClientError as GeneratedClientError, Envelope as ClientEnvelope,
     EventPage as ClientEventPage, EventType as ClientEventType, Fence as ClientFence,
     Page as ClientPage, PairingBegin, Resource as ClientResource,
     TargetParameters as ClientTargetParameters, TerminalInputMode as ClientTerminalInputMode,
@@ -5639,17 +5639,34 @@ fn print_timeline_page(
         return print_value(response, true);
     }
     use std::fmt::Write as _;
+    let mut output = timeline_entries_text(&response.value.session_id, &response.value.items);
+    if response.value.page.has_more
+        && let Some(cursor) = &response.value.page.next_cursor
+    {
+        let _ = writeln!(
+            output,
+            "\nOlder entries: st conversations timeline {} --cursor {}",
+            response.value.session_id,
+            shell_argument(cursor)
+        );
+    }
+    print!("{output}");
+    Ok(())
+}
+
+fn timeline_entries_text(session_id: &str, items: &[ClientTimelineEntry]) -> String {
+    use std::fmt::Write as _;
     let mut output = String::new();
     let _ = writeln!(
         output,
         "CONVERSATION  {} · {} entries",
-        response.value.session_id,
-        response.value.items.len()
+        session_id,
+        items.len()
     );
-    if response.value.items.is_empty() {
+    if items.is_empty() {
         let _ = writeln!(output, "No normalized timeline entries.");
     }
-    for entry in &response.value.items {
+    for entry in items {
         let kind = format!("{:?}", entry.body.entry_type()).to_lowercase();
         let role = format!("{:?}", entry.role).to_lowercase();
         let _ = writeln!(
@@ -5660,6 +5677,12 @@ fn print_timeline_page(
         match &entry.body {
             ClientTimelineBody::Message(body) => {
                 let _ = write!(output, "message {}", body.message_id);
+                if let (Some(from), Some(to)) = (&body.from, &body.to) {
+                    let _ = write!(output, " · {from} → {to}");
+                }
+                if let Some(title) = &body.title {
+                    let _ = write!(output, " · {title}");
+                }
                 if let Some(reply_to) = &body.reply_to {
                     let _ = write!(output, " · reply to {reply_to}");
                 }
@@ -5718,18 +5741,7 @@ fn print_timeline_page(
             }
         }
     }
-    if response.value.page.has_more
-        && let Some(cursor) = &response.value.page.next_cursor
-    {
-        let _ = writeln!(
-            output,
-            "\nOlder entries: st conversations timeline {} --cursor {}",
-            response.value.session_id,
-            shell_argument(cursor)
-        );
-    }
-    print!("{output}");
-    Ok(())
+    output
 }
 
 fn unseen_timeline_entries(
@@ -5756,12 +5768,17 @@ fn unseen_timeline_entries(
             seen.remove(&id);
         }
     }
-    changed.sort_by_key(|entry| entry.sequence);
+    // Small Talk and transcript entries number their sequences apart; time orders them.
+    changed.sort_by(|a, b| {
+        a.timestamp
+            .cmp(&b.timestamp)
+            .then(a.sequence.cmp(&b.sequence))
+    });
     changed
 }
 
 fn print_follow_entries(
-    response: &ClientEnvelope<ClientTimelinePage>,
+    session_id: &str,
     changed: Vec<ClientTimelineEntry>,
     json_output: bool,
 ) -> Result<()> {
@@ -5774,65 +5791,46 @@ fn print_follow_entries(
         }
         return Ok(());
     }
-    let mut delta = response.clone();
-    delta.value.items = changed;
-    delta.value.page.has_more = false;
-    delta.value.page.next_cursor = None;
-    print_timeline_page(&delta, false)
+    print!("{}", timeline_entries_text(session_id, &changed));
+    Ok(())
 }
 
+/// Follow a conversation the way every client sees it: st joins the transcript and the Small
+/// Talk and pushes each change on the collection socket.
 async fn follow_conversation(
     client: &GeneratedClient,
-    session: &str,
+    target: &str,
     limit: usize,
     json_output: bool,
 ) -> Result<()> {
-    // Subscribe before reading the first page so a change during that read cannot be lost.
-    let mut event_cursor = client.capabilities().await?.value.event_cursor;
+    let mut stream = client.collection_stream().await?;
+    stream.subscribe_conversation("conversation", target).await?;
     let mut seen = BTreeMap::new();
-    let initial = client.timeline(session, None, Some(limit)).await?;
-    print_follow_entries(
-        &initial,
-        unseen_timeline_entries(&initial.value.items, &mut seen),
-        json_output,
-    )?;
-    let mut last_read = Instant::now();
     loop {
-        let events = match client
-            .events(Some(&event_cursor), Some(200), Some(3_000))
-            .await
-        {
-            Ok(events) => events,
-            Err(GeneratedClientError::Api(ClientErrorCode::CursorGap, _, _)) => {
-                // Keep the visible window; re-establish the subscription and compare revisions.
-                event_cursor = client.capabilities().await?.value.event_cursor;
-                let page = client.timeline(session, None, Some(limit)).await?;
+        match stream.next_event().await? {
+            None => anyhow::bail!("st closed the conversation stream"),
+            Some(st3_client::CollectionEvent::Conversation {
+                session_id,
+                replace,
+                items,
+                ..
+            }) => {
+                // The first page shows its newest `limit` entries; later pages only what changed.
+                let items = if replace && seen.is_empty() {
+                    items[items.len().saturating_sub(limit)..].to_vec()
+                } else {
+                    items
+                };
                 print_follow_entries(
-                    &page,
-                    unseen_timeline_entries(&page.value.items, &mut seen),
+                    &session_id,
+                    unseen_timeline_entries(&items, &mut seen),
                     json_output,
                 )?;
-                last_read = Instant::now();
-                continue;
             }
-            Err(error) => return Err(error.into()),
-        };
-        event_cursor = events.value.resume_cursor;
-        let relevant = events
-            .value
-            .items
-            .iter()
-            .any(|event| event.resource_ids.iter().any(|id| id == session));
-        // Native host-local transcripts may advance without a graph event. This bounded
-        // fallback runs only while this explicit follow command is active.
-        if relevant || last_read.elapsed() >= Duration::from_secs(3) {
-            let page = client.timeline(session, None, Some(limit)).await?;
-            print_follow_entries(
-                &page,
-                unseen_timeline_entries(&page.value.items, &mut seen),
-                json_output,
-            )?;
-            last_read = Instant::now();
+            Some(st3_client::CollectionEvent::Error { message, .. }) => {
+                anyhow::bail!("st could not show this conversation: {message}")
+            }
+            Some(_) => {}
         }
     }
 }
