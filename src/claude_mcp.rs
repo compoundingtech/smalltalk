@@ -3,22 +3,30 @@
 //! The inbox is the durable source of truth. This process keeps only an ephemeral set of
 //! filenames delivered during its current lifetime; a restart scans the inbox again. The outer
 //! Claude session wrapper owns presence because Claude can close this child before the session ends.
+//!
+//! The st3 channel follows its installed binary. When a deploy replaces it, the channel carries the
+//! handshake, the delivered set, and any partial request line into the new image with `execve`, so
+//! Claude keeps the same stdio server. It also writes a small presence file its driver reports to
+//! the daemon, which is how st tells a live, current delivery path from a stale one.
 
 use std::collections::HashSet;
-use std::io::{self, BufRead, Write as _};
+use std::io::{self, Write as _};
 use std::path::Path;
 use std::sync::mpsc::{self, RecvTimeoutError};
-use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 use crate::harness_state::{Activity, BlockedOn, InputBuffer, Observation, Writer};
 use crate::message;
 use crate::native_channel::{channel_content, write_json};
+use crate::reexec::{self, StdinChunk};
 
 const POLL: Duration = Duration::from_millis(250);
+const PRESENCE_REFRESH: Duration = Duration::from_secs(1);
+const REPLACEMENT_CHECK: Duration = Duration::from_secs(1);
 const LEGACY_SERVER_NAME: &str = "st2";
 const ST3_SERVER_NAME: &str = "st3";
 
@@ -45,73 +53,72 @@ fn run_named(
     let agent_dir =
         message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
             .with_context(|| format!("Claude MCP agent '{identity}' is not declared"))?;
-    let mut initialized_writer = observe_initialized
+    // Only the st3 channel follows a replaced binary: st3 answers the resume probe and owns the
+    // daemon a deploy restarts.
+    let resumed = if observe_initialized {
+        match reexec::resume_path(reexec::CHANNEL_RESUME_ENV) {
+            Some(path) => {
+                let state = reexec::read_state::<ChannelResume>(&path);
+                reexec::unblock_stop_signals();
+                Some(state.context("resuming the Claude channel after a binary replacement")?)
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+    let mut watch = observe_initialized
+        .then(reexec::ReplacementWatch::for_current_process)
+        .flatten();
+    let (mut delivered, mut initialized, mut lines) = match resumed {
+        Some(state) => (state.delivered, state.initialized, state.lines),
+        None => (HashSet::new(), false, reexec::LineBuffer::default()),
+    };
+    let mut initialized_writer = (observe_initialized && !initialized)
         .then(|| st3_initialized_writer(&agent_dir, identity))
         .flatten();
     let inbox = message::inbox_dir(&agent_dir);
     let (input_tx, input_rx) = mpsc::channel();
-    thread::spawn(move || {
-        for line in io::stdin().lock().lines() {
-            if input_tx.send(line).is_err() {
-                break;
-            }
-        }
-    });
+    let spawn_reader = |sender: mpsc::Sender<StdinChunk>| {
+        reexec::StdinReader::spawn(move |chunk| sender.send(chunk).is_ok())
+    };
+    let mut reader = Some(spawn_reader(input_tx.clone()));
     let mut stdout = io::BufWriter::new(io::stdout().lock());
-    let mut delivered = HashSet::new();
-    let mut initialized = false;
+    let mut next_presence = Instant::now();
+    let mut next_replacement_check = Instant::now() + REPLACEMENT_CHECK;
     loop {
         match input_rx.recv_timeout(POLL) {
-            Ok(line) => {
-                let line = line.context("reading Claude MCP input")?;
-                if line.trim().is_empty() {
-                    continue;
-                }
-                let request: Value =
-                    serde_json::from_str(&line).context("decoding Claude MCP JSON")?;
-                match request.get("method").and_then(Value::as_str) {
-                    Some("initialize") => {
-                        write_json(&mut stdout, &initialize_response(&request, server_name))?;
-                    }
-                    Some("notifications/initialized") => {
-                        initialized = true;
-                        if let Some(writer) = initialized_writer.as_mut() {
-                            writer.observe(
-                                Observation::new(
-                                    Activity::Ready,
-                                    BlockedOn::None,
-                                    InputBuffer::Unknown,
-                                )
-                                .with_reason("channelInitialized"),
-                            )?;
-                        }
-                    }
-                    Some("tools/list") | Some("resources/list") | Some("prompts/list") => {
-                        if let Some(id) = request.get("id") {
-                            let field = if request["method"] == "tools/list" {
-                                "tools"
-                            } else if request["method"] == "resources/list" {
-                                "resources"
-                            } else {
-                                "prompts"
-                            };
-                            write_json(
-                                &mut stdout,
-                                &json!({"jsonrpc":"2.0","id":id,"result":{field:[]}}),
-                            )?;
-                        }
-                    }
-                    Some("ping") => {
-                        if let Some(id) = request.get("id") {
-                            write_json(&mut stdout, &json!({"jsonrpc":"2.0","id":id,"result":{}}))?;
-                        }
-                    }
-                    _ => {}
+            Ok(StdinChunk::Bytes(bytes)) => {
+                lines.push(&bytes);
+                while let Some(line) = lines.next_line() {
+                    handle_request(
+                        &line,
+                        server_name,
+                        &mut stdout,
+                        &mut initialized,
+                        &mut initialized_writer,
+                    )?;
                 }
             }
-            Err(RecvTimeoutError::Timeout) => {}
             // Claude owns this child over stdio. EOF is the session-lifetime
             // boundary, so do not leave a detached watcher behind.
+            Ok(StdinChunk::Eof) => {
+                if let Some(line) = lines.finish() {
+                    handle_request(
+                        &line,
+                        server_name,
+                        &mut stdout,
+                        &mut initialized,
+                        &mut initialized_writer,
+                    )?;
+                    stdout.flush()?;
+                }
+                return Ok(());
+            }
+            Ok(StdinChunk::Failed(error)) => {
+                return Err(error).context("reading Claude MCP input");
+            }
+            Err(RecvTimeoutError::Timeout) => {}
             Err(RecvTimeoutError::Disconnected) => return Ok(()),
         }
         if initialized {
@@ -141,10 +148,167 @@ fn run_named(
                     )?;
                 }
             }
+            // Forget files the driver archived, so the carried set stays as small as the inbox.
+            if delivered.len() > 256 {
+                let present = message::list_inbox(&inbox)?
+                    .into_iter()
+                    .map(|msg| msg.filename)
+                    .collect::<HashSet<_>>();
+                delivered.retain(|filename| present.contains(filename));
+            }
         }
         stdout.flush()?;
-        thread::sleep(POLL);
+        let now = Instant::now();
+        if observe_initialized && now >= next_presence {
+            let _ = write_presence(&agent_dir);
+            next_presence = now + PRESENCE_REFRESH;
+        }
+        if now >= next_replacement_check
+            && let Some(watch) = watch.as_mut()
+        {
+            next_replacement_check = now + REPLACEMENT_CHECK;
+            if let Some(binary) = watch.ready() {
+                // Take every byte the reader already consumed, answer every complete request,
+                // and carry only a partial frame across the exec.
+                if let Some(reader) = reader.take() {
+                    reader.stop();
+                }
+                while let Ok(chunk) = input_rx.try_recv() {
+                    match chunk {
+                        StdinChunk::Bytes(bytes) => lines.push(&bytes),
+                        StdinChunk::Eof => return Ok(()),
+                        StdinChunk::Failed(error) => {
+                            return Err(error).context("reading Claude MCP input");
+                        }
+                    }
+                }
+                while let Some(line) = lines.next_line() {
+                    handle_request(
+                        &line,
+                        server_name,
+                        &mut stdout,
+                        &mut initialized,
+                        &mut initialized_writer,
+                    )?;
+                }
+                stdout.flush()?;
+                let state = ChannelResume {
+                    initialized,
+                    delivered: std::mem::take(&mut delivered),
+                    lines: std::mem::take(&mut lines),
+                };
+                match reexec::write_state(&agent_dir, "claude-channel-resume", &state) {
+                    Ok(path) => {
+                        let error = reexec::exec(&binary, reexec::CHANNEL_RESUME_ENV, &path, &[]);
+                        let _ = std::fs::remove_file(&path);
+                        tracing::warn!(
+                            "st3 Claude channel: executing {} failed: {error}",
+                            binary.display()
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!("st3 Claude channel: saving resume state failed: {error:#}");
+                    }
+                }
+                // Keep serving from this image and retry the replacement later.
+                watch.refuse_current();
+                initialized = state.initialized;
+                delivered = state.delivered;
+                lines = state.lines;
+                reader = Some(spawn_reader(input_tx.clone()));
+            }
+        }
     }
+}
+
+/// What a Claude channel hands its next image: the MCP handshake already happened, which inbox
+/// files Claude already saw, and any partial request line read from Claude.
+#[derive(Serialize, Deserialize)]
+struct ChannelResume {
+    initialized: bool,
+    delivered: HashSet<String>,
+    lines: reexec::LineBuffer,
+}
+
+fn handle_request(
+    line: &str,
+    server_name: &str,
+    stdout: &mut impl io::Write,
+    initialized: &mut bool,
+    initialized_writer: &mut Option<Writer>,
+) -> Result<()> {
+    if line.trim().is_empty() {
+        return Ok(());
+    }
+    let request: Value = serde_json::from_str(line).context("decoding Claude MCP JSON")?;
+    match request.get("method").and_then(Value::as_str) {
+        Some("initialize") => {
+            write_json(stdout, &initialize_response(&request, server_name))?;
+        }
+        Some("notifications/initialized") => {
+            *initialized = true;
+            if let Some(writer) = initialized_writer.as_mut() {
+                writer.observe(
+                    Observation::new(Activity::Ready, BlockedOn::None, InputBuffer::Unknown)
+                        .with_reason("channelInitialized"),
+                )?;
+            }
+        }
+        Some("tools/list") | Some("resources/list") | Some("prompts/list") => {
+            if let Some(id) = request.get("id") {
+                let field = if request["method"] == "tools/list" {
+                    "tools"
+                } else if request["method"] == "resources/list" {
+                    "resources"
+                } else {
+                    "prompts"
+                };
+                write_json(
+                    stdout,
+                    &json!({"jsonrpc":"2.0","id":id,"result":{field:[]}}),
+                )?;
+            }
+        }
+        Some("ping") => {
+            if let Some(id) = request.get("id") {
+                write_json(stdout, &json!({"jsonrpc":"2.0","id":id,"result":{}}))?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+/// The Claude channel's own liveness, read by its driver: which process delivers into Claude,
+/// which st binary it runs, and when it last looked at the inbox.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelPresence {
+    pub pid: u32,
+    pub image: Option<String>,
+    pub at_unix_ms: u64,
+}
+
+const PRESENCE_FILE: &str = "channel-presence.json";
+
+fn write_presence(agent_dir: &Path) -> Result<()> {
+    let presence = ChannelPresence {
+        pid: std::process::id(),
+        image: reexec::running_identity().map(|identity| identity.token()),
+        at_unix_ms: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64,
+    };
+    let path = agent_dir.join(PRESENCE_FILE);
+    let staging = agent_dir.join(format!(".{PRESENCE_FILE}.{}", std::process::id()));
+    std::fs::write(&staging, serde_json::to_vec(&presence)?)?;
+    std::fs::rename(&staging, &path)?;
+    Ok(())
+}
+
+/// The channel presence the st3 Claude channel last wrote for this agent directory.
+pub fn read_presence(agent_dir: &Path) -> Option<ChannelPresence> {
+    serde_json::from_slice(&std::fs::read(agent_dir.join(PRESENCE_FILE)).ok()?).ok()
 }
 
 fn st3_initialized_writer(agent_dir: &Path, identity: &str) -> Option<Writer> {

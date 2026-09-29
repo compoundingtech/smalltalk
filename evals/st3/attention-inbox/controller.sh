@@ -95,10 +95,8 @@ st3 --json work revise "$revision_run" revision.kdl \
 proposal_subject=$(jq -er '.proposal.subject' revision-proposal.json)
 proposal_hash=$(jq -er '.proposal.preview_hash' revision-proposal.json)
 
-mkdir -p blocked-planner/.st3
-git -C blocked-planner init -q
-printf '%s\n' 'This tracked file blocks the model-free planner.' >blocked-planner/.st3/boot.md
-git -C blocked-planner add .st3/boot.md
+# A workspace that is a file refuses the planner's render, so the model-free planner never starts.
+printf '%s\n' 'This file blocks the model-free planner.' >blocked-planner
 st3 --json launch start \
   --id eval/attention-inbox/planned \
   request.md \

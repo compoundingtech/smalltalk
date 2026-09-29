@@ -498,18 +498,45 @@ export default function (pi: ExtensionAPI) {
     });
   });
 
+  // st starts a seat with no prompt, so no turn follows `session_start` and no `agent_settled`
+  // would ever report the idle edge that lets the channel deliver mail. Prove it with a bounded
+  // poll whose first sample comes after the `session_start` handler has returned. A turn that a
+  // person or a positional prompt already started keeps `isIdle()` false and reports itself
+  // through `agent_start`; a budget spent without proof sends nothing.
+  const START_IDLE_POLL_MS = 100;
+  const START_IDLE_POLL_BUDGET_MS = 5000;
+  const settleAfterStart = (ctx: ExtensionContext, opened: childProcess.ChildProcess) => {
+    const startedAt = Date.now();
+    const poller = setInterval(() => {
+      if (state.child !== opened) {
+        clearInterval(poller);
+        return;
+      }
+      let idle = false;
+      try {
+        idle = ctx.isIdle();
+      } catch {
+        idle = false;
+      }
+      if (!idle && Date.now() - startedAt < START_IDLE_POLL_BUDGET_MS) return;
+      clearInterval(poller);
+      if (idle) sendState("idle");
+    }, START_IDLE_POLL_MS);
+    poller.unref?.();
+  };
+
   pi.on("session_start", async (_event, ctx) => {
     // Awaited before the session's first turn, which is what makes restored context reach the boot
     // prompt rather than the turn after it.
     const restored = await open(ctx);
     const opened = state.child;
-    // Do not seed an idle state here. `session_start` precedes a positional boot prompt, and an
-    // idle frame would authorize the channel to inject mail before pi has created the transcript
-    // for that prompt. `agent_settled` is the first transcript-ready lifecycle edge. Seed only the
-    // context record, so a resumed session still publishes the window it resumed INTO
+    // Seed the context record, so a resumed session still publishes the window it resumed INTO
     // rather than waiting for its first turn boundary. A fresh session reads `{tokens: 0}` here
     // and a post-compaction restart reads `{tokens: null}` — both are honest answers pi gives.
-    if (opened) sendContext(ctx);
+    if (opened) {
+      sendContext(ctx);
+      settleAfterStart(ctx, opened);
+    }
     if (restored.trim()) {
       // A custom message participates in LLM context without triggering a turn of its own — the
       // closest pi equivalent to the other harnesses' `additionalContext` hook output.

@@ -63,6 +63,26 @@ pub fn run(
     pi_family_session::run_for(catalog_root, identity, runtime_id, pi_argv, &PI_KIND)
 }
 
+/// Resume supervising a pi provider a predecessor driver image launched and released.
+pub fn adopt(
+    catalog_root: &Path,
+    identity: String,
+    runtime_id: String,
+    pid: u32,
+    session: String,
+    seq: u64,
+) -> Result<()> {
+    pi_family_session::adopt_for(
+        catalog_root,
+        identity,
+        runtime_id,
+        &PI_KIND,
+        pid,
+        session,
+        seq,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
