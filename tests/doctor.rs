@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest as _, Sha256};
 
-mod support;
+use crate::support;
 
 use support::RETIRED_RESOURCES;
 

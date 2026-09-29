@@ -45,7 +45,7 @@ The final report remains a message because communication is its product. A resou
 
 ## Run
 
-Validate its graph contract with `cargo test -p st3 --test examples`; paid live orchestration uses
+Validate its graph contract with `cargo test -p st3 --test integration examples::`; paid live orchestration uses
 the repository's internal eval controller, not the public CLI.
 
 The graph screen shows the current root and nested work state. It also shows recent semantic state transitions without streaming agent logs.
