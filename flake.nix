@@ -314,7 +314,7 @@
           };
         };
 
-        st3 = pkgs.rustPlatform.buildRustPackage {
+        st3Check = pkgs.rustPlatform.buildRustPackage {
           pname = "st3";
           inherit version;
           src = self;
@@ -401,6 +401,10 @@
             mainProgram = "st3";
           };
         };
+
+        # Installing the current tools must not depend on running the full runtime suite.
+        # Keep that suite as checks.st3; st/ci also runs it in the native test environment.
+        st3 = st3Check.overrideAttrs (_: { doCheck = false; });
 
         st3Help = pkgs.runCommand "st3-help-${version}" { } ''
           test "$(readlink ${st3}/bin/st)" = st3
@@ -711,7 +715,7 @@
         # commits on every rebase. The devShell ships rustfmt + clippy for whoever
         # wants them.
         checks.st2 = st2;
-        checks.st3 = st3;
+        checks.st3 = st3Check;
         checks.st3-help = st3Help;
         checks.install-layout = installLayout;
         checks.st2-install-layout = st2InstallLayout;
