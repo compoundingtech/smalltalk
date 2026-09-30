@@ -5,7 +5,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
@@ -1012,13 +1012,47 @@ fn claims_for_subject_query(kind: bool) -> String {
     )
 }
 
+/// The store's only write connection, owned by one writer thread. Writes queue in front of it in
+/// arrival order: a batched write runs on the writer thread with the others queued behind it, each
+/// in a savepoint of one transaction that commits once for all of them, and its caller hears back
+/// after that commit. `write` lends the connection itself to its caller until the guard drops,
+/// for writes that manage their own transactions. Nothing else ever takes SQLite's write lock.
 struct WriterConnection {
-    connection: Mutex<Connection>,
+    jobs: Mutex<Option<std::sync::mpsc::Sender<WriterJob>>>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
     committed_index: Arc<AtomicU64>,
+    /// Transactions the writer committed for batched writes, and the batched writes in them.
+    /// Tests read them; `st replication status` counts every commit.
+    #[cfg_attr(not(test), allow(dead_code))]
+    batches: Arc<(AtomicU64, AtomicU64)>,
 }
 
+enum WriterJob {
+    /// Runs in a savepoint of the writer's next transaction and says whether it succeeded. `run`
+    /// is declared first, so it drops before `done` wakes its caller.
+    Batched {
+        run: Box<dyn FnOnce(&Transaction<'_>) -> bool + Send>,
+        profile: Option<crate::profile::Op>,
+        /// When profiling, when its caller began to wait and who held the writer then.
+        wait: Option<crate::profile::WriterWait>,
+        done: std::sync::mpsc::SyncSender<Result<(), String>>,
+    },
+    /// Hands the connection to a caller until its guard gives it back.
+    Lend {
+        lent: std::sync::mpsc::SyncSender<Connection>,
+        returned: std::sync::mpsc::Receiver<Connection>,
+    },
+}
+
+/// At most this many batched writes share one transaction.
+const WRITE_BATCH_LIMIT: usize = 256;
+/// A batch takes in more queued writes only while it has run for less than this, so a write that
+/// arrives during a busy moment waits for about this long plus one write, not for a long batch.
+const WRITE_BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(50);
+
 struct WriterGuard<'a> {
-    connection: MutexGuard<'a, Connection>,
+    connection: Option<Connection>,
+    give_back: std::sync::mpsc::SyncSender<Connection>,
     committed_index: &'a AtomicU64,
     /// When profiling, when this thread took the writer.
     acquired: Option<std::time::Instant>,
@@ -1026,25 +1060,90 @@ struct WriterGuard<'a> {
 
 impl WriterConnection {
     fn new(connection: Connection, committed_index: Arc<AtomicU64>) -> Self {
+        let (jobs, queue) = std::sync::mpsc::channel::<WriterJob>();
+        let index = committed_index.clone();
+        let batches = Arc::new((AtomicU64::new(0), AtomicU64::new(0)));
+        let counted = batches.clone();
+        let thread = std::thread::Builder::new()
+            .name("st3-writer".into())
+            .spawn(move || write_queue(connection, queue, &index, &counted))
+            .expect("the writer thread starts");
         Self {
-            connection: Mutex::new(connection),
+            jobs: Mutex::new(Some(jobs)),
+            thread: Mutex::new(Some(thread)),
             committed_index,
+            batches,
         }
     }
 
-    /// The writer. A panic while the writer was held cannot leave a half-written database: its
-    /// open transaction rolls back as the panic unwinds. So a poisoned lock is recovered, rather
-    /// than turning every later write into a panic while the daemon keeps running.
+    fn send(&self, job: WriterJob) {
+        self.jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+            .expect("the writer queue is open while the store is")
+            .send(job)
+            .expect("the writer thread runs while the store is open");
+    }
+
+    /// The writer connection itself, lent until the guard drops, after every write queued before
+    /// this one. A panic while it is lent rolls back the open transaction as it unwinds and still
+    /// gives the connection back, so it cannot disable the store.
     fn write(&self) -> WriterGuard<'_> {
         let wait = crate::profile::writer_waiting();
-        let connection = self
-            .connection
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
+        let (lent, lent_here) = std::sync::mpsc::sync_channel(1);
+        let (give_back, returned) = std::sync::mpsc::sync_channel(1);
+        self.send(WriterJob::Lend { lent, returned });
+        let connection = lent_here
+            .recv()
+            .expect("the writer thread lends its connection");
         WriterGuard {
-            connection,
+            connection: Some(connection),
+            give_back,
             committed_index: &self.committed_index,
             acquired: crate::profile::writer_acquired(wait),
+        }
+    }
+
+    /// Run `job` in a savepoint of the writer's next transaction, together with the other writes
+    /// queued with it, and answer once that transaction commits. An `Err` from `job` rolls back
+    /// only its own savepoint. The outer `Err` is a commit that failed, which undid every write in
+    /// the batch.
+    fn batched<'job, T: Send + 'job, E: Send + 'job>(
+        &self,
+        job: impl FnOnce(&Transaction<'_>) -> std::result::Result<T, E> + Send + 'job,
+    ) -> std::result::Result<std::result::Result<T, E>, String> {
+        let outcome = Mutex::new(None);
+        let slot = &outcome;
+        let run: Box<dyn FnOnce(&Transaction<'_>) -> bool + Send + '_> = Box::new(move |tx| {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| job(tx)));
+            let succeeded = matches!(result, Ok(Ok(_)));
+            *slot.lock().unwrap_or_else(PoisonError::into_inner) = Some(result);
+            succeeded
+        });
+        // SAFETY: `run` borrows `outcome` and whatever `job` borrows. This caller blocks below
+        // until the writer thread has run `run` and committed, or has dropped it: `run` drops
+        // before `done`, and `recv` returns only once `done` is sent or dropped. So nothing `run`
+        // borrows is used after this frame returns.
+        let run: Box<dyn FnOnce(&Transaction<'_>) -> bool + Send + 'static> =
+            unsafe { std::mem::transmute(run) };
+        let (done, done_here) = std::sync::mpsc::sync_channel(1);
+        self.send(WriterJob::Batched {
+            run,
+            profile: crate::profile::current(),
+            wait: crate::profile::writer_waiting(),
+            done,
+        });
+        let committed = done_here
+            .recv()
+            .unwrap_or_else(|_| Err("the writer thread stopped".into()));
+        let result = outcome.into_inner().unwrap_or_else(PoisonError::into_inner);
+        match (result, committed) {
+            (Some(Err(panic)), _) => std::panic::resume_unwind(panic),
+            (Some(Ok(result)), Ok(())) => Ok(result),
+            // The batch failed to begin or to commit, or failed before it ran this write.
+            (_, Err(error)) => Err(error),
+            (None, Ok(())) => Err("the writer answered a write it did not run".into()),
         }
     }
 
@@ -1054,26 +1153,166 @@ impl WriterConnection {
     }
 }
 
+impl Drop for WriterConnection {
+    fn drop(&mut self) {
+        // Closing the queue ends the writer thread, which closes the connection.
+        self.jobs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(thread) = self
+            .thread
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
+            let _ = thread.join();
+        }
+    }
+}
+
+/// The writer thread: run each batched write with the others queued behind it in one
+/// transaction, and lend the connection to each lending write in its turn.
+fn write_queue(
+    mut connection: Connection,
+    queue: std::sync::mpsc::Receiver<WriterJob>,
+    committed_index: &AtomicU64,
+    batches: &(AtomicU64, AtomicU64),
+) {
+    let mut next = None;
+    loop {
+        let job = match next.take() {
+            Some(job) => job,
+            None => match queue.recv() {
+                Ok(job) => job,
+                // The store closed its queue.
+                Err(_) => return,
+            },
+        };
+        match job {
+            WriterJob::Lend { lent, returned } => {
+                if let Err(std::sync::mpsc::SendError(back)) = lent.send(connection) {
+                    connection = back;
+                    continue;
+                }
+                match returned.recv() {
+                    Ok(back) => connection = back,
+                    Err(_) => return,
+                }
+            }
+            batched => {
+                next = run_write_batch(&mut connection, batched, &queue, committed_index, batches);
+            }
+        }
+    }
+}
+
+/// Run `first` and the batched writes queued behind it in one transaction, each in its own
+/// savepoint, then commit once and answer every caller. The batch stops taking writes when it
+/// reaches `WRITE_BATCH_LIMIT`, has run for `WRITE_BATCH_WINDOW`, fails, or meets a lending write,
+/// which it returns to run next.
+fn run_write_batch(
+    connection: &mut Connection,
+    first: WriterJob,
+    queue: &std::sync::mpsc::Receiver<WriterJob>,
+    committed_index: &AtomicU64,
+    batches: &(AtomicU64, AtomicU64),
+) -> Option<WriterJob> {
+    let started = std::time::Instant::now();
+    let mut answers = Vec::new();
+    let mut lend = None;
+    let (transaction, mut failure) =
+        match connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+            Ok(transaction) => (Some(transaction), None),
+            Err(error) => (None, Some(error)),
+        };
+    let mut job = Some(first);
+    while let Some(current) = job.take() {
+        let WriterJob::Batched {
+            run,
+            profile,
+            wait,
+            done,
+        } = current
+        else {
+            lend = Some(current);
+            break;
+        };
+        match (&transaction, &failure) {
+            (Some(transaction), None) => {
+                // The caller's operation waited until now, holds the writer while its write
+                // runs, and shares the commit below with the rest of the batch.
+                let _entered = crate::profile::enter(profile.as_ref());
+                let acquired = crate::profile::writer_acquired(wait);
+                let savepoint = (|| {
+                    transaction.execute_batch("SAVEPOINT batched_write")?;
+                    if run(transaction) {
+                        transaction.execute_batch("RELEASE batched_write")
+                    } else {
+                        transaction
+                            .execute_batch("ROLLBACK TO batched_write; RELEASE batched_write")
+                    }
+                })();
+                crate::profile::writer_released(acquired);
+                failure = savepoint.err();
+            }
+            // A batch that failed to begin answers its first write with the error.
+            _ => drop(run),
+        }
+        answers.push(done);
+        if failure.is_none()
+            && answers.len() < WRITE_BATCH_LIMIT
+            && started.elapsed() < WRITE_BATCH_WINDOW
+        {
+            job = queue.try_recv().ok();
+        }
+    }
+    batches.0.fetch_add(1, Ordering::Relaxed);
+    batches.1.fetch_add(answers.len() as u64, Ordering::Relaxed);
+    let committed = match (transaction, failure) {
+        (Some(transaction), None) => transaction.commit(),
+        // Dropping the transaction rolls back every write in the batch.
+        (_, Some(error)) => Err(error),
+        (None, None) => unreachable!("a batch without a transaction failed to begin"),
+    };
+    if let Ok(index) = current_index(connection) {
+        committed_index.store(index, Ordering::Release);
+    }
+    let committed = committed.map_err(|error| error.to_string());
+    for done in answers {
+        let _ = done.send(committed.clone());
+    }
+    lend
+}
+
 impl Deref for WriterGuard<'_> {
     type Target = Connection;
 
     fn deref(&self) -> &Self::Target {
-        &self.connection
+        self.connection
+            .as_ref()
+            .expect("a writer guard holds the connection until it drops")
     }
 }
 
 impl DerefMut for WriterGuard<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.connection
+        self.connection
+            .as_mut()
+            .expect("a writer guard holds the connection until it drops")
     }
 }
 
 impl Drop for WriterGuard<'_> {
     fn drop(&mut self) {
-        if let Ok(index) = current_index(&self.connection) {
+        let Some(connection) = self.connection.take() else {
+            return;
+        };
+        if let Ok(index) = current_index(&connection) {
             self.committed_index.store(index, Ordering::Release);
         }
         crate::profile::writer_released(self.acquired.take());
+        let _ = self.give_back.send(connection);
     }
 }
 
@@ -2636,11 +2875,15 @@ impl Store {
         key: &str,
         response: &T,
     ) -> Result<()> {
-        let connection = self.connection.write();
-        connection.execute(
-            "INSERT OR IGNORE INTO idempotency(operation_id, response) VALUES (?1, ?2)",
-            params![opaque_cache_key(key), serde_json::to_string(response)?],
-        )?;
+        let response = serde_json::to_string(response)?;
+        self.connection
+            .batched(|transaction| {
+                transaction.execute(
+                    "INSERT OR IGNORE INTO idempotency(operation_id, response) VALUES (?1, ?2)",
+                    params![opaque_cache_key(key), response],
+                )
+            })
+            .map_err(anyhow::Error::msg)??;
         Ok(())
     }
 
@@ -3503,112 +3746,113 @@ impl Store {
         let subject = normalize_step_run(subject);
         let actor = normalize_actor(actor, "agent");
         let now = now_ms();
-        let mut connection = self.connection.write();
-        if let Some(response) = connection
-            .query_row(
-                "SELECT response FROM idempotency WHERE operation_id=?1",
-                [opaque_cache_key(idempotency_key)],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(internal)?
-        {
-            return serde_json::from_str(&response).map_err(internal);
-        }
-        let transaction = connection.transaction().map_err(internal)?;
-        let current = transaction
-            .query_row(
-                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
-                        lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
-                 FROM step_runs WHERE subject=?1",
-                [&subject],
-                step_run_from_row,
-            )
-            .optional()
-            .map_err(internal)?
-            .ok_or_else(|| {
-                St3Error::new(
-                    "missing-step-run",
-                    format!("step run `{subject}` does not exist"),
+        self.connection
+            .batched(|transaction| -> Result<MissionOutputView, St3Error> {
+                if let Some(response) = transaction
+                    .query_row(
+                        "SELECT response FROM idempotency WHERE operation_id=?1",
+                        [opaque_cache_key(idempotency_key)],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(internal)?
+                {
+                    return serde_json::from_str(&response).map_err(internal);
+                }
+                let current = transaction
+                    .query_row(
+                        "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                                lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+                         FROM step_runs WHERE subject=?1",
+                        [&subject],
+                        step_run_from_row,
+                    )
+                    .optional()
+                    .map_err(internal)?
+                    .ok_or_else(|| {
+                        St3Error::new(
+                            "missing-step-run",
+                            format!("step run `{subject}` does not exist"),
+                        )
+                    })?;
+                if !step_generation_is_current(transaction, &current).map_err(internal)? {
+                    return Err(St3Error::new(
+                        "stale-run-generation",
+                        format!("step run `{subject}` belongs to a superseded generation"),
+                    ));
+                }
+                if !mission_output_authority(transaction, &current, &actor, incarnation, now)
+                    .map_err(internal)?
+                {
+                    return Err(St3Error::new(
+                        "work-not-claimed",
+                        format!(
+                            "`{actor}` does not hold an active lease for `{subject}` or its nested work"
+                        ),
+                    ));
+                }
+                if mission.id != expected_mission || mission.state != MissionState::Ready {
+                    return Err(St3Error::new(
+                        "wrong-mission-output",
+                        format!("step run `{subject}` must publish ready mission `{expected_mission}`"),
+                    ));
+                }
+                let stored = transaction
+                    .query_row(
+                        "SELECT state FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+                        params![mission.id, mission.revision],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(internal)?;
+                if stored.as_deref() != Some("ready") {
+                    return Err(St3Error::new(
+                        "unpublished-mission-output",
+                        "the exact ready mission revision is not published",
+                    ));
+                }
+                let fields: BTreeMap<String, Value> = BTreeMap::from([
+                    (
+                        "mission".into(),
+                        Value::String(format!("mission/{}", mission.id)),
+                    ),
+                    ("revision".into(), Value::String(mission.revision.clone())),
+                    (
+                        "step_definition".into(),
+                        Value::String(current.definition_hash.clone()),
+                    ),
+                    ("attempt".into(), Value::from(current.attempt)),
+                ]);
+                let body = json!({"fields": fields});
+                let claim = append_claim_tx(
+                    transaction,
+                    &self.origin,
+                    &subject,
+                    "mission.produced",
+                    Some(&actor),
+                    &body,
+                    &[],
+                    None,
                 )
-            })?;
-        if !step_generation_is_current(&transaction, &current).map_err(internal)? {
-            return Err(St3Error::new(
-                "stale-run-generation",
-                format!("step run `{subject}` belongs to a superseded generation"),
-            ));
-        }
-        if !mission_output_authority(&transaction, &current, &actor, incarnation, now)
-            .map_err(internal)?
-        {
-            return Err(St3Error::new(
-                "work-not-claimed",
-                format!(
-                    "`{actor}` does not hold an active lease for `{subject}` or its nested work"
-                ),
-            ));
-        }
-        if mission.id != expected_mission || mission.state != MissionState::Ready {
-            return Err(St3Error::new(
-                "wrong-mission-output",
-                format!("step run `{subject}` must publish ready mission `{expected_mission}`"),
-            ));
-        }
-        let stored = transaction
-            .query_row(
-                "SELECT state FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
-                params![mission.id, mission.revision],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(internal)?;
-        if stored.as_deref() != Some("ready") {
-            return Err(St3Error::new(
-                "unpublished-mission-output",
-                "the exact ready mission revision is not published",
-            ));
-        }
-        let fields: BTreeMap<String, Value> = BTreeMap::from([
-            (
-                "mission".into(),
-                Value::String(format!("mission/{}", mission.id)),
-            ),
-            ("revision".into(), Value::String(mission.revision.clone())),
-            (
-                "step_definition".into(),
-                Value::String(current.definition_hash.clone()),
-            ),
-            ("attempt".into(), Value::from(current.attempt)),
-        ]);
-        let body = json!({"fields": fields});
-        let claim = append_claim_tx(
-            &transaction,
-            &self.origin,
-            &subject,
-            "mission.produced",
-            Some(&actor),
-            &body,
-            &[],
-            None,
-        )
-        .map_err(internal)?;
-        let output = MissionOutputView {
-            step: subject,
-            mission: format!("mission/{}", mission.id),
-            revision: mission.revision.clone(),
-            claim_id: claim.id,
-        };
-        transaction
-            .execute(
-                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
-                params![
-                    opaque_cache_key(idempotency_key),
-                    serde_json::to_string(&output).map_err(internal)?
-                ],
-            )
-            .map_err(internal)?;
-        transaction.commit().map_err(internal)?;
-        Ok(output)
+                .map_err(internal)?;
+                let output = MissionOutputView {
+                    step: subject,
+                    mission: format!("mission/{}", mission.id),
+                    revision: mission.revision.clone(),
+                    claim_id: claim.id,
+                };
+                transaction
+                    .execute(
+                        "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
+                        params![
+                            opaque_cache_key(idempotency_key),
+                            serde_json::to_string(&output).map_err(internal)?
+                        ],
+                    )
+                    .map_err(internal)?;
+                Ok(output)
+            })
+            .map_err(|error| St3Error::new("internal", error))?
     }
 
     pub fn mission_output_authorized(
@@ -5555,38 +5799,40 @@ impl Store {
         } else {
             format!("mission-run/{run}")
         };
-        let mut connection = self.connection.write();
-        let transaction = connection.transaction().map_err(internal)?;
-        let claim_ids =
-            cancel_mission_run_tx(&transaction, &self.origin, &run, reason, None, now_ms())?;
-        transaction.commit().map_err(internal)?;
-        Ok(!claim_ids.is_empty())
+        self.connection
+            .batched(|transaction| -> Result<bool, St3Error> {
+                let claim_ids =
+                    cancel_mission_run_tx(transaction, &self.origin, &run, reason, None, now_ms())?;
+                Ok(!claim_ids.is_empty())
+            })
+            .map_err(|error| St3Error::new("internal", error))?
     }
 
     pub fn terminate_mission_run_descendants(&self, run: &str, reason: &str) -> Result<bool> {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
-        let mut connection = self.connection.write();
-        let transaction = connection.transaction()?;
-        let generation: Option<String> = transaction
-            .query_row(
-                "SELECT current_generation_id FROM mission_runs WHERE id=?1",
-                [run],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let Some(generation) = generation else {
-            return Ok(false);
-        };
-        let claim_ids = cancel_descendant_mission_runs_tx(
-            &transaction,
-            &self.origin,
-            &generation,
-            "daemon/runtime",
-            reason,
-            now_ms(),
-        )?;
-        transaction.commit()?;
-        Ok(!claim_ids.is_empty())
+        self.connection
+            .batched(|transaction| -> Result<bool> {
+                let generation: Option<String> = transaction
+                    .query_row(
+                        "SELECT current_generation_id FROM mission_runs WHERE id=?1",
+                        [run],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                let Some(generation) = generation else {
+                    return Ok(false);
+                };
+                let claim_ids = cancel_descendant_mission_runs_tx(
+                    transaction,
+                    &self.origin,
+                    &generation,
+                    "daemon/runtime",
+                    reason,
+                    now_ms(),
+                )?;
+                Ok(!claim_ids.is_empty())
+            })
+            .map_err(anyhow::Error::msg)?
     }
 
     pub fn mission_run_origin(&self, run: &str) -> Result<Option<String>> {
@@ -6328,382 +6574,384 @@ impl Store {
                 )
             })?;
         let now = now_ms();
-        let mut connection = self.connection.write();
-        if let Some(response) = connection
-            .query_row(
-                "SELECT response FROM idempotency WHERE operation_id=?1",
-                [opaque_cache_key(&request.idempotency_key)],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(internal)?
-        {
-            return serde_json::from_str(&response).map_err(internal);
-        }
-        let transaction = connection.transaction().map_err(internal)?;
-        let current = transaction
-            .query_row(
-                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
-                        lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
-                 FROM step_runs WHERE subject=?1",
-                [&subject],
-                step_run_from_row,
-            )
-            .optional()
-            .map_err(internal)?
-            .ok_or_else(|| St3Error::new("missing-step-run", format!("step run `{subject}` does not exist")))?;
-        // A revision carries a claim into the successor generation. Its worker may still name the
-        // step by the predecessor subject.
-        let (subject, current) = match (action != "claim")
-            .then(|| carried_claim_successor_tx(&transaction, &current, &actor))
-            .transpose()
-            .map_err(internal)?
-            .flatten()
-        {
-            Some(successor) => (successor.subject.clone(), successor),
-            None => (subject, current),
-        };
-        let (run_status, run_phase, current_generation, generation_status, root_status, root_phase): (
-            String,
-            String,
-            String,
-            String,
-            String,
-            String,
-        ) = transaction
-            .query_row(
-                "SELECT mission_runs.status, mission_runs.phase,
-                        mission_runs.current_generation_id, run_generations.status,
-                        root_runs.status, root_runs.phase
-                 FROM mission_runs JOIN run_generations
-                   ON run_generations.id=?2
-                 JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
-                 WHERE mission_runs.id=?1",
-                params![
-                    current
-                        .run
-                        .strip_prefix("mission-run/")
-                        .unwrap_or(&current.run),
-                    generation_id_from_subject(&current.generation),
-                ],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
-            )
-            .map_err(internal)?;
-        if generation_id_from_subject(&current.generation) != current_generation {
-            return Err(St3Error::new(
-                "stale-run-generation",
-                format!("step run `{subject}` belongs to a superseded generation"),
-            ));
-        }
-        if is_terminal_run_state(&run_status)
-            || run_phase == "terminal"
-            || is_terminal_generation_state(&generation_status)
-            || is_terminal_run_state(&root_status)
-            || root_phase == "terminal"
-        {
-            return Err(St3Error::new(
-                "terminal-work-owner",
-                format!("the owner of step run `{subject}` is terminal"),
-            ));
-        }
-        if action == "claim" && run_phase == "revision-draining" {
-            return Err(St3Error::new(
-                "run-generation-draining",
-                "the current generation is draining for a revision cutover",
-            ));
-        }
-        if action == "claim"
-            && current.blocked_reason.is_some()
-            && !active_step_blockers_tx(&transaction, &subject, now)
-                .map_err(internal)?
-                .is_empty()
-        {
-            return Err(St3Error::new(
-                "work-not-ready",
-                format!("step run `{subject}` has an unresolved external blocker"),
-            ));
-        }
-        let eligible = current.assigned_to.as_deref() == Some(actor.as_str())
-            || current
-                .available_to
-                .iter()
-                .any(|candidate| candidate == &actor);
-        if current.agentless || !eligible {
-            return Err(St3Error::new(
-                "work-not-available",
-                format!("`{subject}` is not available to `{actor}`"),
-            ));
-        }
-        if action == "claim" {
-            let mut statement = transaction
-                .prepare(
-                    "SELECT subject, generation_id, step_path FROM step_runs
-                     WHERE lease_owner=?1
-                       AND subject<>?2
-                       AND status IN ('claimed','working','verifying','blocked')
-                       AND lease_expires_at_unix_ms IS NOT NULL
-                       AND CAST(lease_expires_at_unix_ms AS INTEGER)>?3
-                     ORDER BY subject",
-                )
-                .map_err(internal)?;
-            let active = statement
-                .query_map(params![actor, subject, now.to_string()], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })
-                .map_err(internal)?
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .map_err(internal)?;
-            drop(statement);
-            let current_generation = generation_id_from_subject(&current.generation);
-            if let Some((active_subject, _, _)) =
-                active.into_iter().find(|(_, generation, step)| {
-                    generation != current_generation
-                        || !(current.step.starts_with(&format!("{step}/"))
-                            || step.starts_with(&format!("{}/", current.step)))
-                })
-            {
-                return Err(St3Error::new(
-                    "agent-capacity",
-                    format!(
-                        "`{actor}` already owns independent work `{active_subject}`; finish or release it before claiming `{subject}`"
-                    ),
-                ));
-            }
-        }
-        if matches!(
-            current.status.as_str(),
-            "completed" | "failed" | "cancelled"
-        ) {
-            return Err(St3Error::new(
-                "terminal-step-run",
-                format!("step run `{subject}` is already {}", current.status),
-            ));
-        }
-        if action == "claim"
-            && current.status == "ready"
-            && let Some(next) =
-                seat_order_conflict_tx(&transaction, &actor, &subject).map_err(internal)?
-        {
-            return Err(St3Error::new(
-                "seat-queue-order",
-                format!(
-                    "`{subject}` is not the next work for `{actor}`; claim `{next}` first. A person, or an agent with queue authority for this seat, can reorder it with `st agents queue move`"
-                ),
-            )
-            .with_detail("next_work_id", next));
-        }
-        if action == "claim" && current.status == "ready" {
-            let mut step = current.clone();
-            enrich_step_definition(&transaction, &mut step).map_err(internal)?;
-            if !fresh_context_ready_tx(&transaction, &step, &actor, requested_incarnation)
-                .map_err(internal)?
-            {
-                return Err(St3Error::new(
-                    "fresh-context-pending",
-                    format!(
-                        "`{actor}` must start a fresh harness session before claiming `{subject}`"
-                    ),
-                ));
-            }
-        }
-        let lease_valid = current
-            .claim_expires_at_unix_ms
-            .is_some_and(|expiry| expiry > now);
-        if lease_valid && current.claimant.as_deref() != Some(actor.as_str()) {
-            return Err(St3Error::new(
-                "work-already-claimed",
-                format!("step run `{subject}` has an active lease"),
-            ));
-        }
-        if action != "claim"
-            && (!lease_valid || current.claimant.as_deref() != Some(actor.as_str()))
-        {
-            return Err(St3Error::new(
-                "work-not-claimed",
-                format!("`{actor}` does not hold an active lease for `{subject}`"),
-            ));
-        }
-        if lease_valid
-            && current.claimant.as_deref() == Some(actor.as_str())
-            && current.claim_incarnation.as_deref() != Some(requested_incarnation)
-        {
-            return Err(St3Error::new(
-                "wrong-work-incarnation",
-                format!("another `{actor}` incarnation holds `{subject}`"),
-            ));
-        }
-        let effective_incarnation = current
-            .claim_incarnation
-            .clone()
-            .or_else(|| Some(requested_incarnation.to_owned()));
-        let actor_incarnation = effective_incarnation.clone();
-        let (status, worker_reported, claimant, claim_incarnation, claim_expiry) = match action {
-            "claim" => {
-                if current.status != "ready" && current.status != "claimed" {
+        // One work action in a savepoint of the writer's next batch, answered once that batch commits.
+        self.connection
+            .batched(|transaction| -> Result<StepRunView, St3Error> {
+                if let Some(response) = transaction
+                    .query_row(
+                        "SELECT response FROM idempotency WHERE operation_id=?1",
+                        [opaque_cache_key(&request.idempotency_key)],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(internal)?
+                {
+                    return serde_json::from_str(&response).map_err(internal);
+                }
+                let current = transaction
+                    .query_row(
+                        "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                                lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+                         FROM step_runs WHERE subject=?1",
+                        [&subject],
+                        step_run_from_row,
+                    )
+                    .optional()
+                    .map_err(internal)?
+                    .ok_or_else(|| St3Error::new("missing-step-run", format!("step run `{subject}` does not exist")))?;
+                // A revision carries a claim into the successor generation. Its worker may still name the
+                // step by the predecessor subject.
+                let (subject, current) = match (action != "claim")
+                    .then(|| carried_claim_successor_tx(transaction, &current, &actor))
+                    .transpose()
+                    .map_err(internal)?
+                    .flatten()
+                {
+                    Some(successor) => (successor.subject.clone(), successor),
+                    None => (subject, current),
+                };
+                let (run_status, run_phase, current_generation, generation_status, root_status, root_phase): (
+                    String,
+                    String,
+                    String,
+                    String,
+                    String,
+                    String,
+                ) = transaction
+                    .query_row(
+                        "SELECT mission_runs.status, mission_runs.phase,
+                                mission_runs.current_generation_id, run_generations.status,
+                                root_runs.status, root_runs.phase
+                         FROM mission_runs JOIN run_generations
+                           ON run_generations.id=?2
+                         JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
+                         WHERE mission_runs.id=?1",
+                        params![
+                            current
+                                .run
+                                .strip_prefix("mission-run/")
+                                .unwrap_or(&current.run),
+                            generation_id_from_subject(&current.generation),
+                        ],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                            ))
+                        },
+                    )
+                    .map_err(internal)?;
+                if generation_id_from_subject(&current.generation) != current_generation {
                     return Err(St3Error::new(
-                        "work-not-ready",
-                        format!("step run `{subject}` is {}", current.status),
+                        "stale-run-generation",
+                        format!("step run `{subject}` belongs to a superseded generation"),
                     ));
                 }
-                (
-                    "claimed",
-                    current.worker_reported,
-                    Some(actor.clone()),
-                    effective_incarnation.clone(),
-                    Some(now + 600_000),
-                )
-            }
-            "renew" => (
-                current.status.as_str(),
-                current.worker_reported,
-                Some(actor.clone()),
-                effective_incarnation.clone(),
-                Some(now + 600_000),
-            ),
-            "progress" => (
-                "working",
-                current.worker_reported,
-                Some(actor.clone()),
-                effective_incarnation,
-                Some(now + 600_000),
-            ),
-            "complete" => ("verifying", true, None, None, None),
-            "fail" => ("failed", current.worker_reported, None, None, None),
-            "release" => ("ready", current.worker_reported, None, None, None),
-            _ => {
-                return Err(St3Error::new(
-                    "invalid-work-action",
-                    format!("work action `{action}` is not registered"),
-                ));
-            }
-        };
-        let readiness_epoch = current
-            .readiness_epoch
-            .saturating_add(u32::from(status == "ready" && current.status != "ready"));
-        transaction
-            .execute(
-                "UPDATE step_runs SET status=?2, worker_reported=?3, lease_owner=?4, lease_incarnation=?5,
-                        lease_expires_at_unix_ms=?6, blocked_reason=?7, readiness_epoch=?8,
-                        updated_at_unix_ms=?9 WHERE subject=?1",
-                params![subject, status, worker_reported, claimant, claim_incarnation, claim_expiry.map(|value| value.to_string()), request.reason, readiness_epoch, now.to_string()],
-            )
-            .map_err(internal)?;
-        renew_nested_ancestor_leases_tx(
-            &transaction,
-            &current.generation,
-            &current.step,
-            &actor,
-            actor_incarnation.as_deref(),
-            now,
-        )?;
-        let body = json!({"fields": {
-            "attempt": current.attempt,
-            "status": status,
-            "summary": request.summary,
-            "reason": request.reason,
-            "worker_reported": worker_reported,
-            "claimant": claimant,
-            "claim_incarnation": claim_incarnation,
-            "claim_expires_at_unix_ms": claim_expiry,
-            "readiness_epoch": readiness_epoch
-        }, "evidence": request.evidence});
-        let claim_kind = match action {
-            "claim" => "work.claimed",
-            "renew" => "work.renewed",
-            "progress" => "work.progress",
-            "complete" => "work.submitted",
-            "fail" => "work.failed",
-            "release" => "work.released",
-            _ => unreachable!("the work action was validated above"),
-        };
-        // Most renewals only extend the local operational lease. Publish an
-        // anchor before the last replicated expiry is within five minutes, so
-        // another replica never sees a normally renewed lease as expired.
-        let quiet_renewal = action == "renew"
-            && request.summary.is_none()
-            && request.reason.is_none()
-            && request.evidence.is_empty();
-        let last_replicated_expiry = if quiet_renewal {
-            transaction
-                .query_row(
-                    "SELECT json_extract(body, '$.fields.claim_expires_at_unix_ms')
-                     FROM claims WHERE subject=?1
-                       AND kind IN ('work.claimed','work.renewed','work.progress')
-                     ORDER BY store_index DESC LIMIT 1",
-                    [&subject],
-                    |row| row.get::<_, Option<u64>>(0),
-                )
-                .optional()
-                .map_err(internal)?
-                .flatten()
-                .map(u128::from)
-        } else {
-            None
-        };
-        let publish = !quiet_renewal
-            || last_replicated_expiry.is_none_or(|expiry| expiry <= now.saturating_add(300_000));
-        if publish {
-            append_claim_tx(
-                &transaction,
-                &self.origin,
-                &subject,
-                claim_kind,
-                Some(&actor),
-                &body,
-                &request.evidence,
-                None,
-            )
-            .map_err(claim_append_error)?;
-            transaction
-                .execute(
-                    "DELETE FROM local_work_lease_renewals WHERE subject=?1",
-                    [&subject],
-                )
-                .map_err(internal)?;
-        } else {
-            transaction
-                .execute(
-                    "INSERT INTO local_work_lease_renewals
-                     (subject, attempt, lease_owner, lease_incarnation, lease_expires_at_unix_ms, updated_at_unix_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                     ON CONFLICT(subject) DO UPDATE SET attempt=excluded.attempt,
-                       lease_owner=excluded.lease_owner, lease_incarnation=excluded.lease_incarnation,
-                       lease_expires_at_unix_ms=excluded.lease_expires_at_unix_ms,
-                       updated_at_unix_ms=excluded.updated_at_unix_ms",
-                    params![subject, current.attempt, actor, requested_incarnation,
-                            claim_expiry.expect("a renewal has a lease expiry").to_string(), now.to_string()],
-                )
-                .map_err(internal)?;
-        }
-        let mut view = transaction.query_row(
-            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
-                    lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
-             FROM step_runs WHERE subject=?1", [&subject], step_run_from_row).map_err(internal)?;
-        enrich_step_queue(&transaction, &mut view).map_err(internal)?;
-        transaction
-            .execute(
-                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
-                params![
-                    opaque_cache_key(&request.idempotency_key),
-                    serde_json::to_string(&view).map_err(internal)?
-                ],
-            )
-            .map_err(internal)?;
-        transaction.commit().map_err(internal)?;
-        Ok(view)
+                if is_terminal_run_state(&run_status)
+                    || run_phase == "terminal"
+                    || is_terminal_generation_state(&generation_status)
+                    || is_terminal_run_state(&root_status)
+                    || root_phase == "terminal"
+                {
+                    return Err(St3Error::new(
+                        "terminal-work-owner",
+                        format!("the owner of step run `{subject}` is terminal"),
+                    ));
+                }
+                if action == "claim" && run_phase == "revision-draining" {
+                    return Err(St3Error::new(
+                        "run-generation-draining",
+                        "the current generation is draining for a revision cutover",
+                    ));
+                }
+                if action == "claim"
+                    && current.blocked_reason.is_some()
+                    && !active_step_blockers_tx(transaction, &subject, now)
+                        .map_err(internal)?
+                        .is_empty()
+                {
+                    return Err(St3Error::new(
+                        "work-not-ready",
+                        format!("step run `{subject}` has an unresolved external blocker"),
+                    ));
+                }
+                let eligible = current.assigned_to.as_deref() == Some(actor.as_str())
+                    || current
+                        .available_to
+                        .iter()
+                        .any(|candidate| candidate == &actor);
+                if current.agentless || !eligible {
+                    return Err(St3Error::new(
+                        "work-not-available",
+                        format!("`{subject}` is not available to `{actor}`"),
+                    ));
+                }
+                if action == "claim" {
+                    let mut statement = transaction
+                        .prepare(
+                            "SELECT subject, generation_id, step_path FROM step_runs
+                             WHERE lease_owner=?1
+                               AND subject<>?2
+                               AND status IN ('claimed','working','verifying','blocked')
+                               AND lease_expires_at_unix_ms IS NOT NULL
+                               AND CAST(lease_expires_at_unix_ms AS INTEGER)>?3
+                             ORDER BY subject",
+                        )
+                        .map_err(internal)?;
+                    let active = statement
+                        .query_map(params![actor, subject, now.to_string()], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                            ))
+                        })
+                        .map_err(internal)?
+                        .collect::<rusqlite::Result<Vec<_>>>()
+                        .map_err(internal)?;
+                    drop(statement);
+                    let current_generation = generation_id_from_subject(&current.generation);
+                    if let Some((active_subject, _, _)) =
+                        active.into_iter().find(|(_, generation, step)| {
+                            generation != current_generation
+                                || !(current.step.starts_with(&format!("{step}/"))
+                                    || step.starts_with(&format!("{}/", current.step)))
+                        })
+                    {
+                        return Err(St3Error::new(
+                            "agent-capacity",
+                            format!(
+                                "`{actor}` already owns independent work `{active_subject}`; finish or release it before claiming `{subject}`"
+                            ),
+                        ));
+                    }
+                }
+                if matches!(
+                    current.status.as_str(),
+                    "completed" | "failed" | "cancelled"
+                ) {
+                    return Err(St3Error::new(
+                        "terminal-step-run",
+                        format!("step run `{subject}` is already {}", current.status),
+                    ));
+                }
+                if action == "claim"
+                    && current.status == "ready"
+                    && let Some(next) =
+                        seat_order_conflict_tx(transaction, &actor, &subject).map_err(internal)?
+                {
+                    return Err(St3Error::new(
+                        "seat-queue-order",
+                        format!(
+                            "`{subject}` is not the next work for `{actor}`; claim `{next}` first. A person, or an agent with queue authority for this seat, can reorder it with `st agents queue move`"
+                        ),
+                    )
+                    .with_detail("next_work_id", next));
+                }
+                if action == "claim" && current.status == "ready" {
+                    let mut step = current.clone();
+                    enrich_step_definition(transaction, &mut step).map_err(internal)?;
+                    if !fresh_context_ready_tx(transaction, &step, &actor, requested_incarnation)
+                        .map_err(internal)?
+                    {
+                        return Err(St3Error::new(
+                            "fresh-context-pending",
+                            format!(
+                                "`{actor}` must start a fresh harness session before claiming `{subject}`"
+                            ),
+                        ));
+                    }
+                }
+                let lease_valid = current
+                    .claim_expires_at_unix_ms
+                    .is_some_and(|expiry| expiry > now);
+                if lease_valid && current.claimant.as_deref() != Some(actor.as_str()) {
+                    return Err(St3Error::new(
+                        "work-already-claimed",
+                        format!("step run `{subject}` has an active lease"),
+                    ));
+                }
+                if action != "claim"
+                    && (!lease_valid || current.claimant.as_deref() != Some(actor.as_str()))
+                {
+                    return Err(St3Error::new(
+                        "work-not-claimed",
+                        format!("`{actor}` does not hold an active lease for `{subject}`"),
+                    ));
+                }
+                if lease_valid
+                    && current.claimant.as_deref() == Some(actor.as_str())
+                    && current.claim_incarnation.as_deref() != Some(requested_incarnation)
+                {
+                    return Err(St3Error::new(
+                        "wrong-work-incarnation",
+                        format!("another `{actor}` incarnation holds `{subject}`"),
+                    ));
+                }
+                let effective_incarnation = current
+                    .claim_incarnation
+                    .clone()
+                    .or_else(|| Some(requested_incarnation.to_owned()));
+                let actor_incarnation = effective_incarnation.clone();
+                let (status, worker_reported, claimant, claim_incarnation, claim_expiry) = match action {
+                    "claim" => {
+                        if current.status != "ready" && current.status != "claimed" {
+                            return Err(St3Error::new(
+                                "work-not-ready",
+                                format!("step run `{subject}` is {}", current.status),
+                            ));
+                        }
+                        (
+                            "claimed",
+                            current.worker_reported,
+                            Some(actor.clone()),
+                            effective_incarnation.clone(),
+                            Some(now + 600_000),
+                        )
+                    }
+                    "renew" => (
+                        current.status.as_str(),
+                        current.worker_reported,
+                        Some(actor.clone()),
+                        effective_incarnation.clone(),
+                        Some(now + 600_000),
+                    ),
+                    "progress" => (
+                        "working",
+                        current.worker_reported,
+                        Some(actor.clone()),
+                        effective_incarnation,
+                        Some(now + 600_000),
+                    ),
+                    "complete" => ("verifying", true, None, None, None),
+                    "fail" => ("failed", current.worker_reported, None, None, None),
+                    "release" => ("ready", current.worker_reported, None, None, None),
+                    _ => {
+                        return Err(St3Error::new(
+                            "invalid-work-action",
+                            format!("work action `{action}` is not registered"),
+                        ));
+                    }
+                };
+                let readiness_epoch = current
+                    .readiness_epoch
+                    .saturating_add(u32::from(status == "ready" && current.status != "ready"));
+                transaction
+                    .execute(
+                        "UPDATE step_runs SET status=?2, worker_reported=?3, lease_owner=?4, lease_incarnation=?5,
+                                lease_expires_at_unix_ms=?6, blocked_reason=?7, readiness_epoch=?8,
+                                updated_at_unix_ms=?9 WHERE subject=?1",
+                        params![subject, status, worker_reported, claimant, claim_incarnation, claim_expiry.map(|value| value.to_string()), request.reason, readiness_epoch, now.to_string()],
+                    )
+                    .map_err(internal)?;
+                renew_nested_ancestor_leases_tx(
+                    transaction,
+                    &current.generation,
+                    &current.step,
+                    &actor,
+                    actor_incarnation.as_deref(),
+                    now,
+                )?;
+                let body = json!({"fields": {
+                    "attempt": current.attempt,
+                    "status": status,
+                    "summary": request.summary,
+                    "reason": request.reason,
+                    "worker_reported": worker_reported,
+                    "claimant": claimant,
+                    "claim_incarnation": claim_incarnation,
+                    "claim_expires_at_unix_ms": claim_expiry,
+                    "readiness_epoch": readiness_epoch
+                }, "evidence": request.evidence});
+                let claim_kind = match action {
+                    "claim" => "work.claimed",
+                    "renew" => "work.renewed",
+                    "progress" => "work.progress",
+                    "complete" => "work.submitted",
+                    "fail" => "work.failed",
+                    "release" => "work.released",
+                    _ => unreachable!("the work action was validated above"),
+                };
+                // Most renewals only extend the local operational lease. Publish an
+                // anchor before the last replicated expiry is within five minutes, so
+                // another replica never sees a normally renewed lease as expired.
+                let quiet_renewal = action == "renew"
+                    && request.summary.is_none()
+                    && request.reason.is_none()
+                    && request.evidence.is_empty();
+                let last_replicated_expiry = if quiet_renewal {
+                    transaction
+                        .query_row(
+                            "SELECT json_extract(body, '$.fields.claim_expires_at_unix_ms')
+                             FROM claims WHERE subject=?1
+                               AND kind IN ('work.claimed','work.renewed','work.progress')
+                             ORDER BY store_index DESC LIMIT 1",
+                            [&subject],
+                            |row| row.get::<_, Option<u64>>(0),
+                        )
+                        .optional()
+                        .map_err(internal)?
+                        .flatten()
+                        .map(u128::from)
+                } else {
+                    None
+                };
+                let publish = !quiet_renewal
+                    || last_replicated_expiry.is_none_or(|expiry| expiry <= now.saturating_add(300_000));
+                if publish {
+                    append_claim_tx(
+                        transaction,
+                        &self.origin,
+                        &subject,
+                        claim_kind,
+                        Some(&actor),
+                        &body,
+                        &request.evidence,
+                        None,
+                    )
+                    .map_err(claim_append_error)?;
+                    transaction
+                        .execute(
+                            "DELETE FROM local_work_lease_renewals WHERE subject=?1",
+                            [&subject],
+                        )
+                        .map_err(internal)?;
+                } else {
+                    transaction
+                        .execute(
+                            "INSERT INTO local_work_lease_renewals
+                             (subject, attempt, lease_owner, lease_incarnation, lease_expires_at_unix_ms, updated_at_unix_ms)
+                             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                             ON CONFLICT(subject) DO UPDATE SET attempt=excluded.attempt,
+                               lease_owner=excluded.lease_owner, lease_incarnation=excluded.lease_incarnation,
+                               lease_expires_at_unix_ms=excluded.lease_expires_at_unix_ms,
+                               updated_at_unix_ms=excluded.updated_at_unix_ms",
+                            params![subject, current.attempt, actor, requested_incarnation,
+                                    claim_expiry.expect("a renewal has a lease expiry").to_string(), now.to_string()],
+                        )
+                        .map_err(internal)?;
+                }
+                let mut view = transaction.query_row(
+                    "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                            lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+                     FROM step_runs WHERE subject=?1", [&subject], step_run_from_row).map_err(internal)?;
+                enrich_step_queue(transaction, &mut view).map_err(internal)?;
+                transaction
+                    .execute(
+                        "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
+                        params![
+                            opaque_cache_key(&request.idempotency_key),
+                            serde_json::to_string(&view).map_err(internal)?
+                        ],
+                    )
+                    .map_err(internal)?;
+                Ok(view)
+            })
+            .map_err(|error| St3Error::new("internal", error))?
     }
 
     pub fn set_step_state(
@@ -6713,81 +6961,82 @@ impl Store {
         reason: Option<&str>,
     ) -> Result<bool> {
         let subject = normalize_step_run(subject);
-        let mut connection = self.connection.write();
-        let transaction = connection.transaction()?;
-        let current: Option<StepStateRow> = transaction
-            .query_row(
-                "SELECT step_runs.status,
-                        step_runs.generation_id=mission_runs.current_generation_id,
-                        step_runs.readiness_epoch, mission_runs.status, mission_runs.phase,
-                        run_generations.status, root_runs.status, root_runs.phase
-                 FROM step_runs JOIN mission_runs ON mission_runs.id=step_runs.run_id
-                 JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
-                 JOIN run_generations ON run_generations.id=step_runs.generation_id
-                 WHERE step_runs.subject=?1",
-                [&subject],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((
-            current,
-            is_current,
-            current_epoch,
-            run_status,
-            run_phase,
-            generation_status,
-            root_status,
-            root_phase,
-        )) = current
-        else {
-            return Ok(false);
-        };
-        if !is_current
-            || current == status
-            || ((is_terminal_run_state(&run_status)
-                || run_phase == "terminal"
-                || is_terminal_generation_state(&generation_status)
-                || is_terminal_run_state(&root_status)
-                || root_phase == "terminal")
-                && !matches!(status, "completed" | "failed" | "cancelled"))
-        {
-            return Ok(false);
-        }
-        let now = now_ms();
-        let readiness_epoch = current_epoch.saturating_add(u32::from(status == "ready"));
-        transaction.execute(
-            "UPDATE step_runs SET status=?2, blocked_reason=?3,
-                    lease_owner=CASE WHEN ?2 IN ('ready','completed','failed','cancelled') THEN NULL ELSE lease_owner END,
-                    lease_incarnation=CASE WHEN ?2 IN ('ready','completed','failed','cancelled') THEN NULL ELSE lease_incarnation END,
-                    lease_expires_at_unix_ms=CASE WHEN ?2 IN ('ready','completed','failed','cancelled') THEN NULL ELSE lease_expires_at_unix_ms END,
-                    not_before_unix_ms=CASE WHEN ?2='ready' THEN NULL ELSE not_before_unix_ms END,
-                    activated_at_unix_ms=CASE WHEN ?2='ready' THEN ?4 ELSE activated_at_unix_ms END,
-                    readiness_epoch=?5, updated_at_unix_ms=?4 WHERE subject=?1",
-            params![subject, status, reason, now.to_string(), readiness_epoch])?;
-        let body = json!({"fields": {"status": status, "reason": reason, "readiness_epoch": readiness_epoch}});
-        append_claim_tx(
-            &transaction,
-            &self.origin,
-            &subject,
-            "step-run.state",
-            None,
-            &body,
-            &[],
-            None,
-        )?;
-        transaction.commit()?;
-        Ok(true)
+        self.connection
+            .batched(|transaction| -> Result<bool> {
+                let current: Option<StepStateRow> = transaction
+                    .query_row(
+                        "SELECT step_runs.status,
+                                step_runs.generation_id=mission_runs.current_generation_id,
+                                step_runs.readiness_epoch, mission_runs.status, mission_runs.phase,
+                                run_generations.status, root_runs.status, root_runs.phase
+                         FROM step_runs JOIN mission_runs ON mission_runs.id=step_runs.run_id
+                         JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
+                         JOIN run_generations ON run_generations.id=step_runs.generation_id
+                         WHERE step_runs.subject=?1",
+                        [&subject],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                                row.get(7)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((
+                    current,
+                    is_current,
+                    current_epoch,
+                    run_status,
+                    run_phase,
+                    generation_status,
+                    root_status,
+                    root_phase,
+                )) = current
+                else {
+                    return Ok(false);
+                };
+                if !is_current
+                    || current == status
+                    || ((is_terminal_run_state(&run_status)
+                        || run_phase == "terminal"
+                        || is_terminal_generation_state(&generation_status)
+                        || is_terminal_run_state(&root_status)
+                        || root_phase == "terminal")
+                        && !matches!(status, "completed" | "failed" | "cancelled"))
+                {
+                    return Ok(false);
+                }
+                let now = now_ms();
+                let readiness_epoch = current_epoch.saturating_add(u32::from(status == "ready"));
+                transaction.execute(
+                    "UPDATE step_runs SET status=?2, blocked_reason=?3,
+                            lease_owner=CASE WHEN ?2 IN ('ready','completed','failed','cancelled') THEN NULL ELSE lease_owner END,
+                            lease_incarnation=CASE WHEN ?2 IN ('ready','completed','failed','cancelled') THEN NULL ELSE lease_incarnation END,
+                            lease_expires_at_unix_ms=CASE WHEN ?2 IN ('ready','completed','failed','cancelled') THEN NULL ELSE lease_expires_at_unix_ms END,
+                            not_before_unix_ms=CASE WHEN ?2='ready' THEN NULL ELSE not_before_unix_ms END,
+                            activated_at_unix_ms=CASE WHEN ?2='ready' THEN ?4 ELSE activated_at_unix_ms END,
+                            readiness_epoch=?5, updated_at_unix_ms=?4 WHERE subject=?1",
+                    params![subject, status, reason, now.to_string(), readiness_epoch])?;
+                let body = json!({"fields": {"status": status, "reason": reason, "readiness_epoch": readiness_epoch}});
+                append_claim_tx(
+                    transaction,
+                    &self.origin,
+                    &subject,
+                    "step-run.state",
+                    None,
+                    &body,
+                    &[],
+                    None,
+                )?;
+                Ok(true)
+            })
+            .map_err(anyhow::Error::msg)?
     }
 
     pub fn retry_step(&self, subject: &str, reason: &str, backoff_ms: u64) -> Result<bool> {
@@ -6802,76 +7051,77 @@ impl Store {
         backoff_ms: u64,
     ) -> Result<bool> {
         let subject = normalize_step_run(subject);
-        let mut connection = self.connection.write();
-        let transaction = connection.transaction()?;
-        let current: Option<StepRetryRow> = transaction
-            .query_row(
-                "SELECT step_runs.status, step_runs.attempt,
-                        step_runs.generation_id=mission_runs.current_generation_id,
-                        mission_runs.status, mission_runs.phase, run_generations.status,
-                        root_runs.status, root_runs.phase
-                 FROM step_runs JOIN mission_runs ON mission_runs.id=step_runs.run_id
-                 JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
-                 JOIN run_generations ON run_generations.id=step_runs.generation_id
-                 WHERE step_runs.subject=?1",
-                [&subject],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                    ))
-                },
-            )
-            .optional()?;
-        let Some((
-            status,
-            attempt,
-            is_current,
-            run_status,
-            run_phase,
-            generation_status,
-            root_status,
-            root_phase,
-        )) = current
-        else {
-            return Ok(false);
-        };
-        if !is_current
-            || status != "failed"
-            || is_terminal_run_state(&run_status)
-            || run_phase == "terminal"
-            || is_terminal_generation_state(&generation_status)
-            || is_terminal_run_state(&root_status)
-            || root_phase == "terminal"
-        {
-            return Ok(false);
-        }
-        let now = now_ms();
-        let not_before = now.saturating_add(backoff_ms as u128);
-        transaction.execute(
-            "UPDATE step_runs SET status='pending', attempt=?2, worker_reported=0, lease_owner=NULL,
-                    lease_incarnation=NULL, lease_expires_at_unix_ms=NULL, blocked_reason=?3,
-                    not_before_unix_ms=?4, activated_at_unix_ms=NULL, updated_at_unix_ms=?5 WHERE subject=?1",
-            params![subject, attempt.saturating_add(1), reason, not_before.to_string(), now.to_string()])?;
-        let body = json!({"fields": {"status": "pending", "attempt": attempt.saturating_add(1), "reason": reason, "not_before_unix_ms": not_before}});
-        append_claim_tx(
-            &transaction,
-            &self.origin,
-            &subject,
-            "step-run.retried",
-            actor,
-            &body,
-            &[],
-            None,
-        )?;
-        transaction.commit()?;
-        Ok(true)
+        self.connection
+            .batched(|transaction| -> Result<bool> {
+                let current: Option<StepRetryRow> = transaction
+                    .query_row(
+                        "SELECT step_runs.status, step_runs.attempt,
+                                step_runs.generation_id=mission_runs.current_generation_id,
+                                mission_runs.status, mission_runs.phase, run_generations.status,
+                                root_runs.status, root_runs.phase
+                         FROM step_runs JOIN mission_runs ON mission_runs.id=step_runs.run_id
+                         JOIN mission_runs root_runs ON root_runs.id=mission_runs.root_run_id
+                         JOIN run_generations ON run_generations.id=step_runs.generation_id
+                         WHERE step_runs.subject=?1",
+                        [&subject],
+                        |row| {
+                            Ok((
+                                row.get(0)?,
+                                row.get(1)?,
+                                row.get(2)?,
+                                row.get(3)?,
+                                row.get(4)?,
+                                row.get(5)?,
+                                row.get(6)?,
+                                row.get(7)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                let Some((
+                    status,
+                    attempt,
+                    is_current,
+                    run_status,
+                    run_phase,
+                    generation_status,
+                    root_status,
+                    root_phase,
+                )) = current
+                else {
+                    return Ok(false);
+                };
+                if !is_current
+                    || status != "failed"
+                    || is_terminal_run_state(&run_status)
+                    || run_phase == "terminal"
+                    || is_terminal_generation_state(&generation_status)
+                    || is_terminal_run_state(&root_status)
+                    || root_phase == "terminal"
+                {
+                    return Ok(false);
+                }
+                let now = now_ms();
+                let not_before = now.saturating_add(backoff_ms as u128);
+                transaction.execute(
+                    "UPDATE step_runs SET status='pending', attempt=?2, worker_reported=0, lease_owner=NULL,
+                            lease_incarnation=NULL, lease_expires_at_unix_ms=NULL, blocked_reason=?3,
+                            not_before_unix_ms=?4, activated_at_unix_ms=NULL, updated_at_unix_ms=?5 WHERE subject=?1",
+                    params![subject, attempt.saturating_add(1), reason, not_before.to_string(), now.to_string()])?;
+                let body = json!({"fields": {"status": "pending", "attempt": attempt.saturating_add(1), "reason": reason, "not_before_unix_ms": not_before}});
+                append_claim_tx(
+                    transaction,
+                    &self.origin,
+                    &subject,
+                    "step-run.retried",
+                    actor,
+                    &body,
+                    &[],
+                    None,
+                )?;
+                Ok(true)
+            })
+            .map_err(anyhow::Error::msg)?
     }
 
     /// A reviewer's request for changes starts a fresh attempt without a failed-step interval.
@@ -6883,57 +7133,58 @@ impl Store {
         reviewer: &str,
     ) -> Result<bool> {
         let subject = normalize_step_run(subject);
-        let mut connection = self.connection.write();
-        let transaction = connection.transaction()?;
-        let current: Option<(String, u32, String)> = transaction
-            .query_row(
-                "SELECT status, attempt, goals FROM step_runs WHERE subject=?1",
-                [&subject],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-            )
-            .optional()?;
-        let Some((status, attempt, goals_json)) = current else {
-            return Ok(false);
-        };
-        if attempt != reviewed_attempt
-            || !matches!(status.as_str(), "verifying" | "working" | "blocked")
-            || step_owner_is_terminal_tx(&transaction, &subject)?
-        {
-            return Ok(false);
-        }
-        let mut goals: Vec<String> = serde_json::from_str(&goals_json)?;
-        goals.push(format!("Reviewer feedback: {reason}"));
-        let next_attempt = attempt.saturating_add(1);
-        let now = now_ms();
-        transaction.execute(
-            "UPDATE step_runs SET status='pending', attempt=?2, goals=?3, worker_reported=0,
-                    lease_owner=NULL, lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
-                    blocked_reason=?4, not_before_unix_ms=NULL, activated_at_unix_ms=NULL,
-                    updated_at_unix_ms=?5 WHERE subject=?1",
-            params![
-                subject,
-                next_attempt,
-                serde_json::to_string(&goals)?,
-                reason,
-                now.to_string()
-            ],
-        )?;
-        let body = json!({"fields": {
-            "status": "pending", "attempt": next_attempt, "reason": reason,
-            "goals": goals, "not_before_unix_ms": null
-        }});
-        append_claim_tx(
-            &transaction,
-            &self.origin,
-            &subject,
-            "step-run.retried",
-            Some(reviewer),
-            &body,
-            &[],
-            None,
-        )?;
-        transaction.commit()?;
-        Ok(true)
+        self.connection
+            .batched(|transaction| -> Result<bool> {
+                let current: Option<(String, u32, String)> = transaction
+                    .query_row(
+                        "SELECT status, attempt, goals FROM step_runs WHERE subject=?1",
+                        [&subject],
+                        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                    )
+                    .optional()?;
+                let Some((status, attempt, goals_json)) = current else {
+                    return Ok(false);
+                };
+                if attempt != reviewed_attempt
+                    || !matches!(status.as_str(), "verifying" | "working" | "blocked")
+                    || step_owner_is_terminal_tx(transaction, &subject)?
+                {
+                    return Ok(false);
+                }
+                let mut goals: Vec<String> = serde_json::from_str(&goals_json)?;
+                goals.push(format!("Reviewer feedback: {reason}"));
+                let next_attempt = attempt.saturating_add(1);
+                let now = now_ms();
+                transaction.execute(
+                    "UPDATE step_runs SET status='pending', attempt=?2, goals=?3, worker_reported=0,
+                            lease_owner=NULL, lease_incarnation=NULL, lease_expires_at_unix_ms=NULL,
+                            blocked_reason=?4, not_before_unix_ms=NULL, activated_at_unix_ms=NULL,
+                            updated_at_unix_ms=?5 WHERE subject=?1",
+                    params![
+                        subject,
+                        next_attempt,
+                        serde_json::to_string(&goals)?,
+                        reason,
+                        now.to_string()
+                    ],
+                )?;
+                let body = json!({"fields": {
+                    "status": "pending", "attempt": next_attempt, "reason": reason,
+                    "goals": goals, "not_before_unix_ms": null
+                }});
+                append_claim_tx(
+                    transaction,
+                    &self.origin,
+                    &subject,
+                    "step-run.retried",
+                    Some(reviewer),
+                    &body,
+                    &[],
+                    None,
+                )?;
+                Ok(true)
+            })
+            .map_err(anyhow::Error::msg)?
     }
 
     pub fn set_mission_run_state(
@@ -6943,12 +7194,19 @@ impl Store {
         phase: &str,
         reason: Option<&str>,
     ) -> Result<bool> {
-        let mut connection = self.connection.write();
-        let transaction = connection.transaction()?;
-        let changed =
-            set_mission_run_state_tx(&transaction, &self.origin, run, status, phase, reason)?;
-        transaction.commit()?;
-        Ok(changed)
+        self.connection
+            .batched(|transaction| -> Result<bool> {
+                let changed = set_mission_run_state_tx(
+                    transaction,
+                    &self.origin,
+                    run,
+                    status,
+                    phase,
+                    reason,
+                )?;
+                Ok(changed)
+            })
+            .map_err(anyhow::Error::msg)?
     }
 
     pub fn apply_internal(
@@ -7468,803 +7726,803 @@ impl Store {
         idempotency_key: &str,
         actor: Option<&str>,
     ) -> Result<ApplyResponse, St3Error> {
-        let mut connection = self.connection.write();
-        if let Some(response) = connection
-            .query_row(
-                "SELECT response FROM idempotency WHERE operation_id = ?1",
-                [opaque_cache_key(idempotency_key)],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(internal)?
-        {
-            return serde_json::from_str(&response).map_err(internal);
-        }
-        let transaction = connection.transaction().map_err(internal)?;
-        validate_documents(&transaction, &intent.document_refs)?;
-        for desired in intent
-            .subjects
-            .values()
-            .filter(|subject| subject.kind == "subscription")
-        {
-            let Some(spec) = crate::graph::subscription_spec(&desired.desired) else {
-                continue;
-            };
-            if spec.stopped || spec.delivery != "mission" {
-                continue;
-            }
-            let (Some(mission_id), Some(revision), Some(input)) = (
-                spec.mission.as_deref(),
-                spec.revision.as_deref(),
-                spec.resource_input.as_deref(),
-            ) else {
-                continue;
-            };
-            let local = transaction
-                .query_row(
-                    "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
-                    params![mission_id, revision],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map_err(internal)?
-                .map(|body| serde_json::from_str::<MissionSpec>(&body).map_err(internal))
-                .transpose()?;
-            let published = intent
-                .missions
-                .get(mission_id)
-                .filter(|mission| mission.revision == revision)
-                .cloned()
-                .or(local);
-            let Some(mission) = published else {
-                return Err(St3Error::new(
-                    "missing-mission",
-                    format!(
-                        "subscription `{}` references unpublished mission/{}@{revision}",
-                        desired.subject, mission_id
-                    ),
-                ));
-            };
-            if mission
-                .inputs
-                .get(input)
-                .is_none_or(|declaration| declaration.kind != MissionInputKind::Resource)
-            {
-                return Err(St3Error::new(
-                    "invalid-subscription-resource-input",
-                    format!(
-                        "subscription `{}` uses undeclared resource input `{input}` in mission/{}@{revision}",
-                        desired.subject, mission_id
-                    ),
-                ));
-            }
-        }
-        for subject in intent.subjects.keys() {
-            let actual = intent_leaves_tx(&transaction, subject).map_err(internal)?;
-            let expected = expected.get(subject).ok_or_else(|| {
-                St3Error::new(
-                    "missing-subject-token",
-                    format!("apply omitted the subject token for `{subject}`"),
-                )
-                .with_detail("subject", subject.clone())
-                .with_detail("current_heads", json!(actual.clone()))
-            })?;
-            if actual != *expected {
-                return Err(St3Error::new(
-                    "stale-subject",
-                    format!("the desired state for `{subject}` changed after planning"),
-                )
-                .with_detail("subject", subject.clone())
-                .with_detail("expected_heads", json!(expected))
-                .with_detail("current_heads", json!(actual)));
-            }
-        }
-        for mission in intent.missions.values() {
-            let actual =
-                mission_definition_token_tx(&transaction, &mission.id).map_err(internal)?;
-            let expected = expected.get(&mission.subject).ok_or_else(|| {
-                St3Error::new(
-                    "missing-subject-token",
-                    format!("apply omitted the subject token for `{}`", mission.subject),
-                )
-                .with_detail("subject", mission.subject.clone())
-                .with_detail("current_heads", json!(actual.clone()))
-            })?;
-            if actual != *expected {
-                return Err(St3Error::new(
-                    "stale-subject",
-                    format!(
-                        "the published mission for `{}` changed after planning",
-                        mission.subject
-                    ),
-                )
-                .with_detail("subject", mission.subject.clone())
-                .with_detail("expected_heads", json!(expected))
-                .with_detail("current_heads", json!(actual)));
-            }
-        }
-        for declaration in intent.mission_runs.values() {
-            let actual = latest_claim_id_tx(&transaction, &declaration.subject)
-                .map_err(internal)?
-                .into_iter()
-                .collect::<Vec<_>>();
-            let expected = expected.get(&declaration.subject).ok_or_else(|| {
-                St3Error::new(
-                    "missing-subject-token",
-                    format!(
-                        "apply omitted the subject token for `{}`",
-                        declaration.subject
-                    ),
-                )
-            })?;
-            if actual != *expected {
-                return Err(St3Error::new(
-                    "stale-subject",
-                    format!(
-                        "mission run `{}` changed after planning",
-                        declaration.subject
-                    ),
-                ));
-            }
-        }
-        for declaration in intent.planning_sessions.values() {
-            let actual = latest_claim_id_tx(&transaction, &declaration.subject)
-                .map_err(internal)?
-                .into_iter()
-                .collect::<Vec<_>>();
-            let expected = expected.get(&declaration.subject).ok_or_else(|| {
-                St3Error::new(
-                    "missing-subject-token",
-                    format!(
-                        "apply omitted the subject token for `{}`",
-                        declaration.subject
-                    ),
-                )
-            })?;
-            if actual != *expected {
-                return Err(St3Error::new(
-                    "stale-subject",
-                    format!("launch `{}` changed after planning", declaration.subject),
-                ));
-            }
-        }
-        for repair in &intent.replica_repairs {
-            let subject = format!(
-                "repair/{}",
-                repair
-                    .record_ref
-                    .strip_prefix("record/")
-                    .unwrap_or(&repair.record_ref)
-            );
-            let actual = claim_ids_at(&transaction, &subject, None).map_err(internal)?;
-            let expected = expected.get(&subject).ok_or_else(|| {
-                St3Error::new(
-                    "missing-subject-token",
-                    format!("apply omitted the subject token for `{subject}`"),
-                )
-            })?;
-            if &actual != expected {
-                return Err(St3Error::new(
-                    "stale-subject",
-                    format!("repair `{subject}` changed after planning"),
-                ));
-            }
-        }
-        let desired_changed = intent.subjects.iter().any(|(subject, desired)| {
-            current_desired_row_tx(&transaction, subject)
-                .map(|current| {
-                    current
-                        .as_ref()
-                        .is_none_or(|row| row.revision != desired_revision(desired))
-                })
-                .unwrap_or(true)
-        });
-        let missions_changed = intent.missions.values().any(|mission| {
-            transaction
-                .query_row(
-                    "SELECT revision FROM mission_definitions WHERE mission_id=?1",
-                    [&mission.id],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()
-                .map(|current| current.as_deref() != Some(mission.revision.as_str()))
-                .unwrap_or(true)
-        });
-        let mut operations_changed = false;
-        for declaration in intent.mission_runs.values() {
-            let run_id = declaration
-                .subject
-                .strip_prefix("mission-run/")
-                .unwrap_or(&declaration.subject);
-            if declaration.creation.is_some()
-                && transaction
-                    .query_row("SELECT 1 FROM mission_runs WHERE id=?1", [run_id], |_| {
-                        Ok(())
-                    })
+        self.connection
+            .batched(|transaction| -> Result<ApplyResponse, St3Error> {
+                if let Some(response) = transaction
+                    .query_row(
+                        "SELECT response FROM idempotency WHERE operation_id = ?1",
+                        [opaque_cache_key(idempotency_key)],
+                        |row| row.get::<_, String>(0),
+                    )
                     .optional()
                     .map_err(internal)?
-                    .is_none()
-            {
-                operations_changed = true;
-            }
-            for revision in declaration.revisions.values() {
-                operations_changed |= publication_operation_is_new(
-                    &transaction,
-                    &declaration.subject,
-                    "revision",
-                    &revision.id,
-                    revision,
-                )?;
-            }
-            for reset in declaration.resets.values() {
-                operations_changed |= publication_operation_is_new(
-                    &transaction,
-                    &declaration.subject,
-                    "reset",
-                    &reset.id,
-                    reset,
-                )?;
-            }
-            for cancellation in declaration.cancellations.values() {
-                operations_changed |= publication_operation_is_new(
-                    &transaction,
-                    &declaration.subject,
-                    "cancellation",
-                    &cancellation.id,
-                    cancellation,
-                )?;
-            }
-        }
-        for declaration in intent.planning_sessions.values() {
-            let id = declaration
-                .subject
-                .strip_prefix("planning-session/")
-                .unwrap_or(&declaration.subject);
-            if declaration.creation.is_some()
-                && transaction
-                    .query_row("SELECT 1 FROM planning_sessions WHERE id=?1", [id], |_| {
-                        Ok(())
-                    })
-                    .optional()
-                    .map_err(internal)?
-                    .is_none()
-            {
-                operations_changed = true;
-            }
-            for feedback in declaration.feedback.values() {
-                operations_changed |= publication_operation_is_new(
-                    &transaction,
-                    &declaration.subject,
-                    "feedback",
-                    &feedback.id,
-                    feedback,
-                )?;
-            }
-            for cancellation in declaration.cancellations.values() {
-                operations_changed |= publication_operation_is_new(
-                    &transaction,
-                    &declaration.subject,
-                    "cancellation",
-                    &cancellation.id,
-                    cancellation,
-                )?;
-            }
-        }
-        for refresh in &intent.resource_refreshes {
-            operations_changed |= publication_operation_is_new(
-                &transaction,
-                &refresh.resource,
-                "refresh",
-                &refresh.id,
-                refresh,
-            )?;
-        }
-        for repair in &intent.replica_repairs {
-            operations_changed |= validate_replica_repair(&transaction, repair)?;
-        }
-        let changed = desired_changed || missions_changed || operations_changed;
-        if !changed {
-            let store_index = current_index_tx(&transaction).map_err(internal)?;
-            let mut subject_tokens = intent
-                .subjects
-                .keys()
-                .map(|subject| {
-                    intent_leaves_tx(&transaction, subject)
-                        .map(|heads| (subject.clone(), heads))
-                        .map_err(internal)
-                })
-                .collect::<Result<BTreeMap<_, _>, _>>()?;
-            for mission in intent.missions.values() {
-                subject_tokens.insert(
-                    mission.subject.clone(),
-                    mission_definition_token_tx(&transaction, &mission.id).map_err(internal)?,
-                );
-            }
-            for declaration in intent.mission_runs.values() {
-                subject_tokens.insert(
-                    declaration.subject.clone(),
-                    latest_claim_id_tx(&transaction, &declaration.subject)
-                        .map_err(internal)?
-                        .into_iter()
-                        .collect(),
-                );
-            }
-            for declaration in intent.planning_sessions.values() {
-                subject_tokens.insert(
-                    declaration.subject.clone(),
-                    latest_claim_id_tx(&transaction, &declaration.subject)
-                        .map_err(internal)?
-                        .into_iter()
-                        .collect(),
-                );
-            }
-            for repair in &intent.replica_repairs {
-                let subject = format!(
-                    "repair/{}",
-                    repair
-                        .record_ref
-                        .strip_prefix("record/")
-                        .unwrap_or(&repair.record_ref)
-                );
-                subject_tokens.insert(
-                    subject.clone(),
-                    claim_ids_at(&transaction, &subject, None).map_err(internal)?,
-                );
-            }
-            let response = ApplyResponse {
-                changed: false,
-                store_index,
-                batch_id: None,
-                claim_ids: Vec::new(),
-                subject_tokens,
-                reconcile_subjects: Vec::new(),
-                resolved_kdl: String::new(),
-                operations: Vec::new(),
-            };
-            transaction
-                .execute(
-                    "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
-                    params![
-                        opaque_cache_key(idempotency_key),
-                        serde_json::to_string(&response).map_err(internal)?
-                    ],
-                )
-                .map_err(internal)?;
-            transaction.commit().map_err(internal)?;
-            return Ok(response);
-        }
-        let now = write_time(&transaction, &self.origin).map_err(internal)?;
-        let sequence = next_replica_sequence(&transaction, &self.origin).map_err(internal)?;
-        let previous_hash = previous_batch_hash(&transaction, &self.origin).map_err(internal)?;
-        let batch_hash = batch_header_hash(&self.origin, sequence, previous_hash.as_deref(), now)
-            .map_err(internal)?;
-        let batch_id = format!("batch/{}/{sequence}/{batch_hash}", self.origin);
-        transaction
-            .execute(
-                "INSERT INTO batches(id, origin, replica_sequence, previous_hash, hash, accepted_at_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![batch_id, self.origin, sequence, previous_hash, batch_hash, now.to_string()],
-            )
-            .map_err(internal)?;
-
-        let mut claim_ids = Vec::new();
-        let mut tokens = BTreeMap::new();
-        let mut reconcile_subjects = Vec::new();
-        let mut operation_receipts = Vec::new();
-        for (subject, desired) in &intent.subjects {
-            let revision = desired_revision(desired);
-            let current = current_desired_row_tx(&transaction, subject).map_err(internal)?;
-            if current.as_ref().is_some_and(|row| row.revision == revision) {
-                tokens.insert(
-                    subject.clone(),
-                    intent_leaves_tx(&transaction, subject).map_err(internal)?,
-                );
-                continue;
-            }
-            let predecessors = intent_leaves_tx(&transaction, subject).map_err(internal)?;
-            let body = serde_json::to_value(desired).map_err(internal)?;
-            // The writer decides whether a top-level project seat holds default mission
-            // authority; see `graph::effective_agent_mission_authority`.
-            let claim_id = claim_hash(
-                &batch_id,
-                subject,
-                "intent.desired",
-                &self.origin,
-                actor,
-                &body,
-                &predecessors,
-            )
-            .map_err(internal)?;
-            let store_index = insert_claim(
-                &transaction,
-                &claim_id,
-                &batch_id,
-                subject,
-                "intent.desired",
-                &self.origin,
-                actor,
-                &body,
-                &predecessors,
-                now,
-            )
-            .map_err(internal)?;
-            transaction
-                .execute(
-                    "INSERT INTO desired(subject, kind, revision, claim_id, body, member, owner_run, owner_generation, owner_step) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-                     ON CONFLICT(subject) DO UPDATE SET kind=excluded.kind, revision=excluded.revision, claim_id=excluded.claim_id, body=excluded.body, member=excluded.member, owner_run=excluded.owner_run, owner_generation=excluded.owner_generation, owner_step=excluded.owner_step",
-                    params![
-                        subject,
-                        desired.kind,
-                        revision,
-                        claim_id,
-                        canonical_json_text(&desired.desired).map_err(internal)?,
-                        desired
-                            .member
-                            .as_ref()
-                            .map(canonical_serialized_json_text)
-                            .transpose()
-                            .map_err(internal)?,
-                        desired.owner_run,
-                        desired.owner_generation,
-                        desired.owner_step,
-                    ],
-                )
-                .map_err(internal)?;
-            insert_event(&transaction, store_index, "intent.desired", subject, &body)
-                .map_err(internal)?;
-            claim_ids.push(claim_id.clone());
-            tokens.insert(subject.clone(), vec![claim_id]);
-            reconcile_subjects.push(subject.clone());
-        }
-        for mission in intent.missions.values() {
-            let current: Option<String> = transaction
-                .query_row(
-                    "SELECT revision FROM mission_definitions WHERE mission_id=?1",
-                    [&mission.id],
-                    |row| row.get(0),
-                )
-                .optional()
-                .map_err(internal)?;
-            if current.as_deref() == Some(mission.revision.as_str()) {
-                tokens.insert(
-                    mission.subject.clone(),
-                    mission_definition_token_tx(&transaction, &mission.id).map_err(internal)?,
-                );
-                continue;
-            }
-            let predecessors =
-                mission_definition_token_tx(&transaction, &mission.id).map_err(internal)?;
-            let body = serde_json::to_value(mission).map_err(internal)?;
-            let claim_id = claim_hash(
-                &batch_id,
-                &mission.subject,
-                "mission.published",
-                &self.origin,
-                None,
-                &body,
-                &predecessors,
-            )
-            .map_err(internal)?;
-            let store_index = insert_claim(
-                &transaction,
-                &claim_id,
-                &batch_id,
-                &mission.subject,
-                "mission.published",
-                &self.origin,
-                None,
-                &body,
-                &predecessors,
-                now,
-            )
-            .map_err(internal)?;
-            transaction
-                .execute(
-                    "INSERT OR IGNORE INTO mission_revisions(mission_id, revision, state, body, claim_id, created_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![mission.id, mission.revision, mission_state_name(&mission.state), serde_json::to_string(mission).map_err(internal)?, claim_id, store_index],
-                )
-                .map_err(internal)?;
-            transaction
-                .execute(
-                    "INSERT INTO mission_definitions(mission_id, revision, state, claim_id) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(mission_id) DO UPDATE SET revision=excluded.revision, state=excluded.state, claim_id=excluded.claim_id",
-                    params![mission.id, mission.revision, mission_state_name(&mission.state), claim_id],
-                )
-                .map_err(internal)?;
-            insert_event(
-                &transaction,
-                store_index,
-                "mission.published",
-                &mission.subject,
-                &body,
-            )
-            .map_err(internal)?;
-            claim_ids.push(claim_id.clone());
-            tokens.insert(mission.subject.clone(), vec![claim_id]);
-        }
-        for declaration in intent.mission_runs.values() {
-            let created =
-                create_declared_mission_run_tx(&transaction, &self.origin, declaration, &batch_id)?;
-            if !created.is_empty() {
-                operation_receipts.push(PlannedAction {
-                    subject: declaration.subject.clone(),
-                    action: "start-mission-run".into(),
-                    reason: "the named mission run was created".into(),
-                });
-            }
-            claim_ids.extend(created);
-            for revision in declaration.revisions.values() {
-                if !publication_operation_is_new(
-                    &transaction,
-                    &declaration.subject,
-                    "revision",
-                    &revision.id,
-                    revision,
-                )? {
-                    continue;
+                {
+                    return serde_json::from_str(&response).map_err(internal);
                 }
-                let (ids, proposed) = adopt_declared_mission_revision_tx(
-                    &transaction,
-                    &self.origin,
-                    declaration,
-                    revision,
-                    &batch_id,
-                    actor,
-                )?;
-                claim_ids.extend(ids);
-                let receipt = append_publication_operation_tx(
-                    &transaction,
-                    &self.origin,
-                    &declaration.subject,
-                    "revision",
-                    &revision.id,
-                    revision,
-                    actor,
-                    &batch_id,
-                )?;
-                claim_ids.push(receipt.id);
-                operation_receipts.push(PlannedAction {
-                    subject: declaration.subject.clone(),
-                    action: format!(
-                        "{}:{}",
-                        if proposed {
-                            "propose-revision"
-                        } else {
-                            "revise"
-                        },
-                        revision.id
-                    ),
-                    reason: revision.reason.clone(),
+                validate_documents(transaction, &intent.document_refs)?;
+                for desired in intent
+                    .subjects
+                    .values()
+                    .filter(|subject| subject.kind == "subscription")
+                {
+                    let Some(spec) = crate::graph::subscription_spec(&desired.desired) else {
+                        continue;
+                    };
+                    if spec.stopped || spec.delivery != "mission" {
+                        continue;
+                    }
+                    let (Some(mission_id), Some(revision), Some(input)) = (
+                        spec.mission.as_deref(),
+                        spec.revision.as_deref(),
+                        spec.resource_input.as_deref(),
+                    ) else {
+                        continue;
+                    };
+                    let local = transaction
+                        .query_row(
+                            "SELECT body FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+                            params![mission_id, revision],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map_err(internal)?
+                        .map(|body| serde_json::from_str::<MissionSpec>(&body).map_err(internal))
+                        .transpose()?;
+                    let published = intent
+                        .missions
+                        .get(mission_id)
+                        .filter(|mission| mission.revision == revision)
+                        .cloned()
+                        .or(local);
+                    let Some(mission) = published else {
+                        return Err(St3Error::new(
+                            "missing-mission",
+                            format!(
+                                "subscription `{}` references unpublished mission/{}@{revision}",
+                                desired.subject, mission_id
+                            ),
+                        ));
+                    };
+                    if mission
+                        .inputs
+                        .get(input)
+                        .is_none_or(|declaration| declaration.kind != MissionInputKind::Resource)
+                    {
+                        return Err(St3Error::new(
+                            "invalid-subscription-resource-input",
+                            format!(
+                                "subscription `{}` uses undeclared resource input `{input}` in mission/{}@{revision}",
+                                desired.subject, mission_id
+                            ),
+                        ));
+                    }
+                }
+                for subject in intent.subjects.keys() {
+                    let actual = intent_leaves_tx(transaction, subject).map_err(internal)?;
+                    let expected = expected.get(subject).ok_or_else(|| {
+                        St3Error::new(
+                            "missing-subject-token",
+                            format!("apply omitted the subject token for `{subject}`"),
+                        )
+                        .with_detail("subject", subject.clone())
+                        .with_detail("current_heads", json!(actual.clone()))
+                    })?;
+                    if actual != *expected {
+                        return Err(St3Error::new(
+                            "stale-subject",
+                            format!("the desired state for `{subject}` changed after planning"),
+                        )
+                        .with_detail("subject", subject.clone())
+                        .with_detail("expected_heads", json!(expected))
+                        .with_detail("current_heads", json!(actual)));
+                    }
+                }
+                for mission in intent.missions.values() {
+                    let actual =
+                        mission_definition_token_tx(transaction, &mission.id).map_err(internal)?;
+                    let expected = expected.get(&mission.subject).ok_or_else(|| {
+                        St3Error::new(
+                            "missing-subject-token",
+                            format!("apply omitted the subject token for `{}`", mission.subject),
+                        )
+                        .with_detail("subject", mission.subject.clone())
+                        .with_detail("current_heads", json!(actual.clone()))
+                    })?;
+                    if actual != *expected {
+                        return Err(St3Error::new(
+                            "stale-subject",
+                            format!(
+                                "the published mission for `{}` changed after planning",
+                                mission.subject
+                            ),
+                        )
+                        .with_detail("subject", mission.subject.clone())
+                        .with_detail("expected_heads", json!(expected))
+                        .with_detail("current_heads", json!(actual)));
+                    }
+                }
+                for declaration in intent.mission_runs.values() {
+                    let actual = latest_claim_id_tx(transaction, &declaration.subject)
+                        .map_err(internal)?
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    let expected = expected.get(&declaration.subject).ok_or_else(|| {
+                        St3Error::new(
+                            "missing-subject-token",
+                            format!(
+                                "apply omitted the subject token for `{}`",
+                                declaration.subject
+                            ),
+                        )
+                    })?;
+                    if actual != *expected {
+                        return Err(St3Error::new(
+                            "stale-subject",
+                            format!(
+                                "mission run `{}` changed after planning",
+                                declaration.subject
+                            ),
+                        ));
+                    }
+                }
+                for declaration in intent.planning_sessions.values() {
+                    let actual = latest_claim_id_tx(transaction, &declaration.subject)
+                        .map_err(internal)?
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    let expected = expected.get(&declaration.subject).ok_or_else(|| {
+                        St3Error::new(
+                            "missing-subject-token",
+                            format!(
+                                "apply omitted the subject token for `{}`",
+                                declaration.subject
+                            ),
+                        )
+                    })?;
+                    if actual != *expected {
+                        return Err(St3Error::new(
+                            "stale-subject",
+                            format!("launch `{}` changed after planning", declaration.subject),
+                        ));
+                    }
+                }
+                for repair in &intent.replica_repairs {
+                    let subject = format!(
+                        "repair/{}",
+                        repair
+                            .record_ref
+                            .strip_prefix("record/")
+                            .unwrap_or(&repair.record_ref)
+                    );
+                    let actual = claim_ids_at(transaction, &subject, None).map_err(internal)?;
+                    let expected = expected.get(&subject).ok_or_else(|| {
+                        St3Error::new(
+                            "missing-subject-token",
+                            format!("apply omitted the subject token for `{subject}`"),
+                        )
+                    })?;
+                    if &actual != expected {
+                        return Err(St3Error::new(
+                            "stale-subject",
+                            format!("repair `{subject}` changed after planning"),
+                        ));
+                    }
+                }
+                let desired_changed = intent.subjects.iter().any(|(subject, desired)| {
+                    current_desired_row_tx(transaction, subject)
+                        .map(|current| {
+                            current
+                                .as_ref()
+                                .is_none_or(|row| row.revision != desired_revision(desired))
+                        })
+                        .unwrap_or(true)
                 });
-                if !proposed && let Some(cancellation) = &revision.cancellation {
-                    let ids = cancel_mission_run_tx(
-                        &transaction,
+                let missions_changed = intent.missions.values().any(|mission| {
+                    transaction
+                        .query_row(
+                            "SELECT revision FROM mission_definitions WHERE mission_id=?1",
+                            [&mission.id],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()
+                        .map(|current| current.as_deref() != Some(mission.revision.as_str()))
+                        .unwrap_or(true)
+                });
+                let mut operations_changed = false;
+                for declaration in intent.mission_runs.values() {
+                    let run_id = declaration
+                        .subject
+                        .strip_prefix("mission-run/")
+                        .unwrap_or(&declaration.subject);
+                    if declaration.creation.is_some()
+                        && transaction
+                            .query_row("SELECT 1 FROM mission_runs WHERE id=?1", [run_id], |_| {
+                                Ok(())
+                            })
+                            .optional()
+                            .map_err(internal)?
+                            .is_none()
+                    {
+                        operations_changed = true;
+                    }
+                    for revision in declaration.revisions.values() {
+                        operations_changed |= publication_operation_is_new(
+                            transaction,
+                            &declaration.subject,
+                            "revision",
+                            &revision.id,
+                            revision,
+                        )?;
+                    }
+                    for reset in declaration.resets.values() {
+                        operations_changed |= publication_operation_is_new(
+                            transaction,
+                            &declaration.subject,
+                            "reset",
+                            &reset.id,
+                            reset,
+                        )?;
+                    }
+                    for cancellation in declaration.cancellations.values() {
+                        operations_changed |= publication_operation_is_new(
+                            transaction,
+                            &declaration.subject,
+                            "cancellation",
+                            &cancellation.id,
+                            cancellation,
+                        )?;
+                    }
+                }
+                for declaration in intent.planning_sessions.values() {
+                    let id = declaration
+                        .subject
+                        .strip_prefix("planning-session/")
+                        .unwrap_or(&declaration.subject);
+                    if declaration.creation.is_some()
+                        && transaction
+                            .query_row("SELECT 1 FROM planning_sessions WHERE id=?1", [id], |_| {
+                                Ok(())
+                            })
+                            .optional()
+                            .map_err(internal)?
+                            .is_none()
+                    {
+                        operations_changed = true;
+                    }
+                    for feedback in declaration.feedback.values() {
+                        operations_changed |= publication_operation_is_new(
+                            transaction,
+                            &declaration.subject,
+                            "feedback",
+                            &feedback.id,
+                            feedback,
+                        )?;
+                    }
+                    for cancellation in declaration.cancellations.values() {
+                        operations_changed |= publication_operation_is_new(
+                            transaction,
+                            &declaration.subject,
+                            "cancellation",
+                            &cancellation.id,
+                            cancellation,
+                        )?;
+                    }
+                }
+                for refresh in &intent.resource_refreshes {
+                    operations_changed |= publication_operation_is_new(
+                        transaction,
+                        &refresh.resource,
+                        "refresh",
+                        &refresh.id,
+                        refresh,
+                    )?;
+                }
+                for repair in &intent.replica_repairs {
+                    operations_changed |= validate_replica_repair(transaction, repair)?;
+                }
+                let changed = desired_changed || missions_changed || operations_changed;
+                if !changed {
+                    let store_index = current_index_tx(transaction).map_err(internal)?;
+                    let mut subject_tokens = intent
+                        .subjects
+                        .keys()
+                        .map(|subject| {
+                            intent_leaves_tx(transaction, subject)
+                                .map(|heads| (subject.clone(), heads))
+                                .map_err(internal)
+                        })
+                        .collect::<Result<BTreeMap<_, _>, _>>()?;
+                    for mission in intent.missions.values() {
+                        subject_tokens.insert(
+                            mission.subject.clone(),
+                            mission_definition_token_tx(transaction, &mission.id).map_err(internal)?,
+                        );
+                    }
+                    for declaration in intent.mission_runs.values() {
+                        subject_tokens.insert(
+                            declaration.subject.clone(),
+                            latest_claim_id_tx(transaction, &declaration.subject)
+                                .map_err(internal)?
+                                .into_iter()
+                                .collect(),
+                        );
+                    }
+                    for declaration in intent.planning_sessions.values() {
+                        subject_tokens.insert(
+                            declaration.subject.clone(),
+                            latest_claim_id_tx(transaction, &declaration.subject)
+                                .map_err(internal)?
+                                .into_iter()
+                                .collect(),
+                        );
+                    }
+                    for repair in &intent.replica_repairs {
+                        let subject = format!(
+                            "repair/{}",
+                            repair
+                                .record_ref
+                                .strip_prefix("record/")
+                                .unwrap_or(&repair.record_ref)
+                        );
+                        subject_tokens.insert(
+                            subject.clone(),
+                            claim_ids_at(transaction, &subject, None).map_err(internal)?,
+                        );
+                    }
+                    let response = ApplyResponse {
+                        changed: false,
+                        store_index,
+                        batch_id: None,
+                        claim_ids: Vec::new(),
+                        subject_tokens,
+                        reconcile_subjects: Vec::new(),
+                        resolved_kdl: String::new(),
+                        operations: Vec::new(),
+                    };
+                    transaction
+                        .execute(
+                            "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
+                            params![
+                                opaque_cache_key(idempotency_key),
+                                serde_json::to_string(&response).map_err(internal)?
+                            ],
+                        )
+                        .map_err(internal)?;
+                    return Ok(response);
+                }
+                let now = write_time(transaction, &self.origin).map_err(internal)?;
+                let sequence = next_replica_sequence(transaction, &self.origin).map_err(internal)?;
+                let previous_hash = previous_batch_hash(transaction, &self.origin).map_err(internal)?;
+                let batch_hash = batch_header_hash(&self.origin, sequence, previous_hash.as_deref(), now)
+                    .map_err(internal)?;
+                let batch_id = format!("batch/{}/{sequence}/{batch_hash}", self.origin);
+                transaction
+                    .execute(
+                        "INSERT INTO batches(id, origin, replica_sequence, previous_hash, hash, accepted_at_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![batch_id, self.origin, sequence, previous_hash, batch_hash, now.to_string()],
+                    )
+                    .map_err(internal)?;
+
+                let mut claim_ids = Vec::new();
+                let mut tokens = BTreeMap::new();
+                let mut reconcile_subjects = Vec::new();
+                let mut operation_receipts = Vec::new();
+                for (subject, desired) in &intent.subjects {
+                    let revision = desired_revision(desired);
+                    let current = current_desired_row_tx(transaction, subject).map_err(internal)?;
+                    if current.as_ref().is_some_and(|row| row.revision == revision) {
+                        tokens.insert(
+                            subject.clone(),
+                            intent_leaves_tx(transaction, subject).map_err(internal)?,
+                        );
+                        continue;
+                    }
+                    let predecessors = intent_leaves_tx(transaction, subject).map_err(internal)?;
+                    let body = serde_json::to_value(desired).map_err(internal)?;
+                    // The writer decides whether a top-level project seat holds default mission
+                    // authority; see `graph::effective_agent_mission_authority`.
+                    let claim_id = claim_hash(
+                        &batch_id,
+                        subject,
+                        "intent.desired",
                         &self.origin,
-                        &declaration.subject,
-                        &cancellation.reason,
-                        Some(&batch_id),
+                        actor,
+                        &body,
+                        &predecessors,
+                    )
+                    .map_err(internal)?;
+                    let store_index = insert_claim(
+                        transaction,
+                        &claim_id,
+                        &batch_id,
+                        subject,
+                        "intent.desired",
+                        &self.origin,
+                        actor,
+                        &body,
+                        &predecessors,
                         now,
                     )
                     .map_err(internal)?;
+                    transaction
+                        .execute(
+                            "INSERT INTO desired(subject, kind, revision, claim_id, body, member, owner_run, owner_generation, owner_step) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                             ON CONFLICT(subject) DO UPDATE SET kind=excluded.kind, revision=excluded.revision, claim_id=excluded.claim_id, body=excluded.body, member=excluded.member, owner_run=excluded.owner_run, owner_generation=excluded.owner_generation, owner_step=excluded.owner_step",
+                            params![
+                                subject,
+                                desired.kind,
+                                revision,
+                                claim_id,
+                                canonical_json_text(&desired.desired).map_err(internal)?,
+                                desired
+                                    .member
+                                    .as_ref()
+                                    .map(canonical_serialized_json_text)
+                                    .transpose()
+                                    .map_err(internal)?,
+                                desired.owner_run,
+                                desired.owner_generation,
+                                desired.owner_step,
+                            ],
+                        )
+                        .map_err(internal)?;
+                    insert_event(transaction, store_index, "intent.desired", subject, &body)
+                        .map_err(internal)?;
+                    claim_ids.push(claim_id.clone());
+                    tokens.insert(subject.clone(), vec![claim_id]);
+                    reconcile_subjects.push(subject.clone());
+                }
+                for mission in intent.missions.values() {
+                    let current: Option<String> = transaction
+                        .query_row(
+                            "SELECT revision FROM mission_definitions WHERE mission_id=?1",
+                            [&mission.id],
+                            |row| row.get(0),
+                        )
+                        .optional()
+                        .map_err(internal)?;
+                    if current.as_deref() == Some(mission.revision.as_str()) {
+                        tokens.insert(
+                            mission.subject.clone(),
+                            mission_definition_token_tx(transaction, &mission.id).map_err(internal)?,
+                        );
+                        continue;
+                    }
+                    let predecessors =
+                        mission_definition_token_tx(transaction, &mission.id).map_err(internal)?;
+                    let body = serde_json::to_value(mission).map_err(internal)?;
+                    let claim_id = claim_hash(
+                        &batch_id,
+                        &mission.subject,
+                        "mission.published",
+                        &self.origin,
+                        None,
+                        &body,
+                        &predecessors,
+                    )
+                    .map_err(internal)?;
+                    let store_index = insert_claim(
+                        transaction,
+                        &claim_id,
+                        &batch_id,
+                        &mission.subject,
+                        "mission.published",
+                        &self.origin,
+                        None,
+                        &body,
+                        &predecessors,
+                        now,
+                    )
+                    .map_err(internal)?;
+                    transaction
+                        .execute(
+                            "INSERT OR IGNORE INTO mission_revisions(mission_id, revision, state, body, claim_id, created_index) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            params![mission.id, mission.revision, mission_state_name(&mission.state), serde_json::to_string(mission).map_err(internal)?, claim_id, store_index],
+                        )
+                        .map_err(internal)?;
+                    transaction
+                        .execute(
+                            "INSERT INTO mission_definitions(mission_id, revision, state, claim_id) VALUES (?1, ?2, ?3, ?4)
+                             ON CONFLICT(mission_id) DO UPDATE SET revision=excluded.revision, state=excluded.state, claim_id=excluded.claim_id",
+                            params![mission.id, mission.revision, mission_state_name(&mission.state), claim_id],
+                        )
+                        .map_err(internal)?;
+                    insert_event(
+                        transaction,
+                        store_index,
+                        "mission.published",
+                        &mission.subject,
+                        &body,
+                    )
+                    .map_err(internal)?;
+                    claim_ids.push(claim_id.clone());
+                    tokens.insert(mission.subject.clone(), vec![claim_id]);
+                }
+                for declaration in intent.mission_runs.values() {
+                    let created =
+                        create_declared_mission_run_tx(transaction, &self.origin, declaration, &batch_id)?;
+                    if !created.is_empty() {
+                        operation_receipts.push(PlannedAction {
+                            subject: declaration.subject.clone(),
+                            action: "start-mission-run".into(),
+                            reason: "the named mission run was created".into(),
+                        });
+                    }
+                    claim_ids.extend(created);
+                    for revision in declaration.revisions.values() {
+                        if !publication_operation_is_new(
+                            transaction,
+                            &declaration.subject,
+                            "revision",
+                            &revision.id,
+                            revision,
+                        )? {
+                            continue;
+                        }
+                        let (ids, proposed) = adopt_declared_mission_revision_tx(
+                            transaction,
+                            &self.origin,
+                            declaration,
+                            revision,
+                            &batch_id,
+                            actor,
+                        )?;
+                        claim_ids.extend(ids);
+                        let receipt = append_publication_operation_tx(
+                            transaction,
+                            &self.origin,
+                            &declaration.subject,
+                            "revision",
+                            &revision.id,
+                            revision,
+                            actor,
+                            &batch_id,
+                        )?;
+                        claim_ids.push(receipt.id);
+                        operation_receipts.push(PlannedAction {
+                            subject: declaration.subject.clone(),
+                            action: format!(
+                                "{}:{}",
+                                if proposed {
+                                    "propose-revision"
+                                } else {
+                                    "revise"
+                                },
+                                revision.id
+                            ),
+                            reason: revision.reason.clone(),
+                        });
+                        if !proposed && let Some(cancellation) = &revision.cancellation {
+                            let ids = cancel_mission_run_tx(
+                                transaction,
+                                &self.origin,
+                                &declaration.subject,
+                                &cancellation.reason,
+                                Some(&batch_id),
+                                now,
+                            )
+                            .map_err(internal)?;
+                            claim_ids.extend(ids);
+                        }
+                    }
+                    for reset in declaration.resets.values() {
+                        if !publication_operation_is_new(
+                            transaction,
+                            &declaration.subject,
+                            "reset",
+                            &reset.id,
+                            reset,
+                        )? {
+                            continue;
+                        }
+                        let runtime = runtime_subject_for_run(
+                            declaration
+                                .subject
+                                .strip_prefix("mission-run/")
+                                .unwrap_or(&declaration.subject),
+                            &reset.runtime,
+                        );
+                        let reset_claim = reset_declared_runtime_tx(
+                            transaction,
+                            &self.origin,
+                            declaration,
+                            reset,
+                            &runtime,
+                            &batch_id,
+                        )?;
+                        claim_ids.push(reset_claim.id);
+                        let receipt = append_publication_operation_tx(
+                            transaction,
+                            &self.origin,
+                            &declaration.subject,
+                            "reset",
+                            &reset.id,
+                            reset,
+                            actor,
+                            &batch_id,
+                        )?;
+                        claim_ids.push(receipt.id);
+                        reconcile_subjects.push(runtime.clone());
+                        operation_receipts.push(PlannedAction {
+                            subject: runtime,
+                            action: format!("reset:{}", reset.id),
+                            reason: reset.reason.clone(),
+                        });
+                    }
+                    for cancellation in declaration.cancellations.values() {
+                        if !publication_operation_is_new(
+                            transaction,
+                            &declaration.subject,
+                            "cancellation",
+                            &cancellation.id,
+                            cancellation,
+                        )? {
+                            continue;
+                        }
+                        let ids = cancel_mission_run_tx(
+                            transaction,
+                            &self.origin,
+                            &declaration.subject,
+                            &cancellation.reason,
+                            Some(&batch_id),
+                            now,
+                        )
+                        .map_err(internal)?;
+                        if !ids.is_empty() {
+                            operation_receipts.push(PlannedAction {
+                                subject: declaration.subject.clone(),
+                                action: format!("cancel:{}", cancellation.id),
+                                reason: cancellation.reason.clone(),
+                            });
+                        }
+                        claim_ids.extend(ids);
+                        let receipt = append_publication_operation_tx(
+                            transaction,
+                            &self.origin,
+                            &declaration.subject,
+                            "cancellation",
+                            &cancellation.id,
+                            cancellation,
+                            actor,
+                            &batch_id,
+                        )?;
+                        claim_ids.push(receipt.id);
+                    }
+                    tokens.insert(
+                        declaration.subject.clone(),
+                        latest_claim_id_tx(transaction, &declaration.subject)
+                            .map_err(internal)?
+                            .into_iter()
+                            .collect(),
+                    );
+                    reconcile_subjects.push(declaration.subject.clone());
+                }
+                for declaration in intent.planning_sessions.values() {
+                    let ids = apply_planning_session_declaration_tx(
+                        transaction,
+                        &self.origin,
+                        declaration,
+                        &batch_id,
+                        actor,
+                        &mut operation_receipts,
+                    )?;
                     claim_ids.extend(ids);
+                    tokens.insert(
+                        declaration.subject.clone(),
+                        latest_claim_id_tx(transaction, &declaration.subject)
+                            .map_err(internal)?
+                            .into_iter()
+                            .collect(),
+                    );
+                    reconcile_subjects.push(declaration.subject.clone());
                 }
-            }
-            for reset in declaration.resets.values() {
-                if !publication_operation_is_new(
-                    &transaction,
-                    &declaration.subject,
-                    "reset",
-                    &reset.id,
-                    reset,
-                )? {
-                    continue;
-                }
-                let runtime = runtime_subject_for_run(
-                    declaration
-                        .subject
-                        .strip_prefix("mission-run/")
-                        .unwrap_or(&declaration.subject),
-                    &reset.runtime,
-                );
-                let reset_claim = reset_declared_runtime_tx(
-                    &transaction,
-                    &self.origin,
-                    declaration,
-                    reset,
-                    &runtime,
-                    &batch_id,
-                )?;
-                claim_ids.push(reset_claim.id);
-                let receipt = append_publication_operation_tx(
-                    &transaction,
-                    &self.origin,
-                    &declaration.subject,
-                    "reset",
-                    &reset.id,
-                    reset,
-                    actor,
-                    &batch_id,
-                )?;
-                claim_ids.push(receipt.id);
-                reconcile_subjects.push(runtime.clone());
-                operation_receipts.push(PlannedAction {
-                    subject: runtime,
-                    action: format!("reset:{}", reset.id),
-                    reason: reset.reason.clone(),
-                });
-            }
-            for cancellation in declaration.cancellations.values() {
-                if !publication_operation_is_new(
-                    &transaction,
-                    &declaration.subject,
-                    "cancellation",
-                    &cancellation.id,
-                    cancellation,
-                )? {
-                    continue;
-                }
-                let ids = cancel_mission_run_tx(
-                    &transaction,
-                    &self.origin,
-                    &declaration.subject,
-                    &cancellation.reason,
-                    Some(&batch_id),
-                    now,
-                )
-                .map_err(internal)?;
-                if !ids.is_empty() {
+                for refresh in &intent.resource_refreshes {
+                    if !publication_operation_is_new(
+                        transaction,
+                        &refresh.resource,
+                        "refresh",
+                        &refresh.id,
+                        refresh,
+                    )? {
+                        continue;
+                    }
+                    let ids = request_declared_resource_refresh_tx(
+                        transaction,
+                        &self.origin,
+                        refresh,
+                        &batch_id,
+                    )?;
+                    claim_ids.extend(ids);
+                    let receipt = append_publication_operation_tx(
+                        transaction,
+                        &self.origin,
+                        &refresh.resource,
+                        "refresh",
+                        &refresh.id,
+                        refresh,
+                        actor,
+                        &batch_id,
+                    )?;
+                    claim_ids.push(receipt.id);
                     operation_receipts.push(PlannedAction {
-                        subject: declaration.subject.clone(),
-                        action: format!("cancel:{}", cancellation.id),
-                        reason: cancellation.reason.clone(),
+                        subject: refresh.resource.clone(),
+                        action: format!("refresh:{}", refresh.id),
+                        reason: "the refresh request was accepted".into(),
                     });
                 }
-                claim_ids.extend(ids);
-                let receipt = append_publication_operation_tx(
-                    &transaction,
-                    &self.origin,
-                    &declaration.subject,
-                    "cancellation",
-                    &cancellation.id,
-                    cancellation,
-                    actor,
-                    &batch_id,
-                )?;
-                claim_ids.push(receipt.id);
-            }
-            tokens.insert(
-                declaration.subject.clone(),
-                latest_claim_id_tx(&transaction, &declaration.subject)
-                    .map_err(internal)?
-                    .into_iter()
-                    .collect(),
-            );
-            reconcile_subjects.push(declaration.subject.clone());
-        }
-        for declaration in intent.planning_sessions.values() {
-            let ids = apply_planning_session_declaration_tx(
-                &transaction,
-                &self.origin,
-                declaration,
-                &batch_id,
-                actor,
-                &mut operation_receipts,
-            )?;
-            claim_ids.extend(ids);
-            tokens.insert(
-                declaration.subject.clone(),
-                latest_claim_id_tx(&transaction, &declaration.subject)
-                    .map_err(internal)?
-                    .into_iter()
-                    .collect(),
-            );
-            reconcile_subjects.push(declaration.subject.clone());
-        }
-        for refresh in &intent.resource_refreshes {
-            if !publication_operation_is_new(
-                &transaction,
-                &refresh.resource,
-                "refresh",
-                &refresh.id,
-                refresh,
-            )? {
-                continue;
-            }
-            let ids = request_declared_resource_refresh_tx(
-                &transaction,
-                &self.origin,
-                refresh,
-                &batch_id,
-            )?;
-            claim_ids.extend(ids);
-            let receipt = append_publication_operation_tx(
-                &transaction,
-                &self.origin,
-                &refresh.resource,
-                "refresh",
-                &refresh.id,
-                refresh,
-                actor,
-                &batch_id,
-            )?;
-            claim_ids.push(receipt.id);
-            operation_receipts.push(PlannedAction {
-                subject: refresh.resource.clone(),
-                action: format!("refresh:{}", refresh.id),
-                reason: "the refresh request was accepted".into(),
-            });
-        }
-        for repair in &intent.replica_repairs {
-            if !validate_replica_repair(&transaction, repair)? {
-                continue;
-            }
-            let record_id = repair
-                .record_ref
-                .strip_prefix("record/")
-                .unwrap_or(&repair.record_ref);
-            let subject = format!("repair/{record_id}");
-            let body = json!({
-                "fields": {
-                    "record": repair.record_ref,
-                    "replacement": repair.replacement_claim_id,
-                    "reason": repair.reason,
+                for repair in &intent.replica_repairs {
+                    if !validate_replica_repair(transaction, repair)? {
+                        continue;
+                    }
+                    let record_id = repair
+                        .record_ref
+                        .strip_prefix("record/")
+                        .unwrap_or(&repair.record_ref);
+                    let subject = format!("repair/{record_id}");
+                    let body = json!({
+                        "fields": {
+                            "record": repair.record_ref,
+                            "replacement": repair.replacement_claim_id,
+                            "reason": repair.reason,
+                        }
+                    });
+                    let claim = append_claim_tx(
+                        transaction,
+                        &self.origin,
+                        &subject,
+                        "record.repaired",
+                        actor,
+                        &body,
+                        &[],
+                        Some(&batch_id),
+                    )
+                    .map_err(internal)?;
+                    transaction
+                        .execute(
+                            "UPDATE replica_records SET state='repaired', replacement_claim_id=?2,
+                                error_code=NULL, error_message=NULL, updated_at_unix_ms=?3
+                             WHERE record_ref=?1 AND state IN ('invalid','unknown','repaired')",
+                            params![
+                                repair.record_ref,
+                                repair.replacement_claim_id,
+                                now_ms().to_string()
+                            ],
+                        )
+                        .map_err(internal)?;
+                    claim_ids.push(claim.id);
+                    tokens.insert(
+                        subject.clone(),
+                        claim_ids_at(transaction, &subject, None).map_err(internal)?,
+                    );
+                    operation_receipts.push(PlannedAction {
+                        subject,
+                        action: "repair-record".into(),
+                        reason: "the replacement claim resolved the invalid record".into(),
+                    });
                 }
-            });
-            let claim = append_claim_tx(
-                &transaction,
-                &self.origin,
-                &subject,
-                "record.repaired",
-                actor,
-                &body,
-                &[],
-                Some(&batch_id),
-            )
-            .map_err(internal)?;
-            transaction
-                .execute(
-                    "UPDATE replica_records SET state='repaired', replacement_claim_id=?2,
-                        error_code=NULL, error_message=NULL, updated_at_unix_ms=?3
-                     WHERE record_ref=?1 AND state IN ('invalid','unknown','repaired')",
-                    params![
-                        repair.record_ref,
-                        repair.replacement_claim_id,
-                        now_ms().to_string()
-                    ],
-                )
-                .map_err(internal)?;
-            claim_ids.push(claim.id);
-            tokens.insert(
-                subject.clone(),
-                claim_ids_at(&transaction, &subject, None).map_err(internal)?,
-            );
-            operation_receipts.push(PlannedAction {
-                subject,
-                action: "repair-record".into(),
-                reason: "the replacement claim resolved the invalid record".into(),
-            });
-        }
-        let store_index = current_index_tx(&transaction).map_err(internal)?;
-        let response = ApplyResponse {
-            changed: true,
-            store_index,
-            batch_id: Some(batch_id),
-            claim_ids,
-            subject_tokens: tokens,
-            reconcile_subjects,
-            resolved_kdl: String::new(),
-            operations: operation_receipts,
-        };
-        transaction
-            .execute(
-                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
-                params![
-                    opaque_cache_key(idempotency_key),
-                    serde_json::to_string(&response).map_err(internal)?
-                ],
-            )
-            .map_err(internal)?;
-        transaction.commit().map_err(internal)?;
-        Ok(response)
+                let store_index = current_index_tx(transaction).map_err(internal)?;
+                let response = ApplyResponse {
+                    changed: true,
+                    store_index,
+                    batch_id: Some(batch_id),
+                    claim_ids,
+                    subject_tokens: tokens,
+                    reconcile_subjects,
+                    resolved_kdl: String::new(),
+                    operations: operation_receipts,
+                };
+                transaction
+                    .execute(
+                        "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
+                        params![
+                            opaque_cache_key(idempotency_key),
+                            serde_json::to_string(&response).map_err(internal)?
+                        ],
+                    )
+                    .map_err(internal)?;
+                Ok(response)
+            })
+            .map_err(|error| St3Error::new("internal", error))?
     }
 
     pub fn put_document(
@@ -8285,84 +8543,85 @@ impl Store {
             St3Error::new("document-not-text", "a document must contain valid UTF-8")
         })?;
         let hash = hex::encode(Sha256::digest(bytes));
-        let mut connection = self.connection.write();
-        if let Some(response) = connection
-            .query_row(
-                "SELECT response FROM idempotency WHERE operation_id=?1",
-                [opaque_cache_key(idempotency_key)],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(internal)?
-        {
-            return serde_json::from_str(&response).map_err(internal);
-        }
-        if let Some(version) = find_document(&connection, name, &hash).map_err(internal)? {
-            return Ok(version);
-        }
-        let transaction = connection.transaction().map_err(internal)?;
-        let current: Option<String> = transaction
-            .query_row(
-                "SELECT binding_claim_id FROM documents WHERE name=?1 ORDER BY created_index DESC LIMIT 1",
-                [name],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(internal)?;
-        if &current != expected_document {
-            return Err(St3Error::new(
-                "stale-document-token",
-                format!("the selected binding for `{name}` changed before the post"),
-            )
-            .with_detail("subject", name.to_owned())
-            .with_detail("expected_head", json!(expected_document))
-            .with_detail("current_head", json!(current)));
-        }
-        transaction
-            .execute(
-                "INSERT OR IGNORE INTO blobs(hash, bytes, size) VALUES (?1, ?2, ?3)",
-                params![hash, bytes, bytes.len() as u64],
-            )
-            .map_err(internal)?;
-        let body = json!({ "name": name, "hash": hash, "size": bytes.len() });
-        let record = append_claim_tx(
-            &transaction,
-            &self.origin,
-            name,
-            "doc.bound",
-            None,
-            &body,
-            &[],
-            None,
-        )
-        .map_err(internal)?;
-        transaction
-            .execute(
-                "INSERT INTO documents(name, hash, created_index, binding_claim_id) VALUES (?1, ?2, ?3, ?4)",
-                params![name, hash, record.store_index, record.id],
-            )
-            .map_err(internal)?;
-        let version = DocumentVersion {
-            name: name.into(),
-            hash,
-            size: bytes.len() as u64,
-            created_index: record.store_index,
-            latest: true,
-            binding_claim_id: record.id,
-            created_at_unix_ms: record.accepted_at_unix_ms,
-            owner: record.actor.or(Some(record.origin)),
-        };
-        transaction
-            .execute(
-                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
-                params![
-                    opaque_cache_key(idempotency_key),
-                    serde_json::to_string(&version).map_err(internal)?
-                ],
-            )
-            .map_err(internal)?;
-        transaction.commit().map_err(internal)?;
-        Ok(version)
+        self.connection
+            .batched(|transaction| -> Result<DocumentVersion, St3Error> {
+                if let Some(response) = transaction
+                    .query_row(
+                        "SELECT response FROM idempotency WHERE operation_id=?1",
+                        [opaque_cache_key(idempotency_key)],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()
+                    .map_err(internal)?
+                {
+                    return serde_json::from_str(&response).map_err(internal);
+                }
+                if let Some(version) = find_document(transaction, name, &hash).map_err(internal)? {
+                    return Ok(version);
+                }
+                let current: Option<String> = transaction
+                    .query_row(
+                        "SELECT binding_claim_id FROM documents WHERE name=?1 ORDER BY created_index DESC LIMIT 1",
+                        [name],
+                        |row| row.get(0),
+                    )
+                    .optional()
+                    .map_err(internal)?;
+                if &current != expected_document {
+                    return Err(St3Error::new(
+                        "stale-document-token",
+                        format!("the selected binding for `{name}` changed before the post"),
+                    )
+                    .with_detail("subject", name.to_owned())
+                    .with_detail("expected_head", json!(expected_document))
+                    .with_detail("current_head", json!(current)));
+                }
+                transaction
+                    .execute(
+                        "INSERT OR IGNORE INTO blobs(hash, bytes, size) VALUES (?1, ?2, ?3)",
+                        params![hash, bytes, bytes.len() as u64],
+                    )
+                    .map_err(internal)?;
+                let body = json!({ "name": name, "hash": hash, "size": bytes.len() });
+                let record = append_claim_tx(
+                    transaction,
+                    &self.origin,
+                    name,
+                    "doc.bound",
+                    None,
+                    &body,
+                    &[],
+                    None,
+                )
+                .map_err(internal)?;
+                transaction
+                    .execute(
+                        "INSERT INTO documents(name, hash, created_index, binding_claim_id) VALUES (?1, ?2, ?3, ?4)",
+                        params![name, hash, record.store_index, record.id],
+                    )
+                    .map_err(internal)?;
+                let version = DocumentVersion {
+                    name: name.into(),
+                    hash,
+                    size: bytes.len() as u64,
+                    created_index: record.store_index,
+                    latest: true,
+                    binding_claim_id: record.id,
+                    created_at_unix_ms: record.accepted_at_unix_ms,
+                    owner: record.actor.or(Some(record.origin)),
+                };
+                transaction
+                    .execute(
+                        "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
+                        params![
+                            opaque_cache_key(idempotency_key),
+                            serde_json::to_string(&version).map_err(internal)?
+                        ],
+                    )
+                    .map_err(internal)?;
+                Ok(version)
+            })
+            .map_err(|error| St3Error::new("internal", error))?
     }
 
     pub fn get_document(&self, name: &str, hash: &str) -> Result<Option<Vec<u8>>> {
@@ -8455,120 +8714,132 @@ impl Store {
             return self.append_latest_observation(input, now_ms());
         }
         let operation = claim_operation(input)?;
-        let mut connection = self.connection.write();
-        if let Some((operation_id, request_digest)) = &operation
-            && let Some((stored_digest, canonical_claim, state)) =
-                operation_tx(&connection, operation_id).map_err(internal)?
-        {
-            if state == "conflict" {
-                return Err(St3Error::new(
-                    "idempotency-conflict",
-                    "the replicated operation has conflicting requests",
+        // One claim in a savepoint of the writer's next batch; its caller hears back once that
+        // batch commits.
+        self.connection
+            .batched(|transaction| -> Result<(ClaimRecord, bool), St3Error> {
+                if let Some((operation_id, request_digest)) = &operation
+                    && let Some((stored_digest, canonical_claim, state)) =
+                        operation_tx(transaction, operation_id).map_err(internal)?
+                {
+                    if state == "conflict" {
+                        return Err(St3Error::new(
+                            "idempotency-conflict",
+                            "the replicated operation has conflicting requests",
+                        )
+                        .with_detail("operation_id", operation_id.clone()));
+                    }
+                    if stored_digest != *request_digest {
+                        return Err(St3Error::new(
+                            "idempotency-mismatch",
+                            "the idempotency key already identifies a different request",
+                        )
+                        .with_detail("operation_id", operation_id.clone())
+                        .with_detail("stored_digest", stored_digest)
+                        .with_detail("request_digest", request_digest.clone()));
+                    }
+                    return claim_by_id_tx(transaction, &canonical_claim)
+                        .map_err(internal)?
+                        .map(|claim| (claim, false))
+                        .ok_or_else(|| {
+                            St3Error::new("internal", "the operation claim is missing")
+                        });
+                }
+                if let Some((operation_id, request_digest)) = &operation {
+                    checkpointed_operation_outcome(transaction, operation_id, request_digest)?;
+                }
+                for evidence in &input.evidence {
+                    // Evidence may cite a claim that a checkpoint has since dropped.
+                    let exists = checkpoint::claim_or_tombstone_exists(transaction, evidence)
+                        .map_err(internal)?;
+                    if !exists {
+                        return Err(St3Error::new(
+                            "missing-evidence",
+                            format!("evidence claim `{evidence}` is not stored"),
+                        ));
+                    }
+                }
+                if let Some(expected) = &input.expected_subject {
+                    let actual =
+                        latest_claim_id_tx(transaction, &input.subject).map_err(internal)?;
+                    if &actual != expected {
+                        return Err(St3Error::new(
+                            "stale-subject",
+                            format!("subject `{}` changed", input.subject),
+                        )
+                        .with_detail("subject", input.subject.clone())
+                        .with_detail("expected_head", json!(expected))
+                        .with_detail("current_head", json!(actual)));
+                    }
+                }
+                let mut stored_fields = normalize_resource_observation(transaction, input)?;
+                // A leave names its own batch as the last sequence of its window. The sequence is only
+                // known here, under the writer lock, so a zero high water stands for "this batch".
+                if input.kind == "fleet.member-left"
+                    && input.fields.get("high_water").and_then(Value::as_u64) == Some(0)
+                {
+                    let mut fields = stored_fields
+                        .clone()
+                        .unwrap_or_else(|| input.fields.clone());
+                    fields.insert(
+                        "high_water".into(),
+                        Value::from(
+                            next_replica_sequence(transaction, &self.origin).map_err(internal)?,
+                        ),
+                    );
+                    stored_fields = Some(fields);
+                }
+                if validate_message_transition(transaction, input)? {
+                    let latest_id = latest_claim_id_tx(transaction, &input.subject)
+                        .map_err(internal)?
+                        .ok_or_else(|| {
+                            St3Error::new(
+                                "internal",
+                                "an idempotent message transition has no head",
+                            )
+                        })?;
+                    let latest = claim_by_id_tx(transaction, &latest_id)
+                        .map_err(internal)?
+                        .ok_or_else(|| {
+                            St3Error::new(
+                                "internal",
+                                "an idempotent message transition head is missing",
+                            )
+                        })?;
+                    return Ok((latest, false));
+                }
+                let predecessor =
+                    latest_claim_id_tx(transaction, &input.subject).map_err(internal)?;
+                let predecessors = predecessor.into_iter().collect::<Vec<_>>();
+                let mut body = json!({
+                    "fields": stored_fields.as_ref().unwrap_or(&input.fields),
+                    "evidence": input.evidence,
+                });
+                if let Some((operation_id, request_digest)) = &operation {
+                    body.as_object_mut()
+                        .expect("the claim body is an object")
+                        .insert(
+                            "_operation".into(),
+                            json!({ "id": operation_id, "request_digest": request_digest }),
+                        );
+                }
+                let record = append_claim_tx(
+                    transaction,
+                    &self.origin,
+                    &input.subject,
+                    &input.kind,
+                    input.actor.as_deref(),
+                    &body,
+                    &predecessors,
+                    None,
                 )
-                .with_detail("operation_id", operation_id.clone()));
-            }
-            if stored_digest != *request_digest {
-                return Err(St3Error::new(
-                    "idempotency-mismatch",
-                    "the idempotency key already identifies a different request",
-                )
-                .with_detail("operation_id", operation_id.clone())
-                .with_detail("stored_digest", stored_digest)
-                .with_detail("request_digest", request_digest.clone()));
-            }
-            return claim_by_id_tx(&connection, &canonical_claim)
-                .map_err(internal)?
-                .map(|claim| (claim, false))
-                .ok_or_else(|| St3Error::new("internal", "the operation claim is missing"));
-        }
-        if let Some((operation_id, request_digest)) = &operation {
-            checkpointed_operation_outcome(&connection, operation_id, request_digest)?;
-        }
-        let transaction = connection.transaction().map_err(internal)?;
-        for evidence in &input.evidence {
-            // Evidence may cite a claim that a checkpoint has since dropped.
-            let exists =
-                checkpoint::claim_or_tombstone_exists(&transaction, evidence).map_err(internal)?;
-            if !exists {
-                return Err(St3Error::new(
-                    "missing-evidence",
-                    format!("evidence claim `{evidence}` is not stored"),
-                ));
-            }
-        }
-        if let Some(expected) = &input.expected_subject {
-            let actual = latest_claim_id_tx(&transaction, &input.subject).map_err(internal)?;
-            if &actual != expected {
-                return Err(St3Error::new(
-                    "stale-subject",
-                    format!("subject `{}` changed", input.subject),
-                )
-                .with_detail("subject", input.subject.clone())
-                .with_detail("expected_head", json!(expected))
-                .with_detail("current_head", json!(actual)));
-            }
-        }
-        let mut stored_fields = normalize_resource_observation(&transaction, input)?;
-        // A leave names its own batch as the last sequence of its window. The sequence is only
-        // known here, under the writer lock, so a zero high water stands for "this batch".
-        if input.kind == "fleet.member-left"
-            && input.fields.get("high_water").and_then(Value::as_u64) == Some(0)
-        {
-            let mut fields = stored_fields
-                .clone()
-                .unwrap_or_else(|| input.fields.clone());
-            fields.insert(
-                "high_water".into(),
-                Value::from(next_replica_sequence(&transaction, &self.origin).map_err(internal)?),
-            );
-            stored_fields = Some(fields);
-        }
-        if validate_message_transition(&transaction, input)? {
-            let latest_id = latest_claim_id_tx(&transaction, &input.subject)
-                .map_err(internal)?
-                .ok_or_else(|| {
-                    St3Error::new("internal", "an idempotent message transition has no head")
-                })?;
-            let latest = claim_by_id_tx(&transaction, &latest_id)
-                .map_err(internal)?
-                .ok_or_else(|| {
-                    St3Error::new(
-                        "internal",
-                        "an idempotent message transition head is missing",
-                    )
-                })?;
-            return Ok((latest, false));
-        }
-        let predecessor = latest_claim_id_tx(&transaction, &input.subject).map_err(internal)?;
-        let predecessors = predecessor.into_iter().collect::<Vec<_>>();
-        let mut body = json!({
-            "fields": stored_fields.as_ref().unwrap_or(&input.fields),
-            "evidence": input.evidence,
-        });
-        if let Some((operation_id, request_digest)) = &operation {
-            body.as_object_mut()
-                .expect("the claim body is an object")
-                .insert(
-                    "_operation".into(),
-                    json!({ "id": operation_id, "request_digest": request_digest }),
-                );
-        }
-        let record = append_claim_tx(
-            &transaction,
-            &self.origin,
-            &input.subject,
-            &input.kind,
-            input.actor.as_deref(),
-            &body,
-            &predecessors,
-            None,
-        )
-        .map_err(claim_append_error)?;
-        if operation.is_some() {
-            register_operation_tx(&transaction, &record).map_err(internal)?;
-        }
-        transaction.commit().map_err(internal)?;
-        Ok((record, true))
+                .map_err(claim_append_error)?;
+                if operation.is_some() {
+                    register_operation_tx(transaction, &record).map_err(internal)?;
+                }
+                Ok((record, true))
+            })
+            .map_err(|error| St3Error::new("internal", error))?
     }
 
     pub fn validate_claim_input(&self, input: &ClaimInput) -> Result<(), St3Error> {
@@ -8610,11 +8881,11 @@ impl Store {
         input: &ClaimInput,
     ) -> Result<(ClaimRecord, bool), St3Error> {
         validate_local_observation(input)?;
-        let mut connection = self.connection.write();
-        let transaction = connection.transaction().map_err(internal)?;
-        let outcome = insert_local_observation_tx(&transaction, &self.origin, input, now_ms())?;
-        transaction.commit().map_err(internal)?;
-        Ok(outcome)
+        self.connection
+            .batched(|transaction| {
+                insert_local_observation_tx(transaction, &self.origin, input, now_ms())
+            })
+            .map_err(|error| St3Error::new("internal", error))?
     }
 
     /// Record an observation of `latest` retention. The local observation log keeps every
@@ -8626,24 +8897,25 @@ impl Store {
         now: u128,
     ) -> Result<(ClaimRecord, bool), St3Error> {
         validate_local_observation(input)?;
-        let mut connection = self.connection.write();
-        let transaction = connection.transaction().map_err(internal)?;
-        let (local, appended) =
-            insert_local_observation_tx(&transaction, &self.origin, input, now)?;
-        if !appended {
-            return Ok((local, false));
-        }
-        let published = match input.kind.as_str() {
-            "harness.observed" => {
-                publish_changed_harness_state_tx(&transaction, &self.origin, input, now)?
-            }
-            "harness.usage" => {
-                publish_due_usage_tx(&transaction, &self.origin, input, &local, now)?
-            }
-            _ => None,
-        };
-        transaction.commit().map_err(internal)?;
-        Ok((published.unwrap_or(local), true))
+        self.connection
+            .batched(|transaction| {
+                let (local, appended) =
+                    insert_local_observation_tx(transaction, &self.origin, input, now)?;
+                if !appended {
+                    return Ok((local, false));
+                }
+                let published = match input.kind.as_str() {
+                    "harness.observed" => {
+                        publish_changed_harness_state_tx(transaction, &self.origin, input, now)?
+                    }
+                    "harness.usage" => {
+                        publish_due_usage_tx(transaction, &self.origin, input, &local, now)?
+                    }
+                    _ => None,
+                };
+                Ok((published.unwrap_or(local), true))
+            })
+            .map_err(|error| St3Error::new("internal", error))?
     }
 
     /// A replicated snapshot of the local response totals affected by one timeline entry.
@@ -8741,12 +9013,15 @@ impl Store {
     }
 
     pub fn set_otlp_export_cursor(&self, cursor: u64) -> Result<()> {
-        let connection = self.connection.write();
-        connection.execute(
-            "INSERT INTO meta(key, value) VALUES ('otlp_export_cursor', ?1)
-             ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-            [cursor.to_string()],
-        )?;
+        self.connection
+            .batched(|transaction| {
+                transaction.execute(
+                    "INSERT INTO meta(key, value) VALUES ('otlp_export_cursor', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                    [cursor.to_string()],
+                )
+            })
+            .map_err(anyhow::Error::msg)??;
         Ok(())
     }
 
@@ -11206,524 +11481,525 @@ impl Store {
         ))
         .map_err(internal)?;
         let idempotency_key = format!("resource-observation:{operation_hash}");
-        let mut connection = self.connection.write();
-        if let Some(response) = connection
-            .query_row(
-                "SELECT response FROM idempotency WHERE operation_id=?1",
-                [opaque_cache_key(&idempotency_key)],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(internal)?
-        {
-            return serde_json::from_str(&response).map_err(internal);
-        }
-        let transaction = connection.transaction().map_err(internal)?;
-        let current_observer = current_desired_row_tx(&transaction, observer).map_err(internal)?;
-        if current_observer
-            .as_ref()
-            .map(|desired| desired.revision.as_str())
-            != Some(desired_revision)
-        {
-            return Err(St3Error::new(
-                "stale-observer-revision",
-                format!("observer `{observer}` changed before its observation completed"),
-            ));
-        }
-        let mut active_subscriptions = Vec::new();
-        for (subject, expected) in subscriptions {
-            let Some(desired) = current_desired_row_tx(&transaction, subject).map_err(internal)?
-            else {
-                continue;
-            };
-            if desired.kind != "subscription" {
-                continue;
-            }
-            let value = serde_json::from_str(&desired.body).map_err(internal)?;
-            if crate::graph::subscription_spec(&value).as_ref() == Some(expected)
-                && !expected.stopped
-            {
-                active_subscriptions.push((subject.clone(), expected.clone()));
-            }
-        }
-        let normalized_observation = normalize_resource_observation(
-            &transaction,
-            &ClaimInput {
-                subject: resource.into(),
-                kind: "resource.observed".into(),
-                actor: None,
-                fields: BTreeMap::from([("facts".into(), facts.clone())]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: None,
-            },
-        )?
-        .expect("a resource observation is normalized");
-        let resource_kind = normalized_observation
-            .get("kind")
-            .cloned()
-            .expect("a normalized resource observation has a kind");
-        let previous = latest_actual(&transaction, resource)
-            .map_err(internal)?
-            .and_then(|actual| actual.get("facts").cloned());
-        let baseline = previous.is_none();
-        let previous_object = previous.as_ref().and_then(Value::as_object);
-        let current_object = facts.as_object().ok_or_else(|| {
-            St3Error::new(
-                "invalid-resource-observation",
-                "resource observation facts must be an object",
-            )
-        })?;
-        let mut changed_fields = BTreeSet::new();
-        for field in current_object
-            .keys()
-            .chain(previous_object.into_iter().flat_map(serde_json::Map::keys))
-        {
-            if previous_object.and_then(|object| object.get(field)) != current_object.get(field) {
-                changed_fields.insert(field.clone());
-            }
-        }
-        let changed_fields = changed_fields.into_iter().collect::<Vec<_>>();
-        let observer_health_is_current = latest_actual(&transaction, observer)
-            .map_err(internal)?
-            .is_some_and(|actual| {
-                actual.get("state").and_then(Value::as_str) == Some("healthy")
-                    && actual.get("revision").and_then(Value::as_str) == Some(desired_revision)
-                    && actual.get("reason").is_none()
-            });
-        let mut subscription_states = BTreeMap::new();
-        for (subscription_subject, subscription) in &active_subscriptions {
-            let target_exists = if subscription.delivery == "message" {
-                transaction
+        self.connection
+            .batched(|transaction| -> Result<ResourceObservationOutcome, St3Error> {
+                if let Some(response) = transaction
                     .query_row(
-                        "SELECT 1 FROM desired WHERE subject=?1 AND kind='agent'",
-                        [&subscription.to],
-                        |_| Ok(()),
+                        "SELECT response FROM idempotency WHERE operation_id=?1",
+                        [opaque_cache_key(&idempotency_key)],
+                        |row| row.get::<_, String>(0),
                     )
                     .optional()
                     .map_err(internal)?
-                    .is_some()
-            } else {
-                true
-            };
-            let status = if target_exists { "active" } else { "pending" };
-            let current_status = latest_actual(&transaction, subscription_subject)
-                .map_err(internal)?
-                .and_then(|actual| {
-                    actual
-                        .get("state")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                });
-            subscription_states.insert(
-                subscription_subject.clone(),
-                (
-                    target_exists,
-                    status,
-                    current_status.as_deref() != Some(status),
-                ),
-            );
-        }
-        let changed = baseline || !changed_fields.is_empty();
-        let should_record = changed
-            || attempt.is_some()
-            || !observer_health_is_current
-            || subscription_states.values().any(|(_, _, changed)| *changed);
-        if !should_record {
-            return Ok(ResourceObservationOutcome {
-                baseline,
-                changed_fields,
-                observation_claim: None,
-                message_subjects: Vec::new(),
-            });
-        }
-        let now = write_time(&transaction, &self.origin).map_err(internal)?;
-        let sequence = next_replica_sequence(&transaction, &self.origin).map_err(internal)?;
-        let previous_hash = previous_batch_hash(&transaction, &self.origin).map_err(internal)?;
-        let batch_hash = batch_header_hash(&self.origin, sequence, previous_hash.as_deref(), now)
-            .map_err(internal)?;
-        let batch_id = format!("batch/{}/{sequence}/{batch_hash}", self.origin);
-        transaction
-            .execute(
-                "INSERT INTO batches(id, origin, replica_sequence, previous_hash, hash, accepted_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![
-                    batch_id,
-                    self.origin,
-                    sequence,
-                    previous_hash,
-                    batch_hash,
-                    now.to_string()
-                ],
-            )
-            .map_err(internal)?;
-        let observer_predecessors = latest_claim_id_tx(&transaction, observer)
-            .map_err(internal)?
-            .into_iter()
-            .collect::<Vec<_>>();
-        if !observer_health_is_current {
-            append_claim_tx(
-                &transaction,
-                &self.origin,
-                observer,
-                "observer.state",
-                None,
-                &json!({"fields": {
-                    "state": "healthy",
-                    "revision": desired_revision,
-                }}),
-                &observer_predecessors,
-                Some(&batch_id),
-            )
-            .map_err(internal)?;
-        }
-        if changed || attempt.is_some() {
-            let observer_predecessors = latest_claim_id_tx(&transaction, observer)
-                .map_err(internal)?
-                .into_iter()
-                .collect::<Vec<_>>();
-            let mut observer_fields = json!({
-                "status": "healthy",
-                "revision": desired_revision,
-                "cursor": cursor,
-                "changed": changed,
-            });
-            if let Some(attempt) = attempt {
-                observer_fields
-                    .as_object_mut()
-                    .expect("observer fields are an object")
-                    .insert("attempt".into(), Value::String(attempt.into()));
-            }
-            append_claim_tx(
-                &transaction,
-                &self.origin,
-                observer,
-                "observer.observed",
-                None,
-                &json!({"fields": observer_fields}),
-                &observer_predecessors,
-                Some(&batch_id),
-            )
-            .map_err(internal)?;
-        }
-        let observation_claim = if baseline || !changed_fields.is_empty() {
-            let predecessors = latest_claim_id_tx(&transaction, resource)
-                .map_err(internal)?
-                .into_iter()
-                .collect::<Vec<_>>();
-            Some(
-                append_claim_tx(
-                    &transaction,
-                    &self.origin,
-                    resource,
-                    "resource.observed",
-                    None,
-                    &json!({"fields": {
-                        "kind": resource_kind,
-                        "facts": facts,
-                        "observer": observer,
-                        "baseline": baseline,
-                        "changed_fields": changed_fields,
-                    }}),
-                    &predecessors,
-                    Some(&batch_id),
-                )
-                .map_err(internal)?,
-            )
-        } else {
-            None
-        };
-        let mut collection_discoveries = BTreeMap::<String, Vec<(String, String)>>::new();
-        if !baseline {
-            for field in ["pull_requests", "issues"] {
-                for DiscoveredItem {
-                    subject,
-                    kind,
-                    facts: mut item_facts,
-                    deliver,
-                } in discovered_collection_items(resource, field, previous.as_ref(), &facts)
                 {
-                    // An agent's checkout names the opener first. An authoring run's own pull
-                    // request resource names the run when no agent was found.
-                    if deliver
-                        && field == "pull_requests"
-                        && item_facts.get("opened_by").is_none()
-                        && item_facts.get("opened_by_run").is_none()
-                        && let Some(run) = authoring_pull_request_runs_tx(&transaction, &item_facts)
-                            .map_err(internal)?
-                            .into_iter()
-                            .next()
-                    {
-                        item_facts["opened_by_run"] = Value::String(run);
+                    return serde_json::from_str(&response).map_err(internal);
+                }
+                let current_observer = current_desired_row_tx(transaction, observer).map_err(internal)?;
+                if current_observer
+                    .as_ref()
+                    .map(|desired| desired.revision.as_str())
+                    != Some(desired_revision)
+                {
+                    return Err(St3Error::new(
+                        "stale-observer-revision",
+                        format!("observer `{observer}` changed before its observation completed"),
+                    ));
+                }
+                let mut active_subscriptions = Vec::new();
+                for (subject, expected) in subscriptions {
+                    let Some(desired) = current_desired_row_tx(transaction, subject).map_err(internal)?
+                    else {
+                        continue;
+                    };
+                    if desired.kind != "subscription" {
+                        continue;
                     }
-                    let predecessors = latest_claim_id_tx(&transaction, &subject)
+                    let value = serde_json::from_str(&desired.body).map_err(internal)?;
+                    if crate::graph::subscription_spec(&value).as_ref() == Some(expected)
+                        && !expected.stopped
+                    {
+                        active_subscriptions.push((subject.clone(), expected.clone()));
+                    }
+                }
+                let normalized_observation = normalize_resource_observation(
+                    transaction,
+                    &ClaimInput {
+                        subject: resource.into(),
+                        kind: "resource.observed".into(),
+                        actor: None,
+                        fields: BTreeMap::from([("facts".into(), facts.clone())]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    },
+                )?
+                .expect("a resource observation is normalized");
+                let resource_kind = normalized_observation
+                    .get("kind")
+                    .cloned()
+                    .expect("a normalized resource observation has a kind");
+                let previous = latest_actual(transaction, resource)
+                    .map_err(internal)?
+                    .and_then(|actual| actual.get("facts").cloned());
+                let baseline = previous.is_none();
+                let previous_object = previous.as_ref().and_then(Value::as_object);
+                let current_object = facts.as_object().ok_or_else(|| {
+                    St3Error::new(
+                        "invalid-resource-observation",
+                        "resource observation facts must be an object",
+                    )
+                })?;
+                let mut changed_fields = BTreeSet::new();
+                for field in current_object
+                    .keys()
+                    .chain(previous_object.into_iter().flat_map(serde_json::Map::keys))
+                {
+                    if previous_object.and_then(|object| object.get(field)) != current_object.get(field) {
+                        changed_fields.insert(field.clone());
+                    }
+                }
+                let changed_fields = changed_fields.into_iter().collect::<Vec<_>>();
+                let observer_health_is_current = latest_actual(transaction, observer)
+                    .map_err(internal)?
+                    .is_some_and(|actual| {
+                        actual.get("state").and_then(Value::as_str) == Some("healthy")
+                            && actual.get("revision").and_then(Value::as_str) == Some(desired_revision)
+                            && actual.get("reason").is_none()
+                    });
+                let mut subscription_states = BTreeMap::new();
+                for (subscription_subject, subscription) in &active_subscriptions {
+                    let target_exists = if subscription.delivery == "message" {
+                        transaction
+                            .query_row(
+                                "SELECT 1 FROM desired WHERE subject=?1 AND kind='agent'",
+                                [&subscription.to],
+                                |_| Ok(()),
+                            )
+                            .optional()
+                            .map_err(internal)?
+                            .is_some()
+                    } else {
+                        true
+                    };
+                    let status = if target_exists { "active" } else { "pending" };
+                    let current_status = latest_actual(transaction, subscription_subject)
+                        .map_err(internal)?
+                        .and_then(|actual| {
+                            actual
+                                .get("state")
+                                .and_then(Value::as_str)
+                                .map(str::to_owned)
+                        });
+                    subscription_states.insert(
+                        subscription_subject.clone(),
+                        (
+                            target_exists,
+                            status,
+                            current_status.as_deref() != Some(status),
+                        ),
+                    );
+                }
+                let changed = baseline || !changed_fields.is_empty();
+                let should_record = changed
+                    || attempt.is_some()
+                    || !observer_health_is_current
+                    || subscription_states.values().any(|(_, _, changed)| *changed);
+                if !should_record {
+                    return Ok(ResourceObservationOutcome {
+                        baseline,
+                        changed_fields,
+                        observation_claim: None,
+                        message_subjects: Vec::new(),
+                    });
+                }
+                let now = write_time(transaction, &self.origin).map_err(internal)?;
+                let sequence = next_replica_sequence(transaction, &self.origin).map_err(internal)?;
+                let previous_hash = previous_batch_hash(transaction, &self.origin).map_err(internal)?;
+                let batch_hash = batch_header_hash(&self.origin, sequence, previous_hash.as_deref(), now)
+                    .map_err(internal)?;
+                let batch_id = format!("batch/{}/{sequence}/{batch_hash}", self.origin);
+                transaction
+                    .execute(
+                        "INSERT INTO batches(id, origin, replica_sequence, previous_hash, hash, accepted_at_unix_ms)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        params![
+                            batch_id,
+                            self.origin,
+                            sequence,
+                            previous_hash,
+                            batch_hash,
+                            now.to_string()
+                        ],
+                    )
+                    .map_err(internal)?;
+                let observer_predecessors = latest_claim_id_tx(transaction, observer)
+                    .map_err(internal)?
+                    .into_iter()
+                    .collect::<Vec<_>>();
+                if !observer_health_is_current {
+                    append_claim_tx(
+                        transaction,
+                        &self.origin,
+                        observer,
+                        "observer.state",
+                        None,
+                        &json!({"fields": {
+                            "state": "healthy",
+                            "revision": desired_revision,
+                        }}),
+                        &observer_predecessors,
+                        Some(&batch_id),
+                    )
+                    .map_err(internal)?;
+                }
+                if changed || attempt.is_some() {
+                    let observer_predecessors = latest_claim_id_tx(transaction, observer)
                         .map_err(internal)?
                         .into_iter()
                         .collect::<Vec<_>>();
+                    let mut observer_fields = json!({
+                        "status": "healthy",
+                        "revision": desired_revision,
+                        "cursor": cursor,
+                        "changed": changed,
+                    });
+                    if let Some(attempt) = attempt {
+                        observer_fields
+                            .as_object_mut()
+                            .expect("observer fields are an object")
+                            .insert("attempt".into(), Value::String(attempt.into()));
+                    }
+                    append_claim_tx(
+                        transaction,
+                        &self.origin,
+                        observer,
+                        "observer.observed",
+                        None,
+                        &json!({"fields": observer_fields}),
+                        &observer_predecessors,
+                        Some(&batch_id),
+                    )
+                    .map_err(internal)?;
+                }
+                let observation_claim = if baseline || !changed_fields.is_empty() {
+                    let predecessors = latest_claim_id_tx(transaction, resource)
+                        .map_err(internal)?
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    Some(
+                        append_claim_tx(
+                            transaction,
+                            &self.origin,
+                            resource,
+                            "resource.observed",
+                            None,
+                            &json!({"fields": {
+                                "kind": resource_kind,
+                                "facts": facts,
+                                "observer": observer,
+                                "baseline": baseline,
+                                "changed_fields": changed_fields,
+                            }}),
+                            &predecessors,
+                            Some(&batch_id),
+                        )
+                        .map_err(internal)?,
+                    )
+                } else {
+                    None
+                };
+                let mut collection_discoveries = BTreeMap::<String, Vec<(String, String)>>::new();
+                if !baseline {
+                    for field in ["pull_requests", "issues"] {
+                        for DiscoveredItem {
+                            subject,
+                            kind,
+                            facts: mut item_facts,
+                            deliver,
+                        } in discovered_collection_items(resource, field, previous.as_ref(), &facts)
+                        {
+                            // An agent's checkout names the opener first. An authoring run's own pull
+                            // request resource names the run when no agent was found.
+                            if deliver
+                                && field == "pull_requests"
+                                && item_facts.get("opened_by").is_none()
+                                && item_facts.get("opened_by_run").is_none()
+                                && let Some(run) = authoring_pull_request_runs_tx(transaction, &item_facts)
+                                    .map_err(internal)?
+                                    .into_iter()
+                                    .next()
+                            {
+                                item_facts["opened_by_run"] = Value::String(run);
+                            }
+                            let predecessors = latest_claim_id_tx(transaction, &subject)
+                                .map_err(internal)?
+                                .into_iter()
+                                .collect::<Vec<_>>();
+                            let evidence = observation_claim
+                                .as_ref()
+                                .map(|claim| vec![claim.id.clone()])
+                                .unwrap_or_default();
+                            let claim = append_claim_tx(
+                                transaction,
+                                &self.origin,
+                                &subject,
+                                "resource.observed",
+                                None,
+                                &json!({"fields": {
+                                    "kind": kind,
+                                    "facts": item_facts,
+                                    "observer": observer,
+                                    "baseline": false,
+                                    "changed_fields": [field],
+                                }, "evidence": evidence}),
+                                &predecessors,
+                                Some(&batch_id),
+                            )
+                            .map_err(internal)?;
+                            if deliver {
+                                collection_discoveries
+                                    .entry(field.into())
+                                    .or_default()
+                                    .push((subject, claim.id));
+                            }
+                        }
+                    }
+                }
+                let mut available_subscriptions = BTreeSet::new();
+                for (subscription_subject, _) in &active_subscriptions {
+                    let (target_exists, status, status_changed) = subscription_states
+                        .get(subscription_subject)
+                        .copied()
+                        .expect("an active subscription has a computed state");
+                    if status_changed {
+                        let predecessors = latest_claim_id_tx(transaction, subscription_subject)
+                            .map_err(internal)?
+                            .into_iter()
+                            .collect::<Vec<_>>();
+                        append_claim_tx(
+                            transaction,
+                            &self.origin,
+                            subscription_subject,
+                            "subscription.state",
+                            None,
+                            &json!({"fields": {
+                                "state": status,
+                                "reason": (!target_exists).then_some("the delivery target is absent"),
+                            }}),
+                            &predecessors,
+                            Some(&batch_id),
+                        )
+                        .map_err(internal)?;
+                    }
+                    if target_exists {
+                        available_subscriptions.insert(subscription_subject.clone());
+                    }
+                }
+                let mut message_subjects = Vec::new();
+                if !baseline && !changed_fields.is_empty() {
                     let evidence = observation_claim
                         .as_ref()
                         .map(|claim| vec![claim.id.clone()])
                         .unwrap_or_default();
-                    let claim = append_claim_tx(
-                        &transaction,
-                        &self.origin,
-                        &subject,
-                        "resource.observed",
-                        None,
-                        &json!({"fields": {
-                            "kind": kind,
-                            "facts": item_facts,
-                            "observer": observer,
-                            "baseline": false,
-                            "changed_fields": [field],
-                        }, "evidence": evidence}),
-                        &predecessors,
-                        Some(&batch_id),
-                    )
-                    .map_err(internal)?;
-                    if deliver {
-                        collection_discoveries
-                            .entry(field.into())
-                            .or_default()
-                            .push((subject, claim.id));
-                    }
-                }
-            }
-        }
-        let mut available_subscriptions = BTreeSet::new();
-        for (subscription_subject, _) in &active_subscriptions {
-            let (target_exists, status, status_changed) = subscription_states
-                .get(subscription_subject)
-                .copied()
-                .expect("an active subscription has a computed state");
-            if status_changed {
-                let predecessors = latest_claim_id_tx(&transaction, subscription_subject)
-                    .map_err(internal)?
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                append_claim_tx(
-                    &transaction,
-                    &self.origin,
-                    subscription_subject,
-                    "subscription.state",
-                    None,
-                    &json!({"fields": {
-                        "state": status,
-                        "reason": (!target_exists).then_some("the delivery target is absent"),
-                    }}),
-                    &predecessors,
-                    Some(&batch_id),
-                )
-                .map_err(internal)?;
-            }
-            if target_exists {
-                available_subscriptions.insert(subscription_subject.clone());
-            }
-        }
-        let mut message_subjects = Vec::new();
-        if !baseline && !changed_fields.is_empty() {
-            let evidence = observation_claim
-                .as_ref()
-                .map(|claim| vec![claim.id.clone()])
-                .unwrap_or_default();
-            for (subscription_subject, subscription) in &active_subscriptions {
-                if !available_subscriptions.contains(subscription_subject) {
-                    continue;
-                }
-                let selected = changed_fields
-                    .iter()
-                    .filter(|field| subscription.fields.contains(field))
-                    .cloned()
-                    .collect::<Vec<_>>();
-                if selected.is_empty() {
-                    continue;
-                }
-                if let Some(condition) = &subscription.condition {
-                    let condition_is_true = subscription_condition_matches(condition, &facts);
-                    let condition_was_true = previous
-                        .as_ref()
-                        .is_some_and(|facts| subscription_condition_matches(condition, facts));
-                    if !condition_is_true || condition_was_true {
-                        continue;
-                    }
-                }
-                let stable = canonical_hash(&(
-                    observation_claim.as_ref().map(|claim| claim.id.as_str()),
-                    subscription_subject,
-                ))
-                .map_err(internal)?;
-                if subscription.delivery == "mission" {
-                    let Some(mission) = subscription.mission.as_deref() else {
-                        continue;
-                    };
-                    let Some(resource_input) = subscription.resource_input.as_deref() else {
-                        continue;
-                    };
-                    let Some(workspace) = subscription.workspace.as_deref() else {
-                        continue;
-                    };
-                    let uses_collection = selected
-                        .iter()
-                        .any(|field| matches!(field.as_str(), "pull_requests" | "issues"));
-                    let discoveries = if uses_collection {
-                        selected
-                            .iter()
-                            .flat_map(|field| {
-                                collection_discoveries
-                                    .get(field)
-                                    .into_iter()
-                                    .flatten()
-                                    .cloned()
-                            })
-                            .collect::<Vec<_>>()
-                    } else {
-                        observation_claim
-                            .as_ref()
-                            .map(|claim| vec![(resource.to_owned(), claim.id.clone())])
-                            .unwrap_or_default()
-                    };
-                    let mut requested_count = 0;
-                    for (delivery_resource, discovery) in discoveries {
-                        let discovery_body = transaction
-                            .query_row("SELECT body FROM claims WHERE id=?1", [&discovery], |row| {
-                                row.get::<_, String>(0)
-                            })
-                            .map_err(internal)?;
-                        let discovery_body: Value =
-                            serde_json::from_str(&discovery_body).map_err(internal)?;
-                        let head = discovery_body
-                            .pointer("/fields/facts/head_sha")
-                            .and_then(Value::as_str);
-                        let number = discovery_body
-                            .pointer("/fields/facts/number")
-                            .and_then(Value::as_u64);
-                        let kind = discovery_body
-                            .pointer("/fields/kind")
-                            .and_then(Value::as_str);
-                        let repository_identity = current_object
-                            .get("repository_id")
-                            .filter(|value| !value.is_null())
-                            .cloned()
-                            .unwrap_or_else(|| Value::String(resource.into()));
-                        let delivery_scope = subscription_subject
-                            .rsplit('/')
-                            .next()
-                            .expect("a subscription subject has a local name");
-                        let delivery_key = if uses_collection {
-                            canonical_hash(&(
-                                mission,
-                                delivery_scope,
-                                repository_identity,
-                                kind,
-                                number,
-                                head,
-                            ))
-                        } else {
-                            canonical_hash(&(subscription_subject, &discovery))
-                        }
-                        .map_err(internal)?;
-                        if uses_collection
-                            && collection_delivery_was_requested_tx(
-                                &transaction,
-                                mission,
-                                delivery_scope,
-                                &delivery_resource,
-                                head,
-                                &delivery_key,
-                            )
-                            .map_err(internal)?
-                        {
+                    for (subscription_subject, subscription) in &active_subscriptions {
+                        if !available_subscriptions.contains(subscription_subject) {
                             continue;
                         }
-                        let mut request_fields = json!({
-                            "mission": format!("mission/{mission}"),
-                            "resource": delivery_resource,
-                            "resource_input": resource_input,
-                            "workspace": workspace,
-                            "discovery": discovery,
-                            "delivery_key": delivery_key,
-                        });
-                        if let Some(revision) = subscription.revision.as_deref() {
-                            request_fields
-                                .as_object_mut()
-                                .expect("subscription request fields are an object")
-                                .insert("mission_revision".into(), Value::String(revision.into()));
+                        let selected = changed_fields
+                            .iter()
+                            .filter(|field| subscription.fields.contains(field))
+                            .cloned()
+                            .collect::<Vec<_>>();
+                        if selected.is_empty() {
+                            continue;
                         }
-                        // One observation starts a bounded number of runs. A person releases or
-                        // cancels the rest.
-                        if requested_count >= MAX_OBSERVATION_DELIVERIES {
-                            request_fields
-                                .as_object_mut()
-                                .expect("subscription request fields are an object")
-                                .insert("held".into(), Value::Bool(true));
+                        if let Some(condition) = &subscription.condition {
+                            let condition_is_true = subscription_condition_matches(condition, &facts);
+                            let condition_was_true = previous
+                                .as_ref()
+                                .is_some_and(|facts| subscription_condition_matches(condition, facts));
+                            if !condition_is_true || condition_was_true {
+                                continue;
+                            }
                         }
-                        if let Some(requester) = subscription.requester.as_deref() {
-                            request_fields
-                                .as_object_mut()
-                                .expect("subscription request fields are an object")
-                                .insert("requester".into(), Value::String(requester.into()));
-                        }
-                        append_claim_tx(
-                            &transaction,
-                            &self.origin,
+                        let stable = canonical_hash(&(
+                            observation_claim.as_ref().map(|claim| claim.id.as_str()),
                             subscription_subject,
-                            "subscription.mission-requested",
+                        ))
+                        .map_err(internal)?;
+                        if subscription.delivery == "mission" {
+                            let Some(mission) = subscription.mission.as_deref() else {
+                                continue;
+                            };
+                            let Some(resource_input) = subscription.resource_input.as_deref() else {
+                                continue;
+                            };
+                            let Some(workspace) = subscription.workspace.as_deref() else {
+                                continue;
+                            };
+                            let uses_collection = selected
+                                .iter()
+                                .any(|field| matches!(field.as_str(), "pull_requests" | "issues"));
+                            let discoveries = if uses_collection {
+                                selected
+                                    .iter()
+                                    .flat_map(|field| {
+                                        collection_discoveries
+                                            .get(field)
+                                            .into_iter()
+                                            .flatten()
+                                            .cloned()
+                                    })
+                                    .collect::<Vec<_>>()
+                            } else {
+                                observation_claim
+                                    .as_ref()
+                                    .map(|claim| vec![(resource.to_owned(), claim.id.clone())])
+                                    .unwrap_or_default()
+                            };
+                            let mut requested_count = 0;
+                            for (delivery_resource, discovery) in discoveries {
+                                let discovery_body = transaction
+                                    .query_row("SELECT body FROM claims WHERE id=?1", [&discovery], |row| {
+                                        row.get::<_, String>(0)
+                                    })
+                                    .map_err(internal)?;
+                                let discovery_body: Value =
+                                    serde_json::from_str(&discovery_body).map_err(internal)?;
+                                let head = discovery_body
+                                    .pointer("/fields/facts/head_sha")
+                                    .and_then(Value::as_str);
+                                let number = discovery_body
+                                    .pointer("/fields/facts/number")
+                                    .and_then(Value::as_u64);
+                                let kind = discovery_body
+                                    .pointer("/fields/kind")
+                                    .and_then(Value::as_str);
+                                let repository_identity = current_object
+                                    .get("repository_id")
+                                    .filter(|value| !value.is_null())
+                                    .cloned()
+                                    .unwrap_or_else(|| Value::String(resource.into()));
+                                let delivery_scope = subscription_subject
+                                    .rsplit('/')
+                                    .next()
+                                    .expect("a subscription subject has a local name");
+                                let delivery_key = if uses_collection {
+                                    canonical_hash(&(
+                                        mission,
+                                        delivery_scope,
+                                        repository_identity,
+                                        kind,
+                                        number,
+                                        head,
+                                    ))
+                                } else {
+                                    canonical_hash(&(subscription_subject, &discovery))
+                                }
+                                .map_err(internal)?;
+                                if uses_collection
+                                    && collection_delivery_was_requested_tx(
+                                        transaction,
+                                        mission,
+                                        delivery_scope,
+                                        &delivery_resource,
+                                        head,
+                                        &delivery_key,
+                                    )
+                                    .map_err(internal)?
+                                {
+                                    continue;
+                                }
+                                let mut request_fields = json!({
+                                    "mission": format!("mission/{mission}"),
+                                    "resource": delivery_resource,
+                                    "resource_input": resource_input,
+                                    "workspace": workspace,
+                                    "discovery": discovery,
+                                    "delivery_key": delivery_key,
+                                });
+                                if let Some(revision) = subscription.revision.as_deref() {
+                                    request_fields
+                                        .as_object_mut()
+                                        .expect("subscription request fields are an object")
+                                        .insert("mission_revision".into(), Value::String(revision.into()));
+                                }
+                                // One observation starts a bounded number of runs. A person releases or
+                                // cancels the rest.
+                                if requested_count >= MAX_OBSERVATION_DELIVERIES {
+                                    request_fields
+                                        .as_object_mut()
+                                        .expect("subscription request fields are an object")
+                                        .insert("held".into(), Value::Bool(true));
+                                }
+                                if let Some(requester) = subscription.requester.as_deref() {
+                                    request_fields
+                                        .as_object_mut()
+                                        .expect("subscription request fields are an object")
+                                        .insert("requester".into(), Value::String(requester.into()));
+                                }
+                                append_claim_tx(
+                                    transaction,
+                                    &self.origin,
+                                    subscription_subject,
+                                    "subscription.mission-requested",
+                                    None,
+                                    &json!({"fields": request_fields, "evidence": evidence}),
+                                    &[],
+                                    Some(&batch_id),
+                                )
+                                .map_err(claim_append_error)?;
+                                requested_count += 1;
+                            }
+                            continue;
+                        }
+                        let message_subject = format!("message/resource-{}", &stable[..20]);
+                        let content = serde_json::to_string(&json!({
+                            "resource": resource,
+                            "observer": observer,
+                            "changed_fields": selected,
+                            "facts": facts,
+                        }))
+                        .map_err(internal)?;
+                        append_claim_tx(
+                            transaction,
+                            &self.origin,
+                            &message_subject,
+                            "message.sent",
                             None,
-                            &json!({"fields": request_fields, "evidence": evidence}),
+                            &json!({"fields": {
+                                "from": format!("daemon/{}", self.origin),
+                                "to": subscription.to,
+                                "title": format!("Resource changed: {resource}"),
+                                "content": content,
+                                "status": "sent",
+                                "tags": ["resource-change", subscription_subject],
+                            }, "evidence": evidence}),
                             &[],
                             Some(&batch_id),
                         )
                         .map_err(claim_append_error)?;
-                        requested_count += 1;
+                        message_subjects.push(message_subject);
                     }
-                    continue;
                 }
-                let message_subject = format!("message/resource-{}", &stable[..20]);
-                let content = serde_json::to_string(&json!({
-                    "resource": resource,
-                    "observer": observer,
-                    "changed_fields": selected,
-                    "facts": facts,
-                }))
-                .map_err(internal)?;
-                append_claim_tx(
-                    &transaction,
-                    &self.origin,
-                    &message_subject,
-                    "message.sent",
-                    None,
-                    &json!({"fields": {
-                        "from": format!("daemon/{}", self.origin),
-                        "to": subscription.to,
-                        "title": format!("Resource changed: {resource}"),
-                        "content": content,
-                        "status": "sent",
-                        "tags": ["resource-change", subscription_subject],
-                    }, "evidence": evidence}),
-                    &[],
-                    Some(&batch_id),
-                )
-                .map_err(claim_append_error)?;
-                message_subjects.push(message_subject);
-            }
-        }
-        let outcome = ResourceObservationOutcome {
-            baseline,
-            changed_fields,
-            observation_claim: observation_claim.map(|claim| claim.id),
-            message_subjects,
-        };
-        transaction
-            .execute(
-                "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
-                params![
-                    opaque_cache_key(&idempotency_key),
-                    serde_json::to_string(&outcome).map_err(internal)?
-                ],
-            )
-            .map_err(internal)?;
-        transaction.commit().map_err(internal)?;
-        Ok(outcome)
+                let outcome = ResourceObservationOutcome {
+                    baseline,
+                    changed_fields,
+                    observation_claim: observation_claim.map(|claim| claim.id),
+                    message_subjects,
+                };
+                transaction
+                    .execute(
+                        "INSERT INTO idempotency(operation_id, response) VALUES (?1, ?2)",
+                        params![
+                            opaque_cache_key(&idempotency_key),
+                            serde_json::to_string(&outcome).map_err(internal)?
+                        ],
+                    )
+                    .map_err(internal)?;
+                Ok(outcome)
+            })
+            .map_err(|error| St3Error::new("internal", error))?
     }
 
     /// Every mission request that a subscription recorded, oldest first, with its disposition.
@@ -12000,15 +12276,19 @@ impl Store {
         attempts: u32,
     ) -> Result<()> {
         let deadline = i64::try_from(deadline)?;
-        self.connection.write().execute(
-            "INSERT INTO local_subscription_mission_deferrals
-                 (subject, request, not_before_unix_ms, attempts)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(subject, request) DO UPDATE SET
-                 not_before_unix_ms=excluded.not_before_unix_ms,
-                 attempts=excluded.attempts",
-            params![subject, request, deadline, attempts],
-        )?;
+        self.connection
+            .batched(|transaction| {
+                transaction.execute(
+                    "INSERT INTO local_subscription_mission_deferrals
+                         (subject, request, not_before_unix_ms, attempts)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(subject, request) DO UPDATE SET
+                         not_before_unix_ms=excluded.not_before_unix_ms,
+                         attempts=excluded.attempts",
+                    params![subject, request, deadline, attempts],
+                )
+            })
+            .map_err(anyhow::Error::msg)??;
         Ok(())
     }
 
@@ -13515,100 +13795,105 @@ impl Store {
                 "the peer belongs to another fleet",
             ));
         }
-        let mut connection = self.connection.write();
         let timing = time_stage(&self.replication_timers.receipt);
-        let transaction = connection.transaction().map_err(internal)?;
-        let mut received = 0;
-        let mut duplicate = 0;
-        let mut signatures = 0;
-        let now = now_ms().to_string();
-        for envelope in &input.envelopes {
-            // A checkpoint dropped this envelope here. Its tombstone already stands for it.
-            if checkpoint::envelope_tombstoned(
-                &transaction,
-                &envelope.writer,
-                envelope.sequence,
-                &envelope.hash,
-            )
-            .map_err(internal)?
-            {
-                duplicate += 1;
-                continue;
-            }
-            if let (Some(member_key), Some(signature)) = (&envelope.member_key, &envelope.signature)
-            {
-                signatures += store_envelope_signature_tx(
-                    &transaction,
-                    fleet_id,
-                    &envelope.writer,
-                    envelope.sequence,
-                    &envelope.hash,
-                    member_key,
-                    signature,
-                    &now,
-                )
-                .map_err(internal)?;
-            }
-            let inserted = transaction
-                .execute(
-                    "INSERT OR IGNORE INTO replica_envelopes(
-                         writer, sequence, envelope_hash, previous_hash, accepted_at_unix_ms,
-                         payload, relay, receipt_state, received_at_unix_ms
-                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
-                    params![
-                        envelope.writer,
+        // The envelopes wait as pending in a savepoint of the writer's next batch; admission and
+        // projection take them from there.
+        let (received, duplicate, signatures) = self
+            .connection
+            .batched(|transaction| -> Result<(usize, usize, usize), St3Error> {
+                let mut received = 0;
+                let mut duplicate = 0;
+                let mut signatures = 0;
+                let now = now_ms().to_string();
+                for envelope in &input.envelopes {
+                    // A checkpoint dropped this envelope here. Its tombstone already stands for it.
+                    if checkpoint::envelope_tombstoned(
+                        transaction,
+                        &envelope.writer,
                         envelope.sequence,
-                        envelope.hash,
-                        envelope.previous_hash,
-                        envelope.accepted_at_unix_ms.to_string(),
-                        envelope.payload,
-                        relay,
-                        now,
-                    ],
-                )
-                .map_err(internal)?;
-            if inserted == 0 {
-                duplicate += 1;
-            } else {
-                received += 1;
-            }
-        }
-        for signature in &input.signatures {
-            if checkpoint::envelope_tombstoned(
-                &transaction,
-                &signature.writer,
-                signature.sequence,
-                &signature.hash,
-            )
-            .map_err(internal)?
-            {
-                continue;
-            }
-            signatures += store_envelope_signature_tx(
-                &transaction,
-                fleet_id,
-                &signature.writer,
-                signature.sequence,
-                &signature.hash,
-                &signature.member_key,
-                &signature.signature,
-                &now,
-            )
-            .map_err(internal)?;
-        }
-        transaction
-            .execute(
-                "INSERT INTO replication_peers(peer, status, last_success_at_unix_ms, schema_digest,
-                                                authority_digest, graph_digest, updated_at_unix_ms)
-                 VALUES (?1, 'up', ?2, ?3, ?4, ?5, ?2)
-                 ON CONFLICT(peer) DO UPDATE SET status='up', last_success_at_unix_ms=excluded.last_success_at_unix_ms,
-                    last_error=NULL, schema_digest=excluded.schema_digest,
-                    authority_digest=excluded.authority_digest, graph_digest=excluded.graph_digest,
-                    updated_at_unix_ms=excluded.updated_at_unix_ms",
-                params![relay, now, input.schema_digest, input.authority_digest, input.graph_digest],
-            )
-            .map_err(internal)?;
-        transaction.commit().map_err(internal)?;
+                        &envelope.hash,
+                    )
+                    .map_err(internal)?
+                    {
+                        duplicate += 1;
+                        continue;
+                    }
+                    if let (Some(member_key), Some(signature)) = (&envelope.member_key, &envelope.signature)
+                    {
+                        signatures += store_envelope_signature_tx(
+                            transaction,
+                            fleet_id,
+                            &envelope.writer,
+                            envelope.sequence,
+                            &envelope.hash,
+                            member_key,
+                            signature,
+                            &now,
+                        )
+                        .map_err(internal)?;
+                    }
+                    let inserted = transaction
+                        .execute(
+                            "INSERT OR IGNORE INTO replica_envelopes(
+                                 writer, sequence, envelope_hash, previous_hash, accepted_at_unix_ms,
+                                 payload, relay, receipt_state, received_at_unix_ms
+                             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'pending', ?8)",
+                            params![
+                                envelope.writer,
+                                envelope.sequence,
+                                envelope.hash,
+                                envelope.previous_hash,
+                                envelope.accepted_at_unix_ms.to_string(),
+                                envelope.payload,
+                                relay,
+                                now,
+                            ],
+                        )
+                        .map_err(internal)?;
+                    if inserted == 0 {
+                        duplicate += 1;
+                    } else {
+                        received += 1;
+                    }
+                }
+                for signature in &input.signatures {
+                    if checkpoint::envelope_tombstoned(
+                        transaction,
+                        &signature.writer,
+                        signature.sequence,
+                        &signature.hash,
+                    )
+                    .map_err(internal)?
+                    {
+                        continue;
+                    }
+                    signatures += store_envelope_signature_tx(
+                        transaction,
+                        fleet_id,
+                        &signature.writer,
+                        signature.sequence,
+                        &signature.hash,
+                        &signature.member_key,
+                        &signature.signature,
+                        &now,
+                    )
+                    .map_err(internal)?;
+                }
+                transaction
+                    .execute(
+                        "INSERT INTO replication_peers(peer, status, last_success_at_unix_ms, schema_digest,
+                                                        authority_digest, graph_digest, updated_at_unix_ms)
+                         VALUES (?1, 'up', ?2, ?3, ?4, ?5, ?2)
+                         ON CONFLICT(peer) DO UPDATE SET status='up', last_success_at_unix_ms=excluded.last_success_at_unix_ms,
+                            last_error=NULL, schema_digest=excluded.schema_digest,
+                            authority_digest=excluded.authority_digest, graph_digest=excluded.graph_digest,
+                            updated_at_unix_ms=excluded.updated_at_unix_ms",
+                        params![relay, now, input.schema_digest, input.authority_digest, input.graph_digest],
+                    )
+                    .map_err(internal)?;
+                Ok((received, duplicate, signatures))
+            })
+            .map_err(|error| St3Error::new("internal", error))??;
         drop(timing);
         self.replication_timers
             .exchanges
@@ -13619,7 +13904,6 @@ impl Store {
         if received != 0 {
             self.replica_generation.fetch_add(1, Ordering::AcqRel);
         }
-        drop(connection);
         let snapshot = self.replication_snapshot().map_err(internal)?;
         let difference = replication_inventory_difference(
             &snapshot.inventory,
@@ -14293,16 +14577,17 @@ impl Store {
         {
             return Ok(true);
         }
-        {
-            let connection = self.connection.write();
-            connection.execute(
-                "INSERT INTO replication_peers(peer, status, last_error, updated_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4)
-                 ON CONFLICT(peer) DO UPDATE SET status=excluded.status, last_error=excluded.last_error,
-                    updated_at_unix_ms=excluded.updated_at_unix_ms",
-                params![peer, status, error, now_ms().to_string()],
-            )?;
-        }
+        self.connection
+            .batched(|transaction| {
+                transaction.execute(
+                    "INSERT INTO replication_peers(peer, status, last_error, updated_at_unix_ms)
+                     VALUES (?1, ?2, ?3, ?4)
+                     ON CONFLICT(peer) DO UPDATE SET status=excluded.status, last_error=excluded.last_error,
+                        updated_at_unix_ms=excluded.updated_at_unix_ms",
+                    params![peer, status, error, now_ms().to_string()],
+                )
+            })
+            .map_err(anyhow::Error::msg)??;
         Ok(true)
     }
 
@@ -16618,12 +16903,8 @@ fn unresolved_graph_references(
             .collect::<Result<Vec<_>, _>>()
             .map_err(internal)?
     };
-    let mut unresolved = crate::references::graph(
-        &missions,
-        &desired,
-        &ReferenceGraph { connection },
-        origin,
-    )?;
+    let mut unresolved =
+        crate::references::graph(&missions, &desired, &ReferenceGraph { connection }, origin)?;
     let mut statement = connection
         .prepare(
             "SELECT r.id, r.mission_id, g.revision FROM mission_runs r
@@ -31363,7 +31644,9 @@ mod tests {
         drop(Store::open(&path, "node").unwrap());
         {
             let connection = Connection::open(&path).unwrap();
-            connection.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+            connection
+                .execute_batch("PRAGMA foreign_keys = OFF")
+                .unwrap();
             connection
                 .execute(
                     "INSERT INTO operations(id, request_digest, canonical_claim_id, state)
@@ -31383,7 +31666,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(kept, "a start with current derived tables must not rebuild them");
+        assert!(
+            kept,
+            "a start with current derived tables must not rebuild them"
+        );
         drop(reopened);
         {
             let connection = Connection::open(&path).unwrap();
@@ -31560,6 +31846,144 @@ mod tests {
         assert!(proof.passed, "{proof:?}");
     }
 
+    /// Writes that arrive together share one transaction and one commit, and each caller hears
+    /// back only once that commit is on disk.
+    #[test]
+    fn concurrent_claims_share_the_writer_s_commits() {
+        let directory = tempfile::tempdir().unwrap();
+        let store =
+            Arc::new(Store::open(&directory.path().join("claims.sqlite3"), "node").unwrap());
+        let start = Arc::new(std::sync::Barrier::new(32));
+        let writers = (0..32)
+            .map(|index| {
+                let (store, start) = (store.clone(), start.clone());
+                std::thread::spawn(move || {
+                    start.wait();
+                    store
+                        .append_claim(&ClaimInput {
+                            subject: format!("agent/node.writer-{index}"),
+                            kind: "harness.usage".into(),
+                            actor: Some(format!("agent/node.writer-{index}")),
+                            fields: serde_json::from_value(json!({
+                                "driver": "codex", "incarnation_id": "current",
+                                "semantics": "response", "total_tokens": index
+                            }))
+                            .unwrap(),
+                            evidence: Vec::new(),
+                            expected_subject: None,
+                            idempotency_key: Some(format!("usage-{index}")),
+                        })
+                        .unwrap()
+                })
+            })
+            .collect::<Vec<_>>();
+        let claims = writers
+            .into_iter()
+            .map(|writer| writer.join().unwrap())
+            .collect::<Vec<_>>();
+        let (batches, writes) = (
+            store.connection.batches.0.load(Ordering::Relaxed),
+            store.connection.batches.1.load(Ordering::Relaxed),
+        );
+        assert_eq!(writes, 32, "{batches} batches");
+        assert!(batches < 32, "32 concurrent claims took {batches} commits");
+        // Each claim is committed when its writer hears back.
+        for claim in claims {
+            assert!(store.claim_by_id(&claim.id).unwrap().is_some());
+        }
+    }
+
+    /// A batched write that fails or panics undoes only its own savepoint: the writes that share
+    /// its transaction still commit, the failed caller gets its error and the panic reaches the
+    /// caller that panicked.
+    #[test]
+    fn a_failed_batched_write_undoes_only_itself() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let insert = |transaction: &Transaction<'_>, key: &str| {
+            transaction
+                .execute("INSERT INTO meta(key, value) VALUES (?1, 'written')", [key])
+                .map(drop)
+        };
+        // Hold the writer so the three writes queue behind it and share the next batch.
+        let held = store.connection.write();
+        let writers = ["succeeds", "fails", "panics"].map(|outcome| {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                store
+                    .connection
+                    .batched(|transaction| -> Result<(), String> {
+                        insert(transaction, &format!("batch-test-{outcome}"))
+                            .map_err(|error| error.to_string())?;
+                        match outcome {
+                            "fails" => Err("refused".into()),
+                            "panics" => panic!("a batched write panicked"),
+                            _ => Ok(()),
+                        }
+                    })
+                    .unwrap()
+            })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        drop(held);
+        let [succeeds, fails, panics] = writers.map(|writer| writer.join());
+        assert_eq!(succeeds.unwrap(), Ok(()));
+        assert_eq!(fails.unwrap(), Err("refused".into()));
+        assert!(panics.is_err());
+        let reader = store.readers.get();
+        let written = |key: &str| {
+            reader
+                .query_row("SELECT 1 FROM meta WHERE key=?1", [key], |_| Ok(()))
+                .optional()
+                .unwrap()
+                .is_some()
+        };
+        assert!(written("batch-test-succeeds"));
+        assert!(!written("batch-test-fails"));
+        assert!(!written("batch-test-panics"));
+        // The writer keeps working after both.
+        store
+            .connection
+            .batched(|transaction| insert(transaction, "batch-test-after"))
+            .unwrap()
+            .unwrap();
+        assert!(written("batch-test-after"));
+    }
+
+    /// A batch that cannot begin, because another process holds SQLite's write lock past the busy
+    /// timeout, answers each of its writes with that error instead of losing them.
+    #[test]
+    fn a_batch_that_cannot_begin_answers_its_writes_with_the_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claims.sqlite3");
+        let store = Store::open(&path, "node").unwrap();
+        store
+            .connection
+            .write()
+            .execute_batch("PRAGMA busy_timeout = 50")
+            .unwrap();
+        let other = Connection::open(&path).unwrap();
+        other.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let refused = store.connection.batched(|transaction| {
+            transaction.execute(
+                "INSERT INTO meta(key, value) VALUES ('refused', 'written')",
+                [],
+            )
+        });
+        let error = refused.expect_err("the batch could not begin");
+        assert!(error.contains("locked"), "{error}");
+        other.execute_batch("ROLLBACK").unwrap();
+        store
+            .connection
+            .batched(|transaction| {
+                transaction.execute(
+                    "INSERT INTO meta(key, value) VALUES ('after', 'written')",
+                    [],
+                )
+            })
+            .unwrap()
+            .unwrap();
+    }
+
     /// A panic while the writer is held leaves no half-written transaction behind, so it must not
     /// turn every later write into a panic while the daemon keeps running.
     #[test]
@@ -31572,7 +31996,6 @@ mod tests {
         })
         .join();
         assert!(panicked.is_err());
-        assert!(store.connection.connection.is_poisoned());
         store
             .append_claim(&ClaimInput {
                 subject: "daemon/node".into(),

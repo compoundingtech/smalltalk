@@ -3700,6 +3700,22 @@ where
     .map_err(ApiError::bad)
 }
 
+/// Run a handler's store work on a blocking thread, so a write waiting for the writer's next
+/// commit never holds an async worker that other requests need.
+async fn blocking_api<T, F>(operation: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
+{
+    let profile = crate::profile::current();
+    tokio::task::spawn_blocking(move || {
+        let _entered = crate::profile::enter(profile.as_ref());
+        operation()
+    })
+    .await
+    .map_err(ApiError::internal)?
+}
+
 pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
     serve_unix_inner(socket, app, false).await
 }
@@ -7839,7 +7855,7 @@ async fn send_message(
     State(state): State<AppState>,
     Json(request): Json<MessageSendRequest>,
 ) -> Result<Json<MessageView>, ApiError> {
-    accept_message(&state, request, None)
+    blocking_api(move || accept_message(&state, request, None)).await
 }
 
 fn accept_message(
@@ -8136,51 +8152,55 @@ async fn post_message_claim(
             )));
         }
     };
-    // One message, not every message the store has ever held: a lifecycle post read and folded
-    // the whole mailbox, a quarter second on a busy host's store, while holding up the next write.
-    let message = state
-        .store
-        .message(&subject)
-        .map_err(ApiError::internal)?
-        .ok_or_else(|| ApiError::not_found(format!("message `{subject}` does not exist")))?;
-    let actor = request.actor.ok_or_else(|| {
-        ApiError::bad(St3Error::new(
-            "missing-message-actor",
-            "message lifecycle transitions require the recipient actor",
-        ))
-    })?;
-    let actor = normalize_message_party(&actor);
-    if actor != message.to {
-        return Err(ApiError::bad(St3Error::new(
-            "wrong-message-recipient",
-            format!(
-                "message `{subject}` belongs to `{}`, not `{actor}`",
-                message.to
-            ),
-        )));
-    }
-    let mut fields = BTreeMap::from([("status".into(), Value::String(request.lifecycle.clone()))]);
-    if kind == "message.staged" {
-        fields.insert("recipient".into(), Value::String(actor.clone()));
-        if let Some(transport) = request.transport {
-            fields.insert("transport".into(), Value::String(transport));
+    let store = state.store.clone();
+    let record = blocking_api(move || {
+        // One message, not every message the store has ever held: a lifecycle post read and folded
+        // the whole mailbox, a quarter second on a busy host's store, while holding up the next write.
+        let message = store
+            .message(&subject)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found(format!("message `{subject}` does not exist")))?;
+        let actor = request.actor.ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "missing-message-actor",
+                "message lifecycle transitions require the recipient actor",
+            ))
+        })?;
+        let actor = normalize_message_party(&actor);
+        if actor != message.to {
+            return Err(ApiError::bad(St3Error::new(
+                "wrong-message-recipient",
+                format!(
+                    "message `{subject}` belongs to `{}`, not `{actor}`",
+                    message.to
+                ),
+            )));
         }
-        if let Some(runtime_id) = request.runtime_id {
-            fields.insert("runtime_id".into(), Value::String(runtime_id));
+        let mut fields =
+            BTreeMap::from([("status".into(), Value::String(request.lifecycle.clone()))]);
+        if kind == "message.staged" {
+            fields.insert("recipient".into(), Value::String(actor.clone()));
+            if let Some(transport) = request.transport {
+                fields.insert("transport".into(), Value::String(transport));
+            }
+            if let Some(runtime_id) = request.runtime_id {
+                fields.insert("runtime_id".into(), Value::String(runtime_id));
+            }
         }
-    }
-    let record = state
-        .store
-        .append_claim(&ClaimInput {
-            subject,
-            kind: kind.into(),
-            actor: Some(actor),
-            fields,
-            evidence: request.evidence,
-            expected_subject: request.expected_subject,
-            idempotency_key: Some(request.idempotency_key),
-        })
-        .map_err(ApiError::bad)?;
+        let record = store
+            .append_claim(&ClaimInput {
+                subject,
+                kind: kind.into(),
+                actor: Some(actor),
+                fields,
+                evidence: request.evidence,
+                expected_subject: request.expected_subject,
+                idempotency_key: Some(request.idempotency_key),
+            })
+            .map_err(ApiError::bad)?;
+        Ok(record)
+    })
+    .await?;
     signal_changed(&state);
     Ok(Json(record))
 }
