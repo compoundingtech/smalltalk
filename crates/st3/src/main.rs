@@ -2336,7 +2336,7 @@ enum AgentsCommand {
     New(AgentNewArgs),
     /// Preview and apply one KDL file containing durable agent seats.
     Apply(AgentApplyArgs),
-    /// Start or update one durable typed-harness seat.
+    /// Start a durable seat, patching only explicitly supplied declaration fields.
     Start(AgentStartArgs),
     /// Stop one exact durable seat.
     Stop(AgentStopArgs),
@@ -2500,21 +2500,26 @@ struct AgentStartArgs {
     /// A doubled agent/agent/ prefix is rejected.
     #[arg(value_parser = parse_agent_start_identity)]
     identity: String,
-    #[arg(long, default_value = "claude", value_parser = ["claude", "codex", "pi", "omp", "opencode"])]
-    harness: String,
+    /// Override the typed harness; new seats default to claude.
+    #[arg(long, value_parser = ["claude", "codex", "pi", "omp", "opencode"])]
+    harness: Option<String>,
     #[arg(long)]
     host: Option<String>,
-    #[arg(long, default_value = ".")]
-    workspace: PathBuf,
+    /// Override the workspace; new seats default to the current directory.
+    #[arg(long)]
+    workspace: Option<PathBuf>,
+    /// Set the typed-harness model; refused for existing command/argv seats.
     #[arg(long)]
     model: Option<String>,
+    /// Set the typed-harness reasoning effort; refused for existing command/argv seats.
     #[arg(long)]
     effort: Option<String>,
+    /// Replace typed-harness extra arguments; refused for existing command/argv seats.
     #[arg(long = "arg")]
     arguments: Vec<String>,
     #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
-    /// Print the exact seat KDL without publishing it.
+    /// Read the daemon's declaration and print the effective seat KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
 }
@@ -4915,6 +4920,16 @@ async fn publish_text(
     source_name: String,
     actor: String,
 ) -> Result<ApplyResponse> {
+    publish_text_with_expected(client, kdl, source_name, actor, None).await
+}
+
+async fn publish_text_with_expected(
+    client: &Client,
+    kdl: String,
+    source_name: String,
+    actor: String,
+    expected: Option<(&str, &[String])>,
+) -> Result<ApplyResponse> {
     let intent = IntentInput {
         kdl,
         source_name: Some(source_name),
@@ -4933,6 +4948,12 @@ async fn publish_text(
         "{}",
         mission.blockers.join("; ")
     );
+    if let Some((subject, tokens)) = expected {
+        anyhow::ensure!(
+            mission.subject_tokens.get(subject).map(Vec::as_slice) == Some(tokens),
+            "the declaration for `{subject}` changed while preparing start; retry the command"
+        );
+    }
     let resolved = mission.resolved_intent;
     client
         .post(
@@ -8288,16 +8309,19 @@ async fn run_agents(
             print_value(&response, json_output)
         }
         AgentsCommand::Start(args) => {
-            let kdl = agent_start_document(&args)?;
+            let client = cli_client(endpoint);
+            let (subject, tokens, existing) = agent_start_declaration(&client, &args).await?;
+            let kdl = agent_start_document(&args, existing.as_ref())?;
             if args.print_kdl {
                 print!("{kdl}");
                 return Ok(());
             }
-            let response = publish_text(
-                &cli_client(endpoint),
+            let response = publish_text_with_expected(
+                &client,
                 kdl,
                 format!("st agents start {}", args.identity),
                 args.actor.clone(),
+                Some((&subject, &tokens)),
             )
             .await?;
             print_value(&response, json_output)?;
@@ -8356,47 +8380,190 @@ fn parse_agent_start_identity(identity: &str) -> Result<String, String> {
     Ok(identity.strip_prefix("agent/").unwrap_or(identity).into())
 }
 
-fn agent_start_document(args: &AgentStartArgs) -> Result<String> {
-    let mut agent = KdlNode::new("agent");
-    agent
-        .entries_mut()
-        .push(KdlEntry::new(args.identity.clone()));
-    let mut body = KdlDocument::new();
-    if let Some(host) = &args.host {
-        body.nodes_mut().push(kdl_node("host", [host.as_str()]));
+async fn agent_start_declaration(
+    client: &Client,
+    args: &AgentStartArgs,
+) -> Result<(String, Vec<String>, Option<st3::model::DesiredSubject>)> {
+    let mut subject = format!("agent/{}", args.identity);
+    let mut status = status_for(client, &subject).await?;
+    if status
+        .subjects
+        .iter()
+        .all(|item| item.desired_token.is_none())
+        && !args.identity.contains(['/', '.'])
+    {
+        let host = if let Some(host) = args.host.as_ref().filter(|host| host.as_str() != "local") {
+            host.clone()
+        } else {
+            let health: Value = client.get("/v1/health").await?;
+            health["node"]
+                .as_str()
+                .context("daemon health has no node")?
+                .into()
+        };
+        subject = format!("agent/{host}.{}", args.identity);
+        status = status_for(client, &subject).await?;
     }
-    let workspace = fs::canonicalize(&args.workspace)
-        .with_context(|| format!("resolve workspace {}", args.workspace.display()))?
-        .display()
-        .to_string();
-    body.nodes_mut()
-        .push(kdl_node("workspace", [workspace.as_str()]));
-    body.nodes_mut().push(kdl_node("restart", ["always"]));
+    let Some(current) = status.subjects.iter().find(|item| item.subject == subject) else {
+        return Ok((subject, Vec::new(), None));
+    };
+    anyhow::ensure!(
+        current.conflicts.is_empty(),
+        "`{subject}` has conflicting declarations; resolve them before starting it"
+    );
+    let Some(token) = &current.desired_token else {
+        return Ok((subject, Vec::new(), None));
+    };
+    let mut claim: st3::model::ClaimRecord =
+        client.get(&format!("/v1/claims/by-id/{token}")).await?;
+    loop {
+        let desired: st3::model::DesiredSubject = serde_json::from_value(claim.body)?;
+        if desired.kind == "agent" {
+            anyhow::ensure!(
+                desired.owner_run.is_none(),
+                "`{subject}` is mission-owned; change its declaration through its mission"
+            );
+            return Ok((subject, vec![token.clone()], Some(desired)));
+        }
+        anyhow::ensure!(
+            desired.kind == "stop" && claim.predecessors.len() == 1,
+            "`{subject}` has no unambiguous prior agent declaration; use `st agents apply`"
+        );
+        claim = client
+            .get(&format!("/v1/claims/by-id/{}", claim.predecessors[0]))
+            .await?;
+    }
+}
 
-    let mut harness = KdlNode::new("harness");
-    harness
-        .entries_mut()
-        .push(KdlEntry::new(args.harness.clone()));
-    let mut harness_body = KdlDocument::new();
-    if let Some(model) = &args.model {
-        harness_body
-            .nodes_mut()
-            .push(kdl_node("model", [model.as_str()]));
+fn declaration_node(value: &Value) -> Result<KdlNode> {
+    let mut node = KdlNode::new(value["name"].as_str().context("declaration has no name")?);
+    if let Some(arguments) = value["arguments"].as_array() {
+        for argument in arguments {
+            node.entries_mut()
+                .push(KdlEntry::new(declaration_value(argument)?));
+        }
     }
-    if let Some(effort) = &args.effort {
-        harness_body
-            .nodes_mut()
-            .push(kdl_node("effort", [effort.as_str()]));
+    if let Some(properties) = value["properties"].as_object() {
+        for (name, value) in properties {
+            node.entries_mut()
+                .push(KdlEntry::new_prop(name.as_str(), declaration_value(value)?));
+        }
     }
-    if !args.arguments.is_empty() {
-        let mut arguments = KdlNode::new("args");
-        arguments
-            .entries_mut()
-            .extend(args.arguments.iter().cloned().map(KdlEntry::new));
-        harness_body.nodes_mut().push(arguments);
+    if let Some(children) = value["children"].as_array() {
+        let mut body = KdlDocument::new();
+        for child in children {
+            body.nodes_mut().push(declaration_node(child)?);
+        }
+        node.set_children(body);
     }
-    harness.set_children(harness_body);
-    body.nodes_mut().push(harness);
+    Ok(node)
+}
+
+fn declaration_value(value: &Value) -> Result<kdl::KdlValue> {
+    Ok(match value {
+        Value::String(value) => kdl::KdlValue::String(value.clone()),
+        Value::Bool(value) => kdl::KdlValue::Bool(*value),
+        Value::Null => kdl::KdlValue::Null,
+        Value::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                kdl::KdlValue::Integer(integer.into())
+            } else {
+                kdl::KdlValue::Float(value.as_f64().context("invalid declaration number")?)
+            }
+        }
+        _ => anyhow::bail!("invalid declaration value: {value}"),
+    })
+}
+
+fn replace_declaration_child(body: &mut KdlDocument, node: KdlNode) {
+    if let Some(current) = body
+        .nodes_mut()
+        .iter_mut()
+        .find(|child| child.name() == node.name())
+    {
+        *current = node;
+    } else {
+        body.nodes_mut().push(node);
+    }
+}
+
+fn agent_start_document(
+    args: &AgentStartArgs,
+    existing: Option<&st3::model::DesiredSubject>,
+) -> Result<String> {
+    let mut agent = match existing {
+        Some(existing) => declaration_node(&existing.desired)?,
+        None => kdl_node("agent", [args.identity.as_str()]),
+    };
+    let mut body = agent.children().cloned().unwrap_or_default();
+    if let Some(existing) = existing {
+        // Pin the existing subject before changing placement, including a host-prefixed simple
+        // name and a declaration originally nested inside a host.
+        let identity = existing
+            .subject
+            .strip_prefix("agent/")
+            .unwrap_or(&existing.subject);
+        if body.get("identity").is_some() {
+            replace_declaration_child(&mut body, kdl_node("identity", [identity]));
+        } else {
+            agent.entries_mut()[0] = KdlEntry::new(identity);
+        }
+    }
+    if let Some(host) = args.host.as_deref().or_else(|| {
+        existing.and_then(|seat| seat.member.as_ref().map(|member| member.host.as_str()))
+    }) {
+        replace_declaration_child(&mut body, kdl_node("host", [host]));
+    }
+    if args.workspace.is_some() || existing.is_none() {
+        let path = args.workspace.as_deref().unwrap_or_else(|| Path::new("."));
+        let workspace = fs::canonicalize(path)
+            .with_context(|| format!("resolve workspace {}", path.display()))?
+            .display()
+            .to_string();
+        replace_declaration_child(&mut body, kdl_node("workspace", [workspace.as_str()]));
+    }
+    if existing.is_none() {
+        body.nodes_mut().push(kdl_node("restart", ["always"]));
+    }
+    let harness_options =
+        args.model.is_some() || args.effort.is_some() || !args.arguments.is_empty();
+    if existing.is_some() && body.get("harness").is_none() && harness_options {
+        let style = if body.get("command").is_some() {
+            "command"
+        } else {
+            "argv"
+        };
+        anyhow::bail!(
+            "`{}` uses a `{style}` declaration, not a typed harness; \
+             --model, --effort and --arg require a typed harness",
+            args.identity
+        );
+    }
+    if existing.is_none() || body.get("harness").is_some() || args.harness.is_some() {
+        let mut harness = body
+            .get("harness")
+            .cloned()
+            .unwrap_or_else(|| kdl_node("harness", [args.harness.as_deref().unwrap_or("claude")]));
+        if let Some(driver) = &args.harness {
+            harness.entries_mut()[0] = KdlEntry::new(driver.clone());
+            body.nodes_mut()
+                .retain(|node| !matches!(node.name().value(), "command" | "argv"));
+        }
+        let mut harness_body = harness.children().cloned().unwrap_or_default();
+        for (name, value) in [("model", &args.model), ("effort", &args.effort)] {
+            if let Some(value) = value {
+                replace_declaration_child(&mut harness_body, kdl_node(name, [value.as_str()]));
+            }
+        }
+        if !args.arguments.is_empty() {
+            replace_declaration_child(
+                &mut harness_body,
+                kdl_node("args", args.arguments.iter().map(String::as_str)),
+            );
+        }
+        harness.set_children(harness_body);
+        replace_declaration_child(&mut body, harness);
+    }
     agent.set_children(body);
     Ok(publication_document(agent))
 }
@@ -17323,7 +17490,7 @@ mod tests {
         else {
             panic!("agents start did not parse");
         };
-        let kdl = agent_start_document(&args).unwrap();
+        let kdl = agent_start_document(&args, None).unwrap();
         let intent = st3::parse_intent(&kdl, "node").unwrap();
         assert!(intent.subjects.contains_key("agent/example/cos/standing/cos"));
         assert!(
