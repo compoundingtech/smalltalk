@@ -2,6 +2,7 @@
 import { API_VERSION } from './Models.generated';
 import type {
     ActionOf, ActionRequest, ActionResult, AgentQueue, Capabilities, DocumentContent, EnvelopeOf,
+    SubjectDefinition,
     ConversationChanges, ErrorEnvelope, EventPage, Page, PairingBegin, PairingChallenge,
     PairingComplete, PairedSession, Resource, Snapshot, TerminalScreen, TimelineEntry, TimelinePage,
 } from './Models.generated';

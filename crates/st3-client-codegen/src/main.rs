@@ -193,6 +193,11 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn capabilities(&self) -> Result<Envelope<Capabilities>, ClientError> {{ self.capabilities_internal().await }}"
             )?;
+        } else if id == "subject.definition" {
+            writeln!(
+                out,
+                "    pub async fn subject_definition(&self, subject: &str) -> Result<Envelope<SubjectDefinition>, ClientError> {{ self.get(&format!(\"/v1/client/subject-definition?subject={{}}\", percent_encode(subject))).await }}"
+            )?;
         } else if id == "document.get" {
             writeln!(
                 out,
@@ -287,6 +292,11 @@ fn swift_operation_methods(
             writeln!(
                 out,
                 "    public func documentGet(name: String) async throws -> Envelope<DocumentContent> {{ try await get(\"v1/client/documents/content\", query: [.init(name: \"name\", value: name)]) }}"
+            )?;
+        } else if id == "subject.definition" {
+            writeln!(
+                out,
+                "    public func subjectDefinition(subject: String) async throws -> Envelope<SubjectDefinition> {{ try await get(\"v1/client/subject-definition\", query: [.init(name: \"subject\", value: subject)]) }}"
             )?;
         } else if id.ends_with(".get") {
             let collection = path
@@ -450,6 +460,8 @@ fn validate_surfaces(
     for definition in [
         "AttentionTargetState",
         "DocumentContent",
+        "CanonicalNode",
+        "SubjectDefinition",
         "LaunchPreview",
         "MissionRunSummary",
         "AgentQueue",
@@ -954,6 +966,11 @@ fn typescript_operation_methods(
             writeln!(
                 out,
                 "    async {method}(name: string): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ name }})); }}"
+            )?;
+        } else if id == "subject.definition" {
+            writeln!(
+                out,
+                "    async subjectDefinition(subject: string): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ subject }})); }}"
             )?;
         } else if id == "conversation.changes" {
             writeln!(

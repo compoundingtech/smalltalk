@@ -173,6 +173,34 @@ IDs are stable opaque strings with a type prefix. Renames change labels, not IDs
 uses the same representation as its list item plus its documented detail fields. Deletion is
 represented by an event tombstone; an ID is never reused.
 
+### Applied subject definitions
+
+`GET /v1/client/subject-definition?subject=agent%2Ffleet%2Fworker` reads exactly one agent's
+applied desired declaration, including mission-owned and ad-hoc seats. It requires
+`read.projections`; the Rust method is
+`Client::subject_definition(subject)`, returning `Envelope<SubjectDefinition>` over either
+transport. Swift and TypeScript expose `subjectDefinition`.
+
+The value contains `kind: "subject-definition"`, `subject`, the typed canonical node tree
+`desired` (`name`, optional positional `arguments`, sorted `properties`, ordered `children`),
+rendered canonical KDL `kdl`, `desired_revision`, the selected desired claim `desired_token`,
+and competing claim tokens in `conflicts`. The envelope snapshot's `store_index` fences all these
+fields to one SQLite read snapshot. The read never includes the subject's claim history or other
+subjects' definitions.
+
+The KDL document starts with `version 2` and reconstructs the applied AST. It is suitable for
+display without client-side KDL parsing. It is not original source: comments, whitespace, authored
+entry ordering, and source paths are not retained. Clients label it, for example,
+`applied · rev <desired_revision> · reconstructed`.
+
+Unknown agents and agents with observations but no applied desired declaration return typed
+`not-found`. Other subject kinds return `validation-failed`: a mission is published as a compiled
+revision (read it through `/missions/{id}`) and keeps no canonical declaration AST to render.
+A definition is never truncated:
+when its serialized value exceeds `max_response_bytes - 4096` (reserving room for the envelope),
+the server returns `validation-failed` rather than an incomplete AST or KDL document.
+
+
 `operations` is the client-safe operational view: daemon health, host reachability, transport
 health, resource observers, and diagnostics. Some diagnostics compare the whole projection with
 the claim log, so pages serve the daemon's last diagnostic report and a read of a report older
