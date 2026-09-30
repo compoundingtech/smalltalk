@@ -9314,7 +9314,9 @@ impl Store {
         // snapshot so concurrent callers share one reduction, then serve clones at the same
         // store index. A later index always rebuilds, preserving snapshot semantics.
         if prefix == "agent/" {
-            let current = self.index()?;
+            // What this thread's reads can see, as every snapshot read checks: a read pinned to
+            // a snapshot can see a commit a moment before the writer publishes its index.
+            let current = current_index(&self.readers.get())?;
             let index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
             let mut cache = self
                 .agent_status_cache
