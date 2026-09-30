@@ -1962,6 +1962,9 @@ fn managed_session_owner_at(
     Ok(None)
 }
 
+/// How many of a subject's claims, oldest first, date its session in the session list.
+const SESSION_CLAIMS: usize = 10_000;
+
 fn client_session_resources(
     store: &Arc<Store>,
     history: bool,
@@ -2117,29 +2120,22 @@ fn managed_session_resources(
             "stopped" | "exited" | "absent" => "completed",
             _ => "waiting",
         };
-        let claims = store
-            .claims_page(
-                Some(&subject.subject),
-                None,
-                0,
-                snapshot_index.checked_add(1),
-                false,
-                10_000,
+        // A session is dated by the subject's first SESSION_CLAIMS claims, the page this list
+        // once read whole and filtered, so a subject with more keeps the dates it had.
+        let through_claim = subject
+            .claims
+            .get(SESSION_CLAIMS - 1)
+            .filter(|_| subject.claims.len() > SESSION_CLAIMS);
+        let mut accepted_times = store
+            .runtime_claim_span_at(
+                &subject.subject,
+                incarnation,
+                runtime,
+                snapshot_index,
+                through_claim.map(String::as_str),
             )?
-            .claims;
-        let incarnation_claims = claims.iter().filter(|claim| {
-            let claim_fields = claim.body.get("fields").unwrap_or(&claim.body);
-            let same_incarnation = incarnation.is_some_and(|expected| {
-                claim_fields.get("incarnation_id").and_then(Value::as_str) == Some(expected)
-            });
-            let same_runtime = runtime.is_some_and(|expected| {
-                claim_fields.get("runtime_id").and_then(Value::as_str) == Some(expected)
-            });
-            same_incarnation || (incarnation.is_none() && same_runtime)
-        });
-        let mut accepted_times = incarnation_claims
-            .map(|claim| claim.accepted_at_unix_ms)
-            .collect::<Vec<_>>();
+            .map(|(first, last)| vec![first, last])
+            .unwrap_or_default();
         if let Some(incarnation) = incarnation
             && let Some(observed) =
                 store.latest_local_timeline_at(&subject.subject, incarnation, snapshot_index)?
