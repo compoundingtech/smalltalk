@@ -27,7 +27,7 @@ reconcile pass on host 'dev3':
   launched (1): dev3.pilot
 
 ### channel child spawned by the extension (exact binary, not a PATH lookup)
-1971654 1971158  0 13:33 pts/298  00:00:00 /home/schickling/.megarepo/github.com/compoundingtech/st2/refs/heads/schickling/2026-08-17-pi/target/debug/st2 --cata
+1971654 1971158  0 13:33 pts/298  00:00:00 /home/example/.megarepo/github.com/compoundingtech/st2/refs/heads/schickling/2026-08-17-pi/target/debug/st2 --cata
 
 ### st2 message send (as a peer on the bus)
 1787052836846-q9js1m.md

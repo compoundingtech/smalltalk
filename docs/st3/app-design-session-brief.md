@@ -6,7 +6,7 @@ app, both acting as online thin clients of the same `st3.client.v0` API.
 
 ## Product promise
 
-From either app Nathan can:
+From either app Alex can:
 
 1. understand what work is happening across the Smalltalk network;
 2. see and resolve what needs his attention;
@@ -54,7 +54,7 @@ The first implementation mission should end with two deliberately small, real ar
 
 - `stui`: a Rust binary that opens, renders build/endpoint information and “Hello, Smalltalk”,
   restores the terminal exactly, and can be installed or rolled back from a versioned release.
-- `apps/ios`: an Expo development/internal-distribution build on Nathan's physical iPhone that
+- `apps/ios`: an Expo development/internal-distribution build on Alex's physical iPhone that
   opens, renders the same build/endpoint information and “Hello, Smalltalk”, has crash reporting,
   and can receive a compatible EAS Update.
 
@@ -67,7 +67,7 @@ The shell gate also creates the release machinery before feature work:
 - promotion of the exact tested artifact rather than a rebuild;
 - visible update status and last-known-good version in both clients.
 
-For Nathan's own iPhone, an Expo internal-distribution build is the shortest initial path: it is an
+For Alex's own iPhone, an Expo internal-distribution build is the shortest initial path: it is an
 ad hoc-signed IPA installed from a URL, but the device UDID must be registered and a new or re-signed
 build is needed when the allowed device set changes. TestFlight is the friend-facing path; internal
 testers must be App Store Connect users, while external testers can number up to 10,000 and the first
@@ -118,7 +118,7 @@ Plan visualization should be designed as lenses over `st3.visualization.v0`, not
 
 ## Delivery gate 3: prove remote operation
 
-The same scenario must work from CLI, TUI on Bluey, and a physical iPhone against a different
+The same scenario must work from CLI, TUI on ExamplePeer, and a physical iPhone against a different
 machine: discover and pair, read Now, hold a launch conversation, approve and start a mission,
 follow events, open the resulting normalized harness timeline, attach to a terminal, type and resize,
 detach cleanly, reconnect after network movement and daemon restart, recover from a cursor gap, and
@@ -167,13 +167,13 @@ about new attention or completed work, and the app can reconnect/resync when ope
 The app itself can launch the work that changes it because authority and execution stay server-side:
 
 ```text
-Nathan chats in TUI/iOS
+Alex chats in TUI/iOS
   -> durable launch conversation and typed candidate
   -> approve-and-launch action
   -> mission runs on an eligible development machine
   -> tests and exact-commit preview release
   -> smoke/device evidence recorded in the mission
-  -> deployment policy promotes or asks Nathan in Attention
+  -> deployment policy promotes or asks Alex in Attention
   -> TUI release or compatible EAS Update reaches the device
   -> client reports installed version and health
   -> automatic rollback or explicit recovery remains available
@@ -206,9 +206,9 @@ each with an optional explanation:
 1. What are the initial TUI framework and layout conventions?
 2. What are the iOS navigation model, visual language, and minimum supported iOS version?
 3. Where does the Expo app live, and what package/workspace tooling do both apps share?
-4. Do we install Nathan's first device through an internal ad hoc build, TestFlight internal
+4. Do we install Alex's first device through an internal ad hoc build, TestFlight internal
    testing, or both?
-5. Which changes may auto-promote to Nathan's production devices after tests, and which require an
+5. Which changes may auto-promote to Alex's production devices after tests, and which require an
    Attention approval?
 6. Is Tailscale the day-one iOS carrier while Fabric embedding proceeds, or must Fabric block the
    first connected release?
@@ -220,7 +220,7 @@ each with an optional explanation:
 ## Recommended first three missions
 
 1. **Ship the shells and release loop.** Create the TUI and Expo app, generated TypeScript client,
-   checks, exact-commit preview artifacts, install Nathan's devices, EAS Update channels, release
+   checks, exact-commit preview artifacts, install Alex's devices, EAS Update channels, release
    projection, and rollback proof. No broad UI.
 2. **Build the shared product vertical slices.** Design and implement Now, attention, launch/chat,
    plan visualization, work/mission, agents/machines, conversations/import, terminals, devices,

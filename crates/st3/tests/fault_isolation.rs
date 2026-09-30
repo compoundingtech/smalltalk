@@ -667,7 +667,7 @@ fn schedule_named(host: &Host, run: &MissionRunView, name: &str) -> String {
         .unwrap_or_else(|| panic!("run {} declares no schedule {name}", run.id))
 }
 
-/// bluey, mid-sync: scheduled work named a mission revision the host had not received yet.
+/// example-peer, mid-sync: scheduled work named a mission revision the host had not received yet.
 #[test]
 fn scheduled_work_for_a_revision_this_host_lacks_waits_beside_other_schedules() {
     let host = Host::new();
@@ -835,7 +835,7 @@ fn subscription_request(
         .id
 }
 
-/// hetz and Silber, 21:09Z: a subscription delivery pinned to a claim ID instead of a revision.
+/// example-linux and ExampleMac, 21:09Z: a subscription delivery pinned to a claim ID instead of a revision.
 #[test]
 fn a_subscription_delivery_pinned_to_a_claim_id_waits_beside_other_deliveries() {
     let host = Host::new();

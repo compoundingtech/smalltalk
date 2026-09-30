@@ -366,7 +366,7 @@ const FULL_KDL: &str = r####"
 // The agent is the "job"; pty/exec are the tasks.
 agent "fabric-claude" {
   identity  "fabric-claude"
-  host      "silber"
+  host      "example-mac"
   type      "service"
   workspace "/repos/fabric"
   supervisor "cos"
@@ -381,18 +381,18 @@ agent "fabric-claude" {
   persona "worker"
 
   pty "agent" {
-    id      "silber.fabric-claude"
+    id      "example-mac.fabric-claude"
     lifecycle "adopt-only"
     command #"exec claude --permission-mode bypassPermissions 'boot'"#
     tags role="agent" env="prod"
     env {
-      ST_AGENT "silber.fabric-claude"
+      ST_AGENT "example-mac.fabric-claude"
       ST_ROOT  "$CATALOG"
     }
   }
 
   exec "ding" {
-    command #"st2 ding silber.fabric --identity silber.fabric-claude"#
+    command #"st2 ding example-mac.fabric --identity example-mac.fabric-claude"#
     keep #true
   }
 
@@ -405,7 +405,7 @@ fn parses_full_kdl_service_job() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/silber/fabric-claude/agent.kdl",
+        "agents/example-mac/fabric-claude/agent.kdl",
         FULL_KDL,
     );
 
@@ -419,7 +419,7 @@ fn parses_full_kdl_service_job() {
     let s = &found.specs[0];
 
     assert_eq!(s.identity, "fabric-claude");
-    assert_eq!(s.host.as_deref(), Some("silber"));
+    assert_eq!(s.host.as_deref(), Some("example-mac"));
     assert_eq!(s.job_type, JobType::Service);
     assert_eq!(s.workspace.as_deref(), Some("/repos/fabric"));
     assert_eq!(s.supervisor.as_deref(), Some("cos"));
@@ -436,7 +436,7 @@ fn parses_full_kdl_service_job() {
     assert_eq!(s.tasks.len(), 2);
     let agent = s.tasks.iter().find(|t| t.name == "agent").unwrap();
     assert_eq!(agent.kind, TaskKind::Pty);
-    assert_eq!(agent.id.as_deref(), Some("silber.fabric-claude"));
+    assert_eq!(agent.id.as_deref(), Some("example-mac.fabric-claude"));
     assert_eq!(agent.lifecycle, TaskLifecycle::AdoptOnly);
     assert!(agent.command.as_deref().unwrap().starts_with("exec claude"));
     assert_eq!(agent.tags.get("role").map(String::as_str), Some("agent"));
@@ -458,12 +458,12 @@ fn compact_agent_command_and_ding_lower_to_native_tasks() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/Silber/cos/agent.kdl",
+        "agents/ExampleMac/cos/agent.kdl",
         r#"
 agent "cos" {
-  host "Silber"
-  workspace "/Volumes/SSD/src/github.com/myobie/cos"
-  env { ST_AGENT "Silber.cos" }
+  host "ExampleMac"
+  workspace "/Volumes/SSD/src/github.com/example/cos"
+  env { ST_AGENT "ExampleMac.cos" }
   command "exec codex boot"
   ding
 }
@@ -482,24 +482,24 @@ agent "cos" {
     let agent = spec.tasks.iter().find(|t| t.name == "agent").unwrap();
     assert_eq!(agent.kind, TaskKind::Pty);
     assert!(!agent.derived);
-    assert_eq!(agent.id.as_deref(), Some("Silber.cos"));
+    assert_eq!(agent.id.as_deref(), Some("ExampleMac.cos"));
     assert_eq!(agent.command.as_deref(), Some("exec codex boot"));
     assert_eq!(
         agent.env.get("ST_AGENT").map(String::as_str),
-        Some("Silber.cos")
+        Some("ExampleMac.cos")
     );
 
     let ding = spec.tasks.iter().find(|t| t.name == "ding").unwrap();
     assert_eq!(ding.kind, TaskKind::Exec);
     assert!(ding.derived);
-    assert_eq!(ding.id.as_deref(), Some("Silber.cos.ding"));
+    assert_eq!(ding.id.as_deref(), Some("ExampleMac.cos.ding"));
     assert_eq!(
         ding.command.as_deref(),
-        Some("st2 ding --identity Silber.cos --root $ST_ROOT")
+        Some("st2 ding --identity ExampleMac.cos --root $ST_ROOT")
     );
     assert_eq!(
         ding.env.get("ST_AGENT").map(String::as_str),
-        Some("Silber.cos")
+        Some("ExampleMac.cos")
     );
     assert!(spec.delivery.is_none());
     assert!(spec.session_driver.is_none());
@@ -2017,9 +2017,9 @@ fn compact_and_explicit_agent_task_forms_cannot_be_mixed() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/ambiguous/agent.kdl",
+        "agents/example-linux/ambiguous/agent.kdl",
         r#"agent "ambiguous" {
-  host "hetz"
+  host "example-linux"
   command "compact"
   pty "agent" { command "explicit" }
 }"#,
@@ -2038,7 +2038,7 @@ fn parses_toml_service_job_with_pty_and_exec_tables() {
     let tmp = tempfile::tempdir().unwrap();
     let toml = r#"
 identity = "fetcher"
-host     = "hetz"
+host     = "example-linux"
 type     = "service"
 workspace = "/repos/fetcher"
 
@@ -2048,13 +2048,13 @@ interval = "60s"
 mode = "delay"
 
 [pty.agent]
-id = "hetz.fetcher"
+id = "example-linux.fetcher"
 command = "exec claude 'boot'"
 
 [exec.ding]
-command = "st2 ding hetz.fetcher"
+command = "st2 ding example-linux.fetcher"
 "#;
-    write(tmp.path(), "agents/hetz/fetcher/agent.toml", toml);
+    write(tmp.path(), "agents/example-linux/fetcher/agent.toml", toml);
 
     let found = discover(tmp.path());
     assert!(found.errors.is_empty(), "errors: {:?}", found.errors);
@@ -2081,11 +2081,11 @@ command = "st2 ding hetz.fetcher"
 fn parses_json_service_job() {
     let tmp = tempfile::tempdir().unwrap();
     let json = r#"{
-        "identity": "reporter", "host": "hetz", "type": "service",
+        "identity": "reporter", "host": "example-linux", "type": "service",
         "pty":  { "agent": { "command": "exec claude 'boot'" } },
-        "exec": { "ding":  { "command": "st2 ding hetz.reporter" } }
+        "exec": { "ding":  { "command": "st2 ding example-linux.reporter" } }
     }"#;
-    write(tmp.path(), "agents/hetz/reporter/agent.json", json);
+    write(tmp.path(), "agents/example-linux/reporter/agent.json", json);
 
     let found = discover(tmp.path());
     assert!(found.errors.is_empty(), "errors: {:?}", found.errors);
@@ -2098,7 +2098,7 @@ fn type_defaults_to_service() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/svc/agent.toml",
+        "agents/example-linux/svc/agent.toml",
         "identity=\"svc\"\n[pty.agent]\ncommand=\"x\"\n",
     );
 
@@ -2113,7 +2113,7 @@ fn path_supplies_identity_and_host_when_content_omits_them() {
     let minimal = "type \"service\"\npty \"agent\" { command \"exec claude 'boot'\" }";
     write(
         tmp.path(),
-        "agents/hetz/st2-claude/agent.kdl",
+        "agents/example-linux/st2-claude/agent.kdl",
         &format!("agent {{\n{minimal}\n}}"),
     );
 
@@ -2122,8 +2122,8 @@ fn path_supplies_identity_and_host_when_content_omits_them() {
     assert_eq!(found.specs.len(), 1);
     let s = &found.specs[0];
     assert_eq!(s.identity, "st2-claude");
-    assert_eq!(s.host.as_deref(), Some("hetz"));
-    assert_eq!(s.bus_id("fallback"), "hetz.st2-claude");
+    assert_eq!(s.host.as_deref(), Some("example-linux"));
+    assert_eq!(s.bus_id("fallback"), "example-linux.st2-claude");
 }
 
 #[test]
@@ -2202,12 +2202,12 @@ fn malformed_file_is_collected_as_error_and_does_not_halt_the_walk() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/good/agent.toml",
+        "agents/example-linux/good/agent.toml",
         "identity=\"good\"\n[pty.agent]\ncommand=\"x\"\n",
     );
     write(
         tmp.path(),
-        "agents/hetz/bad/agent.toml",
+        "agents/example-linux/bad/agent.toml",
         "identity = \"broken\"\nthis is not valid =",
     );
 
@@ -2223,7 +2223,7 @@ fn malformed_kdl_is_collected_as_error() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/bad/agent.kdl",
+        "agents/example-linux/bad/agent.kdl",
         "agent \"broken\" { this is { not valid",
     );
     let found = discover(tmp.path());
@@ -2237,12 +2237,12 @@ fn a_nested_generic_filename_is_static_without_agent_shaped_content() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/worker/agent.kdl",
-        r#"agent "worker" { host "hetz"; command "true" }"#,
+        "agents/example-linux/worker/agent.kdl",
+        r#"agent "worker" { host "example-linux"; command "true" }"#,
     );
     write(
         tmp.path(),
-        "agents/hetz/worker/docs/agent.kdl",
+        "agents/example-linux/worker/docs/agent.kdl",
         "note \"documentation metadata\"\n",
     );
 
@@ -2258,12 +2258,12 @@ fn non_spec_files_are_skipped_silently() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/x/package.json",
+        "agents/example-linux/x/package.json",
         r#"{"name":"x","version":"1.0.0"}"#,
     );
     write(
         tmp.path(),
-        "agents/hetz/x/agent.toml",
+        "agents/example-linux/x/agent.toml",
         "identity=\"x\"\n[pty.agent]\ncommand=\"c\"\n",
     );
 
@@ -2283,12 +2283,12 @@ fn adjacent_and_nested_bundle_kdl_are_outside_strict_agent_admission() {
     );
     write(
         tmp.path(),
-        "agents/hetz/x/agent.kdl",
-        r#"agent "x" { host "hetz"; command "true" }"#,
+        "agents/example-linux/x/agent.kdl",
+        r#"agent "x" { host "example-linux"; command "true" }"#,
     );
     write(
         tmp.path(),
-        "agents/hetz/x/docs/agent.kdl",
+        "agents/example-linux/x/docs/agent.kdl",
         r#"note "static payload despite the generic filename""#,
     );
 
@@ -2301,8 +2301,8 @@ fn adjacent_and_nested_bundle_kdl_are_outside_strict_agent_admission() {
 #[test]
 fn discovery_retains_the_immutable_parse_that_it_lowered() {
     let tmp = tempfile::tempdir().unwrap();
-    let path = "agents/hetz/x/agent.kdl";
-    let source = r#"agent "x" { host "hetz"; command "true" }"#;
+    let path = "agents/example-linux/x/agent.kdl";
+    let source = r#"agent "x" { host "example-linux"; command "true" }"#;
     write(tmp.path(), path, source);
 
     let found = discover(tmp.path());
@@ -2319,9 +2319,9 @@ fn shape_invalid_declarations_never_become_runnable_specs() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/x/agent.kdl",
+        "agents/example-linux/x/agent.kdl",
         r#"agent "x" {
-  host "hetz"
+  host "example-linux"
   schedule "daily" { command "true" }
 }"#,
     );
@@ -2338,7 +2338,7 @@ fn render_only_fields_are_ignored_not_errored() {
     // A job carrying every render-only field — st2 must parse it cleanly, ignoring them.
     let toml = r#"
 identity = "rendered"
-host = "hetz"
+host = "example-linux"
 harness = "claude"
 model = "opus"
 role = "worker"
@@ -2352,7 +2352,7 @@ tier = "worker"
 [pty.agent]
 command = "exec claude 'boot'"
 "#;
-    write(tmp.path(), "agents/hetz/rendered/agent.toml", toml);
+    write(tmp.path(), "agents/example-linux/rendered/agent.toml", toml);
 
     let found = discover(tmp.path());
     assert!(
@@ -2369,7 +2369,7 @@ fn unrendered_job_without_command_is_flagged_not_runnable() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/needs-render/agent.toml",
+        "agents/example-linux/needs-render/agent.toml",
         "identity=\"needs-render\"\ntype=\"service\"\n",
     );
     let found = discover(tmp.path());
@@ -2387,7 +2387,7 @@ keep = true
 [pty.agent]
 command = "x"
 "#;
-    write(tmp.path(), "agents/hetz/old/agent.toml", toml);
+    write(tmp.path(), "agents/example-linux/old/agent.toml", toml);
     let found = discover(tmp.path());
     let s = &found.specs[0];
     assert!(s.desired_state.is_retired());
@@ -2398,10 +2398,10 @@ command = "x"
 fn multiple_agent_nodes_in_one_kdl_file_yield_multiple_specs() {
     let tmp = tempfile::tempdir().unwrap();
     let kdl = r#"
-agent "one" { host "hetz" pty "agent" { command "x" } }
-agent "two" { host "hetz" pty "agent" { command "y" } }
+agent "one" { host "example-linux" pty "agent" { command "x" } }
+agent "two" { host "example-linux" pty "agent" { command "y" } }
 "#;
-    write(tmp.path(), "agents/hetz/pair.kdl", kdl);
+    write(tmp.path(), "agents/example-linux/pair.kdl", kdl);
     let found = discover(tmp.path());
     assert!(found.errors.is_empty(), "errors: {:?}", found.errors);
     assert_eq!(found.specs.len(), 2);
@@ -2436,8 +2436,8 @@ fn strict_discovery_reports_unobservable_declaration_entries() {
         .unwrap();
     write(
         tmp.path(),
-        "agents/hetz/live/agent.kdl",
-        r#"agent "live" { host "hetz"; command "x" }"#,
+        "agents/example-linux/live/agent.kdl",
+        r#"agent "live" { host "example-linux"; command "x" }"#,
     );
     let dangling = tmp.path().join("dangling.kdl");
     symlink(tmp.path().join("missing.kdl"), &dangling).unwrap();
@@ -2471,7 +2471,7 @@ fn strict_discovery_reports_a_directory_symlink_that_can_hide_declarations() {
     write(
         external.path(),
         "nested/agent.kdl",
-        r#"agent "hidden" { host "hetz"; command "x" }"#,
+        r#"agent "hidden" { host "example-linux"; command "x" }"#,
     );
     let linked = tmp.path().join("linked-catalog");
     symlink(external.path(), &linked).unwrap();
@@ -2502,7 +2502,7 @@ fn strict_discovery_allows_symlinks_that_cannot_hide_declarations() {
     write(
         tmp.path(),
         "real/agent.kdl",
-        r#"agent "visible" { host "hetz"; command "x" }"#,
+        r#"agent "visible" { host "example-linux"; command "x" }"#,
     );
     symlink("real", tmp.path().join("alias")).unwrap();
 
@@ -2517,8 +2517,8 @@ fn only_contextually_reserved_namespaces_are_ignored() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/live/agent.kdl",
-        r#"agent "live" { host "hetz"; command "x" }"#,
+        "agents/example-linux/live/agent.kdl",
+        r#"agent "live" { host "example-linux"; command "x" }"#,
     );
     for (path, identity) in [
         (".managed/team/agent.kdl", "managed"),
@@ -2540,9 +2540,9 @@ fn only_contextually_reserved_namespaces_are_ignored() {
         "organizations/project/.git/nested/agent.kdl",
         "organizations/project/.st2/nested/agent.kdl",
         "pty/project/agent.kdl",
-        "agents/hetz/live/resources/project/agent.kdl",
-        "agents/hetz/live/archive/project/agent.kdl",
-        "agents/hetz/live/inbox/project/agent.kdl",
+        "agents/example-linux/live/resources/project/agent.kdl",
+        "agents/example-linux/live/archive/project/agent.kdl",
+        "agents/example-linux/live/inbox/project/agent.kdl",
     ] {
         write(
             tmp.path(),
@@ -3025,7 +3025,7 @@ fn the_id_grammar_admits_uuidv7_and_frozen_bus_identities_only() {
     for accepted in [
         "0199b8f4-8d3a-7c21-9a44-6f85b7320ea1",
         "dev3.dotfiles.fractal.help-key.verifier",
-        "hetz.worker",
+        "example-linux.worker",
         "Legacy_Identity-9",
     ] {
         let tmp = tempfile::tempdir().unwrap();

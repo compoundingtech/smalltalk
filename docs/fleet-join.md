@@ -1307,7 +1307,7 @@ Neither job has a path filter, so no change in this series can skip them. A unit
 and fails if a `paths` or `paths-ignore` key appears on the jobs' pull request triggers, or if the
 publish job stops needing `fleet-e2e`.
 
-As built, no macOS job runs on GitHub (#632, Nathan 2026-09-28: too slow and too expensive
+As built, no macOS job runs on GitHub (#632, Alex 2026-09-28: too slow and too expensive
 there). `fleet-compat` runs on `ubuntu-22.04` only, and `fleet_workflows_have_no_path_filter`
 fails if `fleet.yml` names a macOS runner. On macOS, the fleet suite runs in st's own CI
 (`st/ci-macos`, on the fleet's Mac), which runs `cargo test --workspace` and so skips the

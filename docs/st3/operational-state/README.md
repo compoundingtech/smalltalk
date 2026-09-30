@@ -193,6 +193,3 @@ The fixtures under `crates/st3/tests/fixtures/operational-state` cover:
 The passing tests validate fixture completeness and deterministic contract rules. Ignored red tests
 exercise current projections and are expected to fail until behavior work lands. Implementations
 must turn them green without rewriting the expected fixture outcome or removing immutable history.
-
-The evidence, root causes, preserved-commit proof, and goal-by-goal recovery disposition are in
-[`recovery-audit-2026-09-20.md`](recovery-audit-2026-09-20.md).

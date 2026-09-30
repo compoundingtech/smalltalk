@@ -1539,13 +1539,13 @@ mod tests {
         }
         let ordinary: Value = Client::unix(&socket).get("/v1/person").await.unwrap();
         assert!(ordinary["person"].is_null());
-        let named: Value = Client::unix_as(&socket, "person/nathan")
+        let named: Value = Client::unix_as(&socket, "person/alex")
             .unwrap()
             .get("/v1/person")
             .await
             .unwrap();
-        assert_eq!(named["person"], "person/nathan");
-        assert!(Client::unix_as(&socket, "person/nathan\r\nx-forged: yes").is_err());
+        assert_eq!(named["person"], "person/alex");
+        assert!(Client::unix_as(&socket, "person/alex\r\nx-forged: yes").is_err());
         server.abort();
     }
 

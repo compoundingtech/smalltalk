@@ -61,14 +61,14 @@ Every claim below is a test that was run, not a reading of the code.
 ### 4a — fresh agent launches with its pipe in one pass
 
 `tests/run.rs::fresh_compact_agent_launches_with_its_derived_pipe` — one
-`up_once` pass launches `["hetz.demo", "hetz.demo.ding", "hetz.demo.pipe-gh-ci"]`
+`up_once` pass launches `["example-linux.demo", "example-linux.demo.ding", "example-linux.demo.pipe-gh-ci"]`
 and the pipe's launch is the exact late-bound argv:
 
 ```
-<running st2> pipe run --agent hetz.demo --name gh-ci --root <catalog> --command poll-gh-ci.sh
+<running st2> pipe run --agent example-linux.demo --name gh-ci --root <catalog> --command poll-gh-ci.sh
 ```
 
-`ST_AGENT=hetz.demo` is injected into the pipe like any other task (Runner-owned
+`ST_AGENT=example-linux.demo` is injected into the pipe like any other task (Runner-owned
 task identity holds).
 
 ### 4b — suspend / retire / hold tear the pipe down
@@ -87,15 +87,15 @@ With `restart { attempts 1; mode "fail" }`, a live agent, a live ding, and a dea
 pipe, four `reconcile`/`execute` passes over ONE `FlappingCap` give:
 
 ```
-report.flapping     == ["hetz.demo.pipe-gh-ci"]
-lifecycle op log    == ["reap:hetz.demo.pipe-gh-ci", "spawn:hetz.demo.pipe-gh-ci"]
-crash_loops[0]      == { pty_id: "hetz.demo.pipe-gh-ci", identity: "demo",
+report.flapping     == ["example-linux.demo.pipe-gh-ci"]
+lifecycle op log    == ["reap:example-linux.demo.pipe-gh-ci", "spawn:example-linux.demo.pipe-gh-ci"]
+crash_loops[0]      == { pty_id: "example-linux.demo.pipe-gh-ci", identity: "demo",
                          supervisor: "cos-claude" }
-surfaced message    tags ["crash-loop"], body names hetz.demo.pipe-gh-ci
+surfaced message    tags ["crash-loop"], body names example-linux.demo.pipe-gh-ci
 ```
 
 **Measured caveat, not hidden:** the agent DOES appear in the raw runner op log,
-as `patch:hetz.demo` — the pass's ordinary presentation batch, which touches every
+as `patch:example-linux.demo` — the pass's ordinary presentation batch, which touches every
 live task and carries no lifecycle meaning. The test filters `patch:` explicitly
 and says why. The first version of this test failed on exactly that line; the
 claim was narrowed rather than the evidence.
@@ -109,7 +109,7 @@ fresh `FlappingCap`, so a one-shot reconcile can never park anything.
 Real CLI output against a live demo catalog:
 
 ```json
-{"agent":"hetz.demo","task":"pipe-gh-ci","runtimeId":"hetz.demo.pipe-gh-ci",
+{"agent":"example-linux.demo","task":"pipe-gh-ci","runtimeId":"example-linux.demo.pipe-gh-ci",
  "kind":"exec","lifecycle":"service","retired":false,"desiredState":"running",
  "agentDesiredState":"running","agentDesiredStateReason":null,
  "runtime":{"state":"absent","pid":null,"createdAt":null,"generationId":null,"error":null},
@@ -130,11 +130,11 @@ own `id`. No network.
 Real CLI, first run:
 
 ```
-$ st2 pipe run --agent hetz.demo --name gh-ci --root $D --host hetz \
+$ st2 pipe run --agent example-linux.demo --name gh-ci --root $D --host example-linux \
     --command "./poll-gh-ci.sh ci-state.txt"
-st2 pipe: 'gh-ci' source running → hetz.demo's inbox (task hetz.demo.pipe-gh-ci)
+st2 pipe: 'gh-ci' source running → example-linux.demo's inbox (task example-linux.demo.pipe-gh-ci)
 st2 pipe: exiting (SourceExited) after 3 delivered event(s)
-$ ls $D/agents/hetz/demo/resources/inbox/
+$ ls $D/agents/example-linux/demo/resources/inbox/
 1787207698953-nhm7w0.md  1787207698957-he2enx.md  1787207698959-67fd1f.md
 ```
 
@@ -142,12 +142,12 @@ One delivered message:
 
 ```
 ---
-from: hetz.demo
+from: example-linux.demo
 subject: pipe gh-ci: {"id":"run-7:pending","run":7,"state":"pending"}
 tags: pipe, pipe:gh-ci
 idempotency-key: pipe:gh-ci:id:run-7:pending
 ---
-x-st2-pipe-task: hetz.demo.pipe-gh-ci
+x-st2-pipe-task: example-linux.demo.pipe-gh-ci
 
 {"id":"run-7:pending","run":7,"state":"pending"}
 ```
@@ -198,7 +198,7 @@ Green and directly relevant: `--test run` (57), `--test pipe_e2e` (11),
 
 ```kdl
 agent "demo" {
-  host "hetz"
+  host "example-linux"
   command "…"
   ding
 
@@ -241,9 +241,9 @@ Lowering-level refusals (anyhow, from `kdl_format` / `into_agent_spec`):
 `st2 validate` on a catalog with three bad pipes:
 
 ```
-ERROR  agents/hetz/bad/agent.kdl: pipe must declare exactly one of `command` or `argv`
-ERROR  agents/hetz/bad/agent.kdl: pipe `every` is reserved for the future `schedule` contract; …
-ERROR  agents/hetz/bad/agent.kdl: pipe task must have one positional string name
+ERROR  agents/example-linux/bad/agent.kdl: pipe must declare exactly one of `command` or `argv`
+ERROR  agents/example-linux/bad/agent.kdl: pipe `every` is reserved for the future `schedule` contract; …
+ERROR  agents/example-linux/bad/agent.kdl: pipe task must have one positional string name
 ─ 4 errors, 0 warnings across 0 agents
 ```
 
@@ -285,7 +285,7 @@ ERROR  agents/hetz/bad/agent.kdl: pipe task must have one positional string name
    friction found. `message::send_to_resolved_inbox` resolves the SENDER to a
    catalog agent, because that agent's folder holds the sent-message idempotency
    ledger. A pipe companion is a task, not an agent, so
-   `from = "hetz.demo.pipe-gh-ci"` fails with *"no agent … found in catalog"*.
+   `from = "example-linux.demo.pipe-gh-ci"` fails with *"no agent … found in catalog"*.
    The only existing non-agent sender path (`message::send_to_inbox`, used by
    `surface_crash_loop`) bypasses the ledger entirely and would forfeit
    deduplication — the one property a pipe most needs.
@@ -295,7 +295,7 @@ ERROR  agents/hetz/bad/agent.kdl: pipe task must have one positional string name
    `a_pipe_event_pokes_the_agent_as_a_self_addressed_notice`: the agent reads
 
    ```
-   [DING] ↺ hetz.demo: pipe gh-ci: {"id":"run-7:success",…} [id:2f7b]
+   [DING] ↺ example-linux.demo: pipe gh-ci: {"id":"run-7:success",…} [id:2f7b]
    ```
 
    The `↺` marker means "from myself" — precisely the wrong story for an external
@@ -398,7 +398,7 @@ already almost expresses.
 ## (f) Frictions and recommended refactors
 
 1. **Let a declared task identity own a sender ledger.** The "no agent
-   'hetz.demo.pipe-gh-ci'" failure is the one place the seam genuinely does not
+   'example-linux.demo.pipe-gh-ci'" failure is the one place the seam genuinely does not
    reach. The mechanism already exists in a neighbouring shape — the *Idempotent
    service requests* invariant describes "a declared non-agent service principal"
    publishing one exact request per idempotency key. Extending that principal

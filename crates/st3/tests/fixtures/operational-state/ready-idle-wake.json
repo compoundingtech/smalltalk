@@ -2,7 +2,7 @@
   "id": "cos-recovery/ready-idle-wake",
   "source": {
     "document": "doc/cos/st3-idle-with-ready-work-2026-09-20@4ea5b236c3b5fb8cabee06dba238464c9c8270afcc0211b87407b0d494f238ac",
-    "agent": "agent/fleet/app-web/standing/app-web"
+    "agent": "agent/example/app-web/standing/app-web"
   },
   "observed": {
     "occurrences": 2,

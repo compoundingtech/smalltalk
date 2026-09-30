@@ -44,7 +44,7 @@ fn write_agent(
     supervisor: Option<&str>,
     retirement: Option<&str>,
 ) -> PathBuf {
-    let dir = root.join(format!("agents/hetz/{identity}"));
+    let dir = root.join(format!("agents/example-linux/{identity}"));
     fs::create_dir_all(&dir).unwrap();
     let supervisor = supervisor
         .map(|s| format!("  supervisor \"{s}\"\n"))
@@ -53,8 +53,8 @@ fn write_agent(
     fs::write(
         dir.join("agent.kdl"),
         format!(
-            "agent \"{identity}\" {{\n  host \"hetz\"\n{supervisor}{retirement}  command \"agent\"\n  \
-             resource \"goal\" uri=\"dev.schickling.agent-goal://hetz/{identity}\" reason=\"Layer.\"\n}}\n"
+            "agent \"{identity}\" {{\n  host \"example-linux\"\n{supervisor}{retirement}  command \"agent\"\n  \
+             resource \"goal\" uri=\"dev.schickling.agent-goal://example-linux/{identity}\" reason=\"Layer.\"\n}}\n"
         ),
     )
     .unwrap();
@@ -88,11 +88,11 @@ fn wait_for(condition: impl Fn() -> usize, expected: usize) -> bool {
 }
 
 fn spawn(catalog: &Path) -> st2::resync::ResyncSupervisor {
-    st2::event::publish_owner_binding_for_test(catalog, "hetz").unwrap();
+    st2::event::publish_owner_binding_for_test(catalog, "example-linux").unwrap();
     let registry = st2::catalog::declared_profiles(catalog).unwrap();
     let supervisor = st2::resync::ResyncSupervisor::with_profiles(
         catalog.to_path_buf(),
-        "hetz".to_owned(),
+        "example-linux".to_owned(),
         registry,
     );
     let found = st2::discover_strict(catalog);
@@ -107,7 +107,7 @@ fn spawn(catalog: &Path) -> st2::resync::ResyncSupervisor {
         .filter(|spec| spec.desired_state.is_running())
         .cloned()
         .collect::<Vec<_>>();
-    let diagnostics = supervisor.refresh(&specs, &live_subscription_specs, "hetz", &[], &[]);
+    let diagnostics = supervisor.refresh(&specs, &live_subscription_specs, "example-linux", &[], &[]);
     assert!(diagnostics.is_empty(), "clean refresh: {diagnostics:?}");
     std::thread::sleep(Duration::from_millis(300));
     supervisor
@@ -126,8 +126,8 @@ fn an_ancestor_layer_change_reaches_a_descendant_that_opted_in() {
     let catalog = tempfile::tempdir().unwrap();
     catalog_with_profile(catalog.path(), true);
     let root = write_agent(catalog.path(), "root", None, None);
-    let lead = write_agent(catalog.path(), "lead", Some("hetz.root"), None);
-    let worker = write_agent(catalog.path(), "worker", Some("hetz.lead"), None);
+    let lead = write_agent(catalog.path(), "lead", Some("example-linux.root"), None);
+    let worker = write_agent(catalog.path(), "worker", Some("example-linux.lead"), None);
     let _supervisor = spawn(catalog.path());
 
     assert_eq!(resync_bodies(&worker).len(), 0, "seeding is silent");
@@ -145,7 +145,7 @@ fn an_ancestor_layer_change_reaches_a_descendant_that_opted_in() {
     );
     let body = &resync_bodies(&worker)[0];
     assert!(
-        body.contains("key: goal@hetz.lead"),
+        body.contains("key: goal@example-linux.lead"),
         "the descendant's event is keyed by the owning ancestor: {body}"
     );
 
@@ -159,7 +159,7 @@ fn an_ancestor_layer_change_reaches_a_descendant_that_opted_in() {
     assert!(
         resync_bodies(&worker)
             .iter()
-            .any(|body| body.contains("key: goal@hetz.root")),
+            .any(|body| body.contains("key: goal@example-linux.root")),
         "each ancestor keeps its own supersession key: {:?}",
         resync_bodies(&worker)
     );
@@ -172,8 +172,8 @@ fn without_notify_chain_a_supervisor_edge_carries_no_fan_out() {
     let catalog = tempfile::tempdir().unwrap();
     catalog_with_profile(catalog.path(), false);
     let _root = write_agent(catalog.path(), "root", None, None);
-    let lead = write_agent(catalog.path(), "lead", Some("hetz.root"), None);
-    let worker = write_agent(catalog.path(), "worker", Some("hetz.lead"), None);
+    let lead = write_agent(catalog.path(), "lead", Some("example-linux.root"), None);
+    let worker = write_agent(catalog.path(), "worker", Some("example-linux.lead"), None);
     let _supervisor = spawn(catalog.path());
 
     write_layer(&lead, "prioritize the migration\n");
@@ -202,8 +202,8 @@ fn a_retired_ancestor_is_skipped_and_the_walk_continues_past_it() {
         let catalog = tempfile::tempdir().unwrap();
         catalog_with_profile(catalog.path(), true);
         let root = write_agent(catalog.path(), "root", None, None);
-        let lead = write_agent(catalog.path(), "lead", Some("hetz.root"), Some(retirement));
-        let worker = write_agent(catalog.path(), "worker", Some("hetz.lead"), None);
+        let lead = write_agent(catalog.path(), "lead", Some("example-linux.root"), Some(retirement));
+        let worker = write_agent(catalog.path(), "worker", Some("example-linux.lead"), None);
         let _supervisor = spawn(catalog.path());
 
         // The live grandparent beyond the retired ancestor still reaches the descendant.
@@ -214,7 +214,7 @@ fn a_retired_ancestor_is_skipped_and_the_walk_continues_past_it() {
             resync_bodies(&worker)
         );
         assert!(
-            resync_bodies(&worker)[0].contains("key: goal@hetz.root"),
+            resync_bodies(&worker)[0].contains("key: goal@example-linux.root"),
             "the surviving layer is the root's ({retirement})"
         );
 
@@ -224,7 +224,7 @@ fn a_retired_ancestor_is_skipped_and_the_walk_continues_past_it() {
         assert!(
             !resync_bodies(&worker)
                 .iter()
-                .any(|body| body.contains("key: goal@hetz.lead")),
+                .any(|body| body.contains("key: goal@example-linux.lead")),
             "a retired ancestor's layer must be excluded ({retirement}): {:?}",
             resync_bodies(&worker)
         );
@@ -241,29 +241,29 @@ fn a_suspended_ancestor_contributes_its_layer_without_becoming_a_subscription() 
     let lead = write_agent(
         catalog.path(),
         "lead",
-        Some("hetz.root"),
+        Some("example-linux.root"),
         Some("desired-state \"suspended\" reason=\"waiting for capacity\""),
     );
-    let worker = write_agent(catalog.path(), "worker", Some("hetz.lead"), None);
+    let worker = write_agent(catalog.path(), "worker", Some("example-linux.lead"), None);
     write_layer(&lead, "before\n");
     let specs = st2::discover_strict(catalog.path()).specs;
     let worker_spec = specs.iter().find(|spec| spec.identity == "worker").unwrap();
     let set = st2::resync::watch_set_for_in_catalog(
         worker_spec,
         &specs,
-        "hetz",
+        "example-linux",
         &st2::catalog::declared_profiles(catalog.path()).unwrap(),
     );
     assert!(
         set.carriers
             .iter()
-            .any(|carrier| carrier.label == "goal@hetz.lead"),
+            .any(|carrier| carrier.label == "goal@example-linux.lead"),
         "a suspended ancestor remains a layer in the live descendant's watch set"
     );
     assert!(
         set.carriers
             .iter()
-            .any(|carrier| carrier.label == "goal@hetz.root"),
+            .any(|carrier| carrier.label == "goal@example-linux.root"),
         "traversal continues through the suspended ancestor"
     );
     let _supervisor = spawn(catalog.path());
@@ -275,7 +275,7 @@ fn a_suspended_ancestor_contributes_its_layer_without_becoming_a_subscription() 
         resync_bodies(&worker)
     );
     assert!(
-        resync_bodies(&worker)[0].contains("key: goal@hetz.lead"),
+        resync_bodies(&worker)[0].contains("key: goal@example-linux.lead"),
         "the suspended layer keeps its owner-qualified key"
     );
     assert!(
@@ -292,7 +292,7 @@ fn a_suspended_ancestor_contributes_its_layer_without_becoming_a_subscription() 
     assert!(
         resync_bodies(&worker)
             .iter()
-            .any(|body| body.contains("key: goal@hetz.root")),
+            .any(|body| body.contains("key: goal@example-linux.root")),
         "the root layer beyond the suspended middle must remain subscribed"
     );
     assert!(
@@ -305,17 +305,17 @@ fn a_suspended_ancestor_contributes_its_layer_without_becoming_a_subscription() 
 fn live_install_reports_an_unwalkable_notify_chain() {
     let catalog = tempfile::tempdir().unwrap();
     catalog_with_profile(catalog.path(), true);
-    write_agent(catalog.path(), "worker", Some("hetz.missing"), None);
-    st2::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+    write_agent(catalog.path(), "worker", Some("example-linux.missing"), None);
+    st2::event::publish_owner_binding_for_test(catalog.path(), "example-linux").unwrap();
     let specs = st2::discover_strict(catalog.path()).specs;
     let registry = st2::catalog::declared_profiles(catalog.path()).unwrap();
     let supervisor = st2::resync::ResyncSupervisor::with_profiles(
         catalog.path().to_path_buf(),
-        "hetz".to_owned(),
+        "example-linux".to_owned(),
         registry,
     );
 
-    let diagnostics = supervisor.install_live(&specs[0], &specs, "hetz");
+    let diagnostics = supervisor.install_live(&specs[0], &specs, "example-linux");
     assert!(
         diagnostics.iter().any(|diagnostic| {
             diagnostic.contains("supervisor chain is unwalkable")

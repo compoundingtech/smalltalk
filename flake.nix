@@ -42,8 +42,8 @@
             self.homeManagerModules.default
             ({ lib, ... }: {
               options = {
-                xdg.configHome = lib.mkOption { type = lib.types.str; default = "/home/test/.config"; };
-                xdg.stateHome = lib.mkOption { type = lib.types.str; default = "/home/test/.local/state"; };
+                xdg.configHome = lib.mkOption { type = lib.types.str; default = "/home/example/.config"; };
+                xdg.stateHome = lib.mkOption { type = lib.types.str; default = "/home/example/.local/state"; };
                 xdg.configFile = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
                 home.packages = lib.mkOption { type = lib.types.listOf lib.types.package; default = [ ]; };
                 home.activation = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
