@@ -22,7 +22,7 @@ mission "eval/review-escalation/work" state="ready" revision-cutover="restart-ac
     agentless
     depends-on { step "route" completed }
     gate "the human accepts the routed review" type="human" {
-      reviewer "person/nathan"
+      reviewer "person/alex"
       review "${input.source}"
       review "resource/mission-run/${ST_MISSION_RUN}/review"
     }

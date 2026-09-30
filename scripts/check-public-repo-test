@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Exercise public repository guard boundaries using invented identities."""
+import runpy
+import unittest
+from pathlib import Path
+
+CHECK = runpy.run_path(str(Path(__file__).with_name('check-public-repo')))
+
+
+class PublicRepositoryCheck(unittest.TestCase):
+    def findings(self, content='', path='docs/example.md'):
+        return list(CHECK['findings'](Path(path), content))
+
+    def test_public_examples(self):
+        self.assertEqual(self.findings(
+            'host/example-linux /home/example/src /Users/example/src '
+            'person/alex person%2Falex agent/example/worker agent%2Fexample%2Fworker '
+            'agent/fleet/fixture-web/standing/web agent%2Ffleet%2Ffixture-web%2Fworker'
+        ), [])
+
+    def test_unknown_identity_and_home(self):
+        for text in ['person' + '/unknown-fixture', 'person' + '%2Funknown-fixture',
+                     '/home/' + 'unknown-fixture/src', '/Users/' + 'unknown-fixture/src']:
+            with self.subTest(text=text):
+                self.assertTrue(self.findings(text))
+
+    def test_internal_namespace(self):
+        for separator in ['/', '%2F', '%2f']:
+            self.assertTrue(self.findings(separator.join(['agent', 'fleet', 'fixture'])))
+
+    def test_host_boundaries(self):
+        # Build these probes from the checker's denylist, rather than writing host identities.
+        for escaped in CHECK['HOSTS']:
+            name = escaped.replace('\\', '')
+            for text in [name, name.upper(), f'host/{name}', f'https://{name}.example']:
+                self.assertTrue(self.findings(text))
+            self.assertEqual(self.findings(f'prefix{name}suffix'), [])
+            self.assertTrue(self.findings(path=f'docs/{name}.md'))
+
+    def test_private_repository_references(self):
+        for separator in ['-', '%2d']:
+            name = separator.join(['st3', 'network'])
+            for text in [name, name.upper(), f'https://github.com/example/{name}/tree/main',
+                         f'git@github.com:example/{name}.git']:
+                self.assertTrue(self.findings(text))
+            self.assertTrue(self.findings(path=f'docs/{name}.md'))
+        self.assertEqual(self.findings('Keep fleet configuration outside the public repository.'), [])
+
+    def test_retired_documents(self):
+        for path in ['docs/st3/release-status.md', 'docs/st3/rollout.md',
+                     'docs/st3/trial-handoff.md', 'docs/st3/audit-2026-09-30.md',
+                     'docs/st3/operational-state/audit-2027-01-01.md']:
+            self.assertTrue(self.findings(path=path))
+        self.assertEqual(self.findings(path='docs/st2/invariants.md'), [])
+        self.assertEqual(self.findings(path='evals/st3/example/reports/2026-09-30.md'), [])
+
+
+if __name__ == '__main__':
+    unittest.main()

@@ -1153,7 +1153,7 @@ each only once a real test proves it (per `CLAUDE.md`):
   round-trip assertion can see. The pi fixture asserts `23425` and not `23300`;
   the omp fixture asserts the prompt figure and not that message's `totalTokens`.
   The row *Version-pinned producer arithmetic* in
-  [INVARIANTS.md](../../../INVARIANTS.md) names the five.
+  [invariants.md](../../../docs/st2/invariants.md) names the five.
 
 - **Extension asset runtime smoke** — `checks.pi-extension-types` transpiles both
   shipped assets and drives every registered handler, because the type gate is

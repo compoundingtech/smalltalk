@@ -643,9 +643,14 @@ impl Client {
         id: &str,
     ) -> Result<Envelope<Resource>, ClientError> {
         let id = if collection == "launches" {
-            id.trim_start_matches("launch/")
+            id.strip_prefix("launch/").unwrap_or(id)
         } else {
             id
+        };
+        let id = if collection == "launches" {
+            percent_encode_segment(id)
+        } else {
+            id.to_owned()
         };
         self.get(&format!("/v1/client/{collection}/{id}")).await
     }
@@ -697,7 +702,7 @@ impl Client {
         };
         self.get(&format!(
             "/v1/client/launches/{}/{child}{suffix}",
-            launch_id.trim_start_matches("launch/")
+            percent_encode_segment(launch_id.strip_prefix("launch/").unwrap_or(launch_id))
         ))
         .await
     }
@@ -1156,6 +1161,23 @@ impl Client {
             .await
             .map_err(|_| ClientError::Transport("client-v0 request deadline exceeded".into()))??;
         if !(200..300).contains(&status) {
+            if status == 404 && bytes.is_empty() && path.starts_with("/v1/client/launches/") {
+                let error = ErrorEnvelope {
+                    api_version: "st3.client.v0".into(),
+                    error_version: "st3.client.error.v0".into(),
+                    request_id: String::new(),
+                    code: ErrorCode::NotFound,
+                    message: "this launch no longer exists".into(),
+                    retryable: false,
+                    retry_after_ms: None,
+                    details: Default::default(),
+                };
+                return Err(ClientError::Api(
+                    error.code.clone(),
+                    error.message.clone(),
+                    Box::new(error),
+                ));
+            }
             let error: ErrorEnvelope = serde_json::from_slice(&bytes)
                 .map_err(|decode| ClientError::Protocol(format!("HTTP {status}: {decode}")))?;
             return Err(ClientError::Api(

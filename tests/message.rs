@@ -37,7 +37,7 @@ fn agent_kdl(identity: &str, host: &str) -> String {
     )
 }
 
-/// A two-agent catalog on host `hetz`. Send to one by bus id → lands in *its* `resources/inbox`,
+/// A two-agent catalog on host `example-linux`. Send to one by bus id → lands in *its* `resources/inbox`,
 /// never the other's. List, then archive.
 #[test]
 fn send_by_bus_id_lands_in_recipient_inbox() {
@@ -45,30 +45,30 @@ fn send_by_bus_id_lands_in_recipient_inbox() {
     let root = tmp.path();
     write(
         root,
-        "hetz/st2-claude/agent.kdl",
-        &agent_kdl("st2-claude", "hetz"),
+        "example-linux/st2-claude/agent.kdl",
+        &agent_kdl("st2-claude", "example-linux"),
     );
     write(
         root,
-        "hetz/cos-claude/agent.kdl",
-        &agent_kdl("cos-claude", "hetz"),
+        "example-linux/cos-claude/agent.kdl",
+        &agent_kdl("cos-claude", "example-linux"),
     );
 
     // Resolve the recipient's agent folder by its bus id, then by bare identity — both must match.
-    let dir_by_bus = resolve_agent_dir(root, &address("hetz.st2-claude"), "hetz")
+    let dir_by_bus = resolve_agent_dir(root, &address("example-linux.st2-claude"), "example-linux")
         .unwrap()
         .expect("resolve by bus id");
-    let dir_by_ident = resolve_agent_dir(root, &address("st2-claude"), "hetz")
+    let dir_by_ident = resolve_agent_dir(root, &address("st2-claude"), "example-linux")
         .unwrap()
         .expect("resolve by identity");
     assert_eq!(dir_by_bus, dir_by_ident);
-    assert_eq!(dir_by_bus, root.join("hetz/st2-claude"));
+    assert_eq!(dir_by_bus, root.join("example-linux/st2-claude"));
 
     // Send lands under the recipient's resources/inbox — and nowhere near the other agent.
     let inbox = inbox_dir(&dir_by_bus);
-    let f = send_to_inbox(&inbox, "hetz.cos-claude", Some("kick"), None, &[], "do M2").unwrap();
+    let f = send_to_inbox(&inbox, "example-linux.cos-claude", Some("kick"), None, &[], "do M2").unwrap();
     assert!(inbox.join(&f).exists());
-    let other = inbox_dir(&root.join("hetz/cos-claude"));
+    let other = inbox_dir(&root.join("example-linux/cos-claude"));
     assert!(
         list_dir(&other).unwrap().is_empty(),
         "must not leak into the other agent's inbox"
@@ -76,7 +76,7 @@ fn send_by_bus_id_lands_in_recipient_inbox() {
 
     let listed = list_dir(&inbox).unwrap();
     assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].from.as_deref(), Some("hetz.cos-claude"));
+    assert_eq!(listed[0].from.as_deref(), Some("example-linux.cos-claude"));
     assert_eq!(read_msg(&inbox, &f).unwrap().body.trim_end(), "do M2");
 
     // Archive moves it out of the inbox and into resources/archive.
@@ -92,11 +92,11 @@ fn unknown_recipient_does_not_resolve() {
     let root = tmp.path();
     write(
         root,
-        "hetz/st2-claude/agent.kdl",
-        &agent_kdl("st2-claude", "hetz"),
+        "example-linux/st2-claude/agent.kdl",
+        &agent_kdl("st2-claude", "example-linux"),
     );
     assert!(
-        resolve_agent_dir(root, &address("hetz.nobody"), "hetz")
+        resolve_agent_dir(root, &address("example-linux.nobody"), "example-linux")
             .unwrap()
             .is_none()
     );
@@ -203,26 +203,26 @@ fn reply_threads_back_to_the_original_sender() {
     let root = tmp.path();
     write(
         root,
-        "hetz/st2-claude/agent.kdl",
-        &agent_kdl("st2-claude", "hetz"),
+        "example-linux/st2-claude/agent.kdl",
+        &agent_kdl("st2-claude", "example-linux"),
     );
     write(
         root,
-        "hetz/cos-claude/agent.kdl",
-        &agent_kdl("cos-claude", "hetz"),
+        "example-linux/cos-claude/agent.kdl",
+        &agent_kdl("cos-claude", "example-linux"),
     );
 
-    let me = resolve_agent_dir(root, &address("hetz.st2-claude"), "hetz")
+    let me = resolve_agent_dir(root, &address("example-linux.st2-claude"), "example-linux")
         .unwrap()
         .unwrap();
-    let cos = resolve_agent_dir(root, &address("hetz.cos-claude"), "hetz")
+    let cos = resolve_agent_dir(root, &address("example-linux.cos-claude"), "example-linux")
         .unwrap()
         .unwrap();
 
     // cos → me
     let original = send_to_inbox(
         &inbox_dir(&me),
-        "hetz.cos-claude",
+        "example-linux.cos-claude",
         Some("M2 kick"),
         None,
         &[],
@@ -233,12 +233,12 @@ fn reply_threads_back_to_the_original_sender() {
     // me replies: recipient + subject + in-reply-to derived from the original in my inbox.
     let inbound = read_msg(&inbox_dir(&me), &original).unwrap();
     let to = inbound.from.as_deref().unwrap();
-    assert_eq!(to, "hetz.cos-claude");
+    assert_eq!(to, "example-linux.cos-claude");
     let subject = reply_subject(inbound.subject.as_deref());
     assert_eq!(subject.as_deref(), Some("re: M2 kick"));
     let reply = send_to_inbox(
         &inbox_dir(&cos),
-        "hetz.st2-claude",
+        "example-linux.st2-claude",
         subject.as_deref(),
         Some(&original),
         &[],
@@ -247,7 +247,7 @@ fn reply_threads_back_to_the_original_sender() {
     .unwrap();
 
     let got = read_msg(&inbox_dir(&cos), &reply).unwrap();
-    assert_eq!(got.from.as_deref(), Some("hetz.st2-claude"));
+    assert_eq!(got.from.as_deref(), Some("example-linux.st2-claude"));
     assert_eq!(got.in_reply_to.as_deref(), Some(original.as_str()));
     assert_eq!(got.subject.as_deref(), Some("re: M2 kick"));
 }

@@ -367,6 +367,13 @@ CREATE TABLE IF NOT EXISTS replication_peers (
     updated_at_unix_ms TEXT NOT NULL
 );
 
+-- Direct route policy is local cache state, outside the replicated claim vocabulary.
+CREATE TABLE IF NOT EXISTS replication_refusals (
+    peer TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    updated_at_unix_ms TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS capabilities (
     secret_hash TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -14152,6 +14159,11 @@ impl Store {
                         params![relay, now, input.schema_digest, input.authority_digest, input.graph_digest],
                     )
                     .map_err(internal)?;
+                // A response to our own dial proves the outbound grants now permit it.
+                // Incoming exchanges only prove the reverse route.
+                if asks {
+                    transaction.execute("DELETE FROM replication_refusals WHERE peer=?1", [relay]).map_err(internal)?;
+                }
                 Ok((received, duplicate, signatures))
             })
             .map_err(|error| St3Error::new("internal", error))??;
@@ -14799,6 +14811,16 @@ impl Store {
     }
 
     pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<bool> {
+        if status == "refused" {
+            self.connection.batched(|transaction| {
+                transaction.execute(
+                    "INSERT INTO replication_refusals(peer, reason, updated_at_unix_ms) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(peer) DO UPDATE SET reason=excluded.reason, updated_at_unix_ms=excluded.updated_at_unix_ms",
+                    params![peer, error, now_ms().to_string()],
+                )
+            }).map_err(anyhow::Error::msg)??;
+            return Ok(true);
+        }
         // Keep the existing storage and claim vocabulary for mixed-version fleets.
         // Unknown reachability projects as last-seen in current product views.
         let status = if status == "down" { "unknown" } else { status };
@@ -14892,7 +14914,12 @@ impl Store {
         reason: Option<&str>,
         last_success_at: Option<u128>,
     ) -> Result<()> {
-        let status = if status == "down" { "unknown" } else { status };
+        // Keep route refusals local so older members can admit transport observations.
+        let status = if matches!(status, "down" | "refused") {
+            "unknown"
+        } else {
+            status
+        };
         let reason = if status == "unknown" { None } else { reason };
         let subject = format!("host/{peer}");
         let already_current = self
@@ -14935,6 +14962,19 @@ impl Store {
             )),
         })?;
         Ok(())
+    }
+
+    /// A direct Fabric refusal is local route state; it does not assert that the member is away.
+    pub fn replication_peer_refusal(&self, peer: &str) -> Result<Option<String>> {
+        Ok(self
+            .readers
+            .get()
+            .query_row(
+                "SELECT reason FROM replication_refusals WHERE peer=?1",
+                [peer],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// When this replica last exchanged records with `peer`. The peer row records every
@@ -15085,6 +15125,7 @@ impl Store {
                                 .get::<_, Option<String>>(1)?
                                 .and_then(|value| value.parse().ok()),
                             last_error: row.get(2)?,
+                            refusal_reason: None,
                             schema_digest: row.get(3)?,
                             authority_digest: row.get(4)?,
                             graph_digest: row.get(5)?,
@@ -15098,6 +15139,7 @@ impl Store {
                     status: "unknown".into(),
                     last_success_at_unix_ms: None,
                     last_error: None,
+                    refusal_reason: None,
                     schema_digest: None,
                     authority_digest: None,
                     graph_digest: None,
@@ -15116,6 +15158,18 @@ impl Store {
                     "last-seen"
                 }
                 .into();
+                status.last_error = None;
+            }
+            let refusal = connection
+                .query_row(
+                    "SELECT reason FROM replication_refusals WHERE peer=?1",
+                    [peer],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(reason) = refusal {
+                status.status = "refused".into();
+                status.refusal_reason = Some(reason);
                 status.last_error = None;
             }
             status.sync = sync.get(peer).cloned();
@@ -24742,26 +24796,26 @@ fn replication_snapshot_keeps_compact_envelope_identifiers() {
 #[test]
 fn compact_replication_inventory_matches_its_public_identities() {
     let mut identities = [
-        test_envelope_ids("silber-like", 1..=300, "a"),
-        test_envelope_ids("hetz-like", 250..=600, "a"),
-        test_envelope_ids("hetz-like", [255, 256, 511], "b"),
+        test_envelope_ids("example-mac-like", 1..=300, "a"),
+        test_envelope_ids("example-linux-like", 250..=600, "a"),
+        test_envelope_ids("example-linux-like", [255, 256, 511], "b"),
     ]
     .concat();
     // Hashes a peer could send that are not lowercase SHA-256 hex keep their exact text.
     let upper = identities[0].hash.to_uppercase();
     identities.extend([
         ReplicaEnvelopeId {
-            writer: "hetz-like".into(),
+            writer: "example-linux-like".into(),
             sequence: 256,
             hash: upper.clone(),
         },
         ReplicaEnvelopeId {
-            writer: "bluey-like".into(),
+            writer: "example-peer-like".into(),
             sequence: 7,
             hash: "not-a-hash".into(),
         },
         ReplicaEnvelopeId {
-            writer: "silber-like".into(),
+            writer: "example-mac-like".into(),
             sequence: 7,
             hash: String::new(),
         },
@@ -24789,18 +24843,18 @@ fn compact_replication_inventory_matches_its_public_identities() {
         assert_eq!(inventory.digest, replication_inventory_digest(&sorted));
         assert_eq!(inventory.buckets(), test_replication_buckets(&sorted));
         assert_eq!(inventory.irregular_hashes.len(), 3);
-        let range = inventory.range("hetz-like", 256);
+        let range = inventory.range("example-linux-like", 256);
         assert_eq!(
             inventory.identities(range),
             sorted
                 .iter()
-                .filter(|id| id.writer == "hetz-like" && (256..512).contains(&id.sequence))
+                .filter(|id| id.writer == "example-linux-like" && (256..512).contains(&id.sequence))
                 .cloned()
                 .collect::<Vec<_>>()
         );
     }
-    assert!(inventory_holds(&incremental, "hetz-like", 256, &upper));
-    assert!(inventory_holds(&incremental, "bluey-like", 7, "not-a-hash"));
+    assert!(inventory_holds(&incremental, "example-linux-like", 256, &upper));
+    assert!(inventory_holds(&incremental, "example-peer-like", 7, "not-a-hash"));
     assert!(bulk.range("absent", 0).is_empty());
 
     fn inventory_holds(
@@ -24821,9 +24875,9 @@ fn compact_replication_inventory_matches_its_public_identities() {
 #[cfg(test)]
 #[test]
 fn a_tombstoned_identity_held_again_is_listed_once() {
-    let mut identities = test_envelope_ids("hetz-like", [1, 2], "a");
+    let mut identities = test_envelope_ids("example-linux-like", [1, 2], "a");
     identities.push(ReplicaEnvelopeId {
-        writer: "hetz-like".into(),
+        writer: "example-linux-like".into(),
         sequence: 3,
         hash: "not-a-hash".into(),
     });
@@ -24992,8 +25046,8 @@ impl TestReplica {
 #[test]
 fn compact_replication_exchange_lists_only_ranges_that_differ() {
     let shared = [
-        test_envelope_ids("hetz-like", 1..=20_000, "a"),
-        test_envelope_ids("silber-like", 1..=20_000, "a"),
+        test_envelope_ids("example-linux-like", 1..=20_000, "a"),
+        test_envelope_ids("example-mac-like", 1..=20_000, "a"),
     ]
     .concat();
     let mut left = TestReplica(shared.iter().cloned().collect());
@@ -25001,15 +25055,15 @@ fn compact_replication_exchange_lists_only_ranges_that_differ() {
     // A new publish on one side, a sparse gap relayed around the other, and two candidates
     // at one writer sequence all fall inside ranges both peers already hold.
     left.0
-        .extend(test_envelope_ids("silber-like", [20_001], "a"));
+        .extend(test_envelope_ids("example-mac-like", [20_001], "a"));
     right
         .0
-        .extend(test_envelope_ids("hetz-like", 20_001..=20_003, "a"));
+        .extend(test_envelope_ids("example-linux-like", 20_001..=20_003, "a"));
     left.0
-        .remove(&test_envelope_ids("hetz-like", [19_990], "a")[0]);
+        .remove(&test_envelope_ids("example-linux-like", [19_990], "a")[0]);
     right
         .0
-        .extend(test_envelope_ids("silber-like", [20_000], "b"));
+        .extend(test_envelope_ids("example-mac-like", [20_000], "b"));
 
     let listed = left.exchange(&mut right);
     assert_eq!(left.0, right.0, "one exchange converges both peers");
@@ -25041,7 +25095,7 @@ fn compact_replication_exchange_lists_only_ranges_that_differ() {
 #[cfg(test)]
 #[test]
 fn compact_replication_exchange_bounds_the_listing_of_many_differing_ranges() {
-    let all = test_envelope_ids("hetz-like", 1..=5_000, "a");
+    let all = test_envelope_ids("example-linux-like", 1..=5_000, "a");
     let ranges = 5_000 / REPLICATION_BUCKET_WIDTH as usize + 1;
     let replica = |skip: u64| {
         TestReplica(
@@ -31629,6 +31683,46 @@ mod tests {
     }
 
     #[test]
+    fn an_inbound_exchange_keeps_the_outbound_grant_refusal_until_a_dial_succeeds() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("amber.db");
+        let fleet = "94cd11ba-c582-4558-9c84-c3bda922eb6d";
+        let store = Store::open(&path, "amber").unwrap();
+        store.bind_fleet(fleet).unwrap();
+        store
+            .record_peer_failure(
+                "cobalt",
+                "refused",
+                "refused by that member's Fabric grants",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path, "amber").unwrap();
+        let peer = Store::open_memory("cobalt").unwrap();
+        peer.bind_fleet(fleet).unwrap();
+        let exchange = peer
+            .export_replication_exchange(fleet, &ReplicationInventory::default())
+            .unwrap();
+        store
+            .receive_replication_exchange("cobalt", fleet, &exchange)
+            .unwrap();
+        let status = store
+            .replication_status(true, Some(fleet), &["cobalt".into()])
+            .unwrap();
+        assert_eq!(status.peers[0].status, "refused");
+        assert!(status.peers[0].last_success_at_unix_ms.is_some());
+        assert!(status.peers[0].last_error.is_none());
+        store
+            .receive_replication_exchange_asking("cobalt", fleet, &exchange, true)
+            .unwrap();
+        let status = store
+            .replication_status(true, Some(fleet), &["cobalt".into()])
+            .unwrap();
+        assert_eq!(status.peers[0].status, "up");
+        assert!(status.peers[0].refusal_reason.is_none());
+    }
+
+    #[test]
     fn recent_up_observation_prevents_a_transport_timeout_flap() {
         let store = Store::open_memory("source").unwrap();
         store
@@ -34749,28 +34843,28 @@ version 2
 
     #[test]
     fn a_remote_stop_without_process_authority_cannot_poison_the_running_owner() {
-        let owner = json!({"fields": {"status": "running", "host": "Silber"}});
+        let owner = json!({"fields": {"status": "running", "host": "ExampleMac"}});
         let remote_stop = json!({"fields": {"status": "stopped"}});
-        let remote_running = json!({"fields": {"status": "running", "host": "hetz"}});
+        let remote_running = json!({"fields": {"status": "running", "host": "example-linux"}});
         assert!(nonowner_terminal_observation(
             None,
-            "Silber",
+            "ExampleMac",
             &owner,
-            "hetz",
+            "example-linux",
             &remote_stop,
         ));
         assert!(!nonowner_terminal_observation(
-            Some("hetz"),
-            "Silber",
+            Some("example-linux"),
+            "ExampleMac",
             &owner,
-            "hetz",
+            "example-linux",
             &remote_stop,
         ));
         assert!(!nonowner_terminal_observation(
             None,
-            "Silber",
+            "ExampleMac",
             &owner,
-            "hetz",
+            "example-linux",
             &remote_running,
         ));
     }
@@ -37390,6 +37484,110 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         }
     }
 
+    #[test]
+    fn planning_state_and_attention_agree_when_claims_arrive_in_different_orders() {
+        let source = Store::open_memory("source").unwrap();
+        let kdl = "version 2\nmission \"release\" state=\"ready\" { goal \"Ship a release\" }\n";
+        let intent = crate::graph::parse_test_intent(kdl, "source").unwrap();
+        let mission = source
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        let doc = source
+            .put_document(
+                "doc/planning/release/request",
+                b"Ship a release",
+                &None,
+                "request",
+            )
+            .unwrap();
+        let reference = format!("{}@{}", doc.name, doc.hash);
+        let subject = "planning-session/planning/release/one";
+        let events = [
+            (
+                "started",
+                json!({"mission": "mission/release", "request": reference, "workspace": "/work/release", "requester": "person/avery", "planner": "agent/source.planner"}),
+            ),
+            (
+                "candidate-submitted",
+                json!({"candidate_revision": 1, "markdown": reference, "kdl": reference, "mission_revision": "revision-one"}),
+            ),
+            (
+                "previewed",
+                json!({"candidate_revision": 1, "preview_hash": "preview-one", "store_index": mission.store_index, "graph": "release", "diff": "new", "mission": mission}),
+            ),
+            (
+                "approved",
+                json!({"mission_revision": "revision-one", "requester": "person/avery"}),
+            ),
+        ];
+        for (kind, fields) in events {
+            // Distinct accepted times also prove this is independent of the receiver's indexes.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            source
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: format!("planning-session.{kind}"),
+                    actor: Some("person/avery".into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("planning-{kind}")),
+                })
+                .unwrap();
+            if kind == "previewed" {
+                source.replay_replication_graph().unwrap();
+                let attention = source.attention_items(Some("person/avery")).unwrap();
+                assert_eq!(attention.len(), 1);
+                assert_eq!(attention[0].kind, "launch-approval");
+            }
+        }
+        let envelopes = exchange_from(&source, &ReplicationInventory::default()).envelopes;
+        let in_order = Store::open_memory("in-order").unwrap();
+        receive_and_project(
+            &in_order,
+            "source",
+            &exchange_of("source", envelopes.clone()),
+        );
+        let reversed = Store::open_memory("reversed").unwrap();
+        for envelope in envelopes.iter().rev() {
+            receive_and_project(
+                &reversed,
+                "source",
+                &exchange_of("source", vec![envelope.clone()]),
+            );
+        }
+        assert_eq!(graph_digest_of(&in_order), graph_digest_of(&reversed));
+        for store in [&in_order, &reversed] {
+            let launch = store.planning_session(subject).unwrap().unwrap();
+            assert_eq!(launch.status, "approved");
+            assert_eq!(launch.published_revision.as_deref(), Some("revision-one"));
+            assert!(
+                store
+                    .attention_items(Some("person/avery"))
+                    .unwrap()
+                    .is_empty()
+            );
+            // Startup replay must retain the same result, too.
+            store.replay_replication_graph().unwrap();
+            assert_eq!(
+                store.planning_session(subject).unwrap().unwrap().status,
+                "approved"
+            );
+            assert!(
+                store
+                    .attention_items(Some("person/avery"))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
     /// Status, the harness view and the latest claim of a kind fold in canonical order. Two nodes
     /// that hold the same claims therefore agree even when the claims reached them in different
     /// orders, which a checkpoint relies on when it drops claims that a later one replaced.
@@ -39700,7 +39898,7 @@ version 2
 
     #[test]
     fn a_local_write_rehashes_only_its_own_inventory_range() {
-        let store = Store::open_memory("hetz").unwrap();
+        let store = Store::open_memory("example-linux").unwrap();
         for observed_at_ms in 0..600 {
             observe_harness(&store, observed_at_ms);
         }
@@ -39736,7 +39934,7 @@ version 2
                 1..6,
             ),
         ) {
-            let writers = ["Silber", "fleet-node", "hetz"];
+            let writers = ["ExampleMac", "fleet-node", "example-linux"];
             // Some hashes are not SHA-256 hex, so the digest also covers verbatim hashes.
             let identity = |(writer, sequence): (usize, u64)| ReplicaEnvelopeId {
                 writer: writers[writer].into(),
@@ -39780,7 +39978,7 @@ version 2
 
     #[test]
     fn replication_reuses_the_graph_digest_until_a_digested_column_changes() {
-        let store = Store::open_memory("hetz").unwrap();
+        let store = Store::open_memory("example-linux").unwrap();
         observe_harness(&store, 0);
         let first = store.replication_snapshot().unwrap();
         GRAPH_DIGESTS_COMPUTED.with(|computed| computed.set(0));
@@ -40343,7 +40541,7 @@ mission "asks" state="ready" {
                 mission: "asks".into(),
                 revision: None,
                 workspace: "/tmp".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "asks-run".into(),
@@ -40356,7 +40554,7 @@ mission "asks" state="ready" {
             store.request_attention_closing(
                 &format!("attention/{key}"),
                 &AttentionRequest {
-                    reviewer: "person/nathan".into(),
+                    reviewer: "person/alex".into(),
                     title: format!("Decide {key}"),
                     reason: "A person needs to decide before the work goes on.".into(),
                     severity: "warning".into(),
@@ -40369,15 +40567,15 @@ mission "asks" state="ready" {
         };
         let open = |subject: &str| {
             store
-                .attention_items(Some("person/nathan"))
+                .attention_items(Some("person/alex"))
                 .unwrap()
                 .iter()
                 .any(|item| item.subject == subject)
         };
-        let context = ["resource/fabric/queue", "host/silber"];
+        let context = ["resource/fabric/queue", "host/ExampleMac"];
 
         // Context and hosts never end an item, so a request naming only those is refused.
-        for (key, actor) in [("agent-unclaimed", agent), ("person", "person/nathan")] {
+        for (key, actor) in [("agent-unclaimed", agent), ("person", "person/alex")] {
             assert_eq!(
                 ask(key, actor, &context, AttentionClosing::default())
                     .unwrap_err()
@@ -40476,7 +40674,7 @@ mission "asks" state="ready" {
         assert_eq!(
             ask(
                 "late",
-                "person/nathan",
+                "person/alex",
                 &context,
                 AttentionClosing {
                     step: Some(step.clone()),
@@ -40520,7 +40718,7 @@ mission "external-blocker" state="ready" {
                 mission: "external-blocker".into(),
                 revision: None,
                 workspace: "/tmp".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "external-blocker-run".into(),
@@ -40541,19 +40739,19 @@ mission "external-blocker" state="ready" {
             .unwrap();
         let attention = store
             .request_attention(
-                "attention/silber-xcode",
+                "attention/example-mac-xcode",
                 &AttentionRequest {
-                    reviewer: "person/nathan".into(),
-                    title: "Silber needs its Xcode simulator components updated".into(),
+                    reviewer: "person/alex".into(),
+                    title: "ExampleMac needs its Xcode simulator components updated".into(),
                     reason: "CoreSimulator must be repaired before automated proof can run.".into(),
                     severity: "error".into(),
-                    targets: vec!["host/silber".into(), subject.clone()],
+                    targets: vec!["host/example-mac".into(), subject.clone()],
                     actor: "agent/source.ios-owner".into(),
-                    idempotency_key: "silber-xcode-attention".into(),
+                    idempotency_key: "example-mac-xcode-attention".into(),
                 },
             )
             .unwrap();
-        let reason = "Silber has an exact CoreSimulator/CoreDevice mismatch; renewing this claim would be idle and misleading.";
+        let reason = "ExampleMac has an exact CoreSimulator/CoreDevice mismatch; renewing this claim would be idle and misleading.";
         store
             .work_action(
                 &subject,
@@ -40610,8 +40808,8 @@ mission "external-blocker" state="ready" {
                 &AttentionResolveRequest {
                     outcome: "resolved".into(),
                     reason: Some("Xcode first-launch setup now succeeds.".into()),
-                    actor: "person/nathan".into(),
-                    idempotency_key: "resolve-silber-xcode".into(),
+                    actor: "person/alex".into(),
+                    idempotency_key: "resolve-example-mac-xcode".into(),
                 },
             )
             .unwrap();
@@ -46194,7 +46392,7 @@ mission "review-current" state="ready" revision-cutover="restart-active" {{
                     actor: None,
                     fields: BTreeMap::from([
                         ("owner".into(), Value::String(owner.into())),
-                        ("reviewer".into(), Value::String("person/nathan".into())),
+                        ("reviewer".into(), Value::String("person/alex".into())),
                         ("question".into(), Value::String("Approve it?".into())),
                         ("review_targets".into(), Value::Array(Vec::new())),
                         (
@@ -46314,7 +46512,7 @@ mission "asked-again" state="ready" {
         let ask = |operation: &str, mode: Option<&str>| {
             let mut fields = BTreeMap::from([
                 ("owner".into(), Value::String(step.subject.clone())),
-                ("reviewer".into(), Value::String("person/nathan".into())),
+                ("reviewer".into(), Value::String("person/alex".into())),
                 ("question".into(), Value::String("Approve it?".into())),
                 ("review_targets".into(), Value::Array(Vec::new())),
                 (
@@ -46363,7 +46561,7 @@ mission "asked-again" state="ready" {
         );
         assert_eq!(reviews[0].requested_at_unix_ms, first.accepted_at_unix_ms);
 
-        let items = store.attention_items(Some("person/nathan")).unwrap();
+        let items = store.attention_items(Some("person/alex")).unwrap();
         let gates = items
             .iter()
             .filter(|item| item.kind == "human-gate")
@@ -46377,7 +46575,7 @@ mission "asked-again" state="ready" {
             .request_attention(
                 subject,
                 &AttentionRequest {
-                    reviewer: "person/nathan".into(),
+                    reviewer: "person/alex".into(),
                     title: format!("Fault {subject}"),
                     reason: "a person must decide".into(),
                     severity: "warning".into(),
@@ -46391,7 +46589,7 @@ mission "asked-again" state="ready" {
 
     fn fault_is_current(store: &Store, subject: &str) -> bool {
         store
-            .attention_items(Some("person/nathan"))
+            .attention_items(Some("person/alex"))
             .unwrap()
             .iter()
             .any(|item| item.kind == "fault" && item.subject == subject)
@@ -46414,7 +46612,7 @@ mission "{mission}" state="ready" {{
                 mission: mission.into(),
                 revision: None,
                 workspace: ".".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: format!("{mission}-run"),
@@ -46457,7 +46655,7 @@ mission "{mission}" state="ready" {{
                 actor: None,
                 fields: BTreeMap::from([
                     ("owner".into(), Value::String(step.subject.clone())),
-                    ("reviewer".into(), Value::String("person/nathan".into())),
+                    ("reviewer".into(), Value::String("person/alex".into())),
                     ("question".into(), Value::String("Approve it?".into())),
                     ("review_targets".into(), Value::Array(Vec::new())),
                     (
@@ -46498,7 +46696,7 @@ mission "{mission}" state="ready" {{
                 &AttentionResolveRequest {
                     outcome: "resolved".into(),
                     reason: None,
-                    actor: "person/nathan".into(),
+                    actor: "person/alex".into(),
                     idempotency_key: "other-review-resolved".into(),
                 },
             )
@@ -46788,14 +46986,14 @@ mission "typecase" state="ready" {
                 mission: "typecase".into(),
                 revision: None,
                 workspace: ".".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "typecase-run".into(),
             })
             .unwrap();
         let request = AttentionRequest {
-            reviewer: "person/nathan".into(),
+            reviewer: "person/alex".into(),
             title: "Another fault".into(),
             reason: "a person must decide".into(),
             severity: "warning".into(),
@@ -46881,7 +47079,7 @@ mission "typecase" state="ready" {
     fn explicit_attention_is_idempotent_authorized_and_terminal() {
         let store = Store::open_memory("node").unwrap();
         let request = AttentionRequest {
-            reviewer: "nathan".into(),
+            reviewer: "alex".into(),
             title: "Fabric needs review".into(),
             reason: "The queue did not recover.".into(),
             severity: "error".into(),
@@ -46896,9 +47094,9 @@ mission "typecase" state="ready" {
             .request_attention("attention/fabric-queue", &request)
             .unwrap();
         assert_eq!(first.request, retry.request);
-        assert_eq!(first.reviewer, "person/nathan");
+        assert_eq!(first.reviewer, "person/alex");
         assert_eq!(first.status, "pending");
-        let items = store.attention_items(Some("person/nathan")).unwrap();
+        let items = store.attention_items(Some("person/alex")).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, "agent-request");
         assert_eq!(items[0].actions[0].label, "answer");
@@ -46955,7 +47153,7 @@ mission "typecase" state="ready" {
     fn attention_until_needs_a_known_condition_and_a_target() {
         let store = Store::open_memory("node").unwrap();
         let request = |targets: Vec<String>, key: &str| AttentionRequest {
-            reviewer: "person/nathan".into(),
+            reviewer: "person/alex".into(),
             title: "Publish this revision".into(),
             reason: "Publish the prepared revision as a person.".into(),
             severity: "warning".into(),
@@ -47017,7 +47215,7 @@ mission "typecase" state="ready" {
 version 2
 message "human-attention" {
   from "agent/demo/worker"
-  to "person/nathan"
+  to "person/alex"
   title "Please review"
   content "The declarative message is ready."
 }
@@ -47036,7 +47234,7 @@ message "human-attention" {
             .apply(&intent, &preview.subject_tokens, "desired-human-attention")
             .unwrap();
 
-        let items = store.attention_items(Some("person/nathan")).unwrap();
+        let items = store.attention_items(Some("person/alex")).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, "unread-message");
         assert_eq!(items[0].title, "Please review");
@@ -47049,7 +47247,7 @@ message "human-attention" {
                 "read",
                 "message/human-attention",
                 "--as",
-                "person/nathan",
+                "person/alex",
             ]
         );
         assert!(
@@ -47070,7 +47268,7 @@ message "human-attention" {
                 actor: Some("agent/demo/worker".into()),
                 fields: BTreeMap::from([
                     ("from".into(), Value::String("agent/demo/worker".into())),
-                    ("to".into(), Value::String("person/nathan".into())),
+                    ("to".into(), Value::String("person/alex".into())),
                     ("content".into(), Value::String("Please read this.".into())),
                     ("status".into(), Value::String("sent".into())),
                 ]),
@@ -47079,7 +47277,7 @@ message "human-attention" {
                 idempotency_key: Some("human-attention-message".into()),
             })
             .unwrap();
-        let items = store.attention_items(Some("person/nathan")).unwrap();
+        let items = store.attention_items(Some("person/alex")).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, "unread-message");
         assert_eq!(items[0].actions[0].label, "read");
@@ -47091,7 +47289,7 @@ message "human-attention" {
                 actor: None,
                 fields: BTreeMap::from([
                     ("status".into(), Value::String("delivered".into())),
-                    ("recipient".into(), Value::String("person/nathan".into())),
+                    ("recipient".into(), Value::String("person/alex".into())),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -47099,14 +47297,14 @@ message "human-attention" {
             })
             .unwrap();
         assert_eq!(
-            store.attention_items(Some("person/nathan")).unwrap()[0].kind,
+            store.attention_items(Some("person/alex")).unwrap()[0].kind,
             "unread-message"
         );
         store
             .append_claim(&ClaimInput {
                 subject: message.subject,
                 kind: "message.read".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([("status".into(), Value::String("read".into()))]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -47115,7 +47313,7 @@ message "human-attention" {
             .unwrap();
         assert!(
             store
-                .attention_items(Some("person/nathan"))
+                .attention_items(Some("person/alex"))
                 .unwrap()
                 .is_empty()
         );

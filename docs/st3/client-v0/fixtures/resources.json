@@ -1,6 +1,6 @@
 [
   {
-    "id": "attention/release-review", "kind": "attention", "attention_kind": "launch-approval", "source_id": "launch/release", "person_id": "person/nathan", "mission_id": "mission/release", "revision": "a1", "updated_at": "2026-09-20T11:00:00Z",
+    "id": "attention/release-review", "kind": "attention", "attention_kind": "launch-approval", "source_id": "launch/release", "person_id": "person/alex", "mission_id": "mission/release", "revision": "a1", "updated_at": "2026-09-20T11:00:00Z",
     "title": "Review release", "detail": "Choose a launch variant", "priority": "high", "state": "open",
     "requested_at": "2026-09-20T11:00:00Z", "targets": ["launch/release"], "actions": ["launch.approve", "launch.cancel"]
   },
@@ -83,10 +83,10 @@
   {
     "id": "lane/release/train", "kind": "lane", "revision": "claim-lane-3", "updated_at": "2026-09-20T11:09:05Z",
     "name": "train", "mission_run_id": "mission-run/release", "mission_id": "mission/release",
-    "entries_prefix": "resource/github/acme/app/ci/pull-request/", "approver_id": "person/nathan", "state": "open",
+    "entries_prefix": "resource/github/acme/app/ci/pull-request/", "approver_id": "person/ada", "state": "open",
     "entries": [
       {"entry_id":"resource/github/acme/app/ci/pull-request/42","label":"42","position":1,"state":"running","detail":"testing 1f2e3d4 on st/ci","head":"1f2e3d4","marked_by_id":"agent/release-driver","marked_at":"2026-09-20T11:09:05Z","joined_by_id":"agent/release-agent","joined_at":"2026-09-20T11:00:00Z","join_reason":"green","approved_by_id":null,"approved_at":null},
-      {"entry_id":"resource/github/acme/app/ci/pull-request/45","label":"45","position":2,"state":"held","detail":"waiting for person/nathan to approve","head":"9a8b7c6","marked_by_id":"agent/release-driver","marked_at":"2026-09-20T11:09:04Z","joined_by_id":"person/visitor","joined_at":"2026-09-20T11:08:00Z","join_reason":null,"approved_by_id":null,"approved_at":null}
+      {"entry_id":"resource/github/acme/app/ci/pull-request/45","label":"45","position":2,"state":"held","detail":"waiting for person/ada to approve","head":"9a8b7c6","marked_by_id":"agent/release-driver","marked_at":"2026-09-20T11:09:04Z","joined_by_id":"person/visitor","joined_at":"2026-09-20T11:08:00Z","join_reason":null,"approved_by_id":null,"approved_at":null}
     ],
     "recent": [
       {"change":"moved","entry_id":"resource/github/acme/app/ci/pull-request/43","label":"43","actor_id":"agent/release-driver","at":"2026-09-20T11:07:00Z","outcome":null,"placement":"bottom","anchor_id":null,"reason":"main moved during the run"}
@@ -101,7 +101,7 @@
   },
   {
     "id": "device/ios-release", "kind": "device", "revision": "dv2", "updated_at": "2026-09-20T11:09:30Z",
-    "person_id": "person/nathan", "name": "Nathan's iPhone", "session_actor": "person/nathan/session/ios-release", "state": "active",
+    "person_id": "person/alex", "name": "Alex's iPhone", "session_actor": "person/alex/session/ios-release", "state": "active",
     "scopes": ["read.projections", "terminal.read", "control.attention", "control.launches"], "expires_at": "2026-10-20T11:09:30Z"
   },
   {

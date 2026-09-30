@@ -2195,7 +2195,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 idempotency_key: Some(key.clone()),
         })?;
         self.store.request_attention(&attention_subject, &AttentionRequest {
-                reviewer: "person/nathan".into(),
+                reviewer: "person/alex".into(),
                 title: "Claude login expired".into(),
                 reason: format!("{} on {} is unauthenticated. Run /login in its terminal, then restart this harness; work delivery is held until a new authenticated incarnation.", subject.subject, self.host),
                 severity: "error".into(),
@@ -3731,7 +3731,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             self.store.request_attention(
                 &attention_subject,
                 &AttentionRequest {
-                    reviewer: "person/nathan".into(),
+                    reviewer: "person/alex".into(),
                     title: "A Codex agent stopped after repeated failures".into(),
                     reason: format!("{subject}: {retained_reason}. Inspect the seat and revise its desired declaration before restarting."),
                     severity: "error".into(),
@@ -13222,7 +13222,7 @@ version 2
     step "approval" {
       title "The candidate change"
       gate "human-review" type="human" {
-        reviewer "person/nathan"
+        reviewer "person/alex"
         question "Is the candidate ready?"
         review "resource/mission-run/${ST_MISSION_RUN}/candidate"
       }
@@ -13294,7 +13294,7 @@ version 2
             .append_claim(&ClaimInput {
                 subject: request.subject.clone(),
                 kind: "gate.result".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([("verdict".into(), Value::String("pass".into()))]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -13311,7 +13311,7 @@ version 2
             .append_claim(&ClaimInput {
                 subject: request.subject.clone(),
                 kind: "gate.result".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
                     ("verdict".into(), Value::String("pass".into())),
                     ("request".into(), Value::String(request.id.clone())),
@@ -13352,7 +13352,7 @@ version 2
             .append_claim(&ClaimInput {
                 subject: rejected_request.subject,
                 kind: "gate.result".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
                     ("verdict".into(), Value::String("fail".into())),
                     (
@@ -15225,7 +15225,7 @@ mission "publish" state="ready" {
                 mission: "publish".into(),
                 revision: None,
                 workspace: "/tmp".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "until-run".into(),
@@ -15236,7 +15236,7 @@ mission "publish" state="ready" {
                 .request_attention_closing(
                     subject,
                     &AttentionRequest {
-                        reviewer: "person/nathan".into(),
+                        reviewer: "person/alex".into(),
                         title: "Publish this revision".into(),
                         reason: "Publish the prepared revision as a person.".into(),
                         severity: "warning".into(),
@@ -15308,7 +15308,7 @@ mission "asks" state="ready" {
                 mission: "asks".into(),
                 revision: None,
                 workspace: "/tmp".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "asks-run".into(),
@@ -15334,7 +15334,7 @@ mission "asks" state="ready" {
             .request_attention_closing(
                 "attention/asked",
                 &AttentionRequest {
-                    reviewer: "person/nathan".into(),
+                    reviewer: "person/alex".into(),
                     title: "Decide the rollout".into(),
                     reason: "A person needs to decide before the rollout.".into(),
                     severity: "warning".into(),
@@ -17862,7 +17862,7 @@ mission "human-exhaustion" state="ready" {
     round { completion { when "all-steps-exhausted" } }
     on-exhausted {
       gate "accept-best" type="human" {
-        reviewer "person/nathan"
+        reviewer "person/alex"
         question "Accept the best bounded result?"
       }
     }
@@ -17928,7 +17928,7 @@ mission "human-exhaustion" state="ready" {
             .append_claim(&ClaimInput {
                 subject: request.subject.clone(),
                 kind: "gate.result".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
                     ("verdict".into(), Value::String("pass".into())),
                     ("request".into(), Value::String(request.id.clone())),
@@ -18107,7 +18107,7 @@ mission "alert-exhaustion" state="ready" {
     on-exhausted {
       fail
       attention "Automatic review failed" {
-        reviewer "person/nathan"
+        reviewer "person/alex"
         severity "error"
       }
     }
@@ -18139,7 +18139,7 @@ mission "alert-exhaustion" state="ready" {
             store.mission_run(&run.id).unwrap().unwrap().status,
             "failed"
         );
-        let attention = store.attention_items(Some("person/nathan")).unwrap();
+        let attention = store.attention_items(Some("person/alex")).unwrap();
         assert_eq!(attention.len(), 1);
         assert_eq!(attention[0].title, "Automatic review failed");
         assert_eq!(attention[0].kind, "fault");
@@ -18153,7 +18153,7 @@ mission "alert-exhaustion" state="ready" {
             reconciler.reconcile_once().unwrap();
         }
         assert_eq!(
-            store.attention_items(Some("person/nathan")).unwrap().len(),
+            store.attention_items(Some("person/alex")).unwrap().len(),
             1
         );
     }
@@ -18265,7 +18265,7 @@ mission "stopping" state="ready" {{
     #[test]
     fn a_loop_stopped_by_a_cancelled_round_says_how_to_start_over() {
         let (store, reconciler, run) = stopping_loop_run(
-            "agent/fleet/orchid",
+            "agent/example/orchid",
             r#"step "wait" {
         agentless
         gate "never" { field "status" "resource/never" "is" "ready" }
@@ -18916,8 +18916,8 @@ mission "eval/demo" state="ready" timeout="1m" {
 
     #[test]
     fn a_remote_reconciler_does_not_observe_a_local_stop_for_another_host() {
-        let store = Arc::new(Store::open_memory("Silber").unwrap());
-        let subject = "agent/fleet/probe";
+        let store = Arc::new(Store::open_memory("ExampleMac").unwrap());
+        let subject = "agent/example/probe";
         store
             .append_claim(&ClaimInput {
                 subject: subject.into(),
@@ -18925,7 +18925,7 @@ mission "eval/demo" state="ready" timeout="1m" {
                 actor: None,
                 fields: BTreeMap::from([
                     ("status".into(), Value::String("running".into())),
-                    ("host".into(), Value::String("Silber".into())),
+                    ("host".into(), Value::String("ExampleMac".into())),
                     ("runtime_id".into(), Value::String("fleet.probe".into())),
                     ("terminal".into(), Value::Bool(true)),
                 ]),
@@ -18946,7 +18946,7 @@ mission "eval/demo" state="ready" timeout="1m" {
         let remote = Reconciler::new(
             store.clone(),
             Arc::new(FakeRuntime::default()),
-            "hetz".into(),
+            "example-linux".into(),
             Arc::new(Notify::new()),
         );
         remote.reconcile_stop(&stop, Some(&HashMap::new())).unwrap();
@@ -18960,7 +18960,7 @@ mission "eval/demo" state="ready" timeout="1m" {
         let owner = Reconciler::new(
             store.clone(),
             Arc::new(FakeRuntime::default()),
-            "Silber".into(),
+            "ExampleMac".into(),
             Arc::new(Notify::new()),
         );
         owner.reconcile_stop(&stop, Some(&HashMap::new())).unwrap();
@@ -20404,7 +20404,7 @@ subscription "reviews" {{
                 &crate::model::AttentionResolveRequest {
                     outcome: "resolved".into(),
                     reason: Some("Corrected the subscription input".into()),
-                    actor: "person/nathan".into(),
+                    actor: "person/alex".into(),
                     idempotency_key: "resolve-subscription-failure".into(),
                 },
             )
@@ -20528,13 +20528,13 @@ subscription "reviews" {{
                 &crate::model::AttentionResolveRequest {
                     outcome: "dismissed".into(),
                     reason: Some("The intake run was cancelled days ago".into()),
-                    actor: "person/nathan".into(),
+                    actor: "person/ada".into(),
                     idempotency_key: "dismiss-agent-subscription-failure".into(),
                 },
             )
             .unwrap();
         assert_eq!(closed.status, "dismissed");
-        assert_eq!(closed.reviewer, "person/nathan");
+        assert_eq!(closed.reviewer, "person/ada");
         assert_eq!(failures().len(), 1);
 
         // A stopped subscription starts nothing more, so its failures end on their own.
@@ -20630,7 +20630,7 @@ subscription "reviews" {{
     mission "review@{revision}"
     resource "source"
     workspace "/tmp/st3-review"
-    requester "agent/fleet/repository/standing/owner"
+    requester "agent/example/repository/standing/owner"
   }}
 }}"#
         );
@@ -20752,7 +20752,7 @@ subscription "reviews" {{
         let runs = store.active_mission_runs_for_mission("review").unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].revision, revision);
-        assert_eq!(runs[0].requester, "agent/fleet/repository/standing/owner");
+        assert_eq!(runs[0].requester, "agent/example/repository/standing/owner");
         assert_eq!(
             runs[0].inputs["source"].subject.as_deref(),
             Some("resource/repo/pull-request/7")
@@ -23073,7 +23073,7 @@ version 2
         );
         let harness = store.current_harness("agent/node.seat-b").unwrap().unwrap();
         assert_eq!(harness.reason.as_deref(), Some("providerAuth"));
-        let attention = store.attention_items(Some("person/nathan")).unwrap();
+        let attention = store.attention_items(Some("person/alex")).unwrap();
         assert_eq!(attention.len(), 1);
         assert_eq!(attention[0].targets, ["agent/node.seat-b"]);
     }
@@ -23114,7 +23114,7 @@ version 2
         reconciler.reconcile_once().unwrap();
         assert!(fenced());
         assert_eq!(
-            store.attention_items(Some("person/nathan")).unwrap().len(),
+            store.attention_items(Some("person/alex")).unwrap().len(),
             1
         );
 
@@ -23124,7 +23124,7 @@ version 2
         assert!(!fenced());
         assert!(
             store
-                .attention_items(Some("person/nathan"))
+                .attention_items(Some("person/alex"))
                 .unwrap()
                 .is_empty()
         );
@@ -23148,7 +23148,7 @@ version 2
         reconciler.reconcile_once().unwrap();
         assert!(fenced());
         assert_eq!(
-            store.attention_items(Some("person/nathan")).unwrap().len(),
+            store.attention_items(Some("person/alex")).unwrap().len(),
             1
         );
     }
@@ -23754,7 +23754,7 @@ version 2
         );
         assert!(
             store
-                .attention_items(Some("person/nathan"))
+                .attention_items(Some("person/alex"))
                 .unwrap()
                 .is_empty()
         );
@@ -24416,7 +24416,7 @@ mission "ios-proof-blocked" state="ready" {
                 mission: "ios-proof-blocked".into(),
                 revision: None,
                 workspace: "/tmp".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "ios-proof-blocked-run".into(),
@@ -24459,11 +24459,11 @@ mission "ios-proof-blocked" state="ready" {
             .request_attention(
                 "attention/ios-proof-xcode",
                 &crate::model::AttentionRequest {
-                    reviewer: "person/nathan".into(),
-                    title: "Silber needs its Xcode simulator components updated".into(),
+                    reviewer: "person/alex".into(),
+                    title: "ExampleMac needs its Xcode simulator components updated".into(),
                     reason: "CoreSimulator cannot start until the privileged repair runs.".into(),
                     severity: "error".into(),
-                    targets: vec!["host/silber".into(), subject.clone()],
+                    targets: vec!["host/example-mac".into(), subject.clone()],
                     actor: "agent/node.ios-owner".into(),
                     idempotency_key: "ios-proof-xcode-attention".into(),
                 },
@@ -24518,7 +24518,7 @@ mission "ios-proof-blocked" state="ready" {
                 &crate::model::AttentionResolveRequest {
                     outcome: "resolved".into(),
                     reason: Some("Xcode simulator components are healthy.".into()),
-                    actor: "person/nathan".into(),
+                    actor: "person/alex".into(),
                     idempotency_key: "ios-proof-xcode-resolved".into(),
                 },
             )
