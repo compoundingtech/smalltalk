@@ -802,8 +802,8 @@ async fn a_dial_out_member_is_caught_up_and_never_reported_down() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|peer| peer["peer"] != "laptop"),
-        "a reports on the dial-out laptop: {peers}"
+            .any(|peer| peer["peer"] == "laptop" && peer["last_success_at_unix_ms"].is_number()),
+        "{peers}"
     );
     let machines = a.st_json(&["machines"]);
     let laptop_machine = machines["value"]["items"]
@@ -813,7 +813,7 @@ async fn a_dial_out_member_is_caught_up_and_never_reported_down() {
         .find(|machine| machine["host_id"] == "host/laptop")
         .cloned()
         .unwrap_or(Value::Null);
-    assert_eq!(laptop_machine["state"], "dial-out", "{machines}");
+    assert_eq!(laptop_machine["state"], "reachable", "{machines}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1723,6 +1723,7 @@ echo "$me $*" >> "$registry/calls"
 key() {{ echo "$1.$(echo "$2" | tr '/' '_')"; }}
 case "$1" in
   id) echo "$me" ;;
+  addr) epoch=$(cat "$registry/epoch" 2>/dev/null || echo 0); echo "{{\"addrs\":[\"$epoch\"]}}" ;;
   expose) echo "$4" > "$registry/$(key "$me" "$2")" ;;
   unexpose) rm -f "$registry/$(key "$me" "$2")" ;;
   dial) f="$registry/$(key "$2" "$3")"; [ -f "$f" ] || {{ echo "no such exposure" >&2; exit 1; }}; cat "$f" ;;
@@ -1784,9 +1785,18 @@ async fn the_fabric_transport_works_through_the_worker_alone() {
     ));
     let shim_b = fabric_shim(root.path(), "b");
     let port = b.port.to_string();
+    let file = st3::config::FleetFile::load(&a.state_dir())
+        .unwrap()
+        .unwrap();
+    let route = format!(
+        "fabric://a-fabric-id/{}",
+        st3::fleet::transport::default_fabric_protocol(&file.fleet_id)
+    );
     b.st_ok(&[
         "fleet",
         "join",
+        "--via",
+        &route,
         "--fabric-inbox",
         "--no-service",
         "--name",
@@ -1809,12 +1819,34 @@ async fn the_fabric_transport_works_through_the_worker_alone() {
     wait_for_notes(&a, &expected, 60, &[&a, &b]).await;
     wait_for_notes(&b, &expected, 60, &[&a, &b]).await;
 
+    // The shim drops live exposure mappings and changes its endpoint on restart. The running
+    // workers notice local connectivity, re-expose and dial again without a helper.
+    for entry in fs::read_dir(&registry).unwrap().flatten() {
+        if entry.file_name().to_string_lossy().contains(".st3_fleet_") {
+            fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    fs::write(registry.join("epoch"), "1").unwrap();
+    a.note("after-fabric-restart-a").await;
+    b.note("after-fabric-restart-b").await;
+    let recovered = expected
+        .iter()
+        .cloned()
+        .chain([
+            "custom/fleet-test/after-fabric-restart-a".to_owned(),
+            "custom/fleet-test/after-fabric-restart-b".to_owned(),
+        ])
+        .collect();
+    for node in [&a, &b] {
+        wait_for_notes(node, &recovered, 10, &[&a, &b]).await;
+    }
+
     let calls = fs::read_to_string(registry.join("calls")).unwrap();
     for node in ["a", "b"] {
         assert!(
             calls.contains(&format!("{node}-fabric-id expose st3/fleet/"))
-                && calls.contains("--ephemeral"),
-            "{node} did not expose itself ephemerally:\n{calls}"
+                && !calls.contains("--ephemeral"),
+            "{node} did not persist its exposure:\n{calls}"
         );
     }
     // An exchange synchronizes both directions, so the first successful dial can
@@ -1916,4 +1948,163 @@ async fn a_removed_members_writes_relayed_by_an_uninformed_member_are_refused() 
     r.note("r-later").await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(!c.notes().await.contains("custom/fleet-test/r-later"));
+}
+
+/// No member classification: the traveller has the same legacy configuration as its peers,
+/// but its network accepts no inbound connection. Two servers keep syncing while it sleeps.
+#[tokio::test(flavor = "multi_thread")]
+async fn outbound_only_member_returns_after_minutes_and_aged_hours_without_alerts() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let fleet_id = "8a7c55c0-e0d4-41cb-8e8c-6ab134611650";
+    let secret = root.path().join("fleet.secret");
+    fs::write(&secret, hex::encode([23_u8; 32])).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut a = Node::new(root.path(), "harbor");
+    let mut b = Node::new(root.path(), "beacon");
+    let mut traveller = Node::new(root.path(), "traveller");
+    // A closed inbound service counts attempted connections without contacting a real host.
+    let rejected = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rejected_port = rejected.local_addr().unwrap().port();
+    let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+    let count = attempts.clone();
+    let reject_task = tokio::spawn(async move {
+        while let Ok((connection, _)) = rejected.accept().await {
+            count.fetch_add(1, Ordering::Relaxed);
+            drop(connection);
+        }
+    });
+    a.legacy_config(
+        fleet_id,
+        &secret,
+        &[("beacon", b.port), ("traveller", rejected_port)],
+    );
+    b.legacy_config(
+        fleet_id,
+        &secret,
+        &[("harbor", a.port), ("traveller", rejected_port)],
+    );
+    traveller.legacy_config(fleet_id, &secret, &[("harbor", a.port), ("beacon", b.port)]);
+    let path = traveller.root.join("config/st3/config.toml");
+    let config = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        config
+            .lines()
+            .filter(|line| !line.starts_with("peer_listen"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    for node in [&mut a, &mut b, &mut traveller] {
+        node.start().await;
+    }
+    let mut expected = BTreeSet::new();
+    for node in [&a, &b, &traveller] {
+        node.note(&format!("{}-initial", node.name)).await;
+        expected.insert(format!("custom/fleet-test/{}-initial", node.name));
+    }
+    for node in [&a, &b, &traveller] {
+        wait_for_notes(node, &expected, 10, &[&a, &b, &traveller]).await;
+    }
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", traveller.port))
+            .await
+            .is_err()
+    );
+
+    for (label, sleep, age_ms) in [("minutes", 120, 120_000), ("hours", 2, 4 * 3_600_000)] {
+        // Leave its local daemon alive so it can record work while the network worker sleeps.
+        let mut worker = traveller.worker.take().unwrap();
+        worker.kill().unwrap();
+        worker.wait().unwrap();
+        let before = attempts.load(Ordering::Relaxed);
+        traveller.note(&format!("traveller-{label}")).await;
+        expected.insert(format!("custom/fleet-test/traveller-{label}"));
+        a.note(&format!("harbor-{label}")).await;
+        expected.insert(format!("custom/fleet-test/harbor-{label}"));
+        b.note(&format!("beacon-{label}")).await;
+        expected.insert(format!("custom/fleet-test/beacon-{label}"));
+        tokio::time::sleep(Duration::from_secs(sleep)).await;
+        // The minutes case uses real elapsed time. The hours case ages persistent evidence;
+        // virtual-clock worker tests separately exercise the full four-hour retry schedule.
+        for node in [&a, &b] {
+            let db = rusqlite::Connection::open(node.state_dir().join("claims.sqlite3")).unwrap();
+            db.busy_timeout(Duration::from_secs(5)).unwrap();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            db.execute(
+                "UPDATE replication_peers SET last_success_at_unix_ms=?1 WHERE peer='traveller'",
+                [(now - age_ms).to_string()],
+            )
+            .unwrap();
+            let status = node.st_json(&["replication", "status"]);
+            let peer = status["peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|peer| peer["peer"] == "traveller")
+                .unwrap();
+            assert_eq!(peer["status"], "last-seen", "{status}");
+            assert!(peer["last_success_at_unix_ms"].is_number());
+            assert!(peer["last_error"].is_null());
+            let doctor = node.st_json(&["doctor"]);
+            let check = doctor["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["name"] == "replication")
+                .unwrap();
+            assert_eq!(check["status"], "pass", "{doctor}");
+            let machines = node.st_json(&["machines"]);
+            let machine = machines["value"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|machine| machine["host_id"] == "host/traveller")
+                .unwrap();
+            assert_eq!(machine["state"], "last-seen", "{machines}");
+        }
+        assert!(
+            attempts.load(Ordering::Relaxed) - before <= 20,
+            "absence did not back off"
+        );
+        let always_on_notes = expected
+            .iter()
+            .filter(|note| !note.ends_with(&format!("traveller-{label}")))
+            .cloned()
+            .collect();
+        for node in [&a, &b] {
+            wait_for_notes(node, &always_on_notes, 10, &[&a, &b]).await;
+        }
+        // The returning member changes its local address and retains outbound-only networking.
+        traveller.port = free_port();
+        let returned = Instant::now();
+        traveller.worker = Some(
+            traveller
+                .command(&["replication-worker"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        for node in [&a, &b, &traveller] {
+            wait_for_notes(node, &expected, 10, &[&a, &b, &traveller]).await;
+        }
+        assert!(returned.elapsed() < Duration::from_secs(10));
+        for node in [&a, &b] {
+            assert_eq!(down_observations(node, "traveller").await, 0);
+            let attention = node.st_json(&["attention", "ls"]);
+            assert!(
+                attention["value"]["items"]
+                    .as_array()
+                    .is_some_and(|items| items.is_empty()),
+                "{attention}"
+            );
+        }
+    }
+    reject_task.abort();
 }

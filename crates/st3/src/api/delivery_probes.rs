@@ -41,7 +41,18 @@ struct PreviousRead {
     latency_ms: u128,
 }
 
-pub(super) fn check(store: &Store, now: u128) -> anyhow::Result<Option<DoctorCheck>> {
+pub(super) fn check(
+    store: &Store,
+    now: u128,
+    peers: &[String],
+) -> anyhow::Result<Option<DoctorCheck>> {
+    let seen = |member: &str| -> anyhow::Result<bool> {
+        Ok(member == store.origin()
+            || !peers.iter().any(|peer| peer == member)
+            || store
+                .replication_peer_last_success(member)?
+                .is_some_and(|at| now.saturating_sub(at) < STALE_MS))
+    };
     let documents = store.list_documents_page(None, Some(PREFIX), false, None, 201)?;
     if documents.is_empty() {
         return Ok(None);
@@ -79,12 +90,19 @@ pub(super) fn check(store: &Store, now: u128) -> anyhow::Result<Option<DoctorChe
         .flat_map(|report| report.members.iter().cloned())
         .collect::<BTreeSet<_>>();
     for member in &members {
+        if !seen(member)? {
+            notes.push(format!("{member}: last seen; waiting for an exchange"));
+            continue;
+        }
         if !reports.contains_key(member) {
             warned = true;
             notes.push(format!("{member}: no probe heartbeat or outgoing results"));
         }
     }
     for report in reports.values() {
+        if !seen(&report.source)? {
+            continue;
+        }
         let age = now.saturating_sub(report.updated_at_unix_ms);
         if age > STALE_MS || report.updated_at_unix_ms > now.saturating_add(5_000) {
             warned = true;
@@ -99,12 +117,18 @@ pub(super) fn check(store: &Store, now: u128) -> anyhow::Result<Option<DoctorChe
             .iter()
             .filter(|target| *target != &report.source)
         {
+            if !seen(target)? {
+                continue;
+            }
             if !report.routes.iter().any(|route| &route.target == target) {
                 warned = true;
                 notes.push(format!("{} → {target}: no route result", report.source));
             }
         }
         for route in &report.routes {
+            if !seen(&route.target)? {
+                continue;
+            }
             let path = format!("{} → {}", report.source, route.target);
             if let Some(previous) = &route.previous_read
                 && previous.late
@@ -251,22 +275,22 @@ mod tests {
     #[test]
     fn delivery_probes_require_every_source_and_current_read_results() {
         let store = Store::open_memory("amber").unwrap();
-        assert!(check(&store, 2000).unwrap().is_none());
+        assert!(check(&store, 2000, &[]).unwrap().is_none());
         put(&store, "amber", 2000, "read", 400);
-        let missing = check(&store, 2000).unwrap().unwrap();
+        let missing = check(&store, 2000, &[]).unwrap().unwrap();
         assert_eq!(missing.status, "warn");
         assert!(missing.message.contains("cobalt: no probe heartbeat"));
         put(&store, "cobalt", 2000, "read", 600);
-        let good = check(&store, 2000).unwrap().unwrap();
+        let good = check(&store, 2000, &[]).unwrap().unwrap();
         assert_eq!(good.status, "pass");
         assert!(good.message.contains("amber → cobalt: read in 400ms"));
-        assert_eq!(check(&store, 100_000).unwrap().unwrap().status, "warn");
+        assert_eq!(check(&store, 100_000, &[]).unwrap().unwrap().status, "warn");
         put(&store, "amber", 100_000, "pending", 400);
-        let overdue = check(&store, 100_000).unwrap().unwrap();
+        let overdue = check(&store, 100_000, &[]).unwrap().unwrap();
         assert!(overdue.message.contains("no read within the deadline"));
         put(&store, "amber", 100_000, "read", 61_000);
         assert!(
-            check(&store, 100_000)
+            check(&store, 100_000, &[])
                 .unwrap()
                 .unwrap()
                 .message
@@ -275,11 +299,21 @@ mod tests {
     }
 
     #[test]
+    fn absent_members_pause_missing_heartbeats_and_overdue_routes() {
+        let store = Store::open_memory("amber").unwrap();
+        put(&store, "amber", 100_000, "overdue", 61_000);
+        let report = check(&store, 100_000, &["cobalt".into()]).unwrap().unwrap();
+        assert_eq!(report.status, "pass");
+        assert!(report.message.contains("last seen"));
+        assert!(!report.message.contains("deadline"));
+    }
+
+    #[test]
     fn delivery_probes_do_not_accept_delivered_as_read_or_bad_documents() {
         let store = Store::open_memory("amber").unwrap();
         put(&store, "amber", 2000, "delivered", 400);
         put(&store, "cobalt", 2000, "read", 600);
-        let check_result = check(&store, 2000).unwrap().unwrap();
+        let check_result = check(&store, 2000, &[]).unwrap().unwrap();
         assert_eq!(check_result.status, "warn");
         assert!(check_result.message.contains("no verified read"));
         let name = format!("{PREFIX}cobalt");
@@ -296,7 +330,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            check(&store, 2000)
+            check(&store, 2000, &[])
                 .unwrap()
                 .unwrap()
                 .message
@@ -313,7 +347,7 @@ mod tests {
             )
             .unwrap();
         assert!(
-            check(&store, 2000)
+            check(&store, 2000, &[])
                 .unwrap()
                 .unwrap()
                 .message

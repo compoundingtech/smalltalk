@@ -819,7 +819,13 @@ fn machines(model: &Model) -> Vec<Machine> {
                 "online" | "reachable" | "local" | "active"
             ),
             platform: machine.state.clone(),
-            seen: age(&machine.header.updated_at),
+            seen: machine
+                .transports
+                .iter()
+                .filter_map(|transport| transport.last_success_at.as_deref())
+                .max()
+                .map(age)
+                .unwrap_or_else(|| "not seen yet".into()),
             load: Some(format!(
                 "{} running runtimes",
                 machine.occupancy.running_runtimes
@@ -832,7 +838,7 @@ fn machines(model: &Model) -> Vec<Machine> {
                         transport.protocol.clone(),
                         matches!(
                             transport.status.as_str(),
-                            "ok" | "connected" | "reachable" | "healthy"
+                            "ok" | "up" | "connected" | "reachable" | "healthy"
                         ),
                         transport.status.clone(),
                     )

@@ -38,8 +38,11 @@ class FakeApi:
         self.records = []
         self.fail_send = False
         self.advanced = False
+        self.online = True
 
     async def get(self, path):
+        if path == "/v1/replication/status":
+            return {"peers": [{"peer": "cobalt", "status": "up" if self.online else "last-seen"}]}
         if path.startswith("/v1/claims"):
             return {"claims": self.records}
         if path.startswith("/v1/messages/read/") and self.advanced:
@@ -84,6 +87,37 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(route["status"], "sending")
         await self.monitor.route(self.target)
         self.assertEqual(sum(path == "/v1/attention" for path, _ in self.monitor.api.posts), 1)
+
+    async def test_absence_pauses_sends_and_resumes_the_same_pending_message(self):
+        self.monitor.api.online = False
+        await self.monitor.route(self.target)
+        self.assertFalse(self.monitor.api.posts)
+        self.assertEqual(self.monitor.report()["routes"][0]["status"], "last-seen")
+        self.monitor.api.online = True
+        await self.monitor.route(self.target)
+        original = self.monitor.state["routes"][self.target]["message"]
+        self.monitor.measuring[self.target] -= 14_400_000_000_000
+        self.monitor.api.online = False
+        await self.monitor.route(self.target)
+        self.assertFalse(any(path == "/v1/attention" for path, _ in self.monitor.api.posts))
+        self.monitor.api.online = True
+        await self.monitor.route(self.target)
+        self.assertEqual(self.monitor.state["routes"][self.target]["message"], original)
+        self.assertEqual(self.monitor.state["routes"][self.target]["status"], "pending")
+        self.assertFalse(any(path == "/v1/attention" for path, _ in self.monitor.api.posts))
+
+    async def test_absence_withdraws_existing_route_attention(self):
+        await self.monitor.route(self.target)
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        self.assertIn("attention", self.monitor.state["routes"][self.target])
+        self.monitor.api.online = False
+        await self.monitor.route(self.target)
+        self.assertNotIn("attention", self.monitor.state["routes"][self.target])
+        self.assertTrue(any(path.startswith("/v1/attention/withdraw/") for path, _ in self.monitor.api.posts))
+        self.monitor.api.online = True
+        await self.monitor.route(self.target)
+        self.assertEqual(self.monitor.state["routes"][self.target]["status"], "pending")
 
     async def test_delivered_is_not_read_and_wrong_actor_cannot_clear_attention(self):
         await self.monitor.route(self.target)

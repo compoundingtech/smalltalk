@@ -287,7 +287,7 @@ enum FleetInvitesCommand {
 
 #[derive(Args, Clone)]
 struct FleetMemberArgs {
-    /// Accept no connections and dial listening members: for a laptop that is often away.
+    /// Accept no inbound connections; replication and presence otherwise behave normally.
     #[arg(long)]
     dial_out: bool,
     /// The replication port. The default is 31313 or the next free port.
@@ -373,7 +373,7 @@ struct FleetJoinArgs {
     /// This machine's name in the fleet.
     #[arg(long)]
     name: Option<String>,
-    /// A loopback URL that reaches the sponsor, instead of the code's endpoints.
+    /// A loopback/tailnet http:// or fabric:// route to the sponsor.
     #[arg(long)]
     via: Option<String>,
     /// Do not stop, install, or start services; print the foreground commands instead.
@@ -6934,7 +6934,7 @@ fn render_replication_peers(
             peer.last_error.as_deref().unwrap_or("")
         );
         if let Some(at) = peer.last_success_at_unix_ms {
-            let _ = writeln!(output, "  last exchange {}", relative_time(at, now));
+            let _ = writeln!(output, "  last seen {}", relative_time(at, now));
         } else {
             let _ = writeln!(output, "  no exchange yet");
         }
@@ -15256,29 +15256,29 @@ mod tests {
              sync\tcatching up: Silber has 124,384 envelopes this node lacks, \
              caught up in about 15m\n\
              peer\tSilber\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 Silber has 124,384 envelopes this node lacks\n\
              \x20 this node has 3 envelopes Silber lacks\n\
              \x20 receiving 142.5 envelopes/s, caught up in about 15m (measured 2s ago)\n\
              peer\tQuiet\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 in sync: the same envelopes and the same graph (measured now)\n\
              peer\tMoved\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 same envelopes (measured now), but the graphs differ (this node \
              111111111111, Moved 444444444444); the next exchange compares them\n\
              peer\tSettling\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 graphs differ: the same envelopes project different graphs since 10s ago \
              (compared now; this node 111111111111, Settling 555555555555)\n\
              \x20 diverged if this lasts a minute; a peer still projecting settles by itself\n\
              peer\tLaptop\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 diverged: the same envelopes project different graphs since 3m ago \
              (compared 1s ago; this node 111111111111, Laptop 222222222222)\n\
              \x20 exchanges cannot fix this; the nodes heal by comparing the claims each projects, and views on one node are wrong until then\n\
              peer\tFresh\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 difference not measured yet\n"
         );
     }

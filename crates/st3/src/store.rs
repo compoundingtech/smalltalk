@@ -14797,6 +14797,10 @@ impl Store {
     }
 
     pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<bool> {
+        // Keep the existing storage and claim vocabulary for mixed-version fleets.
+        // Unknown reachability projects as last-seen in current product views.
+        let status = if status == "down" { "unknown" } else { status };
+        let error = if status == "unknown" { "" } else { error };
         // An inbound exchange is just as good evidence of reachability as an outbound one.
         // Keep the last success during a short missed-exchange window, so a failed dial on
         // one side cannot flap a peer that is still exchanging in the other direction.
@@ -14883,6 +14887,8 @@ impl Store {
         reason: Option<&str>,
         last_success_at: Option<u128>,
     ) -> Result<()> {
+        let status = if status == "down" { "unknown" } else { status };
+        let reason = if status == "unknown" { None } else { reason };
         let subject = format!("host/{peer}");
         let already_current = self
             .latest_claim(&subject, Some("transport.observed"))?
@@ -14905,7 +14911,9 @@ impl Store {
         if let Some(reason) = reason {
             fields.insert("reason".into(), Value::String(reason.to_owned()));
         }
-        let last_success_at = last_success_at.or_else(|| (status == "up").then(now_ms));
+        let last_success_at = last_success_at
+            .or_else(|| (status == "up").then(now_ms))
+            .or(self.replication_peer_last_success(peer)?);
         if let Some(last_success_at) = last_success_at.and_then(|value| u64::try_from(value).ok()) {
             fields.insert("last_success_at".into(), Value::from(last_success_at));
         }
@@ -15090,6 +15098,21 @@ impl Store {
                     graph_digest: None,
                     sync: None,
                 });
+            if matches!(
+                status.status.as_str(),
+                "up" | "unknown" | "down" | "last-seen"
+            ) {
+                status.status = if status
+                    .last_success_at_unix_ms
+                    .is_some_and(|at| now_ms().saturating_sub(at) < 90_000)
+                {
+                    "up"
+                } else {
+                    "last-seen"
+                }
+                .into();
+                status.last_error = None;
+            }
             status.sync = sync.get(peer).cloned();
             peers.push(status);
         }

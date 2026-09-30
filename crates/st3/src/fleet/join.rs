@@ -15,7 +15,8 @@ use super::code::{CodeEndpoint, JoinCode};
 use super::handshake::{JoinResponse, Joiner, SealedJoin, WriterHead};
 use super::keys::MemberKey;
 use super::transport::{
-    Fabric, bindable_tailnet_addresses, local_addresses, resolve_tool, tailscale_addresses,
+    Fabric, Route, bindable_tailnet_addresses, local_addresses, parse_route, resolve_tool,
+    tailscale_addresses,
 };
 use crate::config::{FleetFile, FleetMode};
 use crate::store::{Store, valid_fleet_node_name};
@@ -173,7 +174,7 @@ pub struct JoinOptions {
     pub configured_node: String,
     pub code: String,
     pub name: Option<String>,
-    /// A loopback URL that reaches the sponsor, overriding the code's endpoints.
+    /// A loopback/tailnet HTTP or Fabric route to the sponsor, overriding its endpoints.
     pub via: Option<String>,
     pub settings: MemberSettings,
     /// A migration keeps the node's config-peer secret file.
@@ -198,17 +199,19 @@ pub struct Joined {
 /// handshake and the lasting route to record, which for Fabric names the peer, not the tunnel.
 async fn sponsor_url(code: &JoinCode, options: &JoinOptions) -> Result<(String, String)> {
     if let Some(via) = &options.via {
-        let url = reqwest::Url::parse(via).context("parse --via")?;
-        let loopback = url.host_str().is_some_and(|host| {
-            host.eq_ignore_ascii_case("localhost")
-                || host
-                    .trim_matches(['[', ']'])
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|address| address.is_loopback())
-        });
-        anyhow::ensure!(loopback, "--via must be a loopback URL");
-        let url = via.trim_end_matches('/').to_owned();
-        return Ok((url.clone(), url));
+        let route = parse_route(via).context(
+            "--via needs a loopback or tailnet http:// URL, or fabric://NODE_ID/PROTOCOL",
+        )?;
+        return match route {
+            Route::Http(url) => Ok((url.clone(), url)),
+            Route::Fabric { node, protocol } => {
+                let fabric = resolve_tool(options.settings.fabric.as_deref(), "fabric")
+                    .map(Fabric::new)
+                    .context("Fabric is unavailable for --via")?;
+                let address = fabric.dial(&node, &protocol).await?;
+                Ok((format!("http://{address}"), via.clone()))
+            }
+        };
     }
     let tailscale = resolve_tool(options.settings.tailscale.as_deref(), "tailscale");
     if let Some(tailscale) = tailscale

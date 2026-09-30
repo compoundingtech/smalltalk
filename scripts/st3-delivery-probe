@@ -199,7 +199,32 @@ class Probe:
 
     async def route(self, target):
         route = self.state["routes"].get(target)
-        if route is None or (route.get("status") == "read" and now_ms() >= route["next_at_unix_ms"]):
+        presence = await self.api.get("/v1/replication/status")
+        online = any(peer["peer"] == self.peers[target] and peer["status"] == "up"
+                     for peer in presence["peers"])
+        if not online:
+            if route is None:
+                route = {"target": self.peers[target], "to": target, "status": "unstarted"}
+                self.state["routes"][target] = route
+            if not route.get("waiting_for_member"):
+                if route.get("attention"):
+                    await self.api.post("/v1/attention/withdraw/" + route["attention"], {
+                        "actor": self.actor, "reason": "Member is last seen; delivery waits for a new exchange.",
+                        "idempotency_key": "delivery-probe-absent:" + route["attention"],
+                    })
+                    route.pop("attention", None)
+                route["waiting_for_member"] = True
+                self.measuring.pop(target, None)
+                self.persist()
+            return
+        if route and route.pop("waiting_for_member", False):
+            if route["status"] not in ("read", "unstarted"):
+                route["started_at_unix_ms"] = now_ms()
+                route["status"] = "sending" if route["status"] == "sending" else "pending"
+                route.pop("previous_read", None)
+                self.measuring[target] = time.monotonic_ns()
+            self.persist()
+        if route is None or route.get("status") == "unstarted" or (route.get("status") == "read" and now_ms() >= route["next_at_unix_ms"]):
             previous_read = {key: route[key] for key in ("message", "latency_ms", "late") if key in route} if route else None
             nonce = str(uuid.uuid4())
             key = f"delivery-probe:{self.actor}:{target}:{nonce}"
@@ -264,7 +289,7 @@ class Probe:
                     "title": f"Delivery probe {self.source} → {self.peers[target]} has no read receipt",
                     "reason": f"{route['message']} was not read within {self.deadline // 1000}s. The native probe keeps watching; its recipient closes the message after a real read, which clears this item. Inspect the node's probe seat, replication and daemon.",
                     "targets": [route["message"]],
-                    "idempotency_key": f"delivery-probe-overdue:{route['message']}",
+                    "idempotency_key": f"delivery-probe-overdue:{route['message']}:{route['started_at_unix_ms']}",
                 })
                 route["attention"] = attention["subject"]
                 self.persist()
@@ -283,7 +308,7 @@ class Probe:
         return {"format": FORMAT, "source": self.source, "agent": self.actor,
                 "updated_at_unix_ms": now_ms(), "interval_ms": self.interval,
                 "deadline_ms": self.deadline, "members": sorted([self.source] + list(self.peers.values())),
-                "routes": [self.state["routes"].get(target, {"target": host, "to": target, "status": "unstarted"})
+                "routes": [dict(self.state["routes"][target], status="last-seen") if self.state["routes"].get(target, {}).get("waiting_for_member") else self.state["routes"].get(target, {"target": host, "to": target, "status": "unstarted"})
                            for target, host in sorted(self.peers.items())]}
 
     async def publish(self):

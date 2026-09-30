@@ -307,7 +307,9 @@ fn conversation_owner_host(
     .map(|origin| client_host_id(&origin));
     if let Some(owner) = &remote {
         if !session.authority_actor.starts_with("person/") {
-            return Err(forbidden("a remote conversation requires a concrete person"));
+            return Err(forbidden(
+                "a remote conversation requires a concrete person",
+            ));
         }
         if state
             .client_relay
@@ -411,9 +413,7 @@ async fn follow_conversation(
     outbox: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
 ) {
     let remote = remote.as_deref();
-    let failed = |error: ApiError| {
-        json!({"kind":"error", "id":id, "collection":"conversation", "code":error.code, "message":error.message})
-    };
+    let failed = |error: ApiError| json!({"kind":"error", "id":id, "collection":"conversation", "code":error.code, "message":error.message});
     loop {
         // The cursor first, so nothing that lands while the page is read is lost.
         let start =
@@ -1850,12 +1850,6 @@ fn machine_resources(
     // Fleet members count as configured hosts; ended members are history. A config peer that
     // ended as a member is history too, even while its [[peers]] entry remains.
     let fleet = state.store.fleet_view_for_client()?;
-    let dial_out_hosts = fleet
-        .members
-        .iter()
-        .filter(|member| member.state == "current" && member.mode == "dial-out")
-        .map(|member| client_host_id(&member.name))
-        .collect::<BTreeSet<_>>();
     let ended_hosts = fleet
         .members
         .iter()
@@ -1910,20 +1904,20 @@ fn machine_resources(
             operational_layer,
             operational_actionable,
             operational_reasons,
-        ) = if host_id != local_host && dial_out_hosts.contains(&host_id) {
-            // A dial-out member is never dialed, so it is never reachable or unreachable from
-            // here: show when it last exchanged with this node instead.
+        ) = if host_id != local_host && configured_hosts.contains(&host_id) {
             let last_success_at = state.store.replication_peer_last_success(&name)?;
+            let recent =
+                last_success_at.is_some_and(|at| client_now_ms().saturating_sub(at) < 90_000);
             (
-                "dial-out",
+                if recent { "reachable" } else { "last-seen" },
                 vec![json!({
                     "protocol": "replication",
-                    "status": "unknown",
+                    "status": if recent { "up" } else { "last-seen" },
                     "last_success_at": last_success_at.map(client_timestamp),
                 })],
                 "current".to_owned(),
-                false,
-                vec!["dial-out-member".to_owned()],
+                recent,
+                vec!["replication-transport".to_owned()],
             )
         } else if host_id == local_host {
             (
@@ -3885,13 +3879,15 @@ impl ConversationMark {
             .unwrap_or_default();
         // Resolve the transcript once: finding it walks the harness's session directories.
         let transcript = match (&owner, &incarnation) {
-            (Some(owner), Some(incarnation)) => match managed_codex_transcript(state, owner, incarnation)? {
-                Some(external) => Some(external),
-                None => match managed_claude_transcript(state, owner, incarnation)? {
+            (Some(owner), Some(incarnation)) => {
+                match managed_codex_transcript(state, owner, incarnation)? {
                     Some(external) => Some(external),
-                    None => managed_omp_transcript(state, owner, incarnation)?,
-                },
-            },
+                    None => match managed_claude_transcript(state, owner, incarnation)? {
+                        Some(external) => Some(external),
+                        None => managed_omp_transcript(state, owner, incarnation)?,
+                    },
+                }
+            }
             _ => crate::external_sessions::find(state.native_session_home.as_deref(), session_id)
                 .map_err(ApiError::internal)?,
         }
@@ -3912,7 +3908,14 @@ impl ConversationMark {
         if index > self.store_index {
             let claims = state
                 .store
-                .claims_page(None, None, self.store_index, index.checked_add(1), false, 10_000)
+                .claims_page(
+                    None,
+                    None,
+                    self.store_index,
+                    index.checked_add(1),
+                    false,
+                    10_000,
+                )
                 .map_err(ApiError::internal)?
                 .claims;
             // A burst too large to scan is treated as a change.
@@ -7897,8 +7900,8 @@ subscription "watch/source" {
             .iter()
             .find(|machine| machine["host_id"] == "host/laptop")
             .expect("the dial-out member is a current machine");
-        assert_eq!(laptop["state"], "dial-out");
-        assert_eq!(laptop["transports"][0]["status"], "unknown");
+        assert_eq!(laptop["state"], "last-seen");
+        assert_eq!(laptop["transports"][0]["status"], "last-seen");
         assert!(
             machines
                 .iter()

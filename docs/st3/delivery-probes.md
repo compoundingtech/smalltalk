@@ -104,3 +104,8 @@ only its own test recipient, observes an overdue attention item and a doctor
 warning, then restores that recipient and verifies exactly one read claim.
 Shorter test intervals make the outage proof bounded; production uses the
 60-second deadline. The native proof runs in the normal Linux Cargo test suite.
+
+A member shown as last seen pauses its route: the probe queues no new sends, withdraws
+route attention, and retains any pending message. After a new replication exchange,
+it resumes that same message with a fresh measurement window. Doctor waits for absent
+members before judging missing heartbeats or overdue routes.
