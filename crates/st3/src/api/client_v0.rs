@@ -3266,6 +3266,29 @@ fn managed_omp_transcript(
     }
 }
 
+fn external_conversation_items(
+    conversation: Option<crate::external_sessions::ExternalConversation>,
+    session_id: &str,
+) -> Result<Vec<Value>, ApiError> {
+    match conversation {
+        Some(crate::external_sessions::ExternalConversation::Readable(external)) => {
+            crate::external_sessions::normalized_timeline(&external).map_err(ApiError::internal)
+        }
+        Some(crate::external_sessions::ExternalConversation::Unavailable(process)) => Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "unsupported-capability".into(),
+            message: "This agent was not started by st, and st could not identify its saved session. Its conversation is not available.".into(),
+            details: Box::new(serde_json::Map::from_iter([
+                ("session_id".into(), json!(process.id)),
+                ("reason".into(), json!("native-session-unidentified")),
+            ])),
+        }),
+        None => Err(ApiError::not_found(format!(
+            "session `{session_id}` does not exist"
+        ))),
+    }
+}
+
 pub(super) fn timeline_value(
     state: &AppState,
     snapshot: &ClientSnapshot,
@@ -3294,14 +3317,12 @@ pub(super) fn timeline_value(
     let managed = super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
         .map_err(ApiError::internal)?;
     let Some((owner, incarnation, _)) = managed else {
-        let external =
-            crate::external_sessions::find(state.native_session_home.as_deref(), &session_id)
-                .map_err(ApiError::internal)?
-                .ok_or_else(|| {
-                    ApiError::not_found(format!("session `{session_id}` does not exist"))
-                })?;
-        let items =
-            crate::external_sessions::normalized_timeline(&external).map_err(ApiError::internal)?;
+        let conversation = crate::external_sessions::find_conversation(
+            state.native_session_home.as_deref(),
+            &session_id,
+        )
+        .map_err(ApiError::internal)?;
+        let items = external_conversation_items(conversation, &session_id)?;
         return native_timeline_page(state, snapshot, &session_id, query, items);
     };
     let owner = owner.as_str();
@@ -7256,6 +7277,47 @@ mod tests {
     use super::*;
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
+
+    #[test]
+    fn listed_unresolved_process_opens_into_explanatory_no_conversation_state() {
+        use crate::external_sessions::{
+            ExternalDiscovery, ExternalDriver, ExternalProcess, UnresolvedProcess,
+        };
+
+        let unresolved = UnresolvedProcess {
+            id: "session/external-process-test".into(),
+            revision: "test".into(),
+            driver: ExternalDriver::Omp,
+            process: ExternalProcess {
+                pid: 123,
+                parent_pid: 1,
+                started_at_unix_ms: 0,
+                fingerprint: "123:0:test".into(),
+                cwd: None,
+                command: "omp --resume native-session".into(),
+                exact_session: false,
+            },
+        };
+        let resource =
+            super::super::unresolved_session_resource(unresolved.clone(), "2026-09-30T00:00:00Z");
+        let id = resource["id"].as_str().unwrap();
+        let discovery = ExternalDiscovery {
+            sessions: Vec::new(),
+            unresolved_processes: vec![unresolved],
+        };
+        let error = external_conversation_items(discovery.into_conversation(id), id).unwrap_err();
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.code, "unsupported-capability");
+        assert_eq!(error.details["session_id"], id);
+        assert_eq!(error.details["reason"], "native-session-unidentified");
+        assert!(error.message.contains("not started by st"));
+        assert!(
+            error
+                .message
+                .contains("could not identify its saved session")
+        );
+        assert!(!error.message.contains("does not exist"));
+    }
 
     fn test_state(root: &Path) -> AppState {
         test_state_named(root, "terminal-test")

@@ -20,7 +20,7 @@ or build from source below.
 With Nix, from a checkout:
 
 ```sh
-nix profile install .#st3
+nix profile install .
 ```
 
 For local development, enter `nix develop`. The shell provides Rust, sccache,
@@ -32,7 +32,9 @@ Outside the Nix shell, install mold on Linux and cargo-nextest separately; the
 repository's `.cargo/config.toml` still selects mold for Linux builds.
 
 This installs `st3`, the `st` symlink, the `stui` terminal app, `st3-migrate`, and the pinned
-`pty` terminal runtime.
+`pty` terminal runtime. The default, `st`, `st3`, and `small-talk` Nix package names all select
+this package. The previous generation is built and tested separately as `.#st2`;
+install it explicitly with `nix profile install .#st2`.
 
 Without Nix, build and install from a checkout with a Rust toolchain:
 
@@ -41,9 +43,8 @@ scripts/install                  # into ~/.local/bin
 scripts/install --bin-dir DIR    # or anywhere else
 ```
 
-The script builds everything once, installs `st3`, `stui`, and `st3-migrate` (and `st2`, the
-previous generation), and makes `st` a symlink to the installed `st3`. `st` is never a separate
-build. A source install also needs [`pty`](https://github.com/compoundingtech/pty-rust) on `PATH`.
+The script builds and installs `st3`, `stui`, and `st3-migrate`, and makes `st` a symlink to
+the installed `st3`. `st` is never a separate build. A source install also needs [`pty`](https://github.com/compoundingtech/pty-rust) on `PATH`.
 
 Each seat runs a coding harness, so install and log in to at least one: Claude Code, Codex, omp,
 pi, or OpenCode. Log in as the same user that runs the daemon.
@@ -72,6 +73,15 @@ disables this step. Reapplying is safe, but removing a file does **not** delete
 its previously published declaration until managed-set apply exists (#646).
 The optional `ptyPackage` replaces the bundled `pty` for both the daemon and
 seats, working around the executable-directory PATH precedence in #633.
+
+Activation atomically installs a real `st3` executable at `stateDir/bin/st3` (by default
+`~/.local/state/st3/bin/st3`) before restarting the daemon, with `st` as an alias in that directory.
+The daemon, declaration-apply service, and service PATH use this stable location so running seats
+can follow new builds without ending their harness sessions. Unchanged contents are not rewritten.
+Package references in the systemd unit or launchd plist still trigger daemon restarts on upgrades.
+Seats started from store paths before this change remain stale until restarted; see
+[seats across deploys](docs/st3/seat-deploys.md).
+
 Linux user-manager lingering and macOS `st service permissions` remain host
 setup prerequisites. Fleet/replication setup is not managed by this module.
 
