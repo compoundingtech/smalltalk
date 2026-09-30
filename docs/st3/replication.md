@@ -82,7 +82,9 @@ again on each attempt, so a restarted Fabric does not leave a stale cached tunne
 0.2.21 or later, the worker also consumes its passive `peer-events --watch` stream: an online
 admission resets that member's retry, and a daemon reset refreshes exposures and announces this
 node. Offline transport events create no fault. Older Fabric keeps using address-change,
-suspend-gap, and anti-entropy recovery.
+suspend-gap, and anti-entropy recovery. Tailnet listeners and advertised endpoints also
+refresh on local connectivity changes, without waiting for their minute timer; disappeared
+interface addresses stop being advertised.
 
 ## Protocol
 

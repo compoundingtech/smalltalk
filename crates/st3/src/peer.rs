@@ -1443,6 +1443,7 @@ pub async fn run_worker(config: Config) -> Result<()> {
                 endpoints.clone(),
                 fleet_transports,
                 notify_for_transports,
+                fleet.connectivity_changed.subscribe(),
             ));
         }
         if let (Some(fabric), Some(address)) = (fabric, loopback) {
@@ -1531,6 +1532,7 @@ async fn keep_tailnet_current(
     endpoints: Endpoints,
     transports: Arc<std::sync::RwLock<LocalTransports>>,
     notify: watch::Sender<u64>,
+    mut connectivity: watch::Receiver<u64>,
 ) {
     let mut bound = BTreeSet::new();
     loop {
@@ -1538,6 +1540,7 @@ async fn keep_tailnet_current(
             Ok(reported) => bindable_tailnet_addresses(&reported, &local_addresses()),
             Err(_) => Vec::new(),
         };
+        let bindable = bindable.into_iter().collect::<BTreeSet<_>>();
         let up = !bindable.is_empty();
         let was_up = std::mem::replace(
             &mut transports
@@ -1550,7 +1553,7 @@ async fn keep_tailnet_current(
             notify.send_modify(|generation| *generation = generation.wrapping_add(1));
         }
         if let Some((port, app)) = &listen {
-            for address in bindable {
+            for &address in &bindable {
                 if bound.contains(&address) {
                     continue;
                 }
@@ -1564,11 +1567,15 @@ async fn keep_tailnet_current(
             }
             let addresses = bound
                 .iter()
+                .filter(|address| bindable.contains(address))
                 .map(|address| SocketAddr::new(*address, *port))
                 .collect::<Vec<_>>();
             endpoints.update(|set| set.tailscale = addresses);
         }
-        tokio::time::sleep(worker_interval(Duration::from_secs(60))).await;
+        tokio::select! {
+            _ = connectivity.changed() => {},
+            _ = tokio::time::sleep(worker_interval(Duration::from_secs(60))) => {},
+        }
     }
 }
 
@@ -6122,6 +6129,50 @@ mod retry_tests {
         for task in tasks {
             task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn a_network_change_refreshes_tailnet_without_waiting_for_the_minute_timer() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let polls = root.path().join("polls");
+        let program = root.path().join("tailnet");
+        std::fs::write(&program, format!(
+            "#!/bin/sh\nprintf '%s\\n' poll >> '{}'\nprintf '%s\\n' '{{\"TailscaleIPs\":[]}}'\n",
+            polls.display(),
+        )).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (changed, connectivity) = watch::channel(0);
+        let task = tokio::spawn(keep_tailnet_current(
+            program,
+            None,
+            Endpoints::default(),
+            Arc::default(),
+            watch::channel(0).0,
+            connectivity,
+        ));
+        async fn observed(path: &Path, count: usize) {
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    if std::fs::read_to_string(path)
+                        .unwrap_or_default()
+                        .lines()
+                        .count()
+                        >= count
+                    {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("tailnet did not refresh within two seconds");
+        }
+        observed(&polls, 1).await;
+        changed.send_modify(|generation| *generation += 1);
+        observed(&polls, 2).await;
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test(start_paused = true)]
