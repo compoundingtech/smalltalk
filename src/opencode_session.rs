@@ -1784,10 +1784,6 @@ fn stable_message_id(recipient: &str, session_id: &str, filename: &str) -> Strin
 }
 
 pub fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
-    let base = std::env::var_os("XDG_STATE_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))
-        .unwrap_or_else(|| PathBuf::from("/tmp"));
     let mut hash = Sha256::new();
     for value in [
         catalog_root.as_os_str().as_encoded_bytes(),
@@ -1797,7 +1793,9 @@ pub fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
         hash.update(value);
     }
     let digest = format!("{:x}", hash.finalize());
-    base.join("st2").join("opencode").join(&digest[..24])
+    crate::run::harness_state_root()
+        .join("opencode")
+        .join(&digest[..24])
 }
 
 /// Read the exact inbox files whose correlated OpenCode assistant turn started.
