@@ -120,7 +120,7 @@ is in [`spec.md`](./spec.md).
 ## Evidence
 
 Each guarantee above is pinned by a named test in
-[`INVARIANTS.md`](../../../INVARIANTS.md) under **Fail-closed observed native
+[`invariants.md`](../../../docs/st2/invariants.md) under **Fail-closed observed native
 DING**, **Bounded DING PTY probe churn**, **Mutation-only filesystem wakeups**,
 and **Agent-declared presence discipline**. A change that keeps those tests
 green but violates a requirement here means the invariant set is incomplete, not

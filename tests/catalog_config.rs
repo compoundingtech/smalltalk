@@ -124,7 +124,7 @@ fn catalog_profile_and_agent_nodes_share_catalog_kdl_without_hiding_the_agent() 
         catalog.path().join("catalog.kdl"),
         r#"catalog { pty-root "pty" }
 profile "dev.example.goal" { wasm "resolver.wasm"; class "immediate" }
-agent "worker" { host "hetz"; command "true" }
+agent "worker" { host "example-linux"; command "true" }
 "#,
     )
     .unwrap();
@@ -134,7 +134,7 @@ agent "worker" { host "hetz"; command "true" }
     assert!(discovered.warnings.is_empty(), "{:?}", discovered.warnings);
     assert_eq!(discovered.specs.len(), 1);
     assert_eq!(discovered.specs[0].identity, "worker");
-    assert_eq!(discovered.specs[0].host.as_deref(), Some("hetz"));
+    assert_eq!(discovered.specs[0].host.as_deref(), Some("example-linux"));
     assert!(
         discovered.declarations[0]
             .parse

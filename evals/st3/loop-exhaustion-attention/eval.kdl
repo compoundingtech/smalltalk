@@ -25,7 +25,7 @@ mission "eval/loop-exhaustion-attention" state="ready" timeout="5m" {
     on-exhausted {
       fail
       attention "The bounded eval loop needs review" {
-        reviewer "person/nathan"
+        reviewer "person/alex"
         severity "error"
       }
     }
