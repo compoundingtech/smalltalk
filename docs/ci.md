@@ -34,6 +34,15 @@ directory. Each run isolates `HOME` and XDG directories. Forked pull requests
 are excluded before any code from them runs on these machines. GitHub Actions handles tags
 and forks.
 
+macOS builds use a stable checkout path and a separate Cargo cache with debug information and
+incremental compilation disabled. Darwin's unpacked debug objects can otherwise accumulate
+beside test executables, slowing dependency lookup and native filesystem watcher startup. The
+runner clears the debug cache when its dependency directory exceeds 20,000 files. The Codex
+control tests remain enabled on macOS, and the test command retains its 25-minute limit.
+
+The macOS summary includes the checked head, each stage's elapsed seconds, and the overall
+result. Stage logs have matching `.time` files recording elapsed seconds and command exit status.
+
 ## Merge rule
 
 The `main` ruleset refuses to merge a pull request into `main` unless `st/ci` succeeded on the
