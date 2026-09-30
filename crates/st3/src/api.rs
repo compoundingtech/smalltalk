@@ -6249,7 +6249,7 @@ async fn get_planning_session(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<PlanningSessionView>, ApiError> {
     let store = state.store.clone();
-    let id_for_read = launch_session_id(&id).to_owned();
+    let id_for_read = id.clone();
     blocking_store(move || store.planning_session(&id_for_read))
         .await?
         .map(Json)

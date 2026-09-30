@@ -3893,7 +3893,6 @@ async fn run_launch(
             let session = args
                 .session
                 .strip_prefix("planning-session/")
-                .or_else(|| args.session.strip_prefix("launch/"))
                 .unwrap_or(&args.session);
             let document_name = format!("doc/planning/{session}/feedback/{hash}");
             let reference = format!("{document_name}@{hash}");
@@ -4018,7 +4017,6 @@ async fn run_launch(
             let session = args
                 .session
                 .strip_prefix("planning-session/")
-                .or_else(|| args.session.strip_prefix("launch/"))
                 .unwrap_or(&args.session);
             let operation = format!("cancel-{}", uuid::Uuid::now_v7().simple());
             let kdl = planning_cancellation_intent(
