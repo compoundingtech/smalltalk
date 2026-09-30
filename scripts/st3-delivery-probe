@@ -207,14 +207,14 @@ class Probe:
                 route = {"target": self.peers[target], "to": target, "status": "unstarted"}
                 self.state["routes"][target] = route
             if not route.get("waiting_for_member"):
-                route["waiting_for_member"] = True
-                self.measuring.pop(target, None)
                 if route.get("attention"):
                     await self.api.post("/v1/attention/withdraw/" + route["attention"], {
                         "actor": self.actor, "reason": "Member is last seen; delivery waits for a new exchange.",
                         "idempotency_key": "delivery-probe-absent:" + route["attention"],
                     })
                     route.pop("attention", None)
+                route["waiting_for_member"] = True
+                self.measuring.pop(target, None)
                 self.persist()
             return
         if route and route.pop("waiting_for_member", False):
