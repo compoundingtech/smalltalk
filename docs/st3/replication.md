@@ -23,7 +23,17 @@ The fleet ID is a persistent UUID. A store rejects another fleet ID after its fi
 
 The secret contains 32 raw bytes or 64 hexadecimal characters. Its file mode must deny group and other access.
 
-The listener and every peer URL must use loopback. Fabric or a similar local port exposer carries traffic between hosts.
+The peer listener accepts loopback or a literal Tailscale IP in `100.64.0.0/10` or
+`fd7a:115c:a1e0::/48`; the worker can also bind discovered tailnet addresses.
+Explicit peer routes accept loopback or tailnet HTTP and `fabric://NODE_ID/PROTOCOL`.
+Fabric routes name the lasting remote endpoint: the worker creates or reacquires the local
+tunnel itself. Several peer entries may name the same member with distinct routes.
+Wildcard listeners, arbitrary DNS names, and LAN/public HTTP addresses remain rejected.
+Replication is plain HTTP, encrypted between hosts by Tailscale or a Fabric tunnel;
+the fleet secret and joined members' signatures still authenticate the exchange.
+See [Tailscale setup](tailscale.md) for direct-host setup and
+[the migration procedure](../fleet-join.md#move-an-existing-fleet-off-local-dial-helpers)
+for replacing a legacy local dial helper.
 
 On a node that only receives connections from a peer, list its name without a URL:
 

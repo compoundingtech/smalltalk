@@ -17,8 +17,8 @@ Adding a third machine to a two-machine fleet took all of this:
 3. The new machine had to be added to an existing member's `config.toml`.
 4. `st service install` had to run again on that member, because the service files bake
    `--peer` arguments in at install time.
-5. The new machine is a laptop behind a firewall. `st` accepts only loopback peer URLs, so a
-   hand-written script kept a Fabric dial alive, with its own launchd agent.
+5. The new machine is a laptop behind a firewall. A Fabric dial once required a
+   hand-written script and launchd agent; direct tailnet addresses now work too.
 6. The member refuses exchanges from any node it does not list, and every listed peer needs a
    URL. So the member lists the laptop at a port nothing serves, keeps dialing it, and reports it
    down.
@@ -51,6 +51,17 @@ st fleet join --dial-out
 `join` asks for the code, receives the fleet secret, installs the services, and waits until the
 new machine has the fleet's full history. `--dial-out` is for a machine that is often asleep or
 offline, such as a laptop. Leave it out for a machine that stays on.
+
+### Tailscale setup
+
+Install and connect Tailscale on both machines, confirm `tailscale ip -4` returns an address,
+and allow the listening member's replication port in the tailnet ACL. On the anchor,
+`st fleet create` establishes membership; start its daemon and replication worker before
+running `st fleet invite NAME --via tailscale`. On the joining machine run
+`st fleet join` (add `--dial-out` for a laptop), then start its daemon and worker if the
+CLI did not install services. Check `st fleet wait` and `st replication status` on both.
+The invite is single-use: never commit its code or the fleet secret. See the
+[direct Tailscale setup](st3/tailscale.md) for commands and troubleshooting.
 
 When both machines are Fabric peers, the code never has to appear on a screen or in a command
 line. `st` sends it as a file to the new machine's Fabric inbox, and `join` reads and deletes it:
