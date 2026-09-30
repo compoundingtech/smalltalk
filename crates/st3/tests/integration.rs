@@ -10,6 +10,7 @@ mod convergence;
 mod daemon_bench;
 mod daemon_environment;
 mod daemon_restart;
+mod delivery_probe;
 mod examples;
 mod fault_isolation;
 mod first_sync;
