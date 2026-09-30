@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use base64::Engine as _;
-use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand, ValueEnum};
 use kdl::{KdlDocument, KdlEntry, KdlNode};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -49,6 +49,7 @@ use st3_client::{
 };
 use tokio::sync::{Notify, watch};
 
+mod cli_help;
 mod presentation;
 
 use presentation::{
@@ -63,6 +64,7 @@ use presentation::{
     name = "st",
     bin_name = "st",
     version,
+    disable_help_subcommand = true,
     about = "Coordinate durable agent work across machines without losing operational truth"
 )]
 struct Cli {
@@ -92,6 +94,14 @@ const DEFAULT_DAEMON_WAIT_SECS: u64 = 30;
 
 #[derive(Subcommand)]
 enum Command {
+    /// Print help, including plumbing with --all.
+    #[command(hide = true)]
+    Help {
+        #[arg(long)]
+        all: bool,
+        /// Command path, such as agents new.
+        command: Vec<String>,
+    },
     /// Start the HTTP API, readers, peers, and reconciler.
     Up(UpArgs),
     /// Understand what needs action now.
@@ -511,14 +521,11 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 "Created fleet {} with {} as its first member.",
                 founded.fleet_id, founded.node
             );
-            if !args.no_service && services_installed() {
+            let services = !args.no_service && services_installed();
+            if services {
                 st3::service::install(Config::load_with_fleet(None)?)?;
-                println!("The st3 services now run as a fleet member. Next: st fleet invite NAME");
-            } else {
-                println!(
-                    "Restart st3 up and start st3 replication-worker, then: st fleet invite NAME"
-                );
             }
+            print!("{}", cli_help::fleet_created_next_steps(services));
             Ok(())
         }
         FleetCommand::Invite(args) => {
@@ -695,11 +702,12 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                     if joined.resumed { " (resumed)" } else { "" }
                 );
             }
+            let mut sync_state = None;
             if use_services {
                 st3::service::install(Config::load_with_fleet(None)?)?;
-                println!(
-                    "The st3 services now run as a fleet member; st fleet status shows the sync."
-                );
+                if !json_output {
+                    println!("The st services now run as a fleet member.");
+                }
                 if !args.no_wait {
                     match wait_for_first_sync(&client, Duration::from_secs(30 * 60), !json_output)
                         .await?
@@ -710,7 +718,16 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                             "{}",
                             render_first_sync(&first, now_ms())
                         ),
-                        Some(first) => report_first_sync(&first, false)?,
+                        Some(first) => {
+                            sync_state = Some(first.state.clone());
+                            if first.state != "verified" {
+                                print!(
+                                    "{}",
+                                    cli_help::fleet_next_steps(use_services, sync_state.as_deref())
+                                );
+                            }
+                            report_first_sync(&first, false)?;
+                        }
                         None if json_output => {}
                         None => println!(
                             "This machine is a member and still syncing; st fleet wait waits for \
@@ -722,6 +739,12 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 println!(
                     "Start st3 up and st3 replication-worker to begin syncing; st fleet wait \
                      waits for the first sync to end and checks it."
+                );
+            }
+            if !json_output {
+                print!(
+                    "{}",
+                    cli_help::fleet_next_steps(use_services, sync_state.as_deref())
                 );
             }
             Ok(())
@@ -2497,7 +2520,7 @@ struct AgentNewArgs {
     /// What the agent is for.
     #[arg(long)]
     description: Option<String>,
-    /// Attach this terminal to the agent once its harness is ready. Detach with Ctrl+\.
+    /// Attach this terminal to the agent once it is ready. Detach with Ctrl+\.
     #[arg(long, conflicts_with = "print_kdl")]
     attach: bool,
     /// Print the declaration without applying it.
@@ -3031,7 +3054,34 @@ fn main() -> ExitCode {
         st2::provider_session::install_stop_handlers();
         st2::reexec::unblock_stop_signals();
     }
-    let cli = Cli::parse();
+    let matches = Cli::command()
+        .override_help(cli_help::root_help(false))
+        .get_matches();
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
+    if let Command::Help { all, command } = &cli.command {
+        if command.is_empty() {
+            print!("{}", cli_help::root_help(*all));
+        } else {
+            let mut help = Cli::command();
+            help.build();
+            let mut path = String::from("st");
+            for name in command {
+                let Some(child) = help.find_subcommand(name).cloned() else {
+                    eprintln!("Unknown command: {path} {name}");
+                    return ExitCode::from(2);
+                };
+                help = child;
+                path.push(' ');
+                path.push_str(name);
+            }
+            help = help.bin_name(path.clone());
+            // Let clap choose the same short/long format as the command's --help flag.
+            help.try_get_matches_from([path, "--help".into()])
+                .expect_err("--help renders help")
+                .exit();
+        }
+        return ExitCode::SUCCESS;
+    }
     if let Command::Up(args) = &cli.command {
         record_daemon_commands(args);
     }
@@ -3158,6 +3208,7 @@ async fn run(cli: Cli) -> Result<()> {
     // Drivers outlive daemon restarts and handle an outage in their own loops; doctor reports one.
     let immediate = Client::new(endpoint.clone());
     match cli.command {
+        Command::Help { .. } => unreachable!(),
         Command::Up(_) => unreachable!(),
         Command::Skill(_) => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),
@@ -3723,6 +3774,7 @@ async fn run_launch(
         );
     }
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let starting = matches!(&command, LaunchCommand::Start(_));
     let response = match command {
         LaunchCommand::Ls { .. } => unreachable!(),
         LaunchCommand::Start(args) => {
@@ -3923,7 +3975,11 @@ async fn run_launch(
                     },
                 )
                 .await?;
-            return print_value(&response, json_output);
+            print_value(&response, json_output)?;
+            if !json_output {
+                print!("{}", cli_help::mission_next_steps(&response.mission_run));
+            }
+            return Ok(());
         }
         LaunchCommand::Run(args) => {
             let workspace = fs::canonicalize(&args.workspace)
@@ -3939,7 +3995,11 @@ async fn run_launch(
                     },
                 )
                 .await?;
-            return print_value(&response, json_output);
+            print_value(&response, json_output)?;
+            if !json_output {
+                print!("{}", cli_help::mission_next_steps(&response));
+            }
+            return Ok(());
         }
         LaunchCommand::Question(args) => {
             let response: Value = client
@@ -4056,6 +4116,9 @@ async fn run_launch(
         for blocker in &preview.mission.blockers {
             println!("Blocker: {blocker}");
         }
+    }
+    if starting {
+        print!("{}", cli_help::launch_next_steps(&response));
     }
     Ok(())
 }
@@ -4406,9 +4469,12 @@ async fn start_mission_run(
                 true,
             )
         } else {
-            println!("{}", started.subject);
+            print!("{}", cli_help::mission_next_steps(&started));
             Ok(())
         };
+    }
+    if !json_output {
+        print!("{}", cli_help::mission_next_steps(&started));
     }
     follow_mission_run(client, started, response.store_index, json_output).await
 }
@@ -5607,11 +5673,15 @@ async fn run_devices(
                 .pairing_begin(&PairingBegin {
                     api_version: CLIENT_V0_API_VERSION.into(),
                     device_name,
-                    person_id: person,
+                    person_id: person.clone(),
                     full_control: full_control.then_some(true),
                 })
                 .await?;
-            print_client_value(&response, json_output)
+            print_client_value(&response, json_output)?;
+            if !json_output {
+                print!("{}", cli_help::pairing_next_steps(&person));
+            }
+            Ok(())
         }
         DevicesCommand::Revoke { device, reason } => {
             let capabilities = client.capabilities().await?;
@@ -7803,10 +7873,33 @@ async fn run_agents(
                 &cli_client(endpoint),
                 kdl,
                 format!("st agents start {}", args.identity),
-                args.actor,
+                args.actor.clone(),
             )
             .await?;
-            print_value(&response, json_output)
+            print_value(&response, json_output)?;
+            if !json_output
+                && let Some(subject) = response
+                    .subject_tokens
+                    .keys()
+                    .find(|subject| subject.starts_with("agent/"))
+            {
+                let agent = generated_client(endpoint, None)?
+                    .agents_get(subject)
+                    .await?;
+                if let ClientResource::Agent(agent) = agent.value {
+                    let state = cli_help::agent_state(
+                        &agent.state,
+                        agent.harness_state.as_deref(),
+                        agent.fault.as_deref(),
+                        &agent.reachability,
+                    );
+                    print!(
+                        "{}",
+                        cli_help::agent_next_steps(subject, &args.actor, &state)
+                    );
+                }
+            }
+            Ok(())
         }
         AgentsCommand::Stop(args) => {
             let subject = normalize_member_subject(&args.subject, "agent");
@@ -8023,19 +8116,47 @@ async fn run_agent_new(
     }
     publish_text(&client, kdl, source_name, actor.clone()).await?;
     if !json_output {
-        eprintln!("Declared {subject} in {workspace}; waiting for its harness.");
+        eprintln!("Created {subject} in {workspace}; waiting for the agent to start.");
     }
-    let agent = match tokio::time::timeout(
+    let mut latest = None;
+    let waiting = tokio::time::timeout(
         timeout,
-        wait_for_agent_harness(&client, &gateway, &subject, args.attach),
-    )
-    .await
-    {
-        Ok(agent) => agent?,
-        Err(_) => anyhow::bail!(
-            "`{subject}` was declared, but its harness was not ready after {}; see `st agents show {subject}`",
-            args.timeout
+        wait_for_agent_harness(
+            &client,
+            &gateway,
+            &subject,
+            args.attach,
+            json_output,
+            &mut latest,
         ),
+    )
+    .await;
+    let agent = match waiting {
+        Ok(Ok(agent)) => agent,
+        other => {
+            if !json_output {
+                let state = latest.as_ref().map_or_else(
+                    || cli_help::agent_state("starting", None, None, "unknown"),
+                    |agent: &st3_client::Agent| {
+                        cli_help::agent_state(
+                            &agent.state,
+                            agent.harness_state.as_deref(),
+                            agent.fault.as_deref(),
+                            &agent.reachability,
+                        )
+                    },
+                );
+                println!("{}", cli_help::agent_next_steps(&subject, &actor, &state));
+            }
+            return match other {
+                Ok(Err(error)) => Err(error),
+                Err(_) => anyhow::bail!(
+                    "`{subject}` was created, but was not ready after {}; see `st agents show {subject}`",
+                    args.timeout
+                ),
+                Ok(Ok(_)) => unreachable!(),
+            };
+        }
     };
     if json_output {
         print_value(
@@ -8049,7 +8170,13 @@ async fn run_agent_new(
             true,
         )?;
     } else {
-        println!("{subject}");
+        let state = cli_help::agent_state(
+            &agent.state,
+            agent.harness_state.as_deref(),
+            agent.fault.as_deref(),
+            &agent.reachability,
+        );
+        println!("{}", cli_help::agent_next_steps(&subject, &actor, &state));
     }
     if args.attach {
         // The daemon has just answered for the new agent, so there is no registry fallback to name.
@@ -8130,6 +8257,8 @@ async fn wait_for_agent_harness(
     gateway: &GeneratedClient,
     subject: &str,
     attach: bool,
+    json_output: bool,
+    latest: &mut Option<st3_client::Agent>,
 ) -> Result<st3_client::Agent> {
     let health: Value = client.get("/v1/health").await?;
     let mut cursor = health["store_index"]
@@ -8146,12 +8275,13 @@ async fn wait_for_agent_harness(
             Err(error) => return Err(error.into()),
         };
         if let Some(agent) = agent {
-            let harness = agent.harness_state.as_deref().unwrap_or("unobserved");
+            *latest = Some(agent.clone());
+            let harness = agent.harness_state.as_deref().unwrap_or("not ready");
             match agent.state.as_str() {
                 "running" => return Ok(agent),
                 "waiting" if attach && agent.reachability == "reachable" => return Ok(agent),
                 "waiting" if agent.reachability == "reachable" => anyhow::bail!(
-                    "`{subject}` started, but its harness is {harness} and waits on a person; attach with `st terminals attach {subject}`"
+                    "`{subject}` started and is waiting for your input; attach with `st terminals attach {subject}`"
                 ),
                 "failed" => anyhow::bail!(
                     "`{subject}` failed to start: {}",
@@ -8159,8 +8289,13 @@ async fn wait_for_agent_harness(
                 ),
                 _ => {}
             }
-            let progress = format!("{} · harness {harness}", agent.state);
-            if progress != reported {
+            let progress = cli_help::agent_state(
+                &agent.state,
+                agent.harness_state.as_deref(),
+                agent.fault.as_deref(),
+                &agent.reachability,
+            );
+            if !json_output && progress != reported {
                 eprintln!("{subject}: {progress}");
                 reported = progress;
             }
