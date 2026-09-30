@@ -178,7 +178,7 @@ def tmux_hangup_case(binary: str) -> None:
     base = [tmux, "-L", socket_name]
     subprocess.run(
         base + ["new-session", "-d", "-s", target,
-                f"exec env ST3_PERSON=person/nathan {shlex.quote(binary)} --old"],
+                f"exec env ST3_PERSON=person/alex {shlex.quote(binary)} --old"],
         check=True, capture_output=True,
     )
     pid = int(subprocess.check_output(

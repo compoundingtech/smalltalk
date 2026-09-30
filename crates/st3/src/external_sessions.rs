@@ -2706,7 +2706,7 @@ mod tests {
             Some(ExternalDriver::Omp)
         );
         assert_eq!(
-            driver_for_command("/Users/test/.opencode/bin/opencode --session ses_123"),
+            driver_for_command("/Users/example/.opencode/bin/opencode --session ses_123"),
             Some(ExternalDriver::OpenCode)
         );
         assert_eq!(driver_for_command("rg codex crates/st3"), None);

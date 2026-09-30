@@ -3,7 +3,7 @@
 Status: superseded by 0015-immutable-agent-id-and-mutable-address
 
 Johannes authorized the requirements direction on 2026-07-31. The draft
-required Nathan's merge and acceptance approval, which was not recorded.
+required Alex's merge and acceptance approval, which was not recorded.
 Decision 0015-immutable-agent-id-and-mutable-address independently accepted the replacement contract.
 
 ## Context

@@ -23,7 +23,7 @@ use agent_spec::spec::{
 /// A parsed st2 spec: a base team (`st2 up` boots this) plus an optional `eval` (`st2 eval` runs it).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Spec {
-    /// The logical host this file's team belongs to (top-level `host "silber"`), if declared. It is the
+    /// The logical host this file's team belongs to (top-level `host "example-mac"`), if declared. It is the
     /// Logical host name, not necessarily the OS hostname. `st2 up/down` resolve the run host as
     /// `--host` (explicit) › this field › the OS hostname, so a per-host spec runs its own slice
     /// even when the machine's OS hostname differs from the logical name.
@@ -1315,8 +1315,8 @@ team "mix" {
     fn parses_a_top_level_host_and_defaults_to_none() {
         // A per-host fleet file declares the logical host at the top. Absent → None (falls back to
         // --host / OS hostname).
-        let with = parse_spec("host \"silber\"\nagent \"a\" { command \"x\" }").unwrap();
-        assert_eq!(with.host.as_deref(), Some("silber"));
+        let with = parse_spec("host \"example-mac\"\nagent \"a\" { command \"x\" }").unwrap();
+        assert_eq!(with.host.as_deref(), Some("example-mac"));
         let without = parse_spec("agent \"a\" { command \"x\" }").unwrap();
         assert_eq!(without.host, None);
     }

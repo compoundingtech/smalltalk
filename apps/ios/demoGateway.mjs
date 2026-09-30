@@ -25,38 +25,38 @@ const agent = (name, extra = {}) => ({
   driver: 'claude', host_id: 'host/harbor', reachability: 'local', runtime_ids: [`runtime/${name}`], current_session_id: `session/${name.replaceAll('/', '-')}`, ...extra,
 });
 const agents = [
-  agent('fleet/atlas/standing/atlas', { minutes: 480 }),
-  agent('fleet/beacon', { harness_state: 'working', driver: 'codex', minutes: 2, current_work: [{ id: 'step-run/r1/build', mission_id: 'mission/fleet/beacon/ship-widgets', mission_run_id: 'mission-run/r1', path: 'build', since: ago(20), state: 'claimed', title: 'Build the widget' }] }),
-  agent('fleet/cedar', { minutes: 240, driver: 'omp', host_id: 'host/meadow' }),
-  agent('fleet/delta/omp', { minutes: 60, driver: 'omp' }),
-  agent('fleet/ember', { state: 'waiting', harness_state: 'blocked', minutes: 5 }),
-  agent('fleet/fjord', { fault: 'the harness exited twice in a minute', minutes: 12 }),
-  agent('fleet/grove', { minutes: 420 }),
-  agent('fleet/harbor-ci', { driver: 'codex', minutes: 480, harness_state: null }),
-  agent('fleet/iris', { minutes: 10 }),
-  agent('fleet/juniper/builds/2026-09-30/juniper-builder', { state: 'stopped', driver: 'codex', minutes: 120, runtime_ids: [] }),
+  agent('example/atlas/standing/atlas', { minutes: 480 }),
+  agent('example/beacon', { harness_state: 'working', driver: 'codex', minutes: 2, current_work: [{ id: 'step-run/r1/build', mission_id: 'mission/example/beacon/ship-widgets', mission_run_id: 'mission-run/r1', path: 'build', since: ago(20), state: 'claimed', title: 'Build the widget' }] }),
+  agent('example/cedar', { minutes: 240, driver: 'omp', host_id: 'host/meadow' }),
+  agent('example/delta/omp', { minutes: 60, driver: 'omp' }),
+  agent('example/ember', { state: 'waiting', harness_state: 'blocked', minutes: 5 }),
+  agent('example/fjord', { fault: 'the harness exited twice in a minute', minutes: 12 }),
+  agent('example/grove', { minutes: 420 }),
+  agent('example/harbor-ci', { driver: 'codex', minutes: 480, harness_state: null }),
+  agent('example/iris', { minutes: 10 }),
+  agent('example/juniper/builds/2026-09-30/juniper-builder', { state: 'stopped', driver: 'codex', minutes: 120, runtime_ids: [] }),
 ];
 const sessions = [
-  { id: 'session/found-1', kind: 'session', revision: 'r1', updated_at: ago(1), owner_id: 'person/demo', started_at: ago(90), state: 'running', timeline_cursor: 'c', managed: false, driver: 'codex', workspace: '/home/demo/src/garden', native_session_id: 'n1' },
+  { id: 'session/found-1', kind: 'session', revision: 'r1', updated_at: ago(1), owner_id: 'person/demo', started_at: ago(90), state: 'running', timeline_cursor: 'c', managed: false, driver: 'codex', workspace: '/home/example/src/garden', native_session_id: 'n1' },
   ...agents.map(item => ({ id: item.current_session_id, kind: 'session', revision: 'r1', updated_at: item.updated_at, owner_id: item.id, started_at: ago(600), state: 'running', timeline_cursor: 'c' })),
 ];
 const attention = [
-  { id: 'attention/gate', kind: 'attention', revision: 'r1', updated_at: ago(40), attention_kind: 'human-gate', title: 'Approve the widget release', detail: 'Beacon built **v2.3**. Approve to ship it to the staging fleet.', priority: 'high', state: 'open', person_id: 'person/demo', requested_at: ago(40), source_id: 'step-run/r1/approve', step_run_id: 'step-run/r1/approve', mission_id: 'mission/fleet/beacon/ship-widgets', actions: ['review.approve', 'review.reject'] },
-  { id: 'attention/ask', kind: 'attention', revision: 'r1', updated_at: ago(6), attention_kind: 'agent-request', title: 'Which region should the canary use?', detail: 'I can use `eu-west` or `us-east`. Which one?', priority: 'normal', state: 'open', person_id: 'person/demo', requested_at: ago(6), source_id: 'agent/fleet/ember', requester_id: 'agent/fleet/ember', actions: ['attention.resolve'] },
-  { id: 'attention/fault', kind: 'attention', revision: 'r1', updated_at: ago(12), attention_kind: 'fault', title: 'Fjord keeps crashing', detail: 'The harness exited twice in a minute.', priority: 'critical', state: 'open', person_id: 'person/demo', requested_at: ago(12), source_id: 'agent/fleet/fjord', actions: ['attention.resolve'] },
+  { id: 'attention/gate', kind: 'attention', revision: 'r1', updated_at: ago(40), attention_kind: 'human-gate', title: 'Approve the widget release', detail: 'Beacon built **v2.3**. Approve to ship it to the staging fleet.', priority: 'high', state: 'open', person_id: 'person/demo', requested_at: ago(40), source_id: 'step-run/r1/approve', step_run_id: 'step-run/r1/approve', mission_id: 'mission/example/beacon/ship-widgets', actions: ['review.approve', 'review.reject'] },
+  { id: 'attention/ask', kind: 'attention', revision: 'r1', updated_at: ago(6), attention_kind: 'agent-request', title: 'Which region should the canary use?', detail: 'I can use `eu-west` or `us-east`. Which one?', priority: 'normal', state: 'open', person_id: 'person/demo', requested_at: ago(6), source_id: 'agent/example/ember', requester_id: 'agent/example/ember', actions: ['attention.resolve'] },
+  { id: 'attention/fault', kind: 'attention', revision: 'r1', updated_at: ago(12), attention_kind: 'fault', title: 'Fjord keeps crashing', detail: 'The harness exited twice in a minute.', priority: 'critical', state: 'open', person_id: 'person/demo', requested_at: ago(12), source_id: 'agent/example/fjord', actions: ['attention.resolve'] },
   { id: 'attention/launch', kind: 'attention', revision: 'r1', updated_at: ago(90), attention_kind: 'launch-approval', title: 'Plan: tidy the docs site', detail: 'A planner proposed a mission.', priority: 'normal', state: 'open', person_id: 'person/demo', requested_at: ago(90), source_id: 'launch/docs', actions: ['launch.approve', 'launch.cancel'] },
-  { id: 'attention/msg1', kind: 'attention', revision: 'r1', updated_at: ago(180), attention_kind: 'unread-message', title: 'Nightly report is ready', detail: 'Unread message from agent/fleet/atlas/standing/atlas.', priority: 'low', state: 'open', person_id: 'person/demo', requested_at: ago(180), source_id: 'message/m1', message_id: 'message/m1', actions: ['message.read'] },
-  { id: 'attention/msg2', kind: 'attention', revision: 'r1', updated_at: ago(300), attention_kind: 'unread-message', title: 'Re: cache warmup numbers', detail: 'Unread message from agent/fleet/iris.', priority: 'low', state: 'open', person_id: 'person/demo', requested_at: ago(300), source_id: 'message/m2', message_id: 'message/m2', actions: ['message.read'] },
+  { id: 'attention/msg1', kind: 'attention', revision: 'r1', updated_at: ago(180), attention_kind: 'unread-message', title: 'Nightly report is ready', detail: 'Unread message from agent/example/atlas/standing/atlas.', priority: 'low', state: 'open', person_id: 'person/demo', requested_at: ago(180), source_id: 'message/m1', message_id: 'message/m1', actions: ['message.read'] },
+  { id: 'attention/msg2', kind: 'attention', revision: 'r1', updated_at: ago(300), attention_kind: 'unread-message', title: 'Re: cache warmup numbers', detail: 'Unread message from agent/example/iris.', priority: 'low', state: 'open', person_id: 'person/demo', requested_at: ago(300), source_id: 'message/m2', message_id: 'message/m2', actions: ['message.read'] },
 ];
 const step = (path, state, extra = {}) => ({ id: `step-run/r1/${path}`, path, state, attempt: 1, since: ago(30), goals: [`Do the ${path} step.`], ...extra });
 const mission = (id, state, steps, minutes = 60) => ({ id: `mission/${id}`, kind: 'mission', title: id, revision: 'r1', updated_at: ago(minutes), mission_revision: 'm1', run_generations: {}, runs: ['mission-run/r1'], state, run_details: [{ id: 'mission-run/r1', status: state, steps, current_steps: [] }] });
 const missions = [
-  mission('fleet/beacon/ship-widgets', 'running', [step('design', 'completed'), step('build', 'claimed', { claimant: 'agent/fleet/beacon' }), step('approve', 'waiting'), step('deploy', 'pending')], 20),
-  mission('fleet/cedar/garden-sync', 'running', [step('sync', 'ready')], 50),
-  mission('fleet/grove/nightly-report', 'standing', [step('keep-watch', 'running', { agentless: true })], 400),
-  mission('fleet/iris/cache-warmup', 'completed', [step('warm', 'completed'), step('measure', 'completed')], 700),
-  mission('fleet/fjord/index-rebuild', 'running', [step('rebuild', 'blocked', { blocked_reason: 'waiting on fjord to restart' })], 15),
-  mission('fleet/harbor/ci/run', 'running', [step('test', 'running', { agentless: true })], 3),
+  mission('example/beacon/ship-widgets', 'running', [step('design', 'completed'), step('build', 'claimed', { claimant: 'agent/example/beacon' }), step('approve', 'waiting'), step('deploy', 'pending')], 20),
+  mission('example/cedar/garden-sync', 'running', [step('sync', 'ready')], 50),
+  mission('example/grove/nightly-report', 'standing', [step('keep-watch', 'running', { agentless: true })], 400),
+  mission('example/iris/cache-warmup', 'completed', [step('warm', 'completed'), step('measure', 'completed')], 700),
+  mission('example/fjord/index-rebuild', 'running', [step('rebuild', 'blocked', { blocked_reason: 'waiting on fjord to restart' })], 15),
+  mission('example/harbor/ci/run', 'running', [step('test', 'running', { agentless: true })], 3),
 ];
 const machines = [
   { id: 'machine/harbor', kind: 'machine', revision: 'r1', updated_at: ago(0), name: 'harbor', host_id: 'host/harbor', state: 'local', capacity: { state: 'reported', reason: '' }, occupancy: { running_runtimes: 9 }, projects: [], runtime_ids: [], transports: [{ protocol: 'unix', status: 'local' }], work: [] },
@@ -80,11 +80,11 @@ const conversation = () => {
     entry(40, 'error', 'system', { code: 'native-delivery-recovered', message: 'Native conversation delivery over claude-channel recovered and resumed replay from durable graph state.', retryable: true, details: { severity: 'warning' } }),
     entry(30, 'error', 'system', { code: 'native-delivery-degraded', message: 'Native conversation delivery over claude-channel paused while the st daemon was unreachable; the driver stayed online and retried every second.', retryable: true, details: { severity: 'warning' } }),
     entry(30, 'error', 'system', { code: 'native-delivery-recovered', message: 'Native conversation delivery over claude-channel recovered and resumed replay from durable graph state.', retryable: true, details: { severity: 'warning' } }),
-    entry(20, 'message', 'user', { message_id: 'message/m9', from: 'agent/fleet/atlas/standing/atlas', to: 'agent/fleet/beacon', title: 'Ship it after the canary' }),
+    entry(20, 'message', 'user', { message_id: 'message/m9', from: 'agent/example/atlas/standing/atlas', to: 'agent/example/beacon', title: 'Ship it after the canary' }),
     entry(20, 'content', 'user', { text: 'Once the canary is green for an hour, go ahead. [id:message/m9]' }),
     entry(18, 'tool_call', 'assistant', { call_id: 'c2', name: 'Edit', arguments: { file_path: 'build/profiles.toml' } }),
     entry(18, 'tool_result', 'tool', { call_id: 'c2', status: 'success', content: '-lto = true\n+lto = false' }),
-    entry(10, 'message', 'user', { message_id: 'message/m10', from: 'person/demo', to: 'agent/fleet/beacon', title: 'Nice' }),
+    entry(10, 'message', 'user', { message_id: 'message/m10', from: 'person/demo', to: 'agent/example/beacon', title: 'Nice' }),
     entry(10, 'content', 'user', { text: 'Nice work. Open a PR when it is ready.' }),
     entry(9, 'content', 'assistant', { text: 'Will do. Running the full test suite now.' }),
     entry(8, 'tool_call', 'assistant', { call_id: 'c3', name: 'Bash', arguments: { command: 'cargo test --workspace' } }),
@@ -128,7 +128,7 @@ const server = http.createServer((request, response) => {
     const missionMatch = /^\/v1\/client\/missions\/(.+)$/.exec(path);
     if (missionMatch) { const found = missions.find(item => item.id === decodeURIComponent(missionMatch[1])); return found ? send(found) : send({ error_version: 1, code: 'not-found', message: 'no such mission' }, 404); }
     const runtimeMatch = /^\/v1\/client\/runtimes\/(.+)$/.exec(path);
-    if (runtimeMatch) return send({ kind: 'runtime', id: decodeURIComponent(runtimeMatch[1]), revision: 'r1', updated_at: ago(1), desired_revision: null, incarnation_id: 'inc-1', owner_host_id: 'host/harbor', owner_id: 'agent/fleet/beacon', runtime_id: 'demo', runtime_kind: 'agent', state: 'running', terminal_id: 'terminal/demo' });
+    if (runtimeMatch) return send({ kind: 'runtime', id: decodeURIComponent(runtimeMatch[1]), revision: 'r1', updated_at: ago(1), desired_revision: null, incarnation_id: 'inc-1', owner_host_id: 'host/harbor', owner_id: 'agent/example/beacon', runtime_id: 'demo', runtime_kind: 'agent', state: 'running', terminal_id: 'terminal/demo' });
     if (/^\/v1\/client\/terminals\/[^/]+\/screen$/.test(path)) return send(screen);
     if (path === '/v1/client/actions') {
       let action = {};

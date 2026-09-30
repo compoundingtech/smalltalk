@@ -10,7 +10,7 @@ version 2
 
 mission "fleet/app-web/one-space-gets-instant-new-items" state="ready" {
   completion { when "all-steps-exhausted" }
-  goal "Put the instant-new-items branch into the one-space-at-a-time branch so Nathan can deploy it to staging and test it."
+  goal "Put the instant-new-items branch into the one-space-at-a-time branch so Alex can deploy it to staging and test it."
   constraint "Merge instant-new-items into one-space-at-a-time. Do not rebase, do not force-push, and do not merge pull request 1465 or 1471."
 
   resource "github/shareup/app-web/pull/1465" { kind "vcs.pull-request" }
@@ -56,7 +56,7 @@ mission "fleet/app-web/one-space-gets-instant-new-items" state="ready" {
     round {
       completion { when "all-steps-exhausted" }
       step "merge" timeout="1h" {
-        assigned-to "agent/fleet/app-web/standing/app-web"
+        assigned-to "agent/example/app-web/standing/app-web"
         goal "Merge origin/instant-new-items into one-space-at-a-time in the owner worktree and resolve every conflict so the intent of both sides survives. storage.ts, items-store.ts and root-space-store.ts have changes on both branches."
         goal "Run the checks for the changed areas, then push one-space-at-a-time to origin."
         goal "Read ${loop.feedback} when it is not empty. It holds the until gates that failed after the last push. Fix what they report and push again."
@@ -66,7 +66,7 @@ mission "fleet/app-web/one-space-gets-instant-new-items" state="ready" {
     on-exhausted {
       fail
       attention "The one-space branch is not green after three merge rounds" {
-        reviewer "person/nathan"
+        reviewer "person/alex"
         severity "error"
       }
     }
@@ -79,9 +79,9 @@ mission "fleet/app-web/one-space-gets-instant-new-items" state="ready" {
     step "tell-cos" timeout="5m" {
       agentless
       message "finished" {
-        to "agent/fleet/cos/standing/cos"
+        to "agent/example/cos/standing/cos"
         title "fleet/app-web/one-space-gets-instant-new-items finished"
-        content "one-space-at-a-time contains instant-new-items and pull request 1465 is green. Nathan can deploy staging from that branch."
+        content "one-space-at-a-time contains instant-new-items and pull request 1465 is green. Alex can deploy staging from that branch."
       }
     }
   }
@@ -92,7 +92,7 @@ mission "fleet/app-web/one-space-gets-instant-new-items" state="ready" {
     observer "observer/one-space-pull-request"
     on "checks"
     when { every "checks" { field "conclusion" "is" "success" } }
-    to "agent/fleet/cos/standing/cos"
+    to "agent/example/cos/standing/cos"
     delivery "message"
   }
 }

@@ -208,11 +208,11 @@ fn st3_ping_keeps_the_plain_bounded_notice_for_the_claude_channel() {
     assert_eq!(
         st3_ping_text(
             "message/abc123",
-            "agent/fleet/cos\nspoofed",
+            "agent/example/cos\nspoofed",
             Some("Check\rreceipt"),
             "Reply once\nwith token.",
         ),
-        "[PING from st3] message/abc123 from agent/fleet/cos spoofed: Check receipt\n\nReply once with token."
+        "[PING from st3] message/abc123 from agent/example/cos spoofed: Check receipt\n\nReply once with token."
     );
     let long = st3_ping_text(
         "message/abc123",
@@ -230,14 +230,14 @@ fn st3_notification_wraps_one_bounded_message_with_its_hash_and_graph_address() 
     assert_eq!(
         st3_notification_text(
             "message/abc123",
-            "agent/fleet/cos\nspoofed",
-            "agent/fleet/dev",
+            "agent/example/cos\nspoofed",
+            "agent/example/dev",
             Some("Check\rreceipt"),
             body,
             &st3_body_sha256(body),
         ),
         format!(
-            "<smalltalk-message id=\"abc123\" from=\"agent/fleet/cos spoofed\" to=\"agent/fleet/dev\" \
+            "<smalltalk-message id=\"abc123\" from=\"agent/example/cos spoofed\" to=\"agent/example/dev\" \
              subject=\"Check receipt\" sha256=\"{}\" graph=\"message/abc123\">\n\
              Reply once with token.\n</smalltalk-message>",
             st3_body_sha256(body)
@@ -2213,24 +2213,24 @@ fn archive_cancels_staged_ownership_without_submit_or_repaste() {
 /// A real catalog with one agent-owned stream.
 fn event_catalog() -> (tempfile::TempDir, PathBuf) {
     let catalog = tempfile::tempdir().unwrap();
-    declare_agent(catalog.path(), "hetz", "worker", None);
-    crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
-    let declaration = catalog.path().join("hetz/worker/agent.kdl");
+    declare_agent(catalog.path(), "example-linux", "worker", None);
+    crate::event::publish_owner_binding_for_test(catalog.path(), "example-linux").unwrap();
+    let declaration = catalog.path().join("example-linux/worker/agent.kdl");
     let source = std::fs::read_to_string(&declaration).unwrap();
     std::fs::write(
         declaration,
         source.replacen("\n}\n", "\n  stream \"gh-ci\" {}\n}\n", 1),
     )
     .unwrap();
-    let inbox = inbox_dir(&catalog.path().join("hetz").join("worker"));
+    let inbox = inbox_dir(&catalog.path().join("example-linux").join("worker"));
     (catalog, inbox)
 }
 
 fn emit_ci(root: &Path, event_id: &str, supersede: bool) -> String {
     crate::event::emit(
         root,
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         event_id,
         Some("pr-42"),
@@ -2246,8 +2246,8 @@ fn flush_in(root: &Path, pending: &mut VecDeque<PendingNotice>, poker: &dyn Poke
     flush_pending(
         DingContext {
             catalog_root: root,
-            this_host: "hetz",
-            recipient: "hetz.worker",
+            this_host: "example-linux",
+            recipient: "example-linux.worker",
         },
         None,
         pending,
@@ -2271,13 +2271,13 @@ fn a_producer_supersede_of_a_staged_event_never_repastes_and_the_successor_deliv
     let failure_text = pending[0].text(
         DingContext {
             catalog_root: root,
-            this_host: "hetz",
-            recipient: "hetz.worker",
+            this_host: "example-linux",
+            recipient: "example-linux.worker",
         },
         &mut None,
     );
     assert!(
-        failure_text.starts_with("[PING] » hetz.worker/gh-ci:"),
+        failure_text.starts_with("[PING] » example-linux.worker/gh-ci:"),
         "an event announces itself as a world-event: {failure_text}"
     );
 
@@ -2357,8 +2357,8 @@ fn a_superseded_staged_event_is_cancelled_even_if_pixels_remain() {
     let failure_text = pending[0].text(
         DingContext {
             catalog_root: root,
-            this_host: "hetz",
-            recipient: "hetz.worker",
+            this_host: "example-linux",
+            recipient: "example-linux.worker",
         },
         &mut None,
     );
@@ -2413,7 +2413,7 @@ fn archive_copy_fallback_preserves_supersede_ownership_without_staging_leftovers
 
     let (catalog, inbox) = event_catalog();
     let root = catalog.path();
-    let archive = crate::message::archive_dir(&root.join("hetz").join("worker"));
+    let archive = crate::message::archive_dir(&root.join("example-linux").join("worker"));
 
     let failure_filename = emit_ci(root, "failure", true);
     let mut seen = HashSet::new();
@@ -2426,8 +2426,8 @@ fn archive_copy_fallback_preserves_supersede_ownership_without_staging_leftovers
     let failure_text = pending[0].text(
         DingContext {
             catalog_root: root,
-            this_host: "hetz",
-            recipient: "hetz.worker",
+            this_host: "example-linux",
+            recipient: "example-linux.worker",
         },
         &mut None,
     );

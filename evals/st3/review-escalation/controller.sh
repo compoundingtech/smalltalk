@@ -60,13 +60,13 @@ new_generation=$(jq -er '.mission_run.generation' revised.json)
 
 route=$(jq -er '.mission_run.steps[] | select(.step == "route") | .subject' revised.json)
 st3 work claim "$route" --as "$OWNER" >/dev/null
-st3 work complete "$route" --as "$OWNER" --summary "Nathan must review this result" >/dev/null
+st3 work complete "$route" --as "$OWNER" --summary "Alex must review this result" >/dev/null
 
 human=$(st3 --json mission show "$work_run" | jq -er '.steps[] | select(.step == "human-review") | .subject')
 st3 trace wait "$human" --for ready --timeout 1m >/dev/null
 review_list_ready=false
 for attempt in $(seq 1 100); do
-  st3 review ls --as person/nathan --json >pending-reviews.json
+  st3 review ls --as person/alex --json >pending-reviews.json
   if jq -e --arg owner "$human" 'map(select(.owner == $owner)) | length == 1' pending-reviews.json >/dev/null; then
     review_list_ready=true
     break
@@ -80,7 +80,7 @@ jq -e --arg owner "$human" --arg run "$work_run" --arg source "$source_claim" '
   and $reviews[0].mission == "mission/eval/review-escalation/work"
   and $reviews[0].mission_run == $run
   and $reviews[0].step == "human-review"
-  and $reviews[0].reviewer == "person/nathan"
+  and $reviews[0].reviewer == "person/alex"
   and $reviews[0].question == "Approve human-review?"
   and $reviews[0].review_targets == [
     "resource/eval/review-escalation/source@" + $source,
@@ -91,7 +91,7 @@ jq -e --arg owner "$human" --arg run "$work_run" --arg source "$source_claim" '
 ' pending-reviews.json >/dev/null
 review_requested=false
 for attempt in $(seq 1 100); do
-  if st3 review approve "$human" --actor person/nathan --reason "the model-free review route is correct" >/dev/null 2>&1; then
+  if st3 review approve "$human" --actor person/alex --reason "the model-free review route is correct" >/dev/null 2>&1; then
     review_requested=true
     break
   fi
@@ -99,7 +99,7 @@ for attempt in $(seq 1 100); do
 done
 [[ "$review_requested" == "true" ]]
 st3 trace wait "$work_run" --for completed --timeout 1m >/dev/null
-st3 review ls --as person/nathan --json \
+st3 review ls --as person/alex --json \
   | jq -e --arg owner "$human" 'map(select(.owner == $owner)) | length == 0' >/dev/null
 
 st3 --json work revision generations "$work_run" >generations.json

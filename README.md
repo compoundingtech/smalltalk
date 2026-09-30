@@ -198,7 +198,7 @@ st agents start example/worker --harness claude --model claude-sonnet-5 --effort
 ```kdl
 version 2
 agent "example/worker" {
-    workspace "/home/ada/src/garden"
+    workspace "/home/example/src/garden"
     restart always
     harness claude {
         model claude-sonnet-5

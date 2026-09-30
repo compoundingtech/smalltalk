@@ -179,7 +179,7 @@ fn cli_prints_each_snapshot_without_changing_its_input() {
             .arg(&input)
             .args(
                 (provider == "claude")
-                    .then_some(["--agent", "Silber.fabric"])
+                    .then_some(["--agent", "ExampleMac.fabric"])
                     .into_iter()
                     .flatten(),
             )
