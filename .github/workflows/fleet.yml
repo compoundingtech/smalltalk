@@ -60,6 +60,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
+      CI_RUN_ID: ${{ github.run_id }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -105,19 +106,32 @@ jobs:
       - name: Build workspace tests first (no debug info)
         shell: bash
         run: nix develop -c cargo nextest run --workspace --locked --profile ci --no-run
+      - name: Start the runner user systemd manager
+        run: |
+          uid=$(id -u)
+          sudo loginctl enable-linger "$USER"
+          for _ in $(seq 100); do
+            test -S "/run/user/$uid/bus" && break
+            sleep 0.2
+          done
+          export XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus"
+          systemd-run --user --scope --quiet true
+          printf 'XDG_RUNTIME_DIR=%s\nDBUS_SESSION_BUS_ADDRESS=%s\n' "$XDG_RUNTIME_DIR" "$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
       - name: Summarize tested revision and selection
         env:
           REASON: ${{ steps.st2.outputs.reason }}
-        run: "printf 'Checked merge/commit: \\x60%s\\x60\\n\\n%s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$REASON\" >> \"$GITHUB_STEP_SUMMARY\""
+        run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n%s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" \"$REASON\" >> \"$GITHUB_STEP_SUMMARY\""
       - name: Run nextest, clippy, generated clients and fleet compatibility in parallel
         shell: bash
         run: nix develop -c bash scripts/ci-linux
         env:
           ST2_FILTER: ${{ steps.st2.outputs.filter }}
-      - name: Retain stage logs and timings
+      - name: Retain stage logs, timings and messaging-fault evidence
         uses: actions/upload-artifact@v4
         if: always()
         with:
           name: linux-ci-logs
-          path: ci-logs/
+          path: |
+            ${{ runner.temp }}/ci-logs/
+            target/messaging-faults/
           if-no-files-found: ignore

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Invoked inside the pinned devShell, after the workspace test build completes.
 set -euo pipefail
-mkdir -p ci-logs
+# Logs stay outside the checkout: the public-content test scans untracked files.
+logs="$RUNNER_TEMP/ci-logs"
+mkdir -p "$logs"
 
 fleet_compat() {
   local baseline
@@ -16,15 +18,15 @@ fleet_compat() {
     return 1
   fi
   cargo test -p st3 --locked --test integration -- --ignored --exact \
-    fleet::an_old_build_config_peer_replicates_with_new_members 2>&1 | tee ci-logs/compat-result.log || return
-  grep -q "test result: ok. 1 passed" ci-logs/compat-result.log
+    fleet::an_old_build_config_peer_replicates_with_new_members 2>&1 | tee "$logs/compat-result.log" || return
+  grep -q "test result: ok. 1 passed" "$logs/compat-result.log"
 }
 
 run_stage() {
   local stage=$1 start=$SECONDS status=0
   shift
-  "$@" > "ci-logs/$stage.log" 2>&1 || status=$?
-  printf '%s %s\n' "$((SECONDS - start))" "$status" > "ci-logs/$stage.time"
+  "$@" > "$logs/$stage.log" 2>&1 || status=$?
+  printf '%s %s\n' "$((SECONDS - start))" "$status" > "$logs/$stage.time"
   return "$status"
 }
 
@@ -50,8 +52,8 @@ for entry in "test:$test_pid" "clippy:$clippy_pid" "codegen:$codegen_pid" "fleet
     failed=1
   fi
   printf '\n--- %s (%s) ---\n' "$stage" "$result"
-  cat "ci-logs/$stage.log"
-  read -r elapsed status < "ci-logs/$stage.time"
+  cat "$logs/$stage.log"
+  read -r elapsed status < "$logs/$stage.time"
   printf '| %s | %s | %ss | %s |\n' "$stage" "$result" "$elapsed" "$status" >> "$GITHUB_STEP_SUMMARY"
 done
 exit "$failed"
