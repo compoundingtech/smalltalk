@@ -1,4 +1,5 @@
 mod cache;
+mod connection;
 mod feed;
 mod model;
 mod tree;
@@ -2573,6 +2574,24 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
 
 fn main() -> Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        println!(
+            "stui [--client | --local] [--old]\nstui pair MEMBER_URL PAIRING_ID\n\nPairing reads the single-use code privately from the terminal (or stdin).\nPaired devices use the network automatically; --local selects the local daemon.\n--client requires a paired device. --demo opens invented data."
+        );
+        return Ok(());
+    }
+    if args.get(1).is_some_and(|arg| arg == "pair") {
+        anyhow::ensure!(args.len() == 4, "Usage: stui pair MEMBER_URL PAIRING_ID");
+        let path = connection::profile_path()?;
+        let code = connection::read_code()?;
+        let runtime = tokio::runtime::Runtime::new()?;
+        let person = runtime.block_on(connection::pair(&path, &args[2], &args[3], &code))?;
+        println!("Paired as {person}. Run stui to connect; no local daemon is needed.");
+        return Ok(());
+    }
     if args.iter().any(|arg| arg == "--demo") {
         return ui::run_demo(&args);
     }
@@ -2587,22 +2606,63 @@ fn main() -> Result<()> {
     ] {
         signal_hook::flag::register(signal, stopping.clone())?;
     }
-    let path =
-        st3_client::discover_unix_endpoint(std::env::var_os("ST3_ENDPOINT").map(PathBuf::from))?;
-    let person = configured_person()?;
+    let local = args.iter().any(|arg| arg == "--local");
+    let client_only = args.iter().any(|arg| arg == "--client");
+    anyhow::ensure!(!(local && client_only), "Choose --client or --local");
+    let profile = if local {
+        None
+    } else if std::env::var_os("XDG_CONFIG_HOME").is_none() && std::env::var_os("HOME").is_none() {
+        None
+    } else {
+        connection::profile_path().and_then(|path| connection::Profile::load(&path))?
+    };
+    anyhow::ensure!(
+        !client_only || profile.is_some(),
+        "Run stui pair MEMBER_URL PAIRING_ID first"
+    );
+    anyhow::ensure!(
+        profile.is_none() || !args.iter().any(|arg| arg == "--old"),
+        "Client-only mode uses the current screens; omit --old"
+    );
+    let person = match &profile {
+        Some(profile) => Some(profile.person()?.to_owned()),
+        None => configured_person()?,
+    };
     anyhow::ensure!(
         person
             .as_deref()
             .is_some_and(|person| person.starts_with("person/") && person.len() > 7),
         "stui needs ST3_PERSON=person/NAME or person = \"person/NAME\" in the st config"
     );
-    let cache_path = person
-        .as_deref()
-        .and_then(|actor| cache::path(&path, actor));
-    let client = match person.as_deref() {
-        Some(person) => Client::unix_as(&path, person),
-        None => Client::unix(&path),
+    let (clients, cache_path) = match &profile {
+        Some(profile) => {
+            // Scope cached snapshots to this device grant, including every known member.
+            let identity = profile
+                .devices
+                .iter()
+                .map(|device| format!("{}:{}", device.endpoint, device.session.device_id))
+                .collect::<Vec<_>>()
+                .join("|");
+            (
+                profile.clients(),
+                cache::path(
+                    std::path::Path::new(&identity),
+                    person.as_deref().unwrap_or_default(),
+                ),
+            )
+        }
+        None => {
+            let path = st3_client::discover_unix_endpoint(
+                std::env::var_os("ST3_ENDPOINT").map(PathBuf::from),
+            )?;
+            let actor = person.as_deref().unwrap_or_default();
+            (
+                vec![Client::unix_as(&path, actor)],
+                cache::path(&path, actor),
+            )
+        }
     };
+    let client = clients[0].clone();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -2615,7 +2675,12 @@ fn main() -> Result<()> {
             .and_then(|(path, actor)| cache::load(path, actor));
         let (updates, incoming) = mpsc::channel::<feed::Update>();
         let (commands, command_receiver) = tokio::sync::mpsc::unbounded_channel();
-        runtime.spawn(feed::run(client.clone(), updates, command_receiver));
+        runtime.spawn(feed::run_members(
+            clients,
+            profile.is_some(),
+            updates,
+            command_receiver,
+        ));
         return ui::live::run(ui::live::Context {
             client,
             runtime,
