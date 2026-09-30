@@ -767,6 +767,20 @@ fn prefix_upper_bound(prefix: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
+/// The batches of the claims accepted at `?2` at or before store index `?1`. The `length` term is
+/// the first column of `claims_accepted_order_index`, so SQLite seeks the index instead of
+/// reading every claim.
+const LAST_ACCEPTED_BATCHES: &str = "SELECT batch_id FROM claims
+     WHERE length(accepted_at_unix_ms)=length(?2) AND accepted_at_unix_ms=?2 AND store_index<=?1";
+
+/// Whether a run `?2`, its generation `?3`, or a step of that generation (subjects from `?4` up
+/// to `?5`) has a claim at or before store index `?1`. Three seeks in `claims_subject_index`;
+/// the steps are a subject range, as a `LIKE` pattern cannot use the index.
+const RUN_HAS_PRIOR_CLAIMS: &str =
+    "SELECT EXISTS(SELECT 1 FROM claims WHERE store_index<=?1 AND subject=?2)
+         OR EXISTS(SELECT 1 FROM claims WHERE store_index<=?1 AND subject=?3)
+         OR EXISTS(SELECT 1 FROM claims WHERE store_index<=?1 AND subject>=?4 AND subject<?5)";
+
 /// The runtime incarnation a claim names, read as a view of the claim does: from its `fields`,
 /// or from the body itself when it has none. The expression of
 /// `claims_incarnation_accepted_index`, word for word, so SQLite can use the index.
@@ -26517,9 +26531,7 @@ fn try_project_simple_replication_tx(
             .map_err(internal)?;
         if let Some(accepted) = last_accepted {
             let mut statement = transaction
-                .prepare(
-                    "SELECT batch_id FROM claims WHERE store_index<=?1 AND accepted_at_unix_ms=?2",
-                )
+                .prepare_cached(LAST_ACCEPTED_BATCHES)
                 .map_err(internal)?;
             let batches = statement
                 .query_map(params![frontier, accepted], |row| row.get::<_, String>(0))
@@ -26622,15 +26634,16 @@ fn try_project_simple_replication_tx(
                     .get("current_generation")
                     .and_then(Value::as_str)
                     .unwrap_or("");
+                let generation_id = generation_id_from_subject(generation);
                 let prior_dependents: bool = transaction
                     .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM claims WHERE store_index<=?1
-                         AND (subject=?2 OR subject=?3 OR subject LIKE ?4))",
+                        RUN_HAS_PRIOR_CLAIMS,
                         params![
                             frontier,
                             claim.subject,
                             generation,
-                            format!("step-run/{}/%", generation_id_from_subject(generation))
+                            format!("step-run/{generation_id}/"),
+                            format!("step-run/{generation_id}0"),
                         ],
                         |row| row.get(0),
                     )
@@ -34068,6 +34081,111 @@ observer "ordered/file" {
         connection
             .query_row("SELECT MAX(store_index) FROM claims", [], |row| row.get(0))
             .unwrap()
+    }
+
+    /// The replication projection's two frontier checks seek an index instead of reading every
+    /// claim, and answer as the scans they replace at every snapshot.
+    #[test]
+    fn replication_frontier_checks_seek_instead_of_scanning() {
+        let store = Store::open_memory("node").unwrap();
+        let mut snapshots = vec![0];
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute_batch("PRAGMA foreign_keys = OFF")
+                .unwrap();
+            for (subject, batch, accepted) in [
+                ("mission-run/one", "batch/left/1/a", "9"),
+                ("run-generation/gen", "batch/left/2/a", "10"),
+                ("step-run/gen/build", "batch/right/1/a", "10"),
+                // Just outside the steps of generation `gen`.
+                ("step-run/gen0", "batch/right/2/a", "100"),
+                ("step-run/ge/test", "batch/left/3/a", "11"),
+            ] {
+                connection
+                    .execute(
+                        "INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body,
+                                            predecessors, accepted_at_unix_ms)
+                         VALUES (?1, ?2, ?3, 'harness.observed', 'node', NULL, '{}', '[]', ?4)",
+                        params![Uuid::now_v7().to_string(), batch, subject, accepted],
+                    )
+                    .unwrap();
+                snapshots.push(
+                    connection
+                        .query_row("SELECT MAX(store_index) FROM claims", [], |row| row.get(0))
+                        .unwrap(),
+                );
+            }
+            connection
+                .execute_batch("PRAGMA foreign_keys = ON")
+                .unwrap();
+        }
+        let batches_scan = "SELECT batch_id FROM claims
+                            WHERE store_index<=?1 AND accepted_at_unix_ms=?2";
+        let prior_scan = "SELECT EXISTS(SELECT 1 FROM claims WHERE store_index<=?1
+                          AND (subject=?2 OR subject=?3 OR subject LIKE ?4))";
+        let exists = |sql: &str, params: &[&dyn rusqlite::ToSql]| -> bool {
+            store
+                .readers
+                .get()
+                .query_row(sql, params, |row| row.get(0))
+                .unwrap()
+        };
+        for &snapshot in &snapshots {
+            for accepted in ["1", "9", "10", "11", "100"] {
+                let mut sought = listed(&store, LAST_ACCEPTED_BATCHES, params![snapshot, accepted]);
+                let mut scanned = listed(&store, batches_scan, params![snapshot, accepted]);
+                sought.sort();
+                scanned.sort();
+                assert_eq!(sought, scanned, "accepted {accepted} at {snapshot}");
+            }
+            for (run, generation, id) in [
+                ("mission-run/one", "run-generation/none", "none"),
+                ("mission-run/none", "run-generation/gen", "gen"),
+                ("mission-run/none", "run-generation/other", "gen"),
+                ("mission-run/none", "run-generation/other", "ge"),
+                ("mission-run/none", "run-generation/other", "other"),
+            ] {
+                let (from, to) = (format!("step-run/{id}/"), format!("step-run/{id}0"));
+                let pattern = format!("step-run/{id}/%");
+                assert_eq!(
+                    exists(
+                        RUN_HAS_PRIOR_CLAIMS,
+                        params![snapshot, run, generation, from, to]
+                    ),
+                    exists(prior_scan, params![snapshot, run, generation, pattern]),
+                    "{run} {generation} {id} at {snapshot}"
+                );
+            }
+        }
+        let plan = query_plan(&store, LAST_ACCEPTED_BATCHES, params![10, "10"]);
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("claims_accepted_order_index")),
+            "{plan:?}"
+        );
+        let plan = query_plan(
+            &store,
+            RUN_HAS_PRIOR_CLAIMS,
+            params![
+                10,
+                "mission-run/one",
+                "run-generation/gen",
+                "step-run/gen/",
+                "step-run/gen0"
+            ],
+        );
+        let reads = plan
+            .iter()
+            .filter(|step| step.contains("claims"))
+            .collect::<Vec<_>>();
+        assert_eq!(reads.len(), 3, "{plan:?}");
+        assert!(
+            reads
+                .iter()
+                .all(|step| step.contains("INDEX claims_subject_index (subject")),
+            "{plan:?}"
+        );
     }
 
     /// The runtimes' subjects are found one index seek per subject, not by reading every runtime
