@@ -226,34 +226,264 @@ pub(crate) fn find_bound_transcript(
         _ => return Ok(None),
     };
     let filename = format!("{native_id}.jsonl");
+    // Codex prefixes the session ID with the rollout time: `rollout-<time>-<id>.jsonl`.
+    let codex_suffix = format!("-{filename}");
+    let mut found: Option<SessionMetadata> = None;
     for entry in WalkDir::new(root)
         .follow_links(false)
         .into_iter()
         .filter_map(Result::ok)
     {
-        if !entry.file_type().is_file() || entry.file_name() != std::ffi::OsStr::new(&filename) {
-            continue;
-        }
-        let Some(metadata) = read_metadata(driver, entry.path())? else {
+        let Some(name) = entry.file_name().to_str() else {
             continue;
         };
-        if metadata.native_id != native_id {
+        if !entry.file_type().is_file()
+            || !(name == filename
+                || (driver == ExternalDriver::Codex && name.ends_with(&codex_suffix)))
+        {
             continue;
         }
-        return Ok(Some(ExternalSession {
-            id: external_session_id(driver, native_id),
-            revision: metadata.revision,
-            driver,
-            native_id: metadata.native_id,
-            transcript: metadata.transcript,
-            cwd: metadata.cwd,
-            title: metadata.title,
-            started_at_unix_ms: metadata.started_at_unix_ms,
-            updated_at_unix_ms: metadata.updated_at_unix_ms,
-            process: None,
-        }));
+        // One unreadable candidate is skipped; it does not end the search.
+        let Ok(Some(metadata)) = read_metadata(driver, entry.path()) else {
+            continue;
+        };
+        // Claude names each transcript after its session, so the file name alone identifies
+        // it, even when history copied in at the top still carries an earlier session's ID.
+        // Other harnesses must also name the session inside the file.
+        if driver != ExternalDriver::Claude && metadata.native_id != native_id {
+            continue;
+        }
+        // The same session can leave a file in more than one project directory; the one
+        // written most recently is the live one.
+        if found
+            .as_ref()
+            .is_none_or(|current| metadata.updated_at_unix_ms > current.updated_at_unix_ms)
+        {
+            found = Some(metadata);
+        }
     }
-    Ok(None)
+    Ok(found.map(|metadata| ExternalSession {
+        id: external_session_id(driver, native_id),
+        revision: metadata.revision,
+        driver,
+        native_id: native_id.to_owned(),
+        transcript: metadata.transcript,
+        cwd: metadata.cwd,
+        title: metadata.title,
+        started_at_unix_ms: metadata.started_at_unix_ms,
+        updated_at_unix_ms: metadata.updated_at_unix_ms,
+        process: None,
+    }))
+}
+
+/// Prove which Claude session a managed seat's live provider is running, from process evidence
+/// alone, for when the SessionStart hook never wrote its binding.
+///
+/// `driver_token` is the `evidence_incarnation` from the seat's own `harness.observed` claim for
+/// its current incarnation. The Claude wrapper mints it as `<driver pid>-<unix ms>-<counter>`
+/// inside the `st3 driver claude` process, and that process launches Claude as its direct child.
+/// Claude records its own session in `~/.claude/sessions/<pid>.json` beside the kernel start time
+/// of the process that wrote it. Every link is exact:
+///
+/// - the driver pid comes from the seat's own claim, never from a client, a scan, or a guess;
+/// - that pid must still run `st3 driver claude --subject <this seat>`, and must have started no
+///   later than the token was minted, so a reused pid is refused;
+/// - the Claude process must be that driver's direct child;
+/// - the session file must name that same pid and the same kernel start time, so a file left
+///   behind by an earlier process with the same pid is refused;
+/// - exactly one session must result.
+///
+/// Nothing here matches by workspace, recency, or a similar file name. Another seat's Claude has
+/// a different driver as its parent and an unmanaged Claude has no driver parent at all, so this
+/// cannot select another session's transcript. Any gap yields an explanation, not a guess.
+pub(crate) fn claude_session_of_managed_driver(
+    home: &Path,
+    subject: &str,
+    driver_token: &str,
+) -> std::result::Result<String, String> {
+    // A seat without a wrapper names Claude's own session in its evidence token.
+    if let Some(session) = driver_token.strip_prefix(st2::harness_state::WRAPPERLESS_PREFIX) {
+        return if is_uuid(session) {
+            Ok(session.to_owned())
+        } else {
+            Err(format!(
+                "the harness evidence names a malformed Claude session `{session}`"
+            ))
+        };
+    }
+    let mut parts = driver_token.splitn(3, '-');
+    let (Some(Ok(pid)), Some(Ok(minted_at_ms)), Some(Ok(_))) = (
+        parts.next().map(str::parse::<u32>),
+        parts.next().map(str::parse::<u128>),
+        parts.next().map(str::parse::<u64>),
+    ) else {
+        return Err(format!(
+            "the harness evidence `{driver_token}` does not name a driver process"
+        ));
+    };
+    claude_session_of_driver_process(home, subject, pid, minted_at_ms)
+}
+
+#[cfg(target_os = "linux")]
+fn claude_session_of_driver_process(
+    home: &Path,
+    subject: &str,
+    pid: u32,
+    minted_at_ms: u128,
+) -> std::result::Result<String, String> {
+    let cmdline = fs::read(format!("/proc/{pid}/cmdline"))
+        .map_err(|_| format!("the seat's Claude driver (process {pid}) is no longer running"))?;
+    let arguments = cmdline
+        .split(|byte| *byte == 0)
+        .map(String::from_utf8_lossy)
+        .collect::<Vec<_>>();
+    // Only the driver's own options count, never the provider argv after `--`.
+    let options = arguments
+        .iter()
+        .position(|argument| argument == "--")
+        .map_or(&arguments[..], |end| &arguments[..end]);
+    let is_claude_driver = options
+        .windows(2)
+        .any(|pair| pair[0] == "driver" && pair[1] == "claude");
+    let is_this_seat = options
+        .windows(2)
+        .any(|pair| pair[0] == "--subject" && pair[1] == subject)
+        || options
+            .iter()
+            .any(|argument| argument.strip_prefix("--subject=") == Some(subject));
+    if !is_claude_driver || !is_this_seat {
+        return Err(format!(
+            "process {pid} is not this seat's Claude driver any more"
+        ));
+    }
+    let started_at_ms = linux_process_started_at_ms(pid)
+        .ok_or_else(|| format!("the start time of driver process {pid} is unreadable"))?;
+    // Boot time is whole seconds, so allow for that rounding and clock-tick granularity.
+    if started_at_ms > minted_at_ms.saturating_add(2_000) {
+        return Err(format!(
+            "process {pid} started after the harness evidence was written, so it is a different process"
+        ));
+    }
+    let sessions = home.join(".claude/sessions");
+    let mut found = BTreeSet::new();
+    for child in linux_child_processes(pid) {
+        let Ok(record) = fs::read(sessions.join(format!("{child}.json"))) else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_slice::<Value>(&record) else {
+            continue;
+        };
+        let recorded_start = match record.get("procStart") {
+            Some(Value::String(value)) => value.clone(),
+            Some(Value::Number(value)) => value.to_string(),
+            _ => continue,
+        };
+        if record.get("pid").and_then(Value::as_u64) != Some(u64::from(child))
+            || linux_process_start_ticks(child).as_deref() != Some(recorded_start.as_str())
+        {
+            continue;
+        }
+        if let Some(session) = record.get("sessionId").and_then(Value::as_str)
+            && is_uuid(session)
+        {
+            found.insert(session.to_owned());
+        }
+    }
+    let mut found = found.into_iter();
+    match (found.next(), found.next()) {
+        (Some(session), None) => Ok(session),
+        (None, _) => Err(format!(
+            "no live Claude process under driver {pid} has recorded its session in ~/.claude/sessions"
+        )),
+        (Some(_), Some(_)) => Err(format!(
+            "driver {pid} has more than one Claude session, so none is chosen"
+        )),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn claude_session_of_driver_process(
+    _home: &Path,
+    _subject: &str,
+    _pid: u32,
+    _minted_at_ms: u128,
+) -> std::result::Result<String, String> {
+    Err("proving the Claude session from process evidence is supported only on Linux".into())
+}
+
+/// The kernel start time of `pid` in clock ticks since boot, as `/proc/<pid>/stat` reports it.
+#[cfg(target_os = "linux")]
+fn linux_process_start_ticks(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end_name = stat.rfind(") ")?;
+    stat[end_name + 2..]
+        .split_whitespace()
+        .nth(19)
+        .map(str::to_owned)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_process_started_at_ms(pid: u32) -> Option<u128> {
+    let ticks = linux_process_start_ticks(pid)?.parse::<u128>().ok()?;
+    let boot_seconds = fs::read_to_string("/proc/stat")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("btime "))
+        .and_then(|value| value.trim().parse::<u128>().ok())?;
+    let per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u128;
+    Some(
+        boot_seconds
+            .saturating_mul(1_000)
+            .saturating_add(ticks.saturating_mul(1_000) / per_second),
+    )
+}
+
+/// The direct children of `pid`. Every thread's `children` list is read, because the driver
+/// launches its provider from a worker thread; a kernel without those lists falls back to a scan
+/// of every process's parent.
+#[cfg(target_os = "linux")]
+fn linux_child_processes(pid: u32) -> BTreeSet<u32> {
+    let mut children = BTreeSet::new();
+    let mut listed = false;
+    if let Ok(tasks) = fs::read_dir(format!("/proc/{pid}/task")) {
+        for task in tasks.filter_map(Result::ok) {
+            if let Ok(list) = fs::read_to_string(task.path().join("children")) {
+                listed = true;
+                children.extend(
+                    list.split_whitespace()
+                        .filter_map(|value| value.parse::<u32>().ok()),
+                );
+            }
+        }
+    }
+    if listed {
+        return children;
+    }
+    let Ok(processes) = fs::read_dir("/proc") else {
+        return children;
+    };
+    for entry in processes.filter_map(Result::ok) {
+        let Some(candidate) = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let parent = stat.rfind(") ").and_then(|end| {
+            stat[end + 2..]
+                .split_whitespace()
+                .nth(1)
+                .and_then(|value| value.parse::<u32>().ok())
+        });
+        if parent == Some(pid) {
+            children.insert(candidate);
+        }
+    }
+    children
 }
 
 /// Find the newest transcript created by the current managed OMP incarnation.
@@ -267,24 +497,27 @@ pub(crate) fn find_managed_omp_transcript(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
+    // OMP names sessions with an ISO timestamp prefix. Keep only a bounded set of the newest
+    // names while listing, so a large directory costs memory for 64 names rather than failing,
+    // and an entry that cannot be inspected is skipped rather than ending the lookup.
+    const CANDIDATES: usize = 64;
     let mut files = Vec::new();
-    for (index, entry) in entries.enumerate() {
-        anyhow::ensure!(
-            index < MAX_DISCOVERED_FILES,
-            "managed OMP session directory exceeds the bounded file inventory"
-        );
-        let entry = entry?;
-        if entry.file_type()?.is_file()
+    for entry in entries.filter_map(std::result::Result::ok) {
+        if entry.file_type().is_ok_and(|kind| kind.is_file())
             && entry.path().extension().is_some_and(|ext| ext == "jsonl")
         {
             files.push(entry.path());
+            if files.len() >= CANDIDATES * 4 {
+                files.sort_unstable_by(|left, right| right.file_name().cmp(&left.file_name()));
+                files.truncate(CANDIDATES);
+            }
         }
     }
-    // OMP names sessions with an ISO timestamp prefix. Try a bounded number
-    // of newest candidates so a partial header cannot hide a valid predecessor.
+    // Try a bounded number of newest candidates so a partial header cannot hide a valid
+    // predecessor.
     files.sort_unstable_by(|left, right| right.file_name().cmp(&left.file_name()));
-    for path in files.into_iter().take(64) {
-        let Some(metadata) = read_metadata(ExternalDriver::Omp, &path)? else {
+    for path in files.into_iter().take(CANDIDATES) {
+        let Ok(Some(metadata)) = read_metadata(ExternalDriver::Omp, &path) else {
             continue;
         };
         if metadata.started_at_unix_ms < started_after_unix_ms {
@@ -320,6 +553,14 @@ pub(crate) fn timestamp(unix_ms: u128) -> String {
         .to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
 }
 
+/// Normalize a native transcript into timeline entries.
+///
+/// Harnesses change their files between releases, crash mid-write, and occasionally tear a
+/// record. The reader is liberal in what it accepts: one unreadable unit (a line that is not
+/// UTF-8, is not JSON, or carries a kind this reader does not know) costs only that unit, never
+/// the rest of the transcript. What it emits stays conservative: a skipped line or an
+/// unrecognized record becomes a clearly-labelled `system` entry, never an entry attributed to
+/// the user or the agent. Only opening the file can fail the whole read.
 pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value>> {
     if session.driver == ExternalDriver::OpenCode {
         return normalized_opencode_timeline(session);
@@ -331,16 +572,34 @@ pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value
     let start = metadata.len().saturating_sub(MAX_TIMELINE_BYTES);
     file.seek(SeekFrom::Start(start))?;
     let mut reader = BufReader::new(file);
+    let mut read_error = None;
     if start != 0 {
-        let mut partial = String::new();
-        reader.read_line(&mut partial)?;
-    }
-    let mut lines = VecDeque::new();
-    for line in reader.lines() {
-        if lines.len() == MAX_TIMELINE_LINES {
-            lines.pop_front();
+        let mut partial = Vec::new();
+        if let Err(error) = reader.read_until(b'\n', &mut partial) {
+            read_error = Some(error);
         }
-        lines.push_back(line?);
+    }
+    // Each line keeps whether it ended with a newline: only the final, unterminated line can be
+    // a record the harness is still writing.
+    let mut lines = VecDeque::new();
+    while read_error.is_none() {
+        let mut buffer = Vec::new();
+        match reader.read_until(b'\n', &mut buffer) {
+            Ok(0) => break,
+            Ok(_) => {
+                let terminated = buffer.last() == Some(&b'\n');
+                if lines.len() == MAX_TIMELINE_LINES {
+                    lines.pop_front();
+                }
+                // A line that is not UTF-8 is read lossily rather than ending the transcript.
+                lines.push_back((String::from_utf8_lossy(&buffer).into_owned(), terminated));
+                if !terminated {
+                    break;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => read_error = Some(error),
+        }
     }
     let mut items = Vec::new();
     if start != 0 || lines.len() == MAX_TIMELINE_LINES {
@@ -356,22 +615,170 @@ pub(crate) fn normalized_timeline(session: &ExternalSession) -> Result<Vec<Value
             }),
         ));
     }
-    for (line_index, line) in lines.into_iter().enumerate() {
-        let Ok(value) = serde_json::from_str::<Value>(&line) else {
+    // An entry without its own timestamp takes its predecessor's, so it stays in place when
+    // the timeline is merged by time with Small Talk messages.
+    let mut last_timestamp = timestamp(session.updated_at_unix_ms);
+    let mut next_free_sequence = 0_u64;
+    for (line_index, (line, terminated)) in lines.into_iter().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
             continue;
-        };
-        let sequence = ((line_index as u64).saturating_add(1)).saturating_mul(16);
-        match session.driver {
-            ExternalDriver::Codex => normalize_codex(&value, sequence, session, &mut items),
-            ExternalDriver::Claude => normalize_claude(&value, sequence, session, &mut items),
-            ExternalDriver::Pi | ExternalDriver::Omp => {
-                normalize_omp(&value, sequence, session, &mut items)
-            }
-            ExternalDriver::OpenCode => unreachable!("OpenCode history is stored in SQLite"),
         }
+        // A line normally owns sixteen sequence numbers. A record with more parts than that
+        // pushes the following lines later instead of colliding with their entry IDs.
+        let sequence = ((line_index as u64).saturating_add(1))
+            .saturating_mul(16)
+            .max(next_free_sequence);
+        let first_new = items.len();
+        match serde_json::from_str::<Value>(line) {
+            Ok(value) => normalize_native_line(
+                session.driver,
+                &value,
+                sequence,
+                &last_timestamp,
+                &mut items,
+            ),
+            // The harness is still writing this record; the next read sees it whole.
+            Err(_) if !terminated => {}
+            Err(error) => {
+                let recovered = recover_trailing_record(line);
+                push_unreadable_line(
+                    &mut items,
+                    sequence,
+                    &last_timestamp,
+                    session.driver,
+                    line_index,
+                    &error,
+                    recovered.is_some(),
+                );
+                if let Some(value) = recovered {
+                    normalize_native_line(
+                        session.driver,
+                        &value,
+                        sequence.saturating_add(1),
+                        &last_timestamp,
+                        &mut items,
+                    );
+                }
+            }
+        }
+        if let Some(highest) = items[first_new..]
+            .iter()
+            .filter_map(|item| item["sequence"].as_u64())
+            .max()
+        {
+            next_free_sequence = highest.saturating_add(1);
+        }
+        if let Some(stamp) = items[first_new..]
+            .last()
+            .and_then(|item| item["timestamp"].as_str())
+        {
+            last_timestamp = stamp.to_owned();
+        }
+    }
+    if let Some(error) = read_error {
+        items.push(timeline_item(
+            next_free_sequence.max(16),
+            &last_timestamp,
+            "system",
+            "error",
+            json!({
+                "code": "native-transcript-read-failed",
+                "message": format!("st stopped reading the {} transcript early: {error}", session.driver.as_str()),
+                "retryable": true,
+                "details": {}
+            }),
+        ));
     }
     items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
     Ok(items)
+}
+
+fn normalize_native_line(
+    driver: ExternalDriver,
+    value: &Value,
+    sequence: u64,
+    fallback_timestamp: &str,
+    items: &mut Vec<Value>,
+) {
+    match driver {
+        ExternalDriver::Codex => normalize_codex(value, sequence, fallback_timestamp, items),
+        ExternalDriver::Claude => normalize_claude(value, sequence, fallback_timestamp, items),
+        ExternalDriver::Pi | ExternalDriver::Omp => {
+            normalize_omp(driver, value, sequence, fallback_timestamp, items)
+        }
+        // OpenCode history is stored in SQLite and never read line by line.
+        ExternalDriver::OpenCode => {}
+    }
+}
+
+/// Recover a whole record glued behind a torn one.
+///
+/// A harness killed mid-append leaves a partial record, and its next append lands on the same
+/// line: `{"type":"assistant","message":{..."stop_sequence":n{"type":"user",...}`. In valid JSON an
+/// object only opens after `:`, `,`, `[`, or at the start, so an object opening after anything
+/// else is where the torn record ends. The first such position whose remainder parses as one
+/// whole object is the recovered record. The search is bounded.
+fn recover_trailing_record(line: &str) -> Option<Value> {
+    let bytes = line.as_bytes();
+    let mut attempts = 0;
+    for (index, _) in line.match_indices('{') {
+        if index == 0 {
+            continue;
+        }
+        let previous = bytes[..index]
+            .iter()
+            .rev()
+            .find(|byte| !byte.is_ascii_whitespace());
+        if matches!(previous, Some(b':' | b',' | b'[')) {
+            continue;
+        }
+        attempts += 1;
+        if attempts > 16 {
+            return None;
+        }
+        if let Ok(value @ Value::Object(_)) = serde_json::from_str::<Value>(&line[index..]) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn push_unreadable_line(
+    items: &mut Vec<Value>,
+    sequence: u64,
+    timestamp: &str,
+    driver: ExternalDriver,
+    line_index: usize,
+    error: &serde_json::Error,
+    recovered: bool,
+) {
+    let message = if recovered {
+        format!(
+            "st skipped a torn {} transcript record and kept the record written after it",
+            driver.as_str()
+        )
+    } else {
+        format!(
+            "st skipped a {} transcript line that is not valid JSON",
+            driver.as_str()
+        )
+    };
+    items.push(timeline_item(
+        sequence,
+        timestamp,
+        "system",
+        "error",
+        json!({
+            "code": "native-line-unreadable",
+            "message": message,
+            "retryable": false,
+            "details": {
+                "line_in_window": line_index.saturating_add(1),
+                "parse_error": error.to_string(),
+            }
+        }),
+    ));
 }
 
 pub(crate) struct ImportSeat {
@@ -680,8 +1087,15 @@ fn parse_metadata(
     let mut cwd = None;
     let mut title = None;
     let mut started_at_unix_ms = None;
-    for line in BufReader::new(file).lines().take(MAX_METADATA_LINES) {
-        let Ok(value) = serde_json::from_str::<Value>(&line?) else {
+    let mut reader = BufReader::new(file);
+    for _ in 0..MAX_METADATA_LINES {
+        // A header line that is not UTF-8 or not JSON is skipped, not fatal to the session.
+        let mut line = Vec::new();
+        match reader.read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+        let Ok(value) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
         match driver {
@@ -728,11 +1142,8 @@ fn parse_metadata(
             _ => {}
         }
     }
-    if driver == ExternalDriver::Claude && native_id.is_none() {
-        native_id = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .map(str::to_owned);
+    if native_id.is_none() {
+        native_id = native_id_from_file_name(driver, path);
     }
     let Some(native_id) = native_id.filter(|value| !value.trim().is_empty()) else {
         return Ok(None);
@@ -755,6 +1166,35 @@ fn parse_metadata(
         updated_at_unix_ms,
         revision,
     }))
+}
+
+/// The session ID a harness encodes in its own transcript file name, used when the header that
+/// normally names it is missing or unreadable. Claude names the file `<session>.jsonl`; Codex
+/// `rollout-<time>-<session>.jsonl`; Pi `<time>_<session>.jsonl`. Only a UUID-shaped suffix counts
+/// for the latter, so an arbitrary file name never becomes a session ID.
+fn native_id_from_file_name(driver: ExternalDriver, path: &Path) -> Option<String> {
+    let stem = path.file_stem()?.to_str()?;
+    match driver {
+        ExternalDriver::Claude => Some(stem.to_owned()),
+        ExternalDriver::Codex | ExternalDriver::Pi | ExternalDriver::Omp => {
+            let suffix = stem.get(stem.len().checked_sub(36)?..)?;
+            let separated =
+                stem.len() == 36 || matches!(stem.as_bytes()[stem.len() - 37], b'-' | b'_');
+            (separated && is_uuid(suffix)).then(|| suffix.to_owned())
+        }
+        ExternalDriver::OpenCode => None,
+    }
+}
+
+fn is_uuid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
 }
 
 #[derive(Clone)]
@@ -993,36 +1433,52 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
              WHERE session_id = ?1 ORDER BY time_created DESC, id DESC LIMIT ?2\
          ) ORDER BY time_created, id",
     )?;
-    let messages = message_statement
-        .query_map(
-            params![session.native_id, MAX_TIMELINE_LINES as i64 + 1],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                ))
-            },
-        )?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut messages = messages;
+    // Rows are decoded one column at a time, so one row with an unexpected column type costs
+    // only itself. The count of rows that could not be decoded is shown, not hidden.
+    let mut skipped_rows = 0_usize;
+    let mut messages = Vec::new();
+    for row in message_statement.query_map(
+        params![session.native_id, MAX_TIMELINE_LINES as i64 + 1],
+        |row| {
+            Ok((
+                row.get::<_, Option<String>>(0).ok().flatten(),
+                row.get::<_, Option<i64>>(1).ok().flatten(),
+                row.get::<_, Option<String>>(2).ok().flatten(),
+            ))
+        },
+    )? {
+        match row {
+            Ok((Some(id), created, encoded)) => messages.push((id, created, encoded)),
+            _ => skipped_rows += 1,
+        }
+    }
     let mut truncated = messages.len() > MAX_TIMELINE_LINES;
     if truncated {
         messages.remove(0);
     }
-    let mut part_statement = connection.prepare(
-        "SELECT data FROM part WHERE session_id = ?1 AND message_id = ?2 \
-         ORDER BY time_created, id",
-    )?;
+    // A database from an OpenCode release without the part table still shows its messages.
+    let mut part_statement = connection
+        .prepare(
+            "SELECT data FROM part WHERE session_id = ?1 AND message_id = ?2 \
+             ORDER BY time_created, id",
+        )
+        .ok();
+    let parts_unavailable = part_statement.is_none();
     let mut items = VecDeque::new();
     // Include the surrounding JSON array delimiters so this remains an exact bound on the
     // serialized timeline, not just on its native payloads.
     let mut serialized_bytes = 2_usize;
     let mut sequence = 1_u64;
+    let mut last_created = session.started_at_unix_ms;
     for (message_id, created, encoded) in messages {
-        let message = serde_json::from_str::<Value>(&encoded).unwrap_or(Value::Null);
+        let message = encoded
+            .and_then(|encoded| serde_json::from_str::<Value>(&encoded).ok())
+            .unwrap_or(Value::Null);
         let role = normalized_role(message.get("role").and_then(Value::as_str));
-        let at = timestamp(created.max(0) as u128);
+        if let Some(created) = created {
+            last_created = created.max(0) as u128;
+        }
+        let at = timestamp(last_created);
         let mut additions = Vec::with_capacity(2);
         push_message(
             &mut additions,
@@ -1037,12 +1493,25 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
             &mut truncated,
             additions,
         );
-        let parts = part_statement.query_map(params![session.native_id, message_id], |row| {
-            row.get::<_, String>(0)
-        })?;
+        let Some(part_statement) = part_statement.as_mut() else {
+            continue;
+        };
+        let parts = match part_statement.query_map(params![session.native_id, message_id], |row| {
+            row.get::<_, Option<String>>(0)
+        }) {
+            Ok(parts) => parts.collect::<Vec<_>>(),
+            Err(_) => {
+                skipped_rows += 1;
+                continue;
+            }
+        };
         for encoded_part in parts {
-            let encoded_part = encoded_part?;
-            let Ok(part) = serde_json::from_str::<Value>(&encoded_part) else {
+            let Some(part) = encoded_part
+                .ok()
+                .flatten()
+                .and_then(|encoded| serde_json::from_str::<Value>(&encoded).ok())
+            else {
+                skipped_rows += 1;
                 continue;
             };
             let mut additions = Vec::with_capacity(2);
@@ -1074,11 +1543,9 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
                         name,
                         state.get("input").cloned().unwrap_or_else(|| json!({})),
                     );
-                    if matches!(
-                        state.get("status").and_then(Value::as_str),
-                        Some("completed" | "error")
-                    ) {
-                        push_tool_result(
+                    let status = state.get("status").and_then(Value::as_str);
+                    if matches!(status, Some("completed" | "error")) {
+                        push_tool_result_with_status(
                             &mut additions,
                             next_opencode_sequence(&mut sequence)?,
                             &at,
@@ -1088,10 +1555,34 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
                                 .or_else(|| state.get("error"))
                                 .cloned()
                                 .unwrap_or(Value::Null),
+                            status == Some("error"),
                         );
                     }
                 }
-                _ => {}
+                Some("file") => {
+                    let name = part
+                        .get("filename")
+                        .or_else(|| part.get("url"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("attachment");
+                    push_content(
+                        &mut additions,
+                        next_opencode_sequence(&mut sequence)?,
+                        &at,
+                        role,
+                        &format!("[file: {name}]"),
+                    );
+                }
+                Some(kind) if OPENCODE_HIDDEN_PARTS.contains(&kind) => {}
+                kind => push_unrecognized(
+                    &mut additions,
+                    next_opencode_sequence(&mut sequence)?,
+                    &at,
+                    "opencode",
+                    "part",
+                    kind,
+                    &part,
+                ),
             }
             extend_bounded_opencode_timeline(
                 &mut items,
@@ -1100,6 +1591,31 @@ fn normalized_opencode_timeline(session: &ExternalSession) -> Result<Vec<Value>>
                 additions,
             );
         }
+    }
+    if skipped_rows > 0 || parts_unavailable {
+        let message = if parts_unavailable {
+            "st could not read OpenCode's part table, so message contents are missing".to_owned()
+        } else {
+            format!("st skipped {skipped_rows} OpenCode rows it could not decode")
+        };
+        let notice = timeline_item(
+            next_opencode_sequence(&mut sequence)?,
+            &timestamp(session.updated_at_unix_ms),
+            "system",
+            "error",
+            json!({
+                "code": "native-rows-unreadable",
+                "message": message,
+                "retryable": false,
+                "details": {"skipped_rows": skipped_rows}
+            }),
+        );
+        extend_bounded_opencode_timeline(
+            &mut items,
+            &mut serialized_bytes,
+            &mut truncated,
+            vec![notice],
+        );
     }
     if truncated {
         prepend_opencode_truncation(
@@ -1201,22 +1717,143 @@ fn prepend_opencode_truncation(
     }
 }
 
-fn normalize_codex(
-    value: &Value,
-    sequence: u64,
-    session: &ExternalSession,
-    items: &mut Vec<Value>,
-) {
-    let timestamp = value
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
-        .unwrap_or_else(|| timestamp(session.updated_at_unix_ms));
-    let payload = &value["payload"];
-    if value["type"] != "response_item" {
-        return;
+/// Codex records that are known and are not conversation: session headers, the event stream
+/// that mirrors response items, turn settings, and accounting.
+const CODEX_BOOKKEEPING: &[&str] = &[
+    "session_meta",
+    "event_msg",
+    "turn_context",
+    "compacted",
+    "token_usage_record",
+    "world_state",
+];
+/// Codex response items that are known and deliberately not shown (private reasoning and
+/// workspace snapshots).
+const CODEX_HIDDEN_ITEMS: &[&str] = &["reasoning", "ghost_snapshot"];
+/// Claude records that are known and are not conversation: UI and session bookkeeping.
+const CLAUDE_BOOKKEEPING: &[&str] = &[
+    "file-history-snapshot",
+    "file-history-delta",
+    "queue-operation",
+    "permission-mode",
+    "mode",
+    "atis-latch",
+    "last-prompt",
+    "ai-title",
+    "custom-title",
+    "summary",
+    "cost-state",
+    "progress",
+    "agent-name",
+    "tag",
+    "pr-link",
+    "bridge-session",
+    "fork-context-ref",
+];
+/// Content blocks that are known and deliberately not shown: the model's private reasoning.
+const HIDDEN_REASONING_BLOCKS: &[&str] = &["thinking", "redacted_thinking"];
+/// Pi and OMP records that are known and are not conversation.
+const OMP_BOOKKEEPING: &[&str] = &[
+    "session",
+    "model_change",
+    "thinking_level_change",
+    "label",
+    "session_info",
+    "custom",
+    "credential_pin",
+    "title",
+];
+/// OpenCode parts that are known and deliberately not shown.
+const OPENCODE_HIDDEN_PARTS: &[&str] = &[
+    "reasoning",
+    "step-start",
+    "step-finish",
+    "snapshot",
+    "patch",
+    "agent",
+    "retry",
+    "compaction",
+];
+/// The most JSON an unrecognized record contributes to its generic entry.
+const MAX_UNRECOGNIZED_BYTES: usize = 512;
+
+/// A native timestamp as the timeline carries it. RFC 3339 text is kept as written; a number is
+/// Unix milliseconds (or seconds, when too small to be milliseconds). Anything else is absent,
+/// so the caller's fallback applies instead of an unparseable timestamp reaching a client.
+fn native_timestamp(value: Option<&Value>) -> Option<String> {
+    match value? {
+        Value::String(text) => DateTime::parse_from_rfc3339(text)
+            .ok()
+            .map(|_| text.clone()),
+        Value::Number(number) => {
+            let value = number.as_u64()?;
+            let millis = if value < 100_000_000_000 {
+                value.saturating_mul(1_000)
+            } else {
+                value
+            };
+            Some(timestamp(u128::from(millis)))
+        }
+        _ => None,
     }
-    match payload["type"].as_str() {
+}
+
+/// Show a record this reader does not understand as a generic, clearly-labelled system entry
+/// with a bounded excerpt, instead of dropping it. The role is always `system`: an unknown
+/// record is never attributed to the user or the agent.
+fn push_unrecognized(
+    items: &mut Vec<Value>,
+    sequence: u64,
+    timestamp: &str,
+    driver: &str,
+    what: &str,
+    kind: Option<&str>,
+    value: &Value,
+) {
+    let label = match kind {
+        Some(kind) => format!("[unrecognized {driver} {what} `{kind}`]"),
+        None => format!("[unrecognized {driver} {what} without a type]"),
+    };
+    let encoded = serde_json::to_string(value).unwrap_or_default();
+    let excerpt = truncate_at_char_boundary(&encoded, MAX_UNRECOGNIZED_BYTES);
+    let ellipsis = if excerpt.len() < encoded.len() {
+        "…"
+    } else {
+        ""
+    };
+    items.push(timeline_item(
+        sequence,
+        timestamp,
+        "system",
+        "content",
+        json!({"media_type":"text/plain", "text":format!("{label}\n{excerpt}{ellipsis}")}),
+    ));
+}
+
+fn json_kind(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+fn normalize_codex(value: &Value, sequence: u64, fallback_timestamp: &str, items: &mut Vec<Value>) {
+    let timestamp =
+        native_timestamp(value.get("timestamp")).unwrap_or_else(|| fallback_timestamp.to_owned());
+    match value.get("type").and_then(Value::as_str) {
+        Some("response_item") => {}
+        Some(kind) if CODEX_BOOKKEEPING.contains(&kind) => return,
+        kind => {
+            push_unrecognized(items, sequence, &timestamp, "codex", "record", kind, value);
+            return;
+        }
+    }
+    let payload = &value["payload"];
+    match payload.get("type").and_then(Value::as_str) {
         Some("message") => {
             // Provider bootstrap instructions are not a visible chat turn.
             if !matches!(payload["role"].as_str(), Some("user" | "assistant")) {
@@ -1228,17 +1865,47 @@ fn normalize_codex(
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("native/{sequence}"));
             push_message(items, sequence, &timestamp, role, &message_id);
-            if let Some(content) = payload["content"].as_array() {
-                for (offset, part) in content.iter().enumerate() {
-                    if let Some(text) = part
-                        .get("text")
-                        .or_else(|| part.get("input_text"))
-                        .or_else(|| part.get("output_text"))
-                        .and_then(Value::as_str)
-                    {
-                        push_content(items, sequence + 1 + offset as u64, &timestamp, role, text);
+            match &payload["content"] {
+                Value::Array(content) => {
+                    for (offset, part) in content.iter().enumerate() {
+                        let part_sequence = sequence + 1 + offset as u64;
+                        if let Some(text) = part
+                            .get("text")
+                            .or_else(|| part.get("input_text"))
+                            .or_else(|| part.get("output_text"))
+                            .or_else(|| part.get("refusal"))
+                            .and_then(Value::as_str)
+                        {
+                            push_content(items, part_sequence, &timestamp, role, text);
+                            continue;
+                        }
+                        match part.get("type").and_then(Value::as_str) {
+                            Some("input_image" | "output_image" | "image") => {
+                                push_content(items, part_sequence, &timestamp, role, "[image]")
+                            }
+                            kind => push_unrecognized(
+                                items,
+                                part_sequence,
+                                &timestamp,
+                                "codex",
+                                "message part",
+                                kind,
+                                part,
+                            ),
+                        }
                     }
                 }
+                Value::String(text) => push_content(items, sequence + 1, &timestamp, role, text),
+                Value::Null => {}
+                other => push_unrecognized(
+                    items,
+                    sequence + 1,
+                    &timestamp,
+                    "codex",
+                    "message content",
+                    Some(json_kind(other)),
+                    other,
+                ),
             }
         }
         Some("function_call" | "custom_tool_call") => push_tool_call(
@@ -1260,24 +1927,67 @@ fn normalize_codex(
             payload["call_id"].as_str().unwrap_or("native-call"),
             payload.get("output").cloned().unwrap_or(Value::Null),
         ),
-        _ => {}
+        Some(kind) if CODEX_HIDDEN_ITEMS.contains(&kind) => {}
+        kind => push_unrecognized(
+            items,
+            sequence,
+            &timestamp,
+            "codex",
+            "response item",
+            kind,
+            payload,
+        ),
     }
 }
 
 fn normalize_claude(
     value: &Value,
     sequence: u64,
-    session: &ExternalSession,
+    fallback_timestamp: &str,
     items: &mut Vec<Value>,
 ) {
-    let Some(kind @ ("user" | "assistant")) = value["type"].as_str() else {
-        return;
+    let timestamp =
+        native_timestamp(value.get("timestamp")).unwrap_or_else(|| fallback_timestamp.to_owned());
+    let role = match value.get("type").and_then(Value::as_str) {
+        Some("user") => "user",
+        Some("assistant") => "assistant",
+        Some("attachment") => {
+            // A prompt that arrives while Claude is busy, including a Small Talk delivery, is
+            // recorded as a queued command rather than as a user entry. The other attachments
+            // are context Claude injects for itself.
+            if value.pointer("/attachment/type").and_then(Value::as_str) == Some("queued_command") {
+                let message_id = value
+                    .get("uuid")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("native/{sequence}"));
+                push_message(items, sequence, &timestamp, "user", &message_id);
+                push_claude_content(
+                    items,
+                    value.pointer("/attachment/prompt").unwrap_or(&Value::Null),
+                    sequence + 1,
+                    &timestamp,
+                    "user",
+                );
+            }
+            return;
+        }
+        Some("system") => {
+            // Claude's own notices (compaction, local command output, API errors) carry text;
+            // its timing and hook summaries do not.
+            if let Some(text) = value.get("content").and_then(Value::as_str)
+                && !text.trim().is_empty()
+            {
+                push_content(items, sequence, &timestamp, "system", text);
+            }
+            return;
+        }
+        Some(kind) if CLAUDE_BOOKKEEPING.contains(&kind) => return,
+        kind => {
+            push_unrecognized(items, sequence, &timestamp, "claude", "entry", kind, value);
+            return;
+        }
     };
-    let role = if kind == "user" { "user" } else { "assistant" };
-    let timestamp = value["timestamp"]
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| timestamp(session.updated_at_unix_ms));
     let message_id = value
         .pointer("/message/id")
         .and_then(Value::as_str)
@@ -1285,65 +1995,202 @@ fn normalize_claude(
         .map(str::to_owned)
         .unwrap_or_else(|| format!("native/{sequence}"));
     push_message(items, sequence, &timestamp, role, &message_id);
-    match &value["message"]["content"] {
-        Value::String(text) => push_content(items, sequence + 1, &timestamp, role, text),
+    push_claude_content(
+        items,
+        value.pointer("/message/content").unwrap_or(&Value::Null),
+        sequence + 1,
+        &timestamp,
+        role,
+    );
+}
+
+fn push_claude_content(
+    items: &mut Vec<Value>,
+    content: &Value,
+    first_sequence: u64,
+    timestamp: &str,
+    role: &str,
+) {
+    match content {
+        Value::String(text) => push_content(items, first_sequence, timestamp, role, text),
         Value::Array(parts) => {
             for (offset, part) in parts.iter().enumerate() {
-                let item_sequence = sequence + 1 + offset as u64;
-                match part["type"].as_str() {
-                    Some("text") => {
-                        if let Some(text) = part["text"].as_str() {
-                            push_content(items, item_sequence, &timestamp, role, text);
-                        }
+                let item_sequence = first_sequence + offset as u64;
+                match part.get("type").and_then(Value::as_str) {
+                    Some("text") | None if part.get("text").is_some_and(Value::is_string) => {
+                        push_content(
+                            items,
+                            item_sequence,
+                            timestamp,
+                            role,
+                            part["text"].as_str().unwrap_or_default(),
+                        );
                     }
                     Some("tool_use") => push_tool_call(
                         items,
                         item_sequence,
-                        &timestamp,
+                        timestamp,
                         part["id"].as_str().unwrap_or("native-call"),
                         part["name"].as_str().unwrap_or("tool"),
                         part.get("input").cloned().unwrap_or_else(|| json!({})),
                     ),
-                    Some("tool_result") => push_tool_result(
+                    Some("tool_result") => push_tool_result_with_status(
                         items,
                         item_sequence,
-                        &timestamp,
+                        timestamp,
                         part["tool_use_id"].as_str().unwrap_or("native-call"),
                         part.get("content").cloned().unwrap_or(Value::Null),
+                        part.get("is_error") == Some(&Value::Bool(true)),
                     ),
-                    _ => {}
+                    Some(kind) if HIDDEN_REASONING_BLOCKS.contains(&kind) => {}
+                    Some(kind @ ("image" | "document")) => {
+                        push_content(items, item_sequence, timestamp, role, &format!("[{kind}]"))
+                    }
+                    kind => push_unrecognized(
+                        items,
+                        item_sequence,
+                        timestamp,
+                        "claude",
+                        "content block",
+                        kind,
+                        part,
+                    ),
                 }
             }
         }
-        _ => {}
+        Value::Null => {}
+        other => push_unrecognized(
+            items,
+            first_sequence,
+            timestamp,
+            "claude",
+            "message content",
+            Some(json_kind(other)),
+            other,
+        ),
     }
 }
 
-fn normalize_omp(value: &Value, sequence: u64, session: &ExternalSession, items: &mut Vec<Value>) {
-    if value["type"] != "message" {
-        return;
+fn normalize_omp(
+    driver: ExternalDriver,
+    value: &Value,
+    sequence: u64,
+    fallback_timestamp: &str,
+    items: &mut Vec<Value>,
+) {
+    let label = driver.as_str();
+    let timestamp = native_timestamp(value.get("timestamp"))
+        .or_else(|| native_timestamp(value.pointer("/message/timestamp")))
+        .unwrap_or_else(|| fallback_timestamp.to_owned());
+    match value.get("type").and_then(Value::as_str) {
+        Some("message") => {}
+        Some(kind @ ("compaction" | "branch_summary")) => {
+            // A summary replaces the conversation before it in the model's context; show it as
+            // the harness's own note.
+            if let Some(summary) = value.get("summary").and_then(Value::as_str) {
+                push_content(
+                    items,
+                    sequence,
+                    &timestamp,
+                    "system",
+                    &format!("[{label} {kind}]\n{summary}"),
+                );
+            }
+            return;
+        }
+        Some("custom_message") => {
+            // An extension's message; `display: false` marks it hidden in the harness itself.
+            if value.get("display") != Some(&Value::Bool(false)) {
+                push_omp_content(
+                    driver,
+                    items,
+                    value.get("content").unwrap_or(&Value::Null),
+                    sequence,
+                    &timestamp,
+                    "system",
+                );
+            }
+            return;
+        }
+        Some(kind) if OMP_BOOKKEEPING.contains(&kind) => return,
+        kind => {
+            push_unrecognized(items, sequence, &timestamp, label, "entry", kind, value);
+            return;
+        }
     }
     let message = &value["message"];
-    let role = normalized_role(message["role"].as_str());
-    let timestamp = value["timestamp"]
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| timestamp(session.updated_at_unix_ms));
+    let native_role = message.get("role").and_then(Value::as_str);
+    let role = normalized_role(native_role);
     let message_id = value["id"]
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| format!("native/{sequence}"));
     push_message(items, sequence, &timestamp, role, &message_id);
-    match &message["content"] {
-        Value::String(text) => push_content(items, sequence + 1, &timestamp, role, text),
+    match native_role {
+        // A shell command the person ran with `!`: shown as the harness recorded it, without
+        // attributing it to the agent.
+        Some("bashExecution") => {
+            let command = message
+                .get("command")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let output = message
+                .get("output")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            push_content(
+                items,
+                sequence + 1,
+                &timestamp,
+                "system",
+                &format!("$ {command}\n{output}"),
+            );
+            return;
+        }
+        Some("branchSummary" | "compactionSummary")
+            if message.get("content").is_none_or(Value::is_null) =>
+        {
+            if let Some(summary) = message.get("summary").and_then(Value::as_str) {
+                push_content(items, sequence + 1, &timestamp, "system", summary);
+            }
+            return;
+        }
+        _ => {}
+    }
+    push_omp_content(
+        driver,
+        items,
+        message.get("content").unwrap_or(&Value::Null),
+        sequence + 1,
+        &timestamp,
+        role,
+    );
+}
+
+fn push_omp_content(
+    driver: ExternalDriver,
+    items: &mut Vec<Value>,
+    content: &Value,
+    first_sequence: u64,
+    timestamp: &str,
+    role: &str,
+) {
+    let label = driver.as_str();
+    let timestamp = timestamp.to_owned();
+    match content {
+        Value::String(text) => push_content(items, first_sequence, &timestamp, role, text),
         Value::Array(parts) => {
             for (offset, part) in parts.iter().enumerate() {
-                let item_sequence = sequence + 1 + offset as u64;
-                match part["type"].as_str() {
-                    Some("text") => {
-                        if let Some(text) = part["text"].as_str() {
-                            push_content(items, item_sequence, &timestamp, role, text);
-                        }
+                let item_sequence = first_sequence + offset as u64;
+                match part.get("type").and_then(Value::as_str) {
+                    Some("text") | None if part.get("text").is_some_and(Value::is_string) => {
+                        push_content(
+                            items,
+                            item_sequence,
+                            &timestamp,
+                            role,
+                            part["text"].as_str().unwrap_or_default(),
+                        );
                     }
                     Some("toolCall" | "tool_call") => push_tool_call(
                         items,
@@ -1366,11 +2213,32 @@ fn normalize_omp(value: &Value, sequence: u64, session: &ExternalSession, items:
                             .unwrap_or("native-call"),
                         part.get("content").cloned().unwrap_or(Value::Null),
                     ),
-                    _ => {}
+                    Some(kind) if HIDDEN_REASONING_BLOCKS.contains(&kind) => {}
+                    Some("image") => {
+                        push_content(items, item_sequence, &timestamp, role, "[image]")
+                    }
+                    kind => push_unrecognized(
+                        items,
+                        item_sequence,
+                        &timestamp,
+                        label,
+                        "content block",
+                        kind,
+                        part,
+                    ),
                 }
             }
         }
-        _ => {}
+        Value::Null => {}
+        other => push_unrecognized(
+            items,
+            first_sequence,
+            &timestamp,
+            label,
+            "message content",
+            Some(json_kind(other)),
+            other,
+        ),
     }
 }
 
@@ -1439,18 +2307,39 @@ fn push_tool_result(
     call_id: &str,
     content: Value,
 ) {
+    push_tool_result_with_status(items, sequence, timestamp, call_id, content, false);
+}
+
+fn push_tool_result_with_status(
+    items: &mut Vec<Value>,
+    sequence: u64,
+    timestamp: &str,
+    call_id: &str,
+    content: Value,
+    failed: bool,
+) {
     let content = bounded_value(content);
-    items.push(timeline_item(sequence, timestamp, "tool", "tool_result", json!({"call_id":call_id, "status":"success", "media_type":"application/json", "content":content})));
+    let status = if failed { "error" } else { "success" };
+    items.push(timeline_item(sequence, timestamp, "tool", "tool_result", json!({"call_id":call_id, "status":status, "media_type":"application/json", "content":content})));
+}
+
+fn truncate_at_char_boundary(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 fn bounded_text(value: &str) -> String {
     if value.len() <= MAX_TIMELINE_VALUE_BYTES {
         return value.to_owned();
     }
-    let mut output = value
-        .chars()
-        .take(MAX_TIMELINE_VALUE_BYTES)
-        .collect::<String>();
+    // The bound is in bytes: it keeps a page under the gateway's response ceiling.
+    let mut output = truncate_at_char_boundary(value, MAX_TIMELINE_VALUE_BYTES).to_owned();
     output.push_str("\n[st truncated this native timeline value]");
     output
 }
@@ -1501,6 +2390,83 @@ fn digest(value: &str) -> String {
     hex::encode(Sha256::digest(value.as_bytes()))
 }
 
+/// Test support shared with the client API tests.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod test_support {
+    use super::*;
+
+    /// A stand-in for `st3 driver claude --subject <subject>` with one child, as the process
+    /// fallback sees it: a shell whose arguments carry the driver's options.
+    pub(crate) struct FakeClaudeDriver {
+        pub(crate) driver: std::process::Child,
+        pub(crate) child: u32,
+    }
+
+    impl FakeClaudeDriver {
+        pub(crate) fn start(subject: &str) -> Self {
+            let bash = std::env::var_os("PATH")
+                .into_iter()
+                .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+                .map(|directory| directory.join("bash"))
+                .find(|candidate| candidate.is_file())
+                .expect("the test environment must provide `bash` on PATH");
+            let driver = std::process::Command::new(bash)
+                .args([
+                    "-c",
+                    "sleep 30 & wait",
+                    "st3",
+                    "driver",
+                    "claude",
+                    "--subject",
+                    subject,
+                    "--",
+                    "claude",
+                ])
+                .spawn()
+                .unwrap();
+            let child = (0..200)
+                .find_map(|_| {
+                    let found = linux_child_processes(driver.id()).into_iter().next();
+                    if found.is_none() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    found
+                })
+                .expect("the stand-in driver should start its child");
+            Self { driver, child }
+        }
+
+        /// The evidence token the Claude wrapper inside this driver would mint now.
+        pub(crate) fn token(&self) -> String {
+            let now = system_time_ms(SystemTime::now());
+            format!("{}-{now}-0", self.driver.id())
+        }
+
+        /// Write the `~/.claude/sessions/<pid>.json` record Claude keeps for its process,
+        /// with the child's real kernel start time unless `start` overrides it.
+        pub(crate) fn record_session(&self, home: &Path, session: &str, start: Option<&str>) {
+            let sessions = home.join(".claude/sessions");
+            fs::create_dir_all(&sessions).unwrap();
+            let start = start
+                .map(str::to_owned)
+                .unwrap_or_else(|| linux_process_start_ticks(self.child).unwrap());
+            fs::write(
+                sessions.join(format!("{}.json", self.child)),
+                json!({"pid":self.child,"sessionId":session,"procStart":start}).to_string(),
+            )
+            .unwrap();
+        }
+    }
+
+    impl Drop for FakeClaudeDriver {
+        fn drop(&mut self) {
+            unsafe { libc::kill(self.child as i32, libc::SIGKILL) };
+            let _ = self.driver.kill();
+            let _ = self.driver.wait();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1545,24 +2511,36 @@ mod tests {
     }
 
     #[test]
-    fn one_unreadable_session_file_is_skipped_rather_than_failing_discovery() {
+    fn one_unreadable_session_line_does_not_fail_discovery_or_hide_the_session() {
         let home = tempfile::tempdir().unwrap();
         let project = home.path().join(".claude/projects/example");
         fs::create_dir_all(&project).unwrap();
-        fs::write(project.join("broken-id.jsonl"), b"\xff\xfe not UTF-8\n").unwrap();
+        // A line that is not UTF-8 costs only that line: Claude's file name still names the
+        // session, and the later, readable header still supplies its workspace.
+        fs::write(
+            project.join("broken-id.jsonl"),
+            [
+                &b"\xff\xfe not UTF-8\n"[..],
+                br#"{"sessionId":"broken-id","cwd":"/work","type":"user","message":{"content":"hi"}}"#,
+            ]
+            .concat(),
+        )
+        .unwrap();
         fs::write(
             project.join("good-id.jsonl"),
             r#"{"sessionId":"good-id","cwd":"/tmp","timestamp":"2026-09-24T00:00:00Z","type":"user","message":{"content":"hello"}}"#,
         )
         .unwrap();
-        let found = discover_files(home.path()).unwrap();
+        let mut found = discover_files(home.path()).unwrap();
+        found.sort_by(|left, right| left.native_id.cmp(&right.native_id));
         assert_eq!(
             found
                 .iter()
                 .map(|session| session.native_id.as_str())
                 .collect::<Vec<_>>(),
-            ["good-id"]
+            ["broken-id", "good-id"]
         );
+        assert_eq!(found[0].cwd.as_deref(), Some(Path::new("/work")));
     }
 
     #[test]
@@ -1600,35 +2578,25 @@ mod tests {
 
     #[test]
     fn codex_claude_pi_and_omp_transcripts_normalize_to_one_timeline_shape() {
-        let session = |driver| ExternalSession {
-            id: "session/external-test".into(),
-            revision: "revision".into(),
-            driver,
-            native_id: "native".into(),
-            transcript: PathBuf::new(),
-            cwd: None,
-            title: None,
-            started_at_unix_ms: 0,
-            updated_at_unix_ms: 0,
-            process: None,
-        };
+        let fallback = timestamp(0);
         let mut items = Vec::new();
         normalize_codex(
             &json!({"type":"response_item","timestamp":"2026-01-01T00:00:00Z","payload":{"type":"message","role":"assistant","id":"m1","content":[{"type":"output_text","text":"codex"}]}}),
             0,
-            &session(ExternalDriver::Codex),
+            &fallback,
             &mut items,
         );
         normalize_claude(
             &json!({"type":"assistant","timestamp":"2026-01-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"shell","input":{"command":"true"}}]}}),
             16,
-            &session(ExternalDriver::Claude),
+            &fallback,
             &mut items,
         );
         normalize_omp(
+            ExternalDriver::Omp,
             &json!({"type":"message","id":"m2","timestamp":"2026-01-01T00:00:02Z","message":{"role":"tool","content":[{"type":"toolResult","toolCallId":"c1","content":"ok"}]}}),
             32,
-            &session(ExternalDriver::Omp),
+            &fallback,
             &mut items,
         );
         assert!(
@@ -1650,18 +2618,7 @@ mod tests {
 
     #[test]
     fn current_codex_custom_tools_are_visible_but_bootstrap_prompts_are_not() {
-        let session = ExternalSession {
-            id: "session/external-current-codex".into(),
-            revision: "revision".into(),
-            driver: ExternalDriver::Codex,
-            native_id: "native".into(),
-            transcript: PathBuf::new(),
-            cwd: None,
-            title: None,
-            started_at_unix_ms: 0,
-            updated_at_unix_ms: 0,
-            process: None,
-        };
+        let fallback = timestamp(0);
         let mut items = Vec::new();
         for (sequence, payload) in [
             (
@@ -1680,7 +2637,7 @@ mod tests {
             normalize_codex(
                 &json!({"type":"response_item","timestamp":"2026-09-24T12:00:00Z","payload":payload}),
                 sequence,
-                &session,
+                &fallback,
                 &mut items,
             );
         }
@@ -2031,6 +2988,506 @@ mod tests {
             format!("part {}", part_count - 1)
         );
         assert!(serde_json::to_vec(&timeline).unwrap().len() <= MAX_TIMELINE_BYTES as usize);
+    }
+
+    fn transcript_session(driver: ExternalDriver, path: &Path) -> ExternalSession {
+        ExternalSession {
+            id: "session/external-test".into(),
+            revision: "revision".into(),
+            driver,
+            native_id: "native".into(),
+            transcript: path.to_owned(),
+            cwd: None,
+            title: None,
+            started_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+            process: None,
+        }
+    }
+
+    fn texts(timeline: &[Value]) -> Vec<&str> {
+        timeline
+            .iter()
+            .filter(|item| item["type"] == "content")
+            .filter_map(|item| item["body"]["text"].as_str())
+            .collect()
+    }
+
+    fn assert_unique_ids(timeline: &[Value]) {
+        let ids = timeline
+            .iter()
+            .map(|item| item["id"].as_str().unwrap())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), timeline.len(), "{timeline:#?}");
+    }
+
+    fn claude_line(kind: &str, stamp: &str, text: &str) -> String {
+        json!({"type":kind,"timestamp":stamp,"message":{"role":kind,"content":[{"type":"text","text":text}]}})
+            .to_string()
+    }
+
+    #[test]
+    fn a_malformed_line_mid_transcript_costs_only_itself() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let mut bytes = Vec::new();
+        bytes.extend(claude_line("user", "2026-09-30T10:00:00Z", "before").as_bytes());
+        bytes.extend(b"\n{\"type\":\"assistant\",\"message\":{\n");
+        bytes.extend(b"\xff\xfe not UTF-8\n");
+        bytes.extend(claude_line("assistant", "2026-09-30T10:00:01Z", "after").as_bytes());
+        bytes.push(b'\n');
+        fs::write(&path, bytes).unwrap();
+
+        let timeline =
+            normalized_timeline(&transcript_session(ExternalDriver::Claude, &path)).unwrap();
+
+        assert_eq!(texts(&timeline), ["before", "after"]);
+        let unreadable = timeline
+            .iter()
+            .filter(|item| item["body"]["code"] == "native-line-unreadable")
+            .collect::<Vec<_>>();
+        assert_eq!(unreadable.len(), 2, "{timeline:#?}");
+        assert!(
+            unreadable
+                .iter()
+                .all(|item| item["role"] == "system" && item["type"] == "error")
+        );
+        assert_unique_ids(&timeline);
+    }
+
+    #[test]
+    fn a_record_still_being_written_is_skipped_silently_until_complete() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let complete = claude_line("assistant", "2026-09-30T10:00:01Z", "partial answer");
+        let first = claude_line("user", "2026-09-30T10:00:00Z", "question");
+        fs::write(
+            &path,
+            format!("{first}\n{}", &complete[..complete.len() / 2]),
+        )
+        .unwrap();
+        let session = transcript_session(ExternalDriver::Claude, &path);
+
+        let writing = normalized_timeline(&session).unwrap();
+        assert_eq!(texts(&writing), ["question"]);
+        assert!(writing.iter().all(|item| item["type"] != "error"));
+
+        fs::write(&path, format!("{first}\n{complete}\n")).unwrap();
+        let written = normalized_timeline(&session).unwrap();
+        assert_eq!(texts(&written), ["question", "partial answer"]);
+        // Entries already seen keep their identity when the record completes.
+        assert_eq!(writing[..], written[..writing.len()]);
+    }
+
+    #[test]
+    fn a_torn_record_keeps_the_whole_record_written_after_it() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let torn = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"cut off"}],"stop_sequence":n"#;
+        let glued = claude_line("user", "2026-09-30T10:00:02Z", "survivor");
+        fs::write(
+            &path,
+            format!(
+                "{}\n{torn}{glued}\n",
+                claude_line("user", "2026-09-30T10:00:00Z", "first")
+            ),
+        )
+        .unwrap();
+
+        let timeline =
+            normalized_timeline(&transcript_session(ExternalDriver::Claude, &path)).unwrap();
+
+        assert_eq!(texts(&timeline), ["first", "survivor"]);
+        let notice = timeline
+            .iter()
+            .find(|item| item["body"]["code"] == "native-line-unreadable")
+            .unwrap();
+        assert!(notice["body"]["message"].as_str().unwrap().contains("torn"));
+        assert_unique_ids(&timeline);
+    }
+
+    #[test]
+    fn unknown_claude_records_and_blocks_are_labelled_not_dropped_or_attributed() {
+        let fallback = timestamp(0);
+        let mut items = Vec::new();
+        for (sequence, value) in [
+            (
+                16,
+                json!({"type":"brand-new-kind","timestamp":"2026-09-30T10:00:00Z","detail":"x"}),
+            ),
+            (32, json!({"type":"file-history-snapshot","snapshot":{}})),
+            (
+                48,
+                json!({"timestamp":"2026-09-30T10:00:00Z","note":"no type at all"}),
+            ),
+            (
+                64,
+                json!({"type":"assistant","timestamp":"2026-09-30T10:00:01Z","message":{"content":[
+                    {"type":"thinking","thinking":"private"},
+                    {"type":"hologram","payload":"new"},
+                    {"type":"image","source":{"data":"AAAA"}},
+                    {"type":"text","text":"visible"}
+                ]}}),
+            ),
+            (
+                80,
+                json!({"type":"user","timestamp":"2026-09-30T10:00:02Z","message":{"content":[
+                    {"type":"tool_result","tool_use_id":"call-1","is_error":true,"content":"boom"}
+                ]}}),
+            ),
+        ] {
+            normalize_claude(&value, sequence, &fallback, &mut items);
+        }
+        let labels = texts(&items);
+        assert!(labels[0].starts_with("[unrecognized claude entry `brand-new-kind`]"));
+        assert!(labels[1].starts_with("[unrecognized claude entry without a type]"));
+        assert!(labels[2].starts_with("[unrecognized claude content block `hologram`]"));
+        assert_eq!(labels[3], "[image]");
+        assert_eq!(labels[4], "visible");
+        assert_eq!(labels.len(), 5);
+        assert!(!labels.iter().any(|text| text.contains("private")));
+        for item in &items {
+            if item["body"]["text"]
+                .as_str()
+                .is_some_and(|text| text.starts_with("[unrecognized"))
+            {
+                assert_eq!(item["role"], "system");
+            }
+        }
+        let result = items
+            .iter()
+            .find(|item| item["type"] == "tool_result")
+            .unwrap();
+        assert_eq!(result["body"]["status"], "error");
+        assert_unique_ids(&items);
+    }
+
+    #[test]
+    fn an_unrecognized_record_excerpt_is_bounded() {
+        let mut items = Vec::new();
+        normalize_claude(
+            &json!({"type":"brand-new-kind","blob":"é".repeat(MAX_TIMELINE_VALUE_BYTES)}),
+            16,
+            &timestamp(0),
+            &mut items,
+        );
+        let text = items[0]["body"]["text"].as_str().unwrap();
+        assert!(text.len() < MAX_UNRECOGNIZED_BYTES + 128, "{}", text.len());
+        assert!(text.ends_with('…'));
+    }
+
+    #[test]
+    fn claude_queued_prompts_and_system_notes_are_conversation() {
+        let fallback = timestamp(0);
+        let mut items = Vec::new();
+        normalize_claude(
+            &json!({"type":"attachment","uuid":"q1","timestamp":"2026-09-30T10:00:00Z","attachment":{"type":"queued_command","prompt":"a message delivered while busy"}}),
+            16,
+            &fallback,
+            &mut items,
+        );
+        normalize_claude(
+            &json!({"type":"attachment","timestamp":"2026-09-30T10:00:00Z","attachment":{"type":"total_tokens_reminder"}}),
+            32,
+            &fallback,
+            &mut items,
+        );
+        normalize_claude(
+            &json!({"type":"system","subtype":"compact_boundary","content":"Conversation compacted","timestamp":"2026-09-30T10:00:01Z"}),
+            48,
+            &fallback,
+            &mut items,
+        );
+        normalize_claude(
+            &json!({"type":"system","subtype":"turn_duration","durationMs":5,"timestamp":"2026-09-30T10:00:01Z"}),
+            64,
+            &fallback,
+            &mut items,
+        );
+        assert_eq!(
+            texts(&items),
+            ["a message delivered while busy", "Conversation compacted"]
+        );
+        assert_eq!(items[1]["role"], "user");
+        assert_eq!(items[2]["role"], "system");
+    }
+
+    #[test]
+    fn an_entry_without_a_usable_timestamp_takes_its_predecessors() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n{}\n{}\n",
+                claude_line("user", "2026-09-30T10:00:00Z", "stamped"),
+                json!({"type":"assistant","message":{"content":"missing"}}),
+                json!({"type":"assistant","timestamp":"yesterday","message":{"content":"garbled"}}),
+                json!({"type":"assistant","timestamp":1_790_762_401_000_u64,"message":{"content":"numeric"}}),
+            ),
+        )
+        .unwrap();
+        let mut session = transcript_session(ExternalDriver::Claude, &path);
+        session.updated_at_unix_ms = 1_893_456_000_000;
+
+        let timeline = normalized_timeline(&session).unwrap();
+        let stamp = |text: &str| {
+            timeline
+                .iter()
+                .find(|item| item["body"]["text"] == text)
+                .unwrap()["timestamp"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert_eq!(stamp("missing"), "2026-09-30T10:00:00Z");
+        assert_eq!(stamp("garbled"), "2026-09-30T10:00:00Z");
+        assert_eq!(stamp("numeric"), "2026-09-30T10:00:01.000Z");
+    }
+
+    #[test]
+    fn a_record_with_many_parts_does_not_collide_with_the_next_line() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("session.jsonl");
+        let parts = (0..40)
+            .map(|index| json!({"type":"text","text":format!("part {index}")}))
+            .collect::<Vec<_>>();
+        fs::write(
+            &path,
+            format!(
+                "{}\n{}\n",
+                json!({"type":"assistant","timestamp":"2026-09-30T10:00:00Z","message":{"content":parts}}),
+                claude_line("user", "2026-09-30T10:00:01Z", "next line"),
+            ),
+        )
+        .unwrap();
+        let timeline =
+            normalized_timeline(&transcript_session(ExternalDriver::Claude, &path)).unwrap();
+        assert_eq!(texts(&timeline).len(), 41);
+        assert_eq!(*texts(&timeline).last().unwrap(), "next line");
+        assert_unique_ids(&timeline);
+    }
+
+    #[test]
+    fn unknown_codex_records_and_items_are_labelled_and_known_ones_stay_hidden() {
+        let fallback = timestamp(0);
+        let mut items = Vec::new();
+        for (sequence, value) in [
+            (
+                16,
+                json!({"type":"event_msg","payload":{"type":"agent_message","message":"dup"}}),
+            ),
+            (
+                32,
+                json!({"type":"response_item","payload":{"type":"reasoning","summary":[]}}),
+            ),
+            (48, json!({"type":"new_record_kind","payload":{}})),
+            (
+                64,
+                json!({"type":"response_item","payload":{"type":"web_search_call","action":{"query":"q"}}}),
+            ),
+            (
+                80,
+                json!({"type":"response_item","payload":{"type":"message","role":"user","content":[
+                    {"type":"input_image","image_url":"data:"},
+                    {"type":"input_hologram"},
+                    {"type":"input_text","text":"typed"}
+                ]}}),
+            ),
+        ] {
+            normalize_codex(&value, sequence, &fallback, &mut items);
+        }
+        let labels = texts(&items);
+        assert!(labels[0].starts_with("[unrecognized codex record `new_record_kind`]"));
+        assert!(labels[1].starts_with("[unrecognized codex response item `web_search_call`]"));
+        assert_eq!(labels[2], "[image]");
+        assert!(labels[3].starts_with("[unrecognized codex message part `input_hologram`]"));
+        assert_eq!(labels[4], "typed");
+        assert_eq!(labels.len(), 5);
+        assert_unique_ids(&items);
+    }
+
+    #[test]
+    fn omp_summaries_shell_commands_and_unknown_records_are_visible() {
+        let fallback = timestamp(0);
+        let mut items = Vec::new();
+        for (sequence, value) in [
+            (
+                16,
+                json!({"type":"model_change","id":"a","timestamp":"2026-09-30T10:00:00Z"}),
+            ),
+            (
+                32,
+                json!({"type":"compaction","id":"b","timestamp":"2026-09-30T10:00:00Z","summary":"earlier work"}),
+            ),
+            (
+                48,
+                json!({"type":"message","id":"c","timestamp":"2026-09-30T10:00:01Z","message":{"role":"bashExecution","command":"ls","output":"file"}}),
+            ),
+            (64, json!({"type":"future_kind","id":"d"})),
+            (
+                80,
+                json!({"type":"message","id":"e","timestamp":"2026-09-30T10:00:02Z","message":{"role":"assistant","content":[
+                    {"type":"thinking","thinking":"private"},
+                    {"type":"sparkle"},
+                    {"type":"text","text":"answer"}
+                ]}}),
+            ),
+        ] {
+            normalize_omp(ExternalDriver::Omp, &value, sequence, &fallback, &mut items);
+        }
+        let labels = texts(&items);
+        assert_eq!(labels[0], "[omp compaction]\nearlier work");
+        assert_eq!(labels[1], "$ ls\nfile");
+        assert!(labels[2].starts_with("[unrecognized omp entry `future_kind`]"));
+        assert!(labels[3].starts_with("[unrecognized omp content block `sparkle`]"));
+        assert_eq!(labels[4], "answer");
+        assert_eq!(labels.len(), 5);
+        let shell = items
+            .iter()
+            .find(|item| item["body"]["text"] == "$ ls\nfile")
+            .unwrap();
+        assert_eq!(shell["role"], "system");
+    }
+
+    #[test]
+    fn opencode_rows_that_cannot_be_decoded_cost_only_themselves() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("opencode.db");
+        let connection = Connection::open(&database).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE message (\
+                    id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, \
+                    time_updated INTEGER, data TEXT\
+                 );\
+                 CREATE TABLE part (\
+                    id TEXT PRIMARY KEY, message_id TEXT, session_id TEXT, \
+                    time_created INTEGER, time_updated INTEGER, data TEXT\
+                 );\
+                 INSERT INTO message VALUES ('msg_1', 'ses', NULL, 1, NULL);\
+                 INSERT INTO message VALUES ('msg_2', 'ses', 2, 2, '{\"role\":\"user\"}');\
+                 INSERT INTO part VALUES ('p1', 'msg_2', 'ses', 1, 1, NULL);\
+                 INSERT INTO part VALUES ('p2', 'msg_2', 'ses', 2, 2, '{\"type\":\"hologram\"}');\
+                 INSERT INTO part VALUES ('p3', 'msg_2', 'ses', 3, 3, '{\"type\":\"text\",\"text\":\"kept\"}');\
+                 INSERT INTO part VALUES ('p4', 'msg_2', 'ses', 4, 4, '{\"type\":\"file\",\"filename\":\"notes.md\"}');",
+            )
+            .unwrap();
+        drop(connection);
+        let mut session = transcript_session(ExternalDriver::OpenCode, &database);
+        session.native_id = "ses".into();
+
+        let timeline = normalized_timeline(&session).unwrap();
+
+        let labels = texts(&timeline);
+        assert!(labels[0].starts_with("[unrecognized opencode part `hologram`]"));
+        assert_eq!(labels[1..], ["kept", "[file: notes.md]"]);
+        assert_eq!(
+            timeline
+                .iter()
+                .filter(|item| item["type"] == "message")
+                .count(),
+            2
+        );
+        assert!(
+            timeline
+                .iter()
+                .any(|item| item["body"]["code"] == "native-rows-unreadable")
+        );
+        assert_unique_ids(&timeline);
+    }
+
+    #[test]
+    fn bound_transcripts_tolerate_naming_and_header_drift() {
+        let home = tempfile::tempdir().unwrap();
+        // Codex prefixes the thread with its rollout time, and a rollout whose header is
+        // missing is still named by its file.
+        let thread = "0199a1b2-c3d4-7e5f-8a9b-0c1d2e3f4a5b";
+        let rollouts = home.path().join(".codex/sessions/2026/09/30");
+        fs::create_dir_all(&rollouts).unwrap();
+        fs::write(
+            rollouts.join(format!("rollout-2026-09-30T10-00-00-{thread}.jsonl")),
+            "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\"}}\n",
+        )
+        .unwrap();
+        let codex = find_bound_transcript(home.path(), ExternalDriver::Codex, thread)
+            .unwrap()
+            .unwrap();
+        assert_eq!(codex.native_id, thread);
+        // Claude's file name is the session, even when copied history names an earlier one.
+        let session = "11111111-2222-4333-8444-555555555555";
+        let project = home.path().join(".claude/projects/-work");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(
+            project.join(format!("{session}.jsonl")),
+            "{\"sessionId\":\"99999999-2222-4333-8444-555555555555\",\"type\":\"user\"}\n",
+        )
+        .unwrap();
+        let claude = find_bound_transcript(home.path(), ExternalDriver::Claude, session)
+            .unwrap()
+            .unwrap();
+        assert_eq!(claude.native_id, session);
+        // A file name that is not a harness session name never becomes a session ID.
+        assert_eq!(
+            native_id_from_file_name(ExternalDriver::Codex, Path::new("notes.jsonl")),
+            None
+        );
+    }
+
+    #[test]
+    fn a_wrapperless_claude_token_names_its_session_and_a_malformed_token_is_refused() {
+        let home = tempfile::tempdir().unwrap();
+        let session = "11111111-2222-4333-8444-555555555555";
+        assert_eq!(
+            claude_session_of_managed_driver(
+                home.path(),
+                "agent/test",
+                &format!("{}{session}", st2::harness_state::WRAPPERLESS_PREFIX)
+            )
+            .unwrap(),
+            session
+        );
+        let refused =
+            claude_session_of_managed_driver(home.path(), "agent/test", "provider-current")
+                .unwrap_err();
+        assert!(
+            refused.contains("does not name a driver process"),
+            "{refused}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_managed_claude_session_is_proved_only_through_its_own_driver_process() {
+        use super::test_support::FakeClaudeDriver;
+        let home = tempfile::tempdir().unwrap();
+        let session = "11111111-2222-4333-8444-555555555555";
+        let fake = FakeClaudeDriver::start("agent/seat");
+        let token = fake.token();
+
+        // No session record yet: nothing is guessed.
+        let missing =
+            claude_session_of_managed_driver(home.path(), "agent/seat", &token).unwrap_err();
+        assert!(missing.contains("has recorded its session"), "{missing}");
+
+        // A record whose start time belongs to an earlier process with the same pid is refused.
+        fake.record_session(home.path(), session, Some("1"));
+        assert!(claude_session_of_managed_driver(home.path(), "agent/seat", &token).is_err());
+
+        fake.record_session(home.path(), session, None);
+        assert_eq!(
+            claude_session_of_managed_driver(home.path(), "agent/seat", &token).unwrap(),
+            session
+        );
+        // Another seat's evidence cannot claim this driver's Claude.
+        let other =
+            claude_session_of_managed_driver(home.path(), "agent/other", &token).unwrap_err();
+        assert!(other.contains("not this seat's Claude driver"), "{other}");
+        // Evidence minted before the process existed names a different, earlier process.
+        let early = format!("{}-1000-0", fake.driver.id());
+        let reused =
+            claude_session_of_managed_driver(home.path(), "agent/seat", &early).unwrap_err();
+        assert!(reused.contains("different process"), "{reused}");
     }
 
     #[cfg(target_os = "linux")]

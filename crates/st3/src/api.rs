@@ -4131,7 +4131,11 @@ fn native_delivery_peer(pid: u32) -> Option<NativeDeliveryPeer> {
     native_delivery_identity(pid, &args, &env)
 }
 
-fn native_delivery_identity(pid: u32, args: &[String], env: &[String]) -> Option<NativeDeliveryPeer> {
+fn native_delivery_identity(
+    pid: u32,
+    args: &[String],
+    env: &[String],
+) -> Option<NativeDeliveryPeer> {
     let (transport, archives_inbox) = args.windows(2).find_map(|pair| {
         if pair[0] != "driver" {
             return None;
@@ -4621,6 +4625,94 @@ fn daemon_pty(state: &AppState) -> anyhow::Result<st_runtime::PtyRuntime> {
 
 /// The references already in the graph that no longer resolve. Publication refuses new ones, so
 /// each of these was published before that check, or its target was removed later.
+/// Every Claude seat this host runs needs its hooks to run st3, and each running Claude session
+/// needs the native-session binding its SessionStart hook writes; without it st cannot find the
+/// seat's transcript.
+fn claude_hooks_check(
+    state: &AppState,
+    desired: &[crate::model::DesiredSubject],
+) -> Result<DoctorCheck, ApiError> {
+    let seats = desired
+        .iter()
+        .filter(|subject| {
+            subject.member.as_ref().is_some_and(|member| {
+                member.host == state.store.origin() && member.driver.as_deref() == Some("claude")
+            })
+        })
+        .map(|subject| subject.subject.as_str())
+        .collect::<Vec<_>>();
+    if seats.is_empty() {
+        return Ok(DoctorCheck {
+            name: "claude-hooks".into(),
+            status: "pass".into(),
+            message: "no Claude seat runs on this host".into(),
+        });
+    }
+    let mut faults = Vec::new();
+    match crate::reconcile::launch_executable() {
+        Ok(binary) if is_executable_file(&binary) => {}
+        Ok(binary) => faults.push(format!(
+            "the hooks run ST3_BIN={}, which is not an executable file",
+            binary.display()
+        )),
+        Err(error) => faults.push(format!("the hooks' st3 binary does not resolve: {error:#}")),
+    }
+    let set = crate::hooks::set_dir(&crate::hooks::root(&state.state_dir));
+    if let Err(error) = crate::hooks::verify(&set) {
+        faults.push(format!(
+            "the hook set {} is not usable: {error:#}",
+            set.display()
+        ));
+    }
+    let drivers = state.state_dir.join("drivers");
+    let host = st2::run::detect_host();
+    let mut bound = 0;
+    for subject in &seats {
+        let Some(observed) = state
+            .store
+            .latest_claim(subject, Some("harness.observed"))
+            .map_err(ApiError::internal)?
+        else {
+            continue;
+        };
+        let fields = observed.body.get("fields").unwrap_or(&observed.body);
+        if fields["driver"] != "claude" || matches!(fields["state"].as_str(), Some("ended")) {
+            continue;
+        }
+        let Some(session) = fields["evidence_incarnation"].as_str() else {
+            continue;
+        };
+        let agent_dir = crate::hooks::claude_agent_dir(&drivers, subject, &host);
+        if crate::hooks::claude_binding(&agent_dir, session).is_some() {
+            bound += 1;
+        } else {
+            faults.push(format!(
+                "{subject}: Claude session {session} has no native-session binding in {}; its SessionStart hook did not run st3",
+                agent_dir.display()
+            ));
+        }
+    }
+    Ok(DoctorCheck {
+        name: "claude-hooks".into(),
+        status: if faults.is_empty() { "pass" } else { "fail" }.into(),
+        message: if faults.is_empty() {
+            format!(
+                "{} Claude seats; the hooks run st3 from {}; {bound} running sessions are bound to their transcripts",
+                seats.len(),
+                set.display()
+            )
+        } else {
+            faults.join("; ")
+        },
+    })
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
 fn graph_references_check(unresolved: &[String]) -> DoctorCheck {
     const LISTED: usize = 20;
     let mut listed = unresolved.iter().take(LISTED).cloned().collect::<Vec<_>>();
@@ -4862,6 +4954,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             format!("duplicate runtime owners: {}", duplicates.join("; "))
         },
     });
+    checks.push(claude_hooks_check(state, &desired)?);
     checks.push(graph_references_check(
         &state
             .store
@@ -11689,7 +11782,8 @@ mod tests {
                 let env = vec![format!("ST_AGENT={recipient}")];
                 let peer = native_delivery_identity(37, &args, &env).unwrap();
                 let other = format!("{recipient}-other");
-                let other_query = format!("/v1/{endpoint}?to={other}&include_closed=true&limit=100");
+                let other_query =
+                    format!("/v1/{endpoint}?to={other}&include_closed=true&limit=100");
                 let (status, _) =
                     get_request(app.clone().layer(Extension(peer.clone())), &other_query).await;
                 assert_eq!(status, StatusCode::OK);

@@ -879,6 +879,7 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
     };
     let mut stamped: Vec<(String, Entry)> = Vec::new();
     let mut tools: BTreeMap<String, usize> = BTreeMap::new();
+    let mut delivery: BTreeMap<String, bool> = BTreeMap::new();
     // A Small Talk message is two entries: who wrote to whom, then what they wrote. A
     // harness transcript heads its own turns with message entries too; only a graph message,
     // `message/…`, is Small Talk.
@@ -1006,7 +1007,25 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                     output,
                 }
             }
-            (_, TimelineBody::Error(error)) => Body::Event(format!("error: {}", error.message)),
+            (_, TimelineBody::Error(error)) => match error.code.as_str() {
+                "native-delivery-degraded" => {
+                    delivery.insert(entry.id.clone(), false);
+                    Body::Event(if error.message.contains("unreachable") {
+                        "delivery paused · st unreachable".into()
+                    } else {
+                        "delivery failing · retrying".into()
+                    })
+                }
+                "native-delivery-recovered" => {
+                    delivery.insert(entry.id.clone(), true);
+                    Body::Event("delivery resumed".into())
+                }
+                // A warning is st noting something it is handling, not a failure.
+                _ if error.details.get("severity").and_then(Value::as_str) == Some("warning") => {
+                    Body::Event(error.message.clone())
+                }
+                _ => Body::Event(format!("error: {}", error.message)),
+            },
             _ => continue,
         };
         stamped.push((
@@ -1019,7 +1038,47 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
         ));
     }
     stamped.sort_by(|a, b| a.0.cmp(&b.0));
-    stamped.into_iter().map(|(_, entry)| entry).collect()
+    fold_events(stamped.into_iter().map(|(_, entry)| entry), &delivery)
+}
+
+/// A delivery pause that recovered is one quiet line, and a run of the same event line is one
+/// line with a count: a seat that outlived a dozen st restarts shows one line, not a dozen pairs.
+/// `delivery` says which entries paused delivery (`false`) and which resumed it (`true`).
+fn fold_events(
+    entries: impl Iterator<Item = Entry>,
+    delivery: &BTreeMap<String, bool>,
+) -> Vec<Entry> {
+    let mut folded: Vec<(Entry, usize)> = Vec::new();
+    for mut entry in entries {
+        let closes_pause = delivery.get(&entry.id) == Some(&true)
+            && folded
+                .last()
+                .is_some_and(|(last, count)| *count == 1 && delivery.get(&last.id) == Some(&false));
+        if closes_pause {
+            folded.pop();
+            entry.body = Body::Event("delivery paused, then resumed".into());
+        }
+        if let Body::Event(text) = &entry.body
+            && let Some((last, count)) = folded.last_mut()
+            && matches!(&last.body, Body::Event(previous) if previous == text)
+        {
+            *count += 1;
+            last.at = entry.at;
+            continue;
+        }
+        folded.push((entry, 1));
+    }
+    folded
+        .into_iter()
+        .map(|(mut entry, count)| {
+            if count > 1
+                && let Body::Event(text) = &mut entry.body
+            {
+                text.push_str(&format!(" ×{count}"));
+            }
+            entry
+        })
+        .collect()
 }
 
 /// Blocks harnesses add to a transcript for the model's benefit. None of it is conversation.
@@ -1305,6 +1364,67 @@ mod tests {
         );
         // A harness turn's own message header is not Small Talk.
         assert!(matches!(&entries[2].body, Body::Assistant(text) if text == "On it."));
+    }
+
+    #[test]
+    fn delivery_pauses_that_recovered_fold_into_one_quiet_line() {
+        let diagnostic = |id: &str, at: &str, code: &str, severity: &str, message: &str| {
+            json!({"id":id,"sequence":1,"revision":1,"timestamp":at,"role":"system","type":"error","final":true,
+                "body":{"code":code,"message":message,"retryable":true,"details":{"severity":severity}}})
+        };
+        let paused = "Native conversation delivery over claude-channel paused while the st daemon was unreachable; the driver stayed online and retried every second.";
+        let resumed = "Native conversation delivery over claude-channel recovered and resumed replay from durable graph state.";
+        let mut rows = Vec::new();
+        for minute in 0..3 {
+            rows.push(diagnostic(
+                &format!("p{minute}"),
+                &format!("2026-09-30T10:0{minute}:00Z"),
+                "native-delivery-degraded",
+                "warning",
+                paused,
+            ));
+            rows.push(diagnostic(
+                &format!("r{minute}"),
+                &format!("2026-09-30T10:0{minute}:30Z"),
+                "native-delivery-recovered",
+                "warning",
+                resumed,
+            ));
+        }
+        rows.push(json!({"id":"a1","sequence":2,"revision":1,"timestamp":"2026-09-30T10:05:00Z","role":"assistant","type":"content","final":true,
+            "body":{"media_type":"text/plain","text":"Still here."}}));
+        rows.push(diagnostic(
+            "p9",
+            "2026-09-30T10:06:00Z",
+            "native-delivery-degraded",
+            "warning",
+            paused,
+        ));
+        rows.push(diagnostic(
+            "e1",
+            "2026-09-30T10:07:00Z",
+            "harness-crashed",
+            "error",
+            "the harness exited",
+        ));
+        let timeline: Vec<TimelineEntry> = serde_json::from_value(json!(rows)).unwrap();
+        let events: Vec<String> = conversation(&timeline, &BTreeMap::new())
+            .into_iter()
+            .map(|entry| match entry.body {
+                Body::Event(text) => text,
+                Body::Assistant(text) => format!("assistant: {text}"),
+                other => panic!("unexpected {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            events,
+            [
+                "delivery paused, then resumed ×3",
+                "assistant: Still here.",
+                "delivery paused · st unreachable",
+                "error: the harness exited",
+            ]
+        );
     }
 
     fn rendered(fixture: &str) -> String {
