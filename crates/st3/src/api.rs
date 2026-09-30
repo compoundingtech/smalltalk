@@ -3922,6 +3922,19 @@ pub fn start_operation_report(state: &AppState) {
     client_v0::start_operation_report(state);
 }
 
+/// Read the headers of this host's native session transcripts off the request path as the
+/// daemon starts. Discovery keeps each transcript's header until the file changes, so the first
+/// session list after a start reads what changed instead of every header, over a second on a
+/// host with a couple of thousand transcripts.
+pub fn start_native_session_discovery(state: &AppState) {
+    let home = state.native_session_home.clone();
+    std::thread::spawn(move || {
+        if let Err(error) = crate::external_sessions::discover(home.as_deref(), true) {
+            eprintln!("st3: reading native session transcripts at start failed: {error:#}");
+        }
+    });
+}
+
 /// The local daemon binds a Unix peer to the harness identity inherited by that peer or one of
 /// its parents. Test servers and the paired gateway use the ordinary unbound listener.
 pub async fn serve_unix_bound(socket: &Path, app: Router) -> anyhow::Result<()> {
