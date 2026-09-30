@@ -213,6 +213,23 @@ CREATE TABLE IF NOT EXISTS desired (
 CREATE INDEX IF NOT EXISTS desired_owner_step_index ON desired(owner_step, subject);
 CREATE INDEX IF NOT EXISTS desired_owner_run_index ON desired(owner_run, subject);
 
+-- A replicated projection finds a mission run tree's runs, generations and proposals from the
+-- claims that create them, without reading every such claim.
+CREATE INDEX IF NOT EXISTS claims_run_root_index ON claims(json_extract(body, '$.fields.root_mission_run'))
+WHERE kind='mission-run.created';
+CREATE INDEX IF NOT EXISTS claims_run_generation_index ON claims(json_extract(body, '$.fields.current_generation'))
+WHERE kind='mission-run.created';
+CREATE INDEX IF NOT EXISTS claims_generation_run_index ON claims(json_extract(body, '$.fields.run'))
+WHERE kind='run-generation.created';
+CREATE INDEX IF NOT EXISTS claims_proposal_run_index ON claims(json_extract(body, '$.fields.run'))
+WHERE kind='revision-proposal.created';
+CREATE INDEX IF NOT EXISTS claims_run_revision_index ON claims(json_extract(body, '$.fields.revision'))
+WHERE kind='mission-run.created';
+CREATE INDEX IF NOT EXISTS claims_generation_revision_index ON claims(json_extract(body, '$.fields.revision'))
+WHERE kind='run-generation.created';
+CREATE INDEX IF NOT EXISTS claims_proposal_revision_index ON claims(json_extract(body, '$.fields.candidate_revision'))
+WHERE kind='revision-proposal.created';
+
 CREATE TABLE IF NOT EXISTS idempotency (
     operation_id TEXT PRIMARY KEY,
     response TEXT NOT NULL
@@ -13709,7 +13726,7 @@ impl Store {
                 .execute_batch("SAVEPOINT project_incremental")
                 .map_err(internal)?;
             let incremental = crate::profile::span("projection/incremental");
-            let projected = match try_project_simple_replication_tx(&transaction) {
+            let projected = match try_project_simple_replication_tx(&transaction, &self.origin) {
                 Ok(projected) => {
                     transaction
                         .execute_batch("RELEASE project_incremental")
@@ -13773,10 +13790,33 @@ impl Store {
     /// frontier. The incremental projector also handles selected structural and run claims from
     /// a healthy frontier. Keep the full replay for stale projections and ambiguous operation or
     /// renewal ordering.
+    ///
+    /// A kind belongs here only when a full replay does nothing with its claims but record their
+    /// event and operation, and no projection reads them while it builds the graph: then the
+    /// order they arrive in cannot change the graph. Lanes, runtime actions and subscription
+    /// intake write such claims every few minutes, and each one used to replay the whole graph
+    /// while holding the store's only writer.
     fn simple_replication_kind(kind: &str) -> bool {
         matches!(
             kind,
-            "attention.requested"
+            "lane.approved"
+                | "lane.joined"
+                | "lane.left"
+                | "lane.marked"
+                | "lane.moved"
+                | "runtime.action.deadline-reached"
+                | "runtime.action.failed"
+                | "runtime.action.requested"
+                | "runtime.action.succeeded"
+                | "subscription.mission-deferred"
+                | "subscription.mission-failed"
+                | "subscription.mission-request-cancelled"
+                | "subscription.mission-request-released"
+                | "subscription.mission-requested"
+                | "subscription.mission-started"
+                | "observer.refresh-requested"
+                | "publication.operation"
+                | "attention.requested"
                 | "gate.requested"
                 | "gate.result"
                 | "loop.state"
@@ -25159,13 +25199,459 @@ fn batch_order_key(batch_id: &str) -> Option<(String, u64)> {
 
 /// Advance from a healthy frontier when the new claims have unambiguous operation IDs and
 /// structural claims sort after everything projected, in the order the full replay uses.
+/// Whether a full replay projects claims of `kind` into the graph tables the graph digest
+/// commits, or into planning. A replay records every other kind only as an event and an
+/// operation, which the incremental projection does in any order.
+fn replay_projects_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "intent.desired"
+            | "doc.bound"
+            | "mission.published"
+            | "mission-run.created"
+            | "mission-run.state"
+            | "run-generation.created"
+            | "run-generation.state"
+            | "run-generation.superseded"
+            | "revision-proposal.created"
+            | "revision-proposal.approved"
+            | "revision-proposal.cancelled"
+            | "revision-proposal.applied"
+            | "step-run.carried"
+            | "step-run.state"
+            | "step-run.retried"
+    ) || kind.starts_with("work.")
+        || kind.starts_with("planning-session.")
+}
+
+/// A part of the graph that the incremental projection rebuilds on its own when a claim reaches
+/// it out of the replay's order: a mission run tree, named by its root run's id, or the desired
+/// subject, document or mission one claim is about. Rebuilding one costs what its own history
+/// costs, not what the store's does.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Aggregate {
+    RunTree(String),
+    Desired(String),
+    Document(String),
+    Mission(String),
+}
+
+/// Whether claims of `kind` belong to a mission run tree.
+fn run_tree_kind(kind: &str) -> bool {
+    replay_projects_kind(kind)
+        && !matches!(kind, "intent.desired" | "doc.bound" | "mission.published")
+        && !kind.starts_with("planning-session.")
+}
+
+/// The aggregate a structural claim belongs to, or `None` when no projected aggregate holds it.
+fn aggregate_of_tx(
+    transaction: &Transaction<'_>,
+    claim: &ClaimRecord,
+) -> Result<Option<Aggregate>, St3Error> {
+    Ok(match claim.kind.as_str() {
+        "intent.desired" => Some(Aggregate::Desired(claim.subject.clone())),
+        "doc.bound" => Some(Aggregate::Document(claim.subject.clone())),
+        "mission.published" => Some(Aggregate::Mission(claim.subject.clone())),
+        _ => run_tree_of_tx(transaction, &claim.subject)?.map(Aggregate::RunTree),
+    })
+}
+
+/// The run a generation belongs to: from the graph, or from the claims that create it when the
+/// generation is not projected yet.
+fn generation_run_tx(
+    transaction: &Transaction<'_>,
+    generation: &str,
+) -> Result<Option<String>, St3Error> {
+    if let Some(run) = transaction
+        .query_row(
+            "SELECT run_id FROM run_generations WHERE id=?1",
+            [generation],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(internal)?
+    {
+        return Ok(Some(run));
+    }
+    let subject = format!("run-generation/{generation}");
+    let created = transaction
+        .query_row(
+            "SELECT json_extract(body, '$.fields.run') FROM claims
+             WHERE subject=?1 AND kind='run-generation.created' ORDER BY store_index LIMIT 1",
+            [&subject],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(internal)?
+        .flatten();
+    if let Some(run) = created {
+        return Ok(Some(run.trim_start_matches("mission-run/").to_owned()));
+    }
+    // A run's first generation is named by the claim that creates the run.
+    Ok(transaction
+        .query_row(
+            "SELECT subject FROM claims WHERE kind='mission-run.created'
+               AND json_extract(body, '$.fields.current_generation')=?1
+             ORDER BY store_index LIMIT 1",
+            [&subject],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(internal)?
+        .map(|run| run.trim_start_matches("mission-run/").to_owned()))
+}
+
+/// The root run of the mission run tree `subject` belongs to: a run, a generation, a step run
+/// or a revision proposal.
+fn run_tree_of_tx(
+    transaction: &Transaction<'_>,
+    subject: &str,
+) -> Result<Option<String>, St3Error> {
+    let run = if let Some(run) = subject.strip_prefix("mission-run/") {
+        Some(run.to_owned())
+    } else if let Some(generation) = subject.strip_prefix("run-generation/") {
+        generation_run_tx(transaction, generation)?
+    } else if let Some(step) = subject.strip_prefix("step-run/") {
+        generation_run_tx(transaction, step.split('/').next().unwrap_or(step))?
+    } else if let Some(proposal) = subject.strip_prefix("revision-proposal/") {
+        let projected = transaction
+            .query_row(
+                "SELECT run_id FROM revision_proposals WHERE id=?1",
+                [proposal],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        match projected {
+            Some(run) => Some(run),
+            None => transaction
+                .query_row(
+                    "SELECT json_extract(body, '$.fields.run') FROM claims
+                     WHERE subject=?1 AND kind='revision-proposal.created'
+                     ORDER BY store_index LIMIT 1",
+                    [subject],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .map_err(internal)?
+                .flatten()
+                .map(|run| run.trim_start_matches("mission-run/").to_owned()),
+        }
+    } else {
+        None
+    };
+    let Some(run) = run else {
+        return Ok(None);
+    };
+    if let Some(root) = transaction
+        .query_row(
+            "SELECT root_run_id FROM mission_runs WHERE id=?1",
+            [&run],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .map_err(internal)?
+    {
+        return Ok(Some(root));
+    }
+    let root = transaction
+        .query_row(
+            "SELECT json_extract(body, '$.fields.root_mission_run') FROM claims
+             WHERE subject=?1 AND kind='mission-run.created' ORDER BY store_index LIMIT 1",
+            [format!("mission-run/{run}")],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(internal)?
+        .flatten();
+    Ok(Some(
+        root.map(|root| root.trim_start_matches("mission-run/").to_owned())
+            .unwrap_or(run),
+    ))
+}
+
+/// The claims of `subjects`, and of every step run under `generations`, in the replay's order,
+/// without repaired records.
+fn claims_in_replay_order_tx(
+    transaction: &Transaction<'_>,
+    subjects: &BTreeSet<String>,
+    generations: &BTreeSet<String>,
+    kinds: Option<&[&str]>,
+) -> Result<Vec<ClaimRecord>, St3Error> {
+    let kind_filter = kinds
+        .map(|kinds| {
+            format!(
+                " AND claims.kind IN ({})",
+                kinds
+                    .iter()
+                    .map(|kind| format!("'{kind}'"))
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .unwrap_or_default();
+    let query = |filter: &str| {
+        format!(
+            "SELECT {CLAIM_COLUMNS}, batches.origin, batches.replica_sequence,
+                    COALESCE((SELECT MIN(position) FROM replica_records
+                              WHERE replica_records.claim_id=claims.id), 0)
+             FROM claims JOIN batches ON batches.id=claims.batch_id
+             WHERE {filter}{kind_filter}
+               AND NOT EXISTS (SELECT 1 FROM replica_records
+                               WHERE replica_records.claim_id=claims.id
+                                 AND replica_records.state='repaired')"
+        )
+    };
+    let row = |row: &rusqlite::Row<'_>| {
+        Ok((
+            claim_from_row(row)?,
+            row.get::<_, String>(10)?,
+            row.get::<_, i64>(11)?,
+            row.get::<_, i64>(12)?,
+        ))
+    };
+    let mut found = Vec::new();
+    let mut by_subject = transaction
+        .prepare_cached(&query("claims.subject=?1"))
+        .map_err(internal)?;
+    for subject in subjects {
+        for claim in by_subject.query_map([subject], row).map_err(internal)? {
+            found.push(claim.map_err(internal)?);
+        }
+    }
+    let mut by_range = transaction
+        .prepare_cached(&query("claims.subject>=?1 AND claims.subject<?2"))
+        .map_err(internal)?;
+    for generation in generations {
+        // Every `step-run/GENERATION/...` subject, found by a range on the subject index.
+        let start = format!("step-run/{generation}/");
+        let end = format!("step-run/{generation}0");
+        for claim in by_range
+            .query_map(params![start, end], row)
+            .map_err(internal)?
+        {
+            found.push(claim.map_err(internal)?);
+        }
+    }
+    found.sort_by(|left, right| {
+        (
+            &left.0.accepted_at_unix_ms,
+            &left.1,
+            left.2,
+            left.3,
+            &left.0.id,
+        )
+            .cmp(&(
+                &right.0.accepted_at_unix_ms,
+                &right.1,
+                right.2,
+                right.3,
+                &right.0.id,
+            ))
+    });
+    found.dedup_by(|left, right| left.0.id == right.0.id);
+    Ok(found.into_iter().map(|(claim, ..)| claim).collect())
+}
+
+/// Rebuild one mission run tree from nothing, as a full replay would, but from the tree's own
+/// claims: forget its runs, generations, steps and proposals, then project its claims again in
+/// the replay's order and passes.
+fn rebuild_run_tree_tx(transaction: &Transaction<'_>, root: &str) -> Result<(), St3Error> {
+    let _span = crate::profile::span("projection/run-tree");
+    crate::profile::note("projection: run tree rebuilt");
+    let strings = |sql: &str, value: &str| -> Result<Vec<String>, St3Error> {
+        let mut statement = transaction.prepare_cached(sql).map_err(internal)?;
+        let values = statement
+            .query_map([value], |row| row.get::<_, Option<String>>(0))
+            .map_err(internal)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(internal)?;
+        Ok(values.into_iter().flatten().collect())
+    };
+    let mut runs = BTreeSet::from([root.to_owned()]);
+    runs.extend(strings(
+        "SELECT id FROM mission_runs WHERE root_run_id=?1",
+        root,
+    )?);
+    runs.extend(
+        strings(
+            "SELECT subject FROM claims WHERE kind='mission-run.created'
+               AND json_extract(body, '$.fields.root_mission_run')=?1",
+            &format!("mission-run/{root}"),
+        )?
+        .into_iter()
+        .map(|run| run.trim_start_matches("mission-run/").to_owned()),
+    );
+    let mut generations = BTreeSet::new();
+    let mut proposals = BTreeSet::new();
+    for run in &runs {
+        let subject = format!("mission-run/{run}");
+        generations.extend(strings(
+            "SELECT id FROM run_generations WHERE run_id=?1",
+            run,
+        )?);
+        for generation in strings(
+            "SELECT subject FROM claims WHERE kind='run-generation.created'
+               AND json_extract(body, '$.fields.run')=?1",
+            &subject,
+        )?
+        .into_iter()
+        .chain(strings(
+            "SELECT json_extract(body, '$.fields.current_generation') FROM claims
+             WHERE subject=?1 AND kind='mission-run.created'",
+            &subject,
+        )?) {
+            generations.insert(generation.trim_start_matches("run-generation/").to_owned());
+        }
+        proposals.extend(strings(
+            "SELECT id FROM revision_proposals WHERE run_id=?1",
+            run,
+        )?);
+        proposals.extend(
+            strings(
+                "SELECT subject FROM claims WHERE kind='revision-proposal.created'
+                   AND json_extract(body, '$.fields.run')=?1",
+                &subject,
+            )?
+            .into_iter()
+            .map(|proposal| proposal.trim_start_matches("revision-proposal/").to_owned()),
+        );
+    }
+    let subjects = runs
+        .iter()
+        .map(|run| format!("mission-run/{run}"))
+        .chain(
+            generations
+                .iter()
+                .map(|generation| format!("run-generation/{generation}")),
+        )
+        .chain(
+            proposals
+                .iter()
+                .map(|proposal| format!("revision-proposal/{proposal}")),
+        )
+        .collect::<BTreeSet<_>>();
+    let claims = claims_in_replay_order_tx(transaction, &subjects, &generations, None)?;
+    for run in &runs {
+        for table in [
+            "step_runs",
+            "revision_proposals",
+            "mission_run_deadlines",
+            "mission_run_after",
+            "run_generations",
+        ] {
+            transaction
+                .execute(&format!("DELETE FROM {table} WHERE run_id=?1"), [run])
+                .map_err(internal)?;
+        }
+        transaction
+            .execute("DELETE FROM mission_runs WHERE id=?1", [run])
+            .map_err(internal)?;
+    }
+    for claim in &claims {
+        transaction
+            .execute(
+                "DELETE FROM projection_health WHERE aggregate=?1",
+                [format!("projection:runs:{}", claim.id)],
+            )
+            .map_err(internal)?;
+    }
+    for pass in 0..3 {
+        for claim in &claims {
+            let included = match pass {
+                0 => claim.kind == "mission-run.created",
+                1 => {
+                    claim.kind.starts_with("work.")
+                        || matches!(
+                            claim.kind.as_str(),
+                            "mission-run.state"
+                                | "run-generation.created"
+                                | "run-generation.state"
+                                | "run-generation.superseded"
+                                | "revision-proposal.created"
+                                | "revision-proposal.approved"
+                                | "revision-proposal.cancelled"
+                                | "revision-proposal.applied"
+                                | "step-run.carried"
+                                | "step-run.state"
+                                | "step-run.retried"
+                        )
+                }
+                _ => claim.kind == "step-run.carried",
+            };
+            if !included {
+                continue;
+            }
+            project_claim_isolated_tx(transaction, "projection:runs", claim, || match pass {
+                0 => project_mission_run_created(transaction, claim),
+                1 => project_mission_run_update(transaction, claim),
+                _ => reconcile_carried_step_tx(transaction, claim),
+            })?;
+        }
+    }
+    reapply_local_work_lease_renewals_tx(transaction)
+}
+
+/// Rebuild one desired subject, document or mission from its own claims in the replay's order.
+fn rebuild_base_aggregate_tx(
+    transaction: &Transaction<'_>,
+    aggregate: &Aggregate,
+) -> Result<(), St3Error> {
+    let (subject, kind) = match aggregate {
+        Aggregate::Desired(subject) => (subject, "intent.desired"),
+        Aggregate::Document(subject) => (subject, "doc.bound"),
+        Aggregate::Mission(subject) => (subject, "mission.published"),
+        Aggregate::RunTree(_) => return Ok(()),
+    };
+    crate::profile::note(&format!("projection: {kind} subject rebuilt"));
+    match aggregate {
+        Aggregate::Desired(subject) => {
+            transaction
+                .execute("DELETE FROM desired WHERE subject=?1", [subject])
+                .map_err(internal)?;
+        }
+        Aggregate::Mission(subject) => {
+            transaction
+                .execute(
+                    "DELETE FROM mission_definitions WHERE mission_id=?1",
+                    [subject.trim_start_matches("mission/")],
+                )
+                .map_err(internal)?;
+        }
+        _ => {}
+    }
+    let claims = claims_in_replay_order_tx(
+        transaction,
+        &BTreeSet::from([subject.clone()]),
+        &BTreeSet::new(),
+        Some(&[kind]),
+    )?;
+    for claim in &claims {
+        project_claim_isolated_tx(transaction, "projection:base", claim, || {
+            match claim.kind.as_str() {
+                "intent.desired" => {
+                    let desired = serde_json::from_value::<DesiredSubject>(claim.body.clone())
+                        .map_err(internal)?;
+                    select_replicated_desired(transaction, claim, &desired)
+                }
+                "doc.bound" => select_replicated_document(transaction, claim, claim.store_index),
+                _ => select_replicated_mission(transaction, claim, claim.store_index),
+            }
+        })?;
+    }
+    Ok(())
+}
+
 /// The incremental projection cannot extend the graph, for `reason`: count it when profiling.
 fn replay_needed(reason: String) -> bool {
     crate::profile::note(&format!("replay: {reason}"));
     false
 }
 
-fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bool, St3Error> {
+fn try_project_simple_replication_tx(
+    transaction: &Transaction<'_>,
+    origin: &str,
+) -> Result<bool, St3Error> {
     let health: Option<(String, u64)> = transaction
         .query_row(
             "SELECT status, last_good_store_index FROM projection_health WHERE aggregate='graph'",
@@ -25196,9 +25682,13 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
         .map_err(internal)?;
     drop(statement);
 
+    // This node applied its own claims to the graph when it wrote them, and a quiet lease renewal
+    // can move a step on since without writing one, so projecting one of them again could undo
+    // what followed it. A run tree that holds one of them is rebuilt from its own claims in the
+    // replay's order instead; another writer's claims about any other tree project as they come.
     let mut work_claims = claims
         .iter()
-        .filter(|claim| claim.kind.starts_with("work."))
+        .filter(|claim| claim.kind.starts_with("work.") && claim.origin != origin)
         .collect::<Vec<_>>();
     work_claims.sort_by_key(|claim| claim.accepted_at_unix_ms);
     // The full replay orders claims by accepted time, then by batch writer and sequence. A
@@ -25240,9 +25730,25 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
             last_key = Some((accepted.parse().map_err(internal)?, writer, sequence));
         }
     }
+    // A claim that reaches a part of the graph out of the replay's order marks that part to be
+    // rebuilt from its own claims; everything else extends the graph as it arrives.
+    let mut dirty = BTreeSet::<Aggregate>::new();
+    let mut rebuild_planning = false;
+    for claim in claims
+        .iter()
+        .filter(|claim| claim.origin == origin && run_tree_kind(&claim.kind))
+    {
+        if let Some(root) = run_tree_of_tx(transaction, &claim.subject)? {
+            dirty.insert(Aggregate::RunTree(root));
+        }
+    }
     for claim in &claims {
         let has_operation = claim.body.get("_operation").is_some();
-        if !Store::simple_replication_kind(&claim.kind)
+        if claim.kind.starts_with("planning-session.") {
+            rebuild_planning = true;
+        }
+        if replay_projects_kind(&claim.kind)
+            && !Store::simple_replication_kind(&claim.kind)
             && !matches!(
                 claim.kind.as_str(),
                 "intent.desired"
@@ -25283,13 +25789,10 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
                 return Ok(replay_needed("claim batch has no order key".into()));
             };
             let key = (claim.accepted_at_unix_ms, writer, sequence);
-            if last_key.as_ref().is_some_and(|last| key < *last) {
-                return Ok(replay_needed(format!(
-                    "structural claim sorts before the projection: {} from {}",
-                    claim.kind, claim.origin
-                )));
+            let out_of_order = last_key.as_ref().is_some_and(|last| key < *last);
+            if last_key.as_ref().is_none_or(|last| key > *last) {
+                last_key = Some(key);
             }
-            last_key = Some(key);
             let repaired: bool = transaction
                 .query_row(
                     "SELECT EXISTS(SELECT 1 FROM replica_records WHERE claim_id=?1 AND state='repaired')",
@@ -25297,8 +25800,12 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
                     |row| row.get(0),
                 )
                 .map_err(internal)?;
-            if repaired {
-                return Ok(replay_needed("repaired record".into()));
+            // A claim about a run tree not projected yet waits in the claim log: the claim that
+            // creates its run or generation rebuilds the tree with it.
+            if (out_of_order || repaired)
+                && let Some(aggregate) = aggregate_of_tx(transaction, claim)?
+            {
+                dirty.insert(aggregate);
             }
             if claim.kind == "mission-run.created" {
                 let generation = claim
@@ -25321,8 +25828,27 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
                         |row| row.get(0),
                     )
                     .map_err(internal)?;
-                if prior_dependents {
-                    return Ok(replay_needed("run created after its dependents".into()));
+                if prior_dependents && let Some(aggregate) = aggregate_of_tx(transaction, claim)? {
+                    dirty.insert(aggregate);
+                }
+            }
+            if claim.kind == "run-generation.created" {
+                // A generation whose steps already have claims, from a peer that sent them first,
+                // is rebuilt with its tree so those claims apply in the replay's order.
+                let prior_dependents: bool = transaction
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM claims WHERE store_index<=?1
+                         AND subject>=?2 AND subject<?3)",
+                        params![
+                            frontier,
+                            format!("step-run/{}/", generation_id_from_subject(&claim.subject)),
+                            format!("step-run/{}0", generation_id_from_subject(&claim.subject)),
+                        ],
+                        |row| row.get(0),
+                    )
+                    .map_err(internal)?;
+                if prior_dependents && let Some(aggregate) = aggregate_of_tx(transaction, claim)? {
+                    dirty.insert(aggregate);
                 }
             }
             if claim.kind == "mission.published" {
@@ -25331,20 +25857,42 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
                     .get("revision")
                     .and_then(Value::as_str)
                     .unwrap_or("");
-                let waiting_run: bool = transaction
-                    .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM claims AS pending
-                         WHERE pending.kind='mission-run.created'
-                           AND json_extract(pending.body, '$.fields.mission')=?1
-                           AND json_extract(pending.body, '$.fields.revision')=?2
-                           AND NOT EXISTS(SELECT 1 FROM mission_runs AS projected
-                                          WHERE projected.id=substr(pending.subject, 13)))",
-                        params![claim.subject, revision],
-                        |row| row.get(0),
-                    )
-                    .map_err(internal)?;
-                if waiting_run {
-                    return Ok(replay_needed("mission published with a waiting run".into()));
+                // A run or generation that arrived before the revision it runs, and a proposal to
+                // adopt it, wait for it; their trees are rebuilt once the revision is projected.
+                let mut waiting = Vec::new();
+                for query in [
+                    "SELECT pending.subject FROM claims AS pending
+                     WHERE pending.kind='mission-run.created'
+                       AND json_extract(pending.body, '$.fields.revision')=?2
+                       AND json_extract(pending.body, '$.fields.mission')=?1
+                       AND NOT EXISTS(SELECT 1 FROM mission_runs AS projected
+                                      WHERE projected.id=substr(pending.subject, 13))",
+                    "SELECT pending.subject FROM claims AS pending
+                     WHERE pending.kind='run-generation.created'
+                       AND json_extract(pending.body, '$.fields.revision')=?2
+                       AND ?1 IS NOT NULL
+                       AND NOT EXISTS(SELECT 1 FROM run_generations AS projected
+                                      WHERE projected.id=substr(pending.subject, 16))",
+                    "SELECT pending.subject FROM claims AS pending
+                     WHERE pending.kind='revision-proposal.created'
+                       AND json_extract(pending.body, '$.fields.candidate_revision')=?2
+                       AND ?1 IS NOT NULL",
+                ] {
+                    let mut statement = transaction.prepare_cached(query).map_err(internal)?;
+                    waiting.extend(
+                        statement
+                            .query_map(params![claim.subject, revision], |row| {
+                                row.get::<_, String>(0)
+                            })
+                            .map_err(internal)?
+                            .collect::<rusqlite::Result<Vec<_>>>()
+                            .map_err(internal)?,
+                    );
+                }
+                for run in waiting {
+                    if let Some(root) = run_tree_of_tx(transaction, &run)? {
+                        dirty.insert(Aggregate::RunTree(root));
+                    }
                 }
             }
         }
@@ -25383,16 +25931,12 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
                 .and_then(|value: String| value.parse::<u128>().ok())
         };
         if previous.is_none_or(|value| claim.accepted_at_unix_ms <= value) {
-            return Ok(replay_needed(format!(
-                "work claim not newer than its step: {} from {}{}",
-                claim.kind,
-                claim.origin,
-                if previous.is_none() {
-                    " (no step row)"
-                } else {
-                    ""
-                }
-            )));
+            // A work claim for a step that is not projected yet waits in the claim log; the
+            // generation that creates the step rebuilds its tree and applies it.
+            if let Some(root) = run_tree_of_tx(transaction, &claim.subject)? {
+                dirty.insert(Aggregate::RunTree(root));
+            }
+            continue;
         }
         latest_work_by_subject.insert(&claim.subject, claim.accepted_at_unix_ms);
     }
@@ -25406,7 +25950,30 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
         )
         .map_err(internal)?;
     }
+    let mut aggregates = BTreeMap::<String, Option<Aggregate>>::new();
+    // A claim is left to its aggregate's rebuild when that aggregate is dirty, and left waiting
+    // when it is about a run tree that nothing has created yet.
+    let mut in_dirty = |claim: &ClaimRecord| -> Result<bool, St3Error> {
+        if Store::simple_replication_kind(&claim.kind) && !claim.kind.starts_with("work.") {
+            return Ok(false);
+        }
+        let aggregate = match aggregates.get(claim.subject.as_str()) {
+            Some(aggregate) => aggregate.clone(),
+            None => {
+                let aggregate = aggregate_of_tx(transaction, claim)?;
+                aggregates.insert(claim.subject.clone(), aggregate.clone());
+                aggregate
+            }
+        };
+        Ok(match aggregate {
+            Some(aggregate) => dirty.contains(&aggregate),
+            None => claim.kind != "mission-run.created" && run_tree_kind(&claim.kind),
+        })
+    };
     for claim in &claims {
+        if in_dirty(claim)? {
+            continue;
+        }
         match claim.kind.as_str() {
             "intent.desired" => {
                 let desired = serde_json::from_value::<DesiredSubject>(claim.body.clone())
@@ -25443,13 +26010,34 @@ fn try_project_simple_replication_tx(transaction: &Transaction<'_>) -> Result<bo
         .collect::<Vec<_>>();
     run_updates.sort_by_key(|claim| claim.accepted_at_unix_ms);
     for claim in run_updates {
+        if in_dirty(claim)? {
+            continue;
+        }
         project_mission_run_update(transaction, claim)?;
     }
     for claim in claims
         .iter()
         .filter(|claim| claim.kind == "step-run.carried")
     {
+        if in_dirty(claim)? {
+            continue;
+        }
         reconcile_carried_step_tx(transaction, claim)?;
+    }
+    // Missions first, since a rebuilt run reads the revision it runs.
+    let (trees, bases): (Vec<_>, Vec<_>) = dirty
+        .iter()
+        .partition(|aggregate| matches!(aggregate, Aggregate::RunTree(_)));
+    for aggregate in bases {
+        rebuild_base_aggregate_tx(transaction, aggregate)?;
+    }
+    for aggregate in trees {
+        if let Aggregate::RunTree(root) = aggregate {
+            rebuild_run_tree_tx(transaction, root)?;
+        }
+    }
+    if rebuild_planning {
+        rebuild_planning_tx(transaction).map_err(internal)?;
     }
     Ok(true)
 }
@@ -30435,7 +31023,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            assert!(try_project_simple_replication_tx(&transaction).unwrap());
+            assert!(try_project_simple_replication_tx(&transaction, &store.origin).unwrap());
             transaction.commit().unwrap();
             claim
         };
@@ -30857,7 +31445,7 @@ mod tests {
         {
             let mut connection = store.connection.lock().unwrap();
             let transaction = connection.transaction().unwrap();
-            assert!(try_project_simple_replication_tx(&transaction).unwrap());
+            assert!(try_project_simple_replication_tx(&transaction, &store.origin).unwrap());
             transaction.rollback().unwrap();
         }
         let before = store.connection.lock().unwrap().total_changes();
@@ -31027,7 +31615,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(!try_project_simple_replication_tx(&transaction).unwrap());
+        assert!(!try_project_simple_replication_tx(&transaction, &store.origin).unwrap());
     }
 
     #[test]
@@ -31050,7 +31638,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            assert!(try_project_simple_replication_tx(&transaction).unwrap());
+            assert!(try_project_simple_replication_tx(&transaction, &store.origin).unwrap());
             transaction.commit().unwrap();
         }
         assert!(store.operation_projection_drift().unwrap().is_empty());
@@ -31071,7 +31659,7 @@ mod tests {
                 None,
             )
             .unwrap();
-            assert!(!try_project_simple_replication_tx(&transaction).unwrap());
+            assert!(!try_project_simple_replication_tx(&transaction, &store.origin).unwrap());
             transaction.commit().unwrap();
         }
         assert!(store.project_replication_backlog().unwrap());
@@ -34014,7 +34602,7 @@ version 2
                 let mut connection = controller.connection.lock().unwrap();
                 let transaction = connection.transaction().unwrap();
                 assert!(
-                    try_project_simple_replication_tx(&transaction).unwrap(),
+                    try_project_simple_replication_tx(&transaction, &controller.origin).unwrap(),
                     "a single routine work transition should use the bounded projection path"
                 );
                 transaction.rollback().unwrap();
@@ -34025,6 +34613,315 @@ version 2
             controller.step_run(&step).unwrap().unwrap().status,
             "verifying"
         );
+    }
+
+    /// A controller that publishes a one-step mission and a worker that projects its run, with
+    /// the step ready for the worker's agent.
+    fn replicated_step_pair() -> (Store, Store, String) {
+        let controller = Store::open_memory("controller").unwrap();
+        let kdl = r#"
+version 2
+
+  mission "lease-work" state="ready" {
+    goal "Complete mission lease-work."
+    step "work" { assigned-to "agent/worker.one" }
+  }
+
+"#;
+        let intent = parse_intent(kdl, "controller").unwrap();
+        let planned = controller
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        controller
+            .apply(&intent, &planned.subject_tokens, "lease-work-mission")
+            .unwrap();
+        let run = controller
+            .create_mission_run(&MissionRunRequest {
+                mission: "lease-work".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "lease-work-run".into(),
+            })
+            .unwrap();
+        let step = run.steps[0].subject.clone();
+        controller.set_step_state(&step, "ready", None).unwrap();
+        let worker = Store::open_memory("worker").unwrap();
+        receive_and_project(
+            &worker,
+            "controller",
+            &exchange_from(&controller, &ReplicationInventory::default()),
+        );
+        assert!(controller.project_replication_backlog().unwrap());
+        (controller, worker, step)
+    }
+
+    fn worker_work(worker: &Store, step: &str, action: &str, summary: Option<&str>, key: &str) {
+        worker
+            .work_action(
+                step,
+                action,
+                &WorkRequest {
+                    actor: Some("agent/worker.one".into()),
+                    incarnation: Some("worker-generation".into()),
+                    summary: summary.map(str::to_owned),
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: key.into(),
+                },
+            )
+            .unwrap();
+    }
+
+    /// Receive `source`'s new envelopes and project them, and say whether that replayed the
+    /// graph from nothing.
+    fn projection_replayed(target: &Store, relay: &str, source: &Store) -> bool {
+        let exchange = exchange_from(source, &target.replication_inventory().unwrap());
+        target
+            .receive_replication_exchange(relay, TEST_FLEET, &exchange)
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        target.apply_replication_repairs().unwrap();
+        FULL_REPLAYS.with(|replays| replays.set(0));
+        assert!(target.project_replication_backlog().unwrap());
+        FULL_REPLAYS.with(std::cell::Cell::get) > 0
+    }
+
+    /// A seat's own lease renewals, and the lane, runtime-action and intake claims its node writes,
+    /// were projected when they were written. Every one of them used to make the next peer
+    /// exchange replay the whole graph while holding the store's only writer. The exchange now
+    /// extends the graph, and the graph is the one a replay from nothing produces.
+    #[test]
+    fn local_renewals_and_event_claims_extend_the_graph_without_a_replay() {
+        let (controller, worker, step) = replicated_step_pair();
+        worker_work(&worker, &step, "claim", None, "lease-claim");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        worker_work(
+            &worker,
+            &step,
+            "renew",
+            Some("still working"),
+            "lease-renew",
+        );
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        // A quiet renewal moves only the local lease and writes no claim.
+        worker_work(&worker, &step, "renew", None, "lease-quiet-renew");
+        {
+            let mut connection = worker.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            for (subject, kind, fields, operation) in [
+                (
+                    "lane/fleet/test/train",
+                    "lane.marked",
+                    json!({"entry": "mission-run/test-entry", "state": "waiting"}),
+                    Some("op/lane-mark"),
+                ),
+                (
+                    "agent/worker.one",
+                    "runtime.action.requested",
+                    json!({"action": "terminate"}),
+                    Some("op/action"),
+                ),
+                (
+                    "subscription/test/intake",
+                    "subscription.mission-requested",
+                    json!({
+                        "mission": "mission/test", "mission_revision": "revision",
+                        "resource": "resource/test", "resource_input": "source",
+                        "workspace": "/tmp/test", "discovery": "discovery-pending"
+                    }),
+                    None,
+                ),
+            ] {
+                let mut body = json!({"fields": fields});
+                if let Some(operation) = operation {
+                    body["_operation"] = json!({"id": operation, "request_digest": "digest"});
+                }
+                append_claim_tx(
+                    &transaction,
+                    &worker.origin,
+                    subject,
+                    kind,
+                    Some("agent/worker.one"),
+                    &body,
+                    &[],
+                    None,
+                )
+                .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+        controller
+            .append_claim(&ClaimInput {
+                subject: "agent/controller.watch".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/controller.watch".into()),
+                fields: serde_json::from_value(json!({"state": "idle"})).unwrap(),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("controller-heartbeat".into()),
+            })
+            .unwrap();
+
+        assert!(!projection_replayed(&worker, "controller", &controller));
+        let step_run = worker.step_run(&step).unwrap().unwrap();
+        assert_eq!(step_run.claimant.as_deref(), Some("agent/worker.one"));
+        let incremental = graph_digest_of(&worker);
+        worker.replay_replication_graph().unwrap();
+        assert_eq!(incremental, graph_digest_of(&worker));
+    }
+
+    /// Another writer's structural claim that sorts before a lease claim this node already
+    /// applied rebuilds that step's run tree, without replaying the graph, and the step ends as
+    /// the replay's order decides.
+    #[test]
+    fn a_peer_claim_older_than_a_local_lease_claim_rebuilds_its_run_tree() {
+        let (controller, worker, step) = replicated_step_pair();
+        controller
+            .set_step_state(&step, "cancelled", Some("the controller cancels it"))
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        worker_work(&worker, &step, "claim", None, "late-claim");
+
+        assert!(!projection_replayed(&worker, "controller", &controller));
+        assert!(!projection_replayed(&controller, "worker", &worker));
+        assert_eq!(graph_digest_of(&worker), graph_digest_of(&controller));
+        let incremental = graph_digest_of(&worker);
+        worker.replay_replication_graph().unwrap();
+        assert_eq!(incremental, graph_digest_of(&worker));
+    }
+
+    #[test]
+    /// Rebuilding one run tree from its own claims gives what the write path wrote and what a
+    /// replay from nothing gives.
+    fn a_rebuilt_run_tree_matches_the_write_path_and_a_replay() {
+        let (_controller, worker, step) = replicated_step_pair();
+        worker
+            .set_step_state(&step, "ready", Some("a seat can take it"))
+            .unwrap();
+        worker_work(&worker, &step, "claim", None, "debug-claim");
+        let written = worker.step_run(&step).unwrap().unwrap();
+        {
+            let mut connection = worker.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let root = run_tree_of_tx(&transaction, &step).unwrap().unwrap();
+            rebuild_run_tree_tx(&transaction, &root).unwrap();
+            transaction.commit().unwrap();
+        }
+        let rebuilt = worker.step_run(&step).unwrap().unwrap();
+        worker.replay_replication_graph().unwrap();
+        let replayed = worker.step_run(&step).unwrap().unwrap();
+        assert_eq!(
+            (&written.status, &written.claimant),
+            (&rebuilt.status, &rebuilt.claimant)
+        );
+        assert_eq!(
+            (&rebuilt.status, &rebuilt.claimant),
+            (&replayed.status, &replayed.claimant)
+        );
+    }
+
+    #[test]
+    /// A run that adopted a new revision keeps its new generation when its tree is rebuilt.
+    fn a_rebuilt_run_tree_keeps_an_adopted_revision() {
+        let store = Store::open_memory("node").unwrap();
+        let source = |revision: usize| {
+            format!(
+                "version 2\nmission \"adopt\" state=\"ready\" {{\n  goal \"Revision {revision}.\"\n  step \"prepare\" {{ }}\n  step \"check\" {{ depends-on {{ step \"prepare\" completed }} }}\n}}\n"
+            )
+        };
+        let publish = |revision: usize| {
+            let intent = crate::graph::parse_test_intent(&source(revision), "node").unwrap();
+            let planned = store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source(revision),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            store
+                .apply(
+                    &intent,
+                    &planned.subject_tokens,
+                    &format!("adopt-{revision}"),
+                )
+                .unwrap();
+            intent
+        };
+        publish(1);
+        let run = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "adopt".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "adopt-run".into(),
+            })
+            .unwrap();
+        let intent = publish(2);
+        store
+            .adopt_mission_revision(
+                &run.id,
+                &intent.missions["adopt"],
+                "person/test",
+                "reopen it",
+                "adopt-key",
+            )
+            .unwrap();
+        let written = store.mission_run(&run.id).unwrap().unwrap();
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            let root = run_tree_of_tx(&transaction, &run.subject).unwrap().unwrap();
+            rebuild_run_tree_tx(&transaction, &root).unwrap();
+            transaction.commit().unwrap();
+        }
+        let rebuilt = store.mission_run(&run.id).unwrap().unwrap();
+        store.replay_replication_graph().unwrap();
+        let replayed = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(written.generation, rebuilt.generation);
+        assert_eq!(
+            (&rebuilt.generation, &rebuilt.status),
+            (&replayed.generation, &replayed.status)
+        );
+    }
+
+    #[test]
+    fn lanes_runtime_actions_and_intake_extend_the_graph_incrementally() {
+        for kind in [
+            "lane.marked",
+            "lane.joined",
+            "runtime.action.requested",
+            "runtime.action.succeeded",
+            "subscription.mission-requested",
+            "subscription.mission-started",
+            "observer.refresh-requested",
+            "publication.operation",
+        ] {
+            assert!(Store::simple_replication_kind(kind), "{kind}");
+        }
+        // Projections read loop and attention claims, or rebuild from checkpoints and repairs.
+        for kind in [
+            "planning-session.started",
+            "loop.round-result",
+            "attention.resolved",
+            "checkpoint.sealed",
+            "record.repaired",
+        ] {
+            assert!(!Store::simple_replication_kind(kind), "{kind}");
+        }
     }
 
     #[test]
@@ -40248,8 +41145,8 @@ mission "takeover" state="ready" {
             receive_and_project(target, "source", &older);
         };
         newest_first(&reversed);
-        // Later writes that arrive out of order make each node replay the claims it already
-        // projected, including the reopened generation.
+        // Later writes that arrive out of order make each node rebuild the run tree it already
+        // projected, including the reopened generation, without replaying the graph.
         let smoke = takeover_step(&reopened, "smoke-check").subject.clone();
         source.set_step_state(&smoke, "ready", None).unwrap();
         source
@@ -40258,7 +41155,10 @@ mission "takeover" state="ready" {
         FULL_REPLAYS.with(|replays| replays.set(0));
         newest_first(&stepwise);
         newest_first(&reversed);
-        assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 2);
+        assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0);
+        // A replay from nothing, as a heal runs, projects the same graph.
+        stepwise.replay_replication_graph().unwrap();
+        reversed.replay_replication_graph().unwrap();
         sync(&late);
 
         let graph = |store: &Store| {
@@ -40299,7 +41199,8 @@ mission "takeover" state="ready" {
                 &exchange_from(source, &target.replication_inventory().unwrap()),
             );
         };
-        // The newest envelope arrives before the older ones, so the target replays from nothing.
+        // The newest envelope arrives before the older ones, so the target rebuilds the run tree
+        // it reaches out of order; then it replays from nothing, as a heal does.
         let replay = |source: &Store, target: &Store| {
             let mut older = exchange_from(source, &target.replication_inventory().unwrap());
             let newest = older.envelopes.split_off(older.envelopes.len() - 1);
@@ -40313,10 +41214,12 @@ mission "takeover" state="ready" {
                 },
             );
             receive_and_project(target, "source", &older);
-            assert!(
-                FULL_REPLAYS.with(std::cell::Cell::get) > 0,
-                "the target replays from nothing"
+            assert_eq!(
+                FULL_REPLAYS.with(std::cell::Cell::get),
+                0,
+                "out-of-order history rebuilds only the run tree it reaches"
             );
+            target.replay_replication_graph().unwrap();
         };
         let shown = |store: &Store, run: &MissionRunView| {
             let view = store.mission_run(&run.id).unwrap().unwrap();
