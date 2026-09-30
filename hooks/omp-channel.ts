@@ -383,7 +383,11 @@ export default function (pi: ExtensionAPI) {
             settle("");
             return;
           }
+          state.reconnectAttempt = 0;
           send({ type: "ready", sessionId: nativeSessionId });
+          // Every fresh channel needs the provider's idle proof, including reconnects
+          // during an idle session where no further turn boundary will arrive.
+          watchSettle(ctx);
           // The fence proves only the first session restored by this cold launch. A later explicit
           // in-process session switch becomes the current binding and must not inherit the old ID.
           expectedNativeSession = undefined;
@@ -437,7 +441,7 @@ export default function (pi: ExtensionAPI) {
     if (state.shuttingDown || state.reconnectTimer !== undefined) return;
     const attempt = Math.min((state.reconnectAttempt ?? 0) + 1, 6);
     state.reconnectAttempt = attempt;
-    const delay = Math.min(500 * (2 ** (attempt - 1)), 15_000);
+    const delay = Math.min(500 * (2 ** (attempt - 1)), 5_000);
     state.reconnectTimer = setTimeout(() => {
       state.reconnectTimer = undefined;
       if (!state.shuttingDown && !state.child) void open(ctx, true);
@@ -894,11 +898,6 @@ export default function (pi: ExtensionAPI) {
       // Seed the context record, so a resumed session publishes the window it resumed INTO
       // rather than waiting for its first turn boundary.
       sendContext(ctx);
-      // st starts a seat with no prompt, so no turn follows and no `agent_end` would ever report
-      // the idle edge that lets the channel deliver mail. Prove idle with the same bounded poll,
-      // which first samples after this handler has returned. A turn a person or a positional
-      // prompt already started keeps the proof false and reports itself through `agent_start`.
-      watchSettle(ctx);
     }
     if (restored.trim()) {
       // A custom message participates in LLM context without triggering a turn of its own.

@@ -1,0 +1,4 @@
+{
+  "commit": "678103d3e8ae873a158bb2cb951d3ffefdf698c4",
+  "why": "The real st3 channel immediately before graceful messaging reexec and delivery reports. The messaging fault eval tests it under the candidate daemon, driver and extension."
+}

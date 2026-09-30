@@ -47,6 +47,21 @@ class OracleTests(unittest.TestCase):
                 proof.update(change)
                 self.assertIn(reason, "; ".join(runner.judge(proof)))
 
+    def test_legacy_liveness_does_not_claim_a_current_binary(self):
+        self.proof.update(case="old-channel", delivery_after={"state": "legacy"})
+        self.assertEqual([], runner.judge(self.proof))
+        self.proof["delivery_after"] = {"state": "current"}
+        self.assertIn("report is current", "; ".join(runner.judge(self.proof)))
+
+    def test_a_failed_handoff_requires_visibility_in_all_three_views(self):
+        self.proof.update(case="handoff-failed", failed_path_visible=True,
+                          failed_doctor_visible=True, failed_sender_visible=True)
+        self.assertEqual([], runner.judge(self.proof))
+        for field in ("failed_path_visible", "failed_doctor_visible", "failed_sender_visible"):
+            proof = copy.deepcopy(self.proof)
+            proof[field] = False
+            self.assertIn(field, "; ".join(runner.judge(proof)))
+
     def test_injected_harness_restart_allows_exactly_one_replacement(self):
         self.proof.update(case="harness-restart", provider_starts=2, expected_provider_starts=2,
                           provider_pids_after=[456], incarnation_after="456:two")

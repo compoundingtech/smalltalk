@@ -393,6 +393,18 @@ await pause(100);
 assert.strictEqual(acknowledged().filter((id) => id === "message/reopen").length, 1);
 fs.rmSync(outboxPath, { force: true });
 
+// An idle reconnect has no future agent_end to establish readiness. The replacement
+// must receive a fresh idle proof from the same provider, without a synthetic turn.
+await handlers.get("session_start")({}, bareCtx);
+await pause(150);
+const idlePid = Number(fs.readFileSync(pidPath, "utf8").trim().split("\n").at(-1));
+const idleFramesBefore = readFrames().filter((frame) => frame.type === "state" && frame.state === "idle").length;
+process.kill(idlePid, "SIGKILL");
+await pause(1000);
+assert.notStrictEqual(Number(fs.readFileSync(pidPath, "utf8").trim().split("\n").at(-1)), idlePid);
+assert.ok(readFrames().filter((frame) => frame.type === "state" && frame.state === "idle").length > idleFramesBefore,
+  "a replacement channel receives readiness even when no model turn runs");
+
 // The channel may answer after session_start's bounded wait. Its seat context still reaches the
 // next turn, so a slow PTY projection cannot leave an unnamed seat.
 fs.writeFileSync(delayedHelloPath, "1");

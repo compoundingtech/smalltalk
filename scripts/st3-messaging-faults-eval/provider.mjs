@@ -75,6 +75,10 @@ const api = {
     const ids = matched.map(frame => frame.subject);
     for (const frame of matched) pendingFrames.splice(pendingFrames.indexOf(frame), 1);
     if (!ids.length) throw new Error('native message has no immutable envelope id');
+    if (fs.existsSync(`${directory}/handoff-blocked`)) {
+      for (const subject of ids) record({ event: 'handoff-refused', subject });
+      throw new Error('fixture native handoff is temporarily unavailable');
+    }
     for (const subject of ids) {
       record({ event: 'received', subject, content });
       // Reading is the stand-in's model action, after native delivery. Keep a
