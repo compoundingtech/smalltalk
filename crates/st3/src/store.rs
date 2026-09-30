@@ -171,6 +171,10 @@ ON claims(subject, store_index)
 WHERE kind='intent.desired'
    OR json_extract(body, '$.fields.status') NOT IN ('stopped', 'absent', 'exited')
    OR json_extract(body, '$.status') NOT IN ('stopped', 'absent', 'exited');
+-- The gate requests a person reviews, a small part of every gate request a fleet makes.
+CREATE INDEX IF NOT EXISTS claims_human_gate_request_index
+ON claims(json_extract(body, '$.fields.reviewer'), store_index)
+WHERE kind='gate.requested' AND json_extract(body, '$.fields.reviewer') IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS operations (
     id TEXT PRIMARY KEY,
@@ -242,6 +246,33 @@ CREATE TABLE IF NOT EXISTS events (
     subject TEXT NOT NULL,
     body TEXT NOT NULL
 );
+
+-- Every message this node holds claims for: its first claim's store index, and whether a claim
+-- closed it. The claim log alone decides it, through the triggers below, so listing the open
+-- messages reads the open messages rather than every lifecycle claim of every message.
+CREATE TABLE IF NOT EXISTS message_index (
+    subject TEXT PRIMARY KEY,
+    created_index INTEGER NOT NULL,
+    closed INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS message_index_open ON message_index(closed, created_index);
+CREATE TRIGGER IF NOT EXISTS message_index_claim_insert AFTER INSERT ON claims
+WHEN NEW.subject LIKE 'message/%'
+BEGIN
+    INSERT INTO message_index(subject, created_index, closed)
+    VALUES (NEW.subject, NEW.store_index, NEW.kind = 'message.closed')
+    ON CONFLICT(subject) DO UPDATE SET
+        created_index = MIN(created_index, excluded.created_index),
+        closed = MAX(closed, excluded.closed);
+END;
+CREATE TRIGGER IF NOT EXISTS message_index_claim_delete AFTER DELETE ON claims
+WHEN OLD.subject LIKE 'message/%'
+BEGIN
+    DELETE FROM message_index WHERE subject = OLD.subject;
+    INSERT INTO message_index(subject, created_index, closed)
+    SELECT subject, MIN(store_index), MAX(kind = 'message.closed')
+    FROM claims WHERE subject = OLD.subject GROUP BY subject;
+END;
 
 CREATE TABLE IF NOT EXISTS peer_cursors (
     peer TEXT PRIMARY KEY,
@@ -2204,6 +2235,29 @@ fn authoring_pull_request_runs_tx(
     Ok(runs)
 }
 
+/// Fill the message index once, from the claims a store held before the index existed. The
+/// triggers keep it after that.
+fn backfill_message_index(connection: &Connection) -> Result<()> {
+    let filled: bool = connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key='message_index')",
+        [],
+        |row| row.get(0),
+    )?;
+    if filled {
+        return Ok(());
+    }
+    connection.execute_batch(
+        "BEGIN IMMEDIATE;
+         INSERT OR REPLACE INTO message_index(subject, created_index, closed)
+         SELECT subject, MIN(store_index), MAX(kind = 'message.closed')
+         FROM claims WHERE subject LIKE 'message/%'
+         GROUP BY subject;
+         INSERT INTO meta(key, value) VALUES ('message_index', '1');
+         COMMIT;",
+    )?;
+    Ok(())
+}
+
 fn open_read_connection(path: &Path, shared_memory: bool) -> Result<Connection> {
     let flags = if shared_memory {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI
@@ -2250,6 +2304,7 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        backfill_message_index(&connection)?;
         connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(&connection)?;
         {
@@ -2306,6 +2361,7 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        backfill_message_index(&connection)?;
         connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(&connection)?;
         {
@@ -5014,6 +5070,28 @@ impl Store {
         self.mission_run_summaries_for_ids(None)
     }
 
+    /// The run headers of the missions `ids`, without their steps.
+    pub fn mission_run_headers_for_missions(&self, ids: &[String]) -> Result<Vec<MissionRunView>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let sql = MISSION_RUN_HEADER_SELECT.replace(
+            "ORDER BY mission_runs.created_at_unix_ms, mission_runs.id",
+            "WHERE mission_runs.mission_id IN (SELECT value FROM json_each(?1))
+             ORDER BY mission_runs.created_at_unix_ms, mission_runs.id",
+        );
+        let ids = ids
+            .iter()
+            .map(|id| id.trim_start_matches("mission/"))
+            .collect::<Vec<_>>();
+        connection
+            .prepare_cached(&sql)?
+            .query_map([serde_json::to_string(&ids)?], mission_run_header_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     pub fn mission_run_summaries_for_missions(
         &self,
         ids: &[String],
@@ -5078,19 +5156,41 @@ impl Store {
     /// When each run entered its current state, and the outcome someone set on it, from its
     /// state claims in canonical order, so every node that holds the same claims agrees.
     pub fn mission_run_states(&self) -> Result<BTreeMap<String, MissionRunStateMoment>> {
+        self.mission_run_states_among(None)
+    }
+
+    /// `mission_run_states` for the runs `subjects` alone, by their subjects' claims, so a page of
+    /// missions does not read every run's state history.
+    pub fn mission_run_states_for_runs(
+        &self,
+        subjects: &[String],
+    ) -> Result<BTreeMap<String, MissionRunStateMoment>> {
+        self.mission_run_states_among(Some(subjects))
+    }
+
+    fn mission_run_states_among(
+        &self,
+        subjects: Option<&[String]>,
+    ) -> Result<BTreeMap<String, MissionRunStateMoment>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(&format!(
+        let filter = if subjects.is_some() {
+            "claims.subject IN (SELECT value FROM json_each(?1)) AND"
+        } else {
+            "?1 IS NULL AND"
+        };
+        let mut statement = connection.prepare_cached(&format!(
             "SELECT claims.subject, claims.accepted_at_unix_ms, claims.actor,
                     json_extract(claims.body, '$.fields.status'),
                     json_extract(claims.body, '$.fields.phase'),
                     json_extract(claims.body, '$.fields.previous_phase'),
                     json_extract(claims.body, '$.fields.reason')
              FROM claims JOIN batches ON batches.id=claims.batch_id
-             WHERE claims.kind='mission-run.state'
+             WHERE {filter} claims.kind='mission-run.state'
              ORDER BY claims.subject, {CANONICAL_ORDER}"
         ))?;
+        let selected = subjects.map(serde_json::to_string).transpose()?;
         let mut states = BTreeMap::<String, MissionRunStateMoment>::new();
-        for row in statement.query_map([], |row| {
+        for row in statement.query_map([selected], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
@@ -5810,6 +5910,37 @@ impl Store {
         snapshot_unix_ms: u128,
     ) -> Result<Vec<StepRunView>> {
         self.work_history_at_snapshot_with_agentless(actor, snapshot_unix_ms, true)
+    }
+
+    /// One step as the client's work history shows it, found by its subject rather than by
+    /// reading and enriching every step the store has ever run.
+    pub fn client_work_item_at_snapshot(
+        &self,
+        subject: &str,
+        actor: Option<&str>,
+        snapshot_unix_ms: u128,
+    ) -> Result<Option<StepRunView>> {
+        let actor = actor.map(|value| normalize_actor(value, "agent"));
+        let connection = self.readers.get();
+        let view = connection
+            .prepare_cached(
+                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                        lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+                 FROM step_runs
+                 WHERE subject=?3 AND (agentless=0 OR (?1 AND ?2 IS NULL))",
+            )?
+            .query_row(params![true, actor.as_deref(), subject], step_run_from_row)
+            .optional()?;
+        let Some(mut view) = view else {
+            return Ok(None);
+        };
+        enrich_step_queue_at(&connection, &mut view, snapshot_unix_ms)?;
+        let visible_to_actor = actor.as_ref().is_none_or(|actor| {
+            view.assigned_to.as_deref() == Some(actor.as_str())
+                || view.claimant.as_deref() == Some(actor.as_str())
+                || view.available_to.iter().any(|candidate| candidate == actor)
+        });
+        Ok(visible_to_actor.then_some(view))
     }
 
     fn work_history_at_snapshot_with_agentless(
@@ -9319,9 +9450,12 @@ impl Store {
 
     pub fn event_bounds(&self) -> Result<(u64, u64)> {
         let connection = self.readers.get();
+        // Two subqueries: SQLite finds a lone MIN or MAX from the index, but reads the whole table
+        // for both in one aggregate.
         connection
             .query_row(
-                "SELECT COALESCE(MIN(store_index), 0), COALESCE(MAX(store_index), 0) FROM events",
+                "SELECT COALESCE((SELECT MIN(store_index) FROM events), 0),
+                        COALESCE((SELECT MAX(store_index) FROM events), 0)",
                 [],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
@@ -9468,6 +9602,54 @@ impl Store {
              FROM desired WHERE owner_step=?1 ORDER BY subject",
         )?;
         let rows = statement.query_map([owner_step], desired_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The desired subjects named in `subjects`, by their primary keys.
+    pub fn desired_subjects_named(&self, subjects: &[String]) -> Result<Vec<DesiredSubject>> {
+        if subjects.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
+             FROM desired WHERE subject IN (SELECT value FROM json_each(?1)) ORDER BY subject",
+        )?;
+        let rows = statement.query_map([serde_json::to_string(subjects)?], desired_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The desired subjects that the runs `owner_runs` own.
+    pub fn desired_subjects_for_owner_runs(
+        &self,
+        owner_runs: &[String],
+    ) -> Result<Vec<DesiredSubject>> {
+        if owner_runs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
+             FROM desired WHERE owner_run IN (SELECT value FROM json_each(?1)) ORDER BY subject",
+        )?;
+        let rows = statement.query_map([serde_json::to_string(owner_runs)?], desired_from_row)?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// The desired subjects that the steps `owner_steps` own.
+    pub fn desired_subjects_for_owner_steps(
+        &self,
+        owner_steps: &[String],
+    ) -> Result<Vec<DesiredSubject>> {
+        if owner_steps.is_empty() {
+            return Ok(Vec::new());
+        }
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step
+             FROM desired WHERE owner_step IN (SELECT value FROM json_each(?1)) ORDER BY subject",
+        )?;
+        let rows = statement.query_map([serde_json::to_string(owner_steps)?], desired_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
@@ -9874,42 +10056,13 @@ impl Store {
             }
             return Ok((output, next_after));
         }
-        let mut statement = connection.prepare(
-            "SELECT claims.subject, claims.store_index
-             FROM claims
-             WHERE claims.subject LIKE 'message/%'
-               AND claims.store_index>?3 AND claims.store_index<=?4
-               AND NOT EXISTS (
-                   SELECT 1 FROM claims earlier
-                   WHERE earlier.subject=claims.subject
-                     AND earlier.store_index<claims.store_index
-               )
-               AND (?1 OR NOT EXISTS (
-                   SELECT 1 FROM claims closed
-                   WHERE closed.subject=claims.subject AND closed.kind='message.closed'
-               ))
-               AND (?2 IS NULL OR EXISTS (
-                   SELECT 1 FROM claims sent
-                   WHERE sent.subject=claims.subject
-                     AND sent.kind='message.sent'
-                     AND CASE
-                         WHEN json_extract(sent.body, '$.fields.to')='' OR json_extract(sent.body, '$.fields.to')='requester' OR instr(json_extract(sent.body, '$.fields.to'), '/')>0
-                         THEN json_extract(sent.body, '$.fields.to')
-                         ELSE 'agent/' || json_extract(sent.body, '$.fields.to')
-                     END=?2
-               ) OR EXISTS (
-                   SELECT 1
-                   FROM desired, json_each(desired.body, '$.children') child
-                   WHERE desired.subject=claims.subject
-                     AND desired.kind='message'
-                     AND json_extract(child.value, '$.name')='to'
-                     AND CASE
-                         WHEN json_extract(child.value, '$.arguments[0]')='' OR json_extract(child.value, '$.arguments[0]')='requester' OR instr(json_extract(child.value, '$.arguments[0]'), '/')>0
-                         THEN json_extract(child.value, '$.arguments[0]')
-                         ELSE 'agent/' || json_extract(child.value, '$.arguments[0]')
-                     END=?2
-               ))
-             ORDER BY claims.store_index, claims.subject LIMIT ?5",
+        // Every recipient took the indexed path above. Without one, the message index lists the
+        // open messages, or all of them, without reading their lifecycle claims.
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, created_index FROM message_index
+             WHERE (?1 OR closed=0) AND ?2 IS NULL
+               AND created_index>?3 AND created_index<=?4
+             ORDER BY created_index, subject LIMIT ?5",
         )?;
         let mut subjects = statement
             .query_map(
@@ -18815,7 +18968,7 @@ fn pending_human_reviews_tx(
             "SELECT request.id, request.store_index, request.batch_id, request.subject,
                     request.kind, request.origin, request.actor, request.body,
                     request.predecessors, request.accepted_at_unix_ms
-             FROM claims request
+             FROM claims request INDEXED BY claims_human_gate_request_index
              WHERE request.kind='gate.requested'
                AND json_extract(request.body, '$.fields.reviewer') IS NOT NULL
                AND (?1 IS NULL OR json_extract(request.body, '$.fields.reviewer')=?1)
@@ -23352,6 +23505,8 @@ thread_local! {
     static GRAPH_DIGESTS_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FULL_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static SUBJECT_REDUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Steps whose queue, timing and wake a read enriched, so a test can see a read's work.
+    pub(crate) static STEPS_ENRICHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The projected tables the graph digest commits: digest label, table, digested columns in
@@ -28482,6 +28637,8 @@ fn enrich_step_queue_at(
     view: &mut StepRunView,
     snapshot_unix_ms: u128,
 ) -> rusqlite::Result<()> {
+    #[cfg(test)]
+    STEPS_ENRICHED.with(|enriched| enriched.set(enriched.get() + 1));
     apply_effective_step_state(connection, view, snapshot_unix_ms)?;
     let (execution_started_at_unix_ms, execution_elapsed_ms) = step_execution_timing_at(
         connection,
@@ -36814,6 +36971,104 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                 .code,
             "expired-capability"
         );
+    }
+
+    /// The message index follows the claim log: each message's first claim, closed once a claim
+    /// closes it. A message whose claims a checkpoint removes is indexed again from the rest, and
+    /// a store written before the index existed fills it once from its claims.
+    #[test]
+    fn the_message_index_follows_the_message_claims() {
+        let store = Store::open_memory("node").unwrap();
+        let append = |subject: &str, kind: &str, status: &str, actor: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some(actor.into()),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("{subject}-{kind}")),
+                })
+                .unwrap()
+        };
+        for message in 0..3 {
+            append(
+                &format!("message/index-{message}"),
+                "message.sent",
+                "sent",
+                "requester",
+            );
+        }
+        for (kind, status) in [
+            ("message.delivered", "delivered"),
+            ("message.read", "read"),
+            ("message.closed", "closed"),
+        ] {
+            append("message/index-0", kind, status, "agent/worker");
+        }
+        let indexed = |store: &Store| {
+            let connection = store.readers.get();
+            let rows = |sql: &str| {
+                connection
+                    .prepare(sql)
+                    .unwrap()
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, u64>(1)?,
+                            row.get::<_, bool>(2)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            (
+                rows("SELECT subject, created_index, closed FROM message_index ORDER BY subject"),
+                rows(
+                    "SELECT subject, MIN(store_index), MAX(kind = 'message.closed') FROM claims
+                     WHERE subject LIKE 'message/%' GROUP BY subject ORDER BY subject",
+                ),
+            )
+        };
+        let (index, claims) = indexed(&store);
+        assert_eq!(index, claims);
+        assert_eq!(index.iter().filter(|(_, _, closed)| *closed).count(), 1);
+        let open = store
+            .messages(None, false)
+            .unwrap()
+            .into_iter()
+            .map(|message| message.subject)
+            .collect::<Vec<_>>();
+        assert_eq!(open, ["message/index-1", "message/index-2"]);
+        assert_eq!(store.messages(None, true).unwrap().len(), 3);
+
+        // A checkpoint removes the rows that refer to a claim before the claim itself.
+        store
+            .connection
+            .write()
+            .execute_batch(
+                "PRAGMA foreign_keys = OFF;
+                 DELETE FROM claims WHERE subject='message/index-0' AND kind='message.closed';
+                 PRAGMA foreign_keys = ON;",
+            )
+            .unwrap();
+        let (index, claims) = indexed(&store);
+        assert_eq!(index, claims);
+        assert_eq!(store.messages(None, false).unwrap().len(), 3);
+
+        {
+            let connection = store.connection.write();
+            connection
+                .execute_batch(
+                    "DELETE FROM message_index; DELETE FROM meta WHERE key='message_index';",
+                )
+                .unwrap();
+            backfill_message_index(&connection).unwrap();
+        }
+        let (index, claims) = indexed(&store);
+        assert_eq!(index, claims);
     }
 
     #[test]
