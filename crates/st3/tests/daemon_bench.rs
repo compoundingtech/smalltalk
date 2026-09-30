@@ -320,6 +320,15 @@ async fn bench(name: &str, source: &Path, settings: &Settings) -> Run {
     while UnixStream::connect(&socket).is_err() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    let subjects = {
+        let store = store.clone();
+        let seats = settings.seats;
+        tokio::task::spawn_blocking(move || fleet_subjects(&store, seats))
+            .await
+            .unwrap()
+    };
+    // The fleet takes its steps before the reconciler starts, which could otherwise block a step
+    // between its turning ready and its claim.
     let reconciler = settings.reconciler.then(|| {
         let reconciler = Arc::new(
             st3::reconcile::Reconciler::native(
@@ -338,13 +347,6 @@ async fn bench(name: &str, source: &Path, settings: &Settings) -> Run {
         tokio::spawn(reconciler.supervise())
     });
 
-    let subjects = {
-        let store = store.clone();
-        let seats = settings.seats;
-        tokio::task::spawn_blocking(move || fleet_subjects(&store, seats))
-            .await
-            .unwrap()
-    };
     let client = Client::unix(&socket);
     let mut subjects = subjects;
     subjects.agents = listed(&client, "/v1/client/agents").await;
