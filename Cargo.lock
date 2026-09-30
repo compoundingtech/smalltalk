@@ -3483,11 +3483,15 @@ dependencies = [
 name = "stui"
 version = "0.1.0"
 dependencies = [
+ "alacritty_terminal",
  "anyhow",
+ "axum",
  "chrono",
  "crossterm",
  "libc",
+ "portable-pty",
  "ratatui",
+ "reqwest",
  "serde",
  "serde_json",
  "signal-hook 0.3.18",

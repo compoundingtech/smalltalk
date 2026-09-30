@@ -2,6 +2,9 @@
 
 Fleet replication is optional. A node without peer configuration is a complete local-only st system.
 
+A laptop running only stui can instead be a [paired client device](client-only.md), with no daemon
+or replica. Devices read and act through a member's client gateway and are not sync peers.
+
 Replication makes the logical authority equal across configured nodes. It does not make the SQLite files byte-identical.
 
 ## Configuration

@@ -44,6 +44,8 @@ impl Collection {
 
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Model {
+    #[serde(default)]
+    pub last_connected: Option<String>,
     pub now: Collection,
     pub messages: Collection,
     pub launches: Collection,

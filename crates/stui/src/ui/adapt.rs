@@ -110,8 +110,11 @@ fn short(id: &str) -> String {
 }
 
 pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
-    let link = if let Some(error) = &extras.offline {
-        Link::Offline(error.clone())
+    let link = if extras.offline.is_some() {
+        Link::Offline(match &model.last_connected {
+            Some(at) => format!("Last connected at {at} · reconnecting · r retry now"),
+            None => "No member reachable · reconnecting · r retry now".into(),
+        })
     } else if extras.live {
         Link::Live
     } else {

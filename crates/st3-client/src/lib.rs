@@ -98,7 +98,7 @@ pub enum Endpoint {
     FabricLoopback(String),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct Client {
     endpoint: Endpoint,
     credential: Option<String>,
@@ -107,6 +107,16 @@ pub struct Client {
     max_response_bytes: Arc<AtomicUsize>,
     outage_wait: Duration,
     announce_outage_wait: bool,
+}
+
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("endpoint", &self.endpoint)
+            .field("paired", &self.credential.is_some())
+            .field("local_person", &self.local_person)
+            .finish_non_exhaustive()
+    }
 }
 
 /// An open terminal stream. Each message is a whole screen that replaces every earlier one.

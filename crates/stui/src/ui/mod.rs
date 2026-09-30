@@ -521,6 +521,16 @@ impl Ui {
 
     fn footer(&self, buf: &mut Buffer, area: Rect) {
         buf.set_style(area, Style::default().bg(theme::CRUST));
+        if let Link::Offline(message) = &self.world.link {
+            buf.set_stringn(
+                area.x + 1,
+                area.y,
+                message,
+                area.width.saturating_sub(2) as usize,
+                Style::default().fg(theme::YELLOW).bg(theme::CRUST),
+            );
+            return;
+        }
         let hints: Vec<(&str, &str)> = if self.terminal.is_some() && self.tab == 1 {
             vec![
                 ("ctrl+\\", "return"),
