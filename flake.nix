@@ -429,7 +429,7 @@
             printf '%s\n' pty st st3 st3-migrate stui > expected-package-bin
             ls ${st3}/bin | sort > actual-package-bin
             cmp expected-package-bin actual-package-bin
-  
+
             mkdir built
             ln -s ${st3}/bin/st3 ${st3}/bin/st3-migrate ${st3}/bin/stui built/
             bash ${self}/scripts/install --from built --bin-dir "$PWD/bin"
@@ -442,7 +442,7 @@
             cmp st.help st3.help
             bin/st3-migrate --help > /dev/null
             bin/stui --help > /dev/null
-  
+
             bash ${self}/scripts/install-test
             touch $out
           '';
