@@ -2471,7 +2471,10 @@ struct AgentApplyArgs {
 
 #[derive(Args)]
 struct AgentStartArgs {
-    /// Stable seat identity. Slash-qualified identities are preserved exactly after `agent/`.
+    /// Seat identity or complete subject, e.g. example/worker or agent/example/worker.
+    /// Slash-qualified and dotted identities are exact; a simple name becomes agent/HOST.NAME.
+    /// A doubled agent/agent/ prefix is rejected.
+    #[arg(value_parser = parse_agent_start_identity)]
     identity: String,
     #[arg(long, default_value = "claude", value_parser = ["claude", "codex", "pi", "omp", "opencode"])]
     harness: String,
@@ -8026,6 +8029,17 @@ async fn run_agents(
         }
         command => run_agent_inspection(endpoint, command, json_output).await,
     }
+}
+
+fn parse_agent_start_identity(identity: &str) -> Result<String, String> {
+    if identity.starts_with("agent/agent/") {
+        return Err(
+            "doubled agent/agent/ prefix; accepted forms are ID or agent/ID \
+             (for example, example/worker or agent/example/worker)"
+                .into(),
+        );
+    }
+    Ok(identity.strip_prefix("agent/").unwrap_or(identity).into())
 }
 
 fn agent_start_document(args: &AgentStartArgs) -> Result<String> {

@@ -1253,6 +1253,11 @@ harness defaults, waits until its harness is ready, and attaches from any fleet 
 `--print-kdl` prints the exact declaration. `st agents stop SUBJECT` publishes an explicit root
 stop.
 
+For `agents start`, `fleet/cos/standing/cos` and `agent/fleet/cos/standing/cos` both name
+`agent/fleet/cos/standing/cos`. Pass an identity or its complete `agent/` subject, never a doubled
+`agent/agent/` prefix. Slash-qualified and dotted identities are exact; a simple name becomes
+`agent/HOST.NAME` on its placement host.
+
 A mission run does not stop because a controller deletes its runtime. The graph must publish cancellation.
 
 ```kdl
