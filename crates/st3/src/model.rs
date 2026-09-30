@@ -1643,7 +1643,8 @@ pub struct AttentionClosing {
 }
 
 /// One mission request that a subscription recorded, with its current disposition: `pending`,
-/// `held` for a person, `started`, `cancelled`, or `failed` when its run could not be created.
+/// legacy `held` awaiting automatic migration, `started`, `cancelled`, or `failed` when its run
+/// could not be created.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct SubscriptionRequestView {
     pub request: String,

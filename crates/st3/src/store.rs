@@ -2325,10 +2325,6 @@ fn subscription_request_view(
     }
 }
 
-/// The most mission runs one resource observation requests at once for one subscription. The
-/// remaining requests wait for a person.
-pub const MAX_OBSERVATION_DELIVERIES: usize = 5;
-
 /// One repository item whose recorded facts changed. `deliver` says whether the change asks a
 /// subscription for a review or a triage.
 struct DiscoveredItem {
@@ -12125,7 +12121,6 @@ impl Store {
                                     .map(|claim| vec![(resource.to_owned(), claim.id.clone())])
                                     .unwrap_or_default()
                             };
-                            let mut requested_count = 0;
                             for (delivery_resource, discovery) in discoveries {
                                 let discovery_body = transaction
                                     .query_row("SELECT body FROM claims WHERE id=?1", [&discovery], |row| {
@@ -12192,14 +12187,6 @@ impl Store {
                                         .expect("subscription request fields are an object")
                                         .insert("mission_revision".into(), Value::String(revision.into()));
                                 }
-                                // One observation starts a bounded number of runs. A person releases or
-                                // cancels the rest.
-                                if requested_count >= MAX_OBSERVATION_DELIVERIES {
-                                    request_fields
-                                        .as_object_mut()
-                                        .expect("subscription request fields are an object")
-                                        .insert("held".into(), Value::Bool(true));
-                                }
                                 if let Some(requester) = subscription.requester.as_deref() {
                                     request_fields
                                         .as_object_mut()
@@ -12217,7 +12204,6 @@ impl Store {
                                     Some(&batch_id),
                                 )
                                 .map_err(claim_append_error)?;
-                                requested_count += 1;
                             }
                             continue;
                         }

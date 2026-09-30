@@ -1547,14 +1547,14 @@ enum MissionViewCommand {
         /// Exact seat subject or its identity without the `agent/` prefix.
         agent: String,
     },
-    /// List the open mission requests that one subscription recorded.
+    /// Show one subscription's automatic mission request queue.
     Requests {
         subscription: String,
         /// Include started, cancelled, and failed requests.
         #[arg(long)]
         all: bool,
     },
-    /// Start one mission request that an observation held for a person.
+    /// Release a legacy held request; new requests are queued automatically.
     Release(SubscriptionRequestArgs),
     /// Close one pending or held mission request without starting it.
     CancelRequest(SubscriptionRequestArgs),
