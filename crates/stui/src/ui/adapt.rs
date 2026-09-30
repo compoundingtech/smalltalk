@@ -8,7 +8,7 @@ use crate::model::{Model, clean_message_text};
 use serde_json::Value;
 use st3_client::{MissionStep, WorkLabel};
 use st3_client::{TimelineBody, TimelineEntry, TimelineRole, TimelineToolStatus};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// What the live loop has fetched beside the model: conversations and launch previews.
 #[derive(Default)]
@@ -879,6 +879,16 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
     // harness transcript heads its own turns with message entries too; only a graph message,
     // `message/…`, is Small Talk.
     let mut mail: Option<&st3_client::TimelineMessageBody> = None;
+    // A harness that wraps a delivery in its own prompt repeats mail the stream may already show.
+    let shown = timeline
+        .iter()
+        .filter_map(|entry| match &entry.body {
+            TimelineBody::Message(message) if message.message_id.starts_with("message/") => {
+                Some(message.message_id.clone())
+            }
+            _ => None,
+        })
+        .collect::<BTreeSet<_>>();
     for entry in timeline {
         let at = clock(&entry.timestamp);
         if let TimelineBody::Message(message) = &entry.body {
@@ -932,8 +942,13 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                 let bodies = from_harness(
                     entry.role == TimelineRole::User,
                     content.text.as_deref().unwrap_or(""),
+                    &shown,
                 );
-                for (index, body) in bodies.into_iter().enumerate() {
+                for (index, mut body) in bodies.into_iter().enumerate() {
+                    if let Body::Mail { from, to, .. } = &mut body {
+                        *from = name(from);
+                        *to = name(to);
+                    }
                     stamped.push((
                         entry.timestamp.clone(),
                         Entry {
@@ -973,9 +988,10 @@ pub fn conversation(timeline: &[TimelineEntry], names: &BTreeMap<String, String>
                 }
             }
             (_, TimelineBody::ToolResult(result)) => {
-                let output = tool_output(&result.content);
+                let (output, command_failed) = tool_output(&result.content);
                 let state = match result.status {
                     TimelineToolStatus::Error => ToolState::Failed,
+                    _ if command_failed => ToolState::Failed,
                     _ => ToolState::Ok,
                 };
                 if let Some(index) = tools.get(&result.call_id).copied()
@@ -1143,10 +1159,88 @@ fn shorten(text: &str, max: usize) -> String {
     }
 }
 
+/// The value of `name="…"` in a tag's head, unescaped.
+fn attribute(head: &str, name: &str) -> Option<String> {
+    let start = head.find(&format!(" {name}=\""))? + name.len() + 3;
+    let end = head[start..].find('"')? + start;
+    Some(unescape(&head[start..end]))
+}
+
+/// Undo the XML escaping st applies to a delivery's attributes and body.
+fn unescape(text: &str) -> String {
+    text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Every `<tag …>` head in `text`, in order, so the blocks `take_blocks` returns can be matched
+/// with their attributes.
+fn heads(text: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}");
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(offset) = text[from..].find(&open) {
+        let start = from + offset;
+        let end = text[start..]
+            .find('>')
+            .map(|index| start + index + 1)
+            .unwrap_or(text.len());
+        found.push(text[start..end].to_owned());
+        from = end;
+    }
+    found
+}
+
 /// A user or system entry from a harness transcript, turned into what a person should see.
-pub fn from_harness(is_user: bool, raw: &str) -> Vec<Body> {
+/// `shown` holds the graph messages the stream already draws as mail: a delivery of one of
+/// those is a line, and a delivery of any other is the mail itself.
+pub fn from_harness(is_user: bool, raw: &str, shown: &BTreeSet<String>) -> Vec<Body> {
     let mut text = raw.replace("\r\n", "\n");
     let mut bodies = Vec::new();
+    // st's own envelope, as codex and the pi family receive it.
+    let envelopes = heads(&text, "smalltalk-message");
+    for (block, head) in take_blocks(&mut text, "smalltalk-message")
+        .into_iter()
+        .zip(envelopes)
+    {
+        let from = attribute(&head, "from").unwrap_or_default();
+        let subject = attribute(&head, "subject").unwrap_or_default();
+        let graph = attribute(&head, "graph").unwrap_or_default();
+        bodies.push(if shown.contains(&graph) {
+            Body::Event(format!(
+                "delivered to the agent: {} · from {}",
+                shorten(&subject, 80),
+                short(&from)
+            ))
+        } else {
+            Body::Mail {
+                from,
+                to: attribute(&head, "to").unwrap_or_default(),
+                subject,
+                body: clean_message_text(&unescape(&block)),
+            }
+        });
+    }
+    // `[PING from st3] message/ID from SENDER: TITLE` announces mail on its own line.
+    let mut kept = Vec::new();
+    for line in text.lines() {
+        let ping = line
+            .trim()
+            .strip_prefix("[PING from st3] ")
+            .and_then(|rest| rest.split_once(" from "))
+            .and_then(|(_, rest)| rest.split_once(": "));
+        match ping {
+            Some((sender, title)) => bodies.push(Body::Event(format!(
+                "delivered to the agent: {} · from {}",
+                shorten(title, 80),
+                short(sender)
+            ))),
+            None => kept.push(line),
+        }
+    }
+    text = kept.join("\n");
     for block in take_blocks(&mut text, "task-notification") {
         let status = field(&block, "status").unwrap_or_else(|| "update".into());
         let summary = field(&block, "summary").unwrap_or_default();
@@ -1246,6 +1340,18 @@ fn clock(timestamp: &str) -> String {
 }
 
 fn tool_title(name: &str, arguments: &Value) -> String {
+    // Codex's code mode passes a script; its commands are what a person wants to see.
+    if let Value::String(script) = arguments {
+        let commands = script_commands(script);
+        return match commands.as_slice() {
+            [] => format!("{name} {}", shorten(script, 100)),
+            [only] => format!("$ {}", first_line(only)),
+            [first, rest @ ..] => format!("$ {} (+{} more)", first_line(first), rest.len()),
+        };
+    }
+    if let Some(ms) = arguments.get("duration_ms").and_then(Value::as_u64) {
+        return format!("{name} {}s", ms.div_ceil(1000));
+    }
     let pick = [
         "command",
         "cmd",
@@ -1260,29 +1366,266 @@ fn tool_title(name: &str, arguments: &Value) -> String {
     .find_map(|key| arguments.get(key).and_then(Value::as_str));
     match (name, pick) {
         ("Bash" | "bash" | "shell" | "exec_command", Some(command)) => {
-            format!("$ {}", command.lines().next().unwrap_or(command))
+            format!("$ {}", first_line(command))
         }
-        (_, Some(detail)) => format!("{name} {}", detail.lines().next().unwrap_or(detail)),
+        (_, Some(detail)) => format!("{name} {}", first_line(detail)),
         _ => name.to_owned(),
     }
 }
 
-fn tool_output(content: &Value) -> Vec<String> {
-    let text = match content {
-        Value::String(text) => text.clone(),
+fn first_line(text: &str) -> &str {
+    text.trim().lines().next().unwrap_or("")
+}
+
+/// The shell commands in a codex code-mode script: each `cmd:` string literal it passes to
+/// `exec_command`, unescaped.
+fn script_commands(script: &str) -> Vec<String> {
+    let mut commands = Vec::new();
+    let mut rest = script;
+    while let Some(offset) = rest.find("cmd:") {
+        rest = rest[offset + 4..].trim_start();
+        let Some(quote) = rest
+            .chars()
+            .next()
+            .filter(|c| matches!(c, '"' | '\'' | '`'))
+        else {
+            continue;
+        };
+        let mut command = String::new();
+        let mut chars = rest[1..].char_indices();
+        let mut end = rest.len();
+        while let Some((index, c)) = chars.next() {
+            match c {
+                '\\' => match chars.next() {
+                    Some((_, 'n')) => command.push('\n'),
+                    Some((_, 't')) => command.push('\t'),
+                    Some((_, other)) => command.push(other),
+                    None => {}
+                },
+                c if c == quote => {
+                    end = index + 2;
+                    break;
+                }
+                c => command.push(c),
+            }
+        }
+        commands.push(command);
+        rest = &rest[end.min(rest.len())..];
+    }
+    commands
+}
+
+/// What a tool printed, and whether a command in it failed. Codex's code mode reports each
+/// command as JSON (`{"exit_code":…,"output":…}`, inside `{"status":…,"value":…}` when the
+/// script awaited several); those become the command's own output.
+fn tool_output(content: &Value) -> (Vec<String>, bool) {
+    if is_redacted(content) {
+        return (vec!["output not recorded".into()], false);
+    }
+    let mut cut = false;
+    let texts: Vec<String> = match content {
+        // Some transcripts store the content array as JSON text, which st cuts at 8 KB.
+        Value::String(text) => {
+            let whole = text.strip_suffix(CUT_MARKER);
+            cut = whole.is_some();
+            let text = whole.unwrap_or(text);
+            match serde_json::from_str::<Value>(text) {
+                Ok(inner @ Value::Array(_)) if !cut => return tool_output(&inner),
+                _ if text.trim_start().starts_with("[{") => {
+                    let mut texts = string_fields(text, "text");
+                    texts.extend(std::iter::repeat_n(
+                        IMAGE.to_owned(),
+                        text.matches("\"type\":\"image\"").count(),
+                    ));
+                    if texts.is_empty() {
+                        vec![text.to_owned()]
+                    } else {
+                        texts
+                    }
+                }
+                _ => vec![text.to_owned()],
+            }
+        }
         Value::Array(items) => items
             .iter()
-            .filter_map(|item| item.get("text").and_then(Value::as_str).or(item.as_str()))
-            .collect::<Vec<_>>()
-            .join("\n"),
-        Value::Null => String::new(),
-        other => other
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .unwrap_or_else(|| other.to_string()),
+            .filter_map(|item| {
+                if item.get("type").and_then(Value::as_str) == Some("image") {
+                    return Some(IMAGE.to_owned());
+                }
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .or(item.as_str())
+                    .map(str::to_owned)
+            })
+            .collect(),
+        Value::Null => vec![],
+        other => vec![
+            other
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .unwrap_or_else(|| other.to_string()),
+        ],
     };
-    text.lines().take(400).map(str::to_owned).collect()
+    let mut lines = Vec::new();
+    let mut failed = false;
+    for text in texts {
+        for line in text.lines() {
+            let Some(reports) = command_report(line) else {
+                // Code mode's own preamble says nothing the reports do not.
+                if !matches!(line.trim(), "Script completed" | "Output:")
+                    && !line.starts_with("Wall time ")
+                {
+                    lines.push(line.to_owned());
+                }
+                continue;
+            };
+            for (output, exit) in reports {
+                if lines
+                    .last()
+                    .is_some_and(|line: &String| !line.trim().is_empty())
+                {
+                    lines.push(String::new());
+                }
+                lines.extend(output.lines().map(str::to_owned));
+                if let Some(code) = exit.filter(|code| *code != 0) {
+                    failed = true;
+                    lines.push(format!("exit {code}"));
+                }
+            }
+        }
+    }
+    while lines.first().is_some_and(|line| line.trim().is_empty()) {
+        lines.remove(0);
+    }
+    while lines.last().is_some_and(|line| line.trim().is_empty()) {
+        lines.pop();
+    }
+    lines.truncate(400);
+    if cut {
+        lines.push("… st kept only the start of this output".into());
+    }
+    (lines, failed)
+}
+
+/// How an image a tool returned is drawn in text.
+const IMAGE: &str = "[image]";
+
+/// What st appends to a transcript value it cut short.
+const CUT_MARKER: &str = "\n[st truncated this native timeline value]";
+
+/// Every `"key":"…"` string in JSON text that may be cut short, decoded; a string the cut
+/// ends early keeps what it had.
+fn string_fields(json: &str, key: &str) -> Vec<String> {
+    let needle = format!("\"{key}\":\"");
+    let mut found = Vec::new();
+    let mut rest = json;
+    while let Some(offset) = rest.find(&needle) {
+        rest = &rest[offset + needle.len()..];
+        let mut value = String::new();
+        let mut chars = rest.char_indices();
+        let mut end = rest.len();
+        while let Some((index, c)) = chars.next() {
+            match c {
+                '"' => {
+                    end = index + 1;
+                    break;
+                }
+                '\\' => match chars.next().map(|(_, escaped)| escaped) {
+                    Some('n') => value.push('\n'),
+                    Some('t') => value.push('\t'),
+                    Some('r') => {}
+                    Some('u') => {
+                        let hex: String = chars.by_ref().take(4).map(|(_, c)| c).collect();
+                        if let Some(c) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32)
+                        {
+                            value.push(c);
+                        }
+                    }
+                    Some(other) => value.push(other),
+                    None => {}
+                },
+                c => value.push(c),
+            }
+        }
+        found.push(value);
+        rest = &rest[end..];
+    }
+    found
+}
+
+/// One line of codex code-mode output that holds command reports, as each report's output and
+/// exit code. Scripts wrap reports as they like (`{"status":"fulfilled","value":…}`,
+/// `{"i":0,"result":…}`, arrays); every report inside counts. A line st cut short keeps what
+/// its reports printed before the cut.
+fn command_report(line: &str) -> Option<Vec<(String, Option<i64>)>> {
+    let line = line.trim();
+    if !(line.starts_with('{') || line.starts_with('['))
+        || ![
+            "\"chunk_id\"",
+            "\"exit_code\"",
+            "\"wall_time_seconds\"",
+            "\"status\":\"rejected\"",
+        ]
+        .iter()
+        .any(|key| line.contains(key))
+    {
+        return None;
+    }
+    let mut reports = Vec::new();
+    match serde_json::from_str::<Value>(line) {
+        Ok(value) => collect_reports(&value, &mut reports),
+        Err(_) => reports.extend(
+            string_fields(line, "output")
+                .into_iter()
+                .map(|output| (output, None)),
+        ),
+    }
+    (!reports.is_empty()).then_some(reports)
+}
+
+fn collect_reports(value: &Value, reports: &mut Vec<(String, Option<i64>)>) {
+    match value {
+        Value::Object(object) => {
+            if let Some(output) = object.get("output").and_then(Value::as_str)
+                && ["exit_code", "chunk_id", "wall_time_seconds"]
+                    .iter()
+                    .any(|key| object.contains_key(*key))
+            {
+                reports.push((
+                    output.to_owned(),
+                    object.get("exit_code").and_then(Value::as_i64),
+                ));
+                return;
+            }
+            if object.get("status").and_then(Value::as_str) == Some("rejected")
+                && let Some(reason) = object.get("reason")
+            {
+                let text = reason
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .or(reason.as_str())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| reason.to_string());
+                reports.push((text, Some(1)));
+                return;
+            }
+            for inner in object.values() {
+                collect_reports(inner, reports);
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                collect_reports(item, reports);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A body some recorders keep only as a digest: `{"redacted":true,"sha256":…,"bytes":…}`.
+fn is_redacted(value: &Value) -> bool {
+    value.get("redacted").and_then(Value::as_bool) == Some(true) && value.get("sha256").is_some()
 }
 
 #[cfg(test)]
@@ -1359,6 +1702,145 @@ mod tests {
         );
         // A harness turn's own message header is not Small Talk.
         assert!(matches!(&entries[2].body, Body::Assistant(text) if text == "On it."));
+    }
+
+    fn tool_pair(arguments: Value, content: Value) -> Vec<Entry> {
+        let timeline: Vec<TimelineEntry> = serde_json::from_value(json!([
+            {"id":"c","sequence":1,"revision":1,"timestamp":"2026-09-30T10:00:00Z","role":"assistant","type":"tool_call","final":true,
+             "body":{"call_id":"call-1","name":"exec","arguments":arguments}},
+            {"id":"r","sequence":2,"revision":1,"timestamp":"2026-09-30T10:00:01Z","role":"tool","type":"tool_result","final":true,
+             "body":{"call_id":"call-1","status":"success","media_type":"application/json","content":content}}
+        ]))
+        .unwrap();
+        conversation(&timeline, &BTreeMap::new())
+    }
+
+    fn tool(entries: &[Entry]) -> (String, ToolState, Vec<String>) {
+        match entries {
+            [
+                Entry {
+                    body:
+                        Body::Tool {
+                            title,
+                            state,
+                            output,
+                        },
+                    ..
+                },
+            ] => (title.clone(), *state, output.clone()),
+            other => panic!("expected one tool, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn codex_code_mode_shows_each_commands_output_and_names_the_commands() {
+        let script = "const r=await Promise.allSettled([\ntools.exec_command({cmd:\"git status --short\"}),\ntools.exec_command({cmd:'cargo test -p harbor',max_output_tokens:8000})]);\ntext(JSON.stringify(r));";
+        let reports = [
+            json!({"status":"fulfilled","value":{"chunk_id":"a1","wall_time_seconds":0.1,"exit_code":0,"original_token_count":3,"output":" M src/lib.rs\n"}}),
+            json!({"i":1,"result":{"status":"fulfilled","value":{"chunk_id":"b2","exit_code":101,"output":"test harbor::keys ... FAILED\n"}}}),
+        ];
+        let entries = tool_pair(
+            Value::String(script.into()),
+            json!([
+                {"type":"input_text","text":"Script completed\nWall time 0.1 seconds\nOutput:\n"},
+                {"type":"input_text","text":format!("{}\n{}", reports[0], reports[1])}
+            ]),
+        );
+        let (title, state, output) = tool(&entries);
+        assert_eq!(title, "$ git status --short (+1 more)");
+        assert_eq!(state, ToolState::Failed, "a command exited 101");
+        assert_eq!(
+            output,
+            [
+                " M src/lib.rs",
+                "",
+                "test harbor::keys ... FAILED",
+                "exit 101"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_result_st_cut_short_reads_as_far_as_it_goes_and_says_so() {
+        let whole = json!([
+            {"type":"input_text","text":"Output:\n"},
+            {"type":"input_text","text":json!({"chunk_id":"c3","exit_code":0,"output":"line one\nline two\nline three that goes on"}).to_string()}
+        ])
+        .to_string();
+        let cut = format!(
+            "{}\n[st truncated this native timeline value]",
+            &whole[..whole.find("three").unwrap()]
+        );
+        let entries = tool_pair(json!({"cmd":"cat notes.txt"}), Value::String(cut));
+        let (title, _, output) = tool(&entries);
+        assert_eq!(title, "exec cat notes.txt");
+        assert_eq!(
+            output,
+            [
+                "line one",
+                "line two",
+                "line",
+                "… st kept only the start of this output"
+            ]
+        );
+    }
+
+    #[test]
+    fn redacted_and_image_results_are_words_not_json() {
+        let redacted = json!({"redacted":true,"sha256":"00ff","bytes":120});
+        let (title, _, output) = tool(&tool_pair(redacted.clone(), redacted));
+        assert_eq!(title, "exec");
+        assert_eq!(output, ["output not recorded"]);
+        let (_, _, output) = tool(&tool_pair(
+            json!({"path":"shot.png"}),
+            json!([{"type":"image","source":{"type":"base64","data":"iVBORw0KGgo="}}]),
+        ));
+        assert_eq!(output, ["[image]"]);
+        let (title, _, _) = tool(&tool_pair(
+            json!({"duration_ms":50000}),
+            json!("Sleep completed."),
+        ));
+        assert_eq!(title, "exec 50s");
+    }
+
+    #[test]
+    fn st_deliveries_in_a_harness_prompt_are_mail_or_a_line_never_markup() {
+        let envelope = "<smalltalk-message id=\"a1\" from=\"agent/fleet/harbor\" to=\"agent/fleet/quay\" subject=\"Keys &amp; locks\" sha256=\"00\" graph=\"message/a1\">\nRotate &lt;all&gt; keys.\n</smalltalk-message>";
+        let bodies = from_harness(true, envelope, &BTreeSet::new());
+        match &bodies[..] {
+            [
+                Body::Mail {
+                    from,
+                    to,
+                    subject,
+                    body,
+                },
+            ] => {
+                assert_eq!(
+                    (from.as_str(), to.as_str()),
+                    ("agent/fleet/harbor", "agent/fleet/quay")
+                );
+                assert_eq!(subject, "Keys & locks");
+                assert_eq!(body, "Rotate <all> keys.");
+            }
+            other => panic!("expected mail, got {other:?}"),
+        }
+        let shown = BTreeSet::from(["message/a1".to_owned()]);
+        let bodies = from_harness(true, envelope, &shown);
+        assert!(
+            matches!(&bodies[..], [Body::Event(line)] if line == "delivered to the agent: Keys & locks · from fleet/harbor"),
+            "{bodies:?}"
+        );
+        let bodies = from_harness(
+            true,
+            "[PING from st3] message/b2 from agent/fleet/quay: Tide tables\nplease look",
+            &BTreeSet::new(),
+        );
+        assert!(
+            matches!(&bodies[..], [Body::User(text), Body::Event(line)]
+                if text == "please look" && line == "delivered to the agent: Tide tables · from fleet/quay"),
+            "{bodies:?}"
+        );
     }
 
     #[test]
@@ -1515,7 +1997,11 @@ mod tests {
 
     #[test]
     fn an_unclosed_wrapper_cannot_leak() {
-        let bodies = from_harness(true, "hello\n<system-reminder>\nnever closed");
+        let bodies = from_harness(
+            true,
+            "hello\n<system-reminder>\nnever closed",
+            &BTreeSet::new(),
+        );
         assert!(
             matches!(&bodies[..], [Body::User(text)] if text == "hello"),
             "{bodies:?}"
