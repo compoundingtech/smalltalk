@@ -686,7 +686,13 @@ fn discover_files(
         let mut seen = BTreeSet::new();
         for candidate in candidates.iter().filter(|candidate| !candidate.managed_by_st3) {
             for token in candidate.process.command.split_whitespace() {
-                let path = Path::new(token.trim_matches(['"', '\'']));
+                let token = token.trim_matches(['"', '\'']);
+                let token = if token.starts_with('-') {
+                    token.split_once('=').map_or(token, |(_, path)| path)
+                } else {
+                    token
+                };
+                let path = Path::new(token);
                 if path.extension().is_none_or(|extension| extension != "jsonl")
                     || !path.is_absolute()
                 {
@@ -1814,7 +1820,7 @@ mod tests {
             },
         };
         let candidates = [
-            candidate(format!("omp --resume {}", active.display())),
+            candidate(format!("omp --resume={}", active.display())),
             candidate(format!("omp --log {}", nested.display())),
             candidate("omp --resume historical".into()),
         ];
