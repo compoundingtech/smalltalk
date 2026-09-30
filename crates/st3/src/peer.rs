@@ -909,8 +909,12 @@ struct FleetContext {
     /// Inventory advertised by the last inbound response; graph wakes it covers need no dial.
     inbound_authority: Arc<std::sync::RwLock<BTreeMap<String, String>>>,
     connectivity_changed: watch::Sender<u64>,
-    /// Transport or authenticated peer activity, distinct from a completed exchange.
+    /// Sign of life from Fabric, distinct from a completed replication exchange.
     online: Arc<std::sync::RwLock<BTreeMap<String, tokio::time::Instant>>>,
+    /// Authenticated traffic and successful probes interrupt failure waits without waking
+    /// healthy anti-entropy exchanges or cancelling their coalescing window.
+    activity: Arc<std::sync::RwLock<BTreeMap<String, tokio::time::Instant>>>,
+    activity_changed: watch::Sender<u64>,
 }
 
 impl FleetContext {
@@ -935,6 +939,8 @@ impl FleetContext {
             inbound_authority: Arc::default(),
             connectivity_changed: watch::channel(0).0,
             online: Arc::default(),
+            activity: Arc::default(),
+            activity_changed: watch::channel(0).0,
         }
     }
 
@@ -962,12 +968,12 @@ impl FleetContext {
         self.removed.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    fn note_online(&self, name: &str) {
-        self.online
+    fn note_activity(&self, name: &str) {
+        self.activity
             .write()
-            .expect("online lock poisoned")
+            .expect("activity lock poisoned")
             .insert(name.to_owned(), tokio::time::Instant::now());
-        self.inbound_changed
+        self.activity_changed
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
@@ -1372,6 +1378,8 @@ pub async fn run_worker(config: Config) -> Result<()> {
         inbound_authority: Arc::default(),
         connectivity_changed: watch::channel(0).0,
         online: Arc::default(),
+        activity: Arc::default(),
+        activity_changed: watch::channel(0).0,
     };
     tokio::spawn(keep_connectivity_current(fleet.clone()));
     if let Some(fabric) = fabric.clone() {
@@ -1847,7 +1855,7 @@ async fn receive_client_read(
             Ok(sender) if state.fleet.accept(&sender).is_ok() => sender.name,
             _ => return (StatusCode::UNAUTHORIZED, "untrusted fleet client read").into_response(),
         };
-    state.fleet.note_online(&sender);
+    state.fleet.note_activity(&sender);
     let request_digest = FleetAuth::body_digest(&body);
     let result: Result<serde_json::Value> = async {
         anyhow::ensure!(
@@ -2179,6 +2187,7 @@ async fn dial_peer(
     let mut http = replication_http_client();
     let mut backoff = PeerBackoff::default();
     let mut inbound_changes = fleet.inbound_changed.subscribe();
+    let mut activity_changes = fleet.activity_changed.subscribe();
     let mut connectivity = fleet.connectivity_changed.subscribe();
     let mut must_send = false;
     let mut route = 0_usize;
@@ -2280,6 +2289,7 @@ async fn dial_peer(
                 backoff.next(),
                 &mut routes,
                 &mut inbound_changes,
+                &mut activity_changes,
                 &mut connectivity,
                 &fleet,
                 &name,
@@ -2303,9 +2313,6 @@ async fn dial_peer(
                     last_http_success = Some((peer.url.clone(), tokio::time::Instant::now()));
                 }
                 backoff = PeerBackoff::default();
-                // Our successful responses publish transport life too. Consume those
-                // notifications here so they cannot cause a quiet replication echo.
-                inbound_changes.borrow_and_update();
                 must_send = false;
                 if heal_now {
                     heal(&backend, &node, &peer, &auth, &fleet, &main_socket).await;
@@ -2354,6 +2361,7 @@ async fn dial_peer(
                     backoff.next(),
                     &mut routes,
                     &mut inbound_changes,
+                    &mut activity_changes,
                     &mut connectivity,
                     &fleet,
                     &name,
@@ -2398,6 +2406,7 @@ async fn wait_peer_retry(
     delay: Duration,
     routes: &mut watch::Receiver<Vec<Route>>,
     inbound_changes: &mut watch::Receiver<u64>,
+    activity_changes: &mut watch::Receiver<u64>,
     connectivity: &mut watch::Receiver<u64>,
     fleet: &FleetContext,
     name: &str,
@@ -2423,6 +2432,12 @@ async fn wait_peer_retry(
                 .expect("online lock poisoned")
                 .get(name)
                 .is_some_and(|at| *at >= attempt_started)
+            || fleet
+                .activity
+                .read()
+                .expect("activity lock poisoned")
+                .get(name)
+                .is_some_and(|at| *at >= attempt_started)
         {
             return true;
         }
@@ -2442,6 +2457,9 @@ async fn wait_peer_retry(
             changed = inbound_changes.changed() => {
                 if changed.is_err() { return false; }
             }
+            changed = activity_changes.changed() => {
+                if changed.is_err() { return false; }
+            }
             alive = async {
                 tokio::time::sleep_until(next_probe).await;
                 // HEAD is answered by the existing router without accessing the graph.
@@ -2452,7 +2470,7 @@ async fn wait_peer_retry(
             }, if probe_url.is_some() => {
                 next_probe = tokio::time::Instant::now() + PEER_PROBE_INTERVAL;
                 if alive {
-                    fleet.note_online(name);
+                    fleet.note_activity(name);
                     return true;
                 }
             }
@@ -2520,7 +2538,7 @@ async fn receive_exchange(
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
     // Authentication proves the connection returned before inventory processing finishes.
-    state.fleet.note_online(&sender.name);
+    state.fleet.note_activity(&sender.name);
     let relay = sender.name;
     let result = async {
         let request: ReplicationExchange =
@@ -2627,7 +2645,7 @@ async fn receive_heal(State(state): State<PeerState>, headers: HeaderMap, body: 
         return signed_refusal(&state, &request_digest, &refusal)
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
-    state.fleet.note_online(&sender.name);
+    state.fleet.note_activity(&sender.name);
     let result = async {
         let request: ReplicationHealRequest =
             serde_json::from_slice(&body).context("decode the heal request")?;
@@ -2677,7 +2695,7 @@ async fn receive_checkpoint_request(
             Ok(sender) if state.fleet.accept(&sender).is_ok() => sender,
             _ => return (StatusCode::UNAUTHORIZED, "untrusted checkpoint request").into_response(),
         };
-    state.fleet.note_online(&sender.name);
+    state.fleet.note_activity(&sender.name);
     let request_digest = FleetAuth::body_digest(&body);
     let result = async {
         let request: CheckpointManifestRequest =
@@ -2789,7 +2807,7 @@ async fn fetch_checkpoint_manifest_page(
         response.api_version == "st3.v1",
         "the peer API version differs"
     );
-    fleet.note_online(&peer.name);
+    fleet.note_activity(&peer.name);
     anyhow::ensure!(
         response.value.checkpoint == request.checkpoint
             && response.value.cut_unix_ms == request.cut_unix_ms,
@@ -3332,7 +3350,7 @@ async fn post_signed_to<B: Serialize, R: serde::de::DeserializeOwned>(
         response.api_version == "st3.v1",
         "the peer API version differs"
     );
-    fleet.note_online(&peer.name);
+    fleet.note_activity(&peer.name);
     Ok((response.value, accepts_deflate(&headers)))
 }
 
@@ -5772,6 +5790,8 @@ mod tests {
             inbound_authority: Arc::default(),
             connectivity_changed: watch::channel(0).0,
             online: Arc::default(),
+            activity: Arc::default(),
+            activity_changed: watch::channel(0).0,
         }
     }
 
@@ -5911,11 +5931,76 @@ mod tests {
 mod retry_tests {
     use super::*;
 
+    #[tokio::test]
+    async fn authenticated_activity_does_not_start_redundant_healthy_exchanges() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fleet_id = "d706eab5-433c-474b-ae43-fd2a7891d85d";
+        let auth = FleetAuth::test(fleet_id, &[42; 32]);
+        let local = Arc::new(Store::open_memory("harbor").unwrap());
+        let remote = Arc::new(Store::open_memory("beacon").unwrap());
+        for store in [&local, &remote] {
+            store.bind_fleet(fleet_id).unwrap();
+        }
+        let fleet = FleetContext::legacy(BTreeSet::from(["beacon".into()]));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let app = peer_router(PeerState {
+            backend: PeerBackend::Local(remote),
+            node: "beacon".into(),
+            auth: auth.clone(),
+            fleet: FleetContext::legacy(BTreeSet::from(["harbor".into()])),
+            main_socket: PathBuf::from("unused.sock"),
+            outbound_notify: watch::channel(0).0,
+        })
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                async move { next.run(request).await }
+            },
+        ));
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+        let (_route_tx, routes) = watch::channel(vec![Route::Http(url)]);
+        let (notify, _) = watch::channel(0);
+        let dialer = tokio::spawn(dial_peer(
+            PeerBackend::Local(local),
+            "harbor".into(),
+            "beacon".into(),
+            routes,
+            auth,
+            fleet.clone(),
+            PathBuf::from("unused.sock"),
+            notify.subscribe(),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !fleet.activity.read().unwrap().contains_key("beacon") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = requests.load(Ordering::Relaxed);
+        // A successful client read/probe proves peer life, but it does not change the graph.
+        fleet.note_activity("beacon");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            before,
+            "authenticated activity interrupted healthy anti-entropy coalescing"
+        );
+        dialer.abort();
+        server.abort();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn signs_of_life_during_a_failed_attempt_are_not_lost_before_the_retry_wait() {
         let fleet = FleetContext::legacy(BTreeSet::new());
         let (_route_tx, mut routes) = watch::channel(Vec::new());
         let mut inbound = fleet.inbound_changed.subscribe();
+        let mut activity = fleet.activity_changed.subscribe();
         let mut connectivity = fleet.connectivity_changed.subscribe();
         let http = replication_http_client();
         for completed_exchange in [false, true] {
@@ -5931,16 +6016,18 @@ mod retry_tests {
                     .inbound_changed
                     .send_modify(|generation| *generation += 1);
             } else {
-                fleet.note_online("traveller");
+                fleet.note_activity("traveller");
             }
             // The outbound request fails later, after a coalesced notification was read.
             inbound.borrow_and_update();
+            activity.borrow_and_update();
             tokio::time::advance(REPLICATION_EXCHANGE_TIMEOUT).await;
             assert!(
                 wait_peer_retry(
                     Duration::from_secs(3600),
                     &mut routes,
                     &mut inbound,
+                    &mut activity,
                     &mut connectivity,
                     &fleet,
                     "traveller",
@@ -5958,6 +6045,7 @@ mod retry_tests {
                 Duration::from_secs(3600),
                 &mut routes,
                 &mut inbound,
+                &mut activity,
                 &mut connectivity,
                 &fleet,
                 "traveller",
@@ -5991,6 +6079,7 @@ mod retry_tests {
         );
         let (_route_tx, mut routes) = watch::channel(vec![Route::Http(url.clone())]);
         let mut inbound = fleet.inbound_changed.subscribe();
+        let mut activity = fleet.activity_changed.subscribe();
         let mut connectivity = fleet.connectivity_changed.subscribe();
         let http = replication_http_client();
         let previous = (
@@ -6005,6 +6094,7 @@ mod retry_tests {
                     Duration::from_secs(3600),
                     &mut routes,
                     &mut inbound,
+                    &mut activity,
                     &mut connectivity,
                     &fleet,
                     "traveller",
@@ -6016,7 +6106,7 @@ mod retry_tests {
             .await
             .unwrap()
         );
-        assert!(fleet.online.read().unwrap().contains_key("traveller"));
+        assert!(fleet.activity.read().unwrap().contains_key("traveller"));
         assert!(
             fleet.inbound.read().unwrap().is_empty(),
             "HEAD must not invoke receive_exchange"
@@ -6031,6 +6121,7 @@ mod retry_tests {
                 Duration::from_secs(3600),
                 &mut routes,
                 &mut inbound,
+                &mut activity,
                 &mut connectivity,
                 &fleet,
                 "traveller",
@@ -6067,6 +6158,7 @@ mod retry_tests {
         let fleet = FleetContext::legacy(BTreeSet::new());
         let (route_tx, mut routes) = watch::channel(vec![Route::Http("http://127.0.0.1:1".into())]);
         let mut inbound = fleet.inbound_changed.subscribe();
+        let mut activity = fleet.activity_changed.subscribe();
         let mut connectivity = fleet.connectivity_changed.subscribe();
         for away in [Duration::from_secs(120), Duration::from_secs(4 * 3600)] {
             tokio::time::advance(away).await;
@@ -6074,6 +6166,7 @@ mod retry_tests {
                 Duration::from_secs(300),
                 &mut routes,
                 &mut inbound,
+                &mut activity,
                 &mut connectivity,
                 &fleet,
                 "traveller",
@@ -6108,6 +6201,7 @@ mod retry_tests {
             Duration::from_secs(300),
             &mut routes,
             &mut inbound,
+            &mut activity,
             &mut connectivity,
             &fleet,
             "traveller",
@@ -6416,11 +6510,13 @@ mod retry_tests {
         let (_route_tx, mut routes) =
             watch::channel(vec![Route::Http("http://127.0.0.1:1".into())]);
         let mut inbound = fleet.inbound_changed.subscribe();
+        let mut activity = fleet.activity_changed.subscribe();
         let mut connectivity = fleet.connectivity_changed.subscribe();
         let wait = wait_peer_retry(
             Duration::from_secs(3600),
             &mut routes,
             &mut inbound,
+            &mut activity,
             &mut connectivity,
             &fleet,
             "traveller",

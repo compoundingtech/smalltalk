@@ -155,7 +155,9 @@ a redundant connection in the opposite direction; local graph changes still requ
 push. Failed attempts back off exponentially from one second through minutes to one hour, with 20 percent
 jitter. Graph wakes do not reset failure backoff. An authenticated inbound request, a successful
 peer request, a change to the member's routes, or a local connectivity change interrupts it
-immediately, including activity received while an outbound request is still failing. A returning outbound-only member starts its own
+immediately, including activity received while an outbound request is still failing. Peer
+activity has a separate notification channel used only by failure waits, so ordinary
+authenticated traffic does not start redundant healthy exchanges. A returning outbound-only member starts its own
 push and pull without waiting for the other members' retry timers. Fabric tunnels are obtained
 again on each attempt, so a restarted Fabric does not leave a stale cached tunnel. With Fabric
 0.2.21 or later, the worker also consumes its passive `peer-events --watch` stream: an online
