@@ -331,6 +331,7 @@ impl Word {
 #[serde(rename_all = "snake_case")]
 pub enum StepState {
     Done,
+    Cancelled,
     Working,
     Ready,
     Waiting,

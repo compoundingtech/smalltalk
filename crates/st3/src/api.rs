@@ -1429,6 +1429,15 @@ fn client_work_item(
     Ok(client_work_values(store, vec![work], &desired, snapshot_index)?.pop())
 }
 
+/// Translate internal step states once for every client projection.
+fn client_work_state(status: &str) -> &str {
+    match status {
+        "pending" => "waiting",
+        "working" => "claimed",
+        other => other,
+    }
+}
+
 /// Client resources for `work`, with the usage of the seats in `desired` that its steps own.
 fn client_work_values(
     store: &Store,
@@ -1483,11 +1492,7 @@ fn client_work_values(
             let operational = work_annotations
                 .get(&work.subject)
                 .expect("every work item has an annotation");
-            let state = match work.status.as_str() {
-                "pending" => "waiting",
-                "working" => "claimed",
-                other => other,
-            };
+            let state = client_work_state(&work.status);
             let usage = aggregate_usage_values(
                 usage_by_step
                     .get(work.subject.as_str())
@@ -1769,7 +1774,7 @@ fn client_agent_resources_uncached(
                 "path": step.path,
                 "title": step.title,
                 "goal": step.goal,
-                "state": step.status,
+                "state": client_work_state(&step.status),
                 "since": client_timestamp(step.updated_at_unix_ms),
             })
         })
@@ -3668,14 +3673,21 @@ async fn client_launches_detail(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    client_detail(
-        client_launch_resources(&state, query.history).map_err(ApiError::internal)?,
-        "launch",
-        &id,
-    )
+    let items = client_launch_resources(&state, query.history).map_err(ApiError::internal)?;
+    // The route carries a session ID. A native ID may itself start with `launch/`.
+    let resource_id = format!("launch/{id}");
+    let id = if items.iter().any(|item| item["id"] == resource_id) {
+        resource_id
+    } else {
+        id
+    };
+    client_detail(items, "launch", &id)
 }
 
 fn client_launch_session(state: &AppState, id: &str) -> Result<PlanningSessionView, ApiError> {
+    if let Some(session) = state.store.planning_session(id).map_err(ApiError::internal)? {
+        return Ok(session);
+    }
     state
         .store
         .planning_session(launch_session_id(id))
@@ -5093,7 +5105,12 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             let unavailable = replication
                 .peers
                 .iter()
-                .filter(|peer| !matches!(peer.status.as_str(), "up" | "last-seen" | "unknown"))
+                .filter(|peer| {
+                    !matches!(
+                        peer.status.as_str(),
+                        "up" | "last-seen" | "unknown" | "refused"
+                    )
+                })
                 .map(|peer| format!("{}={}", peer.peer, peer.status))
                 .collect::<Vec<_>>();
             let unresolved = replication.invalid_records + replication.unknown_records;
@@ -5154,11 +5171,17 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                                 .unwrap_or("no reason recorded")
                         ))
                         .unwrap_or_default(),
-                    if unavailable.is_empty() {
-                        "up".into()
-                    } else {
-                        unavailable.join(", ")
-                    }
+                    replication
+                        .peers
+                        .iter()
+                        .map(|peer| {
+                            match &peer.refusal_reason {
+                                Some(reason) => format!("{}: {reason}", peer.peer),
+                                None => format!("{}={}", peer.peer, peer.status),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             });
         }
@@ -13211,6 +13234,44 @@ agent "good" {{ workspace {:?}; command "true" }}
         );
     }
 
+    #[tokio::test]
+    async fn doctor_and_replication_status_explain_fabric_refusals_without_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.fleet_id = Some("94cd11ba-c582-4558-9c84-c3bda922eb6d".into());
+        state.configured_peers = vec!["cobalt".into()];
+        let app = router(state.clone());
+        let (status, recorded) = json_request(app.clone(), "/v1/internal/replication/peer-failure", json!({
+            "peer": "cobalt", "status": "refused", "error": "refused by that member's Fabric grants (service st3-peer-v1); replication can continue through other members"
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{recorded}");
+        let (status, replication) = get_request(app.clone(), "/v1/replication/status").await;
+        assert_eq!(status, StatusCode::OK, "{replication}");
+        assert_eq!(replication["peers"][0]["status"], "refused");
+        assert!(replication["peers"][0]["last_error"].is_null());
+        assert!(
+            replication["peers"][0]["refusal_reason"]
+                .as_str()
+                .unwrap()
+                .contains("Fabric grants")
+        );
+        let (status, doctor) = get_request(app, "/v1/doctor").await;
+        assert_eq!(status, StatusCode::OK, "{doctor}");
+        let check = doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "replication")
+            .unwrap();
+        assert_eq!(check["status"], "pass", "{check}");
+        assert!(
+            check["message"]
+                .as_str()
+                .unwrap()
+                .contains("cobalt: refused by that member's Fabric grants")
+        );
+    }
+
     #[test]
     fn doctor_lists_attention_items_open_for_more_than_a_day() {
         let root = tempfile::tempdir().unwrap();
@@ -16056,7 +16117,7 @@ mission "labelled" state="ready" {
                     step["state"].as_str().unwrap()
                 ))
                 .collect::<Vec<_>>(),
-            [("first", "ready"), ("second", "pending")]
+            [("first", "ready"), ("second", "waiting")]
         );
         assert_eq!(steps[0]["goals"], json!(["Greet the fleet."]));
         assert_eq!(steps[0]["assignee"], format!("agent/{}/worker", run.id));

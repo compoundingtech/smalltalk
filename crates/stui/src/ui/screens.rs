@@ -103,6 +103,7 @@ pub fn word_style(word: Word, spinner: &'static str) -> (&'static str, Color) {
 fn step_style(state: StepState, spinner: &'static str) -> (&'static str, Color, &'static str) {
     match state {
         StepState::Done => ("▰", theme::DONE, "done"),
+        StepState::Cancelled => ("−", theme::SURFACE2, "cancelled"),
         StepState::Working => (spinner, theme::WORKING, "working"),
         StepState::Ready => ("▱", theme::WAITING, "ready"),
         StepState::Waiting => ("◐", theme::SAPPHIRE, "waiting"),
@@ -1930,7 +1931,12 @@ pub fn peek(world: &World, subject: &str, width: usize, spinner: &'static str) -
         for step in mission
             .steps
             .iter()
-            .filter(|step| !matches!(step.state, StepState::Done | StepState::Pending))
+            .filter(|step| {
+                !matches!(
+                    step.state,
+                    StepState::Done | StepState::Cancelled | StepState::Pending
+                )
+            })
             .take(3)
         {
             let (glyph, color, word) = step_style(step.state, spinner);
