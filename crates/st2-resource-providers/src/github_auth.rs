@@ -240,6 +240,9 @@ mod tests {
         );
     }
 
+    // The descendant liveness assertion uses Linux /proc; without it this test
+    // cannot verify process-group cleanup. Other platforms still test discovery.
+    #[cfg(target_os = "linux")]
     #[test]
     fn deadline_terminates_the_owned_process_group() {
         let (_temporary, executable) = executable_fixture(
@@ -281,6 +284,7 @@ wait "$descendant"
         (temporary, executable)
     }
 
+    #[cfg(target_os = "linux")]
     fn process_is_running(pid: i32) -> bool {
         let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
             return false;
