@@ -116,6 +116,8 @@ function useAppStore() {
       },
       onWindowError: (name, message) => { if (current()) setLoadErrors(previous => ({ ...previous, [name]: message })); },
     }, foreground.current, actionId);
+    // Paired: connecting from here on, even while the app waits to be active before it dials.
+    setStatus(previous => previous === 'setup' ? 'connecting' : previous);
     setFeed(opened);
     return () => { opened.close(); setFeed(held => held === opened ? null : held); };
   }, [client, credential, loadCapabilities]);

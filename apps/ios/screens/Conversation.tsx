@@ -28,8 +28,10 @@ function nowClock() {
 export function ConversationScreen({ route, navigation }: RootScreen<'Conversation'>) {
   const { target, sessionId } = route.params;
   const { data, feed, caps, status, historicalSessions, conversationCache, draftCache, actions } = useStore();
-  const agent = data.agents.find(candidate => candidate.id === target);
   const session = [...data.sessions, ...historicalSessions].find(candidate => candidate.id === (sessionId ?? target));
+  // A running session st manages belongs to its agent: name it, and send to it, as the agent.
+  const agent = data.agents.find(candidate => candidate.id === target)
+    ?? (session?.state === 'running' && session.managed !== false ? data.agents.find(candidate => candidate.id === session.owner_id) : undefined);
   const unresolved = session ? isUnresolved(session) : false;
   const title = route.params.title ?? (agent ? agentName(agent) : session?.driver ?? target.split('/').pop() ?? target);
   const [timeline, setTimeline] = useState<Conversation<TimelineEntry>>(() => conversationCache.current.get(target) ?? empty);

@@ -100,6 +100,9 @@ function Main() {
     };
     void Linking.getInitialURL().then(handle);
     handle(process.env.EXPO_PUBLIC_ST3_TEST_PAIR_LINK ?? null);
+    // Links to follow at launch, six seconds apart, for headless screenshots: the simulator asks
+    // before opening each link it is handed, and nobody is there to answer.
+    (process.env.EXPO_PUBLIC_ST3_TEST_LINKS ?? '').split(/\s+/).filter(Boolean).forEach((link: string, index: number) => setTimeout(() => handle(link), 6000 * (index + 1)));
     const subscription = Linking.addEventListener('url', event => handle(event.url));
     return () => subscription.remove();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
