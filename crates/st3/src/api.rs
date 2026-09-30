@@ -4005,6 +4005,10 @@ async fn serve_unix_with_ancestor(
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent)?;
     }
+    // A second daemon must never detach an active listener by unlinking its pathname.
+    if tokio::net::UnixStream::connect(socket).await.is_ok() {
+        anyhow::bail!("refusing to replace live Unix socket listener at {}", socket.display());
+    }
     match fs::remove_file(socket) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -4071,6 +4075,23 @@ async fn serve_unix_with_ancestor(
                 .with_upgrades()
                 .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod gateway_listener_tests {
+    #[tokio::test]
+    async fn live_listener_cannot_be_unlinked_by_another_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("gateway.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let error = super::serve_unix(&socket, axum::Router::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("refusing to replace live Unix socket listener"), "{error}");
+        assert!(tokio::net::UnixStream::connect(&socket).await.is_ok());
+        drop(listener);
     }
 }
 
