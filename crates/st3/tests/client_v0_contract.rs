@@ -1801,6 +1801,202 @@ async fn operational_lists_share_one_versioned_paginated_shape() {
 }
 
 #[tokio::test]
+async fn step_states_in_every_client_projection_belong_to_the_contract() {
+    let schema = json(asset_root().join("schemas/client-v0.schema.json"));
+    let allowed = schema["$defs"]["WorkState"]["enum"].as_array().unwrap();
+    for state in [
+        &schema["$defs"]["Work"]["allOf"][1]["properties"]["state"],
+        &schema["$defs"]["MissionStep"]["properties"]["state"],
+        &schema["$defs"]["WorkLabel"]["properties"]["state"],
+        &schema["$defs"]["MissionRunSummary"]["properties"]["current_steps"]["items"]["properties"]
+            ["state"],
+    ] {
+        assert_eq!(state["$ref"], "#/$defs/WorkState");
+    }
+    let root = tempfile::tempdir().unwrap();
+    let state = test_state(root.path());
+    let states = [
+        ("pending", "waiting"),
+        ("ready", "ready"),
+        ("working", "claimed"),
+        ("blocked", "blocked"),
+        ("verifying", "verifying"),
+        ("completed", "completed"),
+        ("failed", "failed"),
+        ("cancelled", "cancelled"),
+    ];
+    let steps = states
+        .iter()
+        .map(|(internal, _)| format!("step {internal:?} {{ assigned-to \"agent/builder\" }}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let source = format!(
+        "version 2\nagent \"builder\" {{ workspace \"/tmp\"; command \"true\" }}\nmission \"state-contract\" state=\"ready\" {{ goal \"Show every step state\"; {steps} }}"
+    );
+    let intent = st3::graph::parse_intent(&source, "client-v0-baseline").unwrap();
+    let planned = state
+        .store
+        .mission(
+            &intent,
+            st3::model::IntentInput {
+                kdl: source,
+                source_name: None,
+            },
+        )
+        .unwrap();
+    state
+        .store
+        .apply(&intent, &planned.subject_tokens, "state-contract-mission")
+        .unwrap();
+    let run = state
+        .store
+        .create_mission_run(&st3::model::MissionRunRequest {
+            mission: "state-contract".into(),
+            revision: None,
+            workspace: root.path().display().to_string(),
+            requester: Some("person/avery".into()),
+            mode: Some("run".into()),
+            inputs: Default::default(),
+            idempotency_key: "state-contract-run".into(),
+        })
+        .unwrap();
+    for (internal, _) in states {
+        let step = run.steps.iter().find(|step| step.step == internal).unwrap();
+        if internal == "working" {
+            state
+                .store
+                .set_step_state(&step.subject, "ready", None)
+                .unwrap();
+            state
+                .store
+                .work_action(
+                    &step.subject,
+                    "claim",
+                    &st3::model::WorkRequest {
+                        actor: step.assigned_to.clone(),
+                        incarnation: Some("builder-one".into()),
+                        summary: None,
+                        reason: None,
+                        evidence: Vec::new(),
+                        idempotency_key: "state-contract-claim".into(),
+                    },
+                )
+                .unwrap();
+            state
+                .store
+                .work_action(
+                    &step.subject,
+                    "progress",
+                    &st3::model::WorkRequest {
+                        actor: step.assigned_to.clone(),
+                        incarnation: Some("builder-one".into()),
+                        summary: Some("Building the release".into()),
+                        reason: None,
+                        evidence: Vec::new(),
+                        idempotency_key: "state-contract-progress".into(),
+                    },
+                )
+                .unwrap();
+            assert_eq!(
+                state
+                    .store
+                    .mission_run_steps(&run.subject, true)
+                    .unwrap()
+                    .unwrap()
+                    .steps
+                    .into_iter()
+                    .find(|item| item.subject == step.subject)
+                    .unwrap()
+                    .status,
+                "working"
+            );
+        } else {
+            state
+                .store
+                .set_step_state(&step.subject, internal, None)
+                .unwrap();
+        }
+    }
+    let app = st3::api::router(state);
+    let check = |item: &Value| {
+        assert!(
+            allowed.contains(&item["state"]),
+            "{} emits undeclared state {}",
+            item["id"],
+            item["state"]
+        );
+    };
+    for path in ["/v1/client/missions", "/v1/client/missions/state-contract"] {
+        let (status, response) = client_json(app.clone(), path).await;
+        assert_eq!(status, StatusCode::OK, "{response}");
+        let mission = if path.ends_with("state-contract") {
+            &response["value"]
+        } else {
+            &response["value"]["items"][0]
+        };
+        let run = &mission["run_details"][0];
+        for step in run["steps"].as_array().unwrap() {
+            check(step);
+            let expected = states
+                .iter()
+                .find(|(internal, _)| step["path"] == *internal)
+                .unwrap()
+                .1;
+            assert_eq!(step["state"], expected);
+        }
+        for step in run["current_steps"].as_array().unwrap() {
+            check(step);
+        }
+        assert!(
+            run["current_steps"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|step| step["state"] == "claimed")
+        );
+    }
+    let (status, response) = client_json(app.clone(), "/v1/client/work?history=true").await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    assert_eq!(
+        response["value"]["items"].as_array().unwrap().len(),
+        states.len()
+    );
+    for step in response["value"]["items"].as_array().unwrap() {
+        check(step);
+        let (status, detail) = client_json(
+            app.clone(),
+            &format!("/v1/client/work/{}", step["id"].as_str().unwrap()),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{detail}");
+        check(&detail["value"]);
+    }
+    let (status, response) = client_json(app, "/v1/client/agents").await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let agent = &response["value"]["items"][0];
+    assert_eq!(
+        agent["current_work"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|step| step["path"] == "working")
+            .unwrap()["state"],
+        "claimed"
+    );
+    for step in agent["current_work"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(agent["upcoming_work"].as_array().unwrap())
+    {
+        check(step);
+    }
+    if agent["next_work"].is_object() {
+        check(&agent["next_work"]);
+    }
+}
+
+#[tokio::test]
 async fn client_work_projection_exposes_external_blocker_and_reopens_after_resolution() {
     let root = tempfile::tempdir().unwrap();
     let state = test_state(root.path());

@@ -1429,6 +1429,15 @@ fn client_work_item(
     Ok(client_work_values(store, vec![work], &desired, snapshot_index)?.pop())
 }
 
+/// Translate internal step states once for every client projection.
+fn client_work_state(status: &str) -> &str {
+    match status {
+        "pending" => "waiting",
+        "working" => "claimed",
+        other => other,
+    }
+}
+
 /// Client resources for `work`, with the usage of the seats in `desired` that its steps own.
 fn client_work_values(
     store: &Store,
@@ -1483,11 +1492,7 @@ fn client_work_values(
             let operational = work_annotations
                 .get(&work.subject)
                 .expect("every work item has an annotation");
-            let state = match work.status.as_str() {
-                "pending" => "waiting",
-                "working" => "claimed",
-                other => other,
-            };
+            let state = client_work_state(&work.status);
             let usage = aggregate_usage_values(
                 usage_by_step
                     .get(work.subject.as_str())
@@ -1769,7 +1774,7 @@ fn client_agent_resources_uncached(
                 "path": step.path,
                 "title": step.title,
                 "goal": step.goal,
-                "state": step.status,
+                "state": client_work_state(&step.status),
                 "since": client_timestamp(step.updated_at_unix_ms),
             })
         })
@@ -6244,7 +6249,7 @@ async fn get_planning_session(
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<PlanningSessionView>, ApiError> {
     let store = state.store.clone();
-    let id_for_read = id.clone();
+    let id_for_read = launch_session_id(&id).to_owned();
     blocking_store(move || store.planning_session(&id_for_read))
         .await?
         .map(Json)

@@ -39,6 +39,20 @@ assert.equal(missionDetail({ runs: [], run_details: [] }), '0 runs');
 const shipped = { runs: ['mission-run/9f'], run_details: [{ id: 'mission-run/9f', steps: [step('gate', 'failed')], outcome: { status: 'completed', previous_status: 'failed', actor: 'person/avery', reason: 'it merged after the gate was fixed', at: '2026-09-25T08:20:00Z' } }] };
 assert.equal(missionDetail(shipped), '1 runs · gate (failed) · set completed (was failed) by person/avery: it merged after the gate was fixed');
 
+// Every contract state is grouped deliberately, with active work ahead of waiting dependencies.
+const expectedGroups = { waiting: 'Waiting', ready: 'Running', claimed: 'Running', blocked: 'Blocked', verifying: 'Running', completed: 'Drafts', failed: 'Blocked', cancelled: 'Drafts', working: 'Running', pending: 'Waiting' };
+for (const [state, expected] of Object.entries(expectedGroups)) {
+  const mission = { ...release, state: 'ready', run_details: [{ id: 'mission-run/9f', steps: [step('review', state)] }] };
+  assert.equal(missionGroup(mission), expected, state);
+  assert.equal(missionDetail(mission), `1 runs · 2 planned steps · review (${state})`);
+}
+for (const state of ['claimed', 'working', 'verifying']) {
+  const mission = { ...release, run_details: [{ id: 'mission-run/9f', steps: [step('build', 'completed'), step('review', state), step('deploy', 'waiting')] }] };
+  assert.equal(missionGroup(mission), 'Running', state);
+  assert.equal(missionDetail(mission), `1 runs · 2 planned steps · review (${state})`);
+}
+assert.equal(missionGroup({ ...stuck, state: 'completed' }), 'Archive');
+
 // Small Talk st joined into a conversation shows who wrote to whom and its title.
 assert.deepEqual(smallTalkPresentation({ message_id: 'message/1', from: 'agent/fleet/cos/standing/cos', to: 'person/nathan', title: 'Release is ready' }), { from: 'COS → nathan', text: 'Release is ready' });
 assert.deepEqual(smallTalkPresentation({ message_id: 'message/2', from: 'agent/fleet/app' }), { from: 'App → someone', text: 'Small Talk' });

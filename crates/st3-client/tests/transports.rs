@@ -215,6 +215,75 @@ async fn serve_terminal_state(
 }
 
 #[tokio::test]
+async fn nested_launch_ids_reach_detail_and_child_routes() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = state(root.path(), "launch-routing");
+    let request = state
+        .store
+        .put_document(
+            "doc/planning/request",
+            b"Plan a release",
+            &None,
+            "launch-request",
+        )
+        .unwrap();
+    state
+        .store
+        .create_planning_session(
+            "planning/fleet/harbor/release/one",
+            "release",
+            &format!("{}@{}", request.name, request.hash),
+            "/work/release",
+            "person/avery",
+            "agent/launch-routing.planner",
+            &Default::default(),
+            None,
+            None,
+        )
+        .unwrap();
+    let app = st3::api::router(state);
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
+    wait_for_socket(&socket).await;
+    let client = Client::unix(&socket);
+    let id = "launch/planning/fleet/harbor/release/one";
+    assert_eq!(client.launches_get(id).await.unwrap().value.header().id, id);
+    assert!(
+        client
+            .launch_variants_list(id, None, None)
+            .await
+            .unwrap()
+            .value
+            .items
+            .is_empty()
+    );
+    server.abort();
+}
+
+#[tokio::test]
+async fn an_empty_launch_404_explains_that_the_launch_no_longer_exists() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        axum::serve(listener, axum::Router::new()).await.unwrap();
+    });
+    let client = Client::fabric_pairing(format!("http://{address}"));
+    let error = client
+        .launches_get("launch/planning/missing/one")
+        .await
+        .unwrap_err();
+    match error {
+        ClientError::Api(ErrorCode::NotFound, message, envelope) => {
+            assert_eq!(message, "this launch no longer exists");
+            assert!(!envelope.retryable);
+        }
+        other => panic!("missing launch must be understandable: {other}"),
+    }
+    server.abort();
+}
+
+#[tokio::test]
 async fn terminal_stream_sends_changed_screens_and_nothing_while_idle() {
     let (_root, state, pty, client, server) =
         serve_terminal_state("client-stream-changes", 24, 80).await;
