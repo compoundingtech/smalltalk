@@ -1,0 +1,53 @@
+{
+  "configured": true,
+  "fleet_id": "e291cc02-7397-45a6-9c78-f4c9ff834a62",
+  "authority_digest": "e248010cea55c6feeb767cc62302c3b174448a3b92554837ea915ec395bf4811",
+  "graph_digest": "39d159800617afb9dbfc9454e0fade95c4dce2645d44b7d5dba4f714fb1a3cec",
+  "received_envelopes": 24,
+  "pending_records": 0,
+  "valid_records": 24,
+  "unknown_records": 0,
+  "invalid_records": 0,
+  "repaired_records": 0,
+  "unsigned_envelopes": 0,
+  "fenced_envelopes": 0,
+  "checkpointed_envelopes": 0,
+  "unhealthy_projections": 0,
+  "unhealthy": [],
+  "peers": [
+    {
+      "peer": "cobalt",
+      "status": "up",
+      "last_success_at_unix_ms": 1790755759656,
+      "last_error": null,
+      "schema_digest": "70fe3830256aa711de822f76cded2d189b324fde29333a3fdb7c0dd9d25bf496",
+      "authority_digest": "e248010cea55c6feeb767cc62302c3b174448a3b92554837ea915ec395bf4811",
+      "graph_digest": "39d159800617afb9dbfc9454e0fade95c4dce2645d44b7d5dba4f714fb1a3cec",
+      "sync": {
+        "peer_only_envelopes": 0,
+        "local_only_envelopes": 0,
+        "measured_at_unix_ms": 1790755759657,
+        "estimated_catch_up_seconds": 0,
+        "catching_up": false,
+        "graph_compared_at_unix_ms": 1790755759657,
+        "diverged": false
+      }
+    }
+  ],
+  "timings": {
+    "exchanges": 21,
+    "envelopes_received": 18,
+    "round_trip_ms": 178,
+    "export_ms": 7,
+    "snapshot_ms": 3,
+    "receipt_ms": 4,
+    "admission_ms": 8,
+    "verify_ms": 0,
+    "projection_ms": 1,
+    "repair_ms": 0,
+    "signing_ms": 0,
+    "sqlite_ms": 19,
+    "commits": 93,
+    "commit_ms": 2
+  }
+}

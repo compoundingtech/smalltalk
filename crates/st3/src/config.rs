@@ -423,8 +423,8 @@ impl Config {
                     "fleet_id and shared_secret_file are required exactly when fleet peers are configured"
                 );
                 anyhow::ensure!(
-                    self.peer_listen.is_some() == !self.peers.is_empty(),
-                    "a fleet node needs both a peer listener and at least one peer"
+                    !fleet_configured || !self.peers.is_empty(),
+                    "a fleet node needs at least one peer; its listener is optional"
                 );
             }
             // A member: peers come from membership, so config peers are optional overrides.
@@ -456,7 +456,11 @@ impl Config {
         );
         let mut names = std::collections::HashSet::new();
         for peer in &self.peers {
-            anyhow::ensure!(names.insert(&peer.name), "peer '{}' repeats", peer.name);
+            anyhow::ensure!(
+                names.insert((&peer.name, &peer.url)),
+                "peer '{}' repeats",
+                peer.name
+            );
             anyhow::ensure!(
                 peer.name != self.node,
                 "peer '{}' uses the local node label",
@@ -465,21 +469,9 @@ impl Config {
             if peer.url.is_empty() {
                 continue;
             }
-            let url = reqwest::Url::parse(&peer.url)
-                .with_context(|| format!("parse peer URL for '{}'", peer.name))?;
             anyhow::ensure!(
-                url.scheme() == "http",
-                "peer '{}' must use plain http:// in st v1",
-                peer.name
-            );
-            let host = url.host_str().unwrap_or_default();
-            let loopback = host.eq_ignore_ascii_case("localhost")
-                || host
-                    .parse::<std::net::IpAddr>()
-                    .is_ok_and(|address| address.is_loopback());
-            anyhow::ensure!(
-                loopback,
-                "peer '{}' must use a loopback URL exposed by Fabric",
+                crate::fleet::transport::parse_route(&peer.url).is_some(),
+                "peer '{}' needs a loopback or tailnet http:// URL, or fabric://NODE_ID/PROTOCOL",
                 peer.name
             );
         }
@@ -695,9 +687,13 @@ mod tests {
             ..Config::default()
         };
         config.validate().unwrap();
+        // An outbound-only network needs no member kind or listener to exchange both ways.
+        config.peer_listen = None;
+        config.validate().unwrap();
+        config.peer_listen = Some("127.0.0.1:31313".into());
 
         config.peers.clear();
-        assert!(config.validate().unwrap_err().to_string().contains("both"));
+        assert!(config.validate().unwrap_err().to_string().contains("peer"));
         config.peers.push(PeerConfig {
             name: "peer".into(),
             url: "http://192.0.2.1:31314".into(),
@@ -839,6 +835,40 @@ url = "http://127.0.0.1:31314"
         config.peer_listen = Some("127.0.0.1:31313".into());
         config.fleet_id = Some("1f91ca65-7793-48cc-866e-ac15690130e1".into());
         config.shared_secret_file = Some(root.path().join("secret"));
-        assert!(config.validate().unwrap_err().to_string().contains("both"));
+        assert!(config.validate().unwrap_err().to_string().contains("peer"));
+    }
+    #[test]
+    fn native_routes_allow_alternatives_without_a_machine_kind() {
+        let mut config = Config {
+            fleet_id: Some("60407391-a0b8-4c5b-aa62-8137a3b3a2bf".into()),
+            shared_secret_file: Some("/tmp/isolated-secret".into()),
+            peers: vec![
+                PeerConfig {
+                    name: "beacon".into(),
+                    url: "http://100.64.0.10:31313".into(),
+                },
+                PeerConfig {
+                    name: "beacon".into(),
+                    url: "fabric://invented-node-id/sync".into(),
+                },
+            ],
+            ..Config::default()
+        };
+        config.validate().unwrap();
+        config.peers.push(config.peers[0].clone());
+        assert!(
+            config.validate().is_err(),
+            "a duplicate route must not create another dialer"
+        );
+        config.peers.pop();
+        for url in [
+            "http://192.0.2.1:31313",
+            "https://100.64.0.10",
+            "fabric://invented-node-id/",
+            "fabric:///sync",
+        ] {
+            config.peers[0].url = url.into();
+            assert!(config.validate().is_err(), "{url}");
+        }
     }
 }

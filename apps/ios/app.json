@@ -4,7 +4,7 @@
     "slug": "smalltalk-starter",
     "version": "0.1.0",
     "orientation": "portrait",
-    "userInterfaceStyle": "automatic",
+    "userInterfaceStyle": "dark",
     "plugins": [
       [
         "expo-build-properties",
@@ -14,7 +14,8 @@
           }
         }
       ],
-      "expo-secure-store"
+      "expo-secure-store",
+      "expo-font"
     ],
     "ios": {
       "bundleIdentifier": "com.compoundingtech.smalltalk.starter",

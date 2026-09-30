@@ -124,8 +124,7 @@ pub fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
         hash.update(value);
     }
     let digest = format!("{:x}", hash.finalize());
-    crate::run::state_root()
-        .join("st2")
+    crate::run::harness_state_root()
         .join("omp")
         .join(&digest[..24])
 }
@@ -290,11 +289,7 @@ fn load_pending_binding(
     agent: &str,
     runtime_id: &str,
 ) -> Result<Option<OmpSessionBinding>> {
-    load_binding_file(
-        &state_dir.join(PENDING_BINDING_FILE),
-        agent,
-        runtime_id,
-    )
+    load_binding_file(&state_dir.join(PENDING_BINDING_FILE), agent, runtime_id)
 }
 
 fn load_binding_file(
@@ -436,7 +431,6 @@ pub fn run_residency_attempt(
     resume_generation: crate::residency::Generation,
     required_incarnation: String,
 ) -> Result<()> {
-
     anyhow::ensure!(
         !required_incarnation.is_empty(),
         "OMP required runtime incarnation is empty"
@@ -476,10 +470,7 @@ fn run_with_required_resume(
             CHANNEL_RESUME_GENERATION.to_string(),
             resume_generation.0.to_string(),
         ),
-        (
-            CHANNEL_EXPECTED_NATIVE_SESSION.to_string(),
-            native_session,
-        ),
+        (CHANNEL_EXPECTED_NATIVE_SESSION.to_string(), native_session),
     ];
     pi_family_session::run_for_with_environment(
         catalog_root,
@@ -516,7 +507,6 @@ fn verify_supported_version(binary: &str) -> Result<()> {
     );
     Ok(())
 }
-
 
 #[cfg(test)]
 mod tests {

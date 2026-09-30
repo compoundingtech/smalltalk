@@ -1,13 +1,18 @@
 # CI operations
 
-The fleet CI definitions and trusted scripts live in
-[`myobie/st3-network/missions`](https://github.com/myobie/st3-network/tree/main/missions)
-as `smalltalk-ci-*.kdl` and `smalltalk-ci*.sh`. The standing `st` mission observes
+The fleet's CI mission declarations and trusted runner scripts are kept with that fleet's private
+machine configuration, outside this repository, as `smalltalk-ci-*.kdl` and `smalltalk-ci*.sh`. The standing `st` mission observes
 same-repository pull request heads and pushes to `main`. Each run checks the exact observed
 commit. A pull request run merges that commit with the latest `main` in a temporary checkout
 before running `cargo test --workspace --locked` and
 `cargo clippy --workspace --all-targets --locked`. Linux also checks generated clients and
-runs the fleet compatibility test against the pinned older st3 baseline.
+runs the fleet compatibility test against the pinned older st3 baseline. The normal Linux test
+suite also runs the token-free two-node messaging fault matrix: daemon restart, binary replacement,
+short and two-minute partitions, receiver downtime, provider restart, channel death, an actual
+historical channel and repeated rejected handoffs. It requires one native handoff and a graph
+read within ten seconds of recovery. The historical channel build is pinned separately in
+`.github/messaging-compat-baseline.json` and cached by Nix. See
+[the eval contract](../evals/st3/messaging-faults/README.md).
 
 On Linux, the workspace test build runs first and alone, without debug information. Then the
 tests, Clippy, the generated client check and the fleet compatibility test run side by side, and
@@ -33,6 +38,15 @@ Linux runs use two host-local Cargo target lanes, while Silber reuses one target
 directory. Each run isolates `HOME` and XDG directories. Forked pull requests
 are excluded before any code from them runs on these machines. GitHub Actions handles tags
 and forks.
+
+macOS builds use a stable checkout path and a separate Cargo cache with debug information and
+incremental compilation disabled. Darwin's unpacked debug objects can otherwise accumulate
+beside test executables, slowing dependency lookup and native filesystem watcher startup. The
+runner clears the debug cache when its dependency directory exceeds 20,000 files. The Codex
+control tests remain enabled on macOS, and the test command retains its 25-minute limit.
+
+The macOS summary includes the checked head, each stage's elapsed seconds, and the overall
+result. Stage logs have matching `.time` files recording elapsed seconds and command exit status.
 
 ## Merge rule
 

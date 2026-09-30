@@ -1,0 +1,31 @@
+[
+  {
+    "id": "dcf26855cc67dbb85b0bd3b44bb712a0284997d5ba954ddfc0dfa6073a5cfc6b",
+    "store_index": 18,
+    "batch_id": "batch/amber/6/21aa85fe17baa96ff1da0064ec552acac5018ae225cfd673b391cc86f58a5276",
+    "subject": "message/67c53f1d41a67df1",
+    "kind": "message.sent",
+    "origin": "amber",
+    "actor": "person/eval",
+    "operation_id": "op/d9a691b3d48289a0bb14226fb3fee78050881155e9e5c88c1350825ffadefb1b",
+    "request_digest": "55ecd0c8615a10bc4acc484d36676fb665c82c42caae13e45e3eb4baa23d49d9",
+    "body": {
+      "_operation": {
+        "id": "op/d9a691b3d48289a0bb14226fb3fee78050881155e9e5c88c1350825ffadefb1b",
+        "request_digest": "55ecd0c8615a10bc4acc484d36676fb665c82c42caae13e45e3eb4baa23d49d9"
+      },
+      "evidence": [],
+      "fields": {
+        "content": "receipt-token:channel-killed",
+        "from": "person/eval",
+        "in_reply_to": null,
+        "status": "sent",
+        "tags": [],
+        "title": "Fault probe: channel-killed",
+        "to": "agent/eval/fault-probe"
+      }
+    },
+    "predecessors": [],
+    "accepted_at_unix_ms": 1790756034791
+  }
+]

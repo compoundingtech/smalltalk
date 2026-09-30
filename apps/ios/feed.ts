@@ -4,7 +4,7 @@ import { TERMINAL_RESTARTED, withFreshTerminalFence, type Foreground, type Termi
 // The app holds three windows on one collections socket. It needs no work window: missions carry
 // their steps and agents name theirs. Subscription IDs are the window names.
 export const FEED_WINDOWS = {
-  attention: { collection: 'attention', limit: 50 },
+  attention: { collection: 'attention', limit: 200 },
   missions: { collection: 'missions', limit: 200 },
   agents: { collection: 'agents', limit: 200 },
 } as const satisfies Record<string, { collection: CollectionName; limit: number }>;

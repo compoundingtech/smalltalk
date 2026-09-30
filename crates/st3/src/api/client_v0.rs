@@ -307,7 +307,9 @@ fn conversation_owner_host(
     .map(|origin| client_host_id(&origin));
     if let Some(owner) = &remote {
         if !session.authority_actor.starts_with("person/") {
-            return Err(forbidden("a remote conversation requires a concrete person"));
+            return Err(forbidden(
+                "a remote conversation requires a concrete person",
+            ));
         }
         if state
             .client_relay
@@ -411,9 +413,7 @@ async fn follow_conversation(
     outbox: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
 ) {
     let remote = remote.as_deref();
-    let failed = |error: ApiError| {
-        json!({"kind":"error", "id":id, "collection":"conversation", "code":error.code, "message":error.message})
-    };
+    let failed = |error: ApiError| json!({"kind":"error", "id":id, "collection":"conversation", "code":error.code, "message":error.message});
     loop {
         // The cursor first, so nothing that lands while the page is read is lost.
         let start =
@@ -1084,15 +1084,7 @@ fn mission_visualization(
     })).collect::<Vec<_>>();
     let timeline = mission.display_order.iter().enumerate().filter_map(|(ordinal, id)| mission.steps.get(id).map(|step| json!({"id":format!("timeline/{}", step.path), "node":format!("step/{}", step.path), "ordinal":ordinal, "dependencies":step.dependencies, "timeout_ms":step.timeout_ms}))).collect::<Vec<_>>();
     let mut decisions = Vec::new();
-    for session in store
-        .planning_sessions(true)?
-        .into_iter()
-        .filter(|session| {
-            session.mission == mission_id
-                || format!("mission/{}", session.mission) == mission_id
-                || session.mission == mission_id.trim_start_matches("mission/")
-        })
-    {
+    for session in store.planning_sessions_for_mission(mission_id)? {
         decisions.extend(super::client_launch_decision_resources(store, &session)?);
     }
     Ok(Some(json!({
@@ -1121,14 +1113,15 @@ fn mission_resources_filtered(
     selected_id: Option<&str>,
     page_ids: Option<&[String]>,
 ) -> anyhow::Result<Vec<Value>> {
-    let attention = store.attention_items(None)?;
-    let human_attention_runs = attention
-        .iter()
-        .filter_map(|item| item.mission_run.as_deref())
-        .collect::<BTreeSet<_>>();
+    let human_attention_runs = store.human_attention_runs()?;
     let mut missions = BTreeMap::<String, Vec<MissionRunView>>::new();
-    let runs = if selected_id.is_some() {
-        store.mission_run_headers()?
+    // A detail or a page reads only its own missions' runs, definitions, seats and states.
+    let scope = selected_id
+        .map(|selected| vec![selected.to_owned()])
+        .or_else(|| page_ids.map(|ids| ids.to_vec()));
+    // A detail reads its runs' current steps with their headers, two reads for every run.
+    let runs = if let Some(selected) = selected_id {
+        store.mission_run_summaries_for_missions(&[selected.to_owned()])?
     } else if let Some(ids) = page_ids {
         store.mission_run_summaries_for_missions(ids)?
     } else {
@@ -1137,7 +1130,7 @@ fn mission_resources_filtered(
     for run in runs {
         missions.entry(run.mission.clone()).or_default().push(run);
     }
-    let definitions = if let Some(ids) = page_ids {
+    let definitions = if let Some(ids) = &scope {
         store.mission_definitions_for_ids(ids)?
     } else {
         store.mission_definitions()?
@@ -1153,12 +1146,20 @@ fn mission_resources_filtered(
     for mission in definitions.keys() {
         missions.entry(mission.clone()).or_default();
     }
-    let desired = store.desired_subjects()?;
     let page_runs = missions
         .values()
         .flatten()
         .map(|run| run.subject.as_str())
         .collect::<BTreeSet<_>>();
+    let page_run_subjects = page_runs
+        .iter()
+        .map(|run| (*run).to_owned())
+        .collect::<Vec<_>>();
+    let desired = if scope.is_some() {
+        store.desired_subjects_for_owner_runs(&page_run_subjects)?
+    } else {
+        store.desired_subjects()?
+    };
     let usage_subjects = desired
         .iter()
         .filter(|seat| {
@@ -1178,7 +1179,11 @@ fn mission_resources_filtered(
             usage_by_run.entry(run).or_default().push(usage);
         }
     }
-    let run_states = store.mission_run_states()?;
+    let run_states = if scope.is_some() {
+        store.mission_run_states_for_runs(&page_run_subjects)?
+    } else {
+        store.mission_run_states()?
+    };
     let mut values = missions
         .into_iter()
         .filter(|(mission, _)| selected_id.is_none_or(|selected| mission == selected))
@@ -1242,10 +1247,10 @@ fn mission_resources_filtered(
             let run_details = runs
                 .iter()
                 .map(|header| {
+                    // A detail shows each step's effective state and latest progress, and none of
+                    // the timing and wake history a work view reads for every step.
                     let run = if selected_id.is_some() {
-                        store
-                            .mission_run(&header.id)?
-                            .unwrap_or_else(|| header.clone())
+                        store.with_step_states(header.clone(), true)?
                     } else {
                         header.clone()
                     };
@@ -1441,6 +1446,21 @@ fn runtime_resources(
         Some(snapshot.store_index),
         history,
     )?;
+    // Each runtime's declaration and observation time, in one statement apiece for the list.
+    let desired_tokens = state.store.selected_desired_tokens(
+        &status
+            .subjects
+            .iter()
+            .map(|selected| selected.subject.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+    let claim_times = state.store.claim_acceptance_times(
+        &status
+            .subjects
+            .iter()
+            .filter_map(|selected| selected.actual_claim.as_deref())
+            .collect::<Vec<_>>(),
+    )?;
     let mut values = Vec::new();
     for selected in status.subjects {
         let Some(actual) = selected.actual.as_ref() else {
@@ -1480,11 +1500,10 @@ fn runtime_resources(
         }
         let local = authoritative && observed == "running" && actual_origin == state.store.origin();
         let incarnation_id = fields.get("incarnation_id").and_then(Value::as_str);
-        let desired_revision = state.store.selected_desired_token(&owner_id)?;
-        let updated_at = state
-            .store
-            .claim_by_id(actual_claim)?
-            .map(|claim| client_timestamp(claim.accepted_at_unix_ms))
+        let desired_revision = desired_tokens.get(&owner_id).cloned();
+        let updated_at = claim_times
+            .get(actual_claim)
+            .map(|accepted_at| client_timestamp(*accepted_at))
             .unwrap_or_else(|| snapshot.created_at.clone());
         let reasons = selected.reason.into_iter().collect::<Vec<_>>();
         values.push(json!({
@@ -1796,19 +1815,13 @@ fn machine_resources(
         }
     }
 
-    // Machines need only the claimant, subject, and update time. Building full
-    // client work resources also reduces usage history and mission annotations
-    // for every step, which makes this small host list expensive during the
+    // Machines need only the claimant, subject, and update time of the steps a claimant holds.
+    // Building full client work resources also reduces usage history, wake history and mission
+    // annotations for every step, which makes this small host list expensive during the
     // startup burst when many seats connect at once.
-    let work = if history {
-        state
-            .store
-            .client_work_history_at_snapshot(None, client_snapshot_time(snapshot))?
-    } else {
-        state
-            .store
-            .client_work_at_snapshot(None, false, client_snapshot_time(snapshot))?
-    };
+    let work = state
+        .store
+        .client_work_claims_at_snapshot(history, client_snapshot_time(snapshot))?;
     let mut host_work = BTreeMap::<String, BTreeSet<String>>::new();
     for item in work {
         let Some(claimant) = item.claimant.as_deref() else {
@@ -1837,12 +1850,6 @@ fn machine_resources(
     // Fleet members count as configured hosts; ended members are history. A config peer that
     // ended as a member is history too, even while its [[peers]] entry remains.
     let fleet = state.store.fleet_view_for_client()?;
-    let dial_out_hosts = fleet
-        .members
-        .iter()
-        .filter(|member| member.state == "current" && member.mode == "dial-out")
-        .map(|member| client_host_id(&member.name))
-        .collect::<BTreeSet<_>>();
     let ended_hosts = fleet
         .members
         .iter()
@@ -1897,20 +1904,20 @@ fn machine_resources(
             operational_layer,
             operational_actionable,
             operational_reasons,
-        ) = if host_id != local_host && dial_out_hosts.contains(&host_id) {
-            // A dial-out member is never dialed, so it is never reachable or unreachable from
-            // here: show when it last exchanged with this node instead.
+        ) = if host_id != local_host && configured_hosts.contains(&host_id) {
             let last_success_at = state.store.replication_peer_last_success(&name)?;
+            let recent =
+                last_success_at.is_some_and(|at| client_now_ms().saturating_sub(at) < 90_000);
             (
-                "dial-out",
+                if recent { "reachable" } else { "last-seen" },
                 vec![json!({
                     "protocol": "replication",
-                    "status": "unknown",
+                    "status": if recent { "up" } else { "last-seen" },
                     "last_success_at": last_success_at.map(client_timestamp),
                 })],
                 "current".to_owned(),
-                false,
-                vec!["dial-out-member".to_owned()],
+                recent,
+                vec!["replication-transport".to_owned()],
             )
         } else if host_id == local_host {
             (
@@ -2056,11 +2063,134 @@ fn machine_resources(
     Ok(machines)
 }
 
+/// How long page reads serve the daemon's last diagnostic report before one of them asks for a
+/// new report.
+const OPERATION_REPORT_REFRESH: Duration = Duration::from_secs(30);
+
+struct OperationReport {
+    store: std::sync::Weak<crate::store::Store>,
+    /// `None` while the first report since the daemon started is being made.
+    checks: Option<Arc<Vec<crate::model::DoctorCheck>>>,
+    at: Instant,
+    refreshing: bool,
+}
+
+/// The daemon's last diagnostic report for each store, which the operations collection lists.
+/// Some checks compare the whole projection with the claim log, seconds of work on a busy host's
+/// store, so page reads serve the last report and a new one is made off the request path.
+static OPERATION_REPORTS: OnceLock<Mutex<BTreeMap<usize, OperationReport>>> = OnceLock::new();
+
+fn operation_reports() -> std::sync::MutexGuard<'static, BTreeMap<usize, OperationReport>> {
+    OPERATION_REPORTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Start the daemon's first diagnostic report off the request path, so no read waits for it. The
+/// daemon calls this as its API starts to listen; until the report is made, the operations
+/// collection says that it is being made.
+pub(super) fn start_operation_report(state: &AppState) {
+    let key = Arc::as_ptr(&state.store) as usize;
+    let mut reports = operation_reports();
+    if reports.get(&key).is_some_and(|report| {
+        report
+            .store
+            .upgrade()
+            .is_some_and(|store| Arc::ptr_eq(&store, &state.store))
+    }) {
+        return;
+    }
+    reports.insert(
+        key,
+        OperationReport {
+            store: Arc::downgrade(&state.store),
+            checks: None,
+            at: Instant::now(),
+            refreshing: true,
+        },
+    );
+    let state = state.clone();
+    std::thread::spawn(move || refresh_operation_report(&state, key));
+}
+
+/// The last diagnostic report, or `None` while the first one since the daemon started is being
+/// made.
+fn operation_checks(
+    state: &AppState,
+) -> Result<Option<Arc<Vec<crate::model::DoctorCheck>>>, ApiError> {
+    let key = Arc::as_ptr(&state.store) as usize;
+    {
+        let mut reports = operation_reports();
+        if let Some(report) = reports.get_mut(&key).filter(|report| {
+            report
+                .store
+                .upgrade()
+                .is_some_and(|store| Arc::ptr_eq(&store, &state.store))
+        }) {
+            if report.checks.is_some()
+                && report.at.elapsed() >= OPERATION_REPORT_REFRESH
+                && !report.refreshing
+            {
+                report.refreshing = true;
+                let state = state.clone();
+                std::thread::spawn(move || refresh_operation_report(&state, key));
+            }
+            return Ok(report.checks.clone());
+        }
+    }
+    // A server that did not start a report, such as a test's, makes the first one on its first
+    // read.
+    let checks = Arc::new(doctor_report(state)?.0.checks);
+    operation_reports().insert(
+        key,
+        OperationReport {
+            store: Arc::downgrade(&state.store),
+            checks: Some(checks.clone()),
+            at: Instant::now(),
+            refreshing: false,
+        },
+    );
+    Ok(Some(checks))
+}
+
+fn refresh_operation_report(state: &AppState, key: usize) {
+    let checks = doctor_report(state)
+        .ok()
+        .map(|report| Arc::new(report.0.checks));
+    let mut reports = operation_reports();
+    let Some(report) = reports.get_mut(&key) else {
+        return;
+    };
+    report.refreshing = false;
+    match checks {
+        Some(checks) => {
+            report.checks = Some(checks);
+            report.at = Instant::now();
+        }
+        // The first report failed: the next read makes one and answers with its error.
+        None if report.checks.is_none() => drop(reports.remove(&key)),
+        None => {}
+    }
+}
+
 fn operation_resources(state: &AppState, at: &str) -> Result<Vec<Value>, ApiError> {
-    let report = doctor_report(state)?.0;
-    let mut values = report
-        .checks
-        .into_iter()
+    let Some(checks) = operation_checks(state)? else {
+        return Ok(vec![json!({
+            "id": "operation/diagnostic-report",
+            "kind": "operation",
+            "revision": "diagnostic-report:running",
+            "updated_at": at,
+            "component": "daemon",
+            "severity": "info",
+            "state": "running",
+            "summary": "the daemon is making its first diagnostic report since it started",
+            "targets": [],
+            "operational": { "layer": "current", "actionable": false, "reasons": ["diagnostic"] }
+        })]);
+    };
+    let mut values = checks
+        .iter()
         .map(|check| {
             let digest = hex::encode(Sha256::digest(check.name.as_bytes()));
             json!({
@@ -2096,7 +2226,7 @@ pub(super) async fn missions(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     require_scope(&session, "read.projections")?;
     let requested_limit = query
         .limit
@@ -2133,27 +2263,37 @@ pub(super) async fn missions(
             client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS),
         )
     };
-    if state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
-        return Err(client_page_expired(
-            "the mission collection changed; restart pagination",
-        ));
-    }
-    let store = state.store.clone();
-    let snapshot_index = snapshot.store_index;
+    // Each page reads its missions inside one SQLite snapshot. A first page names that snapshot;
+    // a later page reads the missions again, so it holds only while that is still its first
+    // page's snapshot.
+    let reader = state.clone();
     let history = query.history;
-    let (items, has_more) = super::blocking_store(move || {
-        let mut ids = store.mission_collection_ids(history, offset, limit.saturating_add(1))?;
-        let has_more = ids.len() > limit;
-        ids.truncate(limit);
-        let items = mission_resources_filtered(&store, snapshot_index, history, None, Some(&ids))?;
-        Ok::<_, anyhow::Error>((items, has_more))
+    let later_page = query.cursor.is_some();
+    let requested = snapshot;
+    let read = super::blocking_store(move || {
+        let store = reader.store.clone();
+        store.read_snapshot(|index| {
+            if later_page && index != requested.store_index {
+                return Ok(None);
+            }
+            let snapshot = if later_page {
+                requested
+            } else {
+                client_snapshot_at(&reader, index)
+            };
+            let mut ids = store.mission_collection_ids(history, offset, limit.saturating_add(1))?;
+            let has_more = ids.len() > limit;
+            ids.truncate(limit);
+            let items = mission_resources_filtered(&store, index, history, None, Some(&ids))?;
+            Ok(Some((snapshot, items, has_more)))
+        })
     })
     .await?;
-    if state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
+    let Some((snapshot, items, has_more)) = read else {
         return Err(client_page_expired(
             "the mission collection changed; restart pagination",
         ));
-    }
+    };
     let next_cursor = has_more
         .then(|| {
             encode_client_cursor(&ClientPageCursor {
@@ -2173,7 +2313,7 @@ pub(super) async fn missions(
             })
         })
         .transpose()?;
-    Ok(Json(ClientResourcePage {
+    let page = ClientResourcePage {
         kind: "page".into(),
         collection: "missions".into(),
         filters: if history {
@@ -2189,7 +2329,8 @@ pub(super) async fn missions(
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
         sync: client_sync_notice(&state),
-    }))
+    };
+    Ok((Extension(snapshot), Json(page)))
 }
 
 /// A single read of the projections used by mission show, agent tree, and seat queues.
@@ -2219,57 +2360,94 @@ fn desired_child_arg(value: &Value, name: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+/// The most items of each part the missions tree lists. A fleet with more shows the first ones
+/// and says how many there are, instead of failing the whole tree.
+const MISSIONS_TREE_ITEMS: usize = 200;
+const MISSIONS_TREE_QUEUED_RUNS: usize = 1000;
+
 fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Value> {
-    let mut runs = store
-        .mission_run_headers()?
-        .into_iter()
-        .filter(|run| matches!(run.status.as_str(), "running" | "standing" | "blocked"))
-        .collect::<Vec<_>>();
+    missions_tree_value_within(
+        store,
+        at,
+        index,
+        MISSIONS_TREE_ITEMS,
+        MISSIONS_TREE_QUEUED_RUNS,
+    )
+}
+
+fn missions_tree_value_within(
+    store: &Store,
+    at: &str,
+    index: u64,
+    items: usize,
+    queued_limit: usize,
+) -> anyhow::Result<Value> {
+    let mut truncated = serde_json::Map::new();
+    let mut note = |part: &str, shown: usize, total: usize| {
+        if total > shown {
+            truncated.insert(part.into(), json!({ "shown": shown, "total": total }));
+        }
+    };
+    let mut runs = store.open_mission_run_headers()?;
     runs.sort_by(|a, b| {
         a.mission
             .cmp(&b.mission)
             .then_with(|| a.subject.cmp(&b.subject))
     });
-    anyhow::ensure!(runs.len() <= 200, "missions tree exceeds 200 active runs");
+    note("runs", items, runs.len());
+    runs.truncate(items);
     let mut run_values = Vec::with_capacity(runs.len());
+    let (mut steps_shown, mut steps_total) = (0, 0);
     for run in runs {
+        // The tree shows each step's state, not its timing, wake or progress.
         let full = store
-            .mission_run(&run.subject)?
+            .mission_run_steps(&run.subject, false)?
             .ok_or_else(|| anyhow::anyhow!("run disappeared: {}", run.subject))?;
-        anyhow::ensure!(
-            full.steps.len() <= 200,
-            "missions tree run exceeds 200 steps: {}",
-            full.subject
-        );
+        steps_total += full.steps.len();
+        steps_shown += full.steps.len().min(items);
         run_values.push(json!({
             "id": full.subject, "mission": full.mission, "state": full.status,
-            "steps": full.steps.iter().map(|step| json!({
+            "steps": full.steps.iter().take(items).map(|step| json!({
                 "id": step.subject, "name": step.title.as_deref().unwrap_or(&step.step),
                 "path": step.step, "state": step.status
             })).collect::<Vec<_>>()
         }));
     }
-    let mut unstarted = mission_resources(store, index, false, None)?
+    // A mission that never ran and can start, as the current mission list shows it: its
+    // definition is ready or a draft, and st3's internal loop definitions stay out.
+    let mut unstarted = store
+        .mission_definitions_without_runs()?
         .into_iter()
-        .filter(|mission| {
-            matches!(mission["state"].as_str(), Some("ready" | "draft"))
-                && mission["runs"].as_array().is_some_and(Vec::is_empty)
+        .filter(|definition| !definition.mission.subject.starts_with("mission/__st3/"))
+        .filter_map(|definition| {
+            let state = match definition.mission.state {
+                crate::model::MissionState::Draft => "draft",
+                crate::model::MissionState::Ready => "ready",
+                crate::model::MissionState::Retired => return None,
+            };
+            let id = definition.mission.subject;
+            let title = id.strip_prefix("mission/").unwrap_or(&id).to_owned();
+            Some(json!({ "id": id, "title": title, "state": state }))
         })
-        .map(|mission| json!({ "id": mission["id"], "title": mission["title"], "state": mission["state"] }))
         .collect::<Vec<_>>();
+    note("steps", steps_shown, steps_total);
     unstarted.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
-    anyhow::ensure!(
-        unstarted.len() <= 200,
-        "missions tree exceeds 200 unstarted missions"
-    );
+    note("unstarted_missions", items, unstarted.len());
+    unstarted.truncate(items);
 
+    let mut agents = client_agent_resources(store, false, at, index)?;
+    note("agents", items, agents.len());
+    agents.truncate(items);
+    // The declarations of the agents shown, not of every seat the fleet ever declared.
+    let shown = agents
+        .iter()
+        .filter_map(|agent| agent["id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
     let desired = store
-        .desired_subjects()?
+        .desired_subjects_named(&shown)?
         .into_iter()
         .map(|seat| (seat.subject.clone(), seat))
         .collect::<BTreeMap<_, _>>();
-    let mut agents = client_agent_resources(store, false, at, index)?;
-    anyhow::ensure!(agents.len() <= 200, "missions tree exceeds 200 agents");
     for agent in &mut agents {
         let Some(id) = agent["id"].as_str() else {
             continue;
@@ -2297,7 +2475,7 @@ fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Va
         });
     }
     let mut queues = Vec::new();
-    let mut queued_runs = 0;
+    let (mut queued_runs, mut queues_total) = (0, 0);
     for agent in &agents {
         if agent["seat_kind"] != "standing" {
             continue;
@@ -2305,21 +2483,23 @@ fn missions_tree_value(store: &Store, at: &str, index: u64) -> anyhow::Result<Va
         let Some(id) = agent["id"].as_str() else {
             continue;
         };
+        queues_total += 1;
+        if queued_runs >= queued_limit {
+            continue;
+        }
         let queue = store.seat_queue(id)?;
         queued_runs += queue.runs.len();
-        anyhow::ensure!(
-            queued_runs <= 1000,
-            "missions tree exceeds 1000 queued runs"
-        );
         queues.push(agent_queue_value(&queue));
     }
+    note("standing_queues", queues.len(), queues_total);
     let lanes = store
         .lanes(false)?
         .iter()
         .map(lane_resource)
         .collect::<Vec<_>>();
     Ok(json!({ "runs": run_values, "standing_queues": queues,
-        "unstarted_missions": unstarted, "agents": agents, "lanes": lanes }))
+        "unstarted_missions": unstarted, "agents": agents, "lanes": lanes,
+        "truncated": truncated }))
 }
 
 pub(super) async fn mission_detail(
@@ -2344,14 +2524,17 @@ pub(super) async fn runtimes(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     require_scope(&session, "read.projections")?;
-    if query.cursor.is_some() {
-        return client_page(&state, &snapshot, "runtimes", Vec::new(), &query).map(Json);
-    }
-    let items = runtime_resources(&state, query.history, &snapshot, &session)
-        .map_err(ApiError::internal)?;
-    client_page(&state, &snapshot, "runtimes", items, &query).map(Json)
+    let history = query.history;
+    client_snapshot_page(
+        &state,
+        snapshot,
+        "runtimes",
+        &query,
+        move |state, snapshot| runtime_resources(state, history, snapshot, &session),
+    )
+    .await
 }
 
 pub(super) async fn terminals(
@@ -2359,15 +2542,21 @@ pub(super) async fn terminals(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     require_scope(&session, "read.projections")?;
-    if query.cursor.is_some() {
-        return client_page(&state, &snapshot, "terminals", Vec::new(), &query).map(Json);
-    }
-    let mut items = runtime_resources(&state, query.history, &snapshot, &session)
-        .map_err(ApiError::internal)?;
-    items.retain(|item| item.get("terminal_id").is_some_and(Value::is_string));
-    client_page(&state, &snapshot, "terminals", items, &query).map(Json)
+    let history = query.history;
+    client_snapshot_page(
+        &state,
+        snapshot,
+        "terminals",
+        &query,
+        move |state, snapshot| {
+            let mut items = runtime_resources(state, history, snapshot, &session)?;
+            items.retain(|item| item.get("terminal_id").is_some_and(Value::is_string));
+            Ok(items)
+        },
+    )
+    .await
 }
 
 pub(super) async fn runtime_detail(
@@ -2389,10 +2578,13 @@ pub(super) async fn operations(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     require_scope(&session, "read.projections")?;
-    let items = operation_resources(&state, &snapshot.created_at)?;
-    client_page(&state, &snapshot, "operations", items, &query).map(Json)
+    client_snapshot_page(&state, snapshot, "operations", &query, |state, snapshot| {
+        operation_resources(state, &snapshot.created_at)
+            .map_err(|error| anyhow::anyhow!(error.message))
+    })
+    .await
 }
 
 pub(super) async fn now(
@@ -2400,32 +2592,40 @@ pub(super) async fn now(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     require_scope(&session, "read.projections")?;
     let person = person_filter(&session, query.person.as_deref())?;
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
-    let mut items =
-        super::client_attention_resources_with_previews(&state, person.as_deref(), query.history)
-            .map_err(ApiError::internal)?;
-    // The default Now view is the person's attention queue. Mission work belongs
-    // in Control; only an explicit work filter opts it into this combined view.
-    if query.actor.is_some() || query.owner_run.is_some() {
-        let mut work = super::client_work_resources(
-            &state.store,
-            query.actor.as_deref(),
-            query.history,
-            client_snapshot_time(&snapshot),
-            snapshot.store_index,
-        )
-        .map_err(ApiError::internal)?;
-        if let Some(owner_run) = query.owner_run.as_deref() {
-            work.retain(|item| item["mission_run_id"].as_str() == Some(owner_run));
-        }
-        items.extend(work);
-    }
-    // Attention is already ranked by the daemon. Keep that order when work is included.
-    client_page(&state, &snapshot, "now", items, &effective_query).map(Json)
+    let (history, actor, owner_run) = (query.history, query.actor.clone(), query.owner_run.clone());
+    client_snapshot_page(
+        &state,
+        snapshot,
+        "now",
+        &effective_query,
+        move |state, snapshot| {
+            let mut items =
+                super::client_attention_resources_with_previews(state, person.as_deref(), history)?;
+            // The default Now view is the person's attention queue. Mission work belongs
+            // in Control; only an explicit work filter opts it into this combined view.
+            if actor.is_some() || owner_run.is_some() {
+                let mut work = super::client_work_resources(
+                    &state.store,
+                    actor.as_deref(),
+                    history,
+                    client_snapshot_time(snapshot),
+                    snapshot.store_index,
+                )?;
+                if let Some(owner_run) = owner_run.as_deref() {
+                    work.retain(|item| item["mission_run_id"].as_str() == Some(owner_run));
+                }
+                items.extend(work);
+            }
+            // Attention is already ranked by the daemon. Keep that order when work is included.
+            Ok(items)
+        },
+    )
+    .await
 }
 
 pub(super) async fn machines(
@@ -2433,11 +2633,17 @@ pub(super) async fn machines(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     require_scope(&session, "read.projections")?;
-    let items = machine_resources(&state, query.history, &snapshot, &session)
-        .map_err(ApiError::internal)?;
-    client_page(&state, &snapshot, "machines", items, &query).map(Json)
+    let history = query.history;
+    client_snapshot_page(
+        &state,
+        snapshot,
+        "machines",
+        &query,
+        move |state, snapshot| machine_resources(state, history, snapshot, &session),
+    )
+    .await
 }
 
 fn device_resources(
@@ -2776,10 +2982,8 @@ fn native_timeline_page(
     snapshot: &ClientSnapshot,
     session_id: &str,
     query: &ClientListQuery,
-    external: &crate::external_sessions::ExternalSession,
+    mut items: Vec<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let mut items =
-        crate::external_sessions::normalized_timeline(external).map_err(ApiError::internal)?;
     if let Some((owner, incarnation, _)) =
         super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
             .map_err(ApiError::internal)?
@@ -2828,13 +3032,96 @@ fn native_timeline_page(
     })))
 }
 
-fn managed_codex_transcript(
+/// What st3 established about a managed seat's native transcript.
+struct ManagedTranscript {
+    /// The harness the seat's latest observation names.
+    driver: String,
+    /// The `harness.observed` claim the verdict rests on. A notice about a missing transcript is
+    /// placed beside it in the timeline, so it moves forward when the observation changes.
+    anchor: ClaimRecord,
+    /// The seat's exact native session, or why st3 could not bind one.
+    transcript: Result<crate::external_sessions::ExternalSession, String>,
+}
+
+/// Bind a managed seat to its exact native transcript, when its harness keeps one st3 reads.
+///
+/// `None` means the seat runs no such harness (or has not reported one), and its timeline is
+/// built from claims alone as before. Otherwise the result either carries the exact session or
+/// says why none could be bound, so the timeline can say so rather than silently showing only
+/// status entries. The binding is never widened to a guess: a transcript that cannot be tied to
+/// this seat's current incarnation is not shown.
+fn managed_transcript(
     state: &AppState,
     owner: &str,
     incarnation: &str,
-) -> Result<Option<crate::external_sessions::ExternalSession>, ApiError> {
-    let Some(home) = state.native_session_home.as_deref() else {
+) -> Result<Option<ManagedTranscript>, ApiError> {
+    let Some(anchor) = state
+        .store
+        .latest_claim(owner, Some("harness.observed"))
+        .map_err(ApiError::internal)?
+    else {
         return Ok(None);
+    };
+    let fields = anchor.body.get("fields").unwrap_or(&anchor.body);
+    let driver = fields["driver"].as_str().unwrap_or_default().to_owned();
+    if !matches!(driver.as_str(), "codex" | "claude" | "omp") {
+        return Ok(None);
+    }
+    let transcript = if fields["incarnation_id"] != incarnation {
+        Err("the harness has not reported on the seat's current incarnation yet".to_owned())
+    } else {
+        let evidence = fields["evidence_incarnation"].as_str();
+        match driver.as_str() {
+            "codex" => managed_codex_transcript(state, owner, evidence),
+            "claude" => managed_claude_transcript(state, owner, evidence),
+            _ => managed_omp_transcript(state, owner, incarnation),
+        }
+    };
+    Ok(Some(ManagedTranscript {
+        driver,
+        anchor,
+        transcript,
+    }))
+}
+
+/// The timeline entry that says a managed seat's native transcript is not shown, and why.
+fn transcript_notice(session_id: &str, managed: &ManagedTranscript, reason: &str) -> Value {
+    let anchor = &managed.anchor;
+    let fields = anchor.body.get("fields").unwrap_or(&anchor.body);
+    let digest = hex::encode(Sha256::digest(
+        format!("{}:transcript-not-bound", anchor.id).as_bytes(),
+    ));
+    json!({
+        "id": format!("timeline-entry/{}/{}", session_id.trim_start_matches("session/"), &digest[..24]),
+        // Slot 2 of the observation's four sequence slots is otherwise unused.
+        "sequence": anchor.store_index.saturating_mul(4).saturating_add(2),
+        "revision": 1,
+        "timestamp": client_timestamp(
+            fields
+                .get("observed_at_unix_ms")
+                .and_then(Value::as_u64)
+                .map(u128::from)
+                .unwrap_or(anchor.accepted_at_unix_ms),
+        ),
+        "role": "system",
+        "type": "error",
+        "final": true,
+        "body": {
+            "code": "transcript-not-bound",
+            "message": format!("transcript not bound: {reason}"),
+            "retryable": true,
+            "details": { "driver": managed.driver, "claim_id": anchor.id }
+        }
+    })
+}
+
+fn managed_codex_transcript(
+    state: &AppState,
+    owner: &str,
+    evidence: Option<&str>,
+) -> Result<crate::external_sessions::ExternalSession, String> {
+    let Some(home) = state.native_session_home.as_deref() else {
+        return Err("this daemon has no home directory to read native sessions from".into());
     };
     // The wrapper owns this path; never resolve a path from client input. A reused
     // driver directory is only authoritative when its runtime and a durable
@@ -2844,61 +3131,62 @@ fn managed_codex_transcript(
         .join("drivers")
         .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
         .join("state");
-    let Ok(runtime) = std::fs::read(directory.join("runtime.json")) else {
-        return Ok(None);
-    };
-    let Ok(binding) = std::fs::read(directory.join("binding.json")) else {
-        return Ok(None);
-    };
+    let runtime = std::fs::read(directory.join("runtime.json"))
+        .map_err(|_| "the Codex driver has not written its runtime record".to_owned())?;
+    let binding = std::fs::read(directory.join("binding.json"))
+        .map_err(|_| "the Codex driver has not bound a thread yet".to_owned())?;
     let (Ok(runtime), Ok(binding)) = (
         serde_json::from_slice::<Value>(&runtime),
         serde_json::from_slice::<Value>(&binding),
     ) else {
-        return Ok(None);
+        return Err("the Codex driver's runtime or binding record is unreadable".into());
     };
     let identity = owner.strip_prefix("agent/").unwrap_or(owner);
     let Some(provider_incarnation) = runtime["incarnation"].as_str() else {
-        return Ok(None);
+        return Err("the Codex runtime record names no incarnation".into());
     };
     let Some(native_id) = binding["threadId"].as_str() else {
-        return Ok(None);
+        return Err("the Codex binding names no thread".into());
     };
     if runtime["agent"] != identity
         || binding["agent"] != identity
         || binding["runtimeIncarnation"] != provider_incarnation
     {
-        return Ok(None);
+        return Err("the Codex binding belongs to a different runtime".into());
     }
-    let observed = state
-        .store
-        .latest_claim(owner, Some("harness.observed"))
-        .map_err(ApiError::internal)?
-        .is_some_and(|claim| {
-            let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            fields["driver"] == "codex"
-                && fields["incarnation_id"] == incarnation
-                && fields["evidence_incarnation"] == provider_incarnation
-        });
-    if !observed {
-        return Ok(None);
+    if evidence != Some(provider_incarnation) {
+        return Err("the Codex binding is from a different provider incarnation".into());
     }
-    Ok(crate::external_sessions::discover(Some(home), true)
-        .map_err(ApiError::internal)?
-        .sessions
-        .into_iter()
-        .find(|session| {
-            session.driver == crate::external_sessions::ExternalDriver::Codex
-                && session.native_id == native_id
-        }))
+    // Codex names the rollout after its thread, so look it up directly first; a rollout whose
+    // name does not follow that convention is still found by the thread ID inside it.
+    let bound = match crate::external_sessions::find_bound_transcript(
+        home,
+        crate::external_sessions::ExternalDriver::Codex,
+        native_id,
+    ) {
+        Ok(Some(session)) => Some(session),
+        _ => crate::external_sessions::discover(Some(home), true)
+            .map_err(|error| format!("listing Codex sessions failed: {error:#}"))?
+            .sessions
+            .into_iter()
+            .find(|session| {
+                session.driver == crate::external_sessions::ExternalDriver::Codex
+                    && session.native_id == native_id
+            }),
+    };
+    bound.ok_or_else(|| format!("Codex thread {native_id} has no rollout file yet"))
 }
 
 fn managed_claude_transcript(
     state: &AppState,
     owner: &str,
-    incarnation: &str,
-) -> Result<Option<crate::external_sessions::ExternalSession>, ApiError> {
+    evidence: Option<&str>,
+) -> Result<crate::external_sessions::ExternalSession, String> {
     let Some(home) = state.native_session_home.as_deref() else {
-        return Ok(None);
+        return Err("this daemon has no home directory to read native sessions from".into());
+    };
+    let Some(evidence) = evidence else {
+        return Err("the Claude driver has not reported which process owns the seat".into());
     };
     let identity = owner.strip_prefix("agent/").unwrap_or(owner);
     let directory = state
@@ -2909,64 +3197,53 @@ fn managed_claude_transcript(
         .join("agents")
         .join(st2::run::detect_host())
         .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16]);
-    // Only the current wrapper's SessionStart hook may bind a Claude transcript.
-    // A previous provider's session-id file can survive a restart, so neither
-    // its presence nor the newest transcript in a workspace is sufficient.
-    let Ok(binding) = std::fs::read(directory.join("claude-native-session")) else {
-        return Ok(None);
-    };
-    let Ok(binding) = serde_json::from_slice::<Value>(&binding) else {
-        return Ok(None);
-    };
-    let (Some(provider_incarnation), Some(native_id)) = (
-        binding["incarnation"].as_str(),
-        binding["native_session_id"].as_str(),
-    ) else {
-        return Ok(None);
-    };
-    let observed = state
-        .store
-        .latest_claim(owner, Some("harness.observed"))
-        .map_err(ApiError::internal)?
-        .is_some_and(|claim| {
-            let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            fields["driver"] == "claude"
-                && fields["incarnation_id"] == incarnation
-                && fields["evidence_incarnation"] == provider_incarnation
+    // The current wrapper's SessionStart hook binds the Claude session it started. A previous
+    // provider's binding can survive a restart, so it counts only when it names the same
+    // provider incarnation as the seat's current observation; neither its presence nor the
+    // newest transcript in a workspace is sufficient.
+    let hook_binding = std::fs::read(directory.join("claude-native-session"))
+        .ok()
+        .and_then(|binding| serde_json::from_slice::<Value>(&binding).ok())
+        .and_then(|binding| {
+            (binding["incarnation"].as_str() == Some(evidence))
+                .then(|| binding["native_session_id"].as_str().map(str::to_owned))
+                .flatten()
         });
-    if !observed {
-        return Ok(None);
-    }
-    crate::external_sessions::find_bound_transcript(
+    let native_id = match hook_binding {
+        Some(native_id) => native_id,
+        // Without the hook, prove the session from the live processes instead; see
+        // `claude_session_of_managed_driver` for why that cannot pick another session.
+        None => crate::external_sessions::claude_session_of_managed_driver(home, owner, evidence)
+            .map_err(|reason| {
+            format!("the SessionStart hook did not bind this incarnation, and {reason}")
+        })?,
+    };
+    match crate::external_sessions::find_bound_transcript(
         home,
         crate::external_sessions::ExternalDriver::Claude,
-        native_id,
-    )
-    .map_err(ApiError::internal)
+        &native_id,
+    ) {
+        Ok(Some(session)) => Ok(session),
+        Ok(None) => Err(format!(
+            "Claude session {native_id} has no transcript file yet"
+        )),
+        Err(error) => Err(format!(
+            "finding Claude session {native_id} failed: {error:#}"
+        )),
+    }
 }
 
 fn managed_omp_transcript(
     state: &AppState,
     owner: &str,
     incarnation: &str,
-) -> Result<Option<crate::external_sessions::ExternalSession>, ApiError> {
-    let Some((_, started_at)) = incarnation.split_once(':') else {
-        return Ok(None);
-    };
-    let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(started_at) else {
-        return Ok(None);
-    };
-    let observed = state
-        .store
-        .latest_claim(owner, Some("harness.observed"))
-        .map_err(ApiError::internal)?
-        .is_some_and(|claim| {
-            let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            fields["driver"] == "omp" && fields["incarnation_id"] == incarnation
-        });
-    if !observed {
-        return Ok(None);
-    }
+) -> Result<crate::external_sessions::ExternalSession, String> {
+    let started_at = incarnation
+        .split_once(':')
+        .and_then(|(_, started_at)| chrono::DateTime::parse_from_rfc3339(started_at).ok())
+        .ok_or_else(|| {
+            format!("the OMP incarnation `{incarnation}` does not carry its start time")
+        })?;
     let identity = owner.strip_prefix("agent/").unwrap_or(owner);
     let directory = state
         .state_dir
@@ -2977,11 +3254,16 @@ fn managed_omp_transcript(
         .join(st2::run::detect_host())
         .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16])
         .join("provider-sessions");
-    crate::external_sessions::find_managed_omp_transcript(
+    match crate::external_sessions::find_managed_omp_transcript(
         &directory,
         (started_at.timestamp_millis().max(0) as u128).saturating_sub(2_000),
-    )
-    .map_err(ApiError::internal)
+    ) {
+        Ok(Some(session)) => Ok(session),
+        Ok(None) => Err("OMP has not saved a session for this incarnation yet".into()),
+        Err(error) => Err(format!(
+            "reading the OMP session directory failed: {error:#}"
+        )),
+    }
 }
 
 pub(super) fn timeline_value(
@@ -3018,20 +3300,31 @@ pub(super) fn timeline_value(
                 .ok_or_else(|| {
                     ApiError::not_found(format!("session `{session_id}` does not exist"))
                 })?;
-        return native_timeline_page(state, snapshot, &session_id, query, &external);
+        let items =
+            crate::external_sessions::normalized_timeline(&external).map_err(ApiError::internal)?;
+        return native_timeline_page(state, snapshot, &session_id, query, items);
     };
     let owner = owner.as_str();
     let incarnation = incarnation.as_deref();
-    if let Some(incarnation) = incarnation {
-        let external = match managed_codex_transcript(state, owner, incarnation)? {
-            Some(external) => Some(external),
-            None => match managed_claude_transcript(state, owner, incarnation)? {
-                Some(external) => Some(external),
-                None => managed_omp_transcript(state, owner, incarnation)?,
-            },
-        };
-        if let Some(external) = external {
-            return native_timeline_page(state, snapshot, &session_id, query, &external);
+    // When the seat's harness keeps a transcript st3 cannot bind or read, the claim timeline
+    // below is shown with one entry that says why, never silently in its place.
+    let mut transcript_notice_entry = None;
+    if let Some(incarnation) = incarnation
+        && let Some(managed) = managed_transcript(state, owner, incarnation)?
+    {
+        let read = managed
+            .transcript
+            .as_ref()
+            .map_err(String::clone)
+            .and_then(|external| {
+                crate::external_sessions::normalized_timeline(external)
+                    .map_err(|error| format!("the transcript could not be read: {error:#}"))
+            });
+        match read {
+            Ok(items) => return native_timeline_page(state, snapshot, &session_id, query, items),
+            Err(reason) => {
+                transcript_notice_entry = Some(transcript_notice(&session_id, &managed, &reason));
+            }
         }
     }
     let desired = state.store.desired_subjects().map_err(ApiError::internal)?;
@@ -3336,6 +3629,7 @@ pub(super) fn timeline_value(
             }));
         }
     }
+    items.extend(transcript_notice_entry);
     items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
     // A conversation opens at its newest bounded window. The cursor walks toward older
     // windows, while each individual page remains chronological for straightforward rendering.
@@ -3673,13 +3967,8 @@ impl ConversationMark {
             .unwrap_or_default();
         // Resolve the transcript once: finding it walks the harness's session directories.
         let transcript = match (&owner, &incarnation) {
-            (Some(owner), Some(incarnation)) => match managed_codex_transcript(state, owner, incarnation)? {
-                Some(external) => Some(external),
-                None => match managed_claude_transcript(state, owner, incarnation)? {
-                    Some(external) => Some(external),
-                    None => managed_omp_transcript(state, owner, incarnation)?,
-                },
-            },
+            (Some(owner), Some(incarnation)) => managed_transcript(state, owner, incarnation)?
+                .and_then(|managed| managed.transcript.ok()),
             _ => crate::external_sessions::find(state.native_session_home.as_deref(), session_id)
                 .map_err(ApiError::internal)?,
         }
@@ -3700,7 +3989,14 @@ impl ConversationMark {
         if index > self.store_index {
             let claims = state
                 .store
-                .claims_page(None, None, self.store_index, index.checked_add(1), false, 10_000)
+                .claims_page(
+                    None,
+                    None,
+                    self.store_index,
+                    index.checked_add(1),
+                    false,
+                    10_000,
+                )
                 .map_err(ApiError::internal)?
                 .claims;
             // A burst too large to scan is treated as a change.
@@ -7394,6 +7690,132 @@ subscription "watch/source" {
         );
     }
 
+    /// The runtime, terminal and machine lists read what they show in a fixed number of
+    /// statements, however many runtimes there are.
+    #[test]
+    fn runtime_and_machine_lists_cost_a_fixed_number_of_statements() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let observe = |number: usize| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: format!("agent/listed/runtime-{number}"),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String("running".into())),
+                        (
+                            "runtime_id".into(),
+                            Value::String(format!("listed-{number}")),
+                        ),
+                        (
+                            "incarnation_id".into(),
+                            Value::String(format!("listed-{number}:1")),
+                        ),
+                        ("terminal".into(), Value::Bool(true)),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        let statements = |count: usize| {
+            let snapshot = new_client_snapshot(&state);
+            // The first read reduces each runtime once; count a read at the same snapshot.
+            machine_resources(&state, false, &snapshot, &session).unwrap();
+            crate::store::STATEMENTS_RUN.with(|run| run.set(0));
+            let runtimes = runtime_resources(&state, false, &snapshot, &session).unwrap();
+            let runtime_statements = crate::store::STATEMENTS_RUN.with(|run| run.replace(0));
+            assert_eq!(runtimes.len(), count);
+            for runtime in &runtimes {
+                let observed = state
+                    .store
+                    .claim_by_id(runtime["revision"].as_str().unwrap())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    runtime["updated_at"],
+                    client_timestamp(observed.accepted_at_unix_ms)
+                );
+            }
+            crate::store::STATEMENTS_RUN.with(|run| run.set(0));
+            let machines = machine_resources(&state, false, &snapshot, &session).unwrap();
+            assert_eq!(machines[0]["runtime_ids"].as_array().unwrap().len(), count);
+            let machine_statements = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get);
+            (runtime_statements, machine_statements)
+        };
+        for number in 0..3 {
+            observe(number);
+        }
+        let few = statements(3);
+        for number in 3..40 {
+            observe(number);
+        }
+        assert_eq!(statements(40), few);
+    }
+
+    /// The operations collection answers while the first diagnostic report since a start is
+    /// being made, saying so, and lists the report once it is made.
+    #[test]
+    fn operations_answer_while_the_first_report_is_made() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let key = Arc::as_ptr(&state.store) as usize;
+        // As `start_operation_report` leaves it until its thread has made the report.
+        operation_reports().insert(
+            key,
+            OperationReport {
+                store: Arc::downgrade(&state.store),
+                checks: None,
+                at: Instant::now(),
+                refreshing: true,
+            },
+        );
+        crate::store::STATEMENTS_RUN.with(|run| run.set(0));
+        let pending = operation_resources(&state, "2026-09-30T00:00:00Z").unwrap();
+        assert_eq!(crate::store::STATEMENTS_RUN.with(std::cell::Cell::get), 0);
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0]["kind"], "operation");
+        assert_eq!(pending[0]["component"], "daemon");
+        assert_eq!(pending[0]["severity"], "info");
+        assert_eq!(pending[0]["state"], "running");
+        assert_eq!(pending[0]["updated_at"], "2026-09-30T00:00:00Z");
+        refresh_operation_report(&state, key);
+        let report = operation_resources(&state, "2026-09-30T00:00:00Z").unwrap();
+        assert!(
+            report.iter().all(|item| item["state"] != "running"),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|item| item["revision"] == "claim-store:pass"),
+            "{report:?}"
+        );
+
+        // A started report is made on its own thread, and a second start keeps it.
+        let other = tempfile::tempdir().unwrap();
+        let started = test_state(other.path());
+        start_operation_report(&started);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while operation_checks(&started).unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the started report was never made"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let made = operation_checks(&started).unwrap().unwrap();
+        start_operation_report(&started);
+        assert!(Arc::ptr_eq(
+            &made,
+            &operation_checks(&started).unwrap().unwrap()
+        ));
+    }
+
     #[test]
     fn attention_events_name_the_attention_they_change() {
         let root = tempfile::tempdir().unwrap();
@@ -7559,8 +7981,8 @@ subscription "watch/source" {
             .iter()
             .find(|machine| machine["host_id"] == "host/laptop")
             .expect("the dial-out member is a current machine");
-        assert_eq!(laptop["state"], "dial-out");
-        assert_eq!(laptop["transports"][0]["status"], "unknown");
+        assert_eq!(laptop["state"], "last-seen");
+        assert_eq!(laptop["transports"][0]["status"], "last-seen");
         assert!(
             machines
                 .iter()
@@ -7830,6 +8252,353 @@ mission "example/looped" state="ready" {
             .find(|value| value["id"] == "mission/example/looped")
             .unwrap();
         assert_eq!(retired["state"], "retired");
+    }
+
+    /// A mission's detail reads only its own runs, seats and states, and says what the whole
+    /// history says about them.
+    #[test]
+    fn a_mission_detail_matches_the_mission_history() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "detail-node");
+        for mission in ["example/detail", "example/neighbor"] {
+            let source = format!(
+                "version 2\nmission \"{mission}\" state=\"ready\" {{\n  goal \"Finish.\"\n  concurrent-runs max=10\n  step \"do\" {{ assigned-to \"agent/doer\" }}\n}}\n"
+            );
+            let intent = crate::graph::parse_intent(&source, "detail-node").unwrap();
+            let preview = state
+                .store
+                .mission(
+                    &intent,
+                    crate::model::IntentInput {
+                        kdl: source.clone(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            state
+                .store
+                .apply_as(
+                    &intent,
+                    &preview.subject_tokens,
+                    &format!("publish-{mission}"),
+                    Some("person/operator"),
+                )
+                .unwrap();
+            for run in 0..2 {
+                let view = state
+                    .store
+                    .create_mission_run(&crate::model::MissionRunRequest {
+                        mission: mission.into(),
+                        revision: None,
+                        workspace: root.path().display().to_string(),
+                        requester: Some("person/operator".into()),
+                        mode: None,
+                        inputs: BTreeMap::new(),
+                        idempotency_key: format!("{mission}-{run}"),
+                    })
+                    .unwrap();
+                if run == 0 {
+                    for phase in ["cleanup-completed", "terminal"] {
+                        state
+                            .store
+                            .set_mission_run_state(&view.id, "completed", phase, Some("done"))
+                            .unwrap();
+                    }
+                }
+            }
+        }
+        let index = state.store.index().unwrap();
+        let history = mission_resources(&state.store, index, true, None).unwrap();
+        for mission in ["mission/example/detail", "mission/example/neighbor"] {
+            let listed = history.iter().find(|item| item["id"] == mission).unwrap();
+            let detail = mission_resources(&state.store, index, true, Some(mission)).unwrap();
+            assert_eq!(detail.len(), 1);
+            let detail = &detail[0];
+            for field in [
+                "runs",
+                "state",
+                "must_act",
+                "active_runs",
+                "usage",
+                "revision",
+            ] {
+                assert_eq!(detail[field], listed[field], "{mission} {field}");
+            }
+            let runs = |item: &Value| {
+                item["run_details"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|run| {
+                        json!([
+                            run["id"],
+                            run["status"],
+                            run["state_since"],
+                            run["outcome"],
+                            run["must_act"]
+                        ])
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(runs(detail), runs(listed), "{mission}");
+        }
+    }
+
+    /// Page reads of the operations collection serve the daemon's last diagnostic report, whose
+    /// checks read the whole store, instead of running every check on every read.
+    #[test]
+    fn operations_serve_the_last_diagnostic_report() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "operations-node");
+        let first = operation_checks(&state).unwrap().unwrap();
+        let second = operation_checks(&state).unwrap().unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(
+            first
+                .iter()
+                .any(|check| check.name == "operation-projection")
+        );
+        let other = test_state_named(&root.path().join("other"), "operations-other");
+        assert!(!Arc::ptr_eq(
+            &first,
+            &operation_checks(&other).unwrap().unwrap()
+        ));
+    }
+
+    /// A fleet larger than the tree lists shows the first items and says what it left out, rather
+    /// than failing the whole tree.
+    #[test]
+    fn the_missions_tree_lists_a_bounded_part_of_a_large_fleet() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "tree-node");
+        for mission in ["example/first", "example/second", "example/third"] {
+            let source = format!(
+                "version 2\nmission \"{mission}\" state=\"ready\" {{\n  goal \"Wait to start.\"\n}}\n"
+            );
+            let intent = crate::graph::parse_intent(&source, "tree-node").unwrap();
+            let preview = state
+                .store
+                .mission(
+                    &intent,
+                    crate::model::IntentInput {
+                        kdl: source.clone(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            state
+                .store
+                .apply_as(
+                    &intent,
+                    &preview.subject_tokens,
+                    &format!("publish-{mission}"),
+                    Some("person/operator"),
+                )
+                .unwrap();
+        }
+        let index = state.store.index().unwrap();
+        let whole = missions_tree_value(&state.store, "now", index).unwrap();
+        assert_eq!(whole["unstarted_missions"].as_array().unwrap().len(), 3);
+        assert_eq!(whole["truncated"], json!({}));
+        let bounded = missions_tree_value_within(&state.store, "now", index, 2, 1000).unwrap();
+        assert_eq!(
+            bounded["unstarted_missions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|mission| mission["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["mission/example/first", "mission/example/second"]
+        );
+        assert_eq!(
+            bounded["truncated"],
+            json!({"unstarted_missions": {"shown": 2, "total": 3}})
+        );
+    }
+
+    /// A mission detail and the missions tree show each step's state and latest progress
+    /// without reading the timing, wake and definition history a work view reads for every
+    /// step: they enrich no step, and they show what the enriched runs show.
+    #[test]
+    fn mission_detail_and_the_tree_read_no_step_history() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "steps-node");
+        let publish = |source: &str, key: &str| {
+            let intent = crate::graph::parse_intent(source, "steps-node").unwrap();
+            let preview = state
+                .store
+                .mission(
+                    &intent,
+                    crate::model::IntentInput {
+                        kdl: source.into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            state
+                .store
+                .apply_as(
+                    &intent,
+                    &preview.subject_tokens,
+                    key,
+                    Some("person/operator"),
+                )
+                .unwrap();
+        };
+        publish(
+            r#"version 2
+mission "example/steps" state="ready" {
+  goal "Build and review."
+  concurrent-runs max=10
+  step "build" { assigned-to "agent/builder" }
+  step "review" { assigned-to "agent/reviewer" }
+}"#,
+            "publish-steps",
+        );
+        for (mission, state_name) in [("example/waiting", "ready"), ("example/drafted", "draft")] {
+            publish(
+                &format!(
+                    "version 2\nmission \"{mission}\" state=\"{state_name}\" {{\n  goal \"Wait to start.\"\n}}\n"
+                ),
+                &format!("publish-{mission}"),
+            );
+        }
+        let mut runs = Vec::new();
+        for run in 0..2 {
+            let view = state
+                .store
+                .create_mission_run(&crate::model::MissionRunRequest {
+                    mission: "example/steps".into(),
+                    revision: None,
+                    workspace: root.path().display().to_string(),
+                    requester: Some("person/operator".into()),
+                    mode: None,
+                    inputs: BTreeMap::new(),
+                    idempotency_key: format!("steps-{run}"),
+                })
+                .unwrap();
+            let build = view.steps.iter().find(|step| step.step == "build").unwrap();
+            let (build, builder) = (
+                build.subject.clone(),
+                build
+                    .assigned_to
+                    .clone()
+                    .expect("the build step is assigned"),
+            );
+            state.store.set_step_state(&build, "ready", None).unwrap();
+            // A seat holds one step at a time: the first run's is claimed and under way.
+            if run == 0 {
+                let request = |summary: Option<&str>, key: &str| crate::model::WorkRequest {
+                    actor: Some(builder.clone()),
+                    incarnation: Some("builder-1".into()),
+                    summary: summary.map(str::to_owned),
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: key.into(),
+                };
+                state
+                    .store
+                    .work_action(&build, "claim", &request(None, "claim"))
+                    .unwrap();
+                state
+                    .store
+                    .work_action(
+                        &build,
+                        "progress",
+                        &request(Some("Half built."), "progress"),
+                    )
+                    .unwrap();
+            }
+            runs.push(view.subject);
+        }
+        let index = state.store.index().unwrap();
+
+        crate::store::STEPS_ENRICHED.with(|enriched| enriched.set(0));
+        let detail =
+            mission_resources(&state.store, index, true, Some("mission/example/steps")).unwrap();
+        let tree = missions_tree_value(&state.store, "now", index).unwrap();
+        assert_eq!(crate::store::STEPS_ENRICHED.with(std::cell::Cell::get), 0);
+
+        let shown = |run: &crate::model::MissionRunView| {
+            run.steps
+                .iter()
+                .map(|step| {
+                    json!([
+                        step.subject,
+                        step.status,
+                        step.claimant,
+                        step.assigned_to,
+                        step.attempt,
+                        step.blocked_reason,
+                        step.blockers,
+                        step.progress_summary,
+                        step.progress_at_unix_ms,
+                        step.completion_summary,
+                        step.updated_at_unix_ms,
+                    ])
+                })
+                .collect::<Vec<_>>()
+        };
+        for run in &runs {
+            let enriched = state.store.mission_run(run).unwrap().unwrap();
+            let light = state.store.mission_run_steps(run, true).unwrap().unwrap();
+            assert_eq!(shown(&light), shown(&enriched), "{run}");
+        }
+        let claimed = state.store.mission_run(&runs[0]).unwrap().unwrap();
+        assert!(claimed.steps.iter().any(|step| step.status == "working"
+            && step.progress_summary.as_deref() == Some("Half built.")));
+        let details = detail[0]["run_details"].as_array().unwrap();
+        assert_eq!(details.len(), 2);
+        let progress = details
+            .iter()
+            .map(|run| (run["id"].as_str().unwrap(), run["last_progress"].clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(progress[runs[0].as_str()], "Half built.");
+        assert_eq!(progress[runs[1].as_str()], Value::Null);
+        let tree_runs = tree["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|run| {
+                let steps = run["steps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|step| json!([step["id"], step["state"]]))
+                    .collect::<Vec<_>>();
+                (run["id"].as_str().unwrap().to_owned(), steps)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let enriched_runs = runs
+            .iter()
+            .map(|run| {
+                let steps = state
+                    .store
+                    .mission_run(run)
+                    .unwrap()
+                    .unwrap()
+                    .steps
+                    .iter()
+                    .map(|step| json!([step.subject, step.status]))
+                    .collect::<Vec<_>>();
+                (run.clone(), steps)
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(tree_runs, enriched_runs);
+        // The tree's unstarted missions are the current list's ready and draft missions that
+        // never ran.
+        let mut unstarted = mission_resources(&state.store, index, false, None)
+            .unwrap()
+            .into_iter()
+            .filter(|mission| {
+                matches!(mission["state"].as_str(), Some("ready" | "draft"))
+                    && mission["runs"].as_array().is_some_and(Vec::is_empty)
+            })
+            .map(|mission| json!({"id": mission["id"], "title": mission["title"], "state": mission["state"]}))
+            .collect::<Vec<_>>();
+        unstarted.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        assert_eq!(unstarted.len(), 2);
+        assert_eq!(tree["unstarted_missions"], json!(unstarted));
     }
 
     #[test]
@@ -9041,11 +9810,27 @@ mission "example/zero-run" state="ready" {
             .unwrap(),
         )
         .unwrap();
-        assert!(
-            managed_codex_transcript(&state, owner, incarnation)
-                .unwrap()
-                .is_none()
+        let stale = managed_transcript(&state, owner, incarnation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stale.transcript.unwrap_err(),
+            "the Codex binding belongs to a different runtime"
         );
+        let unbound = timeline_value(
+            &state,
+            &new_client_snapshot(&state),
+            &session,
+            &session_id,
+            &ClientListQuery::default(),
+        )
+        .unwrap()
+        .0;
+        assert!(unbound["items"].as_array().unwrap().iter().any(|item| {
+            item["type"] == "error"
+                && item["body"]["code"] == "transcript-not-bound"
+                && item["body"]["details"]["driver"] == "codex"
+        }));
     }
 
     #[test]
@@ -9101,8 +9886,10 @@ mission "example/zero-run" state="ready" {
                 idempotency_key: None,
             })
             .unwrap();
-        let exact = super::managed_claude_transcript(&state, owner, incarnation)
+        let exact = super::managed_transcript(&state, owner, incarnation)
             .unwrap()
+            .unwrap()
+            .transcript
             .unwrap();
         let timeline = crate::external_sessions::normalized_timeline(&exact).unwrap();
         assert!(
@@ -9111,9 +9898,11 @@ mission "example/zero-run" state="ready" {
                 .any(|entry| entry["body"]["text"] == "Current Claude answer")
         );
         assert!(
-            super::managed_claude_transcript(&state, owner, "native-pty:old")
+            super::managed_transcript(&state, owner, "native-pty:old")
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .transcript
+                .is_err()
         );
         std::fs::write(
             directory.join("claude-native-session"),
@@ -9123,11 +9912,133 @@ mission "example/zero-run" state="ready" {
             .unwrap(),
         )
         .unwrap();
-        assert!(
-            super::managed_claude_transcript(&state, owner, incarnation)
-                .unwrap()
-                .is_none()
+        // A stale hook binding is not used, and the process fallback refuses evidence that
+        // does not name a driver process.
+        let stale = super::managed_transcript(&state, owner, incarnation)
+            .unwrap()
+            .unwrap()
+            .transcript
+            .unwrap_err();
+        assert!(stale.contains("does not name a driver process"), "{stale}");
+    }
+
+    #[test]
+    fn managed_claude_without_a_hook_binding_is_proved_from_its_driver_or_says_why_not() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let native_id = "22222222-2222-4222-8222-222222222222";
+        let transcript = home.join(format!(".claude/projects/-test/{native_id}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            format!("{}\n", json!({"type":"assistant","sessionId":native_id,"timestamp":"2026-09-30T12:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Recovered without the hook"}]}})),
+        )
+        .unwrap();
+        let mut state = test_state_named(root.path(), "managed-claude-fallback-test");
+        state.native_session_home = Some(home.clone());
+        let owner = "agent/managed-claude-fallback";
+        let incarnation = "native-pty:current";
+        let append = |kind: &str, fields: BTreeMap<String, Value>| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: owner.into(),
+                    kind: kind.into(),
+                    actor: Some(owner.into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        let observe = |evidence: &str| {
+            append(
+                "harness.observed",
+                BTreeMap::from([
+                    ("state".into(), json!("working")),
+                    ("driver".into(), json!("claude")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("evidence_incarnation".into(), json!(evidence)),
+                ]),
+            );
+        };
+        append(
+            "runtime.observed",
+            BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("runtime_id".into(), json!("managed-claude-pty")),
+                ("incarnation_id".into(), json!(incarnation)),
+                ("terminal".into(), json!(true)),
+            ]),
         );
+        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session_id = super::managed_session_id(owner, incarnation);
+        let timeline = || {
+            timeline_value(
+                &state,
+                &new_client_snapshot(&state),
+                &session,
+                &session_id,
+                &ClientListQuery::default(),
+            )
+            .unwrap()
+            .0["items"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+
+        // The hook never bound a session and the evidence names a driver that is gone: the
+        // claim timeline says so instead of silently standing in for the conversation.
+        observe("4194303-1000-0");
+        let unbound = timeline();
+        let notice = unbound
+            .iter()
+            .find(|item| item["body"]["code"] == "transcript-not-bound")
+            .expect("the timeline should say why the transcript is missing");
+        assert_eq!(notice["type"], "error");
+        assert_eq!(notice["role"], "system");
+        assert_eq!(notice["body"]["details"]["driver"], "claude");
+        assert!(
+            notice["body"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("transcript not bound: the SessionStart hook did not bind"),
+            "{notice:#}"
+        );
+        assert!(
+            !unbound
+                .iter()
+                .any(|item| item["body"]["text"] == "Recovered without the hook")
+        );
+
+        // The live driver named by the evidence proves its Claude child's session.
+        #[cfg(target_os = "linux")]
+        {
+            let fake = crate::external_sessions::test_support::FakeClaudeDriver::start(owner);
+            fake.record_session(&home, native_id, None);
+            observe(&fake.token());
+            let bound = timeline();
+            assert!(
+                bound
+                    .iter()
+                    .any(|item| item["body"]["text"] == "Recovered without the hook"),
+                "{bound:#?}"
+            );
+            assert!(
+                !bound
+                    .iter()
+                    .any(|item| item["body"]["code"] == "transcript-not-bound")
+            );
+            // A different seat's evidence naming this driver binds nothing.
+            let other = crate::external_sessions::claude_session_of_managed_driver(
+                &home,
+                "agent/someone-else",
+                &fake.token(),
+            );
+            assert!(other.is_err());
+        }
     }
 
     #[test]
@@ -9182,8 +10093,10 @@ mission "example/zero-run" state="ready" {
                 idempotency_key: None,
             })
             .unwrap();
-        let exact = super::managed_omp_transcript(&state, owner, incarnation)
+        let exact = super::managed_transcript(&state, owner, incarnation)
             .unwrap()
+            .unwrap()
+            .transcript
             .unwrap();
         assert_eq!(exact.native_id, "current");
         let timeline = crate::external_sessions::normalized_timeline(&exact).unwrap();
@@ -9200,9 +10113,11 @@ mission "example/zero-run" state="ready" {
                     && entry["body"]["text"] == "{\"presence\":null}")
         );
         assert!(
-            super::managed_omp_transcript(&state, owner, "123:2026-09-25T14:00:00Z")
+            super::managed_transcript(&state, owner, "123:2026-09-25T14:00:00Z")
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .transcript
+                .is_err()
         );
     }
 

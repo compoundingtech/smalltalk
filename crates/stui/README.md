@@ -17,6 +17,13 @@ with a running st3 daemon. For source development, use
 `stui` uses `person` from `~/.config/st3/config.toml` (or `$XDG_CONFIG_HOME/st3/config.toml`).
 A concrete person identity is required so Now and devices show the right data.
 
+For a laptop without a daemon, run `stui pair MEMBER_URL PAIRING_ID` and enter the member's
+single-use code, then run `stui`. The paired member supplies the person identity. See
+[client-only setup](../../docs/st3/client-only.md) for gateway setup, multiple members, private
+credentials, offline cache, and automatic reconnect. `--client` requires a saved pairing;
+`--local` selects the local daemon even when a pairing exists. While offline, stui keeps its last
+display, shows the last connection time, queues no mutations, and offers `r` to retry now.
+
 Keys: `1`–`5` switch Now, Chat, Control, Fleet, and Tree; arrow keys or a sidebar click select an item;
 the mouse wheel and PageUp/PageDown scroll the detail pane; `End` follows the newest Chat message;
 `h` or the History control opens Chat history and details, and its Load older pages control fetches more history;

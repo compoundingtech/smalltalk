@@ -8,6 +8,9 @@ it and one admission rule, the writer fence.
 
 `st` and `st3` are the same program. This document uses `st`.
 
+Every member follows the [sync invariants](st3/replication.md#sync-invariants): shared projections
+use one canonical total order, and digests cover every synced logical source and shared outcome.
+
 ## Why
 
 Adding a third machine to a two-machine fleet took all of this:
@@ -32,7 +35,7 @@ This design replaces each step:
 | Edit another member's config | Membership is a set of claims in the graph; every member learns it by replication |
 | Reinstall services to change peers | Service files carry no peers; the worker reads membership at run time |
 | A helper keeps a Fabric dial alive | The worker dials Fabric itself; Tailscale needs no dial at all |
-| A laptop is listed at a dead port and reported down | A dial-out member is never dialed and never reported down |
+| A peer is listed at a dead port and reported down | Any absent member is last seen; successful connections sync both directions |
 
 ## What a person types
 
@@ -45,19 +48,20 @@ st fleet invite laptop
 On the new machine, after installing a release:
 
 ```sh
-st fleet join --dial-out
+st fleet join
 ```
 
 `join` asks for the code, receives the fleet secret, installs the services, and waits until the
-new machine has the fleet's full history. `--dial-out` is for a machine that is often asleep or
-offline, such as a laptop. Leave it out for a machine that stays on.
+new machine has the fleet's full history. Offline is normal for every member, with no machine
+kind or roaming flag. `--dial-out` only prevents opening a listener, when explicitly desired;
+a firewall or NAT that blocks inbound traffic needs no special setup.
 
 When both machines are Fabric peers, the code never has to appear on a screen or in a command
 line. `st` sends it as a file to the new machine's Fabric inbox, and `join` reads and deletes it:
 
 ```sh
 st fleet invite laptop --send-fabric
-fabric exec laptop -- st fleet join --dial-out --fabric-inbox
+fabric exec laptop -- st fleet join --fabric-inbox
 ```
 
 To take a machine out:
@@ -394,7 +398,7 @@ keeps clock skew out of authentication.
 
 ```text
 st fleet join [CODE | - | --code-file PATH | --fabric-inbox] [--name NAME] [--dial-out]
-              [--via auto|tailscale|fabric|URL] [--no-service] [--no-wait] [--as PERSON]
+              [--via ROUTE] [--no-service] [--no-wait]
 ```
 
 With no `CODE`, `join` prompts for it without echo. `-` reads it from standard input.
@@ -415,7 +419,7 @@ continues from the last completed step:
    `local`. Names match `[A-Za-z0-9][A-Za-z0-9._-]{0,62}`.
 2. **Key.** Create `STATE/fleet/node.key` if it does not exist, and sync it to disk before any
    request. Checkpoint `key-created`.
-3. **Route.** Pick the sponsor endpoint: `--via URL` if given (loopback only), else tailnet if this
+3. **Route.** Pick the sponsor endpoint: `--via ROUTE` if given (loopback or tailnet HTTP, or Fabric), else tailnet if this
    machine's Tailscale is up, else Fabric if `fabric probe` reports the sponsor serves the fleet
    protocol, else an advertised loopback endpoint. If Fabric is the only route and the probe says
    `unsupported`, print the exact grant the sponsor needs:
@@ -696,7 +700,8 @@ The worker computes its peers at run time and recomputes them on every wake and 
   plus every config peer that is not a member. A dial-out member dials only listening members.
 - **Accept set**: the table above.
 - **Config peers become local overrides.** A `[[peers]]` entry whose name is a current member
-  becomes that member's loopback route from this machine. A `[[peers]]` entry whose name is
+  becomes that member's first local route from this machine. Multiple entries may give
+  distinct loopback, tailnet HTTP or canonical Fabric alternatives. A `[[peers]]` entry whose name is
   removed or dial-out is ignored, and `st fleet status` says to delete it.
 
 The worker reads membership from the main daemon through a new internal endpoint,
@@ -710,9 +715,18 @@ Every member dials out to every listening member. So when a listening member's a
 while it is offline, it publishes its new endpoints the next time it dials anyone, and the fleet
 converges without a person.
 
-A full mesh sends one exchange per pair every 30 seconds when idle. That is fine for the ten or so
-machines one person or a small team runs. A larger fleet would need designated hubs; that is not
-in this design.
+Healthy peers use a 30-second anti-entropy interval, with graph changes requesting a prompt
+exchange. A recent inbound exchange suppresses a redundant reverse connection. Failed attempts
+back off exponentially from one second to minutes and then an hour, with 20 percent jitter;
+local graph wakes do not restart that failure timer. Inbound exchange, a named Fabric online
+admission, or a changed route interrupts it immediately.
+
+A member coming online announces itself and initiates exchanges with reachable members on
+daemon start, wake from sleep, network change and Fabric recovery. One connection pushes and
+pulls missing history and repeats while the backlog drains. The peer that stayed online resets
+its retry for the returning member; neither needs to wait for the other's timer. This applies
+to every member, including a server that has been absent for hours. The fleet uses a full mesh
+for the small fleets it serves; designated hubs are not part of this design.
 
 ### Service units
 
@@ -731,31 +745,25 @@ and `st fleet migrate` refresh the units themselves when the daemon runs as a se
 Units installed by an older build keep their baked `--peer` arguments and keep working until
 `st fleet migrate` or `st service install` rewrites them. The arguments stay accepted.
 
-## Dial-out members
+## Listener capability and absence
 
-A dial-out member is for a machine that is often asleep or away: a laptop.
+Every member may be offline for any reason. Listening capability determines which connections
+can be opened; it does not identify a machine kind or choose a retry policy. A new laptop or
+server joins with the same command. If NAT or a firewall prevents inbound connections, its own
+outbound exchange still synchronizes both directions.
 
-- It has no listener and publishes no endpoints. No member ever dials it.
-- It dials every listening member it has a route to, on the usual schedule: a wake on each local
-  change, and anti-entropy every 30 seconds. One exchange moves data in both directions, so it
-  sends and receives everything through its own connections.
-- It never appends `transport.observed` claims. Its failed dials stay in its local
-  `replication_peers` rows. A closed lid therefore never publishes "the server is down" into the
-  fleet when it wakes.
-- Listening members record its exchanges in their local `replication_peers` rows, not as
-  `transport.observed` claims.
-- `st machines`, `st doctor`, and `st fleet status` show it as `dial-out` with a local
-  `last contact` time. It is never `unreachable`, and it never causes a doctor warning, however
-  long it has been away. The machines view ignores older `transport.observed` claims about a name
-  whose current member is dial-out.
-- Other machines cannot open remote terminal reads for its seats, because the relay needs to
-  connect to the owner. Its seats are visible in the graph as usual.
+`--dial-out` explicitly disables the listener and publishes no endpoints. Other members then
+have no endpoint to dial, but it still connects to listening members, drains both queues, and
+uses the same adaptive retry and wake behavior. It is optional and is not required because a
+machine sleeps or travels. `st fleet mode dial-out` and `st fleet mode listening` change an
+existing member's listener capability, refresh its endpoints, and remove or add its Fabric
+exposure. Remote terminal reads need a route to the owning machine, so a member with no inbound
+endpoint may replicate its graph while its live terminal remains unavailable remotely.
 
-`st fleet mode dial-out` and `st fleet mode listening` switch an existing member. The switch
-publishes new endpoints, starts or stops the listeners, and adds or removes the Fabric exposure.
-
-A listening member that is offline is reported down, as today. That is correct for a machine that
-is meant to stay on.
+All members show their last successful exchange time. Normal absence never becomes a doctor
+fault or a delivery attention streak, whether or not the member advertises a listener. The
+member remains current until an explicit leave or removal; losing contact does not remove it.
+Authentication, admission and membership errors still need investigation.
 
 ## Remove, leave, and uninstall
 
@@ -896,10 +904,10 @@ in use for each member.
 - **Protocol name.** `st3/fleet/FLEET_ID` by default, so a throwaway fleet never collides with a
   real one on the same machines. `fabric_protocol` overrides it; a migrated fleet can keep the
   exposure name it already uses.
-- **Inbound.** The worker runs `fabric expose PROTOCOL --tcp 127.0.0.1:PORT --ephemeral` at start
-  and every 60 seconds. The exposure is not persisted in Fabric's configuration, so a crash leaves
-  nothing behind after Fabric restarts. `st fleet leave`, `st fleet mode dial-out`, and
-  `st uninstall` run `fabric unexpose PROTOCOL`.
+- **Inbound.** The worker runs `fabric expose PROTOCOL --tcp 127.0.0.1:PORT` at start,
+  on a local reconnect, and every 60 seconds. Fabric persists and restores the exposure after a
+  restart. `st fleet leave`, `st fleet mode dial-out`, and `st uninstall` remove it with
+  `fabric unexpose PROTOCOL`.
 - **Outbound.** Before an exchange over Fabric, the worker runs
   `fabric dial NODE_ID PROTOCOL --tcp 127.0.0.1:0`. Fabric's daemon creates or reuses a loopback
   TCP tunnel to that peer's exposure and the command prints its address. The worker sends the
@@ -956,7 +964,7 @@ st fleet migrate --anchor
 # For each other machine, on any migrated member:
 st fleet invite server --migrate --send-fabric
 # and on that machine:
-st fleet migrate --fabric-inbox          # add --dial-out on a laptop
+st fleet migrate --fabric-inbox          # no machine-kind option is needed
 ```
 
 A migration code works like a join code, and it can be pasted or read from a file the same ways.
@@ -997,9 +1005,9 @@ It checks that condition, sets `legacy_peers = false`, and prints the `[[peers]]
 A hand-written Fabric dial helper and its launchd agent or systemd unit are no longer needed once
 `st fleet status` shows the Fabric route in use for that member. Remove them then.
 
-A config peer that is a laptop listed at an unused port becomes a dial-out member when it migrates
-with `--dial-out`. Every other member then stops dialing it, and the `[[peers]]` entry is ignored
-until it is deleted.
+A member with an unreachable advertised port still joins and exchanges in both directions by
+initiating connections itself. Other members suppress redundant dials after inbound exchanges,
+back off through minutes and hours during absence, and display its last exchange time.
 
 A config peer that will be wiped does not need to migrate. Remove it with `st fleet remove NAME`
 on a migrated member, wipe it, and join it again with a normal invite.
@@ -1015,29 +1023,24 @@ others again (`st fleet migrate --unfinish`).
 
 ## Status and diagnostics
 
-`st fleet status`:
+`st fleet status` shows membership separately from recent transport contact. For example:
 
 ```text
-FLEET  5b0c1d8e-6a44-4f0e-9d51-2f7f3c9a0b12   this node: studio (listening)
-MEMBER   MODE       ROUTE      LAST CONTACT   STATE
-server   listening  tailscale  4s ago         up
-laptop   dial-out   -          2h ago         dial-out
-old-box  -          -          -              removed 3 days ago by person/ada
-
-INVITES  fleet-invite/q3m7k2 for tablet, expires in 11 minutes (sponsor: studio)
-WARNINGS
-  config peer old-box is removed; delete its [[peers]] entry
+FLEET  5b0c1d8e-6a44-4f0e-9d51-2f7f3c9a0b12   this node: studio
+MEMBER  MODE  STATE  ROUTE-ENDPOINTS
+server  listening  current  tailscale,fabric
+beacon  listening  current  fabric
+PEER  server  up
+PEER  beacon  last-seen
 ```
 
-New `st doctor` checks:
-
-- `fleet-membership`: a conflicted name; this node removed; a member admitted but never seen.
-- `fleet-transports`: a configured transport that is not up; a missing Fabric grant; a tailnet
-  refusal.
-- `fleet-legacy`: `legacy_peers = true`, and config peers that duplicate members.
-
-`st replication status` lists members and config peers from the fleet view instead of
-`configured_peers`, with each one's mode and route.
+`current` is the member's admission state, not a claim that it is online. Use
+`st replication status` for each peer's last exchange time, envelope backlog and divergence;
+`st machines` and stui also show last contact. A member never seen has no successful exchange
+time yet. Normal absence does not produce a doctor fault or delivery-probe attention. Invalid
+authentication, conflicting membership, rejected envelopes and projection faults remain
+visible. `st fleet status --json` includes the membership, endpoints and peer results for
+inspection.
 
 ## Failure cases
 
@@ -1052,10 +1055,11 @@ New `st doctor` checks:
 - **A fake sponsor.** It cannot sign with the fingerprinted key, so the joiner refuses its answer.
   The joiner has sent only its request, which reveals neither the token nor any history.
 - **A join interrupted halfway.** See [Interrupted join](#interrupted-join).
-- **A member offline for weeks.** A dial-out member stays `dial-out` and catches up when it
-  returns: one exchange moves up to 512 envelopes each way and repeats at once while envelopes
-  move. A listening member is reported down while it is away, then publishes new endpoints if its
-  address changed. If it was removed meanwhile, its first exchange gets `member-removed`.
+- **A member offline for weeks.** Any member stays admitted and shows its last exchange time.
+  Retries grow to minutes and hours while it is absent. On return it announces its current
+  endpoints and initiates a full exchange in both directions, repeating until it catches up.
+  Current peers exchange up to 4,096 envelopes per pass; older peers may use a smaller limit.
+  If it was explicitly removed meanwhile, its first exchange gets `member-removed`.
 - **Clock skew.** Only the sponsor's clock decides invite expiry. Membership, the writer fence, and
   authentication use keys and writer sequences, never time. Skew affects only displayed times.
 - **A removed member comes back.** It gets `member-removed` from every member that has the
@@ -1167,7 +1171,7 @@ The worker gains hidden settings for tests: `--anti-entropy-interval-ms` and
 - `a_dial_out_member_never_appends_transport_observations`
 - `a_listening_member_records_a_dial_out_exchange_only_locally`
 - `the_fabric_route_dials_through_the_cli_and_dials_again_after_a_lost_socket` (shim)
-- `the_fabric_exposure_is_ephemeral_and_removed_on_leave` (shim)
+- `the_fabric_route_dials_through_the_cli_and_refuses_a_non_loopback_tunnel` (shim)
 - `the_tailnet_listener_binds_only_tailscale_addresses_in_the_tailnet_ranges` (injected
   interface and command output)
 - `the_join_route_is_absent_without_invites_and_bounds_body_size_and_rate`
@@ -1374,8 +1378,8 @@ names:
    new one, and `st fleet status` on both. Include the tailnet ACL note.
 3. Join over Fabric: the one-time Fabric trust and the per-fleet grant, then
    `st fleet invite NAME --send-fabric` and `fabric exec NAME -- st fleet join --fabric-inbox`.
-4. A laptop that is often offline: `--dial-out`, what `dial-out` means in `st machines`, and
-   `st fleet mode`.
+4. Any member may be offline: last exchange time, adaptive retries and immediate catch-up on
+   return. The joining steps are identical for laptops and servers; listener capability is optional.
 5. Removing a machine: `st fleet remove` on another member, then `st uninstall` on the machine.
 6. Moving a fleet configured with `[[peers]]` to membership: `st fleet migrate`, then `--finish`.
 
@@ -1460,3 +1464,64 @@ differences, found while building it or raised by intake reviews:
   step. That is a Fabric change.
 - **Remote terminal reads of a dial-out member's seats.**
 - **Windows.**
+
+
+## Move an existing fleet off local dial helpers
+
+This keeps each member's name, fleet ID, secret, and history. The names below are invented;
+substitute the existing member names. Install the same current st build on all members first.
+Keep the legacy configuration and helpers until the native routes have exchanged successfully.
+
+1. On `harbor`, the chosen anchor, migrate and retain the already granted Fabric protocol:
+
+   ```sh
+   st fleet migrate --anchor --transports tailscale,fabric --fabric-protocol st3-peer-v1
+   st fleet status
+   ```
+
+2. On `harbor`, invite each remaining existing member through the transport it can reach:
+
+   ```sh
+   st fleet invite beacon --migrate --via fabric --send-fabric
+   ```
+
+   On `beacon`, redeem it in one command. Repeat for every remaining member:
+
+   ```sh
+   st fleet migrate --fabric-inbox --transports tailscale,fabric --fabric-protocol st3-peer-v1
+   ```
+
+   When using Tailscale instead, issue `st fleet invite beacon --migrate --via tailscale`,
+   then pass its code to `st fleet migrate --via http://100.64.0.10:31313` on `beacon`.
+   Use the sponsor's actual tailnet address and port. A Fabric code can likewise be redeemed
+   with `st fleet migrate --via fabric://NODE_ID/st3-peer-v1`. The worker saves the lasting
+   Fabric route and obtains its local TCP tunnel itself.
+
+3. On every member, inspect `st fleet status` and `st replication status`. Require current
+   membership for every retained name and a successful signed exchange over the native route.
+   Members advertise all available Tailscale and Fabric endpoints; the worker tries alternatives
+   if one route fails. A member may also list several `[[peers]]` overrides for the same name,
+   each with a different `url`, including `fabric://NODE_ID/PROTOCOL` and tailnet HTTP.
+
+4. On every member, run `st fleet migrate --finish`. Delete exactly the legacy configuration
+   lines it prints, then run `st service install` so both services read the membership settings.
+   Confirm new writes arrive in both directions using `st replication status`.
+
+5. Disable that member's old dial-helper unit, keeping its definition for rollback. Restart
+   the member services and verify another exchange in each direction with the helper disabled.
+   Restart Fabric under its usual supervisor and verify that its declarations survive and sync
+   resumes. Only then remove the helper unit and executable. The replication worker now asks
+   Fabric for its own tunnel, and Fabric 0.2.21 restores persistent dial declarations after a
+   restart. Remove workaround exposures and grants only after the native path has been verified;
+   retain the member protocol grant used by its advertised endpoints.
+
+Keep the original config, service definitions, and secret file through acceptance. Before
+`--finish`, rollback restores the legacy config and helper units. After `--finish`, restore
+the saved legacy peer entries on every member that must accept an old build, run
+`st fleet migrate --unfinish`, and restart its worker. Then restore the old member's config
+and helper units. Preserve the current store,
+member keys, and fleet history throughout; see [Rollback](#rollback) for unsigned writes.
+
+For a new member, `st fleet join --via http://100.64.0.10:31313` or
+`st fleet join --via fabric://NODE_ID/st3-peer-v1` redeems the code and starts normal replication.
+No member type changes the sync policy.

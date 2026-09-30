@@ -168,8 +168,13 @@ uses the same representation as its list item plus its documented detail fields.
 represented by an event tombstone; an ID is never reused.
 
 `operations` is the client-safe operational view: daemon health, host reachability, transport
-health, resource observers, and diagnostics. `history` is a typed audit projection. It does not
-expose raw claims, replication envelopes, or repair internals.
+health, resource observers, and diagnostics. Some diagnostics compare the whole projection with
+the claim log, so pages serve the daemon's last diagnostic report and a read of a report older
+than 30 seconds starts a new one in the background. The daemon makes its first report in the
+background as it starts; until that report is made, the collection lists one `running` operation,
+`operation/diagnostic-report`, that says so.
+`history` is a typed audit projection. It does not expose raw claims, replication envelopes, or
+repair internals.
 
 Every attention resource carries its concrete `person_id`, original `source_id`, semantic
 `attention_kind`, optional mission/run/step context, and currently meaningful typed actions. A
@@ -211,6 +216,9 @@ and `approver_id`, and `state` (`open` or `closed`). `entries` are in lane order
 `held`, `ready`, or `running`) with its `detail`, exact `head`, marker, and time, who joined it and
 when, and who approved it. `recent` lists joins, leaves, moves, and approvals, newest first. The
 `st missions tree` view carries the open lanes as `lanes`. [Lanes](../lanes.md) explains the model.
+The tree lists at most 200 active runs, steps per run, unstarted missions and agents, and standing
+queues up to 1000 queued runs. When a fleet has more, `truncated` names each part that was cut
+with how many it `shown` of the `total`.
 
 Observer and subscription lists and details are available at `/v1/client/observers` and
 `/v1/client/subscriptions`. Each resource includes its normalized specification, current state,

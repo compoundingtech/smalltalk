@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use base64::Engine as _;
-use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand, ValueEnum};
 use kdl::{KdlDocument, KdlEntry, KdlNode};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -49,6 +49,7 @@ use st3_client::{
 };
 use tokio::sync::{Notify, watch};
 
+mod cli_help;
 mod presentation;
 
 use presentation::{
@@ -286,7 +287,7 @@ enum FleetInvitesCommand {
 
 #[derive(Args, Clone)]
 struct FleetMemberArgs {
-    /// Accept no connections and dial listening members: for a laptop that is often away.
+    /// Accept no inbound connections; replication and presence otherwise behave normally.
     #[arg(long)]
     dial_out: bool,
     /// The replication port. The default is 31313 or the next free port.
@@ -372,7 +373,7 @@ struct FleetJoinArgs {
     /// This machine's name in the fleet.
     #[arg(long)]
     name: Option<String>,
-    /// A loopback URL that reaches the sponsor, instead of the code's endpoints.
+    /// A loopback/tailnet http:// or fabric:// route to the sponsor.
     #[arg(long)]
     via: Option<String>,
     /// Do not stop, install, or start services; print the foreground commands instead.
@@ -511,14 +512,11 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 "Created fleet {} with {} as its first member.",
                 founded.fleet_id, founded.node
             );
-            if !args.no_service && services_installed() {
+            let services = !args.no_service && services_installed();
+            if services {
                 st3::service::install(Config::load_with_fleet(None)?)?;
-                println!("The st3 services now run as a fleet member. Next: st fleet invite NAME");
-            } else {
-                println!(
-                    "Restart st3 up and start st3 replication-worker, then: st fleet invite NAME"
-                );
             }
+            print!("{}", cli_help::fleet_created_next_steps(services));
             Ok(())
         }
         FleetCommand::Invite(args) => {
@@ -695,11 +693,12 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                     if joined.resumed { " (resumed)" } else { "" }
                 );
             }
+            let mut sync_state = None;
             if use_services {
                 st3::service::install(Config::load_with_fleet(None)?)?;
-                println!(
-                    "The st3 services now run as a fleet member; st fleet status shows the sync."
-                );
+                if !json_output {
+                    println!("The st services now run as a fleet member.");
+                }
                 if !args.no_wait {
                     match wait_for_first_sync(&client, Duration::from_secs(30 * 60), !json_output)
                         .await?
@@ -710,7 +709,16 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                             "{}",
                             render_first_sync(&first, now_ms())
                         ),
-                        Some(first) => report_first_sync(&first, false)?,
+                        Some(first) => {
+                            sync_state = Some(first.state.clone());
+                            if first.state != "verified" {
+                                print!(
+                                    "{}",
+                                    cli_help::fleet_next_steps(use_services, sync_state.as_deref())
+                                );
+                            }
+                            report_first_sync(&first, false)?;
+                        }
                         None if json_output => {}
                         None => println!(
                             "This machine is a member and still syncing; st fleet wait waits for \
@@ -722,6 +730,12 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 println!(
                     "Start st3 up and st3 replication-worker to begin syncing; st fleet wait \
                      waits for the first sync to end and checks it."
+                );
+            }
+            if !json_output {
+                print!(
+                    "{}",
+                    cli_help::fleet_next_steps(use_services, sync_state.as_deref())
                 );
             }
             Ok(())
@@ -1256,6 +1270,9 @@ struct FleetMigrateArgs {
     code_file: Option<PathBuf>,
     #[arg(long)]
     fabric_inbox: bool,
+    /// A loopback/tailnet http:// or fabric:// route to the sponsor.
+    #[arg(long, conflicts_with_all = ["anchor", "finish", "unfinish"])]
+    via: Option<String>,
     /// Make this machine the anchor: the first machine of the fleet to migrate.
     #[arg(long, conflicts_with_all = ["code", "code_file", "fabric_inbox", "finish", "unfinish"])]
     anchor: bool,
@@ -1391,7 +1408,7 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
             configured_node: config.node.clone(),
             code: code.trim().to_owned(),
             name: Some(config.node.clone()),
-            via: None,
+            via: args.via.clone(),
             settings,
             legacy_secret_file: Some(secret_file),
             fabric_protocol: args.fabric_protocol.clone(),
@@ -2497,7 +2514,7 @@ struct AgentNewArgs {
     /// What the agent is for.
     #[arg(long)]
     description: Option<String>,
-    /// Attach this terminal to the agent once its harness is ready. Detach with Ctrl+\.
+    /// Attach this terminal to the agent once it is ready. Detach with Ctrl+\.
     #[arg(long, conflicts_with = "print_kdl")]
     attach: bool,
     /// Print the declaration without applying it.
@@ -2824,6 +2841,8 @@ enum MessageCommand {
     Send(MessageSendArgs),
     /// List the current mailbox for one explicit identity.
     Ls(MessageListArgs),
+    /// Show delivery and read progress without changing the message lifecycle.
+    Status(MessageReferenceArgs),
     /// Read exact messages and optionally mark them read or archived.
     Read(MessageReadArgs),
     /// Reply to one canonical message ID while preserving its thread.
@@ -3021,6 +3040,14 @@ fn main() -> ExitCode {
         println!("{}", st2::reexec::probe_answer());
         return ExitCode::SUCCESS;
     }
+    // A seat's harness runs its hooks through this binary. They are hidden from help, need no
+    // daemon or config to start, and the status line runs every few seconds, so they skip the
+    // CLI parser and the async runtime.
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(st3::driver_hook::SUBCOMMAND))
+    {
+        return run_driver_hook();
+    }
     // SAFETY: no other thread exists yet; the async runtime starts after this returns.
     unsafe { st2::reexec::take_resume_environment() };
     if st2::reexec::resume_path(st2::reexec::DRIVER_RESUME_ENV).is_some() {
@@ -3029,11 +3056,56 @@ fn main() -> ExitCode {
         st2::provider_session::install_stop_handlers();
         st2::reexec::unblock_stop_signals();
     }
-    let cli = Cli::parse();
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    if cli_help::all_help_requested(&arguments) {
+        print!("{}", cli_help::root_help(true));
+        return ExitCode::SUCCESS;
+    }
+    let matches = Cli::command()
+        .override_help(cli_help::root_help(false))
+        .get_matches_from(arguments);
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     if let Command::Up(args) = &cli.command {
         record_daemon_commands(args);
     }
     run_cli(cli)
+}
+
+/// `st driver-hook NAME [ARGS]`: answer one harness hook with the payload on stdin.
+fn run_driver_hook() -> ExitCode {
+    let arguments = std::env::args().skip(2).collect::<Vec<_>>();
+    let Some((name, rest)) = arguments.split_first() else {
+        eprintln!(
+            "usage: st {} NAME [ARGS]; NAME is one of {}",
+            st3::driver_hook::SUBCOMMAND,
+            st3::driver_hook::HOOKS.join(", ")
+        );
+        return ExitCode::from(2);
+    };
+    // Telemetry as st2's CLI built it: an event hook is its own `hook` process unit, and the
+    // status line, which Claude runs every five seconds, builds no exporter at all.
+    let mut telemetry = match name.as_str() {
+        "claude-observe" => st2::telemetry::Telemetry::init("hook"),
+        _ => st2::telemetry::Telemetry::local_only(),
+    };
+    let env = st3::driver_hook::ProcessEnv;
+    let code = st3::driver_hook::run(
+        name,
+        rest,
+        &env,
+        // Unlocked: the status-line tee reads stdin itself, and a held lock would deadlock it.
+        &mut std::io::stdin(),
+        &mut |diagnostic| {
+            if let Err(error) = st3::driver_hook::post_diagnostic(&env, &diagnostic) {
+                eprintln!(
+                    "st: could not record the {} diagnostic: {error:#}",
+                    diagnostic.code
+                );
+            }
+        },
+    );
+    telemetry.shutdown();
+    ExitCode::from(code)
 }
 
 /// The daemon finds `git` and `gh` through its recorder like every member does. `run_up` installs
@@ -3407,6 +3479,37 @@ fn run_recorder(command: RecorderCommand, config: &Config, json_output: bool) ->
     }
 }
 
+/// Every read that runs at once has a SQLite connection of its own, a few open files each, and
+/// every seat and client holds a socket. Raise the soft open file limit, which is often 1024,
+/// toward the hard one, so a burst of requests cannot run out of descriptors. Children inherit
+/// it, so it stays modest.
+fn raise_open_file_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit fills the rlimit it is given.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return;
+    }
+    let wanted = limit.rlim_max.min(8_192);
+    if wanted <= limit.rlim_cur {
+        return;
+    }
+    let raised = libc::rlimit {
+        rlim_cur: wanted,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: setrlimit only reads the rlimit it is given.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+        eprintln!(
+            "st3: could not raise the open file limit from {}: {}",
+            limit.rlim_cur,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 async fn run_up(args: UpArgs) -> Result<()> {
     let mut config = Config::load_unvalidated(args.config.as_deref())?;
     if let Some(node) = args.node {
@@ -3440,11 +3543,12 @@ async fn run_up(args: UpArgs) -> Result<()> {
     config.validate()?;
     validate_unix_socket_path(&config.socket, "--socket")?;
     validate_unix_socket_path(&config.client_gateway_socket, "--client-gateway-socket")?;
-    st2::hooks::ensure_installed().context(
+    fs::create_dir_all(&config.state_dir)?;
+    st3::hooks::ensure_installed(&st3::hooks::root(&config.state_dir)).context(
         "publishing this st binary's required lifecycle hook set before starting the daemon",
     )?;
-    fs::create_dir_all(&config.state_dir)?;
     st3::profile::init_from_env();
+    raise_open_file_limit();
     let store = Arc::new(st3::profile::task("startup open-store", || {
         Store::open(&config.state_dir.join("claims.sqlite3"), &config.node)
     })?);
@@ -3547,6 +3651,21 @@ async fn run_up(args: UpArgs) -> Result<()> {
         recorder.map(|installation| installation.directory),
     )?);
     tokio::spawn(reconciler.supervise());
+    // A start no longer rebuilds the operation projection; check it once the API serves.
+    tokio::spawn({
+        let store = store.clone();
+        async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            match tokio::task::spawn_blocking(move || store.repair_operation_projection_drift())
+                .await
+            {
+                Ok(Ok(true)) => eprintln!("st3: rebuilt an operation projection that drifted"),
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => eprintln!("st3: operation projection check failed: {error:#}"),
+                Err(error) => eprintln!("st3: operation projection check stopped: {error}"),
+            }
+        }
+    });
     tokio::spawn(st3::profile::watch_runtime_lag());
     tokio::spawn(trim_local_observations(
         store.clone(),
@@ -3593,6 +3712,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
     );
     let local_socket = config.socket.clone();
     let client_gateway_socket = config.client_gateway_socket.clone();
+    // The first diagnostic report reads the whole claim log; no read waits for it.
+    st3::api::start_operation_report(&state);
+    // Nor does the first session list wait to read every native transcript's header.
+    st3::api::start_native_session_discovery(&state);
     tokio::try_join!(
         st3::api::serve_unix_bound(&local_socket, router(state.clone())),
         serve_unix(&client_gateway_socket, fabric_router(state)),
@@ -3670,6 +3793,7 @@ async fn run_launch(
         );
     }
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let starting = matches!(&command, LaunchCommand::Start(_));
     let response = match command {
         LaunchCommand::Ls { .. } => unreachable!(),
         LaunchCommand::Start(args) => {
@@ -3870,7 +3994,11 @@ async fn run_launch(
                     },
                 )
                 .await?;
-            return print_value(&response, json_output);
+            print_value(&response, json_output)?;
+            if !json_output {
+                print!("{}", cli_help::mission_next_steps(&response.mission_run));
+            }
+            return Ok(());
         }
         LaunchCommand::Run(args) => {
             let workspace = fs::canonicalize(&args.workspace)
@@ -3886,7 +4014,11 @@ async fn run_launch(
                     },
                 )
                 .await?;
-            return print_value(&response, json_output);
+            print_value(&response, json_output)?;
+            if !json_output {
+                print!("{}", cli_help::mission_next_steps(&response));
+            }
+            return Ok(());
         }
         LaunchCommand::Question(args) => {
             let response: Value = client
@@ -4003,6 +4135,9 @@ async fn run_launch(
         for blocker in &preview.mission.blockers {
             println!("Blocker: {blocker}");
         }
+    }
+    if starting {
+        print!("{}", cli_help::launch_next_steps(&response));
     }
     Ok(())
 }
@@ -4353,9 +4488,12 @@ async fn start_mission_run(
                 true,
             )
         } else {
-            println!("{}", started.subject);
+            print!("{}", cli_help::mission_next_steps(&started));
             Ok(())
         };
+    }
+    if !json_output {
+        print!("{}", cli_help::mission_next_steps(&started));
     }
     follow_mission_run(client, started, response.store_index, json_output).await
 }
@@ -5554,11 +5692,15 @@ async fn run_devices(
                 .pairing_begin(&PairingBegin {
                     api_version: CLIENT_V0_API_VERSION.into(),
                     device_name,
-                    person_id: person,
+                    person_id: person.clone(),
                     full_control: full_control.then_some(true),
                 })
                 .await?;
-            print_client_value(&response, json_output)
+            print_client_value(&response, json_output)?;
+            if !json_output {
+                print!("{}", cli_help::pairing_next_steps(&person));
+            }
+            Ok(())
         }
         DevicesCommand::Revoke { device, reason } => {
             let capabilities = client.capabilities().await?;
@@ -6662,8 +6804,7 @@ async fn wait_for_first_sync(
             match first.state.as_str() {
                 "verified" | "failed" => return Ok(Some(first)),
                 _ => {
-                    if progress
-                        && reported.is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
+                    if progress && reported.is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
                     {
                         reported = Some(std::time::Instant::now());
                         let behind = status
@@ -6841,7 +6982,7 @@ fn render_replication_peers(
             peer.last_error.as_deref().unwrap_or("")
         );
         if let Some(at) = peer.last_success_at_unix_ms {
-            let _ = writeln!(output, "  last exchange {}", relative_time(at, now));
+            let _ = writeln!(output, "  last seen {}", relative_time(at, now));
         } else {
             let _ = writeln!(output, "  no exchange yet");
         }
@@ -7751,10 +7892,33 @@ async fn run_agents(
                 &cli_client(endpoint),
                 kdl,
                 format!("st agents start {}", args.identity),
-                args.actor,
+                args.actor.clone(),
             )
             .await?;
-            print_value(&response, json_output)
+            print_value(&response, json_output)?;
+            if !json_output
+                && let Some(subject) = response
+                    .subject_tokens
+                    .keys()
+                    .find(|subject| subject.starts_with("agent/"))
+            {
+                let agent = generated_client(endpoint, None)?
+                    .agents_get(subject)
+                    .await?;
+                if let ClientResource::Agent(agent) = agent.value {
+                    let state = cli_help::agent_state(
+                        &agent.state,
+                        agent.harness_state.as_deref(),
+                        agent.fault.as_deref(),
+                        &agent.reachability,
+                    );
+                    print!(
+                        "{}",
+                        cli_help::agent_next_steps(subject, &args.actor, &state)
+                    );
+                }
+            }
+            Ok(())
         }
         AgentsCommand::Stop(args) => {
             let subject = normalize_member_subject(&args.subject, "agent");
@@ -7821,10 +7985,9 @@ fn agent_start_document(args: &AgentStartArgs) -> Result<String> {
     Ok(publication_document(agent))
 }
 
-/// The Claude settings the fleet's Claude seats run with: st's channel plugin on and the older
-/// st2 channel plugin off.
-const CLAUDE_SEAT_SETTINGS: &str =
-    r#"{"enabledPlugins":{"st2-channel@st2":false,"st3-channel@st2":true}}"#;
+/// The Claude settings the fleet's Claude seats run with: st's own channel plugin on, and the
+/// plugins st2's marketplace shipped off.
+const CLAUDE_SEAT_SETTINGS: &str = r#"{"enabledPlugins":{"st2-channel@st2":false,"st3-channel@st2":false,"st3-channel@st3":true}}"#;
 
 /// The declaration `st agents new` publishes: what a person writes by hand for a fleet seat.
 /// Claude and Codex seats get the harness defaults the fleet's existing seats run with.
@@ -7971,19 +8134,47 @@ async fn run_agent_new(
     }
     publish_text(&client, kdl, source_name, actor.clone()).await?;
     if !json_output {
-        eprintln!("Declared {subject} in {workspace}; waiting for its harness.");
+        eprintln!("Created {subject} in {workspace}; waiting for the agent to start.");
     }
-    let agent = match tokio::time::timeout(
+    let mut latest = None;
+    let waiting = tokio::time::timeout(
         timeout,
-        wait_for_agent_harness(&client, &gateway, &subject, args.attach),
-    )
-    .await
-    {
-        Ok(agent) => agent?,
-        Err(_) => anyhow::bail!(
-            "`{subject}` was declared, but its harness was not ready after {}; see `st agents show {subject}`",
-            args.timeout
+        wait_for_agent_harness(
+            &client,
+            &gateway,
+            &subject,
+            args.attach,
+            json_output,
+            &mut latest,
         ),
+    )
+    .await;
+    let agent = match waiting {
+        Ok(Ok(agent)) => agent,
+        other => {
+            if !json_output {
+                let state = latest.as_ref().map_or_else(
+                    || cli_help::agent_state("starting", None, None, "unknown"),
+                    |agent: &st3_client::Agent| {
+                        cli_help::agent_state(
+                            &agent.state,
+                            agent.harness_state.as_deref(),
+                            agent.fault.as_deref(),
+                            &agent.reachability,
+                        )
+                    },
+                );
+                println!("{}", cli_help::agent_next_steps(&subject, &actor, &state));
+            }
+            return match other {
+                Ok(Err(error)) => Err(error),
+                Err(_) => anyhow::bail!(
+                    "`{subject}` was created, but was not ready after {}; see `st agents show {subject}`",
+                    args.timeout
+                ),
+                Ok(Ok(_)) => unreachable!(),
+            };
+        }
     };
     if json_output {
         print_value(
@@ -7997,7 +8188,13 @@ async fn run_agent_new(
             true,
         )?;
     } else {
-        println!("{subject}");
+        let state = cli_help::agent_state(
+            &agent.state,
+            agent.harness_state.as_deref(),
+            agent.fault.as_deref(),
+            &agent.reachability,
+        );
+        println!("{}", cli_help::agent_next_steps(&subject, &actor, &state));
     }
     if args.attach {
         // The daemon has just answered for the new agent, so there is no registry fallback to name.
@@ -8078,6 +8275,8 @@ async fn wait_for_agent_harness(
     gateway: &GeneratedClient,
     subject: &str,
     attach: bool,
+    json_output: bool,
+    latest: &mut Option<st3_client::Agent>,
 ) -> Result<st3_client::Agent> {
     let health: Value = client.get("/v1/health").await?;
     let mut cursor = health["store_index"]
@@ -8094,12 +8293,13 @@ async fn wait_for_agent_harness(
             Err(error) => return Err(error.into()),
         };
         if let Some(agent) = agent {
-            let harness = agent.harness_state.as_deref().unwrap_or("unobserved");
+            *latest = Some(agent.clone());
+            let harness = agent.harness_state.as_deref().unwrap_or("not ready");
             match agent.state.as_str() {
                 "running" => return Ok(agent),
                 "waiting" if attach && agent.reachability == "reachable" => return Ok(agent),
                 "waiting" if agent.reachability == "reachable" => anyhow::bail!(
-                    "`{subject}` started, but its harness is {harness} and waits on a person; attach with `st terminals attach {subject}`"
+                    "`{subject}` started and is waiting for your input; attach with `st terminals attach {subject}`"
                 ),
                 "failed" => anyhow::bail!(
                     "`{subject}` failed to start: {}",
@@ -8107,8 +8307,13 @@ async fn wait_for_agent_harness(
                 ),
                 _ => {}
             }
-            let progress = format!("{} · harness {harness}", agent.state);
-            if progress != reported {
+            let progress = cli_help::agent_state(
+                &agent.state,
+                agent.harness_state.as_deref(),
+                agent.fault.as_deref(),
+                &agent.reachability,
+            );
+            if !json_output && progress != reported {
                 eprintln!("{subject}: {progress}");
                 reported = progress;
             }
@@ -10184,6 +10389,36 @@ async fn run_message(
                 Ok(())
             }
         }
+        MessageCommand::Status(args) => {
+            let value: Value = client
+                .get(&format!(
+                    "/v1/messages/delivery/{}",
+                    urlencoding::encode(&args.reference)
+                ))
+                .await?;
+            if json_output {
+                print_value(&value, true)
+            } else {
+                println!(
+                    "{} · {} → {}",
+                    value["id"].as_str().unwrap_or("message"),
+                    value["from"].as_str().unwrap_or("sender"),
+                    value["to"].as_str().unwrap_or("recipient")
+                );
+                println!(
+                    "{} · {}",
+                    value
+                        .pointer("/delivery/phase")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown"),
+                    value
+                        .pointer("/delivery/reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                );
+                Ok(())
+            }
+        }
         MessageCommand::Ls(args) => {
             let identity = message_list_identity(
                 args.identity.or(args.actor),
@@ -10919,6 +11154,11 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
                 ),
             );
         }
+        // Harness-session state (OpenCode delivery ledgers, Claude resume bindings) stays beneath
+        // st3's driver directory, never st2's; the seat's hooks choose the same root.
+        if let Some(drivers) = std::env::var_os("ST3_DRIVER_STATE_DIR") {
+            st2::run::use_harness_state_root(PathBuf::from(drivers).join("sessions"));
+        }
         if let Some(state) = st2::reexec::resume_path(st2::reexec::DRIVER_RESUME_ENV) {
             return resume_native_driver(client, subject, &args.driver, argv, &state).await;
         }
@@ -11346,6 +11586,7 @@ async fn drive_st2_native(
     let mut last_capacity_fingerprint = None;
     let mut delivery = NativeDeliverySupervisor::resumed(loop_state.delivery_episode);
     let mut replacement = DriverReplacement::new();
+    let mut binding_watch = ClaudeBindingWatch::default();
     loop {
         tokio::select! {
             result = &mut task => {
@@ -11405,6 +11646,37 @@ async fn drive_st2_native(
                 } else {
                     None
                 };
+                if driver == "claude"
+                    && let Some(reason) = binding_watch.overdue(
+                        &agent_dir,
+                        provider_incarnation.as_deref(),
+                        Instant::now(),
+                    )
+                {
+                    let session = provider_incarnation.clone().unwrap_or_default();
+                    let posted: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
+                        subject: subject.into(),
+                        kind: "harness.diagnostic".into(),
+                        actor: Some(subject.into()),
+                        fields: BTreeMap::from([
+                            ("severity".into(), Value::String("error".into())),
+                            ("status".into(), Value::String("failed".into())),
+                            ("code".into(), Value::String(st3::driver_hook::UNBOUND_CODE.into())),
+                            ("reason".into(), Value::String(reason)),
+                            ("incarnation_id".into(), Value::String(incarnation.clone())),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!(
+                            "{}:{subject}:{session}",
+                            st3::driver_hook::UNBOUND_CODE
+                        )),
+                    }).await;
+                    if let Err(error) = posted {
+                        binding_watch.retry();
+                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    }
+                }
                 // Delivery runs first and on its own: a failing observation publish must never
                 // hold back a message.
                 if driver == "claude" {
@@ -11589,6 +11861,61 @@ fn harness_record_belongs_to_current_session(
     current: Option<&[u8]>,
 ) -> bool {
     already_started || current.is_some_and(|bytes| Some(bytes) != predecessor)
+}
+
+/// How long a Claude wrapper session may run before a missing native-session binding is a fault.
+/// SessionStart fires as Claude starts, so a minute covers a slow start.
+const CLAUDE_BINDING_GRACE: Duration = Duration::from_secs(60);
+
+/// Watches that the current Claude wrapper session gets its native-session binding. The seat's
+/// SessionStart hook writes it; when the hook cannot run at all (its st3 binary is missing, or the
+/// seat's settings name no hooks), only the driver can notice.
+#[derive(Default)]
+struct ClaudeBindingWatch {
+    session: Option<String>,
+    since: Option<Instant>,
+    settled: bool,
+}
+
+impl ClaudeBindingWatch {
+    /// The reason to record once `session` has run past the grace period with no binding. It is
+    /// returned once per wrapper session.
+    fn overdue(&mut self, agent_dir: &Path, session: Option<&str>, now: Instant) -> Option<String> {
+        let session = session?;
+        if self.session.as_deref() != Some(session) {
+            self.session = Some(session.to_owned());
+            self.since = Some(now);
+            self.settled = false;
+        }
+        if self.settled {
+            return None;
+        }
+        if st3::hooks::claude_binding(agent_dir, session).is_some() {
+            self.settled = true;
+            return None;
+        }
+        if now.duration_since(self.since?) < CLAUDE_BINDING_GRACE {
+            return None;
+        }
+        self.settled = true;
+        let variable = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "unset".into())
+        };
+        Some(format!(
+            "Claude has run for {} s and its SessionStart hook bound no native session, so st cannot find this seat's transcript. The hooks run \"$ST_HOOKS/claude-observe.sh\" (ST_HOOKS={}), which runs ST3_BIN={}.",
+            CLAUDE_BINDING_GRACE.as_secs(),
+            variable("ST_HOOKS"),
+            variable("ST3_BIN"),
+        ))
+    }
+
+    /// Report again on the next tick, after a report the daemon did not take.
+    fn retry(&mut self) {
+        self.settled = false;
+    }
 }
 
 fn native_file_may_override_channel(driver: &str) -> bool {
@@ -12214,10 +12541,27 @@ async fn run_pi_channel(
                         Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
                     }
                 }
+                // A recipient can read or close a failed handoff through another native
+                // path. Its authoritative receipt settles that retry and its health warning.
+                for message in state.failed_handoffs.keys().cloned().collect::<Vec<_>>() {
+                    if let Ok(view) = read_message(client, &message).await
+                        && matches!(view.status.as_str(), "delivered" | "read" | "closed") {
+                        state.failed_handoffs.remove(&message);
+                        state.retry_after_ms.remove(&message);
+                        state.failed_diagnostics.remove(&message);
+                    }
+                }
                 // The first page is polled on every tick, before the first idle too: the poll
                 // carries this channel's delivery report, which is how the daemon knows the
                 // seat's delivery path is live and current.
-                let report = native_delivery_report(&transport, None);
+                let mut report: Value = serde_json::from_str(&native_delivery_report(&transport, None))?;
+                report["ready"] = json!(state.first_idle_seen && state.failed_handoffs.is_empty());
+                if !state.first_idle_seen {
+                    report["reason"] = json!("the channel has not received the provider's initial idle proof");
+                } else if !state.failed_handoffs.is_empty() {
+                    report["reason"] = json!("the provider rejected a native handoff; the channel keeps retrying");
+                }
+                let report = report.to_string();
                 let mut cursor = None;
                 loop {
                     let page = match message_page_reporting(
@@ -12236,6 +12580,10 @@ async fn run_pi_channel(
                         break;
                     }
                     for message in page.items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged")) {
+                    if state.retry_after_ms.get(&message.subject).is_some_and(|after|
+                        current_unix_ms().unwrap_or_default() < u128::from(*after)) {
+                        continue;
+                    }
                     if !state.delivered.insert(message.subject.clone()) {
                         continue;
                     }
@@ -12350,6 +12698,8 @@ struct PiChannelResume {
     session: String,
     delivered: BTreeSet<String>,
     failed_handoffs: BTreeMap<String, u32>,
+    #[serde(default)]
+    retry_after_ms: BTreeMap<String, u64>,
     failed_diagnostics: BTreeSet<String>,
     first_idle_seen: bool,
     frame_sequence: u64,
@@ -12386,6 +12736,9 @@ impl PiChannelResume {
                 let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else {
                     return false;
                 };
+                self.failed_handoffs.remove(message);
+                self.retry_after_ms.remove(message);
+                self.failed_diagnostics.remove(message);
                 self.pending.acknowledgements.insert(message.to_owned());
                 true
             }
@@ -12394,10 +12747,16 @@ impl PiChannelResume {
                     return false;
                 };
                 let failures = self.failed_handoffs.entry(message.to_owned()).or_default();
-                *failures += 1;
-                if *failures < 3 {
-                    self.delivered.remove(message);
-                } else {
+                *failures = failures.saturating_add(1);
+                // A negative native receipt authorizes another attempt. Keep retrying after
+                // the diagnostic threshold; a temporary failure must never strand the head.
+                let delay_ms = (500u64 << (*failures).min(4)).min(5_000);
+                self.retry_after_ms.insert(
+                    message.to_owned(),
+                    (current_unix_ms().unwrap_or_default() as u64).saturating_add(delay_ms),
+                );
+                self.delivered.remove(message);
+                if *failures >= 3 {
                     self.failed_diagnostics.insert(message.to_owned());
                 }
                 false
@@ -13909,6 +14268,32 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_claude_session_without_a_binding_is_reported_once_after_the_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = Instant::now();
+        let mut watch = ClaudeBindingWatch::default();
+        assert_eq!(watch.overdue(dir.path(), None, start), None);
+        assert_eq!(watch.overdue(dir.path(), Some("wrapper-1"), start), None);
+        let late = start + CLAUDE_BINDING_GRACE;
+        let reason = watch.overdue(dir.path(), Some("wrapper-1"), late).unwrap();
+        assert!(reason.contains("bound no native session"), "{reason}");
+        assert_eq!(watch.overdue(dir.path(), Some("wrapper-1"), late), None);
+        watch.retry();
+        assert!(watch.overdue(dir.path(), Some("wrapper-1"), late).is_some());
+        // A new wrapper session gets its own grace, and a bound one is never reported.
+        assert_eq!(watch.overdue(dir.path(), Some("wrapper-2"), late), None);
+        fs::write(
+            dir.path().join(st3::hooks::CLAUDE_BINDING_FILE),
+            r#"{"incarnation":"wrapper-2","native_session_id":"native-2"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            watch.overdue(dir.path(), Some("wrapper-2"), late + CLAUDE_BINDING_GRACE),
+            None
+        );
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn peer_status(peer: &str, digest: Option<&str>) -> st3::model::ReplicationPeerStatus {
@@ -14192,6 +14577,25 @@ mod tests {
         // A handoff failure below the retry limit makes the message deliverable again.
         assert!(!resumed.accept_frame(r#"{"type":"failed","meta":{"messageId":"message/one"}}"#));
         assert!(!resumed.delivered.contains("message/one"));
+    }
+
+    #[test]
+    fn repeated_negative_handoffs_keep_retrying_and_resume_the_backoff() {
+        let mut state = PiChannelResume::default();
+        for _ in 0..5 {
+            state.delivered.insert("message/retry".into());
+            state.accept_frame(r#"{"type":"failed","meta":{"messageId":"message/retry"}}"#);
+            assert!(!state.delivered.contains("message/retry"));
+            assert!(state.retry_after_ms.contains_key("message/retry"));
+        }
+        assert!(state.failed_diagnostics.contains("message/retry"));
+        let mut resumed: PiChannelResume =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(state.retry_after_ms, resumed.retry_after_ms);
+        resumed.accept_frame(r#"{"type":"delivered","meta":{"messageId":"message/retry"}}"#);
+        assert!(!resumed.retry_after_ms.contains_key("message/retry"));
+        assert!(!resumed.failed_diagnostics.contains("message/retry"));
+        assert!(!resumed.failed_handoffs.contains_key("message/retry"));
     }
 
     #[test]
@@ -15017,29 +15421,29 @@ mod tests {
              sync\tcatching up: Silber has 124,384 envelopes this node lacks, \
              caught up in about 15m\n\
              peer\tSilber\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 Silber has 124,384 envelopes this node lacks\n\
              \x20 this node has 3 envelopes Silber lacks\n\
              \x20 receiving 142.5 envelopes/s, caught up in about 15m (measured 2s ago)\n\
              peer\tQuiet\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 in sync: the same envelopes and the same graph (measured now)\n\
              peer\tMoved\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 same envelopes (measured now), but the graphs differ (this node \
              111111111111, Moved 444444444444); the next exchange compares them\n\
              peer\tSettling\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 graphs differ: the same envelopes project different graphs since 10s ago \
              (compared now; this node 111111111111, Settling 555555555555)\n\
              \x20 diverged if this lasts a minute; a peer still projecting settles by itself\n\
              peer\tLaptop\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 diverged: the same envelopes project different graphs since 3m ago \
              (compared 1s ago; this node 111111111111, Laptop 222222222222)\n\
              \x20 exchanges cannot fix this; the nodes heal by comparing the claims each projects, and views on one node are wrong until then\n\
              peer\tFresh\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 difference not measured yet\n"
         );
     }

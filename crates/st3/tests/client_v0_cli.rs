@@ -712,7 +712,7 @@ mission "cli/child" state="ready" {
             .is_empty()
     );
     assert_eq!(machines["value"]["items"][1]["id"], "machine/offline-peer");
-    assert_eq!(machines["value"]["items"][1]["state"], "indeterminate");
+    assert_eq!(machines["value"]["items"][1]["state"], "last-seen");
     assert!(
         machines["value"]["items"]
             .as_array()
@@ -853,7 +853,10 @@ async fn run_queue_cli(socket: &Path, config_home: &Path, json: bool, args: &[&s
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
         let mut command = std::process::Command::new(binary);
+        // Queue operator commands use the fixture's person, not the invoking harness seat.
         command
+            .env_remove("ST_AGENT")
+            .env_remove("ST_MISSION_RUN")
             .env("XDG_CONFIG_HOME", config_home)
             .arg("--endpoint")
             .arg(socket);
@@ -1861,5 +1864,320 @@ mission "example/merge-train" state="ready" {
     let closed = failure(&cli(None, true, args(&["lanes", "join", &lane, "45"])).await);
     assert!(closed.contains("is closed"), "{closed}");
 
+    server.abort();
+}
+
+#[test]
+fn help_starts_with_examples_and_keeps_plumbing_reachable() {
+    let help = |args: &[&str]| {
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let default = help(&["--help"]);
+    assert_eq!(default, help(&["help"]));
+    assert!(default.starts_with("See what needs you:\n  st now\n"));
+    assert!(default.contains("st agents new NAME --harness claude --attach"));
+    assert!(default.contains("Everyday use:"));
+    assert!(default.contains("Inside an agent seat:"));
+    assert!(default.contains("Running st on a machine or fleet:"));
+    assert!(!default.contains("Plumbing:"));
+    assert!(help(&["help", "--all"]).contains("Plumbing:"));
+    assert_eq!(
+        help(&["help", "--all"]),
+        help(&["--endpoint", "help", "help", "--all"])
+    );
+    assert!(!help(&["agents", "ls", "--all", "--help"]).contains("Plumbing:"));
+    for path in [
+        vec!["schema"],
+        vec!["agents", "new"],
+        vec!["missions", "start"],
+    ] {
+        let mut flag = path.clone();
+        flag.push("--help");
+        let mut named = vec!["help"];
+        named.extend(path.clone());
+        assert_eq!(help(&flag), help(&named));
+        let mut nested = path;
+        nested.insert(1, "help");
+        assert_eq!(help(&flag), help(&nested));
+    }
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+        .args(["help", "missing-command"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+}
+
+// Serve the real API without a reconciler: these tests create graph declarations only.
+async fn serve_creation_api(
+    root: &Path,
+    harness_state: Option<&'static str>,
+) -> (PathBuf, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
+    let socket = root.join("st3.sock");
+    let state = test_state(root);
+    let store = state.store.clone();
+    let router = st3::api::router(state).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let store = store.clone();
+            async move {
+                let applied = request.uri().path() == "/v1/intent/apply";
+                let response = next.run(request).await;
+                // Simulate the observations a newly started process would publish.
+                if applied
+                    && response.status().is_success()
+                    && let Some(harness_state) = harness_state
+                {
+                    for (kind, fields) in [
+                        (
+                            "runtime.observed",
+                            serde_json::json!({
+                                "runtime_id": "demo", "incarnation_id": "demo:1",
+                                "status": "running", "reachability": "reachable"
+                            }),
+                        ),
+                        (
+                            "harness.observed",
+                            serde_json::json!({
+                                "driver": "omp", "incarnation_id": "demo:1", "state": harness_state
+                            }),
+                        ),
+                    ] {
+                        store
+                            .append_claim(&ClaimInput {
+                                subject: "agent/client-v0-cli.demo".into(),
+                                kind: kind.into(),
+                                actor: Some("agent/client-v0-cli.demo".into()),
+                                fields: serde_json::from_value(fields).unwrap(),
+                                evidence: Vec::new(),
+                                expected_subject: None,
+                                idempotency_key: None,
+                            })
+                            .unwrap();
+                    }
+                }
+                response
+            }
+        },
+    ));
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, router).await });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(socket.exists());
+    (socket, server)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_agent_explains_ready_starting_and_waiting_states_and_preserves_json() {
+    for (harness, json) in [
+        (None, false),
+        (Some("ready"), false),
+        (Some("blocked"), false),
+        (Some("ready"), true),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (socket, server) = serve_creation_api(root.path(), harness).await;
+        let workspace = root.path().to_str().unwrap();
+        let output = run_cli_mode(
+            &socket,
+            json,
+            &[
+                "agents",
+                "new",
+                "demo",
+                "--harness",
+                "omp",
+                "--model",
+                "example-model",
+                "--workspace",
+                workspace,
+                "--as",
+                "person/avery",
+                "--timeout",
+                "100ms",
+            ],
+        )
+        .await;
+        if json {
+            let response = value(&output);
+            assert_eq!(
+                response,
+                serde_json::json!({
+                    "subject": "agent/client-v0-cli.demo", "host_id": "host/client-v0-cli",
+                    "workspace": workspace, "state": "running", "harness_state": "ready",
+                })
+            );
+        } else {
+            let rendered = String::from_utf8(output.stdout).unwrap();
+            let progress = String::from_utf8(output.stderr).unwrap();
+            assert!(!progress.contains("unobserved"), "{progress}");
+            let expected = match harness {
+                None => "Still starting — waiting for the agent process to appear.",
+                Some("ready") => "Ready — the agent is running.",
+                _ => "Waiting for you",
+            };
+            assert!(rendered.contains(expected), "{rendered}\n{progress}");
+            assert_eq!(
+                output.status.success(),
+                harness == Some("ready"),
+                "{progress}"
+            );
+            for action in [
+                "st terminals attach agent/client-v0-cli.demo --as person/avery",
+                "st conversations send agent/client-v0-cli.demo --from person/avery --body 'Hello'",
+                "st agents show agent/client-v0-cli.demo",
+                "st agents stop agent/client-v0-cli.demo --as person/avery",
+                "--attach",
+            ] {
+                assert!(rendered.contains(action), "{rendered}");
+            }
+        }
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creation_commands_end_with_actions_and_json_remains_parseable() {
+    let root = tempfile::tempdir().unwrap();
+    let (socket, server) = serve_creation_api(root.path(), None).await;
+    for json in [false, true] {
+        let output = run_cli_mode(
+            &socket,
+            json,
+            &["devices", "pair", "demo-phone", "--as", "person/avery"],
+        )
+        .await;
+        if json {
+            let response = value(&output);
+            assert_eq!(response["value"]["kind"], "pairing-challenge");
+        } else {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let rendered = String::from_utf8(output.stdout).unwrap();
+            assert!(rendered.contains("Waiting for your device"), "{rendered}");
+            assert!(
+                rendered.contains("st devices --as person/avery"),
+                "{rendered}"
+            );
+        }
+    }
+    let request = root.path().join("request.txt");
+    std::fs::write(&request, "Build an example site.").unwrap();
+    let mission = root.path().join("mission.kdl");
+    std::fs::write(&mission, "version 2\nmission \"demo\" state=\"ready\" {\n concurrent-runs max=2\n goal \"Build an example.\"\n step \"work\" {}\n}\n").unwrap();
+    value(
+        &run_cli(
+            &socket,
+            &[
+                "missions",
+                "publish",
+                mission.to_str().unwrap(),
+                "--as",
+                "person/avery",
+            ],
+        )
+        .await,
+    );
+    for json in [false, true] {
+        let id = if json { "demo/json" } else { "demo/human" };
+        let output = run_cli_mode(
+            &socket,
+            json,
+            &[
+                "missions",
+                "start",
+                "demo",
+                "--id",
+                id,
+                "--as",
+                "person/avery",
+                "--workspace",
+                root.path().to_str().unwrap(),
+            ],
+        )
+        .await;
+        if json {
+            let response = value(&output);
+            assert_eq!(
+                response["mission_run"]["subject"],
+                format!("mission-run/{id}")
+            );
+            assert!(response["publication"].is_object());
+        } else {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let rendered = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                rendered.contains("st missions show mission-run/demo/human --follow"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains(
+                    "st missions cancel mission-run/demo/human --as person/avery --reason"
+                ),
+                "{rendered}"
+            );
+        }
+        let output = run_cli_mode(
+            &socket,
+            json,
+            &[
+                "launch",
+                "start",
+                "--id",
+                id,
+                request.to_str().unwrap(),
+                "--as",
+                "person/avery",
+                "--workspace",
+                root.path().to_str().unwrap(),
+            ],
+        )
+        .await;
+        if json {
+            let response = value(&output);
+            assert!(
+                response["subject"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("planning-session/launch/demo/json/")
+            );
+            assert_eq!(response["status"], "planning");
+        } else {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let rendered = String::from_utf8(output.stdout).unwrap();
+            assert!(rendered.contains("Started — the planner"), "{rendered}");
+            assert!(
+                rendered.contains("st launch show planning-session/launch/demo/human/"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("st launch cancel planning-session/launch/demo/human/"),
+                "{rendered}"
+            );
+        }
+    }
     server.abort();
 }

@@ -125,6 +125,11 @@ impl Node {
             .env("XDG_RUNTIME_DIR", self.root.join("run"))
             .env("ST3_WORKER_INTERVAL_MS", "300")
             .env("ST3_DAEMON_WAIT", "0");
+        // The Nix check account has no passwd login shell. Preserve the shell supplied by
+        // preCheck so the daemon can capture its login environment after env_clear().
+        if let Some(shell) = std::env::var_os("SHELL") {
+            command.env("SHELL", shell);
+        }
         for (key, value) in &self.env {
             command.env(key, value);
         }
@@ -797,8 +802,8 @@ async fn a_dial_out_member_is_caught_up_and_never_reported_down() {
             .as_array()
             .unwrap()
             .iter()
-            .all(|peer| peer["peer"] != "laptop"),
-        "a reports on the dial-out laptop: {peers}"
+            .any(|peer| peer["peer"] == "laptop" && peer["last_success_at_unix_ms"].is_number()),
+        "{peers}"
     );
     let machines = a.st_json(&["machines"]);
     let laptop_machine = machines["value"]["items"]
@@ -808,7 +813,7 @@ async fn a_dial_out_member_is_caught_up_and_never_reported_down() {
         .find(|machine| machine["host_id"] == "host/laptop")
         .cloned()
         .unwrap_or(Value::Null);
-    assert_eq!(laptop_machine["state"], "dial-out", "{machines}");
+    assert_eq!(laptop_machine["state"], "reachable", "{machines}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1412,7 +1417,7 @@ async fn a_config_peer_fleet_migrates_to_membership() {
     // b and the laptop migrate with codes from a.
     let code = a.invite("b", &["--migrate"]);
     b.stop();
-    b.migrate(&[&code]);
+    b.migrate(&[&code, "--via", &format!("http://127.0.0.1:{}", a.port)]);
     b.start().await;
     let code = a.invite("l", &["--migrate"]);
     l.stop();
@@ -1718,6 +1723,7 @@ echo "$me $*" >> "$registry/calls"
 key() {{ echo "$1.$(echo "$2" | tr '/' '_')"; }}
 case "$1" in
   id) echo "$me" ;;
+  addr) epoch=$(cat "$registry/epoch" 2>/dev/null || echo 0); echo "{{\"addrs\":[\"$epoch\"]}}" ;;
   expose) echo "$4" > "$registry/$(key "$me" "$2")" ;;
   unexpose) rm -f "$registry/$(key "$me" "$2")" ;;
   dial) f="$registry/$(key "$2" "$3")"; [ -f "$f" ] || {{ echo "no such exposure" >&2; exit 1; }}; cat "$f" ;;
@@ -1732,6 +1738,178 @@ esac
     .unwrap();
     fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
     shim
+}
+
+/// Legacy helper ports must be unnecessary after membership advertises native Fabric routes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_legacy_helper_fleet_migrates_to_native_fabric_without_losing_history() {
+    let root = tempfile::tempdir().unwrap();
+    let fleet_id = "8f14e45f-ceea-467a-9a2b-5c3d6e7f8091";
+    let secret = root.path().join("fleet.secret");
+    fs::write(&secret, hex::encode([42_u8; 32])).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut a = Node::new(root.path(), "a");
+    let mut b = Node::new(root.path(), "b");
+    let mut helpers = Vec::new();
+    let mut helper_ports = Vec::new();
+    let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for target in [a.port, b.port] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", free_port()))
+            .await
+            .unwrap();
+        helper_ports.push(listener.local_addr().unwrap().port());
+        let connections = connections.clone();
+        helpers.push(tokio::spawn(async move {
+            while let Ok((mut incoming, _)) = listener.accept().await {
+                connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::spawn(async move {
+                    if let Ok(mut outgoing) =
+                        tokio::net::TcpStream::connect(("127.0.0.1", target)).await
+                    {
+                        let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+                    }
+                });
+            }
+        }));
+    }
+    a.legacy_config(fleet_id, &secret, &[("b", helper_ports[1])]);
+    b.legacy_config(fleet_id, &secret, &[("a", helper_ports[0])]);
+    a.start().await;
+    b.start().await;
+    a.note("legacy-a").await;
+    b.note("legacy-b").await;
+    let mut expected = BTreeSet::from([
+        "custom/fleet-test/legacy-a".to_owned(),
+        "custom/fleet-test/legacy-b".to_owned(),
+    ]);
+    for node in [&a, &b] {
+        wait_for_notes(node, &expected, 60, &[&a, &b]).await;
+    }
+    assert!(connections.load(std::sync::atomic::Ordering::Relaxed) > 0);
+
+    let shim_a = fabric_shim(root.path(), "a");
+    let shim_b = fabric_shim(root.path(), "b");
+    let absent_tailscale = root.path().join("no-tailscale");
+    a.stop();
+    a.st_ok(&[
+        "fleet",
+        "migrate",
+        "--anchor",
+        "--no-service",
+        "--transports",
+        "fabric",
+        "--fabric-protocol",
+        "st3-peer-v1",
+        "--fabric",
+        shim_a.to_str().unwrap(),
+        "--tailscale",
+        absent_tailscale.to_str().unwrap(),
+    ]);
+    a.start().await;
+    a.wait_listening().await;
+    // The still-legacy member continues exchanging during the sequential upgrade.
+    a.note("anchor-migrated").await;
+    expected.insert("custom/fleet-test/anchor-migrated".into());
+    wait_for_notes(&b, &expected, 60, &[&a, &b]).await;
+    let code = a.st_ok(&[
+        "fleet",
+        "invite",
+        "b",
+        "--migrate",
+        "--via",
+        "fabric",
+        "--code-only",
+        "--as",
+        PERSON,
+    ]);
+    b.stop();
+    b.st_ok(&[
+        "fleet",
+        "migrate",
+        code.trim(),
+        "--via",
+        "fabric://a-fabric-id/st3-peer-v1",
+        "--no-service",
+        "--transports",
+        "fabric",
+        "--fabric-protocol",
+        "st3-peer-v1",
+        "--fabric",
+        shim_b.to_str().unwrap(),
+        "--tailscale",
+        absent_tailscale.to_str().unwrap(),
+    ]);
+    let file = st3::config::FleetFile::load(&b.state_dir())
+        .unwrap()
+        .unwrap();
+    assert_eq!(file.fleet_id, fleet_id);
+    assert_eq!(file.sponsor_routes, ["fabric://a-fabric-id/st3-peer-v1"]);
+    assert_eq!(file.fabric_protocol.as_deref(), Some("st3-peer-v1"));
+    assert_eq!(
+        fs::read(&secret).unwrap(),
+        hex::encode([42_u8; 32]).as_bytes()
+    );
+    b.start().await;
+    b.wait_listening().await;
+    b.note("member-migrated").await;
+    expected.insert("custom/fleet-test/member-migrated".into());
+    for node in [&a, &b] {
+        wait_for_notes(node, &expected, 60, &[&a, &b]).await;
+        let status = node.st_json(&["replication", "status"]);
+        assert_eq!(status["unsigned_envelopes"], 0, "{status}");
+        assert_eq!(status["fenced_envelopes"], 0, "{status}");
+        node.st_ok(&["fleet", "migrate", "--finish", "--no-service"]);
+        fs::write(
+            node.root.join("config/st3/config.toml"),
+            format!("node = \"{}\"\nperson = \"{PERSON}\"\n", node.name),
+        )
+        .unwrap();
+    }
+    // Retire every helper and restart every member with no legacy fields or peer arguments.
+    for helper in helpers {
+        helper.abort();
+        let _ = helper.await;
+    }
+    for port in helper_ports {
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err()
+        );
+    }
+    a.restart().await;
+    b.restart().await;
+    for node in [&a, &b] {
+        node.note(&format!("native-{}", node.name)).await;
+        expected.insert(format!("custom/fleet-test/native-{}", node.name));
+    }
+    for node in [&a, &b] {
+        wait_for_notes(node, &expected, 60, &[&a, &b]).await;
+        let file = st3::config::FleetFile::load(&node.state_dir())
+            .unwrap()
+            .unwrap();
+        assert!(!file.legacy_peers);
+        assert_eq!(file.fleet_id, fleet_id);
+    }
+    // Lose the Fabric declarations as on a daemon restart: the workers repair them themselves.
+    let registry = root.path().join("fabric-registry");
+    for name in ["a", "b"] {
+        fs::remove_file(registry.join(format!("{name}-fabric-id.st3-peer-v1"))).unwrap();
+    }
+    fs::write(registry.join("epoch"), "1").unwrap();
+    for node in [&a, &b] {
+        node.note(&format!("recovered-{}", node.name)).await;
+        expected.insert(format!("custom/fleet-test/recovered-{}", node.name));
+    }
+    for node in [&a, &b] {
+        wait_for_notes(node, &expected, 10, &[&a, &b]).await;
+    }
+    let calls = fs::read_to_string(registry.join("calls")).unwrap();
+    assert!(
+        calls.contains("dial a-fabric-id st3-peer-v1")
+            || calls.contains("dial b-fabric-id st3-peer-v1")
+    );
+    assert!(!calls.contains("--ephemeral"));
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1779,9 +1957,18 @@ async fn the_fabric_transport_works_through_the_worker_alone() {
     ));
     let shim_b = fabric_shim(root.path(), "b");
     let port = b.port.to_string();
+    let file = st3::config::FleetFile::load(&a.state_dir())
+        .unwrap()
+        .unwrap();
+    let route = format!(
+        "fabric://a-fabric-id/{}",
+        st3::fleet::transport::default_fabric_protocol(&file.fleet_id)
+    );
     b.st_ok(&[
         "fleet",
         "join",
+        "--via",
+        &route,
         "--fabric-inbox",
         "--no-service",
         "--name",
@@ -1804,12 +1991,34 @@ async fn the_fabric_transport_works_through_the_worker_alone() {
     wait_for_notes(&a, &expected, 60, &[&a, &b]).await;
     wait_for_notes(&b, &expected, 60, &[&a, &b]).await;
 
+    // The shim drops live exposure mappings and changes its endpoint on restart. The running
+    // workers notice local connectivity, re-expose and dial again without a helper.
+    for entry in fs::read_dir(&registry).unwrap().flatten() {
+        if entry.file_name().to_string_lossy().contains(".st3_fleet_") {
+            fs::remove_file(entry.path()).unwrap();
+        }
+    }
+    fs::write(registry.join("epoch"), "1").unwrap();
+    a.note("after-fabric-restart-a").await;
+    b.note("after-fabric-restart-b").await;
+    let recovered = expected
+        .iter()
+        .cloned()
+        .chain([
+            "custom/fleet-test/after-fabric-restart-a".to_owned(),
+            "custom/fleet-test/after-fabric-restart-b".to_owned(),
+        ])
+        .collect();
+    for node in [&a, &b] {
+        wait_for_notes(node, &recovered, 10, &[&a, &b]).await;
+    }
+
     let calls = fs::read_to_string(registry.join("calls")).unwrap();
     for node in ["a", "b"] {
         assert!(
             calls.contains(&format!("{node}-fabric-id expose st3/fleet/"))
-                && calls.contains("--ephemeral"),
-            "{node} did not expose itself ephemerally:\n{calls}"
+                && !calls.contains("--ephemeral"),
+            "{node} did not persist its exposure:\n{calls}"
         );
     }
     // An exchange synchronizes both directions, so the first successful dial can
@@ -1911,4 +2120,163 @@ async fn a_removed_members_writes_relayed_by_an_uninformed_member_are_refused() 
     r.note("r-later").await;
     tokio::time::sleep(Duration::from_secs(3)).await;
     assert!(!c.notes().await.contains("custom/fleet-test/r-later"));
+}
+
+/// No member classification: the traveller has the same legacy configuration as its peers,
+/// but its network accepts no inbound connection. Two servers keep syncing while it sleeps.
+#[tokio::test(flavor = "multi_thread")]
+async fn outbound_only_member_returns_after_minutes_and_aged_hours_without_alerts() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let root = tempfile::tempdir().unwrap();
+    let fleet_id = "8a7c55c0-e0d4-41cb-8e8c-6ab134611650";
+    let secret = root.path().join("fleet.secret");
+    fs::write(&secret, hex::encode([23_u8; 32])).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut a = Node::new(root.path(), "harbor");
+    let mut b = Node::new(root.path(), "beacon");
+    let mut traveller = Node::new(root.path(), "traveller");
+    // A closed inbound service counts attempted connections without contacting a real host.
+    let rejected = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let rejected_port = rejected.local_addr().unwrap().port();
+    let attempts = std::sync::Arc::new(AtomicUsize::new(0));
+    let count = attempts.clone();
+    let reject_task = tokio::spawn(async move {
+        while let Ok((connection, _)) = rejected.accept().await {
+            count.fetch_add(1, Ordering::Relaxed);
+            drop(connection);
+        }
+    });
+    a.legacy_config(
+        fleet_id,
+        &secret,
+        &[("beacon", b.port), ("traveller", rejected_port)],
+    );
+    b.legacy_config(
+        fleet_id,
+        &secret,
+        &[("harbor", a.port), ("traveller", rejected_port)],
+    );
+    traveller.legacy_config(fleet_id, &secret, &[("harbor", a.port), ("beacon", b.port)]);
+    let path = traveller.root.join("config/st3/config.toml");
+    let config = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        config
+            .lines()
+            .filter(|line| !line.starts_with("peer_listen"))
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    for node in [&mut a, &mut b, &mut traveller] {
+        node.start().await;
+    }
+    let mut expected = BTreeSet::new();
+    for node in [&a, &b, &traveller] {
+        node.note(&format!("{}-initial", node.name)).await;
+        expected.insert(format!("custom/fleet-test/{}-initial", node.name));
+    }
+    for node in [&a, &b, &traveller] {
+        wait_for_notes(node, &expected, 10, &[&a, &b, &traveller]).await;
+    }
+    assert!(
+        tokio::net::TcpStream::connect(("127.0.0.1", traveller.port))
+            .await
+            .is_err()
+    );
+
+    for (label, sleep, age_ms) in [("minutes", 120, 120_000), ("hours", 2, 4 * 3_600_000)] {
+        // Leave its local daemon alive so it can record work while the network worker sleeps.
+        let mut worker = traveller.worker.take().unwrap();
+        worker.kill().unwrap();
+        worker.wait().unwrap();
+        let before = attempts.load(Ordering::Relaxed);
+        traveller.note(&format!("traveller-{label}")).await;
+        expected.insert(format!("custom/fleet-test/traveller-{label}"));
+        a.note(&format!("harbor-{label}")).await;
+        expected.insert(format!("custom/fleet-test/harbor-{label}"));
+        b.note(&format!("beacon-{label}")).await;
+        expected.insert(format!("custom/fleet-test/beacon-{label}"));
+        tokio::time::sleep(Duration::from_secs(sleep)).await;
+        // The minutes case uses real elapsed time. The hours case ages persistent evidence;
+        // virtual-clock worker tests separately exercise the full four-hour retry schedule.
+        for node in [&a, &b] {
+            let db = rusqlite::Connection::open(node.state_dir().join("claims.sqlite3")).unwrap();
+            db.busy_timeout(Duration::from_secs(5)).unwrap();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis();
+            db.execute(
+                "UPDATE replication_peers SET last_success_at_unix_ms=?1 WHERE peer='traveller'",
+                [(now - age_ms).to_string()],
+            )
+            .unwrap();
+            let status = node.st_json(&["replication", "status"]);
+            let peer = status["peers"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|peer| peer["peer"] == "traveller")
+                .unwrap();
+            assert_eq!(peer["status"], "last-seen", "{status}");
+            assert!(peer["last_success_at_unix_ms"].is_number());
+            assert!(peer["last_error"].is_null());
+            let doctor = node.st_json(&["doctor"]);
+            let check = doctor["checks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|check| check["name"] == "replication")
+                .unwrap();
+            assert_eq!(check["status"], "pass", "{doctor}");
+            let machines = node.st_json(&["machines"]);
+            let machine = machines["value"]["items"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|machine| machine["host_id"] == "host/traveller")
+                .unwrap();
+            assert_eq!(machine["state"], "last-seen", "{machines}");
+        }
+        assert!(
+            attempts.load(Ordering::Relaxed) - before <= 20,
+            "absence did not back off"
+        );
+        let always_on_notes = expected
+            .iter()
+            .filter(|note| !note.ends_with(&format!("traveller-{label}")))
+            .cloned()
+            .collect();
+        for node in [&a, &b] {
+            wait_for_notes(node, &always_on_notes, 10, &[&a, &b]).await;
+        }
+        // The returning member changes its local address and retains outbound-only networking.
+        traveller.port = free_port();
+        let returned = Instant::now();
+        traveller.worker = Some(
+            traveller
+                .command(&["replication-worker"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        for node in [&a, &b, &traveller] {
+            wait_for_notes(node, &expected, 10, &[&a, &b, &traveller]).await;
+        }
+        assert!(returned.elapsed() < Duration::from_secs(10));
+        for node in [&a, &b] {
+            assert_eq!(down_observations(node, "traveller").await, 0);
+            let attention = node.st_json(&["attention", "ls"]);
+            assert!(
+                attention["value"]["items"]
+                    .as_array()
+                    .is_some_and(|items| items.is_empty()),
+                "{attention}"
+            );
+        }
+    }
+    reject_task.abort();
 }

@@ -1,0 +1,7 @@
+{"at_unix_ms":1790756033584,"pid":1573886,"event":"started"}
+{"at_unix_ms":1790756033679,"pid":1573886,"event":"ready"}
+{"at_unix_ms":1790756034688,"pid":1573886,"event":"wire-frame","subject":"message/a0371546b68189a9"}
+{"at_unix_ms":1790756034689,"pid":1573886,"event":"received","subject":"message/a0371546b68189a9","content":"<smalltalk-message id=\"a0371546b68189a9\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/a0371546b68189a9\">\nreceipt-token:warmup\n</smalltalk-message>"}
+{"at_unix_ms":1790756034715,"pid":1573886,"event":"delivered","subject":"message/a0371546b68189a9","accepted_at_unix_ms":1790756034711}
+{"at_unix_ms":1790756034717,"pid":1573886,"event":"read","subject":"message/a0371546b68189a9","accepted_at_unix_ms":1790756034716}
+{"at_unix_ms":1790756034719,"pid":1573886,"event":"closed","subject":"message/a0371546b68189a9","accepted_at_unix_ms":1790756034718}

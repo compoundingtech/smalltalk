@@ -1,0 +1,267 @@
+#!/usr/bin/env python3
+"""Probe crash/replay/deadline tests, and an isolated native two-node proof."""
+import asyncio
+from importlib.machinery import SourceFileLoader
+from importlib.util import module_from_spec, spec_from_loader
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import signal
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+import uuid
+
+HERE = Path(__file__).resolve().parent
+def load(name, path):
+    loader = SourceFileLoader(name, str(path))
+    module = module_from_spec(spec_from_loader(name, loader))
+    loader.exec_module(module)
+    return module
+
+
+probe = load("delivery_probe", HERE / "st3-delivery-probe")
+faults = load("messaging_faults", HERE / "st3-messaging-faults-eval/run")
+BINARY = None
+if "--binary" in sys.argv:
+    index = sys.argv.index("--binary")
+    BINARY = Path(sys.argv[index + 1]).resolve()
+    del sys.argv[index:index + 2]
+
+
+class FakeApi:
+    def __init__(self):
+        self.posts = []
+        self.records = []
+        self.fail_send = False
+        self.advanced = False
+        self.online = True
+
+    async def get(self, path):
+        if path == "/v1/replication/status":
+            return {"peers": [{"peer": "cobalt", "status": "up" if self.online else "last-seen"}]}
+        if path.startswith("/v1/claims"):
+            return {"claims": self.records}
+        if path.startswith("/v1/messages/read/") and self.advanced:
+            return {"status": "closed", "to": "agent/probe/amber"}
+        raise AssertionError(path)
+
+    async def post(self, path, body):
+        self.posts.append((path, body))
+        if path == "/v1/messages" and self.fail_send:
+            raise TimeoutError("send committed; client lost its response")
+        if self.advanced and path.endswith("/claims") and body["lifecycle"] != "closed":
+            raise RuntimeError("invalid-message-transition: message already advanced")
+        return {"subject": "attention/probe"}
+
+
+class ProbeTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.config = {"agent": "agent/probe/amber", "host": "amber", "binary": "/bin/false",
+                       "socket": "/unused", "state_dir": self.directory.name, "reviewer": "person/eval",
+                       "peers": [{"host": "cobalt", "agent": "agent/probe/cobalt"}]}
+        with patch.dict(os.environ, ST_AGENT=self.config["agent"]):
+            self.monitor = probe.Probe(self.config)
+        self.monitor.api = FakeApi()
+        self.target = "agent/probe/cobalt"
+
+    def tearDown(self):
+        self.monitor.lock.close()
+        self.directory.cleanup()
+
+    async def test_timeout_replays_exact_send_and_alerts_even_if_send_is_unaccepted(self):
+        self.monitor.api.fail_send = True
+        await self.monitor.route(self.target)
+        key = self.monitor.state["routes"][self.target]["idempotency_key"]
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        sends = [body for path, body in self.monitor.api.posts if path == "/v1/messages"]
+        self.assertEqual(sends[0], sends[1])
+        self.assertEqual(key, sends[1]["idempotency_key"])
+        route = self.monitor.state["routes"][self.target]
+        self.assertEqual(route["attention"], "attention/probe")
+        self.assertEqual(route["status"], "sending")
+        await self.monitor.route(self.target)
+        self.assertEqual(sum(path == "/v1/attention" for path, _ in self.monitor.api.posts), 1)
+
+    async def test_absence_pauses_sends_and_resumes_the_same_pending_message(self):
+        self.monitor.api.online = False
+        await self.monitor.route(self.target)
+        self.assertFalse(self.monitor.api.posts)
+        self.assertEqual(self.monitor.report()["routes"][0]["status"], "last-seen")
+        self.monitor.api.online = True
+        await self.monitor.route(self.target)
+        original = self.monitor.state["routes"][self.target]["message"]
+        self.monitor.measuring[self.target] -= 14_400_000_000_000
+        self.monitor.api.online = False
+        await self.monitor.route(self.target)
+        self.assertFalse(any(path == "/v1/attention" for path, _ in self.monitor.api.posts))
+        self.monitor.api.online = True
+        await self.monitor.route(self.target)
+        self.assertEqual(self.monitor.state["routes"][self.target]["message"], original)
+        self.assertEqual(self.monitor.state["routes"][self.target]["status"], "pending")
+        self.assertFalse(any(path == "/v1/attention" for path, _ in self.monitor.api.posts))
+
+    async def test_absence_withdraws_existing_route_attention(self):
+        await self.monitor.route(self.target)
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        await self.monitor.route(self.target)
+        self.assertIn("attention", self.monitor.state["routes"][self.target])
+        self.monitor.api.online = False
+        await self.monitor.route(self.target)
+        self.assertNotIn("attention", self.monitor.state["routes"][self.target])
+        self.assertTrue(any(path.startswith("/v1/attention/withdraw/") for path, _ in self.monitor.api.posts))
+        self.monitor.api.online = True
+        await self.monitor.route(self.target)
+        self.assertEqual(self.monitor.state["routes"][self.target]["status"], "pending")
+
+    async def test_delivered_is_not_read_and_wrong_actor_cannot_clear_attention(self):
+        await self.monitor.route(self.target)
+        self.monitor.measuring[self.target] -= 61_000_000_000
+        self.monitor.api.records = [{"kind": "message.delivered", "actor": self.target,
+                                     "accepted_at_unix_ms": 1},
+                                    {"kind": "message.read", "actor": "agent/probe/other",
+                                     "accepted_at_unix_ms": 2}]
+        await self.monitor.route(self.target)
+        self.assertEqual(self.monitor.state["routes"][self.target]["status"], "overdue")
+        self.monitor.api.records.append({"kind": "message.read", "actor": self.target,
+                                         "accepted_at_unix_ms": 3})
+        await self.monitor.route(self.target)
+        route = self.monitor.state["routes"][self.target]
+        self.assertEqual(route["status"], "read")
+        self.assertGreater(route["latency_ms"], 60_000)
+        self.assertTrue(route["late"])
+        self.assertNotIn("attention", route)
+        self.assertTrue(any(path.startswith("/v1/attention/withdraw/") for path, _ in self.monitor.api.posts))
+
+    async def test_pending_receipt_and_send_survive_process_replacement(self):
+        await self.monitor.route(self.target)
+        self.monitor.state["receipts"]["message/native"] = {"consumed_at_unix_ms": 10}
+        self.monitor.persist()
+        before = self.monitor.state["routes"][self.target].copy()
+        self.monitor.lock.close()
+        with patch.dict(os.environ, ST_AGENT=self.config["agent"]):
+            self.monitor = probe.Probe(self.config)
+        self.monitor.api = FakeApi()
+        self.assertEqual(self.monitor.state["routes"][self.target], before)
+        await self.monitor.acknowledge("message/native")
+        self.assertEqual([body["lifecycle"] for _, body in self.monitor.api.posts], ["delivered", "read", "closed"])
+        self.assertFalse(self.monitor.state["receipts"])
+
+    async def test_replayed_ack_accepts_forward_read_but_never_infers_read_from_closed(self):
+        self.monitor.state["receipts"]["message/native"] = {"consumed_at_unix_ms": 10}
+        self.monitor.persist()
+        self.monitor.api.advanced = True
+        with self.assertRaises(RuntimeError):
+            await self.monitor.acknowledge("message/native")
+        self.assertIn("message/native", self.monitor.state["receipts"])
+        self.monitor.api.records = [{"kind": "message.read", "actor": self.monitor.actor,
+                                     "accepted_at_unix_ms": 20}]
+        await self.monitor.acknowledge("message/native")
+        self.assertFalse(self.monitor.state["receipts"])
+
+
+@unittest.skipUnless(BINARY, "pass --binary to prove the actual native path")
+class NativeProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_native_read_outage_attention_and_recovery(self):
+        directory = Path(tempfile.mkdtemp(prefix="delivery-probe-"))
+        nodes = []
+        try:
+            env = {"PATH": os.environ["PATH"], "USER": os.environ.get("USER", "eval"),
+                   "LOGNAME": os.environ.get("USER", "eval"), "SHELL": "/bin/bash", "LANG": "C.UTF-8"}
+            if os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+                env["DBUS_SESSION_BUS_ADDRESS"] = os.environ["DBUS_SESSION_BUS_ADDRESS"]
+            nodes = [faults.Node(directory, host, BINARY, env) for host in ("amber", "cobalt")]
+            ports = [faults.free_port(), faults.free_port()]
+            secret = directory / "secret"
+            secret.write_text("9" * 64)
+            secret.chmod(0o600)
+            fleet = str(uuid.uuid4())
+            for index, node in enumerate(nodes):
+                other = nodes[1 - index]
+                (node.root / "config.toml").write_text(f'''node = "{node.name}"
+person = "person/eval"
+fleet_id = "{fleet}"
+shared_secret_file = "{secret}"
+state_dir = "{node.root / 'state'}"
+pty_root = "{node.root / 'pty'}"
+socket = "{node.endpoint}"
+client_gateway_socket = "{node.root / 'run/client.sock'}"
+peer_listen = "127.0.0.1:{ports[index]}"
+[[peers]]
+name = "{other.name}"
+url = "http://127.0.0.1:{ports[1 - index]}"
+''')
+                await node.start()
+                config = {"host": node.name, "agent": f"agent/probe/{node.name}",
+                          "binary": str(node.binary), "socket": str(node.endpoint),
+                          "state_dir": str(node.root / "probe"), "reviewer": "person/eval",
+                          "interval_ms": 4000, "deadline_ms": 3000,
+                          "peers": [{"host": other.name, "agent": f"agent/probe/{other.name}"}]}
+                (node.root / "probe.json").write_text(json.dumps(config))
+                argv = [sys.executable, str(HERE / "st3-delivery-probe"), "--config", str(node.root / "probe.json")]
+                (node.root / "seat.kdl").write_text(f'''version 2
+agent "probe/{node.name}" {{
+  workspace "{node.root / 'ws'}"
+  restart "always"
+  argv {' '.join(json.dumps(arg) for arg in argv)}
+}}
+''')
+                await node.cli("agents", "apply", str(node.root / "seat.kdl"), "--as", "person/eval")
+
+            async def route(node):
+                path = node.root / "probe/latest.json"
+                if path.exists():
+                    return json.loads(path.read_text())["routes"][0]
+
+            async def both_read():
+                rows = [await route(node) for node in nodes]
+                return rows if all(row and row["status"] == "read" and not row.get("late") for row in rows) else None
+
+            first = await faults.until(both_read, 40)
+            self.assertTrue(all(row["latency_ms"] < 3000 for row in first), first)
+            doctor = json.loads(await nodes[0].cli("doctor", "--json"))
+            self.assertTrue(any(check["name"] == "delivery-probes" and check["status"] == "pass" for check in doctor["checks"]), doctor)
+            # Kill only this test's declared recipient, never a shared seat.
+            await nodes[1].cli("agents", "stop", "agent/probe/cobalt", "--as", "person/eval")
+
+            async def alerted():
+                row = await route(nodes[0])
+                return row if row and row.get("attention") else None
+
+            blocked = await faults.until(alerted, 20)
+            self.assertEqual(blocked["status"], "overdue")
+            attention = await nodes[0].api("/v1/attention?person=person%2Feval")
+            self.assertTrue(any(item["subject"] == blocked["attention"] for item in attention), attention)
+            doctor = json.loads(await nodes[0].cli("doctor", "--json"))
+            self.assertTrue(any(check["name"] == "delivery-probes" and check["status"] == "warn" for check in doctor["checks"]))
+            await nodes[1].cli("agents", "apply", str(nodes[1].root / "seat.kdl"), "--as", "person/eval")
+
+            async def recovered():
+                row = await route(nodes[0])
+                return row if row and row["message"] == blocked["message"] and row["status"] == "read" and not row.get("attention") else None
+
+            recovered_row = await faults.until(recovered, 20)
+            self.assertTrue(recovered_row["late"])
+            self.assertGreater(recovered_row["latency_ms"], 3000)
+            claims = await nodes[0].api("/v1/claims?" + probe.urlencode({"subject": blocked["message"]}))
+            self.assertEqual(sum(claim["kind"] == "message.read" for claim in claims["claims"]), 1)
+            # No provider binary was launched: only Python and the real native channel.
+            for node in nodes:
+                events = [json.loads(line) for line in (node.root / "probe/events.jsonl").read_text().splitlines()]
+                self.assertTrue(any(event["event"] == "consumed" for event in events))
+                await node.cli("agents", "stop", f"agent/probe/{node.name}", "--as", "person/eval")
+        except Exception:
+            print(f"failed native probe fixture retained: {directory}", file=sys.stderr)
+            raise
+        finally:
+            for node in reversed(nodes):
+                await node.cleanup()
+
+
+if __name__ == "__main__":
+    unittest.main()

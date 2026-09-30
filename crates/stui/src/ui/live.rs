@@ -72,7 +72,7 @@ enum Fetched {
 
 pub fn run(context: Context) -> Result<()> {
     let Context {
-        client,
+        mut client,
         runtime,
         incoming,
         commands,
@@ -125,6 +125,15 @@ pub fn run(context: Context) -> Result<()> {
         }
         while let Ok(update) = incoming.try_recv() {
             match update {
+                feed::Update::Connected(member) => {
+                    client = member;
+                    extras.live = false;
+                    attached = None;
+                    shown_tab = usize::MAX;
+                    preview_requested.clear();
+                    body_requested.clear();
+                    changed = true;
+                }
                 feed::Update::Window {
                     window,
                     snapshot,
@@ -144,6 +153,9 @@ pub fn run(context: Context) -> Result<()> {
                     }
                     extras.live = true;
                     extras.offline = None;
+                    model.last_connected = Some(
+                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                    );
                     changed = true;
                 }
                 feed::Update::Conversation {
@@ -188,6 +200,8 @@ pub fn run(context: Context) -> Result<()> {
                 feed::Update::Offline(error) => {
                     extras.live = false;
                     extras.offline = Some(error);
+                    attached = None;
+                    save_cache(cache_path.as_deref(), &person, &model);
                     changed = true;
                 }
                 feed::Update::Terminal(update) => match update {
@@ -415,6 +429,10 @@ pub fn run(context: Context) -> Result<()> {
         }
         let mut effects = Vec::new();
         for effect in std::mem::take(&mut ui.effects) {
+            if !extras.live && !matches!(effect, Effect::CloseTerminal) {
+                ui.flash("Offline · reconnect before acting; nothing was queued");
+                continue;
+            }
             match effect {
                 Effect::OpenTerminal { agent } => {
                     // The feed attaches and follows on its socket; screens arrive as updates.
@@ -536,6 +554,13 @@ pub fn run(context: Context) -> Result<()> {
         if event::poll(Duration::from_millis(80))? {
             loop {
                 match event::read()? {
+                    Event::Key(key)
+                        if !extras.live
+                            && key.code == crossterm::event::KeyCode::Char('r')
+                            && !ui.editing =>
+                    {
+                        let _ = commands.send(Command::Reconnect);
+                    }
                     Event::Key(key) => ui.key(key),
                     Event::Mouse(mouse) => ui.mouse(mouse),
                     _ => {}

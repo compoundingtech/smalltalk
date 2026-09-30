@@ -47,6 +47,7 @@ The [source eval migration review](./MIGRATION-REVIEW.md) classifies all 58 acti
 | Codex compaction message delivery | Not supported | `st3/codex-compaction-message-delivery` |
 | Native session import | Not supported | `st3/native-session-import` |
 | Graceful messaging | Not supported | `st3/graceful-messaging` |
+| Messaging faults | Not supported | `st3/messaging-faults` |
 
 The License MIT, Restart continuity, and Claude Skill Inheritance pairs use Claude Sonnet in both runtimes.
 
@@ -58,7 +59,7 @@ Mission Inputs, Local File Refresh, and Constraint Inheritance are also model-fr
 
 Run Generation Revision starts one Codex planner through the launch API.
 
-The st3 corpus has 45 active evals. Twenty-two are model-free, and twenty-three use at least one model.
+The st3 corpus has 46 active evals. Twenty-three are model-free, and twenty-three use at least one model.
 
 Each eval KDL starts with a document version. A missing version means version zero.
 
@@ -114,7 +115,9 @@ Seat queue is counted with its default Claude seat. `scripts/st3-seat-queue-eval
 `gpt-6-luna` or omp `openai-codex/gpt-5.6-luna` in that seat instead. Its chief agent is a
 model-free command, not a native agent seat.
 
-The twenty-two model-free st3 evals add no model seats and no LLM judges.
+The twenty-three model-free st3 evals add no model seats and no LLM judges.
+Messaging faults runs real native drivers and embedded extensions with a token-free provider API
+stand-in across two isolated nodes; it adds no native model seats.
 
 Claude task baselines remain explicitly pinned to `claude-sonnet-5`; the native-channel wake
 canary uses Claude Code's `opus` alias and records the concrete model selected by the provider.
