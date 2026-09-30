@@ -164,11 +164,26 @@ The fleet ID is a persistent UUID. A store rejects another fleet ID after its fi
 
 The secret contains 32 raw bytes or 64 hexadecimal characters. Its file mode must deny group and other access.
 
-The peer listener binds loopback; the worker can additionally bind discovered tailnet addresses.
-Explicit routes accept loopback or tailnet HTTP and `fabric://NODE_ID/PROTOCOL`. Fabric routes
-name the lasting remote endpoint: the worker creates or reacquires the local tunnel itself.
-Several peer entries may name the same member with distinct routes. Arbitrary LAN/public HTTP
-addresses remain rejected. See [the migration procedure](../fleet-join.md#move-an-existing-fleet-off-local-dial-helpers)
+The configured `peer_listen` accepts an IP socket address, including loopback, tailnet IPv4
+(`100.101.102.103:31313`), tailnet IPv6 (`[fd7a:115c:a1e0::1234]:31313`), or another explicitly
+configured listener IP. Hostnames and addresses without a port are rejected. The worker can
+additionally bind discovered tailnet addresses. Prefer a concrete private interface rather than
+an all-interface bind.
+
+The peer HTTP listener is not the privileged local Unix API: it exposes only fleet replication,
+join, and owner-forwarded client operations. Replication and forwarded client requests require
+the fleet HMAC and peer admission; current members must also sign with their member key.
+Joining instead requires a valid invitation proof and the joining member's signature.
+Binding a non-loopback address does not expose the privileged Unix API or bypass these checks.
+Peer HTTP authenticates but does not encrypt traffic: use tailnet or another trusted, encrypted
+transport and restrict network access to the listener. The privileged Unix API remains a local
+boundary protected by filesystem access to its socket.
+
+Explicit outbound routes still accept only loopback or tailnet HTTP and
+`fabric://NODE_ID/PROTOCOL`. Fabric routes name the lasting remote endpoint: the worker creates
+or reacquires the local tunnel itself. Several peer entries may name the same member with
+distinct routes. Arbitrary LAN/public HTTP destination addresses remain rejected even when
+such an address is configured for listening. See [the migration procedure](../fleet-join.md#move-an-existing-fleet-off-local-dial-helpers)
 to replace a legacy local dial helper.
 
 On a node that only receives connections from a peer, list its name without a URL:
