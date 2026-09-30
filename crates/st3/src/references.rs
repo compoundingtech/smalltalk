@@ -494,15 +494,18 @@ mission "watch" state="ready" {{
     #[test]
     fn unpinned_schedule_refuses_unknown_mission_at_publish() {
         let store = Store::open_memory("node").unwrap();
-        let source = r#"version 2
-schedule "cycle" {
+        let source = watch(
+            r#"schedule "cycle" {
   every "6h"
   anchor "2026-01-01T00:00:00Z"
   work { mission "unknown"; workspace "/tmp/cycles" }
-}"#;
+}"#,
+        );
         assert_eq!(
-            refusals(&store, source),
-            ["schedule `schedule/cycle` references unpublished mission `mission/unknown`"]
+            refusals(&store, &source),
+            [
+                "mission `mission/watch` declares schedule `schedule/${ST_MISSION_RUN}/cycle` references unpublished mission `mission/unknown`"
+            ]
         );
         for state in ["draft", "ready", "retired"] {
             let declared = format!(
