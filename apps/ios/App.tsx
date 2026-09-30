@@ -1,502 +1,145 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActivityIndicator, Alert, AppState, Linking, Pressable, SafeAreaView, ScrollView, StyleSheet, Text, TextInput, View } from 'react-native';
-import AsyncStorage from '@react-native-async-storage/async-storage';
-import * as SecureStore from 'expo-secure-store';
-import * as Crypto from 'expo-crypto';
-import { API_VERSION, ClientError, St3Client, type Agent, type Attention, type Capabilities, type Launch, type LaunchVariant, type Mission, type Page, type Resource, type Snapshot, type TerminalScreen, type TimelineEntry } from '../../clients/typescript/st3-client';
-import { applyConversation, conversationRows, isSnapshotChurn, isUnmanaged, isUnresolved, listSessionPages, sessionDetail, sessionLabel, timelineText, type Conversation, type SessionView } from './sessionView';
-import { emptyData, encodeProjectionCache, hydrateProjectionForPairedDevice, offlinePresentation, PROJECTION_CACHE_KEY, type Data, type MachineView } from './projectionCache';
-import { listCollectionPages } from './collectionPages';
-import { agentLabel, agentTree } from './agentTree';
-import { rememberBounded } from './boundedCache';
-import { withFreshTerminalFence } from './terminalControls';
-import { terminalRunStyle } from './terminalStyle';
-import { Feed } from './feed';
-import { ForegroundGate } from './foreground';
-import { gatewayFetch } from './gatewayFetch';
-import { gatewayTransport, LAN_HTTP_WARNING, normalizeGatewayUrl } from './gatewayUrl';
-import { agentHeaderDetail, agentHealth, ago, attentionActionLabel, attentionHeadline, attentionKindLabel, currentWorkSummary, deviceDetail, deviceTitle, missionDetail, missionGroup, missionGroups, missionLabels, missionSteps, pingPresentation, queuedWorkSummary, smallTalkPresentation } from './presentation';
+import { useEffect } from 'react';
+import { Linking, StatusBar, View } from 'react-native';
+import { DarkTheme, NavigationContainer, getFocusedRouteNameFromRoute, type RouteProp } from '@react-navigation/native';
+import { createNativeStackNavigator, type NativeStackNavigationOptions } from '@react-navigation/native-stack';
+import { createNativeBottomTabNavigator } from '@react-navigation/bottom-tabs/unstable';
+import { SafeAreaProvider } from 'react-native-safe-area-context';
+import { useFonts } from 'expo-font';
+// Only the four weights the content uses, not the whole family.
+import { IBMPlexMono_400Regular } from '@expo-google-fonts/ibm-plex-mono/400Regular';
+import { IBMPlexMono_400Regular_Italic } from '@expo-google-fonts/ibm-plex-mono/400Regular_Italic';
+import { IBMPlexMono_600SemiBold } from '@expo-google-fonts/ibm-plex-mono/600SemiBold';
+import { IBMPlexMono_700Bold } from '@expo-google-fonts/ibm-plex-mono/700Bold';
+import { homeRows } from './homeView';
+import { FULL_SCREEN, navigationRef, ROOTS, type StackParams, type TabParams } from './navigation';
+import { StoreProvider, useStore } from './store';
+import { parseDevLink, tabNamed, type Tab } from './tabs';
+import { theme } from './theme';
+import { AgentsScreen, HistoryScreen } from './screens/Agents';
+import { ConversationScreen } from './screens/Conversation';
+import { FleetScreen, PairScreen } from './screens/Fleet';
+import { AttentionScreen, HomeScreen } from './screens/Home';
+import { LaunchScreen, MissionScreen, MissionsScreen, NewMissionScreen } from './screens/Missions';
+import { TerminalScreen } from './screens/Terminal';
 
-const tabs = ['Now', 'Chat', 'Control', 'Fleet'] as const;
-type Tab = typeof tabs[number];
-const emptyConversation: Conversation<TimelineEntry> = { entries: [], hasOlder: false, newestSequence: -1 };
-const URL_KEY = 'st3.gateway.url', ORDER_KEY = 'st3.tabs.order', CREDENTIAL_KEY = 'st3.device.credential';
-const TERMINAL_COLORS = { fg: '#d6dee3', bg: '#101923' };
-function items<K extends Resource['kind']>(page: Page, kind: K): Extract<Resource, { kind: K }>[] {
-  return page.items.filter((item): item is Extract<Resource, { kind: K }> => item.kind === kind);
-}
-function errorText(error: unknown) { return error instanceof ClientError ? `${error.response.code}: ${error.message}` : error instanceof Error ? error.message : String(error); }
-// Now shows attention a person can act on; unread-message markers belong to Chat.
-function visibleAttention(item: Attention) { return item.state === 'open' && item.actions.length > 0 && item.attention_kind !== 'unread-message'; }
-function currentAgent(agent: Agent) { return (agent as { operational?: { layer?: string } }).operational?.layer !== 'history'; }
-// The collections socket keeps attention, missions, and agents current. The rest loads when the tab
-// that shows it opens, and again after an action; nothing reloads on a timer.
-type OnDemand = 'launches' | 'machines' | 'devices' | 'sessions';
-const TAB_LISTS: Record<Tab, readonly OnDemand[]> = { Now: [], Chat: ['sessions'], Control: ['launches'], Fleet: ['machines', 'devices', 'sessions'] };
-function Button({ label, onPress, disabled = false }: { label: string; onPress: () => void; disabled?: boolean }) {
-  return <Pressable accessibilityRole="button" disabled={disabled} onPress={onPress} style={[styles.button, disabled && styles.disabled]}><Text style={styles.buttonText}>{label}</Text></Pressable>;
-}
-function Card({ title, detail, children }: { title: string; detail?: string; children?: React.ReactNode }) {
-  return <View style={styles.card}><Text style={styles.cardTitle}>{title}</Text>{detail ? <Text style={styles.muted}>{detail}</Text> : null}{children}</View>;
-}
-export default function App() {
-  const [order, setOrder] = useState<Tab[]>([...tabs]);
-  const [active, setActive] = useState<Tab>(() => {
-    const testTab = process.env.EXPO_PUBLIC_ST3_TEST_TAB;
-    return __DEV__ && tabs.includes(testTab as Tab) ? testTab as Tab : 'Now';
-  });
-  const [url, setUrl] = useState(''), [urlDraft, setUrlDraft] = useState('');
-  const [credential, setCredential] = useState<string | null>(null);
-  const [pairingId, setPairingId] = useState(''), [pairingCode, setPairingCode] = useState('');
-  const [data, setData] = useState<Data>(emptyData);
-  const [truncated, setTruncated] = useState<Partial<Record<keyof Data, boolean>>>({});
-  const [loadErrors, setLoadErrors] = useState<Partial<Record<keyof Data, string>>>({});
-  const foreground = useRef(new ForegroundGate(AppState.currentState));
-  const [feed, setFeed] = useState<Feed | null>(null), [connectionIssue, setConnectionIssue] = useState('');
-  const [cachedHostId, setCachedHostId] = useState('');
-  const [caps, setCaps] = useState<Capabilities | null>(null), [snapshot, setSnapshot] = useState<Snapshot | null>(null);
-  const capsRef = useRef(caps);
-  capsRef.current = caps;
-  const [status, setStatus] = useState<'setup' | 'connecting' | 'online' | 'offline'>('setup');
-  const [hasSynced, setHasSynced] = useState(false);
-  const [error, setError] = useState(''), [pairingIssue, setPairingIssue] = useState(''), [busy, setBusy] = useState(false);
-  const [expandedAttentionId, setExpandedAttentionId] = useState<string | null>(null);
-  const [sessionId, setSessionId] = useState(''), [timeline, setTimeline] = useState<Conversation<TimelineEntry>>(emptyConversation), [composer, setComposer] = useState('');
-  const [conversationIssue, setConversationIssue] = useState('');
-  const [chatDetailOpen, setChatDetailOpen] = useState(false);
-  const [showHistory, setShowHistory] = useState(false), [historicalSessions, setHistoricalSessions] = useState<SessionView[]>([]), [historyBusy, setHistoryBusy] = useState(false);
-  const [terminalId, setTerminalId] = useState(''), [screen, setScreen] = useState<TerminalScreen | null>(null), [terminalIssue, setTerminalIssue] = useState('');
-  const [terminalDraft, setTerminalDraft] = useState('');
-  const [terminalActionNotice, setTerminalActionNotice] = useState('');
-  const terminalIncarnation = useRef(''), terminalSending = useRef(false);
-  const [reviewLaunch, setReviewLaunch] = useState(''), [variants, setVariants] = useState<LaunchVariant[]>([]);
-  const [selectedMissionId, setSelectedMissionId] = useState(''), [showSystemMissions, setShowSystemMissions] = useState(false), [showPlanner, setShowPlanner] = useState(false);
-  const [missionDetailView, setMissionDetailView] = useState<Mission | null>(null);
-  const missionDetailCache = useRef(new Map<string, Mission>());
-  const selectedMissionRevision = data.missions.find(m => m.id === selectedMissionId)?.revision;
-  const [title, setTitle] = useState(''), [request, setRequest] = useState(''), [workspace, setWorkspace] = useState('');
-  const [provider, setProvider] = useState<'codex' | 'claude' | 'pi' | 'omp' | 'opencode'>('codex');
-  const [model, setModel] = useState(''), [effort, setEffort] = useState(''), [feedback, setFeedback] = useState('');
-  const cachedActor = useRef(''), cacheSavedAt = useRef(0);
-  const cacheGeneration = useRef(0);
-  const conversationCache = useRef(new Map<string, Conversation<TimelineEntry>>()), draftCache = useRef(new Map<string, string>());
-  const chatScrollCache = useRef(new Map<string, number>()), scrollView = useRef<ScrollView>(null), currentScrollY = useRef(0);
-  const client = useMemo(() => url ? new St3Client({ baseUrl: url, credential: () => credential ?? undefined, fetchImpl: gatewayFetch() }) : null, [url, credential]);
+// The chrome is native: one UITabBarController (react-native-screens' tabs, through
+// @react-navigation/bottom-tabs' native navigator) holding a UINavigationController per tab
+// (@react-navigation/native-stack). It keeps the system look and fonts. Everything inside a
+// screen is React, drawn like stui: IBM Plex Mono on the Mocha palette.
 
-  useEffect(() => {
-    if (active !== 'Chat' || !chatDetailOpen || !sessionId) return;
-    const frame = requestAnimationFrame(() => scrollView.current?.scrollTo({ y: chatScrollCache.current.get(sessionId) ?? 0, animated: false }));
-    return () => cancelAnimationFrame(frame);
-  }, [active, chatDetailOpen, sessionId]);
+const Tabs = createNativeBottomTabNavigator<TabParams>();
+const Stack = createNativeStackNavigator<StackParams>();
 
-  useEffect(() => { Promise.allSettled([AsyncStorage.getItem(URL_KEY), AsyncStorage.getItem(ORDER_KEY), SecureStore.getItemAsync(CREDENTIAL_KEY), AsyncStorage.getItem(PROJECTION_CACHE_KEY)]).then(([u, o, c, p]) => {
-    if (u.status === 'fulfilled' && u.value) { setUrl(u.value); setUrlDraft(u.value); }
-    if (o.status === 'fulfilled' && o.value) { try { const parsed: unknown = JSON.parse(o.value); if (Array.isArray(parsed) && parsed.length === 4 && tabs.every(t => parsed.includes(t))) setOrder(parsed as Tab[]); } catch { /* use default */ } }
-    if (c.status === 'fulfilled' && c.value) {
-      if (u.status === 'fulfilled' && u.value && p.status === 'fulfilled') {
-        const cache = hydrateProjectionForPairedDevice(p.value, u.value, true);
-        if (cache) { setData(cache.data); setTruncated(Object.fromEntries(cache.truncated.map(key => [key, true]))); setHasSynced(true); setStatus('connecting'); cachedActor.current = cache.actor; cacheSavedAt.current = cache.savedAt; setCachedHostId(cache.hostId); }
-      }
-      setCredential(c.value);
-    }
-    if (c.status === 'rejected') setError('Secure credential storage is unavailable on this build.');
-  }); }, []);
+const navigationTheme = {
+  ...DarkTheme,
+  colors: { ...DarkTheme.colors, primary: theme.accent, background: theme.base, card: theme.mantle, text: theme.text, border: theme.surface0, notification: theme.person },
+};
+
+const ICONS: Record<Tab, string> = { Home: 'house', Agents: 'person.2', Missions: 'point.3.connected.trianglepath.dotted', Fleet: 'server.rack' };
+const ROOT_SCREENS = { HomeRoot: HomeScreen, AgentsRoot: AgentsScreen, MissionsRoot: MissionsScreen, FleetRoot: FleetScreen } as const;
+
+// Native header options only: the system font and look, tinted with the accent.
+const stackOptions: NativeStackNavigationOptions = {
+  headerTintColor: theme.accent,
+  headerStyle: { backgroundColor: theme.mantle },
+  headerTitleStyle: { color: theme.text },
+  headerLargeTitleStyle: { color: theme.text },
+  contentStyle: { backgroundColor: theme.base },
+  headerBackButtonDisplayMode: 'default',
+};
+
+function TabStack({ tab }: { tab: Tab }) {
+  const root = ROOTS[tab] as keyof typeof ROOT_SCREENS;
+  return <Stack.Navigator screenOptions={stackOptions}>
+    <Stack.Screen name={root} component={ROOT_SCREENS[root]} options={{ title: tab }} />
+    <Stack.Screen name="Conversation" component={ConversationScreen} options={{ title: 'Conversation' }} />
+    <Stack.Screen name="Terminal" component={TerminalScreen} options={{ title: 'Terminal', contentStyle: { backgroundColor: theme.crust } }} />
+    <Stack.Screen name="Mission" component={MissionScreen} options={{ title: 'Mission' }} />
+    <Stack.Screen name="Attention" component={AttentionScreen} options={{ title: 'Needs you' }} />
+    <Stack.Screen name="Launch" component={LaunchScreen} options={{ title: 'Launch' }} />
+    <Stack.Screen name="History" component={HistoryScreen} options={{ title: 'Past sessions' }} />
+    <Stack.Screen name="NewMission" component={NewMissionScreen} options={{ title: 'New mission', presentation: 'modal' }} />
+  </Stack.Navigator>;
+}
+const TAB_COMPONENTS: Record<Tab, () => React.JSX.Element> = {
+  Home: () => <TabStack tab="Home" />,
+  Agents: () => <TabStack tab="Agents" />,
+  Missions: () => <TabStack tab="Missions" />,
+  Fleet: () => <TabStack tab="Fleet" />,
+};
+
+function tabBarHidden(route: RouteProp<TabParams>): boolean {
+  const focused = getFocusedRouteNameFromRoute(route) as keyof StackParams | undefined;
+  return !!focused && FULL_SCREEN.includes(focused);
+}
+
+function Main() {
+  const { credential, url, order, data, caps, actions, setTreeView, requestScroll } = useStore();
+  const homeCount = homeRows(data.attention, caps?.session_actor).length;
+  const paired = !!url && !!credential;
+
+  // Debug-only deep links for simulator checks; disabled in Release.
   useEffect(() => {
     if (!__DEV__) return;
-    let activePairLink = '';
-    async function handleDevPairLink(link: string | null) {
+    let lastPair = '';
+    const handle = (link: string | null) => {
       if (!link) return;
-      const parsed = new URL(link);
-      if (parsed.hostname === 'tab') {
-        const tab = parsed.pathname.replace(/^\//, '');
-        if (tabs.includes(tab as Tab)) setActive(tab as Tab);
-        return;
+      const parsed = parseDevLink(link);
+      if (!parsed) return;
+      if (parsed.kind === 'pair') { if (lastPair !== link) { lastPair = link; void actions.pairFromLink(parsed.gateway, parsed.id, parsed.code); } return; }
+      if (parsed.kind === 'tree') { setTreeView(parsed.on); if (navigationRef.isReady()) navigationRef.navigate('Agents', { screen: 'AgentsRoot' }); return; }
+      if (parsed.kind === 'scroll') { requestScroll(parsed.y); return; }
+      if (!navigationRef.isReady()) { setTimeout(() => handle(link), 300); return; }
+      if (parsed.kind === 'tab') navigationRef.navigate(parsed.tab, { screen: ROOTS[parsed.tab] } as never);
+      else if (parsed.kind === 'mission') navigationRef.navigate('Missions', { screen: 'Mission', params: { id: parsed.id }, initial: false });
+      else if (parsed.kind === 'agent') navigationRef.navigate('Agents', { screen: 'Conversation', params: { target: parsed.id }, initial: false });
+      else if (parsed.kind === 'session') {
+        navigationRef.navigate('Agents', { screen: 'Conversation', params: { target: parsed.id, sessionId: parsed.id }, initial: false });
+        if (parsed.terminal) setTimeout(() => navigationRef.navigate('Agents', { screen: 'Terminal', params: { terminalId: parsed.terminal! }, initial: false }), 300);
       }
-      if (parsed.hostname === 'scroll') {
-        const y = Number(parsed.searchParams.get('y'));
-        if (Number.isFinite(y) && y >= 0) scrollView.current?.scrollTo({ y, animated: false });
-        return;
-      }
-      if (parsed.hostname === 'mission') {
-        const id = parsed.searchParams.get('id');
-        if (id?.startsWith('mission/')) { setSelectedMissionId(id); setActive('Control'); }
-        return;
-      }
-      if (parsed.hostname === 'session') {
-        const id = parsed.searchParams.get('id');
-        const terminal = parsed.searchParams.get('terminal');
-        if (id?.startsWith('session/')) {
-          setSessionId(id);
-          setTimeline(conversationCache.current.get(id) ?? emptyConversation);
-          setComposer(draftCache.current.get(id) ?? '');
-          setTerminalId(terminal?.startsWith('terminal/') ? terminal : '');
-          terminalIncarnation.current = '';
-          setTerminalDraft('');
-          setTerminalActionNotice('');
-          setScreen(null);
-          setTerminalIssue('');
-          setChatDetailOpen(true);
-          setActive('Chat');
-        }
-        return;
-      }
-      if (parsed.hostname !== 'pair') return;
-      if (activePairLink === link) return;
-      const gateway = normalizeGatewayUrl(parsed.searchParams.get('gateway') ?? '');
-      const id = parsed.searchParams.get('id');
-      const code = parsed.searchParams.get('code');
-      if (!gateway || !id || !code) return;
-      activePairLink = link;
-      setPairingIssue('');
-      setBusy(true);
-      try {
-        const publicKey = Array.from(Crypto.getRandomBytes(32), b => b.toString(16).padStart(2, '0')).join('');
-        const result = await new St3Client({ baseUrl: gateway }).completePairing(id, { api_version: API_VERSION, code, device_public_key: publicKey });
-        await clearCachedProjection();
-        await SecureStore.setItemAsync(CREDENTIAL_KEY, result.value.credential, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
-        await AsyncStorage.setItem(URL_KEY, gateway);
-        setUrl(gateway); setUrlDraft(gateway); setCredential(result.value.credential); setPairingIssue(''); setError('');
-      } catch (e) { activePairLink = ''; setPairingIssue(`Pairing failed: ${errorText(e)}`); }
-      finally { setBusy(false); }
-    }
-    void Linking.getInitialURL().then(handleDevPairLink);
-    void handleDevPairLink(process.env.EXPO_PUBLIC_ST3_TEST_PAIR_LINK ?? null);
-    const subscription = Linking.addEventListener('url', event => { void handleDevPairLink(event.url); });
-    return () => subscription.remove();
-  }, []);
-
-  function resetForActor() {
-    cachedActor.current = ''; cacheSavedAt.current = 0;
-    conversationCache.current.clear(); draftCache.current.clear(); chatScrollCache.current.clear(); missionDetailCache.current.clear();
-    setTimeline(emptyConversation); setComposer(''); setSessionId(''); setChatDetailOpen(false); setMissionDetailView(null);
-    setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null);
-    void AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {});
-  }
-  // Capabilities once per connection: limits, the session's actor, and what it may control.
-  const loadCapabilities = useCallback(async () => {
-    if (!client) return;
-    try {
-      const capability = await client.capabilities();
-      if (cachedActor.current && cachedActor.current !== capability.value.session_actor) resetForActor();
-      cachedActor.current = capability.value.session_actor;
-      setCaps(capability.value);
-    } catch (e) { if (e instanceof ClientError && e.status >= 400 && e.status < 500) setError(errorText(e)); }
-  }, [client]);
-  // One collections socket per paired gateway and credential keeps attention, missions, and agents
-  // current. It closes in the background and opens fresh, snapshots first, in the foreground.
-  useEffect(() => {
-    if (!client || !credential) { setStatus('setup'); return; }
-    const generation = cacheGeneration.current;
-    const current = () => generation === cacheGeneration.current;
-    const opened = new Feed(client, {
-      onWindow: (name, rows, hasMore, at) => {
-        if (!current()) return;
-        const shown = name === 'attention' ? (rows as Attention[]).filter(visibleAttention) : name === 'agents' ? (rows as Agent[]).filter(currentAgent) : rows;
-        setData(previous => ({ ...previous, [name]: shown }));
-        setTruncated(previous => ({ ...previous, [name]: hasMore }));
-        setLoadErrors(previous => { if (!(name in previous)) return previous; const rest = { ...previous }; delete rest[name]; return rest; });
-        setSnapshot(at); setCachedHostId(at.host_id); setHasSynced(true);
-      },
-      onConnection: (state, issue) => {
-        if (!current()) return;
-        setStatus(state === 'live' ? 'online' : state === 'connecting' ? 'connecting' : 'offline');
-        setConnectionIssue(issue ?? '');
-        if (state === 'live') { setError(''); void loadCapabilities(); }
-      },
-      onWindowError: (name, message) => { if (current()) setLoadErrors(previous => ({ ...previous, [name]: message })); },
-    }, foreground.current, actionId);
-    setFeed(opened);
-    return () => { opened.close(); setFeed(held => held === opened ? null : held); };
-  }, [client, credential, loadCapabilities]);
-  useEffect(() => {
-    const subscription = AppState.addEventListener('change', state => foreground.current.update(state));
-    return () => subscription.remove();
-  }, []);
-  // Keep the last data for an offline start, saved at most every 10 s while it changes.
-  useEffect(() => {
-    if (!hasSynced || !snapshot || !caps) return;
-    const timer = setTimeout(() => {
-      cacheSavedAt.current = Date.now();
-      const truncatedKeys = (Object.keys(truncated) as Array<keyof Data>).filter(key => truncated[key]);
-      const encoded = encodeProjectionCache(url, caps.session_actor, snapshot.host_id, snapshot.store_index, data, cacheSavedAt.current, truncatedKeys);
-      if (encoded) void AsyncStorage.setItem(PROJECTION_CACHE_KEY, encoded).catch(() => { cacheSavedAt.current = 0; });
-    }, Math.max(0, cacheSavedAt.current + 10_000 - Date.now()));
-    return () => clearTimeout(timer);
-  }, [caps, data, hasSynced, snapshot, truncated, url]);
-  const loadLists = useCallback(async (keys: readonly OnDemand[]) => {
-    if (!client || !keys.length) return;
-    const generation = cacheGeneration.current;
-    const limit = Math.min(capsRef.current?.limits.max_page_items ?? 30, 30);
-    const read = (key: OnDemand): Promise<{ rows: Data[OnDemand]; truncated: boolean }> => {
-      if (key === 'sessions') return listSessionPages(options => client.sessionsList(options), limit).then(rows => ({ rows, truncated: false }));
-      const list = key === 'launches' ? client.launchesList.bind(client) : key === 'machines' ? client.machinesList.bind(client) : client.devicesList.bind(client);
-      const kind = key === 'launches' ? 'launch' : key === 'machines' ? 'machine' : 'device';
-      return listCollectionPages(options => list(options), limit).then(result => ({ rows: result.pages.flatMap(page => page.value.items.filter(item => (item as { kind: string }).kind === kind)) as unknown as Data[OnDemand], truncated: result.truncated }));
     };
-    const results = await Promise.allSettled(keys.map(read));
-    if (generation !== cacheGeneration.current) return;
-    // A list that fails (for example a scope the device lacks) is named, and the others still show.
-    keys.forEach((key, index) => {
-      const result = results[index];
-      if (result.status === 'fulfilled') {
-        setData(previous => ({ ...previous, [key]: result.value.rows }));
-        setTruncated(previous => ({ ...previous, [key]: result.value.truncated }));
-        setLoadErrors(previous => { if (!(key in previous)) return previous; const rest = { ...previous }; delete rest[key]; return rest; });
-      } else if (!isSnapshotChurn(result.reason)) setLoadErrors(previous => ({ ...previous, [key]: errorText(result.reason) }));
-    });
-  }, [client]);
-  useEffect(() => { if (status === 'online') void loadLists(TAB_LISTS[active]); }, [active, loadLists, status]);
-  useEffect(() => { if (!sessionId && data.sessions.some(s => s.state === 'running')) setSessionId(data.sessions.find(s => s.state === 'running')!.id); }, [data.sessions, sessionId]);
-  useEffect(() => {
-    if (active !== 'Control' || !selectedMissionId || !client || status !== 'online') return;
-    let live = true;
-    setMissionDetailView(missionDetailCache.current.get(selectedMissionId) ?? null);
-    void client.missionsGet(selectedMissionId).then(result => {
-      if (!live || result.value.kind !== 'mission') return;
-      rememberBounded(missionDetailCache.current, selectedMissionId, result.value, 12);
-      setMissionDetailView(result.value);
-    }).catch(() => { /* retain the list projection or cached detail while offline */ });
-    return () => { live = false; };
-  }, [active, selectedMissionId, selectedMissionRevision, client, status]);
-  const timelineSession = data.sessions.find(s => s.id === sessionId) ?? historicalSessions.find(s => s.id === sessionId);
-  const timelineUnresolved = timelineSession ? isUnresolved(timelineSession) : false;
-  // A running agent's conversation is followed by the agent, so st joins its Small Talk in; any
-  // other session by its own ID.
-  const timelineAgent = timelineSession?.state === 'running' ? data.agents.find(agent => agent.id === timelineSession.owner_id && (!agent.current_session_id || agent.current_session_id === timelineSession.id)) : undefined;
-  const conversationTarget = timelineSession && !timelineUnresolved ? timelineAgent?.id ?? timelineSession.id : '';
-  useEffect(() => { if (!sessionId || timelineUnresolved) setTimeline(emptyConversation); }, [sessionId, timelineUnresolved]);
-  useEffect(() => {
-    if (!feed || !conversationTarget || active !== 'Chat' || !chatDetailOpen || terminalId) return;
-    // The socket sends the newest page, then each change; it never polls.
-    const shownFor = sessionId;
-    setConversationIssue('');
-    const follow = feed.followConversation(conversationTarget, {
-      onEntries: frame => setTimeline(previous => {
-        const next = applyConversation(previous, frame);
-        rememberBounded(conversationCache.current, shownFor, next, 24);
-        return next;
-      }),
-      onIssue: setConversationIssue,
-    });
-    return () => follow.close();
-  }, [feed, conversationTarget, sessionId, active, chatDetailOpen, terminalId]);
-  useEffect(() => {
-    if (!feed || !terminalId || !chatDetailOpen || active !== 'Chat') return;
-    // The terminal rides the same socket: each changed screen is pushed, and nothing polls.
-    const follow = feed.followTerminal(terminalId, {
-      onScreen: next => {
-        if (!terminalIncarnation.current) terminalIncarnation.current = next.runtime_incarnation;
-        setScreen(next);
-      },
-      onIssue: setTerminalIssue,
-    });
-    return () => follow.close();
-  }, [feed, terminalId, chatDetailOpen, active]);
+    void Linking.getInitialURL().then(handle);
+    handle(process.env.EXPO_PUBLIC_ST3_TEST_PAIR_LINK ?? null);
+    // Links to follow at launch, six seconds apart, for headless screenshots: the simulator asks
+    // before opening each link it is handed, and nobody is there to answer.
+    (process.env.EXPO_PUBLIC_ST3_TEST_LINKS ?? '').split(/\s+/).filter(Boolean).forEach((link: string, index: number) => setTimeout(() => handle(link), 6000 * (index + 1)));
+    const subscription = Linking.addEventListener('url', event => handle(event.url));
+    return () => subscription.remove();
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  async function review(id: string) { if (!client || status !== 'online') return; try { const result = await client.launchVariantsList(id, { limit: Math.min(caps?.limits.max_page_items ?? 30, 30) }); setReviewLaunch(id); setVariants(items(result.value, 'launch-variant')); setError(''); } catch (e) { setError(errorText(e)); } }
-  async function preview(launch: Launch, variant: LaunchVariant) { if (!client) return; await runAction(() => { const id = actionId(); return client.launchPreview({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), parameters: { launch_id: launch.id, variant_id: variant.id } }); }); void review(launch.id); }
-  async function approve(launch: Launch, variant: LaunchVariant) { if (!client || !variant.preview_token) return; await runAction(() => { const id = actionId(); return client.launchApprove({ id, idempotency_key: id, fence: { ...fence({ [launch.id]: launch.revision, [variant.id]: variant.revision }), preview_token: variant.preview_token! }, parameters: { launch_id: launch.id, variant_id: variant.id } }); }); setVariants([]); }
-  function showTerminal(id: string) { if (!client || status !== 'online') return; terminalIncarnation.current = ''; setTerminalDraft(''); setTerminalActionNotice(''); setScreen(null); setTerminalIssue(''); setTerminalId(id); setError(''); }
-  // An agent names its runtimes; a runtime is read only when the person opens its terminal.
-  async function openRuntimeTerminal(runtimeId: string) {
-    if (!client || status !== 'online') return;
-    try {
-      const runtime = await client.runtimesGet(runtimeId);
-      if (runtime.value.kind !== 'runtime' || !runtime.value.terminal_id) { setError('This runtime has no terminal.'); return; }
-      showTerminal(runtime.value.terminal_id);
-    } catch (e) { setError(errorText(e)); }
+  if (!paired) {
+    return <Stack.Navigator screenOptions={stackOptions}>
+      <Stack.Screen name="HomeRoot" component={PairScreen} options={{ title: 'Pair this device' }} />
+    </Stack.Navigator>;
   }
-  async function sendTerminalInput(mode: 'line' | 'key', value: string) {
-    if (!client || !terminalId || status !== 'online' || busy || terminalSending.current || !value || !terminalIncarnation.current) return;
-    const incarnation = terminalIncarnation.current;
-    terminalSending.current = true;
-    setBusy(true);
-    try {
-      await withFreshTerminalFence(client, terminalId, incarnation, fence => {
-        const id = actionId();
-        return client.terminalInput({ id, idempotency_key: id, fence, parameters: { terminal_id: terminalId, mode, value } });
-      });
-      if (mode === 'line') setTerminalDraft('');
-      setTerminalActionNotice(''); setError('');
-    } catch (cause) { setTerminalActionNotice(`Input was not confirmed. Inspect the screen before retrying: ${errorText(cause)}`); }
-    finally { terminalSending.current = false; setBusy(false); }
-  }
-  async function clearCachedProjection() { cacheGeneration.current++; cachedActor.current = ''; cacheSavedAt.current = 0; conversationCache.current.clear(); draftCache.current.clear(); chatScrollCache.current.clear(); missionDetailCache.current.clear(); setMissionDetailView(null); setData(emptyData); setTruncated({}); setHasSynced(false); setCachedHostId(''); setSnapshot(null); setTimeline(emptyConversation); await AsyncStorage.removeItem(PROJECTION_CACHE_KEY).catch(() => {}); }
-  async function saveUrl() { const normalized = normalizeGatewayUrl(urlDraft); if (!normalized) { setError('Enter the paired gateway HTTPS URL, or http:// with a Tailscale address (100.x), a .local name, or a private LAN address (10.x, 172.16-31.x, 192.168.x).'); return; } if (normalized !== url) await clearCachedProjection(); await AsyncStorage.setItem(URL_KEY, normalized); setUrl(normalized); setError(''); }
-  async function pair() { if (!client || !pairingId.trim() || !pairingCode.trim()) return; setBusy(true); try {
-    const publicKey = Array.from(Crypto.getRandomBytes(32), b => b.toString(16).padStart(2, '0')).join('');
-    const result = await client.completePairing(pairingId.trim(), { api_version: API_VERSION, code: pairingCode.trim(), device_public_key: publicKey });
-    await clearCachedProjection();
-    await SecureStore.setItemAsync(CREDENTIAL_KEY, result.value.credential, { keychainAccessible: SecureStore.WHEN_UNLOCKED_THIS_DEVICE_ONLY });
-    setCredential(result.value.credential); setPairingCode(''); setPairingId(''); setPairingIssue(''); setError('');
-  } catch (e) { setError(errorText(e)); } finally { setBusy(false); } }
-  // The socket brings the windows' changes; a tab's on-demand lists are read again after an action.
-  async function runAction(action: () => Promise<unknown>) { if (status !== 'online') { setError('Reconnect before sending an action.'); return; } setBusy(true); try { await action(); setError(''); await loadLists(TAB_LISTS[active]); } catch (e) { setError(errorText(e)); } finally { setBusy(false); } }
-  function fence(revisions: Record<string, string> = {}) { if (!snapshot) throw new Error('Refresh before acting.'); return { snapshot_id: snapshot.id, subject_revisions: revisions }; }
-  function actionId() { return `action/ios-${Crypto.randomUUID()}`; }
-  async function send() { const session = data.sessions.find(s => s.id === sessionId); if (!client || !session || isUnmanaged(session) || session.state !== 'running' || !composer.trim()) return; const content = composer.trim(); await runAction(async () => { const id = actionId(); await client.messageSend({ id, idempotency_key: id, fence: fence(), parameters: { content, session_id: session.id, to: session.owner_id } }); draftCache.current.delete(sessionId); setComposer(''); }); }
-  async function createLaunch() { if (!client || !title.trim() || !request.trim() || !workspace.trim()) return; await runAction(async () => { const id = actionId(); await client.launchCreate({ id, idempotency_key: id, fence: fence(), parameters: { title: title.trim(), request: request.trim(), target: { type: 'new-mission', mission_id: `mission/ios-${Crypto.randomUUID()}`, workspace: workspace.trim() }, provider, ...(model.trim() ? { model: model.trim() } : {}), ...(effort.trim() ? { effort: effort.trim() } : {}) } }); setTitle(''); setRequest(''); }); }
-  async function reviseLaunch(launch: Launch) { if (!client || !feedback.trim()) return; await runAction(async () => { const id = actionId(); await client.launchRevise({ id, idempotency_key: id, fence: fence({ [launch.id]: launch.revision }), parameters: { launch_id: launch.id, feedback: feedback.trim() } }); setFeedback(''); }); }
-  async function resolve(item: Attention) { if (!client) return; await runAction(() => { const id = actionId(); return client.attentionResolve({ id, idempotency_key: id, fence: fence({ [item.id]: item.revision }), parameters: { attention_id: item.id, outcome: 'resolved' } }); }); }
-  async function forget() { await SecureStore.deleteItemAsync(CREDENTIAL_KEY); await clearCachedProjection(); setCredential(null); setCaps(null); setPairingIssue(''); setHistoricalSessions([]); setShowHistory(false); setSessionId(''); setTerminalId(''); terminalIncarnation.current = ''; setTerminalDraft(''); setTerminalActionNotice(''); setScreen(null); setTerminalIssue(''); setStatus('setup'); }
-  async function openHistory() { if (!client || !caps) return; setHistoryBusy(true); try { setHistoricalSessions((await listSessionPages(options => client.sessionsList(options), Math.min(caps.limits.max_page_items, 30), true)).filter(s => ['completed', 'failed', 'cancelled'].includes(s.state))); setShowHistory(true); setError(''); } catch (e) { if (!isSnapshotChurn(e)) setError(errorText(e)); } finally { setHistoryBusy(false); } }
-  function move(tab: Tab, direction: -1 | 1) { const index = order.indexOf(tab), next = index + direction; if (next < 0 || next >= order.length) return; const updated = [...order]; [updated[index], updated[next]] = [updated[next], updated[index]]; setOrder(updated); void AsyncStorage.setItem(ORDER_KEY, JSON.stringify(updated)); }
-  const selectedSession = [...data.sessions, ...historicalSessions].find(s => s.id === sessionId);
-  const canControlTerminal = caps?.capabilities.some(capability => capability.id === 'terminal.input' && capability.state === 'granted') ?? false;
-  const selectedAgent = selectedSession ? data.agents.find(agent => agent.id === selectedSession.owner_id) : undefined;
-  const currentSessions = data.sessions.filter(s => s.state === 'running').sort((a, b) => Number(isUnmanaged(b)) - Number(isUnmanaged(a)));
-  const knownHostId = snapshot?.host_id ?? cachedHostId;
-  const gatewayMachineId = knownHostId ? `machine/${knownHostId.replace(/^host\//, '')}` : '';
-  const sourceHost = data.machines.find(m => m.id === gatewayMachineId)?.name ?? knownHostId?.replace(/^host\//, '') ?? 'connected gateway host';
-  const undeclaredSessions = currentSessions.filter(isUnmanaged);
-  const managedSessions = currentSessions.filter(s => !isUnmanaged(s));
-  const declaredAgentRows = agentTree(data.agents);
-  const representedSessions = new Set(declaredAgentRows.flatMap(({ agent }) => managedSessions.filter(s => s.id === agent.current_session_id || s.owner_id === agent.id).map(s => s.id)));
-  const unmatchedDeclaredSessions = managedSessions.filter(s => !representedSessions.has(s.id));
-  const conversationEntries = timeline.entries;
-  const now = Date.now();
-  const missionNames = missionLabels(data.missions);
-  const unhealthyAgents = data.agents.filter(agent => !agentHealth(agent).healthy);
-  const attentionState = attentionHeadline({ count: data.attention.length, loaded: hasSynced, error: loadErrors.attention ?? (status === 'offline' ? error || 'the gateway is unreachable' : undefined) });
-  const otherLoadErrors = Object.entries(loadErrors).filter(([key]) => key !== 'attention');
-  function selectSession(id: string) { if (sessionId && chatDetailOpen) rememberBounded(chatScrollCache.current, sessionId, currentScrollY.current, 24); setSessionId(id); setTimeline(conversationCache.current.get(id) ?? emptyConversation); setConversationIssue(''); setComposer(draftCache.current.get(id) ?? ''); setTerminalId(''); terminalIncarnation.current = ''; setTerminalDraft(''); setTerminalActionNotice(''); setScreen(null); setTerminalIssue(''); setChatDetailOpen(true); }
-  const sessionChoice = (s: SessionView) => <Pressable key={s.id} onPress={() => selectSession(s.id)} style={[styles.choice, sessionId === s.id && styles.selected]}><Text style={styles.cardTitle}>{sessionLabel(s, sourceHost)}</Text><Text style={styles.small}>{sessionDetail(s)}</Text></Pressable>;
-  const visibleMissions = data.missions.filter(m => showSystemMissions || !m.id.startsWith('mission/__st3/'));
-  const selectedMission = missionDetailView?.id === selectedMissionId ? missionDetailView : visibleMissions.find(m => m.id === selectedMissionId);
-
-  return <SafeAreaView style={styles.page}>
-    <View style={styles.header}><Text style={styles.brand}>Smalltalk</Text><Text style={[styles.status, status === 'online' && styles.good]}>{status === 'online' ? 'Connected' : status === 'connecting' ? hasSynced ? 'Updating · showing last data' : 'Connecting…' : status === 'offline' ? offlinePresentation(hasSynced).title : 'Pair this device'}</Text></View>
-    {error ? <Pressable onPress={() => setError('')} style={styles.error}><Text style={styles.errorText}>{error}</Text></Pressable> : null}
-    {pairingIssue ? <Pressable onPress={() => setPairingIssue('')} style={styles.error}><Text style={styles.errorText}>{pairingIssue}</Text></Pressable> : null}
-    {otherLoadErrors.length && status === 'online' ? <View style={styles.error}><Text style={styles.errorText}>Not loaded: {otherLoadErrors.map(([key, message]) => `${key} (${message})`).join(' · ')}</Text></View> : null}
-    {busy ? <ActivityIndicator color="#67d6c5" /> : null}
-    <ScrollView ref={scrollView} style={styles.content} contentContainerStyle={styles.scroll} keyboardShouldPersistTaps="handled" scrollEventThrottle={100} onScroll={event => { currentScrollY.current = event.nativeEvent.contentOffset.y; if (active === 'Chat' && chatDetailOpen && sessionId) rememberBounded(chatScrollCache.current, sessionId, currentScrollY.current, 24); }}>
-      {!url || !credential ? <><Text style={styles.title}>Connect to Smalltalk</Text><Text style={styles.muted}>Use the paired-only gateway: its HTTPS URL; http:// with the host's Tailscale address (100.x.y.z), which Tailscale encrypts; or http:// with its .local name or private LAN address, which is not encrypted. Begin pairing on a trusted st machine, then enter its short-lived ID and code.</Text>
-        <TextInput style={styles.input} autoCapitalize="none" autoCorrect={false} keyboardType="url" placeholder="https://gateway, http://100.x.y.z:port, or http://host.local:port" placeholderTextColor="#8195a2" value={urlDraft} onChangeText={setUrlDraft} />{gatewayTransport(urlDraft) === 'lan' ? <Text style={styles.warning}>{LAN_HTTP_WARNING}</Text> : null}<Button label="Save gateway" onPress={() => void saveUrl()} />
-        {url ? <><TextInput style={styles.input} autoCapitalize="none" placeholder="Pairing ID" placeholderTextColor="#8195a2" value={pairingId} onChangeText={setPairingId} /><TextInput style={styles.input} autoCapitalize="none" placeholder="Pairing code" placeholderTextColor="#8195a2" value={pairingCode} onChangeText={setPairingCode} /><Button label="Pair device" disabled={busy} onPress={() => void pair()} /></> : null}</> : !hasSynced && status !== 'online' ? <>
-        <Text style={styles.title}>{status === 'offline' ? 'Offline' : 'Connecting…'}</Text>
-        <Text style={styles.muted}>{status === 'offline' ? offlinePresentation(false).detail : 'Loading your workspace for the first time.'}</Text>
-        {status === 'offline' ? <Button label="Reconnect" onPress={() => feed?.reconnect()} /> : null}
-      </> : <>
-        {status === 'offline' ? <><Button label="Reconnect" onPress={() => feed?.reconnect()} />{connectionIssue ? <Text style={styles.small}>Reconnecting on its own: {connectionIssue}</Text> : null}</> : null}
-        {active === 'Now' ? <>
-          <Text style={styles.title}>Needs your attention</Text>
-          <Text style={attentionState.warning ? styles.warning : styles.muted}>{attentionState.text}</Text>
-          {truncated.attention ? <Text style={styles.warning}>More attention items exist beyond this view. Open the full inbox in the CLI to see them all.</Text> : null}
-          {data.attention.map(a => {
-            const expanded = expandedAttentionId === a.id;
-            return <Card key={a.id} title={a.title}>
-              <Text style={styles.small}>{a.priority} · {attentionKindLabel(a.attention_kind)} · requested {ago(a.requested_at, now)} ago</Text>
-              <Text style={styles.muted} numberOfLines={expanded ? undefined : 3}>{a.detail}</Text>
-              {expanded ? <Text style={styles.small}>Source: {a.source_id}</Text> : null}
-              <Pressable accessibilityRole="button" accessibilityState={{ expanded }} onPress={() => setExpandedAttentionId(expanded ? null : a.id)} style={styles.detailToggle}>
-                <Text style={styles.detailToggleText}>{expanded ? 'Hide details' : 'Show details'}</Text>
-              </Pressable>
-              {a.actions.some(action => action !== 'attention.resolve') ? <Text style={styles.small}>In the CLI: {a.actions.filter(action => action !== 'attention.resolve').map(attentionActionLabel).join(', ')}</Text> : null}
-              {a.actions.includes('attention.resolve') ? <Button label={attentionActionLabel('attention.resolve')} disabled={busy} onPress={() => Alert.alert('Resolve attention?', a.title, [{ text: 'Cancel' }, { text: 'Resolve', onPress: () => void resolve(a) }])} /> : null}
-            </Card>;
-          })}
-        </> : null}
-        {active === 'Chat' ? chatDetailOpen && selectedSession ? <>
-          <Button label="← Agents" onPress={() => { setChatDetailOpen(false); setTerminalId(''); terminalIncarnation.current = ''; setTerminalDraft(''); setTerminalActionNotice(''); setScreen(null); setTerminalIssue(''); }} />
-          <Text style={styles.section}>{selectedAgent ? agentLabel(selectedAgent) : sessionLabel(selectedSession, sourceHost)}</Text>
-          {selectedAgent ? <Text style={agentHealth(selectedAgent).healthy ? styles.muted : styles.warning}>{agentHeaderDetail(selectedAgent, now)}</Text> : null}
-          <Text style={styles.muted}>{sessionDetail(selectedSession)}</Text>
-          {terminalId ? <>
-            <Button label="← Conversation" onPress={() => { terminalIncarnation.current = ''; setTerminalDraft(''); setTerminalActionNotice(''); setScreen(null); setTerminalId(''); setTerminalIssue(''); }} />
-            <Text style={styles.section}>{canControlTerminal ? 'Terminal · live controls' : 'Terminal · read-only'}</Text>
-            {terminalIssue ? <Text style={styles.warning}>{terminalIssue}</Text> : null}
-            {terminalActionNotice ? <Text style={styles.warning}>{terminalActionNotice}</Text> : null}
-            {screen && canControlTerminal ? <>
-              <TextInput style={styles.input} autoCapitalize="none" autoCorrect={false} placeholder="Type a terminal line" placeholderTextColor="#8195a2" value={terminalDraft} onChangeText={setTerminalDraft} />
-              <Button label="Send line" disabled={busy || status !== 'online' || !!terminalIssue || !terminalDraft.length} onPress={() => void sendTerminalInput('line', terminalDraft)} />
-              <View style={styles.row}>
-                {(['return', 'tab', 'escape', 'Up', 'Down'] as const).map(key => <Button key={key} label={key === 'return' ? 'Enter' : key === 'escape' ? 'Esc' : key} disabled={busy || status !== 'online' || !!terminalIssue} onPress={() => void sendTerminalInput('key', key)} />)}
-                <Button label="Ctrl-C" disabled={busy || status !== 'online' || !!terminalIssue} onPress={() => Alert.alert('Interrupt terminal process?', 'Send Ctrl-C to this terminal.', [{ text: 'Cancel' }, { text: 'Interrupt', onPress: () => void sendTerminalInput('key', 'C-c') }])} />
-              </View>
-              <Text style={styles.muted}>Inputs require a live paired connection and are fenced to this terminal incarnation.</Text>
-            </> : null}
-            {screen ? <Card title="Screen"><View style={styles.terminal}>{screen.lines.map(line => <Text key={line.row} style={styles.terminalLine}>{line.redacted ? '[redacted]' : line.runs.length ? line.runs.map((run, index) => <Text key={index} style={terminalRunStyle(run, TERMINAL_COLORS)}>{run.text}</Text>) : line.text || ' '}</Text>)}</View></Card> : <Card title="Screen" detail={terminalIssue || (status === 'online' ? 'Loading terminal screen…' : 'Offline; no terminal screen is cached.')} />}
-            {screen && status !== 'online' ? <Text style={styles.muted}>Offline · showing the last terminal frame.</Text> : null}
-          </> : <>
-            {!isUnmanaged(selectedSession) && selectedSession.state === 'running' ? selectedAgent?.runtime_ids.map((runtimeId, index, all) => <Button key={runtimeId} label={all.length > 1 ? `View terminal ${index + 1}` : 'View terminal'} disabled={status !== 'online'} onPress={() => void openRuntimeTerminal(runtimeId)} />) : null}
-            <Text style={styles.section}>Conversation</Text>
-            {conversationIssue ? <Text style={styles.warning}>{conversationIssue}</Text> : null}
-            {isUnresolved(selectedSession) ? <Text style={styles.muted}>This process has no exact native session history.</Text> : null}
-            {conversationRows(conversationEntries, timeline.hasOlder).map(row => {
-              if (row.kind === 'older') return <Text key="older" style={styles.muted}>Older history is not shown here. Open this session in the CLI for the full transcript.</Text>;
-              const shown = row.entry.type === 'message' ? smallTalkPresentation(row.entry.body) : pingPresentation(timelineText(row.entry.body) ?? '');
-              return <Card key={row.entry.id} title={shown.from ?? (row.entry.role === 'assistant' ? 'Agent' : row.entry.role === 'user' ? 'You' : row.entry.role)} detail={shown.text} />;
-            })}
-            {!conversationEntries.length && !isUnresolved(selectedSession) ? <Text style={styles.muted}>No conversation in the recent timeline.</Text> : null}
-            {!isUnmanaged(selectedSession) && selectedSession.state === 'running' ? <><TextInput style={[styles.input, styles.composer]} multiline placeholder="Message this session" placeholderTextColor="#8195a2" value={composer} onChangeText={text => { if (text) rememberBounded(draftCache.current, sessionId, text, 24); else draftCache.current.delete(sessionId); setComposer(text); }} /><Button label="Send" disabled={busy || status !== 'online' || !composer.trim()} onPress={() => void send()} /></> : null}
-          </>}
-        </> : <>
-          <Text style={styles.title}>Chat</Text><Text style={styles.muted}>Declared agents across the fleet; undeclared sessions discovered on this gateway.</Text>
-          <Text style={styles.section}>Undeclared on {sourceHost}</Text>{undeclaredSessions.map(sessionChoice)}{!undeclaredSessions.length ? <Text style={styles.muted}>None discovered on this machine.</Text> : null}
-          {unhealthyAgents.length ? <Text style={styles.warning}>Unhealthy: {unhealthyAgents.map(agent => `${agentLabel(agent)} (${agentHealth(agent).label})`).join(' · ')}</Text> : null}
-          <Text style={styles.section}>Declared agents</Text>{truncated.agents ? <Text style={styles.warning}>More agents exist beyond this view.</Text> : null}
-          {declaredAgentRows.map(({ agent, depth }) => {
-            const session = managedSessions.find(s => s.id === agent.current_session_id) ?? managedSessions.find(s => s.owner_id === agent.id);
-            return <Pressable key={agent.id} disabled={!session} onPress={() => { if (session) selectSession(session.id); }} style={[styles.choice, { marginLeft: Math.min(depth, 4) * 14 }, session?.id === sessionId && styles.selected]}><Text style={styles.cardTitle}>{depth ? '↳ ' : ''}{agentLabel(agent)}</Text><Text style={agentHealth(agent).healthy ? styles.small : styles.warning}>{agentHealth(agent).label} · observed {ago(agent.updated_at, now)} ago</Text><Text style={styles.small}>{agent.owner_run_id ? agent.owner_run_id.replace(/^mission-run\//, '') : 'no owner run'}{session ? ` · ${session.state} session` : ' · no current session'}</Text>{currentWorkSummary(agent) ? <Text style={styles.small}>{currentWorkSummary(agent)}</Text> : null}{queuedWorkSummary(agent, now) ? <Text style={styles.small}>{queuedWorkSummary(agent, now)}</Text> : null}</Pressable>;
-          })}
-          {unmatchedDeclaredSessions.length ? <><Text style={styles.section}>Other declared sessions</Text>{unmatchedDeclaredSessions.map(sessionChoice)}</> : null}
-          {!declaredAgentRows.length && !managedSessions.length ? <Text style={styles.muted}>No declared agents are visible.</Text> : null}
-          <Text style={styles.section}>Past sessions</Text><Button label={showHistory ? 'Refresh past sessions' : 'Show past sessions'} disabled={historyBusy || status !== 'online'} onPress={() => void openHistory()} />{showHistory ? historicalSessions.map(sessionChoice) : null}
-        </> : null}
-        {active === 'Control' ? selectedMission ? <>
-          <Button label="← Missions" onPress={() => setSelectedMissionId('')} />
-          <Text style={styles.title}>{missionNames.get(selectedMission.id) ?? selectedMission.title}</Text>
-          <Text style={styles.muted}>{missionGroup(selectedMission)} · {selectedMission.id}</Text>
-          <Card title="Work tree" detail={`${selectedMission.runs.length} runs · ${selectedMission.visualization?.nodes.filter(node => node.kind === 'step').length ?? 'unknown'} planned steps`}>
-            {(selectedMission.run_details ?? []).filter(run => run.steps?.length).map((run, _, runs) => <View key={run.id}>
-              {runs.length > 1 ? <Text style={[styles.small, { marginTop: 10 }]}>Run {run.id.replace(/^mission-run\//, '')} · {run.status}</Text> : null}
-              {[...run.steps!].sort((a, b) => a.path.localeCompare(b.path)).map(step => <View key={step.id} style={{ marginLeft: Math.min(3, step.path.split('/').length - 1) * 14, marginTop: 10 }}><Text style={styles.cardTitle}>↳ {step.path.split('/').pop()} · {step.state}</Text>{step.blocked_reason ? <Text style={styles.warning}>Blocked: {step.blocked_reason}</Text> : null}{step.goals?.[0] ? <Text style={styles.muted}>Goal: {step.goals[0]}</Text> : null}{step.claimant ?? step.assignee ? <Text style={styles.small}>Agent: {step.claimant ?? step.assignee}</Text> : null}</View>)}
-            </View>)}
-            {selectedMission.visualization?.groups.filter(g => g.kind === 'nested-mission').map(g => <Text key={g.id} style={styles.muted}>↳ Nested mission: {g.members.join(', ')}</Text>)}
-            {!missionSteps(selectedMission).length ? <Text style={styles.muted}>No steps are visible for this mission's runs.</Text> : null}
-          </Card>
-        </> : <>
-          <Text style={styles.title}>Control</Text>
-          <Text style={styles.muted}>Missions grouped by what needs action. Select one to see its work tree and blockers.</Text>
-          {truncated.missions ? <Text style={styles.warning}>This view is partial. Use the CLI for complete mission and work lists.</Text> : null}
-          {missionGroups.map(group => {
-            const missions = visibleMissions.filter(m => missionGroup(m) === group);
-            return missions.length ? <View key={group}><Text style={styles.section}>{group} · {missions.length}</Text>{missions.map(m => <Pressable key={m.id} onPress={() => setSelectedMissionId(m.id)} style={[styles.choice, selectedMissionId === m.id && styles.selected]}><Text style={styles.cardTitle}>{missionNames.get(m.id) ?? m.title}</Text><Text style={styles.small}>{missionDetail(m)}</Text></Pressable>)}</View> : null;
-          })}
-          <Button label={showSystemMissions ? 'Hide system missions' : 'Show system missions'} onPress={() => setShowSystemMissions(!showSystemMissions)} />
-          <Text style={styles.section}>Plan a mission</Text><Button label={showPlanner ? 'Hide planner' : 'New mission'} onPress={() => setShowPlanner(!showPlanner)} />
-          {showPlanner ? <>
-          <Text style={styles.muted}>Start a configurable planner. Review and approval stay in st.</Text>
-          <TextInput style={styles.input} placeholder="Title" placeholderTextColor="#8195a2" value={title} onChangeText={setTitle} />
-          <TextInput style={[styles.input, styles.composer]} multiline placeholder="What should be done?" placeholderTextColor="#8195a2" value={request} onChangeText={setRequest} />
-          <TextInput style={styles.input} autoCapitalize="none" placeholder="Workspace on target machine" placeholderTextColor="#8195a2" value={workspace} onChangeText={setWorkspace} />
-          <Text style={styles.small}>Planner</Text>
-          <View style={styles.row}>{(['codex', 'claude', 'pi', 'omp', 'opencode'] as const).map(p => <Pressable key={p} onPress={() => setProvider(p)} style={[styles.chip, provider === p && styles.selected]}><Text style={styles.small}>{p}</Text></Pressable>)}</View>
-          <TextInput style={styles.input} placeholder="Model (optional)" placeholderTextColor="#8195a2" value={model} onChangeText={setModel} />
-          <TextInput style={styles.input} placeholder="Effort (optional)" placeholderTextColor="#8195a2" value={effort} onChangeText={setEffort} />
-          <Button label="Create launch" disabled={busy || !title.trim() || !request.trim() || !workspace.trim()} onPress={() => void createLaunch()} />
-          </> : null}
-          <Text style={styles.section}>Launches</Text>{truncated.launches ? <Text style={styles.warning}>More launches exist beyond this view. Use the CLI for the complete list.</Text> : null}
-          {data.launches.map(l => <Card key={l.id} title={l.title} detail={`${l.phase} · ${l.planner_config.provider} · ${l.id}`}><Text style={styles.muted}>{l.request}</Text><Button label="Review variants" onPress={() => void review(l.id)} />{reviewLaunch === l.id ? variants.map(v => <Card key={v.id} title={`Variant ${v.ordinal} · ${v.status}`} detail={v.diagnostics.map(d => `${d.severity}: ${d.message}`).join(' · ') || 'No diagnostics'}><Button label="Preview" disabled={busy} onPress={() => void preview(l, v)} />{v.preview_token ? <Button label="Approve" disabled={busy} onPress={() => Alert.alert('Approve launch variant?', l.title, [{ text: 'Cancel' }, { text: 'Approve', onPress: () => void approve(l, v) }])} /> : null}</Card>) : null}{l.phase === 'authoring' || l.phase === 'review' ? <><TextInput style={styles.input} placeholder="Planner feedback" placeholderTextColor="#8195a2" value={feedback} onChangeText={setFeedback} /><Button label="Revise" disabled={busy || !feedback.trim()} onPress={() => void reviseLaunch(l)} /></> : null}</Card>)}
-        </> : null}
-        {active === 'Fleet' ? <>
-          <Text style={styles.title}>Fleet</Text>{truncated.machines || truncated.devices ? <Text style={styles.warning}>This fleet view is partial. Use the CLI for the complete machine, runtime, and device lists.</Text> : null}
-          <Text style={styles.section}>Agent work</Text>{unhealthyAgents.map(agent => <Text key={`unhealthy-${agent.id}`} style={styles.warning}>{agentLabel(agent)} · {agentHealth(agent).label} · observed {ago(agent.updated_at, now)} ago</Text>)}{data.agents.filter(agent => (agent.active_work_count ?? 0) > 0 || (agent.queued_work_count ?? 0) > 0).map(agent => <Text key={agent.id} style={styles.small}>{agentLabel(agent)} · {agent.active_work_count ?? 0} active{queuedWorkSummary(agent, now) ? ` · ${queuedWorkSummary(agent, now)}` : ''}</Text>)}
-          {data.machines.map(m => <Card key={m.id} title={m.name} detail={`${m.state} · ${m.occupancy.running_runtimes} runtimes · ${m.capacity.state}`}>
-            <Text style={styles.small}>{m.transports.map(t => `${t.protocol}: ${t.status}`).join(' · ')}</Text>
-            {m.id === gatewayMachineId ? <><Text style={styles.section}>Undeclared sessions</Text>{undeclaredSessions.map(s => <Text key={s.id} style={styles.muted}>{isUnresolved(s) ? 'Unresolved running process' : 'Exact native session'} · {s.driver ?? 'native harness'}{s.process ? ` · PID ${s.process.pid}` : ''}{s.title ? ` · ${s.title}` : ''}</Text>)}{!undeclaredSessions.length ? <Text style={styles.muted}>None discovered on this machine.</Text> : null}</> : null}
-          </Card>)}
-          {!data.machines.some(m => m.id === gatewayMachineId) ? <Card title={sourceHost} detail="Connected gateway machine"><Text style={styles.section}>Undeclared sessions</Text>{undeclaredSessions.map(s => <Text key={s.id} style={styles.muted}>{isUnresolved(s) ? 'Unresolved running process' : 'Exact native session'} · {s.driver ?? 'native harness'}{s.process ? ` · PID ${s.process.pid}` : ''}</Text>)}{!undeclaredSessions.length ? <Text style={styles.muted}>None discovered on this machine.</Text> : null}</Card> : null}
-          <Text style={styles.muted}>Discovery covers the connected gateway machine only.</Text>
-          <Text style={styles.section}>You & devices</Text>
-          <Card title="This connection" detail={caps ? `${caps.session_actor} · ${caps.transport}` : 'Reconnecting'}><Text style={styles.small}>{url}</Text>{gatewayTransport(url) === 'lan' ? <Text style={styles.warning}>{LAN_HTTP_WARNING}</Text> : null}<Button label="Forget local credential" onPress={() => Alert.alert('Forget this device?', 'You will need to pair again.', [{ text: 'Cancel' }, { text: 'Forget', onPress: () => void forget() }])} /></Card>
-          {data.devices.map(d => <Card key={d.id} title={deviceTitle(d, caps?.session_actor)} detail={deviceDetail(d, now)}><Text style={styles.small}>{d.scopes.join(', ')}</Text></Card>)}
-          <Text style={styles.section}>Tab order</Text>
-          {order.map(t => <View key={t} style={styles.orderRow}><Text style={styles.cardTitle}>{t}</Text><Button label="↑" onPress={() => move(t, -1)} /><Button label="↓" onPress={() => move(t, 1)} /></View>)}
-        </> : null}
-      </>}
-    </ScrollView><View accessibilityRole="tablist" style={styles.tabs}>{order.map(t => <Pressable key={t} accessibilityRole="tab" accessibilityState={{ selected: active === t }} onPress={() => setActive(t)} style={[styles.tab, active === t && styles.activeTab]}><Text style={[styles.tabText, active === t && styles.activeTabText]}>{t}</Text></Pressable>)}</View>
-  </SafeAreaView>;
+  const initial = (__DEV__ ? tabNamed(process.env.EXPO_PUBLIC_ST3_TEST_TAB) : null) ?? order[0];
+  return <Tabs.Navigator
+    initialRouteName={initial}
+    screenOptions={({ route }) => ({
+      headerShown: false,
+      tabBarActiveTintColor: theme.accent,
+      tabBarIcon: { type: 'sfSymbol', name: ICONS[route.name as Tab] as never },
+      tabBarStyle: { display: tabBarHidden(route) ? 'none' : 'flex' },
+    })}
+  >
+    {order.map(tab => <Tabs.Screen
+      key={tab}
+      name={tab}
+      component={TAB_COMPONENTS[tab]}
+      options={tab === 'Home' && homeCount ? { tabBarBadge: homeCount, tabBarBadgeStyle: { backgroundColor: theme.person, color: theme.crust } } : {}}
+    />)}
+  </Tabs.Navigator>;
 }
-const styles = StyleSheet.create({ page: { flex: 1, backgroundColor: '#101923' }, header: { paddingHorizontal: 22, paddingTop: 16, paddingBottom: 14, borderBottomColor: '#344651', borderBottomWidth: 1 }, brand: { color: '#f3f7fa', fontSize: 24, fontWeight: '700' }, status: { color: '#f0ad69', marginTop: 4 }, good: { color: '#67d6c5' }, content: { flex: 1 }, scroll: { padding: 20, paddingBottom: 48 }, title: { color: '#f3f7fa', fontSize: 27, fontWeight: '700', marginBottom: 10 }, section: { color: '#67d6c5', fontSize: 20, fontWeight: '700', marginTop: 25, marginBottom: 10 }, muted: { color: '#b8c7d0', fontSize: 14, lineHeight: 21, marginTop: 4 }, warning: { color: '#f0c77c', fontSize: 13, lineHeight: 19, marginTop: 8, marginBottom: 6 }, small: { color: '#a9bac5', fontSize: 12, lineHeight: 18 }, card: { backgroundColor: '#1b2b36', borderRadius: 12, padding: 15, marginTop: 10 }, cardTitle: { color: '#f3f7fa', fontSize: 16, fontWeight: '600' }, detailToggle: { alignSelf: 'flex-start', paddingVertical: 8, marginTop: 3 }, detailToggleText: { color: '#67d6c5', fontSize: 14, fontWeight: '600' }, input: { borderWidth: 1, borderColor: '#49606b', borderRadius: 10, color: '#f3f7fa', padding: 12, marginTop: 11, fontSize: 15 }, composer: { minHeight: 86, textAlignVertical: 'top' }, button: { backgroundColor: '#176d69', borderRadius: 9, paddingVertical: 10, paddingHorizontal: 13, alignSelf: 'flex-start', marginTop: 10 }, buttonText: { color: '#fff', fontWeight: '700', fontSize: 14 }, disabled: { opacity: 0.45 }, choice: { borderColor: '#49606b', borderWidth: 1, borderRadius: 10, padding: 10, marginTop: 8 }, selected: { borderColor: '#67d6c5', backgroundColor: '#214144' }, row: { flexDirection: 'row', flexWrap: 'wrap', gap: 5 }, chip: { borderRadius: 8, borderWidth: 1, borderColor: '#49606b', padding: 7, marginTop: 7 }, error: { backgroundColor: '#633b3b', padding: 10 }, errorText: { color: '#fff3ed' }, orderRow: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 5 }, tabs: { flexDirection: 'row', borderTopWidth: 1, borderTopColor: '#344651' }, tab: { flex: 1, alignItems: 'center', paddingVertical: 16 }, activeTab: { borderTopWidth: 3, borderTopColor: '#67d6c5' }, tabText: { color: '#a9bac5', fontSize: 13, fontWeight: '600' }, activeTabText: { color: '#f3f7fa' }, terminal: { backgroundColor: '#101923', borderRadius: 8, padding: 8, marginTop: 8 }, terminalLine: { color: TERMINAL_COLORS.fg, fontFamily: 'Menlo', fontSize: 11, lineHeight: 14 } });
+
+export default function App() {
+  const [fontsLoaded] = useFonts({ IBMPlexMono_400Regular, IBMPlexMono_400Regular_Italic, IBMPlexMono_600SemiBold, IBMPlexMono_700Bold });
+  if (!fontsLoaded) return <View style={{ flex: 1, backgroundColor: theme.base }} />;
+  return <SafeAreaProvider>
+    <StatusBar barStyle="light-content" />
+    <StoreProvider>
+      <NavigationContainer ref={navigationRef} theme={navigationTheme}>
+        <Main />
+      </NavigationContainer>
+    </StoreProvider>
+  </SafeAreaProvider>;
+}

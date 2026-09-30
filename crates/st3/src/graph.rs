@@ -2132,10 +2132,10 @@ fn driver_member(
         // The channel wakes the real TUI, while Claude's own lifecycle hooks externalize the
         // resulting turn. Supplying the canonical registration as an additional native settings
         // source keeps arbitrary user workspaces untouched and gives every typed st seat the
-        // same UserPromptSubmit/Stop state edges as a materialized st2 seat.
+        // same UserPromptSubmit/Stop state edges.
         provider.extend([
             "--settings".into(),
-            st2::hooks::claude_st3_settings_registration().to_string(),
+            crate::hooks::claude_settings_registration().to_string(),
         ]);
     }
     if let Some(model) = model {
@@ -5142,6 +5142,36 @@ message "external" {
     }
 
     #[test]
+    fn no_harness_launch_reaches_st2() {
+        for harness in ["claude", "codex", "pi", "omp", "opencode"] {
+            let intent = parse_test_intent(
+                &format!(
+                    "version 2\n\n  agent \"worker\" {{\n    workspace \"/work\"\n    harness \"{harness}\" {{}}\n  }}\n"
+                ),
+                "node",
+            )
+            .expect("new KDL parses");
+            let member = intent.subjects["agent/node.worker"]
+                .member
+                .as_ref()
+                .unwrap();
+            let crate::model::LaunchSpec::Argv(argv) = &member.launch else {
+                panic!("the native driver needs argv");
+            };
+            for text in argv
+                .iter()
+                .chain(member.environment.keys())
+                .chain(member.environment.values())
+            {
+                assert!(
+                    !crate::hooks::mentions_st2_surface(text),
+                    "the {harness} launch reaches st2: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn claude_always_uses_the_native_interactive_channel() {
         let intent = parse_test_intent(
             r#"
@@ -5176,7 +5206,7 @@ version 2
             .expect("typed Claude seats carry lifecycle hook settings");
         assert_eq!(
             serde_json::from_str::<Value>(settings).unwrap(),
-            st2::hooks::claude_st3_settings_registration()
+            crate::hooks::claude_settings_registration()
         );
         assert!(
             !argv

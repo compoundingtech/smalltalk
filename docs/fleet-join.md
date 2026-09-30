@@ -8,6 +8,9 @@ it and one admission rule, the writer fence.
 
 `st` and `st3` are the same program. This document uses `st`.
 
+Every member follows the [sync invariants](st3/replication.md#sync-invariants): shared projections
+use one canonical total order, and digests cover every synced logical source and shared outcome.
+
 ## Why
 
 Adding a third machine to a two-machine fleet took all of this:

@@ -34,6 +34,8 @@ const SCHEMA: u32 = 1;
 const RECEIPT_FILE: &str = "current.json";
 const SET_MANIFEST_FILE: &str = "manifest.json";
 const SETS_DIR: &str = "sets";
+/// The manifest an st3 hook set carries instead of [`SET_MANIFEST_FILE`].
+pub const ST3_SET_MARKER: &str = "st3-hooks.json";
 const HOOKS: [(&str, &[u8]); 10] = [
     ("codex-session-start.sh", CODEX_SESSION_START),
     ("codex-pre-compact.sh", CODEX_PRE_COMPACT),
@@ -196,40 +198,6 @@ pub fn claude_settings_registration() -> serde_json::Value {
     })
 }
 
-/// Claude lifecycle observation used by an st3-controlled interactive seat.
-///
-/// Unlike the full st2 registration this does not inject the legacy SessionStart ritual or run
-/// legacy message/context helpers. The st3 boot document and native MCP channel own those jobs;
-/// these hooks only externalize Claude's real turn and context state.
-pub fn claude_st3_settings_registration() -> serde_json::Value {
-    fn observe(event: &str) -> serde_json::Value {
-        serde_json::json!([{ "hooks": [{
-            "type": "command",
-            "command": format!("\"$ST_HOOKS/claude-observe.sh\" {event}"),
-        }] }])
-    }
-    serde_json::json!({
-        "$schema": "https://json.schemastore.org/claude-code-settings.json",
-        "hooks": {
-            "SessionStart": observe("SessionStart"),
-            "PreCompact": observe("PreCompact"),
-            "PostCompact": observe("PostCompact"),
-            "StopFailure": observe("StopFailure"),
-            "UserPromptSubmit": observe("UserPromptSubmit"),
-            "Stop": observe("Stop"),
-            "PermissionRequest": observe("PermissionRequest"),
-            "PreToolUse": observe("PreToolUse"),
-            "PostToolUse": observe("PostToolUse"),
-        },
-        "statusLine": {
-            "type": "command",
-            "command": "\"$ST_HOOKS/claude-statusline.sh\"",
-            "padding": 0,
-            "refreshInterval": 5,
-        }
-    })
-}
-
 /// Whether one rendered string refers to a file of ANY st2 hook set, structurally — used by the
 /// union merge to supersede st2's own prior registrations without ever touching a foreign entry.
 /// Two spellings are owned: the `$ST_HOOKS` variable at a token boundary (`$ST_HOOKS/...`,
@@ -275,7 +243,12 @@ pub(crate) fn is_managed_hook_reference(text: &str) -> bool {
 /// Install-owned hook root. `$ST_HOOKS` can pin a scratch or custom state layout; otherwise use
 /// `$XDG_STATE_HOME/st2/hooks` or `~/.local/state/st2/hooks`.
 pub fn hooks_root() -> Result<PathBuf> {
-    if let Some(path) = std::env::var_os("ST_HOOKS").filter(|value| !value.is_empty()) {
+    // st3 exports its own hook set under the same name. That set is not an st2 root, so an st2
+    // process started beneath an st3 seat (a test run, for one) keeps its own default root.
+    if let Some(path) = std::env::var_os("ST_HOOKS")
+        .filter(|value| !value.is_empty())
+        .filter(|path| !Path::new(path).join(ST3_SET_MARKER).exists())
+    {
         return Ok(root_of_exported_hooks(PathBuf::from(path)));
     }
     let state = match std::env::var_os("XDG_STATE_HOME").filter(|value| !value.is_empty()) {
@@ -306,6 +279,16 @@ fn root_of_exported_hooks(path: PathBuf) -> PathBuf {
         .and_then(Path::parent)
         .map(Path::to_path_buf);
     root.unwrap_or(path)
+}
+
+/// The exported `$ST_HOOKS` directory when it is itself a set that holds this binary's exact
+/// `name` asset. st3 publishes the pi and omp channel extensions in its own set, so its seats load
+/// them from there and never need st2's hook root.
+pub fn exported_set_holding(name: &str) -> Option<PathBuf> {
+    let (_, expected) = HOOKS.iter().find(|(file, _)| *file == name)?;
+    let dir = PathBuf::from(std::env::var_os("ST_HOOKS").filter(|value| !value.is_empty())?);
+    let actual = fs::read(dir.join(name)).ok()?;
+    (actual == *expected).then_some(dir)
 }
 
 /// The immutable, versioned directory this binary expects rendered hook settings to use.
@@ -828,18 +811,6 @@ mod tests {
             .expect("example declares the settings.local.json upsert");
         let registered: serde_json::Value = serde_json::from_str(content).unwrap();
         assert_eq!(registered, claude_settings_registration());
-    }
-
-
-    #[test]
-    fn st3_claude_settings_externalize_lifecycle_without_the_legacy_boot_ritual() {
-        let settings = claude_st3_settings_registration();
-        let encoded = settings.to_string();
-        assert!(encoded.contains("claude-observe.sh"));
-        assert!(encoded.contains("UserPromptSubmit"));
-        assert!(encoded.contains("Stop"));
-        assert!(!encoded.contains("claude-session-start.sh"));
-        assert!(!encoded.contains("claude-stop-failure.sh"));
     }
 
     #[test]
