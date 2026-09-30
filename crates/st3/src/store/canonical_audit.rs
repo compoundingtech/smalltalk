@@ -396,7 +396,7 @@ fn write_audit_history(source: &Store) {
             json!({
                 "run":failed.subject,"source_generation":failed.generation,"candidate_revision":failed.revision,
                 "reason":"Check two independent reviewers.","status":"pending-approval","cutover":"restart-active",
-                "compatible_steps":[],"reviewers":["person/avery","person/river"],"preview_hash":"audit-preview"
+                "compatible_steps":[],"reviewers":["person/avery","person/robin"],"preview_hash":"audit-preview"
             }),
         ),
         (
