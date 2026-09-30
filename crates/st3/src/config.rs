@@ -494,13 +494,13 @@ impl Config {
                 peer.name
             );
             let host = url.host_str().unwrap_or_default();
-            let loopback = host.eq_ignore_ascii_case("localhost")
+            let permitted = host.eq_ignore_ascii_case("localhost")
                 || host
                     .parse::<std::net::IpAddr>()
-                    .is_ok_and(|address| address.is_loopback());
+                    .is_ok_and(|address| is_permitted_route_address(&address));
             anyhow::ensure!(
-                loopback,
-                "peer '{}' must use a loopback URL exposed by Fabric",
+                permitted,
+                "peer '{}' must use a loopback or tailnet URL",
                 peer.name
             );
         }
