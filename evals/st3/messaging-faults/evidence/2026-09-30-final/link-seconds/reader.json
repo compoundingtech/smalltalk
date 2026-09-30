@@ -1,0 +1,80 @@
+[
+  {
+    "at_unix_ms": 1790755787113,
+    "pid": 1498752,
+    "event": "started"
+  },
+  {
+    "at_unix_ms": 1790755787270,
+    "pid": 1498752,
+    "event": "ready"
+  },
+  {
+    "at_unix_ms": 1790755788287,
+    "pid": 1498752,
+    "event": "wire-frame",
+    "subject": "message/b93cbbc01d813c79"
+  },
+  {
+    "at_unix_ms": 1790755788287,
+    "pid": 1498752,
+    "event": "received",
+    "subject": "message/b93cbbc01d813c79",
+    "content": "<smalltalk-message id=\"b93cbbc01d813c79\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/b93cbbc01d813c79\">\nreceipt-token:warmup\n</smalltalk-message>"
+  },
+  {
+    "at_unix_ms": 1790755788299,
+    "pid": 1498752,
+    "event": "delivered",
+    "subject": "message/b93cbbc01d813c79",
+    "accepted_at_unix_ms": 1790755788294
+  },
+  {
+    "at_unix_ms": 1790755788303,
+    "pid": 1498752,
+    "event": "read",
+    "subject": "message/b93cbbc01d813c79",
+    "accepted_at_unix_ms": 1790755788301
+  },
+  {
+    "at_unix_ms": 1790755788305,
+    "pid": 1498752,
+    "event": "closed",
+    "subject": "message/b93cbbc01d813c79",
+    "accepted_at_unix_ms": 1790755788304
+  },
+  {
+    "at_unix_ms": 1790755792304,
+    "pid": 1498752,
+    "event": "wire-frame",
+    "subject": "message/02c41903750d4226"
+  },
+  {
+    "at_unix_ms": 1790755792305,
+    "pid": 1498752,
+    "event": "received",
+    "subject": "message/02c41903750d4226",
+    "content": "<smalltalk-message id=\"02c41903750d4226\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: link-seconds\" sha256=\"6bb75282de05b047fb03a965b364ce486e3286f9daf406fe508945d786acd0c5\" graph=\"message/02c41903750d4226\">\nreceipt-token:link-seconds\n</smalltalk-message>"
+  },
+  {
+    "at_unix_ms": 1790755792307,
+    "pid": 1498752,
+    "event": "delivered",
+    "subject": "message/02c41903750d4226",
+    "accepted_at_unix_ms": 1790755792306
+  },
+  {
+    "at_unix_ms": 1790755792313,
+    "pid": 1498752,
+    "event": "read",
+    "subject": "message/02c41903750d4226",
+    "accepted_at_unix_ms": 1790755792311
+  },
+  {
+    "at_unix_ms": 1790755792316,
+    "pid": 1498752,
+    "event": "closed",
+    "subject": "message/02c41903750d4226",
+    "accepted_at_unix_ms": 1790755792314
+  }
+]

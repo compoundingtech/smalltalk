@@ -1,0 +1,5 @@
+1790755758408 agent/eval/fault-probe the st binary at <eval-root>/cobalt/bin/st3 was replaced; the omp driver re-executes into it and keeps its provider
+1790755758414 agent/eval/fault-probe the omp driver resumed in <eval-root>/cobalt/bin/st3 after its st binary was replaced; the provider kept running
+1790755760116 agent/eval/fault-probe the st binary at <eval-root>/cobalt/bin/st3 was replaced; the omp channel re-executes into it
+1790755760128 agent/eval/fault-probe the omp channel resumed after its st binary was replaced
+1790755782938 agent/eval/fault-probe the st daemon at <eval-root>/cobalt/run/st3.sock is not reachable (connection refused); it may be restarting; the driver keeps running and retries every second until the daemon is back
