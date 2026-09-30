@@ -2691,7 +2691,7 @@ impl Store {
         {
             let transaction = connection.transaction()?;
             let upgraded: bool = transaction.query_row(
-                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='canonical_shared_projection_rules')",
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='canonical_shared_projection_rules' AND value='2')",
                 [],
                 |row| row.get(0),
             )?;
@@ -2702,7 +2702,7 @@ impl Store {
                     [DERIVED_TABLES_VERSION],
                 )?;
                 transaction.execute(
-                    "INSERT INTO meta(key,value) VALUES('canonical_shared_projection_rules','1')",
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES('canonical_shared_projection_rules','2')",
                     [],
                 )?;
             } else {
@@ -4131,11 +4131,15 @@ impl Store {
         let connection = self.readers.get();
         let id = connection
             .query_row(
-                "SELECT p.id FROM revision_proposals p
+                &canonical_sql(
+                    "SELECT p.id FROM revision_proposals p
                  JOIN mission_runs r ON r.id=p.run_id
+                     JOIN claims created ON created.subject='revision-proposal/' || p.id
+                       AND created.kind='revision-proposal.created'
                  WHERE p.run_id=?1 AND p.source_generation_id=r.current_generation_id
                    AND p.status IN ('pending-approval','draining')
-                 ORDER BY p.created_at_unix_ms DESC LIMIT 1",
+                 ORDER BY CANONICAL_DESC(created) LIMIT 1",
+                ),
                 [run],
                 |row| row.get::<_, String>(0),
             )
@@ -4305,7 +4309,7 @@ impl Store {
                 .map_err(internal)?;
         }
         let subject = format!("revision-proposal/{proposal_id}");
-        append_claim_tx(
+        let record = append_claim_tx(
             &transaction,
             &self.origin,
             &subject,
@@ -4326,6 +4330,15 @@ impl Store {
             None,
         )
         .map_err(internal)?;
+        if status == "draining" {
+            transaction
+                .execute(
+                    "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE id=?1",
+                    params![run_id, record.accepted_at_unix_ms.to_string()],
+                )
+                .map_err(internal)?;
+        }
+
         let view = revision_proposal_view_tx(&transaction, &proposal_id).map_err(internal)?;
         transaction
             .execute(
@@ -4461,7 +4474,7 @@ impl Store {
                 )
                 .map_err(internal)?;
         }
-        append_claim_tx(
+        let record = append_claim_tx(
             &transaction,
             &self.origin,
             &proposal.subject,
@@ -4472,6 +4485,21 @@ impl Store {
             None,
         )
         .map_err(internal)?;
+        if status == "draining" {
+            transaction
+                .execute(
+                    "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE id=?1",
+                    params![
+                        proposal
+                            .run
+                            .strip_prefix("mission-run/")
+                            .unwrap_or(&proposal.run),
+                        record.accepted_at_unix_ms.to_string()
+                    ],
+                )
+                .map_err(internal)?;
+        }
+
         transaction.commit().map_err(internal)?;
         drop(connection);
 
@@ -4588,13 +4616,13 @@ impl Store {
                 params![proposal_id, now.to_string()],
             )
             .map_err(internal)?;
-        transaction
+        let phase_changed = transaction
             .execute(
                 "UPDATE mission_runs SET phase='normal', updated_at_unix_ms=?2 WHERE id=?1 AND phase='revision-draining'",
                 params![run_id, now.to_string()],
             )
             .map_err(internal)?;
-        append_claim_tx(
+        let record = append_claim_tx(
             &transaction,
             &self.origin,
             &current.subject,
@@ -4605,6 +4633,15 @@ impl Store {
             None,
         )
         .map_err(internal)?;
+        if phase_changed > 0 {
+            transaction
+                .execute(
+                    "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE id=?1",
+                    params![run_id, record.accepted_at_unix_ms.to_string()],
+                )
+                .map_err(internal)?;
+        }
+
         let view = revision_proposal_view_tx(&transaction, proposal_id).map_err(internal)?;
         transaction
             .execute(
@@ -4664,11 +4701,15 @@ impl Store {
             }
             let proposal_id = connection
                 .query_row(
-                    "SELECT p.id FROM revision_proposals p
+                    &canonical_sql(
+                        "SELECT p.id FROM revision_proposals p
                      JOIN mission_runs r ON r.id=p.run_id
+                     JOIN claims created ON created.subject='revision-proposal/' || p.id
+                       AND created.kind='revision-proposal.created'
                      WHERE p.run_id=?1 AND p.source_generation_id=r.current_generation_id
                        AND p.status='draining'
-                     ORDER BY p.created_at_unix_ms LIMIT 1",
+                     ORDER BY CANONICAL_ASC(created) LIMIT 1",
+                    ),
                     [run_id],
                     |row| row.get::<_, String>(0),
                 )
@@ -8888,17 +8929,26 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<DocumentVersion>> {
         let connection = self.readers.get();
-        let query = "SELECT d.name, d.hash, b.size, d.created_index,
-                     d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name)
+        let latest_order = canonical::order_sql("newer", true);
+        let version_order = canonical::order_sql("c", true);
+        let cursor_after = canonical::after_sql("cursor_claim", "c");
+        let query = format!("SELECT d.name, d.hash, b.size, d.created_index,
+                     d.hash=(SELECT n.hash FROM documents n JOIN claims newer ON newer.id=n.binding_claim_id
+                 WHERE n.name=d.name ORDER BY {latest_order} LIMIT 1)
                      ,d.binding_claim_id, c.accepted_at_unix_ms, c.actor, c.origin
                      FROM documents d JOIN blobs b ON b.hash=d.hash
                      JOIN claims c ON c.id=d.binding_claim_id
                      WHERE (?1 IS NULL OR d.name=?1)
-                       AND (?2 OR d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name))
+                       AND (?2 OR d.hash=(SELECT n.hash FROM documents n JOIN claims newer ON newer.id=n.binding_claim_id
+                 WHERE n.name=d.name ORDER BY {latest_order} LIMIT 1))
                        AND (?3 IS NULL OR substr(d.name,1,length(?3))=?3)
-                       AND (?4 IS NULL OR d.name>?4 OR (d.name=?4 AND d.created_index<?5))
-                     ORDER BY d.name, d.created_index DESC LIMIT ?6";
-        let mut statement = connection.prepare(query)?;
+                       AND (?4 IS NULL OR d.name>?4 OR (d.name=?4 AND EXISTS (
+                           SELECT 1 FROM documents cursor_document JOIN claims cursor_claim
+                             ON cursor_claim.id=cursor_document.binding_claim_id
+                           WHERE cursor_document.name=?4 AND cursor_document.created_index=?5
+                             AND {cursor_after})))
+                     ORDER BY d.name, {version_order} LIMIT ?6");
+        let mut statement = connection.prepare(&query)?;
         let rows = statement.query_map(
             params![
                 name,
@@ -10552,7 +10602,10 @@ impl Store {
             all.extend(items);
             match next {
                 Some(cursor) => after = Some(cursor),
-                None => return Ok(all),
+                None => {
+                    sort_messages_canonically(&self.readers.get(), &mut all)?;
+                    return Ok(all);
+                }
             }
         }
     }
@@ -10593,6 +10646,7 @@ impl Store {
                 messages.push(message);
             }
         }
+        sort_messages_canonically(&connection, &mut messages)?;
         Ok(messages)
     }
 
@@ -10778,7 +10832,7 @@ impl Store {
         Ok(if include_history {
             messages
         } else {
-            selected_actionable_messages(messages)
+            selected_actionable_messages(&self.readers.get(), messages)?
         })
     }
 
@@ -11522,7 +11576,7 @@ impl Store {
                 messages
             }
         };
-        let messages = selected_actionable_messages(messages);
+        let messages = selected_actionable_messages(&self.readers.get(), messages)?;
         if !messages.is_empty() {
             let connection = self.readers.get();
             for message in messages.into_iter().filter(|message| {
@@ -15133,6 +15187,13 @@ impl Store {
     ) -> Result<ReplicationStatus> {
         let snapshot = self.sealed_replication_snapshot()?;
         let connection = self.readers.get();
+        // Projection caches include committed local batches before their envelopes are sealed.
+        // Equal sealed inventories cannot diagnose those pending writes as peer divergence.
+        let unsealed_local: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM batches WHERE rowid>?1 AND origin=?2)",
+            params![self.seeded_batch_rowid.load(Ordering::Acquire), self.origin],
+            |row| row.get(0),
+        )?;
         let count = |state: &str| -> Result<u64> {
             Ok(connection.query_row(
                 "SELECT COUNT(*) FROM replica_records WHERE state=?1",
@@ -15217,6 +15278,7 @@ impl Store {
                     .optional()?;
                 if peer_inventory.as_deref() == Some(snapshot.inventory.digest.as_str())
                     && !self.replication_projection_deferred()
+                    && !unsealed_local
                 {
                     status.differing_tables = projection_digest::differing(
                         &snapshot.projection_digests,
@@ -17478,14 +17540,18 @@ fn find_document(
     name: &str,
     hash: &str,
 ) -> Result<Option<DocumentVersion>> {
+    let latest_order = canonical::order_sql("newer", true);
     connection
         .query_row(
-            "SELECT d.name, d.hash, b.size, d.created_index,
-             d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name),
+            &format!(
+                "SELECT d.name, d.hash, b.size, d.created_index,
+             d.hash=(SELECT n.hash FROM documents n JOIN claims newer ON newer.id=n.binding_claim_id
+                 WHERE n.name=d.name ORDER BY {latest_order} LIMIT 1),
              d.binding_claim_id, c.accepted_at_unix_ms, c.actor, c.origin
              FROM documents d JOIN blobs b ON b.hash=d.hash
              JOIN claims c ON c.id=d.binding_claim_id
-             WHERE d.name=?1 AND d.hash=?2",
+             WHERE d.name=?1 AND d.hash=?2"
+            ),
             params![name, hash],
             |row| {
                 Ok(DocumentVersion {
@@ -20213,7 +20279,26 @@ fn pending_attention_requests_tx(
         .collect()
 }
 
-fn selected_actionable_messages(messages: Vec<MessageView>) -> Vec<MessageView> {
+fn sort_messages_canonically(connection: &Connection, messages: &mut [MessageView]) -> Result<()> {
+    let mut keys = BTreeMap::new();
+    let mut statement = connection.prepare(&canonical_sql(
+        "SELECT id FROM claims WHERE subject=?1 AND kind IN ('message.sent','intent.desired') ORDER BY CANONICAL_ASC(claims) LIMIT 1"
+    ))?;
+    for message in messages.iter() {
+        let id: String = statement.query_row([&message.subject], |row| row.get(0))?;
+        keys.insert(
+            message.subject.clone(),
+            canonical::claim_key(connection, &id)?,
+        );
+    }
+    messages.sort_by(|left, right| keys[&left.subject].cmp(&keys[&right.subject]));
+    Ok(())
+}
+
+fn selected_actionable_messages(
+    connection: &Connection,
+    messages: Vec<MessageView>,
+) -> Result<Vec<MessageView>> {
     let mut selected_reminders = BTreeMap::<String, (u64, MessageView)>::new();
     let mut selected = Vec::new();
     for message in messages {
@@ -20241,8 +20326,8 @@ fn selected_actionable_messages(messages: Vec<MessageView>) -> Vec<MessageView> 
         }
     }
     selected.extend(selected_reminders.into_values().map(|(_, message)| message));
-    selected.sort_by_key(|message| message.created_index);
-    selected
+    sort_messages_canonically(connection, &mut selected)?;
+    Ok(selected)
 }
 
 /// Target kinds whose own state can end an attention request; see
@@ -28480,6 +28565,27 @@ fn select_replicated_document(
             )
         })?;
     validate_document_name(name)?;
+    let previous: Option<String> = transaction
+        .query_row(
+            "SELECT binding_claim_id FROM documents WHERE name=?1 AND hash=?2",
+            params![name, hash],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(internal)?;
+    if let Some(previous) = previous {
+        if canonical::claim_key(transaction, &claim.id).map_err(internal)?
+            < canonical::claim_key(transaction, &previous).map_err(internal)?
+        {
+            transaction
+                .execute(
+                    "UPDATE documents SET binding_claim_id=?3 WHERE name=?1 AND hash=?2",
+                    params![name, hash, claim.id],
+                )
+                .map_err(internal)?;
+        }
+        return Ok(());
+    }
     transaction
         .execute(
             "INSERT OR IGNORE INTO documents(name, hash, created_index, binding_claim_id) VALUES (?1, ?2, ?3, ?4)",
@@ -28532,6 +28638,23 @@ fn select_replicated_mission(
             params![mission.id, mission.revision, mission_state_name(&mission.state), serde_json::to_string(&mission).map_err(internal)?, claim.id, created_index],
         )
         .map_err(internal)?;
+    let previous: String = transaction
+        .query_row(
+            "SELECT claim_id FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+            params![mission.id, mission.revision],
+            |row| row.get(0),
+        )
+        .map_err(internal)?;
+    if canonical::claim_key(transaction, &claim.id).map_err(internal)?
+        < canonical::claim_key(transaction, &previous).map_err(internal)?
+    {
+        transaction
+            .execute(
+                "UPDATE mission_revisions SET claim_id=?3 WHERE mission_id=?1 AND revision=?2",
+                params![mission.id, mission.revision, claim.id],
+            )
+            .map_err(internal)?;
+    }
     let current: Option<(String, String)> = transaction
         .query_row(
             "SELECT revision, claim_id FROM mission_definitions WHERE mission_id=?1",
