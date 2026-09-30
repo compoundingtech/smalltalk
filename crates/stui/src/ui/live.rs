@@ -20,7 +20,6 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 use st3_client::{
     Client, Fence, LaunchReviseParameters, MessageSendParameters, Resource, TimelineBody,
-    TimelineEntry,
 };
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
@@ -86,7 +85,7 @@ pub fn run(context: Context) -> Result<()> {
     model.actor = person.clone();
     let mut extras = Extras::default();
     // Each conversation st has sent, kept after it closes so reopening it shows its last entries.
-    let mut timelines: BTreeMap<String, Vec<TimelineEntry>> = BTreeMap::new();
+    let mut timelines: BTreeMap<String, st3_conversation_ui::Timeline> = BTreeMap::new();
     let mut failed: BTreeMap<String, String> = BTreeMap::new();
     // The agent or session whose conversation the feed holds.
     let mut conversing: Option<String> = None;
@@ -153,37 +152,29 @@ pub fn run(context: Context) -> Result<()> {
                     }
                     extras.live = true;
                     extras.offline = None;
-                    model.last_connected = Some(
-                        chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                    );
+                    model.last_connected =
+                        Some(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
                     changed = true;
                 }
                 feed::Update::Conversation {
                     target,
                     replace,
+                    has_more,
                     items,
                 } => {
                     failed.remove(&target);
-                    let entries = timelines.entry(target).or_default();
-                    if replace {
-                        *entries = items;
-                    } else {
-                        for item in items {
-                            match entries.iter_mut().find(|entry| entry.id == item.id) {
-                                Some(entry) => *entry = item,
-                                None => entries.push(item),
-                            }
-                        }
-                        entries.sort_by(|a, b| {
-                            a.timestamp
-                                .cmp(&b.timestamp)
-                                .then(a.sequence.cmp(&b.sequence))
+                    timelines
+                        .entry(target)
+                        .or_default()
+                        .apply(st3_conversation_ui::Frame {
+                            replace,
+                            has_more,
+                            items,
                         });
-                    }
                     // A message sent from here is done once st shows it in the conversation.
                     pending.retain(|pending| {
                         pending.message_id.as_ref().is_none_or(|id| {
-                            !timelines.values().flatten().any(|entry| {
+                            !timelines.values().flat_map(|timeline| &timeline.items).any(|entry| {
                                 matches!(&entry.body, TimelineBody::Message(message) if &message.message_id == id)
                             })
                         })
@@ -630,7 +621,7 @@ fn screen_lines(screen: &st3_client::TerminalScreen) -> Vec<ratatui::text::Line<
 fn conversations(
     model: &Model,
     person: &str,
-    timelines: &BTreeMap<String, Vec<TimelineEntry>>,
+    timelines: &BTreeMap<String, st3_conversation_ui::Timeline>,
     failed: &BTreeMap<String, String>,
     conversing: Option<&str>,
 ) -> BTreeMap<String, Load<Vec<super::view::Entry>>> {
@@ -645,7 +636,7 @@ fn conversations(
     for target in targets {
         let load = match (timelines.get(target), failed.get(target)) {
             (Some(timeline), error) => {
-                let mut entries = adapt::conversation(timeline, &names);
+                let mut entries = adapt::conversation(&timeline.items, &names);
                 // Never hide a failure behind what loaded before it.
                 if let Some(error) = error {
                     entries.push(super::view::Entry {
