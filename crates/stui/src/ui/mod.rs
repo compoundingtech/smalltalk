@@ -35,7 +35,7 @@ use crossterm::{
         disable_raw_mode, enable_raw_mode,
     },
 };
-use doc::{Doc, Hit};
+use doc::{Doc, DocExt, Hit};
 use pane::Pane;
 use ratatui::{
     Terminal,
@@ -46,9 +46,11 @@ use ratatui::{
     text::{Line, Span},
 };
 use screens::{Drafts, Item, ListState, Listing, TABS};
+use st3_conversation_ui::pane::order;
+use st3_conversation_ui::{PaneIntent, PaneState, Selection};
 use std::{
     cell::RefCell,
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     io::{self, Write},
     rc::Rc,
     time::{Duration, Instant},
@@ -56,14 +58,6 @@ use std::{
 use view::*;
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-#[derive(Default, Clone, Copy)]
-struct PaneState {
-    top: usize,
-    follow: bool,
-    seen: usize,
-    unseen: usize,
-}
 
 struct FramePane {
     key: String,
@@ -82,13 +76,6 @@ struct FrameInfo {
     sidebar_height: usize,
     /// Glasses: where each pane of the shown tab was drawn, in leaf order.
     glass_leaves: Vec<Rect>,
-}
-
-#[derive(Clone)]
-struct Selection {
-    pane: String,
-    anchor: (usize, u16),
-    head: (usize, u16),
 }
 
 struct Demo {
@@ -183,10 +170,8 @@ pub struct Ui {
     /// The selection each sidebar last scrolled into view. The wheel may scroll away from
     /// the selection; only a new selection brings it back.
     list_follows: RefCell<[Option<usize>; 5]>,
-    panes: RefCell<HashMap<String, PaneState>>,
-    expanded: HashSet<String>,
+    conversation_state: st3_conversation_ui::State,
     cache: conversation::Cache,
-    drafts: HashMap<String, String>,
     editing: bool,
     confirm: Option<char>,
     flash: Option<(String, Instant)>,
@@ -195,7 +180,6 @@ pub struct Ui {
     sidebar: bool,
     system: bool,
     frame: RefCell<FrameInfo>,
-    selection: Option<Selection>,
     dragging: bool,
     demo: Option<Demo>,
     quit: bool,
@@ -233,10 +217,8 @@ impl Ui {
             selected: [0; 5],
             list_top: RefCell::new([0; 5]),
             list_follows: RefCell::new([None; 5]),
-            panes: RefCell::new(HashMap::new()),
-            expanded: HashSet::new(),
+            conversation_state: st3_conversation_ui::State::default(),
             cache: conversation::Cache::default(),
-            drafts: HashMap::new(),
             editing: false,
             confirm: None,
             flash: None,
@@ -245,7 +227,6 @@ impl Ui {
             sidebar: true,
             system: false,
             frame: RefCell::new(FrameInfo::default()),
-            selection: None,
             dragging: false,
             demo: None,
             quit: false,
@@ -919,20 +900,20 @@ impl Ui {
                         .cloned()
                         .collect::<Vec<_>>();
                     self.cache
-                        .render(&about, width.saturating_sub(4), &self.expanded, self.spinner())
+                        .render(&about, width.saturating_sub(4), &self.conversation_state.expanded, self.spinner())
                         .lines
                 }
                 _ => Vec::new(),
             };
             screens::Chat {
                 to: chat.to_name.clone(),
-                text: self.drafts.get(&chat_key).map(String::as_str).unwrap_or(""),
+                text: self.conversation_state.drafts.get(&chat_key).map(String::as_str).unwrap_or(""),
                 editing: chat.editing,
                 thread,
             }
         });
         Drafts {
-            text: self.drafts.get(key).map(String::as_str),
+            text: self.conversation_state.drafts.get(key).map(String::as_str),
             editing: self.editing,
             confirm: self.confirm,
             chat,
@@ -992,7 +973,7 @@ impl Ui {
                     width,
                     self.spinner(),
                     decision,
-                    &self.expanded,
+                    &self.conversation_state.expanded,
                 )
             }
             Pane::Machine(id) => {
@@ -1147,8 +1128,12 @@ impl Ui {
                 let mut doc = Doc::new();
                 doc.blank();
                 doc.append(
-                    self.cache
-                        .render(entries, width, &self.expanded, self.spinner()),
+                    self.cache.render(
+                        entries,
+                        width,
+                        &self.conversation_state.expanded,
+                        self.spinner(),
+                    ),
                     0,
                 );
                 doc.blank();
@@ -1188,24 +1173,14 @@ impl Ui {
     fn pane(&self, buf: &mut Buffer, key: &str, area: Rect, doc: Doc, follow_default: bool) {
         let height = area.height as usize;
         let total = doc.lines.len();
-        let max_top = total.saturating_sub(height);
         let state = {
-            let mut panes = self.panes.borrow_mut();
+            let mut panes = self.conversation_state.panes.borrow_mut();
             let state = panes.entry(key.to_owned()).or_insert(PaneState {
                 follow: follow_default,
                 seen: total,
                 ..PaneState::default()
             });
-            if state.follow {
-                state.top = max_top;
-                state.unseen = 0;
-            } else {
-                state.top = state.top.min(max_top);
-                if total > state.seen {
-                    state.unseen += total - state.seen;
-                }
-            }
-            state.seen = total;
+            state.reconcile(total, height);
             *state
         };
         let top = state.top;
@@ -1229,7 +1204,7 @@ impl Ui {
                 self.hit(rect, target.hit.clone());
             }
         }
-        if let Some(selection) = &self.selection
+        if let Some(selection) = &self.conversation_state.selection
             && selection.pane == key
         {
             let (start, end) = order(selection.anchor, selection.head);
@@ -1392,7 +1367,12 @@ impl Ui {
 
     /// The message box under a conversation, wrapped, newest lines last.
     fn composer_lines(&self, agent: &Agent, width: usize) -> Vec<Line<'static>> {
-        let draft = self.drafts.get(&agent.id).cloned().unwrap_or_default();
+        let draft = self
+            .conversation_state
+            .drafts
+            .get(&agent.id)
+            .cloned()
+            .unwrap_or_default();
         if draft.is_empty() && !self.editing {
             return vec![Line::from(vec![
                 Span::styled("› ", theme::dim()),
@@ -1525,7 +1505,7 @@ impl Ui {
         self.editing = false;
         self.chat = None;
         self.confirm = None;
-        self.selection = None;
+        self.conversation_state.selection = None;
     }
 
     fn switch_tab(&mut self, tab: usize) {
@@ -1535,7 +1515,7 @@ impl Ui {
         self.popover = None;
         self.kdl = false;
         self.confirm = None;
-        self.selection = None;
+        self.conversation_state.selection = None;
     }
 
     fn open(&mut self, id: &str) {
@@ -1564,15 +1544,15 @@ impl Ui {
         let Some(pane) = info.panes.iter().find(|pane| pane.key == key) else {
             return;
         };
-        let max_top = pane.total.saturating_sub(pane.rect.height as usize);
-        let mut panes = self.panes.borrow_mut();
+        let mut panes = self.conversation_state.panes.borrow_mut();
         let state = panes.entry(key.to_owned()).or_default();
-        let top = (pane.top as isize + delta).clamp(0, max_top as isize) as usize;
-        state.top = top;
-        state.follow = top >= max_top && key.starts_with("chat:");
-        if state.follow {
-            state.unseen = 0;
-        }
+        state.top = pane.top;
+        state.scroll(
+            delta,
+            pane.total,
+            pane.rect.height as usize,
+            key.starts_with("chat:"),
+        );
     }
 
     fn main_pane_key(&self) -> Option<String> {
@@ -1586,10 +1566,9 @@ impl Ui {
 
     fn follow_latest(&self) {
         if let Some(key) = self.main_pane_key() {
-            let mut panes = self.panes.borrow_mut();
+            let mut panes = self.conversation_state.panes.borrow_mut();
             let state = panes.entry(key).or_default();
-            state.follow = true;
-            state.unseen = 0;
+            state.follow_latest();
         }
     }
 
@@ -1681,9 +1660,18 @@ impl Ui {
                 }
                 KeyCode::Enter => self.submit_chat(),
                 KeyCode::Backspace => {
-                    self.drafts.entry(key_id).or_default().pop();
+                    self.conversation_state
+                        .drafts
+                        .entry(key_id)
+                        .or_default()
+                        .pop();
                 }
-                KeyCode::Char(character) => self.drafts.entry(key_id).or_default().push(character),
+                KeyCode::Char(character) => self
+                    .conversation_state
+                    .drafts
+                    .entry(key_id)
+                    .or_default()
+                    .push(character),
                 _ => {}
             }
             return;
@@ -1709,16 +1697,29 @@ impl Ui {
                 || (key.code == KeyCode::Char('j')
                     && key.modifiers.contains(KeyModifiers::CONTROL));
             if newline {
-                self.drafts.entry(key_id).or_default().push('\n');
+                self.conversation_state
+                    .drafts
+                    .entry(key_id)
+                    .or_default()
+                    .push('\n');
                 return;
             }
             match key.code {
                 KeyCode::Esc => self.editing = false,
                 KeyCode::Enter => self.submit(),
                 KeyCode::Backspace => {
-                    self.drafts.entry(key_id).or_default().pop();
+                    self.conversation_state
+                        .drafts
+                        .entry(key_id)
+                        .or_default()
+                        .pop();
                 }
-                KeyCode::Char(character) => self.drafts.entry(key_id).or_default().push(character),
+                KeyCode::Char(character) => self
+                    .conversation_state
+                    .drafts
+                    .entry(key_id)
+                    .or_default()
+                    .push(character),
                 _ => {}
             }
             return;
@@ -1793,7 +1794,7 @@ impl Ui {
                 if self.chat.is_some() {
                     self.chat = None;
                 } else {
-                    self.selection = None;
+                    self.conversation_state.selection = None;
                 }
             }
             KeyCode::Char(character) => self.action_key(character),
@@ -1842,12 +1843,15 @@ impl Ui {
             .filter(|entry| matches!(entry.body, Body::Tool { .. }))
             .map(|entry| entry.id.clone())
             .collect::<Vec<_>>();
-        if tools.iter().all(|tool| self.expanded.contains(tool)) {
+        if tools
+            .iter()
+            .all(|tool| self.conversation_state.expanded.contains(tool))
+        {
             for tool in tools {
-                self.expanded.remove(&tool);
+                self.conversation_state.expanded.remove(&tool);
             }
         } else {
-            self.expanded.extend(tools);
+            self.conversation_state.expanded.extend(tools);
         }
     }
 
@@ -2057,7 +2061,12 @@ impl Ui {
             return;
         };
         let key = format!("chat:{}", chat.item);
-        let text = self.drafts.get(&key).cloned().unwrap_or_default();
+        let text = self
+            .conversation_state
+            .drafts
+            .get(&key)
+            .cloned()
+            .unwrap_or_default();
         if text.trim().is_empty() {
             self.flash("Write something first");
             return;
@@ -2073,7 +2082,7 @@ impl Ui {
             return;
         };
         let title = format!("About: {}", item.title);
-        self.drafts.remove(&key);
+        self.conversation_state.drafts.remove(&key);
         if let Some(state) = &mut self.chat {
             state.editing = false;
         }
@@ -2119,11 +2128,10 @@ impl Ui {
 
     fn submit(&mut self) {
         let Some(id) = self.draft_key() else { return };
-        let draft = self.drafts.get(&id).cloned().unwrap_or_default();
-        if draft.trim().is_empty() {
+        let Some(PaneIntent::Send(draft)) = self.conversation_state.send(&id) else {
             self.flash("Write something first");
             return;
-        }
+        };
         self.editing = false;
         if self.live {
             let effect = match self.tab {
@@ -2175,7 +2183,7 @@ impl Ui {
             match effect {
                 Some(effect) => {
                     self.effects.push(effect);
-                    self.drafts.remove(&id);
+                    self.conversation_state.drafts.remove(&id);
                     self.follow_latest();
                     self.flash("Sending…");
                 }
@@ -2205,12 +2213,12 @@ impl Ui {
                         },
                     });
                 }
-                self.drafts.remove(&id);
+                self.conversation_state.drafts.remove(&id);
                 self.follow_latest();
                 self.flash("Sent · demo: nothing left this machine");
             }
             _ => {
-                self.drafts.remove(&id);
+                self.conversation_state.drafts.remove(&id);
                 self.resolve(&id, "Sent to the agent");
             }
         }
@@ -2335,13 +2343,13 @@ impl Ui {
                         .find(|(rect, _)| contains(*rect, mouse.column, mouse.row))
                         .map(|(_, hit)| hit.clone())
                 };
-                self.selection = None;
+                self.conversation_state.selection = None;
                 if let Some(hit) = hit {
                     self.click(hit);
                     return;
                 }
                 if let Some((key, line, column)) = self.pane_point(mouse.column, mouse.row) {
-                    self.selection = Some(Selection {
+                    self.conversation_state.selection = Some(Selection {
                         pane: key,
                         anchor: (line, column),
                         head: (line, column),
@@ -2352,14 +2360,19 @@ impl Ui {
             MouseEventKind::Drag(MouseButton::Left) if self.dragging => {
                 let edge = {
                     let info = self.frame.borrow();
-                    self.selection.as_ref().and_then(|selection| {
-                        info.panes
-                            .iter()
-                            .find(|pane| pane.key == selection.pane)
-                            .map(|pane| (pane.rect, pane.top))
-                    })
+                    self.conversation_state
+                        .selection
+                        .as_ref()
+                        .and_then(|selection| {
+                            info.panes
+                                .iter()
+                                .find(|pane| pane.key == selection.pane)
+                                .map(|pane| (pane.rect, pane.top))
+                        })
                 };
-                if let (Some(selection), Some((rect, top))) = (self.selection.clone(), edge) {
+                if let (Some(selection), Some((rect, top))) =
+                    (self.conversation_state.selection.clone(), edge)
+                {
                     if mouse.row < rect.y {
                         self.scroll_pane(&selection.pane, -1);
                     } else if mouse.row >= rect.y + rect.height {
@@ -2372,16 +2385,16 @@ impl Ui {
                         .column
                         .clamp(rect.x, rect.x + rect.width.saturating_sub(2))
                         - rect.x;
-                    if let Some(selection) = &mut self.selection {
+                    if let Some(selection) = &mut self.conversation_state.selection {
                         selection.head = (top + (row - rect.y) as usize, column);
                     }
                 }
             }
             MouseEventKind::Up(MouseButton::Left) if self.dragging => {
                 self.dragging = false;
-                if let Some(selection) = &self.selection {
+                if let Some(selection) = &self.conversation_state.selection {
                     if selection.anchor == selection.head {
-                        self.selection = None;
+                        self.conversation_state.selection = None;
                     } else if let Some(copied) = self.selected_text() {
                         let count = copied.lines().count();
                         copy(&copied);
@@ -2481,10 +2494,18 @@ impl Ui {
                     }
                 }
             }
-            Hit::ToggleTool(id) => {
-                if !self.expanded.remove(&id) {
-                    self.expanded.insert(id);
+            Hit::ToggleTool(id) | Hit::Pane(PaneIntent::Expand(id)) => {
+                self.conversation_state.expand(id);
+            }
+            Hit::Pane(PaneIntent::Open(id)) => self.open(&id),
+            Hit::Pane(PaneIntent::Send(text)) => {
+                if let Some(key) = self.draft_key() {
+                    self.conversation_state.drafts.insert(key, text);
+                    self.submit();
                 }
+            }
+            Hit::Pane(PaneIntent::LoadOlder) => {
+                self.flash("Earlier history is not available through stui yet");
             }
             Hit::JumpLatest => self.follow_latest(),
             Hit::Composer => {
@@ -2535,22 +2556,10 @@ impl Ui {
     }
 
     fn selected_text(&self) -> Option<String> {
-        let selection = self.selection.as_ref()?;
+        let selection = self.conversation_state.selection.as_ref()?;
         let info = self.frame.borrow();
         let pane = info.panes.iter().find(|pane| pane.key == selection.pane)?;
-        let (start, end) = order(selection.anchor, selection.head);
-        let mut out = Vec::new();
-        for line in start.0..=end.0.min(pane.lines.len().saturating_sub(1)) {
-            let plain = text::plain(&pane.lines[line]);
-            let from = if line == start.0 { start.1 as usize } else { 0 };
-            let to = if line == end.0 {
-                end.1 as usize + 1
-            } else {
-                usize::MAX
-            };
-            out.push(columns(&plain, from, to).trim_end().to_owned());
-        }
-        Some(out.join("\n"))
+        Some(selection.text(&pane.lines))
     }
 
     // -------------------------------------------------------------------- demo
@@ -2672,27 +2681,8 @@ impl Ui {
     }
 }
 
-fn order(a: (usize, u16), b: (usize, u16)) -> ((usize, u16), (usize, u16)) {
-    if a <= b { (a, b) } else { (b, a) }
-}
-
 fn contains(rect: Rect, column: u16, row: u16) -> bool {
     column >= rect.x && column < rect.x + rect.width && row >= rect.y && row < rect.y + rect.height
-}
-
-/// The part of `line` between two display columns.
-fn columns(line: &str, from: usize, to: usize) -> String {
-    use unicode_width::UnicodeWidthChar;
-    let mut column = 0;
-    let mut out = String::new();
-    for character in line.chars() {
-        let width = character.width().unwrap_or(0);
-        if column >= from && column < to {
-            out.push(character);
-        }
-        column += width;
-    }
-    out
 }
 
 fn truncate_spans(spans: &[Span<'static>], width: usize) -> Vec<Span<'static>> {
@@ -3162,9 +3152,9 @@ mod tests {
         ui.select(cos);
         frame(&ui, 140, 30);
         let key = "chat:agent/example/cos".to_owned();
-        assert!(ui.panes.borrow()[&key].follow);
+        assert!(ui.conversation_state.panes.borrow()[&key].follow);
         ui.scroll_pane(&key, -5);
-        assert!(!ui.panes.borrow()[&key].follow);
+        assert!(!ui.conversation_state.panes.borrow()[&key].follow);
         if let Some(Load::Ready(entries)) = ui.world.conversations.get_mut("agent/example/cos") {
             entries.push(demo::late_mail());
         }
@@ -3172,7 +3162,7 @@ mod tests {
         assert!(screen.contains("new lines"), "{screen}");
         ui.follow_latest();
         frame(&ui, 140, 30);
-        assert!(ui.panes.borrow()[&key].follow);
+        assert!(ui.conversation_state.panes.borrow()[&key].follow);
     }
 
     #[test]
@@ -3195,7 +3185,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert!(
-            ui.selection.is_none(),
+            ui.conversation_state.selection.is_none(),
             "a press in the sidebar is not a text selection"
         );
         ui.mouse(MouseEvent {
@@ -3210,7 +3200,7 @@ mod tests {
             row: pane.y + 4,
             modifiers: KeyModifiers::NONE,
         });
-        let selection = ui.selection.clone().unwrap();
+        let selection = ui.conversation_state.selection.clone().unwrap();
         assert!(selection.pane.starts_with("chat:"));
         assert_eq!(
             selection.head.1, 0,

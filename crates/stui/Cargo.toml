@@ -8,8 +8,9 @@ license = "MIT"
 [dependencies]
 anyhow = "1"
 crossterm = "0.28"
-ratatui = { version = "0.29", features = ["unstable-rendered-line-info"] }
+ratatui = { workspace = true }
 st3-client = { path = "../st3-client" }
+st3-conversation-ui = { path = "../st3-conversation-ui" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 uuid = { version = "1", features = ["v7"] }
 signal-hook = "0.3"
