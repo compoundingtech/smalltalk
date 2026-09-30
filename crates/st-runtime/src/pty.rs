@@ -176,6 +176,20 @@ impl PtyRuntime {
             .with_context(|| format!("PTY `{id}` is not present"))
     }
 
+    /// Mirror presentation through the registry's atomic metadata patch surface.
+    pub fn set_display_name(&self, id: &str, name: &str) -> Result<()> {
+        use pty_core::registry;
+        registry::with_root(&self.root, || {
+            let patch = registry::MetadataPatch {
+                display_name: Some(Some(name.to_owned())),
+                ..registry::MetadataPatch::default()
+            };
+            registry::patch_metadata_by_id(id, &patch)
+                .map(|_| ())
+                .map_err(anyhow::Error::msg)
+        })
+    }
+
     pub fn spawn(
         &self,
         id: &str,

@@ -46,6 +46,9 @@ impl Runtime {
 }
 
 impl RuntimeControl for Runtime {
+    fn set_display_name(&self, _runtime_id: &str, _name: &str) -> Result<()> {
+        Ok(())
+    }
     fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
         anyhow::ensure!(
             !self.snapshot_unavailable.load(Ordering::SeqCst),

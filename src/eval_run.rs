@@ -523,7 +523,7 @@ fn eval_exit_code(catalog: &Path, identity: &str) -> Option<i64> {
 /// `ANTHROPIC_*` (API creds) is deliberately kept — only the per-session identity is stripped.
 ///
 /// pi is the same shape: it exports `PI_SESSION_ID`, `PI_SESSION_FILE`, `PI_CODING_AGENT`, and the
-/// selected model into every child, and st2's own `ST2_PI_CHANNEL_*` would hand a nested seat its
+/// selected model into every child, and st2's own `ST3_PI_CHANNEL_*` would hand a nested seat its
 /// launcher's bus identity and inbox. Provider credentials are not `PI_`-prefixed, so stripping the
 /// prefix wholesale costs nothing.
 fn sanitize_agent_env() {
@@ -534,7 +534,7 @@ fn sanitize_agent_env() {
         ) || k.starts_with("CLAUDE_CODE_")
             || k.starts_with("CODEX_")
             || k.starts_with("PI_")
-            || k.starts_with("ST2_PI_CHANNEL_")
+            || k.starts_with("ST3_PI_CHANNEL_")
             || matches!(k, "ST2_EVAL_REQUESTER" | "ST2_EVAL_SENDER")
     };
     let victims: Vec<String> = std::env::vars_os()

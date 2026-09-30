@@ -1424,6 +1424,9 @@ mission "queued-alias-work" state="ready" {
 struct NoRuntime;
 
 impl st3::reconcile::RuntimeControl for NoRuntime {
+    fn set_display_name(&self, _id: &str, _name: &str) -> anyhow::Result<()> {
+        Ok(())
+    }
     fn snapshot_ptys(&self) -> anyhow::Result<Vec<st3::reconcile::RuntimeObservation>> {
         Ok(Vec::new())
     }

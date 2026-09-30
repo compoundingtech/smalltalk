@@ -10173,6 +10173,54 @@ impl Store {
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
     }
 
+    /// Publish a presentation-only revision of a seat through the normal durable intent log.
+    pub fn rename_agent(
+        &self,
+        subject: &str,
+        name: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<ApplyResponse, St3Error> {
+        let (mut desired, heads, writer) = {
+            let connection = self.readers.get();
+            let transaction = connection.unchecked_transaction().map_err(internal)?;
+            let desired = transaction
+                .query_row(
+                    "SELECT desired.subject, desired.kind, desired.body, desired.member,
+                            desired.owner_run, desired.owner_generation, desired.owner_step, claims.actor
+                     FROM desired LEFT JOIN claims ON claims.id=desired.claim_id
+                     WHERE desired.subject=?1 AND desired.kind='agent'",
+                    [subject],
+                    |row| Ok((desired_from_row(row)?, row.get::<_, Option<String>>(7)?)),
+                )
+                .optional()
+                .map_err(internal)?
+                .ok_or_else(|| St3Error::new("missing-agent", format!("no agent `{subject}`")))?;
+            let heads = intent_leaves_tx(&transaction, subject).map_err(internal)?;
+            (desired.0, heads, desired.1)
+        };
+        desired.set_display_name(name)?;
+        let normalized = json!({ "agent": subject, "display_name": name });
+        let intent = NormalizedIntent {
+            schema: "st3.v1".into(),
+            source_hash: canonical_hash(&normalized).map_err(internal)?,
+            subjects: BTreeMap::from([(subject.to_owned(), desired)]),
+            missions: BTreeMap::new(),
+            mission_runs: BTreeMap::new(),
+            planning_sessions: BTreeMap::new(),
+            resource_refreshes: Vec::new(),
+            replica_repairs: Vec::new(),
+            document_refs: BTreeSet::new(),
+            deprecated_syntax: BTreeSet::new(),
+            normalized,
+        };
+        self.apply_as(
+            &intent,
+            &BTreeMap::from([(subject.to_owned(), heads)]),
+            idempotency_key,
+            writer.as_deref(),
+        )
+    }
+
     /// The current desired declaration of `subject` and the actor its claim records. A
     /// declaration from before claims recorded their writer, or the daemon's own, has none.
     pub fn desired_subject_with_writer(

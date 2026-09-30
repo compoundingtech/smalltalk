@@ -32,7 +32,7 @@ impl Daemon {
         Self {
             root: root.to_path_buf(),
             socket: root.join("st3.sock"),
-            store: Arc::new(Store::open_memory("restart-node").unwrap()),
+            store: Arc::new(Store::open(&root.join("claims.sqlite3"), "restart-node").unwrap()),
             server: None,
         }
     }
@@ -360,16 +360,29 @@ async fn a_claude_seat_starts_through_a_daemon_restart_and_then_keeps_its_mail()
 async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
     let root = tempfile::tempdir().unwrap();
     let root = root.path();
-    let seat = "agent/restart-omp";
+    let seat = "agent/test/restart-omp";
     let incarnation = "4343:2026-09-27T12:00:00.000Z";
     let mut daemon = Daemon::new(root);
+    let source = r#"version 2
+agent "test/restart-omp" {
+    workspace "."
+    command "true"
+    name "Initial seat"
+    seat-authority { declare "test/restart-omp" }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, "restart-node").unwrap();
+    let preview = daemon.store.mission(&intent, st3::model::IntentInput {
+        kdl: source.into(), source_name: None,
+    }).unwrap();
+    daemon.store.apply(&intent, &preview.subject_tokens, "fixture-seat").unwrap();
     daemon.observe_running(seat, incarnation);
     daemon.start().await;
 
     let mut channel = seat_command(root, &daemon.socket)
         .arg("--catalog")
         .arg(root.join("catalog"))
-        .args(["driver", "omp-channel", "--identity", "restart-omp"])
+        .args(["driver", "omp-channel", "--identity", "test/restart-omp"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -388,6 +401,25 @@ async fn a_pi_family_channel_keeps_state_and_mail_through_a_daemon_restart() {
     });
     let hello = received.recv_timeout(Duration::from_secs(10)).unwrap();
     assert_eq!(hello["type"], "hello");
+    assert_eq!(hello["protocol"], 1);
+    assert_eq!(hello["name"], "Initial seat");
+    let channel_pid = channel.id();
+    let rename = seat_command(root, &daemon.socket)
+        .env("ST_AGENT", seat)
+        .args(["agents", "rename", seat, "Renamed seat", "--as", seat])
+        .output().unwrap();
+    assert!(rename.status.success(), "{}", String::from_utf8_lossy(&rename.stderr));
+    let frame = received.recv_timeout(Duration::from_secs(10)).unwrap();
+    assert_eq!(frame, json!({"type": "label", "name": "Renamed seat"}));
+    assert_eq!(channel.id(), channel_pid);
+    assert_alive(&mut channel, "the renamed channel");
+    let cleared = seat_command(root, &daemon.socket)
+        .env("ST_AGENT", seat)
+        .args(["agents", "rename", seat, "--clear", "--as", seat])
+        .output().unwrap();
+    assert!(cleared.status.success(), "{}", String::from_utf8_lossy(&cleared.stderr));
+    assert_eq!(received.recv_timeout(Duration::from_secs(10)).unwrap(),
+        json!({"type": "label", "name": "test/restart-omp"}));
 
     daemon.stop().await;
     // The harness goes idle and a message arrives while the daemon is down.

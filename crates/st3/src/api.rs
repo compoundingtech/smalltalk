@@ -361,6 +361,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/schema", get(schema))
         .route("/v1/intent/mission", post(mission))
         .route("/v1/intent/apply", post(apply))
+        .route("/v1/agents/rename", post(rename_agent))
         .route("/v1/missions/{id}", get(get_mission))
         .route("/v1/missions/{id}/retire", post(retire_mission))
         .route("/v1/launches/{id}", get(get_planning_session))
@@ -1898,18 +1899,9 @@ fn client_agent_resources_uncached(
                     })
                 })
                 .unwrap_or_default();
-            let name = subject
-                .desired
-                .as_ref()
-                .and_then(|desired| desired.get("display_name"))
-                .and_then(Value::as_str)
-                .unwrap_or_else(|| {
-                    subject
-                        .subject
-                        .strip_prefix("agent/")
-                        .unwrap_or(&subject.subject)
-                })
-                .to_owned();
+            let name = crate::model::effective_agent_name(
+                &subject.subject, subject.desired.as_ref(),
+            ).to_owned();
             let revision = subject
                 .desired_revision
                 .clone()
@@ -7692,6 +7684,38 @@ async fn publication_refusals(
         })
     })
     .await
+}
+
+#[derive(Deserialize)]
+struct AgentRenameRequest {
+    subject: String,
+    name: Option<String>,
+    actor: String,
+    idempotency_key: String,
+}
+
+async fn rename_agent(
+    State(state): State<AppState>,
+    Json(request): Json<AgentRenameRequest>,
+) -> Result<Json<ApplyResponse>, ApiError> {
+    let subject = if request.subject.starts_with("agent/") {
+        request.subject
+    } else {
+        format!("agent/{}", request.subject)
+    };
+    if !request.actor.starts_with("person/") {
+        let actor = normalized_agent_actor(&request.actor).ok_or_else(|| {
+            ApiError::bad(St3Error::new("invalid-rename-actor", "rename needs a person or agent actor"))
+        })?;
+        require_agent_seat_authority(&state, &actor, "declare", &subject)?;
+    }
+    let response = state.store.rename_agent(
+        &subject,
+        request.name.as_deref(),
+        &request.idempotency_key,
+    ).map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(response))
 }
 
 async fn apply(
@@ -16948,6 +16972,46 @@ mission "queued" state="ready" {
             "the chief keeps its grant: {move_body}"
         );
         let _ = first;
+    }
+
+    #[tokio::test]
+    async fn seat_rename_uses_declaration_authority_and_preserves_other_fields() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let source = r#"version 2
+agent "test/renamer" {
+    workspace "."
+    command "true"
+    seat-authority { declare "test/target" }
+}
+agent "test/target" { workspace "."; command "true"; name "Initial seat" }
+"#;
+        let request = apply_request(&state, source, "person/test", "rename-fixture");
+        let _ = apply(State(state.clone()), Json(request)).await.unwrap();
+        let original = state.store.desired_subject_with_writer("agent/test/target").unwrap().unwrap();
+        let initial = client_agent_resources(&state.store, false, "before", state.store.index().unwrap()).unwrap();
+        assert_eq!(initial.iter().find(|agent| agent["id"] == "agent/test/target").unwrap()["name"], "Initial seat");
+        let app = router(state.clone());
+        let (status, _) = json_request(app.clone(), "/v1/agents/rename", json!({
+            "subject": "test/target", "name": "Denied", "actor": "agent/test/target",
+            "idempotency_key": "denied",
+        })).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(state.store.desired_subject_with_writer("agent/test/target").unwrap().unwrap(), original);
+        for (name, key) in [(Some("Renamed seat"), "rename"), (None, "clear")] {
+            let (status, body) = json_request(app.clone(), "/v1/agents/rename", json!({
+                "subject": "test/target", "name": name, "actor": "agent/test/renamer",
+                "idempotency_key": key,
+            })).await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+            let (mut desired, writer) = state.store.desired_subject_with_writer("agent/test/target").unwrap().unwrap();
+            let agents = client_agent_resources(&state.store, false, "after", state.store.index().unwrap()).unwrap();
+            assert_eq!(agents.iter().find(|agent| agent["id"] == "agent/test/target").unwrap()["name"],
+                name.unwrap_or("test/target"));
+            assert_eq!(writer, original.1);
+            desired.set_display_name(original.0.member.as_ref().unwrap().display_name.as_deref()).unwrap();
+            assert_eq!(desired, original.0);
+        }
     }
 
     #[tokio::test]
