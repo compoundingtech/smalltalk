@@ -8678,6 +8678,75 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// Publish a presentation-only revision of a seat through the normal durable intent log.
+    pub fn rename_agent(
+        &self,
+        subject: &str,
+        name: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<ApplyResponse, St3Error> {
+        let (mut desired, heads, writer) = {
+            let connection = self.readers.get();
+            let transaction = connection.unchecked_transaction().map_err(internal)?;
+            let desired = transaction
+                .query_row(
+                    "SELECT desired.subject, desired.kind, desired.body, desired.member,
+                            desired.owner_run, desired.owner_generation, desired.owner_step, claims.actor
+                     FROM desired LEFT JOIN claims ON claims.id=desired.claim_id
+                     WHERE desired.subject=?1 AND desired.kind='agent'",
+                    [subject],
+                    |row| Ok((desired_from_row(row)?, row.get::<_, Option<String>>(7)?)),
+                )
+                .optional()
+                .map_err(internal)?
+                .ok_or_else(|| St3Error::new("missing-agent", format!("no agent `{subject}`")))?;
+            let heads = intent_leaves_tx(&transaction, subject).map_err(internal)?;
+            (desired.0, heads, desired.1)
+        };
+        desired.set_display_name(name)?;
+        let normalized = json!({ "agent": subject, "display_name": name });
+        let intent = NormalizedIntent {
+            schema: "st3.v1".into(),
+            source_hash: canonical_hash(&normalized).map_err(internal)?,
+            subjects: BTreeMap::from([(subject.to_owned(), desired)]),
+            missions: BTreeMap::new(),
+            mission_runs: BTreeMap::new(),
+            planning_sessions: BTreeMap::new(),
+            resource_refreshes: Vec::new(),
+            replica_repairs: Vec::new(),
+            document_refs: BTreeSet::new(),
+            deprecated_syntax: BTreeSet::new(),
+            normalized,
+        };
+        self.apply_as(
+            &intent,
+            &BTreeMap::from([(subject.to_owned(), heads)]),
+            idempotency_key,
+            writer.as_deref(),
+        )
+    }
+
+    /// The current desired declaration of `subject` and the actor its claim records. A
+    /// declaration from before claims recorded their writer, or the daemon's own, has none.
+    pub fn desired_subject_with_writer(
+        &self,
+        subject: &str,
+    ) -> Result<Option<(DesiredSubject, Option<String>)>> {
+        let connection = self.readers.get();
+        connection
+            .query_row(
+                "SELECT desired.subject, desired.kind, desired.body, desired.member,
+                        desired.owner_run, desired.owner_generation, desired.owner_step,
+                        claims.actor
+                 FROM desired LEFT JOIN claims ON claims.id = desired.claim_id
+                 WHERE desired.subject = ?1",
+                [subject],
+                |row| Ok((desired_from_row(row)?, row.get::<_, Option<String>>(7)?)),
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     /// Among `subjects`, each declaration whose member this build cannot read, with the reason.
     /// `desired_subjects` gives such a declaration no member at all.
     pub fn unreadable_members(&self, subjects: &[&str]) -> Result<Vec<(String, String)>> {
@@ -24723,6 +24792,59 @@ mod tests {
     mod canonical_audit {
         use super::*;
         include!("store/canonical_audit.rs");
+    }
+
+    #[test]
+    fn seat_rename_persists_across_a_real_store_reopen() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let original = {
+            let store = Store::open(&path, "node").unwrap();
+            let intent = parse_intent(r#"version 2
+agent "test/worker" { workspace "."; command "true"; name "Initial" }
+"#, "node").unwrap();
+            let preview = store.mission(&intent, IntentInput {
+                kdl: String::new(), source_name: None,
+            }).unwrap();
+            store.apply_as(&intent, &preview.subject_tokens, "initial", Some("person/operator")).unwrap();
+            let original = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap();
+            store.rename_agent("agent/test/worker", Some("Renamed"), "rename").unwrap();
+            original
+        };
+        let store = Store::open(&path, "node").unwrap();
+        let (mut renamed, writer) = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap();
+        assert_eq!(writer, original.1);
+        assert_eq!(renamed.member.as_ref().unwrap().display_name.as_deref(), Some("Renamed"));
+        renamed.set_display_name(Some("Initial")).unwrap();
+        assert_eq!(renamed, original.0);
+        store.rename_agent("agent/test/worker", None, "clear").unwrap();
+        drop(store);
+        let store = Store::open(&path, "node").unwrap();
+        let cleared = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap().0;
+        assert_eq!(crate::model::effective_agent_name("agent/test/worker", Some(&cleared.desired)), "test/worker");
+        assert_eq!(cleared.member.unwrap().display_name, None);
+    }
+
+    #[test]
+    fn seat_rename_accepts_an_empty_body_and_rejects_a_non_array_body() {
+        let store = Store::open_memory("node").unwrap();
+        let mut intent = parse_intent(r#"version 2
+agent "test/empty" { command "true" }
+"#, "node").unwrap();
+        // An empty canonical KDL body has no children key. Exercise that stored shape
+        // independently of launch validation, which requires a command for new seats.
+        let empty = intent.subjects.get_mut("agent/test/empty").unwrap();
+        empty.desired.as_object_mut().unwrap().remove("children");
+        empty.member = None;
+        let preview = store.mission(&intent, IntentInput {
+            kdl: String::new(), source_name: None,
+        }).unwrap();
+        store.apply(&intent, &preview.subject_tokens, "empty").unwrap();
+        store.rename_agent("agent/test/empty", Some("Empty seat"), "rename-empty").unwrap();
+        let mut desired = store.desired_subject_with_writer("agent/test/empty").unwrap().unwrap().0;
+        assert_eq!(crate::model::effective_agent_name("agent/test/empty", Some(&desired.desired)), "Empty seat");
+        desired.desired["children"] = json!({});
+        assert_eq!(desired.set_display_name(Some("Invalid")).unwrap_err().code, "invalid-agent-declaration");
     }
 
     #[test]

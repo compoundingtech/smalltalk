@@ -2364,6 +2364,8 @@ enum AgentsCommand {
     Start(AgentStartArgs),
     /// Stop one exact durable seat.
     Stop(AgentStopArgs),
+    /// Change only a seat's human label, without restarting its harness.
+    Rename(AgentRenameArgs),
     /// Show one seat's current claim and its queued mission runs in order, or move a run.
     /// The show form is also available as `st missions queued AGENT`.
     Queue(AgentQueueArgs),
@@ -2384,6 +2386,19 @@ struct AgentHoldArgs {
     #[arg(long = "as")]
     actor: Option<String>,
 }
+
+#[derive(Args)]
+struct AgentRenameArgs {
+    subject: String,
+    #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+    label: Option<String>,
+    /// Restore the subject-derived presentation label.
+    #[arg(long)]
+    clear: bool,
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
+
 #[derive(Args)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct AgentQueueArgs {
@@ -3476,6 +3491,9 @@ fn guard_mutating_cli_actor(
             AgentsCommand::Stop(args) => Some(args.actor.as_str()),
             AgentsCommand::Hold(args) if args.duration.is_some() || args.release => Some(args.actor.as_deref().ok_or_else(|| {
                 anyhow::anyhow!("a harness delivery hold needs explicit --as {own}")
+            })?),
+            AgentsCommand::Rename(args) => Some(args.actor.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("a harness rename needs explicit --as {own}")
             })?),
             AgentsCommand::Queue(args) => match &args.command {
                 Some(AgentQueueCommand::Move(args)) => Some(args.actor.as_deref().ok_or_else(|| {
@@ -8621,6 +8639,21 @@ async fn run_agents(
             );
             Ok(())
         }
+        AgentsCommand::Rename(args) => {
+            let actor = args.actor.as_deref().or(configured_person).context(
+                "st3 agents rename needs --as ACTOR or a configured person",
+            )?;
+            let response: Value = cli_client(endpoint).post(
+                "/v1/agents/rename",
+                &json!({
+                    "subject": normalize_agent_subject(&args.subject),
+                    "name": args.label,
+                    "actor": actor,
+                    "idempotency_key": uuid::Uuid::now_v7().to_string(),
+                }),
+            ).await?;
+            print_value(&response, json_output)
+        }
         AgentsCommand::Queue(args) => {
             run_agent_queue(endpoint, configured_person, args, json_output).await
         }
@@ -9262,6 +9295,7 @@ async fn run_agent_inspection(
         | AgentsCommand::Apply(_)
         | AgentsCommand::Start(_)
         | AgentsCommand::Stop(_)
+        | AgentsCommand::Rename(_)
         | AgentsCommand::Queue(_)
         | AgentsCommand::Hold(_) => {
             unreachable!("agent mutation and queue commands return before inspection")

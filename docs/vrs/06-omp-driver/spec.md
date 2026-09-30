@@ -122,6 +122,16 @@ message / delivered / failed / state / context frames, PROTOCOL constant). Diffe
 - **Restored context:** seeding uses
   `sendMessage({customType:"st2-session-start", …}, {deliverAs:"nextTurn"})`.
 
+## Seat label authority
+
+`desired.display_name` (KDL `name`) is the authority for the human label. Its stored declaration
+contains the canonical KDL name child and the normalized member's `display_name`; rename keeps
+these two representations identical and preserves the original declaring authority.
+`st3 agents rename <subject> <label>` and `st3 agents rename <subject> --clear` publish only
+this presentation field through the durable desired-state log, without restarting the harness.
+Rename requires declaration authority over the seat. Clearing restores the subject without the
+`agent/` prefix, which the Agent API uses as the effective label.
+
 ## Rust channel process
 
 `st2 driver omp-channel` reuses the pi channel's loop (`pi_channel.rs`) parameterized by the

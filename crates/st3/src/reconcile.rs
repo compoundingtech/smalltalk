@@ -2708,18 +2708,29 @@ impl<R: RuntimeControl> Reconciler<R> {
         let Some(desired_token) = self.store.selected_desired_token(subject)? else {
             return Ok(false);
         };
-        Ok(self
-            .store
-            .observations_for(subject, "runtime.action.succeeded")?
-            .into_iter()
-            .rev()
-            .any(|claim| {
-                claim
-                    .body
-                    .pointer("/fields/desired_token")
-                    .and_then(Value::as_str)
-                    == Some(desired_token.as_str())
-            }))
+        let launches = self.store.observations_for(subject, "runtime.action.succeeded")?;
+        let Some(token) = launches.iter().rev().find_map(|claim| {
+            claim.body.pointer("/fields/desired_token").and_then(Value::as_str)
+        }) else {
+            return Ok(false);
+        };
+        if token == desired_token {
+            return Ok(true);
+        }
+        let Some((mut current, _)) = self.store.desired_subject_with_writer(subject)? else {
+            return Ok(false);
+        };
+        if current.kind != "agent" {
+            return Ok(false);
+        }
+        current.set_display_name(None)?;
+        if let Some(previous) = self.store.claim_by_id(token)?
+            && let Ok(mut previous) = serde_json::from_value::<DesiredSubject>(previous.body)
+        {
+            previous.set_display_name(None)?;
+            return Ok(previous == current);
+        }
+        Ok(false)
     }
 
     #[cfg(test)]
@@ -15092,6 +15103,42 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
     }
 
     #[test]
+    fn seat_rename_does_not_relaunch() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, r#"version 2
+agent "test/worker" {
+    workspace "/tmp"
+    command "true"
+    name "Initial seat"
+    restart "never"
+}
+"#, "seat");
+        let runtime = Arc::new(FakeRuntime::default());
+        let reconciler = Reconciler::new(store.clone(), runtime.clone(), "node".into(),
+            Arc::new(Notify::new()));
+        reconciler.reconcile_once().unwrap();
+        let original = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap();
+        let runtime_id = original.0.member.as_ref().unwrap().runtime_id.clone();
+        runtime.ptys.lock().unwrap().push(RuntimeObservation {
+            runtime_id: runtime_id.clone(), terminal: true, status: "running".into(),
+            exit_code: None, incarnation_id: Some("unchanged-incarnation".into()),
+        });
+        store.rename_agent("agent/test/worker", Some("Renamed seat"), "rename").unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.starts.lock().unwrap().as_slice(), std::slice::from_ref(&runtime_id));
+        assert!(runtime.stops.lock().unwrap().is_empty());
+        store.rename_agent("agent/test/worker", None, "clear").unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.starts.lock().unwrap().as_slice(), std::slice::from_ref(&runtime_id));
+        assert!(runtime.stops.lock().unwrap().is_empty());
+        runtime.ptys.lock().unwrap()[0].status = "exited".into();
+        runtime.ptys.lock().unwrap()[0].exit_code = Some(0);
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(*runtime.starts.lock().unwrap(), vec![runtime_id]);
+        assert!(runtime.stops.lock().unwrap().is_empty());
+    }
+
+    #[test]
     fn restart_never_starts_a_new_desired_revision() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         apply_source(
@@ -15151,6 +15198,21 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
             runtime.started_members.lock().unwrap()[1].environment["REVISION"],
             "two"
         );
+
+        apply_source(
+            &store,
+            r#"version 2
+agent "worker" {
+    workspace "/tmp"
+    command "true"
+    env { REVISION "one" }
+    restart "never"
+}"#,
+            "member-one-again",
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.starts.lock().unwrap().len(), 3);
+        assert_eq!(runtime.started_members.lock().unwrap()[2].environment["REVISION"], "one");
     }
 
     #[test]
