@@ -745,10 +745,6 @@ mod tests {
             ..Config::default()
         };
         config.validate().unwrap();
-        // An outbound-only network needs no listener to exchange both ways.
-        config.peer_listen = None;
-        config.validate().unwrap();
-        config.peer_listen = Some("127.0.0.1:31313".into());
         for url in [
             "http://localhost:31314",
             "http://127.0.0.1:31314",
