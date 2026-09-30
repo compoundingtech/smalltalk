@@ -1,4 +1,4 @@
-import type { Agent, Attention, Mission, MissionStep } from '../../clients/typescript/st3-client';
+import type { Agent, Attention, Mission, MissionStep, WorkState } from '../../clients/typescript/st3-client';
 import { ago } from './presentation';
 import { missionSteps } from './presentation';
 import { theme } from './theme';
@@ -42,17 +42,26 @@ function queuedFor<A extends QueueAgent>(agents: A[], work: string): A | undefin
   return agents.find(agent => agent.next_work_id === work || (agent.upcoming_work_ids ?? []).includes(work));
 }
 
+// Keep cached projections readable while the gateway moves to the contract states.
+function stepState(state: string): string {
+  if (state === 'working' || state === 'running') return 'claimed';
+  return state === 'pending' ? 'waiting' : state;
+}
+function activeStep(state: string): boolean {
+  return state === 'claimed' || state === 'verifying';
+}
+
 export function missionWord(mission: Pick<Mission, 'id' | 'state' | 'run_details'>, attention: Array<Pick<Attention, 'attention_kind' | 'mission_id' | 'state'>>, agents: QueueAgent[]): Word {
   const work: MissionStep[] = missionSteps(mission);
-  const states = work.map(step => step.state);
+  const states = work.map(step => stepState(step.state));
   const state = mission.state as string;
   if (attention.some(item => item.state !== 'resolved' && item.attention_kind === 'human-gate' && item.mission_id === mission.id)) return 'decision';
   if (state === 'blocked' || states.includes('blocked')) return 'stalled';
   if (state === 'completed') return 'done';
   if (state === 'failed' || states.includes('failed')) return 'failed';
   if (state === 'cancelled') return 'cancelled';
-  if (work.length && work.every(step => step.state === 'completed' || ((step.state === 'claimed' || step.state === 'running') && step.agentless && keepsOpen(step.path))) && work.some(step => step.state !== 'completed')) return 'watching';
-  if (states.some(s => s === 'claimed' || s === 'running')) return 'working';
+  if (work.length && work.every(step => step.state === 'completed' || (activeStep(stepState(step.state)) && step.agentless && keepsOpen(step.path))) && work.some(step => step.state !== 'completed')) return 'watching';
+  if (states.some(activeStep)) return 'working';
   const ready = work.find(step => step.state === 'ready' && !step.claimant);
   if (ready) {
     const agent = queuedFor(agents, ready.id);
@@ -110,16 +119,21 @@ export function missionSections(rows: MissionRow[]): MissionSection[] {
   return sections;
 }
 
+type StepStyle = { glyph: string; color: string; word: string; rank: number };
+const stepStyles: Record<WorkState, StepStyle> = {
+  completed: { glyph: '▰', color: theme.done, word: 'done', rank: 0 },
+  cancelled: { glyph: '⊘', color: theme.quiet, word: 'cancelled', rank: 0 },
+  failed: { glyph: '✕', color: theme.fault, word: 'failed', rank: 1 },
+  claimed: { glyph: '⠿', color: theme.working, word: 'working', rank: 2 },
+  verifying: { glyph: '⠿', color: theme.working, word: 'working', rank: 2 },
+  ready: { glyph: '▱', color: theme.waiting, word: 'ready', rank: 3 },
+  waiting: { glyph: '◐', color: theme.sapphire, word: 'waiting', rank: 4 },
+  blocked: { glyph: '◐', color: theme.sapphire, word: 'waiting', rank: 4 },
+};
+
 /** A step's state as stui draws it in a mission's pipeline, done first. */
-export function stepStyle(state: string, spinner = '⠿'): { glyph: string; color: string; word: string; rank: number } {
-  switch (state) {
-    case 'completed': return { glyph: '▰', color: theme.done, word: 'done', rank: 0 };
-    case 'failed': return { glyph: '✕', color: theme.fault, word: 'failed', rank: 1 };
-    case 'claimed':
-    case 'running': return { glyph: spinner, color: theme.working, word: 'working', rank: 2 };
-    case 'ready': return { glyph: '▱', color: theme.waiting, word: 'ready', rank: 3 };
-    case 'waiting':
-    case 'blocked': return { glyph: '◐', color: theme.sapphire, word: 'waiting', rank: 4 };
-    default: return { glyph: '▱', color: theme.surface2, word: 'later', rank: 5 };
-  }
+export function stepStyle(state: string, spinner = '⠿'): StepStyle {
+  const style = stepStyles[stepState(state) as WorkState];
+  if (!style) return { glyph: '▱', color: theme.surface2, word: 'later', rank: 5 };
+  return activeStep(stepState(state)) ? { ...style, glyph: spinner } : style;
 }
