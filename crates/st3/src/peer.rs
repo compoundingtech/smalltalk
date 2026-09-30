@@ -25,8 +25,7 @@ use crate::client::Client;
 use crate::config::{Config, PeerConfig};
 use crate::fleet::transport::{
     Fabric, LocalTransports, Route, bindable_tailnet_addresses, default_fabric_protocol,
-    is_tailnet_address, local_addresses, parse_route, resolve_tool, routes_from_endpoints,
-    tailscale_addresses,
+    is_tailnet_address, local_addresses, resolve_tool, routes_from_endpoints, tailscale_addresses,
 };
 use crate::fleet::{Acceptance, FleetView, MemberKey, Refusal, Sender, verify_signature};
 use crate::model::InventoryCheckpoint;
