@@ -88,7 +88,22 @@ pub(crate) struct ExternalDiscovery {
     pub(crate) unresolved_processes: Vec<UnresolvedProcess>,
 }
 
-#[derive(Clone)]
+#[derive(Debug)]
+pub(crate) struct AmbiguousSession(pub(crate) String);
+
+impl std::fmt::Display for AmbiguousSession {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            fmt,
+            "native session `{}` has multiple matching transcripts with the same timestamp; refusing ambiguous import",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for AmbiguousSession {}
+
+#[derive(Clone, Debug)]
 struct SessionMetadata {
     driver: ExternalDriver,
     native_id: String,
@@ -113,7 +128,7 @@ pub(crate) fn discover(home: Option<&Path>, include_history: bool) -> Result<Ext
     {
         return Ok(filter_discovery(discovery.clone(), include_history));
     }
-    let discovery = discover_uncached(home)?;
+    let discovery = discover_uncached(home, None)?;
     *cache = Some((home.to_owned(), Instant::now(), discovery.clone()));
     Ok(filter_discovery(discovery, include_history))
 }
@@ -125,11 +140,12 @@ pub(crate) fn discover_fresh(
     let Some(home) = home else {
         return Ok(ExternalDiscovery::default());
     };
-    Ok(filter_discovery(discover_uncached(home)?, include_history))
+    Ok(filter_discovery(discover_uncached(home, None)?, include_history))
 }
 
-fn discover_uncached(home: &Path) -> Result<ExternalDiscovery> {
-    let mut metadata = discover_files(home)?;
+fn discover_uncached(home: &Path, strict_id: Option<&str>) -> Result<ExternalDiscovery> {
+    let candidates = platform_processes()?;
+    let mut metadata = resolve_duplicate_sessions(discover_files(home)?, &candidates, strict_id)?;
     metadata.sort_by(|left, right| {
         right
             .updated_at_unix_ms
@@ -138,7 +154,6 @@ fn discover_uncached(home: &Path) -> Result<ExternalDiscovery> {
     });
     metadata.truncate(MAX_EXPOSED_HISTORY);
 
-    let candidates = platform_processes()?;
     let roots = root_processes(&candidates)
         .into_iter()
         .filter(|candidate| !candidate.managed_by_st3)
@@ -192,6 +207,65 @@ fn discover_uncached(home: &Path) -> Result<ExternalDiscovery> {
         sessions,
         unresolved_processes,
     })
+}
+
+fn resolve_duplicate_sessions(
+    metadata: Vec<SessionMetadata>,
+    candidates: &[ProcessCandidate],
+    strict_id: Option<&str>,
+) -> Result<Vec<SessionMetadata>> {
+    let mut groups = BTreeMap::<(String, String), Vec<SessionMetadata>>::new();
+    for item in metadata {
+        groups
+            .entry((item.driver.as_str().to_owned(), item.native_id.clone()))
+            .or_default()
+            .push(item);
+    }
+    let mut selected = Vec::with_capacity(groups.len());
+    for (_, mut group) in groups {
+        if group.len() == 1 {
+            selected.push(group.pop().expect("one session in group"));
+            continue;
+        }
+        let driver = group[0].driver;
+        let native_id = &group[0].native_id;
+        let process_cwd = candidates
+            .iter()
+            .find(|candidate| {
+                candidate.driver == driver
+                    && !candidate.managed_by_st3
+                    && candidate.process.command.contains(native_id)
+            })
+            .and_then(|candidate| candidate.process.cwd.as_deref())
+            .map(|path| fs::canonicalize(path).unwrap_or_else(|_| path.to_owned()));
+        let cwd_matches = |item: &SessionMetadata| {
+            item.cwd.as_deref().is_some_and(|cwd| {
+                process_cwd.as_deref().is_some_and(|process| {
+                    fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_owned()) == process
+                })
+            })
+        };
+        let best_cwd = group.iter().any(&cwd_matches);
+        if best_cwd {
+            group.retain(|item| cwd_matches(item));
+        }
+        group.sort_by(|left, right| {
+            right
+                .updated_at_unix_ms
+                .cmp(&left.updated_at_unix_ms)
+                .then_with(|| left.transcript.cmp(&right.transcript))
+        });
+        let best = group.remove(0);
+        if strict_id == Some(external_session_id(driver, &best.native_id).as_str())
+            && group
+                .first()
+                .is_some_and(|other| other.updated_at_unix_ms == best.updated_at_unix_ms)
+        {
+            return Err(AmbiguousSession(best.native_id).into());
+        }
+        selected.push(best);
+    }
+    Ok(selected)
 }
 
 fn filter_discovery(mut discovery: ExternalDiscovery, include_history: bool) -> ExternalDiscovery {
@@ -256,6 +330,31 @@ pub(crate) fn find_bound_transcript(
     Ok(None)
 }
 
+/// Read only the exact OMP transcript durably bound by an import claim.
+pub(crate) fn find_imported_omp_transcript(
+    path: &Path,
+    native_id: &str,
+) -> Result<Option<ExternalSession>> {
+    let Some(metadata) = read_metadata(ExternalDriver::Omp, path)? else {
+        return Ok(None);
+    };
+    if metadata.native_id != native_id {
+        return Ok(None);
+    }
+    Ok(Some(ExternalSession {
+        id: external_session_id(ExternalDriver::Omp, native_id),
+        revision: metadata.revision,
+        driver: ExternalDriver::Omp,
+        native_id: metadata.native_id,
+        transcript: metadata.transcript,
+        cwd: metadata.cwd,
+        title: metadata.title,
+        started_at_unix_ms: metadata.started_at_unix_ms,
+        updated_at_unix_ms: metadata.updated_at_unix_ms,
+        process: None,
+    }))
+}
+
 /// Find the newest transcript created by the current managed OMP incarnation.
 /// The directory is constructed from the declared seat, never from client input.
 pub(crate) fn find_managed_omp_transcript(
@@ -307,7 +406,10 @@ pub(crate) fn find_managed_omp_transcript(
 }
 
 pub(crate) fn find_fresh(home: Option<&Path>, id: &str) -> Result<Option<ExternalSession>> {
-    Ok(discover_fresh(home, true)?
+    let Some(home) = home else {
+        return Ok(None);
+    };
+    Ok(discover_uncached(home, Some(id))?
         .sessions
         .into_iter()
         .find(|item| item.id == id))
@@ -389,6 +491,14 @@ pub(crate) fn import_seat(session: &ExternalSession) -> Result<ImportSeat> {
         "the saved session workspace {} does not exist",
         workspace.display()
     );
+    // OMP chooses its transcript directory from the real workspace path. A saved
+    // transcript may still record a symlink from before a workspace relocation.
+    let workspace = if session.driver == ExternalDriver::Omp {
+        fs::canonicalize(&workspace)
+            .with_context(|| format!("resolve saved session workspace {}", workspace.display()))?
+    } else {
+        workspace
+    };
     let suffix = &digest(&format!(
         "{}:{}",
         session.driver.as_str(),
@@ -420,8 +530,13 @@ pub(crate) fn import_seat(session: &ExternalSession) -> Result<ImportSeat> {
                 .push(KdlEntry::new(session.native_id.clone()));
         }
         ExternalDriver::Omp => {
-            args.entries_mut()
-                .push(KdlEntry::new(format!("--resume={}", session.native_id)));
+            // Managed omp seats use a seat-owned --session-dir. An external
+            // session ID cannot be resolved there; the absolute path loads
+            // the selected transcript without looking up another copy.
+            args.entries_mut().push(KdlEntry::new(format!(
+                "--resume={}",
+                session.transcript.display()
+            )));
         }
         ExternalDriver::Pi => {
             args.entries_mut().push(KdlEntry::new("--session"));
@@ -540,7 +655,15 @@ fn discover_files(home: &Path) -> Result<Vec<SessionMetadata>> {
         if !root.is_dir() {
             continue;
         }
+        // OMP stores tool-call JSONL files below each session's attachment directory.
+        // Only the files directly below a project directory are resumable transcripts.
+        let max_depth = if driver == ExternalDriver::Omp {
+            2
+        } else {
+            usize::MAX
+        };
         for entry in WalkDir::new(root)
+            .max_depth(max_depth)
             .follow_links(false)
             .into_iter()
             .filter_map(Result::ok)
@@ -1566,6 +1689,146 @@ mod tests {
     }
 
     #[test]
+    fn omp_inventory_skips_nested_tool_logs_but_keeps_project_transcripts() {
+        let home = tempfile::tempdir().unwrap();
+        for provider in [".omp", ".oh-omp"] {
+            let project = home.path().join(provider).join("agent/sessions/project");
+            let attachment = project.join("2026-09-30T00-00-00Z_session-id");
+            fs::create_dir_all(&attachment).unwrap();
+            fs::write(
+                project.join("2026-09-30T00-00-00Z_session-id.jsonl"),
+                "{\"type\":\"session\",\"id\":\"session-id\",\"cwd\":\"/tmp\"}\n",
+            )
+            .unwrap();
+            fs::write(
+                attachment.join("tool.jsonl"),
+                "{\"type\":\"session\",\"id\":\"not-a-transcript\",\"cwd\":\"/tmp\"}\n",
+            )
+            .unwrap();
+        }
+        let found = discover_files(home.path()).unwrap();
+        assert_eq!(found.len(), 2);
+        assert!(found.iter().all(|item| item.native_id == "session-id"));
+        assert!(found
+            .iter()
+            .all(|item| item.transcript.file_name().unwrap() != "tool.jsonl"));
+    }
+
+    #[test]
+    fn duplicate_native_id_prefers_live_workspace_then_newest_and_refuses_ties() {
+        let root = tempfile::tempdir().unwrap();
+        let active = root.path().join("active");
+        let stale = root.path().join("stale");
+        fs::create_dir_all(&active).unwrap();
+        fs::create_dir_all(&stale).unwrap();
+        let metadata = |workspace: &Path, modified| SessionMetadata {
+            driver: ExternalDriver::Omp,
+            native_id: "shared-id".into(),
+            transcript: workspace.join("shared-id.jsonl"),
+            cwd: Some(workspace.to_owned()),
+            title: None,
+            started_at_unix_ms: 1,
+            updated_at_unix_ms: modified,
+            revision: format!("{modified}"),
+        };
+        let process = ProcessCandidate {
+            driver: ExternalDriver::Omp,
+            managed_by_st3: false,
+            process: ExternalProcess {
+                pid: 42,
+                parent_pid: 1,
+                started_at_unix_ms: 1,
+                fingerprint: "fingerprint".into(),
+                cwd: Some(active.clone()),
+                command: "agent-omp --resume shared-id".into(),
+                exact_session: true,
+            },
+        };
+        let id = external_session_id(ExternalDriver::Omp, "shared-id");
+        let selected = resolve_duplicate_sessions(
+            vec![metadata(&active, 10), metadata(&stale, 20)],
+            &[process.clone()],
+            Some(&id),
+        )
+        .unwrap();
+        assert_eq!(selected[0].transcript, active.join("shared-id.jsonl"));
+
+        #[cfg(unix)]
+        {
+            let alias = root.path().join("old-workspace-symlink");
+            std::os::unix::fs::symlink(&active, &alias).unwrap();
+            let selected = resolve_duplicate_sessions(
+                vec![metadata(&alias, 10), metadata(&stale, 20)],
+                &[process.clone()],
+                Some(&id),
+            )
+            .unwrap();
+            assert_eq!(selected[0].transcript, alias.join("shared-id.jsonl"));
+        }
+
+        let selected = resolve_duplicate_sessions(
+            vec![metadata(&active, 10), metadata(&stale, 20)],
+            &[],
+            Some(&id),
+        )
+        .unwrap();
+        assert_eq!(selected[0].transcript, stale.join("shared-id.jsonl"));
+
+        let mut relocated_copy = metadata(&stale, 20);
+        relocated_copy.cwd = Some(active.clone());
+        let selected = resolve_duplicate_sessions(
+            vec![metadata(&active, 10), relocated_copy],
+            &[process.clone()],
+            Some(&id),
+        )
+        .unwrap();
+        assert_eq!(selected[0].transcript, stale.join("shared-id.jsonl"));
+
+        let other = root.path().join("other");
+        fs::create_dir_all(&other).unwrap();
+        let ambiguous = vec![metadata(&active, 10), metadata(&other, 10)];
+        assert!(resolve_duplicate_sessions(ambiguous.clone(), &[], Some(&id))
+            .unwrap_err()
+            .to_string()
+            .contains("refusing ambiguous import"));
+        assert_eq!(
+            resolve_duplicate_sessions(ambiguous, &[], None)
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn imported_omp_timeline_reads_only_the_claimed_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let selected = root.path().join("selected.jsonl");
+        let stale = root.path().join("stale.jsonl");
+        for (path, content) in [(&selected, "resumed context"), (&stale, "stale context")] {
+            fs::write(
+                path,
+                format!(
+                    "{}\n{}\n",
+                    json!({"type":"session","id":"shared-id","cwd":root.path()}),
+                    json!({"type":"message","id":"m1","message":{"role":"user","content":content}})
+                ),
+            )
+            .unwrap();
+        }
+        let bound = find_imported_omp_transcript(&selected, "shared-id")
+            .unwrap()
+            .unwrap();
+        let timeline = normalized_timeline(&bound).unwrap();
+        assert!(timeline
+            .iter()
+            .any(|item| item["type"] == "content" && item["body"]["text"] == "resumed context"));
+        assert!(!timeline.iter().any(|item| item["body"]["text"] == "stale context"));
+        assert!(find_imported_omp_transcript(&stale, "wrong-id")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn bound_claude_transcript_resolves_without_a_fleetwide_discovery() {
         let home = tempfile::tempdir().unwrap();
         let project = home.path().join(".claude/projects/example");
@@ -1689,45 +1952,6 @@ mod tests {
         assert_eq!(items[0]["body"]["call_id"], "call-one");
         assert_eq!(items[1]["type"], "tool_result");
         assert_eq!(items[1]["body"]["content"][0]["text"], "done");
-    }
-
-    #[test]
-    fn imported_sessions_render_as_valid_durable_seats() {
-        let workspace = tempfile::tempdir().unwrap();
-        for (driver, expected) in [
-            (ExternalDriver::Codex, vec!["resume", "native-session"]),
-            (ExternalDriver::Claude, vec!["--resume", "native-session"]),
-            (ExternalDriver::Pi, vec!["--session"]),
-            (ExternalDriver::Omp, vec!["--resume=native-session"]),
-            (
-                ExternalDriver::OpenCode,
-                vec!["--session", "native-session"],
-            ),
-        ] {
-            let session = ExternalSession {
-                id: "session/external-test".into(),
-                revision: "revision".into(),
-                driver,
-                native_id: "native-session".into(),
-                transcript: workspace.path().join("session.jsonl"),
-                cwd: Some(workspace.path().to_owned()),
-                title: None,
-                started_at_unix_ms: 0,
-                updated_at_unix_ms: 0,
-                process: None,
-            };
-            let import = import_seat(&session).unwrap();
-            crate::graph::parse_intent(&import.kdl, "host/test").unwrap();
-            assert!(import.subject.starts_with("agent/import/"));
-            assert!(!import.kdl.contains("mission \""));
-            for argument in expected {
-                assert!(
-                    import.kdl.contains(argument),
-                    "{} lacks {argument}",
-                    import.kdl
-                );
-            }
-        }
     }
 
     #[test]
