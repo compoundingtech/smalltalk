@@ -853,7 +853,10 @@ async fn run_queue_cli(socket: &Path, config_home: &Path, json: bool, args: &[&s
     let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
     tokio::task::spawn_blocking(move || {
         let mut command = std::process::Command::new(binary);
+        // Queue operator commands use the fixture's person, not the invoking harness seat.
         command
+            .env_remove("ST_AGENT")
+            .env_remove("ST_MISSION_RUN")
             .env("XDG_CONFIG_HOME", config_home)
             .arg("--endpoint")
             .arg(socket);
