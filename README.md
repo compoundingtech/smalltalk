@@ -115,6 +115,22 @@ log.
 If the state directory has a long path, set `XDG_RUNTIME_DIR` to a shorter directory or pass
 `--socket` and `--client-gateway-socket` to `st up` so both Unix socket paths fit the OS limit.
 
+## Run st on more than one machine
+
+Install st on each machine. On an existing listening member, run `st fleet invite beacon`.
+On the new machine, run `st fleet join` and paste the code when asked, then check
+`st fleet status` and `st replication status`. These steps are the same for a laptop or server.
+Join installs the services and catches up the replica over Tailscale or Fabric.
+
+Any member may be offline. It shows its last exchange time, retries with increasing delays,
+and announces itself when it returns so one successful connection synchronizes both directions.
+A machine that can only connect out needs no special sync setting.
+
+See [fleet replication](docs/st3/replication.md#add-any-machine) for explicit tailnet/Fabric
+routes and Fabric inbox invitations, and [fleet join](docs/fleet-join.md) for transport trust,
+removal, and migrating an existing fleet off local dial helpers. A client-only stui or app
+instead pairs as a [device](docs/st3/client-only.md), keeping a cache rather than a full replica.
+
 ## First commands
 
 ```sh
