@@ -709,7 +709,7 @@ mod tests {
         use crate::harness_state::{self, Activity};
         let tmp = tempfile::tempdir().unwrap();
         let observer =
-            SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker").unwrap();
+            SessionObserver::new(tmp.path(), "example-linux.worker", "claude", "example-linux.worker").unwrap();
         let stop = AtomicBool::new(false);
         let result = run_provider_observed(
             "test",
@@ -790,7 +790,7 @@ mod tests {
     fn detaching_releases_a_live_provider_with_its_observed_session() {
         let tmp = tempfile::tempdir().unwrap();
         let observer =
-            SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker").unwrap();
+            SessionObserver::new(tmp.path(), "example-linux.worker", "claude", "example-linux.worker").unwrap();
         let pid = spawn_sleeper("30");
         let outcome = supervise_provider(
             "test",
@@ -826,9 +826,9 @@ mod tests {
         unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         let adopted = SessionObserver::adopt(
             tmp.path(),
-            "hetz.worker",
+            "example-linux.worker",
             "claude",
-            "hetz.worker",
+            "example-linux.worker",
             observer.session(),
             observer.seq(),
         );
@@ -898,9 +898,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let _observer = SessionObserver::with_session(
             tmp.path(),
-            "hetz.worker",
+            "example-linux.worker",
             "claude",
-            "hetz.worker",
+            "example-linux.worker",
             "attempt-exact".into(),
         )
         .unwrap();
@@ -912,9 +912,9 @@ mod tests {
 
         let error = SessionObserver::with_session(
             tmp.path(),
-            "hetz.worker",
+            "example-linux.worker",
             "claude",
-            "hetz.worker",
+            "example-linux.worker",
             String::new(),
         )
         .err()

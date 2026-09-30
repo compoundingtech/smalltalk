@@ -43,7 +43,7 @@ A mission run has one stable subject. Each immutable run generation binds that r
 ```kdl
 version 2
 
-mission "release" state="ready" revisions="human-only" revision-reviewer="person/nathan" revision-cutover="when-idle" {
+mission "release" state="ready" revisions="human-only" revision-reviewer="person/alex" revision-cutover="when-idle" {
     input "source" kind="resource"
     goal "Produce a verified release decision."
     goal "Keep the source and test evidence visible in the graph."
@@ -77,7 +77,7 @@ mission "release" state="ready" revisions="human-only" revision-reviewer="person
     }
 
     gate "the requester approves the release" type="human" {
-      reviewer "person/nathan"
+      reviewer "person/alex"
       question "Is this release ready?"
       review "resource/mission-run/${ST_MISSION_RUN}/release-decision"
     }
@@ -461,7 +461,7 @@ A failed loop can name the item's title, reviewer, and severity:
 on-exhausted {
   fail
   attention "Automatic review failed" {
-    reviewer "person/nathan"
+    reviewer "person/alex"
     severity "error"
   }
 }
@@ -721,7 +721,7 @@ verdict: a runner that never exits is stopped at the limit.
 
 ```kdl
 gate "the release is approved" type="human" {
-  reviewer "person/nathan"
+  reviewer "person/alex"
   question "Is the release ready?"
   review "resource/release-candidate"
   review "doc/release/report@SHA256"
@@ -1082,10 +1082,10 @@ The queue matters most for a durable top-level seat that serves many runs. A mis
 normally serves one run, so its queue has one entry.
 
 ```sh
-st agents queue agent/fleet/example/worker
-st agents queue move agent/fleet/example/worker mission-run/release/2026-09-26 --top \
+st agents queue agent/example/example/worker
+st agents queue move agent/example/example/worker mission-run/release/2026-09-26 --top \
   --reason "the release needs this first" --as person/operator
-st agents queue move agent/fleet/example/worker mission-run/docs/2026-09-26 \
+st agents queue move agent/example/example/worker mission-run/docs/2026-09-26 \
   --after mission-run/release/2026-09-26 --as person/operator
 ```
 
@@ -1233,7 +1233,7 @@ Declare a durable seat directly at the publication root:
 
 ```kdl
 version 2
-agent "fleet/cos/standing/cos" {
+agent "example/cos/standing/cos" {
   host "local"
   workspace "/work/cos"
   restart "always"
@@ -1242,7 +1242,7 @@ agent "fleet/cos/standing/cos" {
 }
 ```
 
-The subject is exactly `agent/fleet/cos/standing/cos`; placement does not change its identity.
+The subject is exactly `agent/example/cos/standing/cos`; placement does not change its identity.
 The seat's bare `fresh-context` node starts a new harness session before each step it claims, even when the step has no `fresh-context` node. Omit it when the seat should retain context across ordinary steps.
 Typed harnesses always run their real interactive TUI in a PTY. Claude always loads the native st
 channel. Use `exec {}` for non-interactive provider commands.
@@ -1551,15 +1551,15 @@ Planning mode asks one durable Codex harness to author Markdown and KDL for revi
 ```sh
 st launch start --id release-mission request.md \
   --workspace ./project \
-  --as person/nathan \
+  --as person/alex \
   --model gpt-5.6-sol \
   --effort medium
 
 st launch show SESSION
 st launch preview SESSION
-st launch revise SESSION feedback.md --as person/nathan
-st launch approve SESSION PREVIEW_TOKEN --as person/nathan
-st launch cancel SESSION --as person/nathan --reason "The request changed."
+st launch revise SESSION feedback.md --as person/alex
+st launch approve SESSION PREVIEW_TOKEN --as person/alex
+st launch cancel SESSION --as person/alex --reason "The request changed."
 ```
 
 Planning can also prepare a revision for one current mission run:
@@ -1567,13 +1567,13 @@ Planning can also prepare a revision for one current mission run:
 ```sh
 st launch start --run MISSION_RUN request.md \
   --workspace ./project \
-  --as person/nathan
+  --as person/alex
 
 st launch preview SESSION --variant compact
 st launch preview SESSION --variant extended
 st launch compare SESSION compact extended
 st launch propose SESSION extended \
-  --as person/nathan \
+  --as person/alex \
   --reason "The extended variant covers the discovered risk."
 ```
 

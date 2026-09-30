@@ -200,8 +200,11 @@ class Probe:
     async def route(self, target):
         route = self.state["routes"].get(target)
         presence = await self.api.get("/v1/replication/status")
-        online = any(peer["peer"] == self.peers[target] and peer["status"] == "up"
-                     for peer in presence["peers"])
+        direct = next((peer for peer in presence["peers"] if peer["peer"] == self.peers[target]), {})
+        # A grant refusal says nothing about end-to-end reachability through a hub.
+        # Continue real delivery probes while another replication path is active.
+        online = direct.get("status") == "up" or (
+            direct.get("status") == "refused" and any(peer["status"] == "up" for peer in presence["peers"]))
         if not online:
             if route is None:
                 route = {"target": self.peers[target], "to": target, "status": "unstarted"}

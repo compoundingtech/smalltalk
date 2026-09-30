@@ -70,7 +70,7 @@ The pipe prototypes add a sixth attempt and both fail on it:
 
 - The **lifecycle prototype** could not give a runner-owned task identity a sender
   ledger, so a pipe sends *as its owning agent* and the agent reads
-  `[DING] ↺ hetz.demo: pipe gh-ci: …` — an external CI event presented as the
+  `[DING] ↺ example-linux.demo: pipe gh-ci: …` — an external CI event presented as the
   agent talking to itself. Its own top recommendation (f)(1) is to fix exactly
   this.
 - The **ingress prototype** proved the message path *cannot* express a non-agent
@@ -146,9 +146,9 @@ state folder, and an inbox (so an agent can reply to it). It has **no** persona,
 presence record, roster row, derived DING, supervisor edge, or Sent ledger.
 
 ```kdl
-// sources/hetz/gh-ci/source.kdl
+// sources/example-linux/gh-ci/source.kdl
 source "gh-ci" {
-  host "hetz"
+  host "example-linux"
   command "poll-gh-ci --json"        // optional
   restart { attempts 5 mode "delay" }
   desired-state "running"
@@ -206,7 +206,7 @@ reply target: exactly the shape it already has, given a name.
 ### 2.2 Event identity: a three-part grammar
 
 ```
-from       hetz.gh-ci            who produced it (a source bus id)
+from       example-linux.gh-ci            who produced it (a source bus id)
 stream     github:ci:pr-42       which series of facts this belongs to
 event-id   failure               which occurrence within that series
 ```
@@ -230,7 +230,7 @@ Two new frontmatter keys:
 
 ```
 ---
-from: hetz.gh-ci
+from: example-linux.gh-ci
 subject: CI failed on PR #42
 stream: github:ci:pr-42
 event-id: failure
@@ -270,8 +270,8 @@ Version-1 stream record:
 {
   "version": 1,
   "stream": "github:ci:pr-42",
-  "from": "hetz.gh-ci",
-  "to": "hetz.worker",
+  "from": "example-linux.gh-ci",
+  "to": "example-linux.worker",
   "pending": { "eventId": "failure", "filename": "1787…-6ktatz.md", "rendered": "---\n…" },
   "recent": [
     { "eventId": "running", "filename": "1787…-bn4myf.md" },
@@ -381,9 +381,9 @@ Two consequences worth stating plainly:
 source renders `~`.
 
 ```
-[DING] ← hetz.reviewer: please look at PR #42            (peer agent)
-[DING] ~ hetz.gh-ci: CI failed on PR #42                 (world event)
-[DING] ? hetz.mystery: …                                 (cannot tell)
+[DING] ← example-linux.reviewer: please look at PR #42            (peer agent)
+[DING] ~ example-linux.gh-ci: CI failed on PR #42                 (world event)
+[DING] ? example-linux.mystery: …                                 (cannot tell)
 ```
 
 `?` currently means three different things at once — "not a declared agent", "the
@@ -696,7 +696,7 @@ against the new coalescing point without a new bound. R15's proposed extension i
 | `a_fan_out_with_one_unknown_recipient_publishes_nothing` | R19 admission: one bad address in a fan-out refuses before any write and reserves no producer state, so a caller can never lose the receipt for a partially published fan-out |
 | `supersede_is_idempotent_and_crash_replay_safe` | Both crash windows. Reserve→materialize: the replay publishes under the *reserved* filename. Materialize→advance (the likelier one): the replay **adopts the already-materialized file** rather than minting a second one, then finishes the supersede and the ring advance. Repeating either emit supersedes nothing new; the stream is never momentarily empty |
 | `the_stream_record_is_constant_size_and_forgets_beyond_its_bound` | 129 events → **one** record file with `recent.len() == 128`; the aged-out id is gone, and replaying it is asserted to be a *new* publication rather than silently claimed as exactly-once |
-| `a_source_event_renders_its_own_marker_and_question_mark_keeps_one_meaning` | `[DING] ~ hetz.gh-ci: CI failed on PR #42 [id:…]`; an unresolvable sender is still `?`; an agent is never mistaken for a source |
+| `a_source_event_renders_its_own_marker_and_question_mark_keeps_one_meaning` | `[DING] ~ example-linux.gh-ci: CI failed on PR #42 [id:…]`; an unresolvable sender is still `?`; an agent is never mistaken for a source |
 | `a_fast_superseding_stream_does_not_multiply_pty_delivery_attempts` | see claim 3 |
 
 Plus `src/event.rs` unit proofs that one declaration node covers both a supervised

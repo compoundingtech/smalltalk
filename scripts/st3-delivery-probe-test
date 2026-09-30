@@ -39,9 +39,12 @@ class FakeApi:
         self.fail_send = False
         self.advanced = False
         self.online = True
+        self.refused = False
 
     async def get(self, path):
         if path == "/v1/replication/status":
+            if self.refused:
+                return {"peers": [{"peer": "cobalt", "status": "refused"}, {"peer": "indigo", "status": "up" if self.online else "last-seen"}]}
             return {"peers": [{"peer": "cobalt", "status": "up" if self.online else "last-seen"}]}
         if path.startswith("/v1/claims"):
             return {"claims": self.records}
@@ -87,6 +90,15 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(route["status"], "sending")
         await self.monitor.route(self.target)
         self.assertEqual(sum(path == "/v1/attention" for path, _ in self.monitor.api.posts), 1)
+
+    async def test_refused_direct_route_probes_indirect_delivery_through_an_active_hub(self):
+        self.monitor.api.refused = True
+        await self.monitor.route(self.target)
+        self.assertTrue(any(path == "/v1/messages" for path, _ in self.monitor.api.posts))
+        self.assertEqual(self.monitor.report()["routes"][0]["status"], "pending")
+        self.monitor.api.online = False
+        await self.monitor.route(self.target)
+        self.assertEqual(self.monitor.report()["routes"][0]["status"], "last-seen")
 
     async def test_absence_pauses_sends_and_resumes_the_same_pending_message(self):
         self.monitor.api.online = False

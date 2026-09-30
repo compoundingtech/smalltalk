@@ -628,8 +628,8 @@ mod path_tests {
     #[test]
     fn canonical_layout_host_identity_agent() {
         assert_eq!(
-            pd("/cat", "/cat/hetz/st2-claude/agent.kdl"),
-            (Some("st2-claude".into()), Some("hetz".into()))
+            pd("/cat", "/cat/example-linux/st2-claude/agent.kdl"),
+            (Some("st2-claude".into()), Some("example-linux".into()))
         );
     }
 
@@ -652,8 +652,8 @@ mod path_tests {
     #[test]
     fn agent_named_file_inside_host_folder() {
         assert_eq!(
-            pd("/cat", "/cat/hetz/fabric-claude.toml"),
-            (Some("fabric-claude".into()), Some("hetz".into()))
+            pd("/cat", "/cat/example-linux/fabric-claude.toml"),
+            (Some("fabric-claude".into()), Some("example-linux".into()))
         );
     }
 }

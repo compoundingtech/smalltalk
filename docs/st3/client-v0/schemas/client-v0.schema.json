@@ -481,7 +481,7 @@
         "status": { "type": "string" },
         "phase": { "type": "string" },
         "progress": { "type": "object", "required": ["done", "total"], "properties": { "done": { "type": "integer" }, "total": { "type": "integer" } } },
-        "current_steps": { "type": "array", "items": { "type": "object", "required": ["id", "title", "state", "since"], "properties": { "id": { "$ref": "#/$defs/Id" }, "title": { "type": ["string", "null"] }, "assignee": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] }, "claimant": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] }, "state": { "type": "string" }, "since": { "$ref": "#/$defs/Timestamp" } } } },
+        "current_steps": { "type": "array", "items": { "type": "object", "required": ["id", "title", "state", "since"], "properties": { "id": { "$ref": "#/$defs/Id" }, "title": { "type": ["string", "null"] }, "assignee": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] }, "claimant": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] }, "state": { "$ref": "#/$defs/WorkState" }, "since": { "$ref": "#/$defs/Timestamp" } } } },
         "must_act": { "enum": ["you", "agent", "system", "blocked", "nobody"] },
         "state_since": { "$ref": "#/$defs/Timestamp" },
         "outcome": { "oneOf": [{ "$ref": "#/$defs/MissionRunOutcome" }, { "type": "null" }], "description": "The outcome a person or an authorized agent set after the run finished." },
@@ -504,6 +504,7 @@
         "at": { "$ref": "#/$defs/Timestamp" }
       }
     },
+    "WorkState": {"enum": ["waiting", "ready", "claimed", "blocked", "verifying", "completed", "failed", "cancelled"]},
     "MissionStep": {
       "type": "object",
       "required": ["id", "path", "state", "attempt", "since"],
@@ -511,7 +512,7 @@
         "id": { "$ref": "#/$defs/Id" },
         "path": { "type": "string" },
         "title": { "type": ["string", "null"] },
-        "state": { "type": "string" },
+        "state": { "$ref": "#/$defs/WorkState" },
         "attempt": { "type": "integer", "minimum": 0 },
         "assignee": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
         "claimant": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
@@ -534,7 +535,7 @@
         "path": { "type": "string" },
         "title": { "type": ["string", "null"] },
         "goal": { "type": ["string", "null"] },
-        "state": { "type": "string" },
+        "state": { "$ref": "#/$defs/WorkState" },
         "since": { "$ref": "#/$defs/Timestamp" }
       }
     },
@@ -555,7 +556,7 @@
             "title": { "type": ["string", "null"] },
             "assigned_to": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "last_progress": { "type": ["string", "null"] },
-            "state": { "enum": ["waiting", "ready", "claimed", "blocked", "verifying", "completed", "failed", "cancelled"] },
+            "state": { "$ref": "#/$defs/WorkState" },
             "attempt": { "type": "integer", "minimum": 0 },
             "readiness_epoch": { "type": "integer", "minimum": 0 },
             "claimant": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },

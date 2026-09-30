@@ -4821,15 +4821,15 @@ mod tests {
     #[test]
     fn accepts_a_durable_agent_seat_but_rejects_unowned_tasks() {
         let intent = parse_intent(
-            "version 2\nagent \"fleet/cos/standing/cos\" { command \"true\" }",
+            "version 2\nagent \"example/cos/standing/cos\" { command \"true\" }",
             "host",
         )
         .expect("a durable seat is valid desired state");
-        let seat = &intent.subjects["agent/fleet/cos/standing/cos"];
+        let seat = &intent.subjects["agent/example/cos/standing/cos"];
         assert!(seat.owner_run.is_none());
         assert_eq!(
             seat.member.as_ref().unwrap().runtime_id,
-            "fleet.cos.standing.cos"
+            "example.cos.standing.cos"
         );
 
         let error = parse_intent("version 2\npty \"worker\" { command \"true\" }", "host")
@@ -5745,7 +5745,7 @@ subscription "reviews" {{
       mission "review@{revision}"
       resource "pull-request"
       workspace "/work/reviews"
-      requester "agent/fleet/repository/standing/owner"
+      requester "agent/example/repository/standing/owner"
     }}
 }}"#
         );
@@ -5762,7 +5762,7 @@ subscription "reviews" {{
         assert_eq!(spec.resource_input.as_deref(), Some("pull-request"));
         assert_eq!(
             spec.requester.as_deref(),
-            Some("agent/fleet/repository/standing/owner")
+            Some("agent/example/repository/standing/owner")
         );
     }
 
@@ -5794,7 +5794,7 @@ resource "pull" { kind "vcs.pull-request" }
 observer "pull" { resource "resource/pull"; provider "github.pull-request"; locator "owner/repo#1"; field "checks" }
 subscription "green" {
   observer "observer/pull"
-  to "agent/fleet/cos/standing/cos"
+  to "agent/example/cos/standing/cos"
   on "checks"
   when {
     every "checks" {

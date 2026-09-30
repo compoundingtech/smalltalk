@@ -88,6 +88,32 @@ pub(crate) struct ExternalDiscovery {
     pub(crate) unresolved_processes: Vec<UnresolvedProcess>,
 }
 
+pub(crate) enum ExternalConversation {
+    Readable(ExternalSession),
+    Unavailable(UnresolvedProcess),
+}
+
+impl ExternalConversation {
+    fn into_readable_session(self) -> Option<ExternalSession> {
+        match self {
+            Self::Readable(session) => Some(session),
+            Self::Unavailable(_) => None,
+        }
+    }
+}
+
+impl ExternalDiscovery {
+    pub(crate) fn into_conversation(self, id: &str) -> Option<ExternalConversation> {
+        if let Some(session) = self.sessions.into_iter().find(|session| session.id == id) {
+            return Some(ExternalConversation::Readable(session));
+        }
+        self.unresolved_processes
+            .into_iter()
+            .find(|process| process.id == id)
+            .map(ExternalConversation::Unavailable)
+    }
+}
+
 #[derive(Clone)]
 struct SessionMetadata {
     driver: ExternalDriver,
@@ -204,13 +230,17 @@ fn filter_discovery(mut discovery: ExternalDiscovery, include_history: bool) -> 
 }
 
 pub(crate) fn find(home: Option<&Path>, id: &str) -> Result<Option<ExternalSession>> {
+    Ok(find_conversation(home, id)?.and_then(ExternalConversation::into_readable_session))
+}
+
+pub(crate) fn find_conversation(
+    home: Option<&Path>,
+    id: &str,
+) -> Result<Option<ExternalConversation>> {
     if !id.starts_with("session/external-") {
         return Ok(None);
     }
-    Ok(discover(home, true)?
-        .sessions
-        .into_iter()
-        .find(|item| item.id == id))
+    Ok(discover(home, true)?.into_conversation(id))
 }
 
 /// Resolve an already-bound managed transcript without inventorying every native session
@@ -541,9 +571,8 @@ pub(crate) fn find_managed_omp_transcript(
 
 pub(crate) fn find_fresh(home: Option<&Path>, id: &str) -> Result<Option<ExternalSession>> {
     Ok(discover_fresh(home, true)?
-        .sessions
-        .into_iter()
-        .find(|item| item.id == id))
+        .into_conversation(id)
+        .and_then(ExternalConversation::into_readable_session))
 }
 
 pub(crate) fn timestamp(unix_ms: u128) -> String {
@@ -1378,6 +1407,9 @@ fn process_cwd_from_lsof(pid: u32) -> Option<PathBuf> {
 
 fn driver_for_command(command: &str) -> Option<ExternalDriver> {
     let tokens = command.split_whitespace().collect::<Vec<_>>();
+    if is_omp_worker_command(&tokens) {
+        return None;
+    }
     for driver in [
         ExternalDriver::Codex,
         ExternalDriver::Claude,
@@ -1400,6 +1432,23 @@ fn driver_for_command(command: &str) -> Option<ExternalDriver> {
         }
     }
     None
+}
+
+fn is_omp_worker_command(tokens: &[&str]) -> bool {
+    let entry = match tokens.first().and_then(|value| command_basename(value)) {
+        Some("omp") => 0,
+        Some("node" | "bun")
+            if tokens.get(1).and_then(|value| command_basename(value)) == Some("omp") =>
+        {
+            1
+        }
+        _ => return false,
+    };
+    // Internal modes such as __omp_worker_daemon_broker, __omp_worker_js_eval_process,
+    // __omp_worker_lsp_mux and __omp_worker_text_predict are helpers, not harness sessions.
+    tokens
+        .get(entry + 1)
+        .is_some_and(|argument| argument.starts_with("__omp_worker_"))
 }
 
 fn command_basename(value: &str) -> Option<&str> {
@@ -2706,11 +2755,41 @@ mod tests {
             Some(ExternalDriver::Omp)
         );
         assert_eq!(
-            driver_for_command("/Users/test/.opencode/bin/opencode --session ses_123"),
+            driver_for_command("/Users/example/.opencode/bin/opencode --session ses_123"),
             Some(ExternalDriver::OpenCode)
         );
         assert_eq!(driver_for_command("rg codex crates/st3"), None);
         assert_eq!(driver_for_command("bash -c echo claude"), None);
+    }
+
+    #[test]
+    fn omp_worker_modes_are_not_harness_sessions() {
+        for mode in [
+            "__omp_worker_daemon_broker",
+            "__omp_worker_js_eval_process",
+            "__omp_worker_lsp_mux",
+            "__omp_worker_text_predict",
+            "__omp_worker_future_helper",
+        ] {
+            for entry in ["/opt/bin/omp", "node /opt/bin/omp", "bun /opt/bin/omp"] {
+                let command = format!("{entry} {mode}");
+                assert_eq!(driver_for_command(&command), None, "{command}");
+            }
+        }
+    }
+
+    #[test]
+    fn genuine_omp_sessions_are_admitted() {
+        for command in [
+            "omp",
+            "/opt/bin/omp --resume native-session",
+            "node /opt/bin/omp",
+            "node /opt/bin/omp --resume native-session",
+            "bun /opt/bin/omp",
+            "omp --resume __omp_worker_not_a_mode",
+        ] {
+            assert_eq!(driver_for_command(command), Some(ExternalDriver::Omp));
+        }
     }
 
     #[test]
