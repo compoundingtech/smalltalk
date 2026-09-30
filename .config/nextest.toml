@@ -2,3 +2,16 @@
 [[profile.default.overrides]]
 filter = 'package(st3) and test(/^messaging_faults::messages_recover_across_transport_and_process_faults$/)'
 priority = 100
+
+[profile.ci]
+test-threads = 8
+fail-fast = false
+retries = { count = 2, backoff = "fixed", delay = "30s", jitter = false }
+status-level = "fail"
+final-status-level = "flaky"
+
+# The fleet reconnect test also includes a real two-minute outage. The ci profile inherits the
+# default profile's messaging-fault priority above.
+[[profile.ci.overrides]]
+filter = 'package(st3) and test(/^fleet::outbound_only_member_returns_after_minutes_and_aged_hours_without_alerts$/)'
+priority = 100

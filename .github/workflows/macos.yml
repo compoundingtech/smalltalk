@@ -1,57 +1,27 @@
 # Generated file - DO NOT EDIT
-# Source: fleet.yml.genie.ts
+# Source: macos.yml.genie.ts
 
-name: Workspace CI
+name: macOS CI
 
 on:
-  pull_request: {}
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
   push:
     branches: [main]
-  schedule:
-    - cron: 23 4 * * *
-  workflow_dispatch: {}
 
 permissions:
   contents: read
 
 concurrency:
-  group: "workspace-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}"
+  group: "macos-${{ github.event.pull_request.number || github.ref }}"
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  genie-freshness:
-    name: genie-freshness
-    timeout-minutes: 20
+  macos-ci:
+    name: macos-ci
+    if: github.event_name == 'push' || contains(github.event.pull_request.labels.*.name, 'macos-ci')
     runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
-    permissions:
-      contents: read
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Install Nix
-        uses: DeterminateSystems/determinate-nix-action@v3
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-        with:
-          extra-conf: |
-            experimental-features = nix-command flakes
-            accept-flake-config = true
-            extra-substituters = https://overeng-effect-utils.cachix.org
-            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
-            access-tokens = github.com=${{ github.token }}
-          summarize: true
-      - name: Check generated files
-        shell: bash
-        run: "nix develop '.#genie' -c genie --check"
-  linux-gate:
-    name: linux-gate
-    runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+      [namespace-profile-macos-arm64, "namespace-features:github.run-id=${{ github.run_id }}"]
     timeout-minutes: 120
     defaults:
       run:
@@ -105,19 +75,10 @@ jobs:
       - name: Build workspace tests first (no debug info)
         shell: bash
         run: nix develop -c cargo nextest run --workspace --locked --profile ci --no-run
-      - name: Summarize tested revision and selection
-        env:
-          REASON: ${{ steps.st2.outputs.reason }}
-        run: "printf 'Checked merge/commit: \\x60%s\\x60\\n\\n%s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$REASON\" >> \"$GITHUB_STEP_SUMMARY\""
-      - name: Run nextest, clippy, generated clients and fleet compatibility in parallel
+      - name: Run macOS workspace tests (25 minute limit)
         shell: bash
-        run: nix develop -c bash scripts/ci-linux
-        env:
-          ST2_FILTER: ${{ steps.st2.outputs.filter }}
-      - name: Retain stage logs and timings
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: linux-ci-logs
-          path: ci-logs/
-          if-no-files-found: ignore
+        run: "nix develop -c cargo nextest run --workspace --locked --profile ci -E '${{ steps.st2.outputs.filter }}'"
+        timeout-minutes: 25
+      - name: Cargo clippy
+        shell: bash
+        run: nix develop -c cargo clippy --workspace --all-targets --locked

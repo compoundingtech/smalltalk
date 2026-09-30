@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+# Invoked inside the pinned devShell, after the workspace test build completes.
+set -euo pipefail
+mkdir -p ci-logs
+
+fleet_compat() {
+  local baseline
+  baseline=$(jq -er .commit .github/fleet-compat-baseline.json) || return
+  BASELINE="$baseline" nix build --impure --out-link "$RUNNER_TEMP/baseline" --print-build-logs --expr '
+    ((builtins.getFlake "github:compoundingtech/smalltalk/${builtins.getEnv "BASELINE"}")
+      .packages.${builtins.currentSystem}.st3).overrideAttrs (_: { doCheck = false; })' || return
+  export ST3_COMPAT_BIN="$RUNNER_TEMP/baseline/bin/st3"
+  test -x "$ST3_COMPAT_BIN" || return
+  if "$ST3_COMPAT_BIN" fleet --help > /dev/null 2>&1; then
+    echo "the baseline must predate fleet membership" >&2
+    return 1
+  fi
+  cargo test -p st3 --locked --test integration -- --ignored --exact \
+    fleet::an_old_build_config_peer_replicates_with_new_members 2>&1 | tee ci-logs/compat-result.log || return
+  grep -q "test result: ok. 1 passed" ci-logs/compat-result.log
+}
+
+run_stage() {
+  local stage=$1 start=$SECONDS status=0
+  shift
+  "$@" > "ci-logs/$stage.log" 2>&1 || status=$?
+  printf '%s %s\n' "$((SECONDS - start))" "$status" > "ci-logs/$stage.time"
+  return "$status"
+}
+
+# The nextest --no-run stage already compiled the test executables. Clippy gets
+# a separate target directory so its Cargo lock cannot serialize the four lanes.
+run_stage test cargo nextest run --workspace --locked --profile ci -E "$ST2_FILTER" &
+test_pid=$!
+run_stage clippy env CARGO_TARGET_DIR="$RUNNER_TEMP/clippy-target" cargo clippy --workspace --all-targets --locked &
+clippy_pid=$!
+run_stage codegen cargo run --locked -p st3-client-codegen -- --check &
+codegen_pid=$!
+run_stage fleet-compat fleet_compat &
+fleet_pid=$!
+
+failed=0
+for entry in "test:$test_pid" "clippy:$clippy_pid" "codegen:$codegen_pid" "fleet-compat:$fleet_pid"; do
+  stage=${entry%%:*}
+  pid=${entry#*:}
+  if wait "$pid"; then
+    result=passed
+  else
+    result=failed
+    failed=1
+  fi
+  printf '\n--- %s (%s) ---\n' "$stage" "$result"
+  cat "ci-logs/$stage.log"
+  read -r elapsed status < "ci-logs/$stage.time"
+  printf '| %s | %s | %ss | %s |\n' "$stage" "$result" "$elapsed" "$status" >> "$GITHUB_STEP_SUMMARY"
+done
+exit "$failed"

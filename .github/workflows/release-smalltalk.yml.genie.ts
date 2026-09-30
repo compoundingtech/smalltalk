@@ -1,0 +1,164 @@
+import { defaultActionlintConfig, githubWorkflow } from '../../repos/effect-utils/genie/external.ts'
+
+// Preserve release triggers, source verification and publishing permissions.
+export default githubWorkflow({
+  actionlint: defaultActionlintConfig,
+  "name": "Smalltalk tag release",
+  "on": {
+    "push": {
+      "tags": [
+        "**"
+      ]
+    },
+    "workflow_dispatch": null,
+    "pull_request": {
+      "paths": [
+        ".github/workflows/release-smalltalk.yml",
+        "scripts/release-smalltalk*",
+        "scripts/install-release*",
+        "docs/st3/binary-releases.md",
+        "flake.lock"
+      ]
+    }
+  },
+  "permissions": {
+    "contents": "read"
+  },
+  "concurrency": {
+    "group": "smalltalk-release-${{ github.ref }}",
+    "cancel-in-progress": "${{ github.event_name == 'pull_request' }}"
+  },
+  "jobs": {
+    "build": {
+      "if": "${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.event.deleted == false) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}",
+      "name": "release-build (${{ matrix.target }})",
+      "strategy": {
+        "fail-fast": false,
+        "matrix": {
+          "include": [
+            {
+              "runner": "namespace-profile-linux-x86-64",
+              "target": "x86_64-unknown-linux-gnu"
+            },
+            {
+              "runner": "namespace-profile-macos-arm64",
+              "target": "aarch64-apple-darwin"
+            }
+          ]
+        }
+      },
+      "runs-on": [
+        "${{ matrix.runner }}",
+        "namespace-features:github.run-id=${{ github.run_id }}"
+      ],
+      "timeout-minutes": 90,
+      "env": {
+        "MACOSX_DEPLOYMENT_TARGET": "15.0",
+        "RELEASE_TAG": "${{ github.ref_type == 'tag' && github.ref_name || '' }}"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@v4",
+          "with": {
+            "persist-credentials": false
+          }
+        },
+        {
+          "uses": "dtolnay/rust-toolchain@stable"
+        },
+        {
+          "uses": "mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29",
+          "with": {
+            "version": "0.15.2"
+          }
+        },
+        {
+          "name": "Test installer",
+          "run": "scripts/install-release-test"
+        },
+        {
+          "name": "Build, package, and test extracted tools",
+          "run": "scripts/release-smalltalk '${{ matrix.target }}' dist"
+        },
+        {
+          "uses": "actions/upload-artifact@v4",
+          "with": {
+            "name": "release-${{ matrix.target }}",
+            "path": "dist/*",
+            "if-no-files-found": "error"
+          }
+        }
+      ]
+    },
+    "assemble": {
+      "name": "release-assemble",
+      "needs": "build",
+      "runs-on": "namespace-profile-linux-x86-64",
+      "steps": [
+        {
+          "uses": "actions/checkout@v4",
+          "with": {
+            "persist-credentials": false
+          }
+        },
+        {
+          "uses": "actions/download-artifact@v4",
+          "with": {
+            "pattern": "release-*",
+            "merge-multiple": true,
+            "path": "dist"
+          }
+        },
+        {
+          "name": "Verify both targets and record exact sources",
+          "env": {
+            "SOURCE_SHA": "${{ github.sha }}"
+          },
+          "run": "set -euo pipefail\ncd dist\ncat ./*.sha256 > SHA256SUMS\nsha256sum --check SHA256SUMS\npython3 ../scripts/release-smalltalk-manifest.py \"$SOURCE_SHA\"\ncp ../docs/st3/binary-releases.md RELEASE-NOTES.md\nprintf '\\nExact source: `%s`. See RELEASE.json for the PTY revision and targets.\\n' \"$SOURCE_SHA\" >> RELEASE-NOTES.md\n"
+        },
+        {
+          "uses": "actions/upload-artifact@v4",
+          "with": {
+            "name": "smalltalk-release",
+            "path": "dist/*",
+            "if-no-files-found": "error"
+          }
+        }
+      ]
+    },
+    "publish": {
+      "name": "release-publish",
+      "if": "github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.event.deleted == false",
+      "needs": "assemble",
+      "runs-on": "namespace-profile-linux-x86-64",
+      "permissions": {
+        "contents": "write"
+      },
+      "env": {
+        "GH_TOKEN": "${{ github.token }}",
+        "GH_REPO": "${{ github.repository }}",
+        "TAG": "${{ github.ref_name }}",
+        "SOURCE_SHA": "${{ github.sha }}"
+      },
+      "steps": [
+        {
+          "uses": "actions/checkout@v4",
+          "with": {
+            "fetch-depth": 0
+          }
+        },
+        {
+          "uses": "actions/download-artifact@v4",
+          "with": {
+            "name": "smalltalk-release",
+            "path": "dist"
+          }
+        },
+        {
+          "name": "Publish the verified tag artifacts",
+          "run": "set -euo pipefail\ngit fetch origin \"refs/tags/$TAG\"\ntest \"$(git rev-parse 'FETCH_HEAD^{commit}')\" = \"$SOURCE_SHA\"\ncd dist\nsha256sum --check SHA256SUMS\npython3 ../scripts/release-smalltalk-manifest.py \"$SOURCE_SHA\"\n# Refuse to replace any existing release or its assets. A partial draft stays private\n# for inspection; delete that draft before retrying, never move the tag.\ngh release create \"$TAG\" --verify-tag --draft --title \"Smalltalk $TAG\" \\\n  --notes-file RELEASE-NOTES.md ./*.tar.gz ./*.sha256 SHA256SUMS RELEASE.json\ngh release edit \"$TAG\" --draft=false\n"
+        }
+      ]
+    }
+  }
+})

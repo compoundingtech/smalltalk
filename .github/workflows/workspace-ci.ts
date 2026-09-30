@@ -1,0 +1,53 @@
+import {
+  effectUtilsBinaryCaches,
+  namespaceRunner,
+  nixDevelopStep,
+  plainFlakeSetupSteps,
+} from '../../repos/effect-utils/genie/external.ts'
+
+export const linuxRunner = namespaceRunner({ profile: 'namespace-profile-linux-x86-64', runId: '${{ github.run_id }}' })
+export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-arm64', runId: '${{ github.run_id }}' })
+
+/** The public, read-only effect-utils cache supplies genie and other pinned effect-utils packages. */
+export const readOnlyBinaryCaches = Object.values(effectUtilsBinaryCaches)
+
+/** Dev/test builds without debug information or incremental state, as on the fleet runners. */
+export const buildEnv = { CARGO_PROFILE_DEV_DEBUG: '0', CARGO_PROFILE_TEST_DEBUG: '0', CARGO_INCREMENTAL: '0' }
+
+/**
+ * Checkout, Nix with the read-only effect-utils cache, isolated HOME/XDG, test selection,
+ * provider fixtures, rendered hooks, and the standalone workspace test build.
+ * `pull_request` checks out GitHub's merge ref: the PR head merged with the latest base.
+ */
+export const workspacePreparationSteps = [
+  { uses: 'actions/checkout@v4', with: { 'fetch-depth': 0, 'persist-credentials': false } },
+  ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
+  {
+    name: 'Isolate test home and XDG state',
+    run: `home="$RUNNER_TEMP/test-home"
+mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
+printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_STATE_HOME=%s/.local/state\\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"`,
+  },
+  { name: 'Test st2 path-filter boundaries', run: 'python3 scripts/ci-st2-filter-test' },
+  {
+    name: 'Select st2 catalog and supervisor tests',
+    id: 'st2',
+    env: {
+      EVENT: '${{ github.event_name }}',
+      BASE: '${{ github.event.pull_request.base.sha }}',
+      HEAD: '${{ github.event.pull_request.head.sha }}',
+    },
+    run: 'python3 scripts/ci-st2-filter --event "$EVENT" --base "$BASE" --head "$HEAD" --github-output "$GITHUB_OUTPUT"',
+  },
+  {
+    name: 'Prepare provider component fixtures',
+    run: `system=$(nix eval --impure --raw --expr builtins.currentSystem)
+components=$(nix build ".#checks.$system.provider-components" --no-link --print-out-paths --print-build-logs)
+for provider in GITHUB_ISSUE GITHUB_PR PTY_STATS VISTA; do
+  wasm=$(printf '%s' "$provider" | tr '[:upper:]' '[:lower:]')
+  printf 'ST2_%s_COMPONENT=%s/share/st2/providers/st2_%s_component.component.wasm\\n' "$provider" "$components" "$wasm" >> "$GITHUB_ENV"
+done`,
+  },
+  nixDevelopStep({ name: 'Install matching rendered hooks', command: ['cargo', 'run', '--locked', '-p', 'st2', '--', 'hooks', 'install'] }),
+  nixDevelopStep({ name: 'Build workspace tests first (no debug info)', command: ['cargo', 'nextest', 'run', '--workspace', '--locked', '--profile', 'ci', '--no-run'] }),
+]
