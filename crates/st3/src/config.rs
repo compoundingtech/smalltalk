@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::fleet::transport::is_permitted_route_address;
 use crate::model::PlannerSpec;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -446,8 +447,8 @@ impl Config {
                 .parse::<SocketAddr>()
                 .with_context(|| format!("parse peer listener `{address}`"))?;
             anyhow::ensure!(
-                address.ip().is_loopback(),
-                "the peer listener must bind to a loopback address"
+                is_permitted_route_address(&address.ip()),
+                "the peer listener must bind to a loopback or Tailscale address"
             );
         }
         anyhow::ensure!(
@@ -635,9 +636,9 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_listener_must_use_a_loopback_address() {
+    fn a_peer_listener_accepts_only_loopback_or_tailnet_addresses() {
         let mut config = Config {
-            peer_listen: Some("0.0.0.0:31313".into()),
+            peer_listen: Some("127.0.0.1:31313".into()),
             fleet_id: Some("1f91ca65-7793-48cc-866e-ac15690130e1".into()),
             shared_secret_file: Some("/tmp/st3-test-secret".into()),
             peers: vec![PeerConfig {
@@ -646,18 +647,34 @@ mod tests {
             }],
             ..Config::default()
         };
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("loopback")
-        );
-
-        config.peer_listen = Some("127.0.0.1:31313".into());
-        config.validate().unwrap();
-        config.peer_listen = Some("[::1]:31313".into());
-        config.validate().unwrap();
+        for address in [
+            "127.0.0.1:31313",
+            "[::1]:31313",
+            "100.64.0.1:31313",
+            "100.127.255.254:31313",
+            "[fd7a:115c:a1e0::1]:31313",
+        ] {
+            config.peer_listen = Some(address.into());
+            config.validate().unwrap();
+        }
+        for address in [
+            "0.0.0.0:31313",
+            "[::]:31313",
+            "100.63.255.255:31313",
+            "100.128.0.1:31313",
+            "192.168.1.10:31313",
+            "[fd7a:115c:a1e1::1]:31313",
+        ] {
+            config.peer_listen = Some(address.into());
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("loopback or Tailscale"),
+                "{address}"
+            );
+        }
     }
 
     #[test]
@@ -675,36 +692,52 @@ mod tests {
     }
 
     #[test]
-    fn fleet_configuration_is_complete_and_uses_only_loopback_transport() {
+    fn fleet_configuration_accepts_only_loopback_or_tailnet_peer_urls() {
         let mut config = Config {
             peer_listen: Some("127.0.0.1:31313".into()),
             fleet_id: Some("1f91ca65-7793-48cc-866e-ac15690130e1".into()),
             shared_secret_file: Some("/tmp/st3-test-secret".into()),
             peers: vec![PeerConfig {
                 name: "peer".into(),
-                url: "http://127.0.0.1:31314".into(),
+                url: String::new(),
             }],
             ..Config::default()
         };
         config.validate().unwrap();
-        // An outbound-only network needs no member kind or listener to exchange both ways.
+        // An outbound-only network needs no listener to exchange both ways.
         config.peer_listen = None;
         config.validate().unwrap();
         config.peer_listen = Some("127.0.0.1:31313".into());
-
+        for url in [
+            "http://localhost:31314",
+            "http://127.0.0.1:31314",
+            "http://[::1]:31314",
+            "http://100.64.0.1:31314",
+            "http://100.127.255.254:31314",
+            "http://[fd7a:115c:a1e0::1]:31314",
+        ] {
+            config.peers[0].url = url.into();
+            config.validate().unwrap();
+        }
+        for url in [
+            "http://100.63.255.255:31314",
+            "http://100.128.0.1:31314",
+            "http://192.0.2.1:31314",
+            "http://[fd7a:115c:a1e1::1]:31314",
+            "http://example.com:31314",
+        ] {
+            config.peers[0].url = url.into();
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("loopback or tailnet"),
+                "{url}"
+            );
+        }
         config.peers.clear();
         assert!(config.validate().unwrap_err().to_string().contains("peer"));
-        config.peers.push(PeerConfig {
-            name: "peer".into(),
-            url: "http://192.0.2.1:31314".into(),
-        });
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("loopback")
-        );
     }
 
     #[test]
