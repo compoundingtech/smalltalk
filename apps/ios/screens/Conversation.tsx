@@ -1,5 +1,5 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
-import { FlatList, KeyboardAvoidingView, Platform, Pressable, StyleSheet, View } from 'react-native';
+import { FlatList, Keyboard, KeyboardAvoidingView, Platform, Pressable, StyleSheet, View } from 'react-native';
 import { useFocusEffect } from '@react-navigation/native';
 import { useHeaderHeight } from '@react-navigation/elements';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
@@ -41,6 +41,14 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   const list = useRef<FlatList<Row>>(null);
   const headerHeight = useHeaderHeight();
   const insets = useSafeAreaInsets();
+  // Above the keyboard the composer needs no home-indicator inset.
+  const [keyboard, setKeyboard] = useState(false);
+  useEffect(() => {
+    const shown = Keyboard.addListener('keyboardWillShow', () => setKeyboard(true));
+    const hidden = Keyboard.addListener('keyboardWillHide', () => setKeyboard(false));
+    return () => { shown.remove(); hidden.remove(); };
+  }, []);
+  const bottom = keyboard ? 8 : Math.max(insets.bottom, 8);
 
   useLayoutEffect(() => {
     const runtime = agent && agent.runtime_ids.length && !['stopped', 'failed'].includes(agent.state) ? agent.runtime_ids[0] : undefined;
@@ -120,7 +128,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       contentContainerStyle={{ paddingVertical: 8 }}
     />
     {away ? <Pressable accessibilityRole="button" accessibilityLabel="Scroll to latest" style={styles.latest} onPress={() => list.current?.scrollToOffset({ offset: 0, animated: true })}><T bold color={theme.accent}>↓ latest</T></Pressable> : null}
-    {agent ? <View style={[styles.composer, { paddingBottom: Math.max(insets.bottom, 8) }]}>
+    {agent ? <View style={[styles.composer, { paddingBottom: bottom }]}>
       <T color={theme.accent} style={styles.prompt}>›</T>
       <Field
         value={draft}
@@ -132,7 +140,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
         accessibilityLabel={`Message ${title}`}
       />
       <Button label="send" disabled={!canSend || !draft.trim()} onPress={() => void send()} style={styles.send} />
-    </View> : session ? <View style={[styles.composer, { paddingBottom: Math.max(insets.bottom, 8) }]}><T dim>{session.managed === false ? 'not started by st · read only' : 'this session has ended · read only'}</T></View> : null}
+    </View> : session ? <View style={[styles.composer, { paddingBottom: bottom }]}><T dim>{session.managed === false ? 'not started by st · read only' : 'this session has ended · read only'}</T></View> : null}
   </KeyboardAvoidingView>;
 }
 
