@@ -233,7 +233,7 @@ fn resource_fixture_covers_every_resource_kind_with_stable_unique_ids() {
         .iter()
         .find(|resource| resource["kind"] == "attention")
         .unwrap();
-    assert_eq!(attention["person_id"], "person/nathan");
+    assert_eq!(attention["person_id"], "person/alex");
     assert_eq!(attention["source_id"], "launch/release");
     assert_eq!(attention["attention_kind"], "launch-approval");
     assert_eq!(
@@ -590,7 +590,7 @@ async fn client_post_json(app: axum::Router, uri: &str, body: Value) -> (StatusC
             Request::builder()
                 .method("POST")
                 .uri(uri)
-                .header("x-st3-person", "person/nathan")
+                .header("x-st3-person", "person/alex")
                 .header("content-type", "application/json")
                 .body(Body::from(serde_json::to_vec(&body).unwrap()))
                 .unwrap(),
@@ -733,7 +733,7 @@ mission "now-work" state="ready" {
             mission: "now-work".into(),
             revision: None,
             workspace: root.path().display().to_string(),
-            requester: Some("person/nathan".into()),
+            requester: Some("person/alex".into()),
             mode: Some("run".into()),
             inputs: std::collections::BTreeMap::new(),
             idempotency_key: "now-work-run".into(),
@@ -744,7 +744,7 @@ mission "now-work" state="ready" {
         .set_step_state(&run.steps[0].subject, "ready", None)
         .unwrap();
     let app = st3::api::router(state);
-    let (_, default) = client_json_person(app.clone(), "/v1/client/now", "person/nathan").await;
+    let (_, default) = client_json_person(app.clone(), "/v1/client/now", "person/alex").await;
     assert!(
         default["value"]["items"]
             .as_array()
@@ -755,7 +755,7 @@ mission "now-work" state="ready" {
     let (_, filtered) = client_json_person(
         app,
         &format!("/v1/client/now?owner_run={}", run.subject),
-        "person/nathan",
+        "person/alex",
     )
     .await;
     assert!(
@@ -849,7 +849,7 @@ async fn concurrent_pairing_completion_mints_exactly_one_credential() {
         serde_json::json!({
             "api_version": "st3.client.v0",
             "device_name": "Concurrent phone",
-            "person_id": "person/nathan"
+            "person_id": "person/alex"
         }),
     )
     .await;
@@ -950,7 +950,7 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
         app.clone(),
         "/v1/client/pairings",
         serde_json::json!({
-            "api_version": "st3.client.v0", "device_name": "Test phone", "person_id": "person/nathan"
+            "api_version": "st3.client.v0", "device_name": "Test phone", "person_id": "person/alex"
         }),
     )
     .await;
@@ -975,7 +975,7 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
         .append_claim(&st3::model::ClaimInput {
             subject: "custom/client/pairing-expired-inventory".into(),
             kind: "custom.client.pairing-completed".into(),
-            actor: Some("person/nathan".into()),
+            actor: Some("person/alex".into()),
             fields: std::collections::BTreeMap::from([
                 (
                     "credential_hash".into(),
@@ -985,10 +985,10 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
                     "device_id".into(),
                     Value::String("device/expired-inventory".into()),
                 ),
-                ("person_id".into(), Value::String("person/nathan".into())),
+                ("person_id".into(), Value::String("person/alex".into())),
                 (
                     "session_actor".into(),
-                    Value::String("person/nathan/session/expired-inventory".into()),
+                    Value::String("person/alex/session/expired-inventory".into()),
                 ),
                 ("scopes".into(), serde_json::json!(["read.projections"])),
                 ("expires_at_unix_ms".into(), serde_json::json!(1)),
@@ -999,7 +999,7 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
         })
         .unwrap();
     let (status, devices) =
-        client_json_person(app.clone(), "/v1/client/devices", "person/nathan").await;
+        client_json_person(app.clone(), "/v1/client/devices", "person/alex").await;
     assert_eq!(status, StatusCode::OK, "{devices}");
     let encoded_devices = serde_json::to_string(&devices).unwrap();
     assert_eq!(devices["value"]["items"][0]["id"], device);
@@ -1009,7 +1009,7 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
     let (status, device_history) = client_json_person(
         app.clone(),
         "/v1/client/devices?history=true",
-        "person/nathan",
+        "person/alex",
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{device_history}");
@@ -1047,7 +1047,7 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
     let (status, revoked) = client_post_json(app.clone(), "/v1/client/actions", revoke).await;
     assert_eq!(status, StatusCode::OK, "{revoked}");
     let (status, current_devices) =
-        client_json_person(app.clone(), "/v1/client/devices", "person/nathan").await;
+        client_json_person(app.clone(), "/v1/client/devices", "person/alex").await;
     assert_eq!(status, StatusCode::OK, "{current_devices}");
     assert!(
         current_devices["value"]["items"]
@@ -1058,7 +1058,7 @@ async fn pairing_is_single_use_and_fenced_actions_are_idempotent() {
     let (status, devices) = client_json_person(
         app.clone(),
         "/v1/client/devices?history=true",
-        "person/nathan",
+        "person/alex",
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{devices}");
@@ -1085,7 +1085,7 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
     let state = test_state(root.path());
     let store = state.store.clone();
     for (subject, reviewer) in [
-        ("attention/nathan-paired", "person/nathan"),
+        ("attention/ada-paired", "person/ada"),
         ("attention/alex-paired", "person/alex"),
     ] {
         store
@@ -1109,9 +1109,9 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
     let (status, challenge) = client_post_json_person(
         local.clone(),
         "/v1/client/pairings",
-        "person/nathan",
+        "person/ada",
         serde_json::json!({
-            "api_version": "st3.client.v0", "device_name": "Nathan's phone", "person_id": "person/nathan"
+            "api_version": "st3.client.v0", "device_name": "Ada's phone", "person_id": "person/ada"
         }),
     )
     .await;
@@ -1131,7 +1131,7 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{paired}");
-    assert_eq!(paired["value"]["person_id"], "person/nathan");
+    assert_eq!(paired["value"]["person_id"], "person/ada");
     let credential = paired["value"]["credential"].as_str().unwrap();
 
     let (status, capabilities) =
@@ -1164,19 +1164,19 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
             .find(|item| item["id"] == id)
             .unwrap()
     };
-    let nathan = item("attention/nathan-paired");
-    assert_eq!(nathan["attention_kind"], "fault");
-    assert_eq!(nathan["source_id"], "attention/nathan-paired");
-    assert_eq!(nathan["person_id"], "person/nathan");
-    assert_eq!(nathan["actions"], serde_json::json!(["attention.resolve"]));
+    let ada = item("attention/ada-paired");
+    assert_eq!(ada["attention_kind"], "fault");
+    assert_eq!(ada["source_id"], "attention/ada-paired");
+    assert_eq!(ada["person_id"], "person/ada");
+    assert_eq!(ada["actions"], serde_json::json!(["attention.resolve"]));
     let resolve = serde_json::json!({
-        "api_version": "st3.client.v0", "id": "action/paired-attention-nathan",
-        "type": "attention.resolve", "idempotency_key": "paired-attention-nathan-0001",
+        "api_version": "st3.client.v0", "id": "action/paired-attention-ada",
+        "type": "attention.resolve", "idempotency_key": "paired-attention-ada-0001",
         "fence": {
             "snapshot_id": attention["snapshot"]["id"],
-            "subject_revisions": { "attention/nathan-paired": nathan["revision"] }
+            "subject_revisions": { "attention/ada-paired": ada["revision"] }
         },
-        "parameters": { "attention_id": "attention/nathan-paired", "outcome": "resolved" }
+        "parameters": { "attention_id": "attention/ada-paired", "outcome": "resolved" }
     });
     let (status, resolved) =
         client_post_json_auth(fabric.clone(), "/v1/client/actions", credential, resolve).await;
@@ -1227,7 +1227,7 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
         .latest_claim("attention/alex-paired", Some("attention.resolved"))
         .unwrap()
         .expect("the item was closed");
-    assert_eq!(resolution.actor.as_deref(), Some("person/nathan"));
+    assert_eq!(resolution.actor.as_deref(), Some("person/ada"));
 
     let (_, current) =
         client_json_auth(fabric.clone(), "/v1/client/capabilities", credential).await;
@@ -1235,7 +1235,7 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
         "api_version": "st3.client.v0", "id": "action/paired-message-denied",
         "type": "message.send", "idempotency_key": "paired-message-denied-0001",
         "fence": { "snapshot_id": current["snapshot"]["id"], "subject_revisions": {} },
-        "parameters": { "to": "person/nathan", "content": "not delegated" }
+        "parameters": { "to": "person/ada", "content": "not delegated" }
     });
     let (status, _) =
         client_post_json_auth(fabric.clone(), "/v1/client/actions", credential, ungranted).await;
@@ -1257,8 +1257,8 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
         "type": "launch.create", "idempotency_key": "paired-launch-create-0001",
         "fence": { "snapshot_id": current["snapshot"]["id"], "subject_revisions": {} },
         "parameters": {
-            "title": "Nathan launch", "request": "Draft a paired mission.",
-            "target": { "type": "new-mission", "mission_id": "mission/paired-nathan", "workspace": workspace }
+            "title": "Ada launch", "request": "Draft a paired mission.",
+            "target": { "type": "new-mission", "mission_id": "mission/paired-ada", "workspace": workspace }
         }
     });
     let (status, created) =
@@ -1274,7 +1274,7 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
             .unwrap()
             .unwrap()
             .requester,
-        "person/nathan"
+        "person/ada"
     );
 
     let (status, alex_launch) = client_post_json_person(
@@ -1329,16 +1329,16 @@ async fn paired_credential_exercises_only_its_exact_person_delegation() {
         .append_claim(&st3::model::ClaimInput {
             subject: "custom/client/pairing-expired-proof".into(),
             kind: "custom.client.pairing-completed".into(),
-            actor: Some("person/nathan".into()),
+            actor: Some("person/ada".into()),
             fields: std::collections::BTreeMap::from([
                 (
                     "credential_hash".into(),
                     Value::String(hex::encode(Sha256::digest(expired_credential.as_bytes()))),
                 ),
-                ("person_id".into(), Value::String("person/nathan".into())),
+                ("person_id".into(), Value::String("person/ada".into())),
                 (
                     "session_actor".into(),
-                    Value::String("person/nathan/session/expired".into()),
+                    Value::String("person/ada/session/expired".into()),
                 ),
                 ("scopes".into(), serde_json::json!(["read.projections"])),
                 ("expires_at_unix_ms".into(), serde_json::json!(1)),
@@ -1379,14 +1379,14 @@ async fn full_control_pairing_requires_explicit_local_person_opt_in_and_can_be_r
     let begin = serde_json::json!({
         "api_version": "st3.client.v0",
         "device_name": "Full control test phone",
-        "person_id": "person/nathan",
+        "person_id": "person/alex",
         "full_control": true
     });
     let (status, denied) =
         client_post_json(paired_gateway.clone(), "/v1/client/pairings", begin.clone()).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{denied}");
     let (status, challenge) =
-        client_post_json_person(local.clone(), "/v1/client/pairings", "person/nathan", begin).await;
+        client_post_json_person(local.clone(), "/v1/client/pairings", "person/alex", begin).await;
     assert_eq!(status, StatusCode::OK, "{challenge}");
     let pairing = challenge["value"]["pairing_id"]
         .as_str()
@@ -1433,11 +1433,11 @@ async fn full_control_pairing_requires_explicit_local_person_opt_in_and_can_be_r
     }
 
     let (_, local_capabilities) =
-        client_json_person(local.clone(), "/v1/client/capabilities", "person/nathan").await;
+        client_json_person(local.clone(), "/v1/client/capabilities", "person/alex").await;
     let (status, revoked) = client_post_json_person(
         local,
         "/v1/client/actions",
-        "person/nathan",
+        "person/alex",
         serde_json::json!({
             "api_version": "st3.client.v0",
             "id": "action/revoke-full-control-test",
@@ -1490,7 +1490,7 @@ async fn core_launch_and_mission_actions_use_session_identity_and_exact_fences()
         .to_owned();
     let session_id = launch_id.trim_start_matches("launch/");
     let session = store.planning_session(session_id).unwrap().unwrap();
-    assert_eq!(session.requester, "person/nathan");
+    assert_eq!(session.requester, "person/alex");
 
     let (status, current) =
         client_json(app.clone(), &format!("/v1/client/launches/{session_id}")).await;
@@ -2028,7 +2028,7 @@ mission "ios-proof" state="ready" {
             mission: "ios-proof".into(),
             revision: None,
             workspace: root.path().display().to_string(),
-            requester: Some("person/nathan".into()),
+            requester: Some("person/alex".into()),
             mode: Some("run".into()),
             inputs: std::collections::BTreeMap::new(),
             idempotency_key: "client-blocker-run".into(),
@@ -2051,19 +2051,19 @@ mission "ios-proof" state="ready" {
     let attention = state
         .store
         .request_attention(
-            "attention/client-silber-xcode",
+            "attention/client-example-mac-xcode",
             &st3::model::AttentionRequest {
-                reviewer: "person/nathan".into(),
-                title: "Silber needs its Xcode simulator components updated".into(),
+                reviewer: "person/alex".into(),
+                title: "ExampleMac needs its Xcode simulator components updated".into(),
                 reason: "CoreSimulator is unavailable.".into(),
                 severity: "error".into(),
-                targets: vec!["host/silber".into(), subject.clone()],
+                targets: vec!["host/example-mac".into(), subject.clone()],
                 actor: "agent/client-v0-baseline.ios-owner".into(),
-                idempotency_key: "client-silber-xcode".into(),
+                idempotency_key: "client-example-mac-xcode".into(),
             },
         )
         .unwrap();
-    let reason = "Silber requires a privileged Xcode first-launch repair.";
+    let reason = "ExampleMac requires a privileged Xcode first-launch repair.";
     state
         .store
         .work_action(
@@ -2096,12 +2096,12 @@ mission "ios-proof" state="ready" {
     state
         .store
         .resolve_attention(
-            "attention/client-silber-xcode",
+            "attention/client-example-mac-xcode",
             &st3::model::AttentionResolveRequest {
                 outcome: "resolved".into(),
                 reason: Some("The simulator runtime is available.".into()),
-                actor: "person/nathan".into(),
-                idempotency_key: "client-silber-resolved".into(),
+                actor: "person/alex".into(),
+                idempotency_key: "client-example-mac-resolved".into(),
             },
         )
         .unwrap();

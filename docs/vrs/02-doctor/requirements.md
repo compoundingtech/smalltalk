@@ -34,6 +34,6 @@ It does not define fleet health.
   is a failed check that says the agent cannot send. An unavailable ledger is
   healthy because no sender history exists.
 
-The [Retirement health invariant](../../../INVARIANTS.md) and its tests prove
+The [Retirement health invariant](../../../docs/st2/invariants.md) and its tests prove
 the retirement rule. The [specification](spec.md) owns the mechanism, check
 groups, and known gaps.

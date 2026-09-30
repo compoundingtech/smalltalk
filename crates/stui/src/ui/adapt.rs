@@ -1328,11 +1328,11 @@ mod tests {
     fn small_talk_in_the_timeline_draws_as_mail_and_step_pings_as_events() {
         let timeline: Vec<TimelineEntry> = serde_json::from_value(serde_json::json!([
             {"id":"e1","sequence":4,"revision":1,"timestamp":"2026-09-29T10:00:00Z","role":"user","type":"message","final":true,
-             "body":{"message_id":"message/one","from":"agent/fleet/harbor","to":"agent/fleet/cos","title":"A question"}},
+             "body":{"message_id":"message/one","from":"agent/example/harbor","to":"agent/example/cos","title":"A question"}},
             {"id":"e2","sequence":5,"revision":1,"timestamp":"2026-09-29T10:00:00Z","role":"user","type":"content","final":true,
              "body":{"media_type":"text/plain","text":"Can you look?"}},
             {"id":"e3","sequence":8,"revision":1,"timestamp":"2026-09-29T10:01:00Z","role":"user","type":"message","final":true,
-             "body":{"message_id":"message/two","from":"daemon/runtime","to":"agent/fleet/cos","title":"Mission step ready: review"}},
+             "body":{"message_id":"message/two","from":"daemon/runtime","to":"agent/example/cos","title":"Mission step ready: review"}},
             {"id":"e4","sequence":9,"revision":1,"timestamp":"2026-09-29T10:01:00Z","role":"user","type":"content","final":true,
              "body":{"media_type":"text/plain","text":"A mission step is ready."}},
             {"id":"e5a","sequence":11,"revision":1,"timestamp":"2026-09-29T10:02:00Z","role":"assistant","type":"message","final":true,
@@ -1341,7 +1341,7 @@ mod tests {
              "body":{"media_type":"text/plain","text":"On it."}}
         ]))
         .unwrap();
-        let names = BTreeMap::from([("agent/fleet/cos".to_owned(), "COS".to_owned())]);
+        let names = BTreeMap::from([("agent/example/cos".to_owned(), "COS".to_owned())]);
         let entries = conversation(&timeline, &names);
         assert_eq!(entries.len(), 3, "{entries:#?}");
         match &entries[0].body {
@@ -1533,13 +1533,13 @@ mod tests {
             "goals": ["Audit dependencies"],
             "display_order": ["scan", "merge"],
             "steps": {
-                "scan": {"path": "scan", "work_selector": {"kind": "assigned", "agent": "agent/fleet/auditor"}, "dependencies": [], "gates": []},
+                "scan": {"path": "scan", "work_selector": {"kind": "assigned", "agent": "agent/example/auditor"}, "dependencies": [], "gates": []},
                 "merge": {"path": "merge", "work_selector": {"kind": "agentless"}, "dependencies": [{"dependency": "step", "step": "scan", "state": "completed"}], "gates": [{"reviewer": "person/robin"}]}
             }
         });
         let preview = preview("harbor/audit", &normalized);
         assert_eq!(preview.goals, vec!["Audit dependencies"]);
-        assert_eq!(preview.steps[0].assignee, "fleet/auditor");
+        assert_eq!(preview.steps[0].assignee, "example/auditor");
         assert_eq!(preview.steps[1].after, vec!["scan"]);
         assert!(preview.steps[1].asks_you);
         assert_eq!(preview.agents.len(), 1);
@@ -1672,7 +1672,7 @@ mod tests {
         let step = |id: &str, path: &str, state: &str, claimant: Option<&str>| {
             serde_json::json!({
                 "id": id, "path": path, "state": state, "attempt": 1,
-                "assignee": "agent/fleet/harbor/keeper", "claimant": claimant,
+                "assignee": "agent/example/harbor/keeper", "claimant": claimant,
                 "since": "2026-09-29T09:58:00Z", "goals": [format!("Do {path}.")],
                 "constraints": [], "blockers": [],
             })
@@ -1702,13 +1702,13 @@ mod tests {
                 // A finished earlier run whose steps must not mix with the open one.
                 run("mission-run/audit-0", "completed", vec![step("step-run/old/scan", "scan", "completed", None)]),
                 run("mission-run/audit-1", "running", vec![
-                    step("step-run/audit-1/scan", "scan", "claimed", Some("agent/fleet/harbor/keeper")),
+                    step("step-run/audit-1/scan", "scan", "claimed", Some("agent/example/harbor/keeper")),
                     step("step-run/audit-1/report", "report", "ready", None),
                 ]),
             ],
         })]);
         model.agents = window(vec![serde_json::json!({
-            "id": "agent/fleet/harbor/keeper", "kind": "agent", "revision": "r2",
+            "id": "agent/example/harbor/keeper", "kind": "agent", "revision": "r2",
             "updated_at": "2026-09-29T09:59:00Z", "name": "fleet/harbor/keeper",
             "state": "running", "reachability": "local", "harness_state": "working",
             "host_id": "host/lighthouse", "runtime_ids": ["runtime/keeper"],
@@ -1737,7 +1737,7 @@ mod tests {
             [("scan", StepState::Working), ("report", StepState::Ready)]
         );
         assert_eq!(mission.steps[0].goals, ["Do scan."]);
-        assert_eq!(mission.agents, ["agent/fleet/harbor/keeper"]);
+        assert_eq!(mission.agents, ["agent/example/harbor/keeper"]);
         assert_eq!(
             mission.steps[1].note.as_deref(),
             Some("queued for Keeper, which is busy with fleet/harbor · Audit › scan")

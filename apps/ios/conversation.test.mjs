@@ -3,7 +3,7 @@ import { applyConversation, conversationRows } from './sessionView.ts';
 
 const status = sequence => ({ id: `entry/${sequence}`, revision: 1, sequence, type: 'status', role: 'system', body: { state: 'idle' } });
 const content = (sequence, text) => ({ id: `entry/${sequence}`, revision: 1, sequence, type: 'content', role: 'assistant', body: { media_type: 'text/plain', text } });
-const message = (sequence, title) => ({ id: `entry/${sequence}-message`, revision: 1, sequence, type: 'message', role: 'user', body: { message_id: `message/${sequence}`, from: 'agent/fleet/lead', to: 'agent/fleet/worker', title } });
+const message = (sequence, title) => ({ id: `entry/${sequence}-message`, revision: 1, sequence, type: 'message', role: 'user', body: { message_id: `message/${sequence}`, from: 'agent/example/lead', to: 'agent/example/worker', title } });
 const texts = conversation => conversation.entries.map(entry => entry.body.text ?? entry.body.title);
 
 // A newest page full of status heartbeats does not hide the conversation in it, and Small Talk

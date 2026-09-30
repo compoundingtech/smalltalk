@@ -1454,7 +1454,7 @@ mod tests {
                 ]},
                 {"hooks": [{"type": "command", "command": "user-audit.sh"}]},
                 {"hooks": [{"type": "command", "command": "/old/root/sets/sha256-aaa/claude-observe.sh Stop"}]},
-                {"hooks": [{"type": "command", "command": "/home/x/claude-observe.sh Stop"}]},
+                {"hooks": [{"type": "command", "command": "/home/example/claude-observe.sh Stop"}]},
                 {"hooks": [{"type": "command", "command": "$ST_HOOKS_SUFFIX/tool.sh"}]}
             ]}
         });
@@ -1473,7 +1473,7 @@ mod tests {
                     ]},
                     {"hooks": [{"type": "command", "command": "user-audit.sh"}]},
                     // A managed basename OUTSIDE a set-shaped path is a user's wrapper: foreign.
-                    {"hooks": [{"type": "command", "command": "/home/x/claude-observe.sh Stop"}]},
+                    {"hooks": [{"type": "command", "command": "/home/example/claude-observe.sh Stop"}]},
                     // `$ST_HOOKS_SUFFIX` is somebody else's variable, not ours at a boundary.
                     {"hooks": [{"type": "command", "command": "$ST_HOOKS_SUFFIX/tool.sh"}]},
                     {"hooks": [{"type": "command", "command": "/new/root/sets/sha256-bbb/claude-observe.sh Stop"}]}
