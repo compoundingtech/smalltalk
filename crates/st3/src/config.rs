@@ -496,6 +496,8 @@ impl Config {
             let host = url.host_str().unwrap_or_default();
             let permitted = host.eq_ignore_ascii_case("localhost")
                 || host
+                    .trim_start_matches('[')
+                    .trim_end_matches(']')
                     .parse::<std::net::IpAddr>()
                     .is_ok_and(|address| is_permitted_route_address(&address));
             anyhow::ensure!(
