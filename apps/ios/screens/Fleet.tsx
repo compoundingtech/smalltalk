@@ -10,6 +10,12 @@ import { TABS } from '../tabs';
 import { theme } from '../theme';
 import { Button, Field, ListRow, Note, Screen, SectionHeader, T } from '../ui';
 
+function machineGlyph(state: string): { glyph: string; color: string } {
+  if (state === 'local' || state === 'reachable' || state === 'dial-out') return { glyph: '●', color: theme.idle };
+  if (state === 'unreachable') return { glyph: '✕', color: theme.fault };
+  return { glyph: '?', color: theme.quiet };
+}
+
 // Fleet: machines, what runs where, this connection and the paired devices.
 export function FleetScreen() {
   const { data, truncated, caps, url, gatewayMachineId, gatewayHost, order, actions } = useStore();
@@ -33,8 +39,8 @@ export function FleetScreen() {
       <SectionHeader title="machines" count={data.machines.length} />
       {data.machines.map(machine => <View key={machine.id}>
         <ListRow
-          glyph={machine.state === 'online' || machine.state === 'ready' ? '●' : '○'}
-          glyphColor={machine.state === 'online' || machine.state === 'ready' ? theme.idle : theme.quiet}
+          glyph={machineGlyph(machine.state).glyph}
+          glyphColor={machineGlyph(machine.state).color}
           title={`${machine.name}${machine.id === gatewayMachineId ? ' · this gateway' : ''}`}
           right={<T dim>{machine.occupancy.running_runtimes} running</T>}
           second={`${machine.state} · ${machine.capacity.state} · ${machine.transports.map(t => `${t.protocol} ${t.status}`).join(' · ')}`}
