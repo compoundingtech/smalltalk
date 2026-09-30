@@ -3040,6 +3040,14 @@ fn main() -> ExitCode {
         println!("{}", st2::reexec::probe_answer());
         return ExitCode::SUCCESS;
     }
+    // A seat's harness runs its hooks through this binary. They are hidden from help, need no
+    // daemon or config to start, and the status line runs every few seconds, so they skip the
+    // CLI parser and the async runtime.
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(st3::driver_hook::SUBCOMMAND))
+    {
+        return run_driver_hook();
+    }
     // SAFETY: no other thread exists yet; the async runtime starts after this returns.
     unsafe { st2::reexec::take_resume_environment() };
     if st2::reexec::resume_path(st2::reexec::DRIVER_RESUME_ENV).is_some() {
@@ -3061,6 +3069,42 @@ fn main() -> ExitCode {
         record_daemon_commands(args);
     }
     run_cli(cli)
+}
+
+/// `st driver-hook NAME [ARGS]`: answer one harness hook with the payload on stdin.
+fn run_driver_hook() -> ExitCode {
+    let arguments = std::env::args().skip(2).collect::<Vec<_>>();
+    let Some((name, rest)) = arguments.split_first() else {
+        eprintln!(
+            "usage: st {} NAME [ARGS]; NAME is one of {}",
+            st3::driver_hook::SUBCOMMAND,
+            st3::driver_hook::HOOKS.join(", ")
+        );
+        return ExitCode::from(2);
+    };
+    // Telemetry as st2's CLI built it: an event hook is its own `hook` process unit, and the
+    // status line, which Claude runs every five seconds, builds no exporter at all.
+    let mut telemetry = match name.as_str() {
+        "claude-observe" => st2::telemetry::Telemetry::init("hook"),
+        _ => st2::telemetry::Telemetry::local_only(),
+    };
+    let env = st3::driver_hook::ProcessEnv;
+    let code = st3::driver_hook::run(
+        name,
+        rest,
+        &env,
+        &mut std::io::stdin().lock(),
+        &mut |diagnostic| {
+            if let Err(error) = st3::driver_hook::post_diagnostic(&env, &diagnostic) {
+                eprintln!(
+                    "st: could not record the {} diagnostic: {error:#}",
+                    diagnostic.code
+                );
+            }
+        },
+    );
+    telemetry.shutdown();
+    ExitCode::from(code)
 }
 
 /// The daemon finds `git` and `gh` through its recorder like every member does. `run_up` installs
@@ -3498,10 +3542,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
     config.validate()?;
     validate_unix_socket_path(&config.socket, "--socket")?;
     validate_unix_socket_path(&config.client_gateway_socket, "--client-gateway-socket")?;
-    st2::hooks::ensure_installed().context(
+    fs::create_dir_all(&config.state_dir)?;
+    st3::hooks::ensure_installed(&st3::hooks::root(&config.state_dir)).context(
         "publishing this st binary's required lifecycle hook set before starting the daemon",
     )?;
-    fs::create_dir_all(&config.state_dir)?;
     st3::profile::init_from_env();
     raise_open_file_limit();
     let store = Arc::new(st3::profile::task("startup open-store", || {
@@ -7940,10 +7984,9 @@ fn agent_start_document(args: &AgentStartArgs) -> Result<String> {
     Ok(publication_document(agent))
 }
 
-/// The Claude settings the fleet's Claude seats run with: st's channel plugin on and the older
-/// st2 channel plugin off.
-const CLAUDE_SEAT_SETTINGS: &str =
-    r#"{"enabledPlugins":{"st2-channel@st2":false,"st3-channel@st2":true}}"#;
+/// The Claude settings the fleet's Claude seats run with: st's own channel plugin on, and the
+/// plugins st2's marketplace shipped off.
+const CLAUDE_SEAT_SETTINGS: &str = r#"{"enabledPlugins":{"st2-channel@st2":false,"st3-channel@st2":false,"st3-channel@st3":true}}"#;
 
 /// The declaration `st agents new` publishes: what a person writes by hand for a fleet seat.
 /// Claude and Codex seats get the harness defaults the fleet's existing seats run with.
@@ -11110,6 +11153,11 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
                 ),
             );
         }
+        // Harness-session state (OpenCode delivery ledgers, Claude resume bindings) stays beneath
+        // st3's driver directory, never st2's; the seat's hooks choose the same root.
+        if let Some(drivers) = std::env::var_os("ST3_DRIVER_STATE_DIR") {
+            st2::run::use_harness_state_root(PathBuf::from(drivers).join("sessions"));
+        }
         if let Some(state) = st2::reexec::resume_path(st2::reexec::DRIVER_RESUME_ENV) {
             return resume_native_driver(client, subject, &args.driver, argv, &state).await;
         }
@@ -11537,6 +11585,7 @@ async fn drive_st2_native(
     let mut last_capacity_fingerprint = None;
     let mut delivery = NativeDeliverySupervisor::resumed(loop_state.delivery_episode);
     let mut replacement = DriverReplacement::new();
+    let mut binding_watch = ClaudeBindingWatch::default();
     loop {
         tokio::select! {
             result = &mut task => {
@@ -11596,6 +11645,37 @@ async fn drive_st2_native(
                 } else {
                     None
                 };
+                if driver == "claude"
+                    && let Some(reason) = binding_watch.overdue(
+                        &agent_dir,
+                        provider_incarnation.as_deref(),
+                        Instant::now(),
+                    )
+                {
+                    let session = provider_incarnation.clone().unwrap_or_default();
+                    let posted: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
+                        subject: subject.into(),
+                        kind: "harness.diagnostic".into(),
+                        actor: Some(subject.into()),
+                        fields: BTreeMap::from([
+                            ("severity".into(), Value::String("error".into())),
+                            ("status".into(), Value::String("failed".into())),
+                            ("code".into(), Value::String(st3::driver_hook::UNBOUND_CODE.into())),
+                            ("reason".into(), Value::String(reason)),
+                            ("incarnation_id".into(), Value::String(incarnation.clone())),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!(
+                            "{}:{subject}:{session}",
+                            st3::driver_hook::UNBOUND_CODE
+                        )),
+                    }).await;
+                    if let Err(error) = posted {
+                        binding_watch.retry();
+                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    }
+                }
                 // Delivery runs first and on its own: a failing observation publish must never
                 // hold back a message.
                 if driver == "claude" {
@@ -11780,6 +11860,61 @@ fn harness_record_belongs_to_current_session(
     current: Option<&[u8]>,
 ) -> bool {
     already_started || current.is_some_and(|bytes| Some(bytes) != predecessor)
+}
+
+/// How long a Claude wrapper session may run before a missing native-session binding is a fault.
+/// SessionStart fires as Claude starts, so a minute covers a slow start.
+const CLAUDE_BINDING_GRACE: Duration = Duration::from_secs(60);
+
+/// Watches that the current Claude wrapper session gets its native-session binding. The seat's
+/// SessionStart hook writes it; when the hook cannot run at all (its st3 binary is missing, or the
+/// seat's settings name no hooks), only the driver can notice.
+#[derive(Default)]
+struct ClaudeBindingWatch {
+    session: Option<String>,
+    since: Option<Instant>,
+    settled: bool,
+}
+
+impl ClaudeBindingWatch {
+    /// The reason to record once `session` has run past the grace period with no binding. It is
+    /// returned once per wrapper session.
+    fn overdue(&mut self, agent_dir: &Path, session: Option<&str>, now: Instant) -> Option<String> {
+        let session = session?;
+        if self.session.as_deref() != Some(session) {
+            self.session = Some(session.to_owned());
+            self.since = Some(now);
+            self.settled = false;
+        }
+        if self.settled {
+            return None;
+        }
+        if st3::hooks::claude_binding(agent_dir, session).is_some() {
+            self.settled = true;
+            return None;
+        }
+        if now.duration_since(self.since?) < CLAUDE_BINDING_GRACE {
+            return None;
+        }
+        self.settled = true;
+        let variable = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "unset".into())
+        };
+        Some(format!(
+            "Claude has run for {} s and its SessionStart hook bound no native session, so st cannot find this seat's transcript. The hooks run \"$ST_HOOKS/claude-observe.sh\" (ST_HOOKS={}), which runs ST3_BIN={}.",
+            CLAUDE_BINDING_GRACE.as_secs(),
+            variable("ST_HOOKS"),
+            variable("ST3_BIN"),
+        ))
+    }
+
+    /// Report again on the next tick, after a report the daemon did not take.
+    fn retry(&mut self) {
+        self.settled = false;
+    }
 }
 
 fn native_file_may_override_channel(driver: &str) -> bool {

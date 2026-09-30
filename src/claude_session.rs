@@ -47,7 +47,6 @@ pub fn run_residency_attempt(
     resume_generation: crate::residency::Generation,
     required_incarnation: String,
 ) -> Result<()> {
-
     anyhow::ensure!(
         !required_incarnation.is_empty(),
         "Claude required runtime incarnation is empty"
@@ -553,8 +552,7 @@ pub fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
         hash.update(value);
     }
     let digest = format!("{:x}", hash.finalize());
-    crate::run::state_root()
-        .join("st2")
+    crate::run::harness_state_root()
         .join("claude")
         .join(&digest[..24])
 }
@@ -1114,24 +1112,63 @@ pub fn run_observe(
     let agent_dir =
         message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
             .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
+    let mut raw = String::new();
+    let _ = std::io::stdin().read_to_string(&mut raw);
+    let var = |name: &str| std::env::var(name).ok();
+    observe_payload(
+        catalog_root,
+        &agent_dir,
+        identity,
+        runtime_id,
+        event,
+        &raw,
+        &var,
+    )
+}
+
+/// Apply one Claude hook event whose payload the caller already read. st3 answers its seats'
+/// hooks through this, so a hook process never needs an `st2` program. `var` reads the hook's
+/// environment: the wrapper-session variables ([`SESSION_ENV`] and its siblings) and `HOME`.
+pub fn run_observe_payload(
+    catalog_root: &Path,
+    identity: &str,
+    runtime_id: Option<&str>,
+    event: &str,
+    raw: &str,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Result<()> {
+    let agent_dir =
+        message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
+            .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
+    observe_payload(
+        catalog_root,
+        &agent_dir,
+        identity,
+        runtime_id,
+        event,
+        raw,
+        var,
+    )
+}
+
+fn observe_payload(
+    catalog_root: &Path,
+    agent_dir: &Path,
+    identity: &str,
+    runtime_id: Option<&str>,
+    event: &str,
+    raw: &str,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Result<()> {
     // Counted only once the invocation has its application target: a hook for an undeclared
     // agent errors out before any state is applied and must not inflate `hook_invocations_total`.
     crate::metrics::record_hook_invocation("claude-observe", event);
-    let mut raw = String::new();
-    let _ = std::io::stdin().read_to_string(&mut raw);
-    let payload = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
-    let exported_session = std::env::var(SESSION_ENV)
-        .ok()
-        .filter(|value| !value.is_empty());
-    let exported_seq = std::env::var(SESSION_SEQ_ENV)
-        .ok()
-        .and_then(|seq| seq.parse::<u64>().ok());
-    let resume_generation_raw = std::env::var(RESUME_GENERATION_ENV)
-        .ok()
-        .filter(|value| !value.is_empty());
-    let expected_native_session = std::env::var(EXPECTED_NATIVE_SESSION_ENV)
-        .ok()
-        .filter(|value| !value.is_empty());
+    let payload = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
+    let exported_session = var(SESSION_ENV).filter(|value| !value.is_empty());
+    let exported_seq = var(SESSION_SEQ_ENV).and_then(|seq| seq.parse::<u64>().ok());
+    let resume_generation_raw = var(RESUME_GENERATION_ENV).filter(|value| !value.is_empty());
+    let expected_native_session =
+        var(EXPECTED_NATIVE_SESSION_ENV).filter(|value| !value.is_empty());
     let mandatory_resume = resume_generation_raw.is_some() || expected_native_session.is_some();
     let resume_generation = resume_generation_raw
         .map(|value| {
@@ -1193,7 +1230,7 @@ pub fn run_observe(
         tracing::warn!("st2 claude-observe: harness-timeline write failed: {error:#}");
     }
     if event == "Stop" {
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = var("HOME") {
             if let Err(error) = crate::harness_timeline::observe_claude_stop_transcript(
                 &mut timeline,
                 &payload,

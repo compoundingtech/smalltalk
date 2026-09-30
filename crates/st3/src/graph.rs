@@ -2132,10 +2132,10 @@ fn driver_member(
         // The channel wakes the real TUI, while Claude's own lifecycle hooks externalize the
         // resulting turn. Supplying the canonical registration as an additional native settings
         // source keeps arbitrary user workspaces untouched and gives every typed st seat the
-        // same UserPromptSubmit/Stop state edges as a materialized st2 seat.
+        // same UserPromptSubmit/Stop state edges.
         provider.extend([
             "--settings".into(),
-            st2::hooks::claude_st3_settings_registration().to_string(),
+            crate::hooks::claude_settings_registration().to_string(),
         ]);
     }
     if let Some(model) = model {
@@ -5083,7 +5083,7 @@ version 2
             .expect("typed Claude seats carry lifecycle hook settings");
         assert_eq!(
             serde_json::from_str::<Value>(settings).unwrap(),
-            st2::hooks::claude_st3_settings_registration()
+            crate::hooks::claude_settings_registration()
         );
         assert!(
             !argv
