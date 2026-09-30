@@ -1,0 +1,4 @@
+# Give the full fault matrix time to finish its CI retries within the test window.
+[[profile.default.overrides]]
+filter = 'package(st3) and test(/^messaging_faults::messages_recover_across_transport_and_process_faults$/)'
+priority = 200
