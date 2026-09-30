@@ -7,6 +7,39 @@ or replica. Devices read and act through a member's client gateway and are not s
 
 Replication makes the logical authority equal across configured nodes. It does not make the SQLite files byte-identical.
 
+## Sync invariants
+
+Every shared projection folds claims in the canonical total order: numeric acceptance time,
+writer, replica sequence, batch identity and immutable position, with claim identity as the final
+tie break. Arrival order belongs to local cursors, caches and operational overlays. Equal claims
+must produce equal shared rows and selected source identities through incremental admission,
+restart replay and checkpoint trimming.
+
+The digest covers everything that is synced: authenticated claim and blob identity, and every
+shared logical projection and its shared columns. Each shared table or claim-derived source has
+its own digest so a mismatch names the source. Local receipt metadata, physical indexes, secrets,
+lease overlays and live reachability are excluded explicitly. Retained history and checkpoint
+tombstones represent the same logical source identity.
+
+`store::tests::canonical_audit::every_shared_projection_agrees_after_shuffle_restart_and_checkpoint`
+checks both invariants by comparing shared rows, selected readers and per-table digest oracles
+across isolated stores. `shared_folds_never_order_by_local_arrival` rejects raw shared arrival
+folds, and `every_persistent_table_has_a_projection_scope` rejects unclassified tables. A new
+shared table must join the shuffle test's inventory and history fixture,
+the canonical ordering guard, and the production digest registry in the same change. A new
+shared claim-derived view must compare its answer at the same explicit time and recipients.
+
+The [canonical projections audit](canonical-projections-audit.md) records the current gaps and
+local exceptions. Its regression intentionally fails on the audited baseline: the current graph
+digest covers only selected columns of six tables. A matching legacy graph digest is therefore
+not yet proof that these invariants hold for every shared outcome.
+
+Shared reducers use `store/canonical.rs`. `canonical_sql` expands `CANONICAL_ASC(ALIAS)` and
+`CANONICAL_DESC(ALIAS)` in a query; `CANONICAL_ORDER` and its descending counterpart format the
+same order for existing claim queries. In-memory comparisons use `claim_key` or
+`key_from_record`, and claim-to-claim predicates use `after_sql`. Legacy batch position is its
+relative position within the batch. A global arrival index never chooses a shared winner.
+
 ## Add any machine
 
 Install st on the new machine and configure the person who operates it, as described in the
