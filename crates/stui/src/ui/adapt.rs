@@ -1650,7 +1650,7 @@ mod tests {
                     "must_act": "agent", "state_since": "2026-09-29T09:58:00Z",
                     "steps": [
                         {"id": "step-run/build-1/build", "path": "build", "state": state, "attempt": 1,
-                         "claimant": "agent/fleet/harbor/builder", "since": "2026-09-29T09:58:00Z"},
+                         "claimant": "agent/example/harbor/builder", "since": "2026-09-29T09:58:00Z"},
                         {"id": "step-run/build-1/deploy", "path": "deploy", "state": "waiting", "attempt": 0,
                          "since": "2026-09-29T09:58:00Z"}
                     ],
