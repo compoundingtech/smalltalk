@@ -18,10 +18,12 @@ import path from "node:path";
 const dir = fs.mkdtempSync(path.join(os.tmpdir(), "st2-pi-smoke-"));
 const framesPath = path.join(dir, "frames.jsonl");
 const recorder = path.join(dir, "recorder");
+const pidPath = path.join(dir, "channel-pids");
 fs.writeFileSync(
   recorder,
   `#!${process.execPath}
 import fs from "node:fs";
+fs.appendFileSync(${JSON.stringify(pidPath)}, process.pid + "\\n");
 process.stdout.write(JSON.stringify({ type: "hello", protocol: 1, sessionContext: "" }) + "\\n");
 process.stdin.setEncoding("utf8");
 process.stdin.on("data", (chunk) => fs.appendFileSync(${JSON.stringify(framesPath)}, chunk));
@@ -127,6 +129,17 @@ for (const ctx of [bareCtx, fullCtx, throwingCtx]) {
   await handlers.get("agent_settled")({}, ctx);
   await handlers.get("session_shutdown")({ reason: "smoke" }, ctx);
 }
+
+// A killed channel reconnects without a provider restart or synthetic model turn.
+await handlers.get("session_start")({}, bareCtx);
+await new Promise((resolve) => setTimeout(resolve, 150));
+const oldPid = Number(fs.readFileSync(pidPath, "utf8").trim().split("\n").at(-1));
+const beforeIdle = readFrames().filter((frame) => frame.type === "state" && frame.state === "idle").length;
+process.kill(oldPid, "SIGKILL");
+await new Promise((resolve) => setTimeout(resolve, 1000));
+assert.notStrictEqual(Number(fs.readFileSync(pidPath, "utf8").trim().split("\n").at(-1)), oldPid);
+assert.ok(readFrames().filter((frame) => frame.type === "state" && frame.state === "idle").length > beforeIdle);
+await handlers.get("session_shutdown")({ reason: "quit" }, bareCtx);
 
 // Give the recorder a moment to drain what was written to its stdin, then assert the wire.
 await new Promise((resolve) => setTimeout(resolve, 500));

@@ -2824,6 +2824,8 @@ enum MessageCommand {
     Send(MessageSendArgs),
     /// List the current mailbox for one explicit identity.
     Ls(MessageListArgs),
+    /// Show delivery and read progress without changing the message lifecycle.
+    Status(MessageReferenceArgs),
     /// Read exact messages and optionally mark them read or archived.
     Read(MessageReadArgs),
     /// Reply to one canonical message ID while preserving its thread.
@@ -6713,8 +6715,7 @@ async fn wait_for_first_sync(
             match first.state.as_str() {
                 "verified" | "failed" => return Ok(Some(first)),
                 _ => {
-                    if progress
-                        && reported.is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
+                    if progress && reported.is_none_or(|at| at.elapsed() >= Duration::from_secs(10))
                     {
                         reported = Some(std::time::Instant::now());
                         let behind = status
@@ -10235,6 +10236,36 @@ async fn run_message(
                 Ok(())
             }
         }
+        MessageCommand::Status(args) => {
+            let value: Value = client
+                .get(&format!(
+                    "/v1/messages/delivery/{}",
+                    urlencoding::encode(&args.reference)
+                ))
+                .await?;
+            if json_output {
+                print_value(&value, true)
+            } else {
+                println!(
+                    "{} · {} → {}",
+                    value["id"].as_str().unwrap_or("message"),
+                    value["from"].as_str().unwrap_or("sender"),
+                    value["to"].as_str().unwrap_or("recipient")
+                );
+                println!(
+                    "{} · {}",
+                    value
+                        .pointer("/delivery/phase")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown"),
+                    value
+                        .pointer("/delivery/reason")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
+                );
+                Ok(())
+            }
+        }
         MessageCommand::Ls(args) => {
             let identity = message_list_identity(
                 args.identity.or(args.actor),
@@ -12265,10 +12296,27 @@ async fn run_pi_channel(
                         Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
                     }
                 }
+                // A recipient can read or close a failed handoff through another native
+                // path. Its authoritative receipt settles that retry and its health warning.
+                for message in state.failed_handoffs.keys().cloned().collect::<Vec<_>>() {
+                    if let Ok(view) = read_message(client, &message).await
+                        && matches!(view.status.as_str(), "delivered" | "read" | "closed") {
+                        state.failed_handoffs.remove(&message);
+                        state.retry_after_ms.remove(&message);
+                        state.failed_diagnostics.remove(&message);
+                    }
+                }
                 // The first page is polled on every tick, before the first idle too: the poll
                 // carries this channel's delivery report, which is how the daemon knows the
                 // seat's delivery path is live and current.
-                let report = native_delivery_report(&transport, None);
+                let mut report: Value = serde_json::from_str(&native_delivery_report(&transport, None))?;
+                report["ready"] = json!(state.first_idle_seen && state.failed_handoffs.is_empty());
+                if !state.first_idle_seen {
+                    report["reason"] = json!("the channel has not received the provider's initial idle proof");
+                } else if !state.failed_handoffs.is_empty() {
+                    report["reason"] = json!("the provider rejected a native handoff; the channel keeps retrying");
+                }
+                let report = report.to_string();
                 let mut cursor = None;
                 loop {
                     let page = match message_page_reporting(
@@ -12287,6 +12335,10 @@ async fn run_pi_channel(
                         break;
                     }
                     for message in page.items.into_iter().filter(|message| matches!(message.status.as_str(), "sent" | "staged")) {
+                    if state.retry_after_ms.get(&message.subject).is_some_and(|after|
+                        current_unix_ms().unwrap_or_default() < u128::from(*after)) {
+                        continue;
+                    }
                     if !state.delivered.insert(message.subject.clone()) {
                         continue;
                     }
@@ -12401,6 +12453,8 @@ struct PiChannelResume {
     session: String,
     delivered: BTreeSet<String>,
     failed_handoffs: BTreeMap<String, u32>,
+    #[serde(default)]
+    retry_after_ms: BTreeMap<String, u64>,
     failed_diagnostics: BTreeSet<String>,
     first_idle_seen: bool,
     frame_sequence: u64,
@@ -12437,6 +12491,9 @@ impl PiChannelResume {
                 let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else {
                     return false;
                 };
+                self.failed_handoffs.remove(message);
+                self.retry_after_ms.remove(message);
+                self.failed_diagnostics.remove(message);
                 self.pending.acknowledgements.insert(message.to_owned());
                 true
             }
@@ -12445,10 +12502,16 @@ impl PiChannelResume {
                     return false;
                 };
                 let failures = self.failed_handoffs.entry(message.to_owned()).or_default();
-                *failures += 1;
-                if *failures < 3 {
-                    self.delivered.remove(message);
-                } else {
+                *failures = failures.saturating_add(1);
+                // A negative native receipt authorizes another attempt. Keep retrying after
+                // the diagnostic threshold; a temporary failure must never strand the head.
+                let delay_ms = (500u64 << (*failures).min(4)).min(5_000);
+                self.retry_after_ms.insert(
+                    message.to_owned(),
+                    (current_unix_ms().unwrap_or_default() as u64).saturating_add(delay_ms),
+                );
+                self.delivered.remove(message);
+                if *failures >= 3 {
                     self.failed_diagnostics.insert(message.to_owned());
                 }
                 false
@@ -14243,6 +14306,25 @@ mod tests {
         // A handoff failure below the retry limit makes the message deliverable again.
         assert!(!resumed.accept_frame(r#"{"type":"failed","meta":{"messageId":"message/one"}}"#));
         assert!(!resumed.delivered.contains("message/one"));
+    }
+
+    #[test]
+    fn repeated_negative_handoffs_keep_retrying_and_resume_the_backoff() {
+        let mut state = PiChannelResume::default();
+        for _ in 0..5 {
+            state.delivered.insert("message/retry".into());
+            state.accept_frame(r#"{"type":"failed","meta":{"messageId":"message/retry"}}"#);
+            assert!(!state.delivered.contains("message/retry"));
+            assert!(state.retry_after_ms.contains_key("message/retry"));
+        }
+        assert!(state.failed_diagnostics.contains("message/retry"));
+        let mut resumed: PiChannelResume =
+            serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(state.retry_after_ms, resumed.retry_after_ms);
+        resumed.accept_frame(r#"{"type":"delivered","meta":{"messageId":"message/retry"}}"#);
+        assert!(!resumed.retry_after_ms.contains_key("message/retry"));
+        assert!(!resumed.failed_diagnostics.contains("message/retry"));
+        assert!(!resumed.failed_handoffs.contains_key("message/retry"));
     }
 
     #[test]

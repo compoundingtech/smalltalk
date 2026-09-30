@@ -7,7 +7,13 @@ same-repository pull request heads and pushes to `main`. Each run checks the exa
 commit. A pull request run merges that commit with the latest `main` in a temporary checkout
 before running `cargo test --workspace --locked` and
 `cargo clippy --workspace --all-targets --locked`. Linux also checks generated clients and
-runs the fleet compatibility test against the pinned older st3 baseline.
+runs the fleet compatibility test against the pinned older st3 baseline. The normal Linux test
+suite also runs the token-free two-node messaging fault matrix: daemon restart, binary replacement,
+short and two-minute partitions, receiver downtime, provider restart, channel death, an actual
+historical channel and repeated rejected handoffs. It requires one native handoff and a graph
+read within ten seconds of recovery. The historical channel build is pinned separately in
+`.github/messaging-compat-baseline.json` and cached by Nix. See
+[the eval contract](../evals/st3/messaging-faults/README.md).
 
 On Linux, the workspace test build runs first and alone, without debug information. Then the
 tests, Clippy, the generated client check and the fleet compatibility test run side by side, and
