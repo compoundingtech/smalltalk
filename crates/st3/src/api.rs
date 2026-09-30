@@ -56,6 +56,7 @@ use crate::store::Store;
 
 mod client_v0;
 mod delivery_presence;
+mod delivery_probes;
 mod terminal_view;
 
 #[derive(Clone)]
@@ -4114,6 +4115,10 @@ struct NativeDeliveryPeer {
 
 fn native_delivery_peer(pid: u32) -> Option<NativeDeliveryPeer> {
     let (args, env) = local_process_arguments(pid)?;
+    native_delivery_identity(pid, &args, &env)
+}
+
+fn native_delivery_identity(pid: u32, args: &[String], env: &[String]) -> Option<NativeDeliveryPeer> {
     let transport = args.windows(2).find_map(|pair| {
         if pair[0] != "driver" {
             return None;
@@ -4121,7 +4126,7 @@ fn native_delivery_peer(pid: u32) -> Option<NativeDeliveryPeer> {
         match pair[1].as_str() {
             "omp-channel" => Some("omp-channel"),
             "pi-channel" => Some("pi-channel"),
-            "claude" => Some("claude-channel"),
+            "claude" | "claude-mcp" => Some("claude-channel"),
             "codex" => Some("app-server"),
             "opencode" => Some("opencode-server"),
             _ => None,
@@ -4629,6 +4634,30 @@ fn graph_references_check(unresolved: &[String]) -> DoctorCheck {
     }
 }
 
+fn unread_current_seat_counts(
+    store: &Store,
+    recipients: &BTreeSet<&str>,
+    messages: &[MessageView],
+    now: u128,
+) -> anyhow::Result<(usize, usize)> {
+    let mut pending = 0;
+    let mut accepted = 0;
+    for message in messages.iter().filter(|message| {
+        recipients.contains(message.to.as_str())
+            && !matches!(message.status.as_str(), "read" | "closed")
+    }) {
+        let claims = store.claims_for(&message.subject, Some("message.sent"))?;
+        let sent_at = claims
+            .first()
+            .map(|claim| claim.accepted_at_unix_ms)
+            .unwrap_or_default();
+        if now.saturating_sub(sent_at) > 10_000 {
+            pending += 1;
+            accepted += usize::from(message.status == "delivered");
+        }
+    }
+    Ok((pending, accepted))
+}
 fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     let mut checks = Vec::new();
     match state.store.index() {
@@ -5044,6 +5073,10 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         state.store.operational_messages(None, false),
     ) {
         (Ok(agents), Ok(messages)) => {
+            let current_recipients = agents
+                .iter()
+                .filter_map(|agent| agent["id"].as_str())
+                .collect::<BTreeSet<_>>();
             let mut blocked = agents
                 .iter()
                 .filter(|agent| {
@@ -5060,25 +5093,14 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                     )
                 })
                 .collect::<Vec<_>>();
-            let mut pending = 0;
-            for message in messages.iter().filter(|message| {
-                message.to.starts_with("agent/")
-                    && !matches!(message.status.as_str(), "read" | "closed")
-            }) {
-                let claims = state
-                    .store
-                    .claims_for(&message.subject, Some("message.sent"))
-                    .map_err(ApiError::internal)?;
-                let sent_at = claims
-                    .first()
-                    .map(|claim| claim.accepted_at_unix_ms)
-                    .unwrap_or_default();
-                if client_now_ms().saturating_sub(sent_at) > 10_000 {
-                    pending += 1;
-                }
-            }
+            let (pending, accepted) = unread_current_seat_counts(
+                &state.store,
+                &current_recipients,
+                &messages,
+                client_now_ms(),
+            ).map_err(ApiError::internal)?;
             if pending > 0 {
-                blocked.push(format!("{pending} messages have waited more than 10s for recipient read; inspect `st conversations status MESSAGE`"));
+                blocked.push(format!("{pending} current-seat messages older than 10s lack a recipient graph read receipt ({accepted} accepted native handoffs); this does not prove that a legacy channel failed to consume them. Inspect `st conversations status MESSAGE`"));
             }
             checks.push(DoctorCheck {
                 name: "message-delivery".into(),
@@ -5092,6 +5114,15 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         }
         (Err(error), _) | (_, Err(error)) => checks.push(DoctorCheck {
             name: "message-delivery".into(),
+            status: "warn".into(),
+            message: error.to_string(),
+        }),
+    }
+    match delivery_probes::check(&state.store, client_now_ms()) {
+        Ok(Some(check)) => checks.push(check),
+        Ok(None) => {}
+        Err(error) => checks.push(DoctorCheck {
+            name: "delivery-probes".into(),
             status: "warn".into(),
             message: error.to_string(),
         }),
@@ -11586,6 +11617,60 @@ mod tests {
         assert!(delivery_presence::known(recipient).is_none());
         record_legacy_poll(Some(&peer), Some(recipient), false);
         assert_eq!(delivery_presence::known(recipient).unwrap().state, "legacy");
+    }
+
+    #[test]
+    fn legacy_claude_mcp_is_a_delivery_peer_but_ordinary_mailbox_queries_are_not() {
+        let env = vec!["ST_AGENT=agent/example/legacy".into()];
+        let args = ["st3", "driver", "claude-mcp"].map(str::to_owned);
+        let peer = native_delivery_identity(37, &args, &env).unwrap();
+        assert_eq!(peer.transport, "claude-channel");
+        assert_eq!(peer.agent, "agent/example/legacy");
+        let query = ["st3", "conversations", "ls"].map(str::to_owned);
+        assert!(native_delivery_identity(37, &query, &env).is_none());
+        assert!(native_delivery_identity(37, &args, &[]).is_none());
+    }
+
+    #[test]
+    fn doctor_unread_counts_exclude_historical_recipients_and_people() {
+        let store = Store::open_memory("amber").unwrap();
+        for (id, recipient) in [
+            ("current", "agent/example/current"),
+            ("retired", "agent/example/retired"),
+            ("person", "person/eval"),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("message/{id}"),
+                    kind: "message.sent".into(),
+                    actor: Some("person/operator".into()),
+                    fields: BTreeMap::from([
+                        ("from".into(), json!("person/operator")),
+                        ("to".into(), json!(recipient)),
+                        ("status".into(), json!("sent")),
+                        ("content".into(), json!("probe")),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(id.into()),
+                })
+                .unwrap();
+        }
+        let current = BTreeSet::from(["agent/example/current"]);
+        let messages = store.operational_messages(None, false).unwrap();
+        assert_eq!(
+            unread_current_seat_counts(&store, &current, &messages, client_now_ms()).unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            unread_current_seat_counts(&store, &current, &messages, client_now_ms() + 20_000).unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            store.messages(None, false).unwrap().len(),
+            3,
+            "inspection does not erase historical messages"
+        );
     }
 
     fn state(root: &Path) -> AppState {
