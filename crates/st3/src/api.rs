@@ -3673,14 +3673,21 @@ async fn client_launches_detail(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    client_detail(
-        client_launch_resources(&state, query.history).map_err(ApiError::internal)?,
-        "launch",
-        &id,
-    )
+    let items = client_launch_resources(&state, query.history).map_err(ApiError::internal)?;
+    // The route carries a session ID. A native ID may itself start with `launch/`.
+    let resource_id = format!("launch/{id}");
+    let id = if items.iter().any(|item| item["id"] == resource_id) {
+        resource_id
+    } else {
+        id
+    };
+    client_detail(items, "launch", &id)
 }
 
 fn client_launch_session(state: &AppState, id: &str) -> Result<PlanningSessionView, ApiError> {
+    if let Some(session) = state.store.planning_session(id).map_err(ApiError::internal)? {
+        return Ok(session);
+    }
     state
         .store
         .planning_session(launch_session_id(id))

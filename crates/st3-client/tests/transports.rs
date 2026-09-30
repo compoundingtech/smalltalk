@@ -228,36 +228,45 @@ async fn nested_launch_ids_reach_detail_and_child_routes() {
             "launch-request",
         )
         .unwrap();
-    state
-        .store
-        .create_planning_session(
-            "planning/fleet/harbor/release/one",
-            "release",
-            &format!("{}@{}", request.name, request.hash),
-            "/work/release",
-            "person/avery",
-            "agent/launch-routing.planner",
-            &Default::default(),
-            None,
-            None,
-        )
-        .unwrap();
+    for id in [
+        "planning/fleet/harbor/release/one",
+        "launch/fleet/harbor/release/two",
+    ] {
+        state
+            .store
+            .create_planning_session(
+                id,
+                "release",
+                &format!("{}@{}", request.name, request.hash),
+                "/work/release",
+                "person/avery",
+                "agent/launch-routing.planner",
+                &Default::default(),
+                None,
+                None,
+            )
+            .unwrap();
+    }
     let app = st3::api::router(state);
     let server_socket = socket.clone();
     let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
     wait_for_socket(&socket).await;
     let client = Client::unix(&socket);
-    let id = "launch/planning/fleet/harbor/release/one";
-    assert_eq!(client.launches_get(id).await.unwrap().value.header().id, id);
-    assert!(
-        client
-            .launch_variants_list(id, None, None)
-            .await
-            .unwrap()
-            .value
-            .items
-            .is_empty()
-    );
+    for id in [
+        "launch/planning/fleet/harbor/release/one",
+        "launch/launch/fleet/harbor/release/two",
+    ] {
+        assert_eq!(client.launches_get(id).await.unwrap().value.header().id, id);
+        assert!(
+            client
+                .launch_variants_list(id, None, None)
+                .await
+                .unwrap()
+                .value
+                .items
+                .is_empty()
+        );
+    }
     server.abort();
 }
 

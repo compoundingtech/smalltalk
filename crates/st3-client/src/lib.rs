@@ -648,7 +648,7 @@ impl Client {
         id: &str,
     ) -> Result<Envelope<Resource>, ClientError> {
         let id = if collection == "launches" {
-            id.trim_start_matches("launch/")
+            id.strip_prefix("launch/").unwrap_or(id)
         } else {
             id
         };
@@ -707,7 +707,7 @@ impl Client {
         };
         self.get(&format!(
             "/v1/client/launches/{}/{child}{suffix}",
-            percent_encode_segment(launch_id.trim_start_matches("launch/"))
+            percent_encode_segment(launch_id.strip_prefix("launch/").unwrap_or(launch_id))
         ))
         .await
     }
