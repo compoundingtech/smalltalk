@@ -1124,6 +1124,23 @@ fn client_page(
     } else {
         None
     };
+    Ok(ClientResourcePage {
+        kind: "page".into(),
+        collection: collection.into(),
+        filters: client_page_filters(query),
+        items: page_items,
+        page: ClientPageInfo {
+            limit,
+            has_more,
+            next_cursor,
+            cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
+        },
+        sync: client_sync_notice(state),
+    })
+}
+
+/// The filters a page names: the ones its query applied.
+fn client_page_filters(query: &ClientListQuery) -> BTreeMap<String, String> {
     let mut filters = BTreeMap::new();
     if query.history {
         filters.insert("history".into(), "all".into());
@@ -1141,19 +1158,7 @@ fn client_page(
     if query.native_only {
         filters.insert("native_only".into(), "true".into());
     }
-    Ok(ClientResourcePage {
-        kind: "page".into(),
-        collection: collection.into(),
-        filters,
-        items: page_items,
-        page: ClientPageInfo {
-            limit,
-            has_more,
-            next_cursor,
-            cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
-        },
-        sync: client_sync_notice(state),
-    })
+    filters
 }
 
 /// A host catching up with a peer can show early history as current, and a host whose graph
@@ -1326,6 +1331,31 @@ fn client_work_resources(
             .collect::<Vec<_>>(),
     )?;
     client_work_values(store, work, &desired, snapshot_index)
+}
+
+/// One page of the work history, newest update first, and whether more follow. Rendering the
+/// whole history to show a page of it enriched every step the store had ever run: seconds on
+/// a busy host's store.
+fn client_work_history_page(
+    store: &Store,
+    actor: Option<&str>,
+    snapshot_unix_ms: u128,
+    snapshot_index: u64,
+    offset: usize,
+    limit: usize,
+) -> anyhow::Result<(Vec<Value>, bool)> {
+    let (work, has_more) =
+        store.client_work_history_page_at_snapshot(actor, snapshot_unix_ms, offset, limit)?;
+    let desired = store.desired_subjects_for_owner_steps(
+        &work
+            .iter()
+            .map(|step| step.subject.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    Ok((
+        client_work_values(store, work, &desired, snapshot_index)?,
+        has_more,
+    ))
 }
 
 /// One work item, read and rendered alone. Rendering the whole history to pick one item
@@ -3098,6 +3128,11 @@ async fn client_work(
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<ClientResourcePage>, ApiError> {
+    if query.history {
+        return client_work_history(&state, &snapshot, &query)
+            .await
+            .map(Json);
+    }
     if query.cursor.is_some() {
         return client_page(&state, &snapshot, "work", Vec::new(), &query).map(Json);
     }
@@ -3116,6 +3151,106 @@ async fn client_work(
     })
     .await?;
     client_page(&state, &snapshot, "work", items, &query).map(Json)
+}
+
+/// The work history, read a page at a time in the order it shows. Like the mission list, a
+/// later page reads its steps again, so it holds only while the store has not changed.
+async fn client_work_history(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    query: &ClientListQuery,
+) -> Result<ClientResourcePage, ApiError> {
+    let (offset, limit, expires_at_unix_ms) = if let Some(encoded) = &query.cursor {
+        let cursor = decode_client_cursor(encoded)?;
+        if cursor.collection != "work"
+            || cursor.snapshot.id != snapshot.id
+            || cursor.snapshot.store_index != snapshot.store_index
+            || cursor.history != query.history
+            || cursor.person != query.person
+            || cursor.actor != query.actor
+            || cursor.owner_run != query.owner_run
+            || cursor.status != query.status
+            || cursor.native_only != query.native_only
+            || cursor.items_digest != "sql-page"
+            || query
+                .limit
+                .is_some_and(|limit| limit.clamp(1, CLIENT_MAX_PAGE_ITEMS) != cursor.limit)
+        {
+            return Err(client_page_expired(
+                "the page cursor does not match this collection, snapshot, or filter",
+            ));
+        }
+        if client_now_ms() > cursor.expires_at_unix_ms {
+            return Err(client_page_expired("the page cursor expired"));
+        }
+        (cursor.offset, cursor.limit, cursor.expires_at_unix_ms)
+    } else {
+        (
+            0,
+            query
+                .limit
+                .unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
+                .clamp(1, CLIENT_MAX_PAGE_ITEMS),
+            client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS),
+        )
+    };
+    let unchanged = || -> Result<(), ApiError> {
+        if state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
+            return Err(client_page_expired(
+                "the snapshot changed; restart pagination from the first page",
+            ));
+        }
+        Ok(())
+    };
+    unchanged()?;
+    let store = state.store.clone();
+    let actor = query.actor.clone();
+    let snapshot_unix_ms = client_snapshot_time(snapshot);
+    let snapshot_index = snapshot.store_index;
+    let (items, has_more) = blocking_store(move || {
+        client_work_history_page(
+            &store,
+            actor.as_deref(),
+            snapshot_unix_ms,
+            snapshot_index,
+            offset,
+            limit,
+        )
+    })
+    .await?;
+    unchanged()?;
+    let next_cursor = has_more
+        .then(|| {
+            encode_client_cursor(&ClientPageCursor {
+                snapshot: snapshot.clone(),
+                collection: "work".into(),
+                offset: offset.saturating_add(items.len()),
+                limit,
+                history: query.history,
+                person: query.person.clone(),
+                actor: query.actor.clone(),
+                owner_run: query.owner_run.clone(),
+                status: query.status.clone(),
+                native_only: query.native_only,
+                items_digest: "sql-page".into(),
+                before_index: None,
+                expires_at_unix_ms,
+            })
+        })
+        .transpose()?;
+    Ok(ClientResourcePage {
+        kind: "page".into(),
+        collection: "work".into(),
+        filters: client_page_filters(query),
+        items,
+        page: ClientPageInfo {
+            limit,
+            has_more,
+            next_cursor,
+            cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
+        },
+        sync: client_sync_notice(state),
+    })
 }
 
 async fn client_work_detail(
@@ -13829,6 +13964,118 @@ mission "many-runs" state="ready" {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    /// Each page of the work history is that page of the whole history, for every reader, and
+    /// reading it enriches only the steps it shows.
+    #[test]
+    fn work_history_pages_read_only_what_they_show() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let state = state(root.path());
+        let kdl = r#"version 2
+mission "paged" state="ready" {
+  goal "Run often."
+  concurrent-runs max=100
+  step "build" { assigned-to "agent/builder" }
+  step "watch" { agentless }
+}"#;
+        let intent = parse_intent(kdl, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "paged")
+            .unwrap();
+        let (mut builds, mut builder) = (Vec::new(), String::new());
+        for run in 0..6 {
+            let view = state
+                .store
+                .create_mission_run(&MissionRunRequest {
+                    mission: "paged".into(),
+                    revision: None,
+                    workspace: workspace.display().to_string(),
+                    requester: Some("person/operator".into()),
+                    mode: None,
+                    inputs: BTreeMap::new(),
+                    idempotency_key: format!("paged-{run}"),
+                })
+                .unwrap();
+            let build = view.steps.iter().find(|step| step.step == "build").unwrap();
+            builder = build
+                .assigned_to
+                .clone()
+                .expect("the build step is assigned");
+            builds.push(build.subject.clone());
+        }
+        // Two builds change after the rest, so the history's newest-first order differs
+        // from the order the steps were made in; the builder claims the first.
+        for build in [&builds[4], &builds[0]] {
+            state.store.set_step_state(build, "ready", None).unwrap();
+        }
+        state
+            .store
+            .work_action(
+                &builds[0],
+                "claim",
+                &crate::model::WorkRequest {
+                    actor: Some(builder.clone()),
+                    incarnation: Some("builder-1".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "claim-paged".into(),
+                },
+            )
+            .unwrap();
+        let (now, index) = (client_now_ms(), state.store.index().unwrap());
+        let bare = builder.strip_prefix("agent/").unwrap();
+        for actor in [
+            None,
+            Some(builder.as_str()),
+            Some(bare),
+            Some("agent/other"),
+        ] {
+            let whole = client_work_resources(&state.store, actor, true, now, index).unwrap();
+            assert_eq!(
+                whole.len(),
+                match actor {
+                    None => 12,
+                    Some("agent/other") => 0,
+                    Some(_) => 6,
+                },
+                "{actor:?}"
+            );
+            for limit in [1, 4, 5, 12, 50] {
+                let mut offset = 0;
+                loop {
+                    let (page, has_more) =
+                        client_work_history_page(&state.store, actor, now, index, offset, limit)
+                            .unwrap();
+                    let end = (offset + limit).min(whole.len());
+                    assert_eq!(page, whole[offset..end], "{actor:?} {limit} {offset}");
+                    assert_eq!(has_more, end < whole.len(), "{actor:?} {limit} {offset}");
+                    offset = end;
+                    if !has_more {
+                        break;
+                    }
+                }
+            }
+        }
+        crate::store::STEPS_ENRICHED.with(|enriched| enriched.set(0));
+        let (page, has_more) =
+            client_work_history_page(&state.store, None, now, index, 4, 3).unwrap();
+        assert_eq!((page.len(), has_more), (3, true));
+        assert_eq!(crate::store::STEPS_ENRICHED.with(std::cell::Cell::get), 3);
     }
 
     #[tokio::test]

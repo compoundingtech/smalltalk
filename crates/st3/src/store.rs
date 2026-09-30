@@ -6303,6 +6303,68 @@ impl Store {
         self.work_history_at_snapshot_with_agentless(actor, snapshot_unix_ms, true)
     }
 
+    /// One page of the client's work history, newest update first: the `limit` steps after
+    /// the first `offset` that `actor` can see, and whether more follow. It reads steps in
+    /// that order and enriches only those it reaches, instead of enriching every step the
+    /// store has ever run to show a page of them.
+    pub fn client_work_history_page_at_snapshot(
+        &self,
+        actor: Option<&str>,
+        snapshot_unix_ms: u128,
+        offset: usize,
+        limit: usize,
+    ) -> Result<(Vec<StepRunView>, bool)> {
+        let actor = actor.map(|value| normalize_actor(value, "agent"));
+        let connection = self.readers.get();
+        // Enrichment can clear a step's claimant, through its effective state alone, but
+        // never changes its assignee, its candidates or its update time. So this finds every
+        // step the actor can see, in the order the history shows them, and a step it matches
+        // only as claimant needs just its effective state to tell.
+        let visible = |view: &StepRunView| -> rusqlite::Result<bool> {
+            let Some(actor) = actor.as_deref() else {
+                return Ok(true);
+            };
+            if view.assigned_to.as_deref() == Some(actor)
+                || view.available_to.iter().any(|candidate| candidate == actor)
+            {
+                return Ok(true);
+            }
+            if view.claimant.as_deref() != Some(actor) {
+                return Ok(false);
+            }
+            let mut effective = view.clone();
+            apply_effective_step_state(&connection, &mut effective, snapshot_unix_ms)?;
+            Ok(effective.claimant.as_deref() == Some(actor))
+        };
+        let mut statement = connection.prepare_cached(
+            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                    lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+             FROM step_runs
+             WHERE (agentless=0 OR ?1 IS NULL)
+               AND (?1 IS NULL OR assignee=?1 OR lease_owner=?1
+                    OR EXISTS (SELECT 1 FROM json_each(step_runs.available_to) WHERE value=?1))
+             ORDER BY length(updated_at_unix_ms) DESC, updated_at_unix_ms DESC, subject",
+        )?;
+        let rows = statement.query_map(params![actor.as_deref()], step_run_from_row)?;
+        let (mut skipped, mut page) = (0, Vec::new());
+        for row in rows {
+            let mut view = row?;
+            if !visible(&view)? {
+                continue;
+            }
+            if skipped < offset {
+                skipped += 1;
+                continue;
+            }
+            if page.len() == limit {
+                return Ok((page, true));
+            }
+            enrich_step_queue_at(&connection, &mut view, snapshot_unix_ms)?;
+            page.push(view);
+        }
+        Ok((page, false))
+    }
+
     /// One step as the client's work history shows it, found by its subject rather than by
     /// reading and enriching every step the store has ever run.
     pub fn client_work_item_at_snapshot(
