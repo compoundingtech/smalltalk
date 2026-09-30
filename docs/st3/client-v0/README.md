@@ -382,6 +382,17 @@ socket. The selected concrete scopes are sealed into that pairing; existing limi
 not silently upgraded and must be re-paired, then revoked when no longer needed. Revocation takes
 effect for every subsequent request, including a new bounded terminal WebSocket exchange.
 
+Agent declarations are a separate, sensitive read: `GET /v1/client/agent-declarations/{id}`
+returns the currently applied desired tree, its canonical KDL v2 text, exact revision ID, and
+the immutable revision IDs newest-first. `?revision=ID` selects only that exact agent claim,
+including superseded declarations; an unknown revision or unmanaged session returns 404.
+Desired trees may include literal environment values and other credentials. Both current and
+historical bodies require `read.declarations`; `read.projections` alone does not authorize this
+endpoint. Default limited pairing never grants `read.declarations`. Full-control pairing does,
+so grant it only to a trusted device whose holder may inspect declaration secrets; revoke or
+re-pair existing devices to change their sealed scopes. KDL is a normalized representation of
+the applied desired state, not a recovery of authored whitespace or comments.
+
 Read-only scope permits snapshots, details, timelines, and event feeds. `terminal.control` adds
 terminal input and resize; other control scopes are action-family-specific. A capabilities response
 must distinguish unavailable, ungranted, and unsupported features.

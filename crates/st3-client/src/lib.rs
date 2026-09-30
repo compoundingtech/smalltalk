@@ -904,6 +904,19 @@ impl Client {
     pub async fn agents_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("agents", id).await
     }
+    pub async fn agent_declaration_get(
+        &self,
+        id: &str,
+        revision: Option<&str>,
+    ) -> Result<Envelope<AgentDeclaration>, ClientError> {
+        let path = format!("/v1/client/agent-declarations/{}", percent_encode(id));
+        let path = if let Some(revision) = revision {
+            format!("{path}?revision={}", percent_encode(revision))
+        } else {
+            path
+        };
+        self.get(&path).await
+    }
     pub async fn agent_queue(&self, agent_id: &str) -> Result<Envelope<AgentQueue>, ClientError> {
         self.agent_queue_internal(agent_id).await
     }

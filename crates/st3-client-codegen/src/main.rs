@@ -223,6 +223,11 @@ fn rust_operation_methods(
                 out,
                 "    pub async fn agent_queue(&self, agent_id: &str) -> Result<Envelope<AgentQueue>, ClientError> {{ self.agent_queue_internal(agent_id).await }}"
             )?;
+        } else if id == "agent-declaration.get" {
+            writeln!(
+                out,
+                "    pub async fn agent_declaration_get(&self, id: &str, revision: Option<&str>) -> Result<Envelope<AgentDeclaration>, ClientError> {{ let path = format!(\"/v1/client/agent-declarations/{{}}\", percent_encode(id)); let path = if let Some(revision) = revision {{ format!(\"{{path}}?revision={{}}\", percent_encode(revision)) }} else {{ path }}; self.get(&path).await }}"
+            )?;
         } else if id.ends_with(".get") {
             let collection = path
                 .trim_start_matches("/v1/client/")
@@ -287,6 +292,11 @@ fn swift_operation_methods(
             writeln!(
                 out,
                 "    public func documentGet(name: String) async throws -> Envelope<DocumentContent> {{ try await get(\"v1/client/documents/content\", query: [.init(name: \"name\", value: name)]) }}"
+            )?;
+        } else if id == "agent-declaration.get" {
+            writeln!(
+                out,
+                "    public func agentDeclarationGet(id: String, revision: String? = nil) async throws -> Envelope<AgentDeclaration> {{ let query: [URLQueryItem] = revision.map {{ [.init(name: \"revision\", value: $0)] }} ?? []; return try await get(\"v1/client/agent-declarations/\\(id)\", query: query) }}"
             )?;
         } else if id.ends_with(".get") {
             let collection = path
@@ -450,6 +460,7 @@ fn validate_surfaces(
     for definition in [
         "AttentionTargetState",
         "DocumentContent",
+        "AgentDeclaration",
         "LaunchPreview",
         "MissionRunSummary",
         "AgentQueue",
@@ -954,6 +965,11 @@ fn typescript_operation_methods(
             writeln!(
                 out,
                 "    async {method}(name: string): Promise<EnvelopeOf<{response}>> {{ return this.get('{route}' + query({{ name }})); }}"
+            )?;
+        } else if id == "agent-declaration.get" {
+            writeln!(
+                out,
+                "    async {method}(id: string, revision?: string): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query({{ revision }})); }}"
             )?;
         } else if id == "conversation.changes" {
             writeln!(

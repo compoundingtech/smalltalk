@@ -639,6 +639,18 @@
         "reason": { "type": ["string", "null"] }
       }
     },
+    "AgentDeclaration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "revision", "tree", "kdl", "revisions"],
+      "properties": {
+        "id": { "$ref": "#/$defs/Id" },
+        "revision": { "type": "string" },
+        "tree": { "type": "object" },
+        "kdl": { "type": "string" },
+        "revisions": { "type": "array", "items": { "type": "string" } }
+      }
+    },
     "AgentQueue": {
       "type": "object",
       "additionalProperties": false,
