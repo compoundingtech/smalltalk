@@ -8495,7 +8495,7 @@ fn agent_start_document(
         Some(existing) => declaration_node(&existing.desired)?,
         None => kdl_node("agent", [args.identity.as_str()]),
     };
-    let mut body = agent.children().cloned().unwrap_or_default();
+    let mut body = agent.children_mut().take().unwrap_or_default();
     if let Some(existing) = existing {
         // Pin the existing subject before changing placement, including a host-prefixed simple
         // name and a declaration originally nested inside a host.
@@ -8540,29 +8540,32 @@ fn agent_start_document(
         );
     }
     if existing.is_none() || body.get("harness").is_some() || args.harness.is_some() {
-        let mut harness = body
-            .get("harness")
-            .cloned()
-            .unwrap_or_else(|| kdl_node("harness", [args.harness.as_deref().unwrap_or("claude")]));
-        if let Some(driver) = &args.harness {
-            harness.entries_mut()[0] = KdlEntry::new(driver.clone());
+        if args.harness.is_some() {
             body.nodes_mut()
                 .retain(|node| !matches!(node.name().value(), "command" | "argv"));
         }
-        let mut harness_body = harness.children().cloned().unwrap_or_default();
+        if body.get("harness").is_none() {
+            body.nodes_mut().push(kdl_node(
+                "harness",
+                [args.harness.as_deref().unwrap_or("claude")],
+            ));
+        }
+        let harness = body.get_mut("harness").expect("harness was inserted");
+        if let Some(driver) = &args.harness {
+            harness.entries_mut()[0] = KdlEntry::new(driver.as_str());
+        }
+        let harness_body = harness.ensure_children();
         for (name, value) in [("model", &args.model), ("effort", &args.effort)] {
             if let Some(value) = value {
-                replace_declaration_child(&mut harness_body, kdl_node(name, [value.as_str()]));
+                replace_declaration_child(harness_body, kdl_node(name, [value.as_str()]));
             }
         }
         if !args.arguments.is_empty() {
             replace_declaration_child(
-                &mut harness_body,
+                harness_body,
                 kdl_node("args", args.arguments.iter().map(String::as_str)),
             );
         }
-        harness.set_children(harness_body);
-        replace_declaration_child(&mut body, harness);
     }
     agent.set_children(body);
     Ok(publication_document(agent))
