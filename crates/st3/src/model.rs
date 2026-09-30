@@ -2538,7 +2538,10 @@ pub struct ReplicationExchange {
     pub fleet_id: String,
     pub schema_digest: String,
     pub authority_digest: String,
+    /// Six-table compatibility digest for older peers. Modern peers compare projection_digests.
     pub graph_digest: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub projection_digests: BTreeMap<String, String>,
     pub inventory: ReplicationInventory,
     #[serde(default)]
     pub envelopes: Vec<ReplicaEnvelope>,
@@ -2637,6 +2640,8 @@ pub enum ReplicationHealQuery {
 pub enum ReplicationHealAnswer {
     Ranges {
         graph_digest: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        projection_digests: BTreeMap<String, String>,
         ranges: Vec<ClaimRangeDigest>,
     },
     Subjects {
@@ -2656,11 +2661,15 @@ pub enum ReplicationHealAnswer {
         refused: Option<String>,
         envelopes: Vec<ReplicaEnvelope>,
         graph_digest: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        projection_digests: BTreeMap<String, String>,
     },
     Replayed {
         /// False while this node's replay backoff has not passed.
         replayed: bool,
         graph_digest: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        projection_digests: BTreeMap<String, String>,
     },
     /// The asking node could not reach the peer or the peer could not answer. The worker
     /// hands it to the main daemon, which ends the heal with it.
@@ -2811,7 +2820,10 @@ pub struct ReplicationStatus {
     pub configured: bool,
     pub fleet_id: Option<String>,
     pub authority_digest: String,
+    /// Aggregate of every shared projection table and admitted immutable claim sources.
     pub graph_digest: String,
+    #[serde(default)]
+    pub projection_digests: BTreeMap<String, String>,
     pub received_envelopes: u64,
     pub pending_records: u64,
     pub valid_records: u64,
@@ -2895,6 +2907,11 @@ pub struct ReplicationPeerStatus {
     pub schema_digest: Option<String>,
     pub authority_digest: Option<String>,
     pub graph_digest: Option<String>,
+    #[serde(default)]
+    pub projection_digests: BTreeMap<String, String>,
+    /// Comparable shared tables that differ at the last inventory-aligned comparison.
+    #[serde(default)]
+    pub differing_tables: Vec<String>,
     /// How far apart the two envelope sets were at the last exchange that measured them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<ReplicationPeerSync>,
