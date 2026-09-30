@@ -110,7 +110,11 @@ repeating a handoff already accepted by the native transport.
 The client message view carries the same `delivery` assessment, including the local recipient
 path when one is known. A remote path stays unverified. A message waiting more than ten seconds
 for read is visible as `waiting`; it stays durable. `st doctor` warns about stale local paths and
-overdue messages to current agents. Reading the message clears its pending-read warning.
+overdue graph read receipts for current agents. It excludes obsolete seat recipients and people,
+and distinguishes accepted native handoffs. A missing graph read receipt on a legacy channel
+does not prove that its provider failed to consume the envelope. Reading the message clears its
+pending-read warning. Both `driver claude` and the older `driver claude-mcp` are recognized as
+native delivery peers; ordinary mailbox inspection never refreshes this health assessment.
 
 The path must stay the same. A deploy that starts the daemon from a new path, such as a new store
 path, leaves every running seat on the old one, and st reports them as stale.

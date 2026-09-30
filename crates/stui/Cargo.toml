@@ -19,6 +19,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 toml = "0.9"
 libc = "0.2"
 unicode-width = "0.2.0"
+reqwest = { version = "0.12", default-features = false }
 
 [[bin]]
 name = "stui"
@@ -27,3 +28,6 @@ path = "src/main.rs"
 [dev-dependencies]
 st3 = { path = "../st3" }
 tempfile = "3"
+axum = { version = "0.8", features = ["ws"] }
+portable-pty = "0.9"
+alacritty_terminal = { version = "0.26", default-features = false }

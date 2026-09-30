@@ -17,6 +17,8 @@ Use these documents for implementation details:
 - [Resource subscriptions](resource-subscriptions.md) defines observers and automatic intake.
 - [Seats across deploys](seat-deploys.md) explains how a running seat's driver and channels follow
   a replaced st binary without ending the provider session, and how st reports a stale message path.
+- [Delivery probes](delivery-probes.md) describes token-free native-channel probes, per-direction
+  read latency, overdue attention, and the replicated results in `st doctor`.
 - [Live-path priority](priority.md) explains how the daemon and each PTY server outrank the builds
   and tests their harnesses run, on Linux and macOS, and what needs root.
 - [Command recorder](command-recorder.md) explains how every `git` and `gh` call st starts is
