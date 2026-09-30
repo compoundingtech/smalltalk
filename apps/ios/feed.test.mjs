@@ -29,7 +29,7 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
   await settle();
   assert.equal(sockets.length, 1);
   assert.deepEqual(sockets[0].sent, [
-    { kind: 'subscribe', id: 'attention', collection: 'attention', limit: 50 },
+    { kind: 'subscribe', id: 'attention', collection: 'attention', limit: 200 },
     { kind: 'subscribe', id: 'missions', collection: 'missions', limit: 200 },
     { kind: 'subscribe', id: 'agents', collection: 'agents', limit: 200 },
   ]);
