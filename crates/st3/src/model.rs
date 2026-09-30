@@ -2878,6 +2878,9 @@ pub struct ReplicationPeerStatus {
     pub status: String,
     pub last_success_at_unix_ms: Option<u128>,
     pub last_error: Option<String>,
+    /// A direct Fabric route was refused by the member's service grants, not an outage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal_reason: Option<String>,
     pub schema_digest: Option<String>,
     pub authority_digest: Option<String>,
     pub graph_digest: Option<String>,

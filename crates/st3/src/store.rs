@@ -367,6 +367,13 @@ CREATE TABLE IF NOT EXISTS replication_peers (
     updated_at_unix_ms TEXT NOT NULL
 );
 
+-- Direct route policy is local cache state, outside the replicated claim vocabulary.
+CREATE TABLE IF NOT EXISTS replication_refusals (
+    peer TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    updated_at_unix_ms TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS capabilities (
     secret_hash TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -14161,6 +14168,11 @@ impl Store {
                         params![relay, now, input.schema_digest, input.authority_digest, input.graph_digest],
                     )
                     .map_err(internal)?;
+                // A response to our own dial proves the outbound grants now permit it.
+                // Incoming exchanges only prove the reverse route.
+                if asks {
+                    transaction.execute("DELETE FROM replication_refusals WHERE peer=?1", [relay]).map_err(internal)?;
+                }
                 Ok((received, duplicate, signatures))
             })
             .map_err(|error| St3Error::new("internal", error))??;
@@ -14808,6 +14820,16 @@ impl Store {
     }
 
     pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<bool> {
+        if status == "refused" {
+            self.connection.batched(|transaction| {
+                transaction.execute(
+                    "INSERT INTO replication_refusals(peer, reason, updated_at_unix_ms) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(peer) DO UPDATE SET reason=excluded.reason, updated_at_unix_ms=excluded.updated_at_unix_ms",
+                    params![peer, error, now_ms().to_string()],
+                )
+            }).map_err(anyhow::Error::msg)??;
+            return Ok(true);
+        }
         // Keep the existing storage and claim vocabulary for mixed-version fleets.
         // Unknown reachability projects as last-seen in current product views.
         let status = if status == "down" { "unknown" } else { status };
@@ -14901,7 +14923,12 @@ impl Store {
         reason: Option<&str>,
         last_success_at: Option<u128>,
     ) -> Result<()> {
-        let status = if status == "down" { "unknown" } else { status };
+        // Keep route refusals local so older members can admit transport observations.
+        let status = if matches!(status, "down" | "refused") {
+            "unknown"
+        } else {
+            status
+        };
         let reason = if status == "unknown" { None } else { reason };
         let subject = format!("host/{peer}");
         let already_current = self
@@ -14944,6 +14971,19 @@ impl Store {
             )),
         })?;
         Ok(())
+    }
+
+    /// A direct Fabric refusal is local route state; it does not assert that the member is away.
+    pub fn replication_peer_refusal(&self, peer: &str) -> Result<Option<String>> {
+        Ok(self
+            .readers
+            .get()
+            .query_row(
+                "SELECT reason FROM replication_refusals WHERE peer=?1",
+                [peer],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// When this replica last exchanged records with `peer`. The peer row records every
@@ -15094,6 +15134,7 @@ impl Store {
                                 .get::<_, Option<String>>(1)?
                                 .and_then(|value| value.parse().ok()),
                             last_error: row.get(2)?,
+                            refusal_reason: None,
                             schema_digest: row.get(3)?,
                             authority_digest: row.get(4)?,
                             graph_digest: row.get(5)?,
@@ -15107,6 +15148,7 @@ impl Store {
                     status: "unknown".into(),
                     last_success_at_unix_ms: None,
                     last_error: None,
+                    refusal_reason: None,
                     schema_digest: None,
                     authority_digest: None,
                     graph_digest: None,
@@ -15125,6 +15167,18 @@ impl Store {
                     "last-seen"
                 }
                 .into();
+                status.last_error = None;
+            }
+            let refusal = connection
+                .query_row(
+                    "SELECT reason FROM replication_refusals WHERE peer=?1",
+                    [peer],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(reason) = refusal {
+                status.status = "refused".into();
+                status.refusal_reason = Some(reason);
                 status.last_error = None;
             }
             status.sync = sync.get(peer).cloned();
@@ -31635,6 +31689,46 @@ mod tests {
                     .expect("a pinned read waited forever for a connection")
             );
         }
+    }
+
+    #[test]
+    fn an_inbound_exchange_keeps_the_outbound_grant_refusal_until_a_dial_succeeds() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("amber.db");
+        let fleet = "94cd11ba-c582-4558-9c84-c3bda922eb6d";
+        let store = Store::open(&path, "amber").unwrap();
+        store.bind_fleet(fleet).unwrap();
+        store
+            .record_peer_failure(
+                "cobalt",
+                "refused",
+                "refused by that member's Fabric grants",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path, "amber").unwrap();
+        let peer = Store::open_memory("cobalt").unwrap();
+        peer.bind_fleet(fleet).unwrap();
+        let exchange = peer
+            .export_replication_exchange(fleet, &ReplicationInventory::default())
+            .unwrap();
+        store
+            .receive_replication_exchange("cobalt", fleet, &exchange)
+            .unwrap();
+        let status = store
+            .replication_status(true, Some(fleet), &["cobalt".into()])
+            .unwrap();
+        assert_eq!(status.peers[0].status, "refused");
+        assert!(status.peers[0].last_success_at_unix_ms.is_some());
+        assert!(status.peers[0].last_error.is_none());
+        store
+            .receive_replication_exchange_asking("cobalt", fleet, &exchange, true)
+            .unwrap();
+        let status = store
+            .replication_status(true, Some(fleet), &["cobalt".into()])
+            .unwrap();
+        assert_eq!(status.peers[0].status, "up");
+        assert!(status.peers[0].refusal_reason.is_none());
     }
 
     #[test]
