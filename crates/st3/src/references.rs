@@ -490,14 +490,14 @@ mission "watch" state="ready" {{
         let missing = r#"version 2
 mission "work" state="ready" {
   goal "Complete the work."
-  step "do-work" { assigned-to "agent/fleet/nobody" }
+  step "do-work" { assigned-to "agent/example/nobody" }
 }"#;
         assert_eq!(
             refusals(&store, missing),
-            ["mission `mission/work` references missing eligible agent `agent/fleet/nobody`"]
+            ["mission `mission/work` references missing eligible agent `agent/example/nobody`"]
         );
         let declared =
-            format!("{missing}\nagent \"fleet/nobody\" {{ workspace \"/tmp\"; command \"true\" }}");
+            format!("{missing}\nagent \"example/nobody\" {{ workspace \"/tmp\"; command \"true\" }}");
         assert_eq!(refusals(&store, &declared), Vec::<String>::new());
     }
 
@@ -581,11 +581,11 @@ mission "parent" state="ready" {{
     const SUBSCRIPTION: &str = r#"subscription "changed" {
   observer "observer/status"
   on "status"
-  to "agent/fleet/watcher"
+  to "agent/example/watcher"
   delivery "message"
 }"#;
 
-    const WATCHER: &str = r#"agent "fleet/watcher" { workspace "/tmp"; command "true" }"#;
+    const WATCHER: &str = r#"agent "example/watcher" { workspace "/tmp"; command "true" }"#;
 
     #[test]
     fn a_subscription_to_a_missing_observer_or_mission_is_refused() {
@@ -599,7 +599,7 @@ mission "parent" state="ready" {{
         assert_eq!(
             refusals(&store, &watch(&format!("{SUBSCRIPTION}\n{OBSERVER}"))),
             [
-                "mission `mission/watch` declares subscription `subscription/${ST_MISSION_RUN}/changed` has missing delivery target `agent/fleet/watcher`"
+                "mission `mission/watch` declares subscription `subscription/${ST_MISSION_RUN}/changed` has missing delivery target `agent/example/watcher`"
             ]
         );
         assert_eq!(
@@ -654,7 +654,7 @@ mission "parent" state="ready" {{
         assert_eq!(
             store.unresolved_graph_references().unwrap(),
             [
-                "mission `mission/watch` declares subscription `subscription/${ST_MISSION_RUN}/changed` has missing delivery target `agent/fleet/watcher`".to_owned(),
+                "mission `mission/watch` declares subscription `subscription/${ST_MISSION_RUN}/changed` has missing delivery target `agent/example/watcher`".to_owned(),
                 format!(
                     "step `cycle` of mission `mission/parent` uses a mission that is not stored: mission `mission/cycle@{UNSTORED}` is not stored on this host"
                 ),

@@ -5,7 +5,7 @@
 //! children can share one service cgroup, and `setsid` changes a
 //! process's *session*, not its *cgroup*. systemd tears a unit down by **cgroup**, so a
 //! `systemctl restart` of the transport/supervisor unit SIGTERM+SIGKILLs every task still sitting in
-//! that cgroup — which is exactly how a fabric restart cascade-killed the whole hetz fleet.
+//! that cgroup — which is exactly how a fabric restart cascade-killed the whole example-linux fleet.
 //!
 //! This gate proves the fix: st2 spawns each task into its OWN transient systemd scope (own cgroup, a
 //! SIBLING of the transport unit), so a cgroup-cascade kill of the transport unit cannot reach it. It

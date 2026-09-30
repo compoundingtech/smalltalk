@@ -116,7 +116,7 @@ fn ls_json_and_read_expose_every_declared_field() {
     assert_eq!(row["uri"], "github-pr://github.com/o/r/pull/42");
     assert_eq!(row["reason"], "PR under preparation.");
     // `inactive_reason`, not `inactiveReason`: this is the descriptor `st2 agents --json`
-    // already emits, and INVARIANTS.md pins that surface to preserve its field names. The
+    // already emits, and docs/st2/invariants.md pins that surface to preserve its field names. The
     // snake_case is inconsistent with sibling roster fields but predates this change.
     assert_eq!(row["inactive_reason"], "Superseded by #43.");
     assert_eq!(

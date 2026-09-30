@@ -6,14 +6,14 @@ use std::path::Path;
 use std::process::Command;
 
 fn write_agent(root: &Path) {
-    let directory = root.join("agents/hetz/worker");
+    let directory = root.join("agents/example-linux/worker");
     fs::create_dir_all(&directory).unwrap();
     fs::write(
         directory.join("agent.kdl"),
-        "agent \"worker\" {\n  host \"hetz\"\n  command \"exec sleep 60\"\n}\n",
+        "agent \"worker\" {\n  host \"example-linux\"\n  command \"exec sleep 60\"\n}\n",
     )
     .unwrap();
-    st2::event::publish_owner_binding_for_test(root, "hetz").unwrap();
+    st2::event::publish_owner_binding_for_test(root, "example-linux").unwrap();
 }
 
 fn st2(root: &Path, args: &[&str]) -> std::process::Output {
@@ -21,7 +21,7 @@ fn st2(root: &Path, args: &[&str]) -> std::process::Output {
         .arg("--catalog")
         .arg(root)
         .args(args)
-        .env("ST2_TEST_EVENT_HOST", "hetz")
+        .env("ST2_TEST_EVENT_HOST", "example-linux")
         .env_remove("ST_AGENT")
         .output()
         .unwrap()
@@ -39,9 +39,9 @@ fn stream_add_emit_and_rm_are_one_real_cli_workflow() {
             "add",
             "webhook",
             "--agent",
-            "hetz.worker",
+            "example-linux.worker",
             "--host",
-            "hetz",
+            "example-linux",
             "--json",
         ],
     );
@@ -60,7 +60,7 @@ fn stream_add_emit_and_rm_are_one_real_cli_workflow() {
         &[
             "event",
             "emit",
-            "hetz.worker",
+            "example-linux.worker",
             "--stream",
             "webhook",
             "--event-id",
@@ -68,7 +68,7 @@ fn stream_add_emit_and_rm_are_one_real_cli_workflow() {
             "--message",
             "payload",
             "--host",
-            "hetz",
+            "example-linux",
             "--json",
         ],
     );
@@ -87,9 +87,9 @@ fn stream_add_emit_and_rm_are_one_real_cli_workflow() {
             "rm",
             "webhook",
             "--agent",
-            "hetz.worker",
+            "example-linux.worker",
             "--host",
-            "hetz",
+            "example-linux",
             "--json",
         ],
     );
@@ -101,7 +101,7 @@ fn stream_add_emit_and_rm_are_one_real_cli_workflow() {
     let receipt: serde_json::Value = serde_json::from_slice(&remove.stdout).unwrap();
     assert_eq!(receipt["result"], "changed");
     let declaration =
-        fs::read_to_string(catalog.path().join("agents/hetz/worker/agent.kdl")).unwrap();
+        fs::read_to_string(catalog.path().join("agents/example-linux/worker/agent.kdl")).unwrap();
     assert!(!declaration.contains("stream \"webhook\""));
 }
 
@@ -117,16 +117,16 @@ fn a_direct_adapter_launch_executes_the_exact_event_cli_contract() {
             "add",
             "adapter",
             "--agent",
-            "hetz.worker",
+            "example-linux.worker",
             "--host",
-            "hetz",
+            "example-linux",
             "--",
             binary,
             "--catalog",
             catalog.path().to_str().unwrap(),
             "event",
             "emit",
-            "hetz.worker",
+            "example-linux.worker",
             "--stream",
             "adapter",
             "--event-id",
@@ -134,7 +134,7 @@ fn a_direct_adapter_launch_executes_the_exact_event_cli_contract() {
             "--message",
             "from-adapter",
             "--host",
-            "hetz",
+            "example-linux",
             "--json",
         ],
     );
@@ -154,7 +154,7 @@ fn a_direct_adapter_launch_executes_the_exact_event_cli_contract() {
     let argv = adapter.argv.as_ref().unwrap();
     let output = Command::new(&argv[0])
         .args(&argv[1..])
-        .env("ST2_TEST_EVENT_HOST", "hetz")
+        .env("ST2_TEST_EVENT_HOST", "example-linux")
         .output()
         .unwrap();
     assert!(
@@ -166,7 +166,7 @@ fn a_direct_adapter_launch_executes_the_exact_event_cli_contract() {
     assert_eq!(receipt["status"], "created");
     assert_eq!(
         st2::message::list_inbox(&st2::message::inbox_dir(
-            &catalog.path().join("agents/hetz/worker")
+            &catalog.path().join("agents/example-linux/worker")
         ))
         .unwrap()
         .len(),
@@ -192,9 +192,9 @@ fn direct_adapter_argv_preserves_spaces_and_metacharacters_exactly() {
         "add",
         "exact-argv",
         "--agent",
-        "hetz.worker",
+        "example-linux.worker",
         "--host",
-        "hetz",
+        "example-linux",
         "--",
     ];
     args.extend(expected);
@@ -232,9 +232,9 @@ fn command_and_direct_argv_are_mutually_exclusive() {
             "add",
             "ambiguous",
             "--agent",
-            "hetz.worker",
+            "example-linux.worker",
             "--host",
-            "hetz",
+            "example-linux",
             "--command",
             "echo shell",
             "--",
@@ -263,9 +263,9 @@ fn launched_stream_removal_retires_runtime_before_source_publication() {
             "add",
             "live",
             "--agent",
-            "hetz.worker",
+            "example-linux.worker",
             "--host",
-            "hetz",
+            "example-linux",
             "--command",
             "sleep 60",
         ],
@@ -275,15 +275,15 @@ fn launched_stream_removal_retires_runtime_before_source_publication() {
         "{}",
         String::from_utf8_lossy(&add.stderr)
     );
-    let runner = st2::SystemRunner::new(catalog.path().to_path_buf(), st2::exec_state_dir("hetz"));
+    let runner = st2::SystemRunner::new(catalog.path().to_path_buf(), st2::exec_state_dir("example-linux"));
     for _ in 0..3 {
-        let report = st2::up_once(catalog.path(), "hetz", &runner).unwrap();
+        let report = st2::up_once(catalog.path(), "example-linux", &runner).unwrap();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         if runner
             .list_sessions()
             .unwrap()
             .iter()
-            .any(|session| session.alive && session.pty_id == "hetz.worker.stream-live")
+            .any(|session| session.alive && session.pty_id == "example-linux.worker.stream-live")
         {
             break;
         }
@@ -294,7 +294,7 @@ fn launched_stream_removal_retires_runtime_before_source_publication() {
             .list_sessions()
             .unwrap()
             .iter()
-            .any(|session| { session.alive && session.pty_id == "hetz.worker.stream-live" })
+            .any(|session| { session.alive && session.pty_id == "example-linux.worker.stream-live" })
     );
 
     let remove = st2(
@@ -304,9 +304,9 @@ fn launched_stream_removal_retires_runtime_before_source_publication() {
             "rm",
             "live",
             "--agent",
-            "hetz.worker",
+            "example-linux.worker",
             "--host",
-            "hetz",
+            "example-linux",
         ],
     );
 
@@ -321,7 +321,7 @@ fn launched_stream_removal_retires_runtime_before_source_publication() {
             .list_sessions()
             .unwrap()
             .iter()
-            .all(|session| !session.alive || session.pty_id != "hetz.worker.stream-live");
+            .all(|session| !session.alive || session.pty_id != "example-linux.worker.stream-live");
         if retired {
             break;
         }
@@ -332,7 +332,7 @@ fn launched_stream_removal_retires_runtime_before_source_publication() {
         "stream adapter remained alive after lifecycle-first removal"
     );
     assert!(
-        !fs::read_to_string(catalog.path().join("agents/hetz/worker/agent.kdl"))
+        !fs::read_to_string(catalog.path().join("agents/example-linux/worker/agent.kdl"))
             .unwrap()
             .contains("stream \"live\"")
     );
@@ -350,9 +350,9 @@ fn launched_stream_removal_escalates_an_ignoring_adapter_before_forgetting_it() 
             "add",
             "stubborn",
             "--agent",
-            "hetz.worker",
+            "example-linux.worker",
             "--host",
-            "hetz",
+            "example-linux",
             "--command",
             "trap '' TERM; while :; do sleep 1; done",
         ],
@@ -362,14 +362,14 @@ fn launched_stream_removal_escalates_an_ignoring_adapter_before_forgetting_it() 
         "{}",
         String::from_utf8_lossy(&add.stderr)
     );
-    let runner = st2::SystemRunner::new(catalog.path().to_path_buf(), st2::exec_state_dir("hetz"));
+    let runner = st2::SystemRunner::new(catalog.path().to_path_buf(), st2::exec_state_dir("example-linux"));
     assert!(
-        st2::up_once(catalog.path(), "hetz", &runner)
+        st2::up_once(catalog.path(), "example-linux", &runner)
             .unwrap()
             .errors
             .is_empty()
     );
-    let runtime_id = "hetz.worker.stream-stubborn";
+    let runtime_id = "example-linux.worker.stream-stubborn";
     for _ in 0..100 {
         if runner
             .list_sessions()
@@ -390,9 +390,9 @@ fn launched_stream_removal_escalates_an_ignoring_adapter_before_forgetting_it() 
             "rm",
             "stubborn",
             "--agent",
-            "hetz.worker",
+            "example-linux.worker",
             "--host",
-            "hetz",
+            "example-linux",
         ],
     );
     assert!(
@@ -410,7 +410,7 @@ fn launched_stream_removal_escalates_an_ignoring_adapter_before_forgetting_it() 
         "retirement must not erase the record until the ignoring process group exits"
     );
     assert!(
-        !fs::read_to_string(catalog.path().join("agents/hetz/worker/agent.kdl"))
+        !fs::read_to_string(catalog.path().join("agents/example-linux/worker/agent.kdl"))
             .unwrap()
             .contains("stream \"stubborn\"")
     );
@@ -429,9 +429,9 @@ fn failed_source_publish_after_stop_keeps_declaration_relaunchable() {
                 "add",
                 "live",
                 "--agent",
-                "hetz.worker",
+                "example-linux.worker",
                 "--host",
-                "hetz",
+                "example-linux",
                 "--command",
                 "sleep 60"
             ]
@@ -439,9 +439,9 @@ fn failed_source_publish_after_stop_keeps_declaration_relaunchable() {
         .status
         .success()
     );
-    let runner = st2::SystemRunner::new(catalog.path().to_path_buf(), st2::exec_state_dir("hetz"));
+    let runner = st2::SystemRunner::new(catalog.path().to_path_buf(), st2::exec_state_dir("example-linux"));
     assert!(
-        st2::up_once(catalog.path(), "hetz", &runner)
+        st2::up_once(catalog.path(), "example-linux", &runner)
             .unwrap()
             .errors
             .is_empty()
@@ -454,28 +454,28 @@ fn failed_source_publish_after_stop_keeps_declaration_relaunchable() {
             "rm",
             "live",
             "--agent",
-            "hetz.worker",
+            "example-linux.worker",
             "--host",
-            "hetz",
+            "example-linux",
         ])
         .env("ST2_TEST_AGENT_AUTHOR_FAIL_BEFORE_PUBLISH", "1")
         .output()
         .unwrap();
     assert!(!failed.status.success());
     assert!(
-        fs::read_to_string(catalog.path().join("agents/hetz/worker/agent.kdl"))
+        fs::read_to_string(catalog.path().join("agents/example-linux/worker/agent.kdl"))
             .unwrap()
             .contains("stream \"live\"")
     );
 
     for _ in 0..3 {
-        let report = st2::up_once(catalog.path(), "hetz", &runner).unwrap();
+        let report = st2::up_once(catalog.path(), "example-linux", &runner).unwrap();
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         if runner
             .list_sessions()
             .unwrap()
             .iter()
-            .any(|session| session.alive && session.pty_id == "hetz.worker.stream-live")
+            .any(|session| session.alive && session.pty_id == "example-linux.worker.stream-live")
         {
             break;
         }
@@ -486,7 +486,7 @@ fn failed_source_publish_after_stop_keeps_declaration_relaunchable() {
             .list_sessions()
             .unwrap()
             .iter()
-            .any(|session| { session.alive && session.pty_id == "hetz.worker.stream-live" })
+            .any(|session| { session.alive && session.pty_id == "example-linux.worker.stream-live" })
     );
     assert!(
         st2(
@@ -496,9 +496,9 @@ fn failed_source_publish_after_stop_keeps_declaration_relaunchable() {
                 "rm",
                 "live",
                 "--agent",
-                "hetz.worker",
+                "example-linux.worker",
                 "--host",
-                "hetz"
+                "example-linux"
             ]
         )
         .status
@@ -518,9 +518,9 @@ fn external_stream_removal_performs_no_runtime_operation() {
                 "add",
                 "external",
                 "--agent",
-                "hetz.worker",
+                "example-linux.worker",
                 "--host",
-                "hetz"
+                "example-linux"
             ]
         )
         .status
@@ -535,9 +535,9 @@ fn external_stream_removal_performs_no_runtime_operation() {
             "rm",
             "external",
             "--agent",
-            "hetz.worker",
+            "example-linux.worker",
             "--host",
-            "hetz",
+            "example-linux",
         ])
         .env("PATH", "")
         .env_remove("ST_AGENT")
@@ -559,7 +559,7 @@ fn a_bare_actor_can_self_author_on_the_selected_host() {
     let add = st2(
         catalog.path(),
         &[
-            "stream", "add", "webhook", "--as", "worker", "--host", "hetz",
+            "stream", "add", "webhook", "--as", "worker", "--host", "example-linux",
         ],
     );
     assert!(
@@ -571,7 +571,7 @@ fn a_bare_actor_can_self_author_on_the_selected_host() {
     let remove = st2(
         catalog.path(),
         &[
-            "stream", "rm", "webhook", "--as", "worker", "--host", "hetz",
+            "stream", "rm", "webhook", "--as", "worker", "--host", "example-linux",
         ],
     );
     assert!(

@@ -24805,26 +24805,26 @@ fn replication_snapshot_keeps_compact_envelope_identifiers() {
 #[test]
 fn compact_replication_inventory_matches_its_public_identities() {
     let mut identities = [
-        test_envelope_ids("silber-like", 1..=300, "a"),
-        test_envelope_ids("hetz-like", 250..=600, "a"),
-        test_envelope_ids("hetz-like", [255, 256, 511], "b"),
+        test_envelope_ids("example-mac-like", 1..=300, "a"),
+        test_envelope_ids("example-linux-like", 250..=600, "a"),
+        test_envelope_ids("example-linux-like", [255, 256, 511], "b"),
     ]
     .concat();
     // Hashes a peer could send that are not lowercase SHA-256 hex keep their exact text.
     let upper = identities[0].hash.to_uppercase();
     identities.extend([
         ReplicaEnvelopeId {
-            writer: "hetz-like".into(),
+            writer: "example-linux-like".into(),
             sequence: 256,
             hash: upper.clone(),
         },
         ReplicaEnvelopeId {
-            writer: "bluey-like".into(),
+            writer: "example-peer-like".into(),
             sequence: 7,
             hash: "not-a-hash".into(),
         },
         ReplicaEnvelopeId {
-            writer: "silber-like".into(),
+            writer: "example-mac-like".into(),
             sequence: 7,
             hash: String::new(),
         },
@@ -24852,18 +24852,18 @@ fn compact_replication_inventory_matches_its_public_identities() {
         assert_eq!(inventory.digest, replication_inventory_digest(&sorted));
         assert_eq!(inventory.buckets(), test_replication_buckets(&sorted));
         assert_eq!(inventory.irregular_hashes.len(), 3);
-        let range = inventory.range("hetz-like", 256);
+        let range = inventory.range("example-linux-like", 256);
         assert_eq!(
             inventory.identities(range),
             sorted
                 .iter()
-                .filter(|id| id.writer == "hetz-like" && (256..512).contains(&id.sequence))
+                .filter(|id| id.writer == "example-linux-like" && (256..512).contains(&id.sequence))
                 .cloned()
                 .collect::<Vec<_>>()
         );
     }
-    assert!(inventory_holds(&incremental, "hetz-like", 256, &upper));
-    assert!(inventory_holds(&incremental, "bluey-like", 7, "not-a-hash"));
+    assert!(inventory_holds(&incremental, "example-linux-like", 256, &upper));
+    assert!(inventory_holds(&incremental, "example-peer-like", 7, "not-a-hash"));
     assert!(bulk.range("absent", 0).is_empty());
 
     fn inventory_holds(
@@ -24884,9 +24884,9 @@ fn compact_replication_inventory_matches_its_public_identities() {
 #[cfg(test)]
 #[test]
 fn a_tombstoned_identity_held_again_is_listed_once() {
-    let mut identities = test_envelope_ids("hetz-like", [1, 2], "a");
+    let mut identities = test_envelope_ids("example-linux-like", [1, 2], "a");
     identities.push(ReplicaEnvelopeId {
-        writer: "hetz-like".into(),
+        writer: "example-linux-like".into(),
         sequence: 3,
         hash: "not-a-hash".into(),
     });
@@ -25055,8 +25055,8 @@ impl TestReplica {
 #[test]
 fn compact_replication_exchange_lists_only_ranges_that_differ() {
     let shared = [
-        test_envelope_ids("hetz-like", 1..=20_000, "a"),
-        test_envelope_ids("silber-like", 1..=20_000, "a"),
+        test_envelope_ids("example-linux-like", 1..=20_000, "a"),
+        test_envelope_ids("example-mac-like", 1..=20_000, "a"),
     ]
     .concat();
     let mut left = TestReplica(shared.iter().cloned().collect());
@@ -25064,15 +25064,15 @@ fn compact_replication_exchange_lists_only_ranges_that_differ() {
     // A new publish on one side, a sparse gap relayed around the other, and two candidates
     // at one writer sequence all fall inside ranges both peers already hold.
     left.0
-        .extend(test_envelope_ids("silber-like", [20_001], "a"));
+        .extend(test_envelope_ids("example-mac-like", [20_001], "a"));
     right
         .0
-        .extend(test_envelope_ids("hetz-like", 20_001..=20_003, "a"));
+        .extend(test_envelope_ids("example-linux-like", 20_001..=20_003, "a"));
     left.0
-        .remove(&test_envelope_ids("hetz-like", [19_990], "a")[0]);
+        .remove(&test_envelope_ids("example-linux-like", [19_990], "a")[0]);
     right
         .0
-        .extend(test_envelope_ids("silber-like", [20_000], "b"));
+        .extend(test_envelope_ids("example-mac-like", [20_000], "b"));
 
     let listed = left.exchange(&mut right);
     assert_eq!(left.0, right.0, "one exchange converges both peers");
@@ -25104,7 +25104,7 @@ fn compact_replication_exchange_lists_only_ranges_that_differ() {
 #[cfg(test)]
 #[test]
 fn compact_replication_exchange_bounds_the_listing_of_many_differing_ranges() {
-    let all = test_envelope_ids("hetz-like", 1..=5_000, "a");
+    let all = test_envelope_ids("example-linux-like", 1..=5_000, "a");
     let ranges = 5_000 / REPLICATION_BUCKET_WIDTH as usize + 1;
     let replica = |skip: u64| {
         TestReplica(
@@ -34852,28 +34852,28 @@ version 2
 
     #[test]
     fn a_remote_stop_without_process_authority_cannot_poison_the_running_owner() {
-        let owner = json!({"fields": {"status": "running", "host": "Silber"}});
+        let owner = json!({"fields": {"status": "running", "host": "ExampleMac"}});
         let remote_stop = json!({"fields": {"status": "stopped"}});
-        let remote_running = json!({"fields": {"status": "running", "host": "hetz"}});
+        let remote_running = json!({"fields": {"status": "running", "host": "example-linux"}});
         assert!(nonowner_terminal_observation(
             None,
-            "Silber",
+            "ExampleMac",
             &owner,
-            "hetz",
+            "example-linux",
             &remote_stop,
         ));
         assert!(!nonowner_terminal_observation(
-            Some("hetz"),
-            "Silber",
+            Some("example-linux"),
+            "ExampleMac",
             &owner,
-            "hetz",
+            "example-linux",
             &remote_stop,
         ));
         assert!(!nonowner_terminal_observation(
             None,
-            "Silber",
+            "ExampleMac",
             &owner,
-            "hetz",
+            "example-linux",
             &remote_running,
         ));
     }
@@ -39803,7 +39803,7 @@ version 2
 
     #[test]
     fn a_local_write_rehashes_only_its_own_inventory_range() {
-        let store = Store::open_memory("hetz").unwrap();
+        let store = Store::open_memory("example-linux").unwrap();
         for observed_at_ms in 0..600 {
             observe_harness(&store, observed_at_ms);
         }
@@ -39839,7 +39839,7 @@ version 2
                 1..6,
             ),
         ) {
-            let writers = ["Silber", "fleet-node", "hetz"];
+            let writers = ["ExampleMac", "fleet-node", "example-linux"];
             // Some hashes are not SHA-256 hex, so the digest also covers verbatim hashes.
             let identity = |(writer, sequence): (usize, u64)| ReplicaEnvelopeId {
                 writer: writers[writer].into(),
@@ -39883,7 +39883,7 @@ version 2
 
     #[test]
     fn replication_reuses_the_graph_digest_until_a_digested_column_changes() {
-        let store = Store::open_memory("hetz").unwrap();
+        let store = Store::open_memory("example-linux").unwrap();
         observe_harness(&store, 0);
         let first = store.replication_snapshot().unwrap();
         GRAPH_DIGESTS_COMPUTED.with(|computed| computed.set(0));
@@ -40446,7 +40446,7 @@ mission "asks" state="ready" {
                 mission: "asks".into(),
                 revision: None,
                 workspace: "/tmp".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "asks-run".into(),
@@ -40459,7 +40459,7 @@ mission "asks" state="ready" {
             store.request_attention_closing(
                 &format!("attention/{key}"),
                 &AttentionRequest {
-                    reviewer: "person/nathan".into(),
+                    reviewer: "person/alex".into(),
                     title: format!("Decide {key}"),
                     reason: "A person needs to decide before the work goes on.".into(),
                     severity: "warning".into(),
@@ -40472,15 +40472,15 @@ mission "asks" state="ready" {
         };
         let open = |subject: &str| {
             store
-                .attention_items(Some("person/nathan"))
+                .attention_items(Some("person/alex"))
                 .unwrap()
                 .iter()
                 .any(|item| item.subject == subject)
         };
-        let context = ["resource/fabric/queue", "host/silber"];
+        let context = ["resource/fabric/queue", "host/ExampleMac"];
 
         // Context and hosts never end an item, so a request naming only those is refused.
-        for (key, actor) in [("agent-unclaimed", agent), ("person", "person/nathan")] {
+        for (key, actor) in [("agent-unclaimed", agent), ("person", "person/alex")] {
             assert_eq!(
                 ask(key, actor, &context, AttentionClosing::default())
                     .unwrap_err()
@@ -40579,7 +40579,7 @@ mission "asks" state="ready" {
         assert_eq!(
             ask(
                 "late",
-                "person/nathan",
+                "person/alex",
                 &context,
                 AttentionClosing {
                     step: Some(step.clone()),
@@ -40623,7 +40623,7 @@ mission "external-blocker" state="ready" {
                 mission: "external-blocker".into(),
                 revision: None,
                 workspace: "/tmp".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "external-blocker-run".into(),
@@ -40644,19 +40644,19 @@ mission "external-blocker" state="ready" {
             .unwrap();
         let attention = store
             .request_attention(
-                "attention/silber-xcode",
+                "attention/example-mac-xcode",
                 &AttentionRequest {
-                    reviewer: "person/nathan".into(),
-                    title: "Silber needs its Xcode simulator components updated".into(),
+                    reviewer: "person/alex".into(),
+                    title: "ExampleMac needs its Xcode simulator components updated".into(),
                     reason: "CoreSimulator must be repaired before automated proof can run.".into(),
                     severity: "error".into(),
-                    targets: vec!["host/silber".into(), subject.clone()],
+                    targets: vec!["host/example-mac".into(), subject.clone()],
                     actor: "agent/source.ios-owner".into(),
-                    idempotency_key: "silber-xcode-attention".into(),
+                    idempotency_key: "example-mac-xcode-attention".into(),
                 },
             )
             .unwrap();
-        let reason = "Silber has an exact CoreSimulator/CoreDevice mismatch; renewing this claim would be idle and misleading.";
+        let reason = "ExampleMac has an exact CoreSimulator/CoreDevice mismatch; renewing this claim would be idle and misleading.";
         store
             .work_action(
                 &subject,
@@ -40713,8 +40713,8 @@ mission "external-blocker" state="ready" {
                 &AttentionResolveRequest {
                     outcome: "resolved".into(),
                     reason: Some("Xcode first-launch setup now succeeds.".into()),
-                    actor: "person/nathan".into(),
-                    idempotency_key: "resolve-silber-xcode".into(),
+                    actor: "person/alex".into(),
+                    idempotency_key: "resolve-example-mac-xcode".into(),
                 },
             )
             .unwrap();
@@ -46297,7 +46297,7 @@ mission "review-current" state="ready" revision-cutover="restart-active" {{
                     actor: None,
                     fields: BTreeMap::from([
                         ("owner".into(), Value::String(owner.into())),
-                        ("reviewer".into(), Value::String("person/nathan".into())),
+                        ("reviewer".into(), Value::String("person/alex".into())),
                         ("question".into(), Value::String("Approve it?".into())),
                         ("review_targets".into(), Value::Array(Vec::new())),
                         (
@@ -46417,7 +46417,7 @@ mission "asked-again" state="ready" {
         let ask = |operation: &str, mode: Option<&str>| {
             let mut fields = BTreeMap::from([
                 ("owner".into(), Value::String(step.subject.clone())),
-                ("reviewer".into(), Value::String("person/nathan".into())),
+                ("reviewer".into(), Value::String("person/alex".into())),
                 ("question".into(), Value::String("Approve it?".into())),
                 ("review_targets".into(), Value::Array(Vec::new())),
                 (
@@ -46466,7 +46466,7 @@ mission "asked-again" state="ready" {
         );
         assert_eq!(reviews[0].requested_at_unix_ms, first.accepted_at_unix_ms);
 
-        let items = store.attention_items(Some("person/nathan")).unwrap();
+        let items = store.attention_items(Some("person/alex")).unwrap();
         let gates = items
             .iter()
             .filter(|item| item.kind == "human-gate")
@@ -46480,7 +46480,7 @@ mission "asked-again" state="ready" {
             .request_attention(
                 subject,
                 &AttentionRequest {
-                    reviewer: "person/nathan".into(),
+                    reviewer: "person/alex".into(),
                     title: format!("Fault {subject}"),
                     reason: "a person must decide".into(),
                     severity: "warning".into(),
@@ -46494,7 +46494,7 @@ mission "asked-again" state="ready" {
 
     fn fault_is_current(store: &Store, subject: &str) -> bool {
         store
-            .attention_items(Some("person/nathan"))
+            .attention_items(Some("person/alex"))
             .unwrap()
             .iter()
             .any(|item| item.kind == "fault" && item.subject == subject)
@@ -46517,7 +46517,7 @@ mission "{mission}" state="ready" {{
                 mission: mission.into(),
                 revision: None,
                 workspace: ".".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: format!("{mission}-run"),
@@ -46560,7 +46560,7 @@ mission "{mission}" state="ready" {{
                 actor: None,
                 fields: BTreeMap::from([
                     ("owner".into(), Value::String(step.subject.clone())),
-                    ("reviewer".into(), Value::String("person/nathan".into())),
+                    ("reviewer".into(), Value::String("person/alex".into())),
                     ("question".into(), Value::String("Approve it?".into())),
                     ("review_targets".into(), Value::Array(Vec::new())),
                     (
@@ -46601,7 +46601,7 @@ mission "{mission}" state="ready" {{
                 &AttentionResolveRequest {
                     outcome: "resolved".into(),
                     reason: None,
-                    actor: "person/nathan".into(),
+                    actor: "person/alex".into(),
                     idempotency_key: "other-review-resolved".into(),
                 },
             )
@@ -46891,14 +46891,14 @@ mission "typecase" state="ready" {
                 mission: "typecase".into(),
                 revision: None,
                 workspace: ".".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "typecase-run".into(),
             })
             .unwrap();
         let request = AttentionRequest {
-            reviewer: "person/nathan".into(),
+            reviewer: "person/alex".into(),
             title: "Another fault".into(),
             reason: "a person must decide".into(),
             severity: "warning".into(),
@@ -46984,7 +46984,7 @@ mission "typecase" state="ready" {
     fn explicit_attention_is_idempotent_authorized_and_terminal() {
         let store = Store::open_memory("node").unwrap();
         let request = AttentionRequest {
-            reviewer: "nathan".into(),
+            reviewer: "alex".into(),
             title: "Fabric needs review".into(),
             reason: "The queue did not recover.".into(),
             severity: "error".into(),
@@ -46999,9 +46999,9 @@ mission "typecase" state="ready" {
             .request_attention("attention/fabric-queue", &request)
             .unwrap();
         assert_eq!(first.request, retry.request);
-        assert_eq!(first.reviewer, "person/nathan");
+        assert_eq!(first.reviewer, "person/alex");
         assert_eq!(first.status, "pending");
-        let items = store.attention_items(Some("person/nathan")).unwrap();
+        let items = store.attention_items(Some("person/alex")).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, "agent-request");
         assert_eq!(items[0].actions[0].label, "answer");
@@ -47058,7 +47058,7 @@ mission "typecase" state="ready" {
     fn attention_until_needs_a_known_condition_and_a_target() {
         let store = Store::open_memory("node").unwrap();
         let request = |targets: Vec<String>, key: &str| AttentionRequest {
-            reviewer: "person/nathan".into(),
+            reviewer: "person/alex".into(),
             title: "Publish this revision".into(),
             reason: "Publish the prepared revision as a person.".into(),
             severity: "warning".into(),
@@ -47120,7 +47120,7 @@ mission "typecase" state="ready" {
 version 2
 message "human-attention" {
   from "agent/demo/worker"
-  to "person/nathan"
+  to "person/alex"
   title "Please review"
   content "The declarative message is ready."
 }
@@ -47139,7 +47139,7 @@ message "human-attention" {
             .apply(&intent, &preview.subject_tokens, "desired-human-attention")
             .unwrap();
 
-        let items = store.attention_items(Some("person/nathan")).unwrap();
+        let items = store.attention_items(Some("person/alex")).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, "unread-message");
         assert_eq!(items[0].title, "Please review");
@@ -47152,7 +47152,7 @@ message "human-attention" {
                 "read",
                 "message/human-attention",
                 "--as",
-                "person/nathan",
+                "person/alex",
             ]
         );
         assert!(
@@ -47173,7 +47173,7 @@ message "human-attention" {
                 actor: Some("agent/demo/worker".into()),
                 fields: BTreeMap::from([
                     ("from".into(), Value::String("agent/demo/worker".into())),
-                    ("to".into(), Value::String("person/nathan".into())),
+                    ("to".into(), Value::String("person/alex".into())),
                     ("content".into(), Value::String("Please read this.".into())),
                     ("status".into(), Value::String("sent".into())),
                 ]),
@@ -47182,7 +47182,7 @@ message "human-attention" {
                 idempotency_key: Some("human-attention-message".into()),
             })
             .unwrap();
-        let items = store.attention_items(Some("person/nathan")).unwrap();
+        let items = store.attention_items(Some("person/alex")).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, "unread-message");
         assert_eq!(items[0].actions[0].label, "read");
@@ -47194,7 +47194,7 @@ message "human-attention" {
                 actor: None,
                 fields: BTreeMap::from([
                     ("status".into(), Value::String("delivered".into())),
-                    ("recipient".into(), Value::String("person/nathan".into())),
+                    ("recipient".into(), Value::String("person/alex".into())),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -47202,14 +47202,14 @@ message "human-attention" {
             })
             .unwrap();
         assert_eq!(
-            store.attention_items(Some("person/nathan")).unwrap()[0].kind,
+            store.attention_items(Some("person/alex")).unwrap()[0].kind,
             "unread-message"
         );
         store
             .append_claim(&ClaimInput {
                 subject: message.subject,
                 kind: "message.read".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([("status".into(), Value::String("read".into()))]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -47218,7 +47218,7 @@ message "human-attention" {
             .unwrap();
         assert!(
             store
-                .attention_items(Some("person/nathan"))
+                .attention_items(Some("person/alex"))
                 .unwrap()
                 .is_empty()
         );

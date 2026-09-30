@@ -11484,8 +11484,8 @@ mod tests {
         for path in [
             "/v1/agent-queue-moves",
             "/v1/work/revision/approve/proposal",
-            "/v1/mission-runs/fleet%2Fdemo%2F1/outcome",
-            "/v1/missions/fleet%2Fdemo/retire",
+            "/v1/mission-runs/example%2Fdemo%2F1/outcome",
+            "/v1/missions/example%2Fdemo/retire",
         ] {
             for actor in ["agent/peer", "person/operator"] {
                 let request = Request::builder()
@@ -12518,7 +12518,7 @@ mod tests {
         let snapshot = new_client_snapshot(&state);
         let query = ClientListQuery {
             limit: Some(2),
-            person: Some("person/nathan".into()),
+            person: Some("person/alex".into()),
             ..ClientListQuery::default()
         };
         let first = client_page(
@@ -12549,7 +12549,7 @@ mod tests {
                         "session_actor".into(),
                         Value::String("client/unused".into()),
                     ),
-                    ("person_id".into(), Value::String("person/nathan".into())),
+                    ("person_id".into(), Value::String("person/alex".into())),
                     ("scopes".into(), json!(["read.projections"])),
                     ("expires_at_unix_ms".into(), json!(u64::MAX)),
                 ]),
@@ -12685,7 +12685,7 @@ mod tests {
             .unwrap();
     }
 
-    /// Hetz, 2026-09-29: under CI load an attach waited behind the store writer until its
+    /// example-linux, 2026-09-29: under CI load an attach waited behind the store writer until its
     /// WebSocket handshake gave up. Naming a local terminal must not wait for the writer.
     #[tokio::test]
     async fn a_local_terminal_is_named_by_reads_alone_while_the_writer_is_busy() {
@@ -13273,12 +13273,12 @@ agent "good" {{ workspace {:?}; command "true" }}
                 .request_attention(
                     &format!("attention/{key}"),
                     &AttentionRequest {
-                        reviewer: "person/nathan".into(),
+                        reviewer: "person/alex".into(),
                         title: title.into(),
                         reason: "A person needs to decide.".into(),
                         severity: "warning".into(),
                         targets: Vec::new(),
-                        actor: "agent/fleet/worker".into(),
+                        actor: "agent/example/worker".into(),
                         idempotency_key: key.into(),
                     },
                 )
@@ -13309,7 +13309,7 @@ agent "good" {{ workspace {:?}; command "true" }}
         assert!(
             stale
                 .message
-                .contains("attention/first for person/nathan, open 2d 3h: Renew the signing key"),
+                .contains("attention/first for person/alex, open 2d 3h: Renew the signing key"),
             "{}",
             stale.message
         );
@@ -13575,7 +13575,7 @@ agent "good" {{ workspace {:?}; command "true" }}
                 expected_subjects: serde_json::from_value(preview["subject_tokens"].clone())
                     .unwrap(),
                 idempotency_key: format!("apply-{}", hex::encode(Sha256::digest(kdl))),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
             })
             .unwrap(),
         )
@@ -13593,10 +13593,10 @@ agent "good" {{ workspace {:?}; command "true" }}
         let kdl = r#"version 2
 mission "work" state="ready" {
   goal "Complete the work."
-  step "do-work" { assigned-to "agent/fleet/nobody" }
+  step "do-work" { assigned-to "agent/example/nobody" }
 }"#;
         let refusal =
-            "mission `mission/work` references missing eligible agent `agent/fleet/nobody`";
+            "mission `mission/work` references missing eligible agent `agent/example/nobody`";
 
         let (preview, status, error) = preview_and_apply(app.clone(), kdl).await;
         assert_eq!(preview["blockers"], json!([refusal]));
@@ -13607,7 +13607,7 @@ mission "work" state="ready" {
         assert_eq!(store.index().unwrap(), before);
 
         let declared =
-            format!("{kdl}\nagent \"fleet/nobody\" {{ workspace \"/tmp\"; command \"true\" }}");
+            format!("{kdl}\nagent \"example/nobody\" {{ workspace \"/tmp\"; command \"true\" }}");
         let (preview, status, applied) = preview_and_apply(app, &declared).await;
         assert_eq!(preview["blockers"], json!([]));
         assert_eq!(status, StatusCode::OK, "{applied}");
@@ -13689,7 +13689,7 @@ agent "four" {{ workspace {workspace_path:?}; command "true"; render {{ file "ow
                     r#"version 2
 mission "work" state="ready" {
   goal "Complete the work."
-  step "do-work" { assigned-to "agent/fleet/nobody" }
+  step "do-work" { assigned-to "agent/example/nobody" }
 }"#,
                     "node",
                 )
@@ -13708,7 +13708,7 @@ mission "work" state="ready" {
         assert_eq!(check["status"], "warn");
         assert_eq!(
             check["message"],
-            "1 reference no longer resolves: mission `mission/work` references missing eligible agent `agent/fleet/nobody`"
+            "1 reference no longer resolves: mission `mission/work` references missing eligible agent `agent/example/nobody`"
         );
     }
 
@@ -13759,7 +13759,7 @@ mission "invalid-message" state="ready" {
                 },
                 expected_subjects: BTreeMap::new(),
                 idempotency_key: "reject-invalid-nested-message".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
             })
             .unwrap(),
         )
@@ -13877,7 +13877,7 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
                 run: None,
                 request: b"Plan the first mission.".to_vec(),
                 workspace: workspace.display().to_string(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 provider: None,
                 model: None,
                 effort: None,
@@ -13905,7 +13905,7 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
                 run: None,
                 request: b"Plan the second mission.".to_vec(),
                 workspace: workspace.display().to_string(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 provider: None,
                 model: None,
                 effort: None,
@@ -13959,7 +13959,7 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
                 run: None,
                 request: b"Mission a two-step release without changing this workspace.".to_vec(),
                 workspace: workspace.display().to_string(),
-                requester: Some("nathan".into()),
+                requester: Some("alex".into()),
                 provider: None,
                 model: Some("gpt-5.6-sol".into()),
                 effort: Some("medium".into()),
@@ -13972,7 +13972,7 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
         let session = started["id"].as_str().unwrap();
         let planner = started["planner"].as_str().unwrap();
         assert!(planner.ends_with(&format!("/planner.{}", &session[..10])));
-        assert_eq!(started["requester"], "person/nathan");
+        assert_eq!(started["requester"], "person/alex");
         let request_reference = started["request"].as_str().unwrap();
         assert!(request_reference.starts_with("doc/planning/"));
         let (request_name, request_hash) = request_reference.rsplit_once('@').unwrap();
@@ -14101,7 +14101,7 @@ version 2
                 .unwrap()
                 .contains("mission/planned/work")
         );
-        let (_, attention) = get_request(app.clone(), "/v1/attention?person=nathan").await;
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=alex").await;
         assert_eq!(attention.as_array().unwrap().len(), 1);
         assert_eq!(attention[0]["kind"], "launch-approval");
         assert_eq!(
@@ -14116,7 +14116,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/revise"),
             serde_json::to_value(PlanningRevisionRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 feedback: b"Add a verification step.".to_vec(),
                 idempotency_key: "planning-revision-one".into(),
             })
@@ -14127,7 +14127,7 @@ version 2
         assert_eq!(revised["status"], "revision-requested");
         assert!(revised.get("preview").is_none());
         assert!(store.mission_spec("planned/work", None).unwrap().is_none());
-        let (_, attention) = get_request(app.clone(), "/v1/attention?person=nathan").await;
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=alex").await;
         assert_eq!(attention, json!([]));
 
         let second = br#"
@@ -14192,7 +14192,7 @@ version 2
         assert_eq!(status, StatusCode::OK, "{launch_page}");
         assert_eq!(launch_page["items"][0]["preview"], variant["preview"]);
         let (status, attention_page) =
-            get_request(app.clone(), "/v1/client/attention?person=person%2Fnathan").await;
+            get_request(app.clone(), "/v1/client/attention?person=person%2Falex").await;
         assert_eq!(status, StatusCode::OK, "{attention_page}");
         assert_eq!(
             attention_page["items"][0]["launch_id"],
@@ -14285,7 +14285,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/decisions/{decision_path}/answer"),
             serde_json::to_value(LaunchDecisionAnswerRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 response: LaunchDecisionResponse::SingleChoice("full".into()),
                 explanation: Some("release candidate requires the full suite".into()),
                 expected_revision: 1,
@@ -14308,7 +14308,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/decisions/{decision_path}/answer"),
             serde_json::to_value(LaunchDecisionAnswerRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 response: LaunchDecisionResponse::SingleChoice("focused".into()),
                 explanation: None,
                 expected_revision: 1,
@@ -14319,7 +14319,7 @@ version 2
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{immutable}");
         assert_eq!(immutable["code"], "launch-decision-immutable");
-        let (_, attention) = get_request(app.clone(), "/v1/attention?person=nathan").await;
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=alex").await;
         assert_eq!(attention.as_array().unwrap().len(), 1);
         assert_eq!(attention[0]["kind"], "launch-approval");
 
@@ -14342,7 +14342,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/approve"),
             serde_json::to_value(PlanningApprovalRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 preview_hash: first_hash,
                 idempotency_key: "planning-approve-stale".into(),
             })
@@ -14357,7 +14357,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/approve"),
             serde_json::to_value(PlanningApprovalRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 preview_hash: preview_token.clone(),
                 idempotency_key: "planning-approve-current".into(),
             })
@@ -14377,7 +14377,7 @@ version 2
         assert!(store.active_mission_runs().unwrap().is_empty());
         assert_eq!(fs::read_to_string(&marker).unwrap(), "unchanged\n");
         assert_eq!(fs::read_dir(&workspace).unwrap().count(), 1);
-        let (_, attention) = get_request(app.clone(), "/v1/attention?person=nathan").await;
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=alex").await;
         assert_eq!(attention, json!([]));
 
         let documents = store
@@ -14408,7 +14408,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/approve"),
             serde_json::to_value(PlanningApprovalRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 preview_hash: approved["preview"]["hash"].as_str().unwrap().into(),
                 idempotency_key: "planning-approve-retry".into(),
             })
@@ -14421,7 +14421,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/approve-and-launch"),
             serde_json::to_value(LaunchApproveAndStartRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 preview_hash: preview_token.clone(),
                 workspace: workspace.display().to_string(),
                 inputs: BTreeMap::new(),
@@ -14440,7 +14440,7 @@ version 2
             app,
             &format!("/v1/launches/{session}/approve-and-launch"),
             serde_json::to_value(LaunchApproveAndStartRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 preview_hash: preview_token,
                 workspace: workspace.display().to_string(),
                 inputs: BTreeMap::new(),
@@ -15043,7 +15043,7 @@ version 2
                 mission: "variants".into(),
                 revision: None,
                 workspace: workspace.display().to_string(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "variant-run".into(),
@@ -15058,7 +15058,7 @@ version 2
                 run: Some(run.subject.clone()),
                 request: b"Compare a compact mission with an extended mission.".to_vec(),
                 workspace: workspace.display().to_string(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 provider: None,
                 model: None,
                 effort: None,
@@ -15146,7 +15146,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/variants/extended/propose"),
             serde_json::to_value(PlanningProposalRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 reason: "the extended variant has the required check".into(),
                 idempotency_key: "variant-propose-extended".into(),
             })
@@ -15161,7 +15161,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/variants/extended/propose"),
             serde_json::to_value(PlanningProposalRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 reason: "the extended variant has the required check".into(),
                 idempotency_key: "variant-propose-extended".into(),
             })
@@ -15178,7 +15178,7 @@ version 2
             app,
             &format!("/v1/launches/{session}/variants/compact/propose"),
             serde_json::to_value(PlanningProposalRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 reason: "try the stale compact variant".into(),
                 idempotency_key: "variant-propose-compact".into(),
             })
@@ -16449,7 +16449,7 @@ mission "revision" state="ready" {
             &format!("/v1/mission-runs/{}/revision", run.id),
             serde_json::to_value(MissionRevisionRequest {
                 intent: crate::model::IntentInput {
-                    kdl: source.replace("agentless", r#"assigned-to "agent/fleet/nobody""#),
+                    kdl: source.replace("agentless", r#"assigned-to "agent/example/nobody""#),
                     source_name: None,
                 },
                 actor: "person/test".into(),
@@ -16463,7 +16463,7 @@ mission "revision" state="ready" {
         assert_eq!(error["code"], "mission-revision-blocked");
         assert!(
             error["message"].as_str().unwrap().contains(
-                "mission `mission/revision` references missing eligible agent `agent/fleet/nobody`"
+                "mission `mission/revision` references missing eligible agent `agent/example/nobody`"
             ),
             "{error}"
         );
@@ -16885,23 +16885,23 @@ mission "authority-self-grant" state="ready" {
     /// The replacement cannot carry authority, so it silently strips the grant a person gave.
     #[tokio::test]
     async fn review_an_agent_redeclares_another_seat_and_strips_its_grant() {
-        const SEAT: &str = "agent/fleet/worker";
+        const SEAT: &str = "agent/example/worker";
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let source = r#"
 version 2
 
-agent "fleet/worker" { workspace "."; command "true"; }
-agent "fleet/chief" {
+agent "example/worker" { workspace "."; command "true"; }
+agent "example/chief" {
   workspace "."
   command "true"
-  queue-authority { move "fleet/worker" }
+  queue-authority { move "example/worker" }
 }
-agent "fleet/helper" { workspace "."; command "true"; }
+agent "example/helper" { workspace "."; command "true"; }
 mission "queued" state="ready" {
   concurrent-runs
   goal "Give the durable seat one step in each run."
-  step "work" { assigned-to "agent/fleet/worker" }
+  step "work" { assigned-to "agent/example/worker" }
 }
 "#;
         let intent = parse_intent(source, "node").unwrap();
@@ -16954,8 +16954,8 @@ mission "queued" state="ready" {
             "/v1/intent/apply",
             serde_json::to_value(apply_request(
                 &state,
-                "version 2\nagent \"fleet/chief\" { workspace \".\"; command \"sh -c 'echo replaced'\"; }\n",
-                "agent/fleet/helper",
+                "version 2\nagent \"example/chief\" { workspace \".\"; command \"sh -c 'echo replaced'\"; }\n",
+                "agent/example/helper",
                 "helper-redeclares-chief",
             ))
             .unwrap(),
@@ -16968,8 +16968,8 @@ mission "queued" state="ready" {
             "/v1/intent/apply",
             serde_json::to_value(apply_request(
                 &state,
-                "version 2\nstop \"agent/fleet/worker\"\n",
-                "agent/fleet/helper",
+                "version 2\nstop \"agent/example/worker\"\n",
+                "agent/example/helper",
                 "helper-stops-worker",
             ))
             .unwrap(),
@@ -16979,7 +16979,7 @@ mission "queued" state="ready" {
         let (move_status, move_body) = json_request(
             app,
             "/v1/agent-queue-moves",
-            promote("agent/fleet/chief", "chief-after-redeclare"),
+            promote("agent/example/chief", "chief-after-redeclare"),
         )
         .await;
         eprintln!("REVIEW chief move after redeclare: {move_status} {move_body}");
@@ -17005,10 +17005,10 @@ mission "queued" state="ready" {
         let state = state(root.path());
         let source = r#"
 version 2
-agent "fleet/builder" {
+agent "example/builder" {
   workspace "."
   command "true"
-  seat-authority { declare "fleet/workers/*"; stop "fleet/workers/*" }
+  seat-authority { declare "example/workers/*"; stop "example/workers/*" }
 }
 "#;
         let intent = parse_intent(source, "node").unwrap();
@@ -17027,14 +17027,14 @@ agent "fleet/builder" {
             .apply(&intent, &preview.subject_tokens, "seat-grant")
             .unwrap();
         let app = router(state.clone());
-        let actor = "agent/fleet/builder";
+        let actor = "agent/example/builder";
         for (source, key) in [
             (
-                "version 2\nagent \"fleet/workers/one\" { workspace \".\"; command \"true\" }\n",
+                "version 2\nagent \"example/workers/one\" { workspace \".\"; command \"true\" }\n",
                 "declare-granted",
             ),
             (
-                "version 2\nstop \"agent/fleet/workers/one\"\n",
+                "version 2\nstop \"agent/example/workers/one\"\n",
                 "stop-granted",
             ),
         ] {
@@ -17051,7 +17051,7 @@ agent "fleet/builder" {
             "/v1/intent/apply",
             serde_json::to_value(apply_request(
                 &state,
-                "version 2\nagent \"fleet/chief\" { workspace \".\"; command \"true\" }\n",
+                "version 2\nagent \"example/chief\" { workspace \".\"; command \"true\" }\n",
                 actor,
                 "declare-ungranted",
             ))
@@ -17075,11 +17075,11 @@ agent "fleet/builder" {
 
     /// A person declares a top-level project seat without `mission-authority`, as a person did
     /// for a website seat that st then refused its own mission with `mission-authority-denied`.
-    /// The seat now publishes, starts, and revises missions under `fleet/website/*`, and still
+    /// The seat now publishes, starts, and revises missions under `fleet/fixture-website/*`, and still
     /// reaches no other project's missions and cannot rewrite its own declaration.
     #[tokio::test]
     async fn a_person_declared_project_seat_holds_its_own_mission_namespace() {
-        const SEAT: &str = "agent/fleet/website/standing/website";
+        const SEAT: &str = "agent/fleet/fixture-website/standing/website";
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let app = router(state.clone());
@@ -17088,8 +17088,8 @@ agent "fleet/builder" {
         };
         let person = r#"
 version 2
-agent "fleet/website/standing/website" { workspace "."; command "true"; }
-mission "fleet/other/deploy" state="ready" {
+agent "fleet/fixture-website/standing/website" { workspace "."; command "true"; }
+mission "fleet/fixture-other/deploy" state="ready" {
   concurrent-runs
   goal "Belong to another project."
   step "ship" { goal "Ship the other project." }
@@ -17102,7 +17102,7 @@ mission "fleet/other/deploy" state="ready" {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let namespace = json!(["fleet/website/*"]);
+        let namespace = json!(["fleet/fixture-website/*"]);
         assert_eq!(
             shown_mission_authority(&state, SEAT),
             json!({
@@ -17113,7 +17113,7 @@ mission "fleet/other/deploy" state="ready" {
 
         let own = r#"
 version 2
-mission "fleet/website/refresh" state="ready" {
+mission "fleet/fixture-website/refresh" state="ready" {
   concurrent-runs
   goal "Refresh the website."
   step "build" { goal "Build the website." }
@@ -17142,7 +17142,7 @@ mission "fleet/website/refresh" state="ready" {
             app.clone(),
             "/v1/intent/apply",
             apply(
-                &run("fleet/website/refresh/one", "fleet/website/refresh"),
+                &run("fleet/fixture-website/refresh/one", "fleet/fixture-website/refresh"),
                 SEAT,
                 "website-starts-own",
             ),
@@ -17167,14 +17167,14 @@ mission "fleet/website/refresh" state="ready" {
                 .unwrap(),
             )
         };
-        let (path, request) = retry("fleet/website/refresh/one", "website-revises-own");
+        let (path, request) = retry("fleet/fixture-website/refresh/one", "website-revises-own");
         let (status, body) = json_request(app.clone(), &path, request).await;
         assert_eq!(status, StatusCode::OK, "revise: {body}");
 
         // Another project's missions stay out of reach for every verb.
         let other = r#"
 version 2
-mission "fleet/other/deploy" state="ready" {
+mission "fleet/fixture-other/deploy" state="ready" {
   concurrent-runs
   goal "Rewrite another project's mission."
 }
@@ -17192,7 +17192,7 @@ mission "fleet/other/deploy" state="ready" {
             app.clone(),
             "/v1/intent/apply",
             apply(
-                &run("fleet/other/deploy/one", "fleet/other/deploy"),
+                &run("fleet/fixture-other/deploy/one", "fleet/fixture-other/deploy"),
                 SEAT,
                 "website-starts-other",
             ),
@@ -17203,7 +17203,7 @@ mission "fleet/other/deploy" state="ready" {
         let other_run = state
             .store
             .create_mission_run(&MissionRunRequest {
-                mission: "fleet/other/deploy".into(),
+                mission: "fleet/fixture-other/deploy".into(),
                 revision: None,
                 workspace: root.path().display().to_string(),
                 requester: Some("person/operator".into()),
@@ -17220,12 +17220,12 @@ mission "fleet/other/deploy" state="ready" {
         // The seat cannot rewrite its own declaration, with or without authority in it.
         for (source, key, code) in [
             (
-                "version 2\nagent \"fleet/website/standing/website\" { workspace \".\"; command \"sh -c 'echo mine'\"; }\n",
+                "version 2\nagent \"fleet/fixture-website/standing/website\" { workspace \".\"; command \"sh -c 'echo mine'\"; }\n",
                 "website-redeclares-itself",
                 "agent-seat-publication-denied",
             ),
             (
-                "version 2\nagent \"fleet/website/standing/website\" {\n  workspace \".\"\n  command \"true\"\n  mission-authority { publish \"fleet/*\"; start \"fleet/*\"; revise \"fleet/*\" }\n}\n",
+                "version 2\nagent \"fleet/fixture-website/standing/website\" {\n  workspace \".\"\n  command \"true\"\n  mission-authority { publish \"example/*\"; start \"example/*\"; revise \"example/*\" }\n}\n",
                 "website-widens-itself",
                 "agent-authority-grant-denied",
             ),
@@ -17251,22 +17251,22 @@ mission "fleet/other/deploy" state="ready" {
         };
         let person = r#"
 version 2
-agent "fleet/docs/standing/docs" {
+agent "fleet/fixture-docs/standing/docs" {
   workspace "."
   command "true"
-  mission-authority { publish "fleet/docs/guides/*" }
+  mission-authority { publish "fleet/fixture-docs/guides/*" }
 }
-agent "fleet/quiet/standing/quiet" {
+agent "fleet/fixture-quiet/standing/quiet" {
   workspace "."
   command "true"
   mission-authority "none"
 }
-agent "fleet/builder" {
+agent "fleet/fixture-builder" {
   workspace "."
   command "true"
-  seat-authority { declare "fleet/workers/*" }
+  seat-authority { declare "fleet/fixture-workers/*" }
 }
-mission "fleet/crew/host" state="ready" {
+mission "fleet/fixture-crew/host" state="ready" {
   goal "Hold one mission-scoped seat in the crew project."
   agent "helper" { workspace "."; command "true"; }
 }
@@ -17282,8 +17282,8 @@ mission "fleet/crew/host" state="ready" {
             app.clone(),
             "/v1/intent/apply",
             apply(
-                "version 2\nagent \"fleet/workers/one\" { workspace \".\"; command \"true\"; }\n",
-                "agent/fleet/builder",
+                "version 2\nagent \"fleet/fixture-workers/one\" { workspace \".\"; command \"true\"; }\n",
+                "agent/fleet/fixture-builder",
                 "builder-declares-worker",
             ),
         )
@@ -17291,7 +17291,7 @@ mission "fleet/crew/host" state="ready" {
         assert_eq!(status, StatusCode::OK, "{body}");
         let revision = state
             .store
-            .mission_spec("fleet/crew/host", None)
+            .mission_spec("fleet/fixture-crew/host", None)
             .unwrap()
             .unwrap()
             .revision;
@@ -17300,7 +17300,7 @@ mission "fleet/crew/host" state="ready" {
             "/v1/intent/apply",
             apply(
                 &format!(
-                    "version 2\nmission-run \"fleet/crew/host/one\" {{\n  mission \"mission/fleet/crew/host@{revision}\"\n  workspace {:?}\n  requester \"person/operator\"\n}}\n",
+                    "version 2\nmission-run \"fleet/fixture-crew/host/one\" {{\n  mission \"mission/fleet/fixture-crew/host@{revision}\"\n  workspace {:?}\n  requester \"person/operator\"\n}}\n",
                     root.path().display().to_string(),
                 ),
                 "person/operator",
@@ -17311,12 +17311,12 @@ mission "fleet/crew/host" state="ready" {
         assert_eq!(status, StatusCode::OK, "{body}");
         let host = state
             .store
-            .mission_run("fleet/crew/host/one")
+            .mission_run("fleet/fixture-crew/host/one")
             .unwrap()
             .unwrap();
         materialize_run_agents(&state, &host);
         // Named like a project seat, but owned by its mission run.
-        let helper = "agent/fleet/crew/host/one/helper".to_owned();
+        let helper = "agent/fleet/fixture-crew/host/one/helper".to_owned();
 
         let publish = |mission: &str| {
             format!(
@@ -17325,31 +17325,31 @@ mission "fleet/crew/host" state="ready" {
         };
         for (actor, mission, allowed, source) in [
             (
-                "agent/fleet/docs/standing/docs",
-                "fleet/docs/guides/intro",
+                "agent/fleet/fixture-docs/standing/docs",
+                "fleet/fixture-docs/guides/intro",
                 true,
                 "declared",
             ),
             (
-                "agent/fleet/docs/standing/docs",
-                "fleet/docs/release",
+                "agent/fleet/fixture-docs/standing/docs",
+                "fleet/fixture-docs/release",
                 false,
                 "declared",
             ),
             (
-                "agent/fleet/quiet/standing/quiet",
-                "fleet/quiet/anything",
+                "agent/fleet/fixture-quiet/standing/quiet",
+                "fleet/fixture-quiet/anything",
                 false,
                 "declared",
             ),
             (
-                "agent/fleet/workers/one",
-                "fleet/workers/job",
+                "agent/fleet/fixture-workers/one",
+                "fleet/fixture-workers/job",
                 false,
                 "none",
             ),
-            ("agent/fleet/builder", "fleet/builder/job", true, "default"),
-            (helper.as_str(), "fleet/crew/job", false, "none"),
+            ("agent/fleet/fixture-builder", "fleet/fixture-builder/job", true, "default"),
+            (helper.as_str(), "fleet/fixture-crew/job", false, "none"),
         ] {
             let (status, body) = json_request(
                 app.clone(),
@@ -17433,7 +17433,7 @@ mission "gen/escalate" state="ready" {
     workspace "."
     command "true"
     mission-authority { publish "victim"; start "victim"; revise "victim" }
-    queue-authority { move "fleet/*" }
+    queue-authority { move "example/*" }
   }
   step "work" { assigned-to "agent/${ST_MISSION_RUN}/boss" }
 }
@@ -17514,7 +17514,7 @@ mission "gen/escalate" state="ready" {
     workspace "."
     command "true"
     mission-authority { publish "victim"; start "victim"; revise "victim" }
-    queue-authority { move "fleet/*" }
+    queue-authority { move "example/*" }
   }
   step "work" { assigned-to "agent/${ST_MISSION_RUN}/boss" }
 }
@@ -17572,11 +17572,11 @@ mission "gen/escalate" state="ready" {
         let mission_authority = crate::graph::agent_mission_authority(&desired.desired);
         let queue_authority = crate::graph::agent_queue_authority(&desired.desired);
         eprintln!(
-            "REVIEW {boss} publish victim={} start victim={} revise victim={} move fleet/worker={}",
+            "REVIEW {boss} publish victim={} start victim={} revise victim={} move example/worker={}",
             mission_authority.allows("publish", "victim"),
             mission_authority.allows("start", "victim"),
             mission_authority.allows("revise", "victim"),
-            queue_authority.allows_move("agent/fleet/worker"),
+            queue_authority.allows_move("agent/example/worker"),
         );
         // The boss now publishes a mission outside the planner's namespace.
         let victim = "version 2\nmission \"victim\" state=\"ready\" {\n  goal \"Published with escalated authority.\"\n}\n";
@@ -17596,28 +17596,28 @@ mission "gen/escalate" state="ready" {
 
     #[tokio::test]
     async fn an_agent_moves_a_seat_queue_only_with_queue_authority() {
-        const SEAT: &str = "agent/fleet/worker";
+        const SEAT: &str = "agent/example/worker";
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let source = r#"
 version 2
 
-agent "fleet/worker" { workspace "."; command "true"; }
-agent "fleet/chief" {
+agent "example/worker" { workspace "."; command "true"; }
+agent "example/chief" {
   workspace "."
   command "true"
-  queue-authority { move "fleet/worker" }
+  queue-authority { move "example/worker" }
 }
-agent "fleet/other-chief" {
+agent "example/other-chief" {
   workspace "."
   command "true"
-  queue-authority { move "fleet/other-worker" }
+  queue-authority { move "example/other-worker" }
 }
-agent "fleet/helper" { workspace "."; command "true"; }
+agent "example/helper" { workspace "."; command "true"; }
 mission "queued" state="ready" {
   concurrent-runs
   goal "Give the durable seat one step in each run."
-  step "work" { assigned-to "agent/fleet/worker" }
+  step "work" { assigned-to "agent/example/worker" }
 }
 "#;
         let intent = parse_intent(source, "node").unwrap();
@@ -17667,10 +17667,10 @@ mission "queued" state="ready" {
         };
 
         for (actor, code) in [
-            ("agent/fleet/helper", "queue-authority-denied"),
-            ("agent/fleet/other-chief", "queue-authority-denied"),
-            ("agent/fleet/worker", "queue-authority-denied"),
-            ("agent/fleet/undeclared", "missing-agent-queue-authority"),
+            ("agent/example/helper", "queue-authority-denied"),
+            ("agent/example/other-chief", "queue-authority-denied"),
+            ("agent/example/worker", "queue-authority-denied"),
+            ("agent/example/undeclared", "missing-agent-queue-authority"),
             ("daemon/runtime", "invalid-queue-move-actor"),
         ] {
             let (status, body) = json_request(
@@ -17690,15 +17690,15 @@ mission "queued" state="ready" {
         for (key, declaration) in [
             (
                 "self-grant",
-                r#"agent "fleet/helper" { workspace "."; command "true"; queue-authority { move "fleet/worker" } }"#,
+                r#"agent "example/helper" { workspace "."; command "true"; queue-authority { move "example/worker" } }"#,
             ),
             (
                 "other-grant",
-                r#"agent "fleet/deputy" { workspace "."; command "true"; queue-authority { move "fleet/*" } }"#,
+                r#"agent "example/deputy" { workspace "."; command "true"; queue-authority { move "example/*" } }"#,
             ),
             (
                 "mission-grant",
-                r#"agent "fleet/helper" { workspace "."; command "true"; mission-authority { publish "queued" } }"#,
+                r#"agent "example/helper" { workspace "."; command "true"; mission-authority { publish "queued" } }"#,
             ),
         ] {
             let (status, body) = json_request(
@@ -17707,7 +17707,7 @@ mission "queued" state="ready" {
                 serde_json::to_value(apply_request(
                     &state,
                     &format!("version 2\n{declaration}\n"),
-                    "agent/fleet/helper",
+                    "agent/example/helper",
                     key,
                 ))
                 .unwrap(),
@@ -17724,8 +17724,8 @@ mission "queued" state="ready" {
             "/v1/intent/apply",
             serde_json::to_value(apply_request(
                 &state,
-                "version 2\nagent \"fleet/deputy\" { workspace \".\"; command \"true\"; }\n",
-                "agent/fleet/helper",
+                "version 2\nagent \"example/deputy\" { workspace \".\"; command \"true\"; }\n",
+                "agent/example/helper",
                 "plain-seat",
             ))
             .unwrap(),
@@ -17736,7 +17736,7 @@ mission "queued" state="ready" {
         let (status, body) = json_request(
             app.clone(),
             "/v1/agent-queue-moves",
-            promote("agent/fleet/helper", "still-refused"),
+            promote("agent/example/helper", "still-refused"),
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
@@ -17746,16 +17746,16 @@ mission "queued" state="ready" {
         let (status, body) = json_request(
             app.clone(),
             "/v1/agent-queue-moves",
-            promote("fleet/chief", "authorized"),
+            promote("example/chief", "authorized"),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["actor"], "agent/fleet/chief");
+        assert_eq!(body["actor"], "agent/example/chief");
         assert_eq!(body["subject"], SEAT);
         assert_eq!(order(), [second.clone(), first.clone()]);
         let queue = state.store.seat_queue(SEAT).unwrap();
         assert_eq!(queue.move_count, 1);
-        assert_eq!(queue.moves[0].actor.as_deref(), Some("agent/fleet/chief"));
+        assert_eq!(queue.moves[0].actor.as_deref(), Some("agent/example/chief"));
         assert_eq!(queue.moves[0].run, second);
         assert_eq!(
             queue.moves[0].reason.as_deref(),
@@ -18020,7 +18020,7 @@ version 2
         let resource = ClaimInput {
             subject: "resource/example".into(),
             kind: "resource.observed".into(),
-            actor: Some("person/nathan".into()),
+            actor: Some("person/alex".into()),
             fields: BTreeMap::from([
                 (
                     "kind".into(),
@@ -18154,7 +18154,7 @@ version 2
     step "approval" {
       goal "Submit the candidate."
       assigned-to "agent/worker"
-      gate "human-review" type="human" { reviewer "person/nathan" }
+      gate "human-review" type="human" { reviewer "person/alex" }
     }
   }
 
@@ -18226,7 +18226,7 @@ version 2
         let request_fields = |owner: String, definition: String, operation: &str| {
             BTreeMap::from([
                 ("owner".into(), Value::String(owner)),
-                ("reviewer".into(), Value::String("person/nathan".into())),
+                ("reviewer".into(), Value::String("person/alex".into())),
                 (
                     "question".into(),
                     Value::String("Is the candidate ready?".into()),
@@ -18300,11 +18300,11 @@ version 2
         assert!(listed[1].get("step").is_none());
 
         let (status, selected) =
-            get_request(app.clone(), "/v1/reviews?reviewer=person%2Fnathan").await;
+            get_request(app.clone(), "/v1/reviews?reviewer=person%2Falex").await;
         assert_eq!(status, StatusCode::OK, "{selected}");
         assert_eq!(selected.as_array().unwrap().len(), 2);
         let (status, attention) =
-            get_request(app.clone(), "/v1/attention?person=person%2Fnathan").await;
+            get_request(app.clone(), "/v1/attention?person=person%2Falex").await;
         assert_eq!(status, StatusCode::OK, "{attention}");
         assert_eq!(attention.as_array().unwrap().len(), 2);
         assert!(
@@ -18348,7 +18348,7 @@ version 2
             .append_claim(&ClaimInput {
                 subject: step_request.subject.clone(),
                 kind: "gate.result".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([("verdict".into(), Value::String("pass".into()))]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -18407,7 +18407,7 @@ version 2
         let (status, accepted_mission) = json_request(
             app.clone(),
             &format!("/v1/reviews/{}", run.subject),
-            body("person/nathan"),
+            body("person/alex"),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{accepted_mission}");
@@ -18421,7 +18421,7 @@ version 2
         let missing_reason = serde_json::to_value(ReviewRequest {
             decision: "rejected".into(),
             reason: None,
-            actor: Some("person/nathan".into()),
+            actor: Some("person/alex".into()),
             expected_subject: None,
         })
         .unwrap();
@@ -18437,7 +18437,7 @@ version 2
         let reject = serde_json::to_value(ReviewRequest {
             decision: "rejected".into(),
             reason: Some("the evidence is incomplete".into()),
-            actor: Some("person/nathan".into()),
+            actor: Some("person/alex".into()),
             expected_subject: None,
         })
         .unwrap();
@@ -18508,7 +18508,7 @@ version 2
                 idempotency_key: Some("feedback-api-request".into()),
             })
             .unwrap();
-        let (_, attention) = get_request(app.clone(), "/v1/attention?person=person%2Fnathan").await;
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=person%2Falex").await;
         assert_eq!(attention[0]["review_mode"], "feedback");
         assert!(
             attention[0]["actions"]
@@ -18522,7 +18522,7 @@ version 2
             app.clone(),
             &feedback_path,
             json!({
-                "decision": "rejected", "reason": "More detail", "actor": "person/nathan"
+                "decision": "rejected", "reason": "More detail", "actor": "person/alex"
             }),
         )
         .await;
@@ -18532,7 +18532,7 @@ version 2
             app.clone(),
             &feedback_path,
             json!({
-                "decision": "changes-requested", "reason": "Add a source.", "actor": "person/nathan"
+                "decision": "changes-requested", "reason": "Add a source.", "actor": "person/alex"
             }),
         )
         .await;
@@ -18540,7 +18540,7 @@ version 2
         assert_eq!(accepted["body"]["fields"]["verdict"], "feedback");
         assert_eq!(accepted["body"]["fields"]["request"], feedback_request.id);
 
-        let (_, empty) = get_request(app, "/v1/reviews?reviewer=person%2Fnathan").await;
+        let (_, empty) = get_request(app, "/v1/reviews?reviewer=person%2Falex").await;
         assert_eq!(empty, json!([]));
     }
 
@@ -18551,7 +18551,7 @@ version 2
         let store = state.store.clone();
         let app = router(state);
         let request = serde_json::to_value(AttentionRequest {
-            reviewer: "nathan".into(),
+            reviewer: "alex".into(),
             title: "Fabric needs review".into(),
             reason: "The queue did not recover.".into(),
             severity: "error".into(),
@@ -18572,16 +18572,16 @@ version 2
         request["closed_by"] = json!("person");
         let (status, created) = json_request(app.clone(), "/v1/attention", request).await;
         assert_eq!(status, StatusCode::OK, "{created}");
-        assert_eq!(created["reviewer"], "person/nathan");
+        assert_eq!(created["reviewer"], "person/alex");
         assert_eq!(created["status"], "pending");
 
-        let (status, selected) = get_request(app.clone(), "/v1/attention?person=nathan").await;
+        let (status, selected) = get_request(app.clone(), "/v1/attention?person=alex").await;
         assert_eq!(status, StatusCode::OK, "{selected}");
         assert_eq!(selected.as_array().unwrap().len(), 1);
         assert_eq!(selected[0]["kind"], "agent-request");
         assert_eq!(selected[0]["requester_id"], "agent/fabric/worker");
         assert_eq!(selected[0]["actions"][0]["label"], "answer");
-        let client = client_attention_resources(&store, Some("person/nathan"), false).unwrap();
+        let client = client_attention_resources(&store, Some("person/alex"), false).unwrap();
         assert_eq!(client[0]["attention_kind"], "agent-request");
         assert_eq!(client[0]["requester_id"], "agent/fabric/worker");
         let (_, filtered) =
@@ -18608,7 +18608,7 @@ version 2
         let resolution = serde_json::to_value(AttentionResolveRequest {
             outcome: "resolved".into(),
             reason: Some("The queue recovered.".into()),
-            actor: "person/nathan".into(),
+            actor: "person/alex".into(),
             idempotency_key: "api-attention-resolve".into(),
         })
         .unwrap();
@@ -18631,7 +18631,7 @@ version 2
         assert_eq!(messages.len(), 1);
         assert!(messages[0].content.contains("The queue recovered."));
         assert!(messages[0].content.contains("resolved"));
-        let (_, empty) = get_request(app, "/v1/attention?person=nathan").await;
+        let (_, empty) = get_request(app, "/v1/attention?person=alex").await;
         assert_eq!(empty, json!([]));
     }
 
@@ -18648,7 +18648,7 @@ version 2
                 .request_attention(
                     subject,
                     &AttentionRequest {
-                        reviewer: "person/nathan".into(),
+                        reviewer: "person/alex".into(),
                         title: format!("Fault {severity}"),
                         reason: "The subscription needs a correction.".into(),
                         severity: severity.into(),
@@ -18660,7 +18660,7 @@ version 2
                 .unwrap();
         }
         let app = router(state);
-        let (status, page) = get_request(app, "/v1/client/now?person=person%2Fnathan").await;
+        let (status, page) = get_request(app, "/v1/client/now?person=person%2Falex").await;
         assert_eq!(status, StatusCode::OK, "{page}");
         assert_eq!(page["items"][0]["source_id"], "attention/z-high");
         assert_eq!(page["items"][1]["source_id"], "attention/a-low");
@@ -18706,7 +18706,7 @@ mission "standing" state="ready" {
                 mission: "standing".into(),
                 revision: None,
                 workspace: "/tmp".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "standing-run".into(),
@@ -18732,7 +18732,7 @@ agent "seat" { workspace "/tmp"; command "true" }
                 .request_attention(
                     subject,
                     &AttentionRequest {
-                        reviewer: "person/nathan".into(),
+                        reviewer: "person/alex".into(),
                         title: format!("Fault from {actor}"),
                         reason: "a person must decide".into(),
                         severity: "warning".into(),
@@ -18744,7 +18744,7 @@ agent "seat" { workspace "/tmp"; command "true" }
                 .unwrap();
         }
         let reasons = |store: &Store| {
-            client_attention_resources(store, Some("person/nathan"), false)
+            client_attention_resources(store, Some("person/alex"), false)
                 .unwrap()
                 .into_iter()
                 .map(|resource| {
@@ -18788,7 +18788,7 @@ agent "seat" { workspace "/tmp"; command "true" }
             ("error", "api-attention-error"),
         ] {
             let request = serde_json::to_value(AttentionRequest {
-                reviewer: "person/nathan".into(),
+                reviewer: "person/alex".into(),
                 title: format!("{severity} fault"),
                 reason: "The queue did not recover.".into(),
                 severity: severity.into(),
@@ -18804,7 +18804,7 @@ agent "seat" { workspace "/tmp"; command "true" }
         }
         for history in [false, true] {
             let resources =
-                client_attention_resources(&state.store, Some("person/nathan"), history).unwrap();
+                client_attention_resources(&state.store, Some("person/alex"), history).unwrap();
             let priority = |title: &str| {
                 resources
                     .iter()
@@ -18829,7 +18829,7 @@ agent "seat" { workspace "/tmp"; command "true" }
         let root = tempfile::tempdir().unwrap();
         let app = router(state(root.path()));
         let request = serde_json::to_value(AttentionRequest {
-            reviewer: "person/nathan".into(),
+            reviewer: "person/alex".into(),
             title: "Old blocker".into(),
             reason: "A logout might eventually help, but no action is needed now.".into(),
             severity: "error".into(),
@@ -18866,7 +18866,7 @@ agent "seat" { workspace "/tmp"; command "true" }
             withdrawn["resolved_at_unix_ms"],
             repeated["resolved_at_unix_ms"]
         );
-        let (_, current) = get_request(app, "/v1/attention?person=person%2Fnathan").await;
+        let (_, current) = get_request(app, "/v1/attention?person=person%2Falex").await;
         assert_eq!(current, json!([]));
     }
 
