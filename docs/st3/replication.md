@@ -1,15 +1,60 @@
 # st fleet replication
 
-Fleet replication is optional. A node without peer configuration is a complete local-only st system.
+Fleet replication is optional. A node outside a fleet is a complete local-only st system.
 
 A laptop running only stui can instead be a [paired client device](client-only.md), with no daemon
 or replica. Devices read and act through a member's client gateway and are not sync peers.
 
 Replication makes the logical authority equal across configured nodes. It does not make the SQLite files byte-identical.
 
-## Configuration
+## Add any machine
 
-Each fleet node needs these values:
+Install st on the new machine and configure the person who operates it, as described in the
+[README](../../README.md#run-the-daemon). On an existing listening member, invite the new name:
+
+```sh
+st fleet invite beacon
+```
+
+On the new machine:
+
+```sh
+st fleet join
+st fleet status
+st replication status
+```
+
+Paste the invitation when asked. These are the same steps for a laptop or server. Join receives
+the fleet settings, installs the services, and catches up its replica. It discovers usable
+Tailscale and Fabric endpoints; a firewall that permits only outbound connections needs no
+extra sync setting. Existing Fabric trust and permission for the sponsor's fleet protocol, or
+a Tailscale ACL permitting its worker port, must allow the connection.
+
+To choose the sponsor route explicitly, use its actual tailnet address/port or canonical Fabric
+NodeID/protocol. Each command prompts for the same invitation:
+
+```sh
+st fleet join --via http://100.64.0.10:31313
+st fleet join --via fabric://NODE_ID/PROTOCOL
+```
+
+When the machines are already Fabric peers, the invitation can travel as a file instead:
+
+```sh
+# On the sponsor:
+st fleet invite beacon --via fabric --send-fabric
+# On beacon:
+st fleet join --fabric-inbox
+```
+
+No helper needs to maintain a loopback dial port. The worker obtains Fabric tunnels itself and
+uses available alternative member routes. `--dial-out` is optional when you explicitly want
+no inbound listener; it does not change retry or presence behavior. See [Fleet join](../fleet-join.md)
+for trust, invitation expiry, removal, and the migration of an existing config-peer fleet.
+
+## Legacy configuration and route overrides
+
+A fleet configured with a shared secret and fixed peers remains supported. Its values look like:
 
 ```toml
 node = "node-a"
@@ -85,6 +130,15 @@ node. Offline transport events create no fault. Older Fabric keeps using address
 suspend-gap, and anti-entropy recovery. Tailnet listeners and advertised endpoints also
 refresh on local connectivity changes, without waiting for their minute timer; disappeared
 interface addresses stop being advertised.
+
+The same recovery applies to every member. A server may be absent for hours just as a laptop
+may be asleep. On daemon start, wake from sleep, network change or Fabric recovery, a member
+announces its current endpoints and attempts exchanges with every reachable member. Either
+side can initiate; one connection transfers both sides' missing history and repeats until the
+backlog drains. The other side need not open a second connection or wait for its retry timer.
+An absent member is shown with its last exchange time, and doctor and delivery attention wait
+for contact before judging its routes. Invalid signatures, rejected membership and corrupt
+records remain faults.
 
 ## Protocol
 
