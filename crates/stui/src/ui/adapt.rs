@@ -1860,7 +1860,7 @@ mod tests {
 
     #[test]
     fn st_deliveries_in_a_harness_prompt_are_mail_or_a_line_never_markup() {
-        let envelope = "<smalltalk-message id=\"a1\" from=\"agent/fleet/harbor\" to=\"agent/fleet/quay\" subject=\"Keys &amp; locks\" sha256=\"00\" graph=\"message/a1\">\nRotate &lt;all&gt; keys.\n</smalltalk-message>";
+        let envelope = "<smalltalk-message id=\"a1\" from=\"agent/example/harbor\" to=\"agent/example/quay\" subject=\"Keys &amp; locks\" sha256=\"00\" graph=\"message/a1\">\nRotate &lt;all&gt; keys.\n</smalltalk-message>";
         let bodies = from_harness(true, envelope, &BTreeSet::new());
         match &bodies[..] {
             [
@@ -1873,7 +1873,7 @@ mod tests {
             ] => {
                 assert_eq!(
                     (from.as_str(), to.as_str()),
-                    ("agent/fleet/harbor", "agent/fleet/quay")
+                    ("agent/example/harbor", "agent/example/quay")
                 );
                 assert_eq!(subject, "Keys & locks");
                 assert_eq!(body, "Rotate <all> keys.");
@@ -1883,17 +1883,17 @@ mod tests {
         let shown = BTreeSet::from(["message/a1".to_owned()]);
         let bodies = from_harness(true, envelope, &shown);
         assert!(
-            matches!(&bodies[..], [Body::Event(line)] if line == "delivered to the agent: Keys & locks · from fleet/harbor"),
+            matches!(&bodies[..], [Body::Event(line)] if line == "delivered to the agent: Keys & locks · from example/harbor"),
             "{bodies:?}"
         );
         let bodies = from_harness(
             true,
-            "[PING from st3] message/b2 from agent/fleet/quay: Tide tables\nplease look",
+            "[PING from st3] message/b2 from agent/example/quay: Tide tables\nplease look",
             &BTreeSet::new(),
         );
         assert!(
             matches!(&bodies[..], [Body::User(text), Body::Event(line)]
-                if text == "please look" && line == "delivered to the agent: Tide tables · from fleet/quay"),
+                if text == "please look" && line == "delivered to the agent: Tide tables · from example/quay"),
             "{bodies:?}"
         );
     }
@@ -2197,7 +2197,7 @@ mod tests {
             ),
         ]);
         model.agents = window(vec![json!({
-            "id": "agent/fleet/wren/probe", "kind": "agent", "revision": "r",
+            "id": "agent/example/wren/probe", "kind": "agent", "revision": "r",
             "updated_at": "2026-09-29T09:00:00Z", "name": "fleet/wren/probe", "state": "running",
             "reachability": "remote", "harness_state": "idle", "next_work_id": null, "next_work": null,
             "host_id": "host/wren", "last_activity_at": ago(1), "runtime_ids": [],
