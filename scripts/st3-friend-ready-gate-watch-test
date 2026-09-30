@@ -7,12 +7,12 @@ trap '[[ $temporary == /tmp/st3-gate-watch-test.* && -d $temporary ]] && /bin/rm
 now=$(/bin/date -u +%s)
 start=$((now - 240))
 
-for host in hetz silber; do
-  if [[ $host == hetz ]]; then output="$temporary/events.jsonl"; else output="$temporary/remote.jsonl"; fi
+for host in example-linux example-mac; do
+  if [[ $host == example-linux ]]; then output="$temporary/events.jsonl"; else output="$temporary/remote.jsonl"; fi
   for offset in 0 60 120 180 240; do
     at=$((start + offset))
     /usr/bin/jq -nc --arg host "$host" --argjson at "$at" \
-      '{at:$at,host:$host,pid:(if $host=="hetz" then 1 else 2 end),
+      '{at:$at,host:$host,pid:(if $host=="example-linux" then 1 else 2 end),
         cpu_seconds:($at / 10),rss_kib:100000,context_switches:$at,
         graph_index:1,material_index:1,pending:0,peer_status:"up",
         peer_error:false,peer_last_success_ms:($at*1000)}' >>"$output"
@@ -35,7 +35,7 @@ first=$(bash "$here/st3-friend-ready-gate-watch")
 /usr/bin/jq -e '.idle_preflight == "healthy" and .idle_preflight_notice == ""' \
   "$temporary/state/state.json" >/dev/null
 
-/usr/bin/jq -c 'if .host=="hetz" and .at==($start+120) then .peer_error=true else . end' \
+/usr/bin/jq -c 'if .host=="example-linux" and .at==($start+120) then .peer_error=true else . end' \
   --argjson start "$start" "$temporary/events.jsonl" >"$temporary/bad.jsonl"
 /bin/mv "$temporary/bad.jsonl" "$temporary/events.jsonl"
 if ST3_GATE_TEST_SEND_FAIL=1 bash "$here/st3-friend-ready-gate-watch" >/dev/null; then
@@ -55,14 +55,14 @@ third=$(bash "$here/st3-friend-ready-gate-watch")
 
 risk_start=$((now - 7200))
 export ST3_FRIEND_READY_IDLE_START_UNIX="$risk_start"
-for host in hetz silber; do
-  if [[ $host == hetz ]]; then output="$temporary/events.jsonl"; else output="$temporary/remote.jsonl"; fi
+for host in example-linux example-mac; do
+  if [[ $host == example-linux ]]; then output="$temporary/events.jsonl"; else output="$temporary/remote.jsonl"; fi
   : >"$output"
   for minute in {0..120}; do
     at=$((risk_start + minute * 60))
     /usr/bin/jq -nc --arg host "$host" --argjson at "$at" \
-      '{at:$at,host:$host,pid:(if $host=="hetz" then 1 else 2 end),
-        cpu_seconds:(if $host=="hetz" then $at / 2 else $at / 10 end),
+      '{at:$at,host:$host,pid:(if $host=="example-linux" then 1 else 2 end),
+        cpu_seconds:(if $host=="example-linux" then $at / 2 else $at / 10 end),
         rss_kib:100000,context_switches:$at,graph_index:1,material_index:1,
         pending:0,peer_status:"up",peer_error:false,peer_last_success_ms:($at*1000)}' >>"$output"
   done

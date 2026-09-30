@@ -5,7 +5,7 @@ After=st3.service network-online.target
 [Service]
 Type=simple
 EnvironmentFile=%h/.config/st3/message-soak.env
-Environment=ST3_SOAK_HOST=hetz
+Environment=ST3_SOAK_HOST=example-linux
 ExecStart=/usr/bin/bash %h/.local/bin/st3-idle-soak --local-only
 Restart=always
 RestartSec=5

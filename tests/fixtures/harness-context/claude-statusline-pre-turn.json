@@ -1,12 +1,12 @@
 {
   "session_id": "6c15eccc-0000-4000-8000-000000000000",
-  "transcript_path": "/home/schickling/.claude-schickling-j/projects/-example/6c15eccc-0000-4000-8000-000000000000.jsonl",
-  "cwd": "/home/schickling/example",
+  "transcript_path": "/home/example/.claude-schickling-j/projects/-example/6c15eccc-0000-4000-8000-000000000000.jsonl",
+  "cwd": "/home/example/example",
   "effort": { "level": "high" },
   "model": { "id": "claude-fable-5", "display_name": "Fable 5" },
   "workspace": {
-    "current_dir": "/home/schickling/example",
-    "project_dir": "/home/schickling/example",
+    "current_dir": "/home/example/example",
+    "project_dir": "/home/example/example",
     "added_dirs": [],
     "git_worktree": "2026-08-29-driver-context",
     "repo": { "host": "github.com", "owner": "compoundingtech", "name": "st2" }

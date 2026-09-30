@@ -43,7 +43,7 @@ A mission run has one stable subject. Each immutable run generation binds that r
 ```kdl
 version 2
 
-mission "release" state="ready" revisions="human-only" revision-reviewer="person/nathan" revision-cutover="when-idle" {
+mission "release" state="ready" revisions="human-only" revision-reviewer="person/alex" revision-cutover="when-idle" {
     input "source" kind="resource"
     goal "Produce a verified release decision."
     goal "Keep the source and test evidence visible in the graph."
@@ -77,7 +77,7 @@ mission "release" state="ready" revisions="human-only" revision-reviewer="person
     }
 
     gate "the requester approves the release" type="human" {
-      reviewer "person/nathan"
+      reviewer "person/alex"
       question "Is this release ready?"
       review "resource/mission-run/${ST_MISSION_RUN}/release-decision"
     }
@@ -461,7 +461,7 @@ A failed loop can name the item's title, reviewer, and severity:
 on-exhausted {
   fail
   attention "Automatic review failed" {
-    reviewer "person/nathan"
+    reviewer "person/alex"
     severity "error"
   }
 }
@@ -721,7 +721,7 @@ verdict: a runner that never exits is stopped at the limit.
 
 ```kdl
 gate "the release is approved" type="human" {
-  reviewer "person/nathan"
+  reviewer "person/alex"
   question "Is the release ready?"
   review "resource/release-candidate"
   review "doc/release/report@SHA256"
@@ -1082,10 +1082,10 @@ The queue matters most for a durable top-level seat that serves many runs. A mis
 normally serves one run, so its queue has one entry.
 
 ```sh
-st agents queue agent/fleet/example/worker
-st agents queue move agent/fleet/example/worker mission-run/release/2026-09-26 --top \
+st agents queue agent/example/example/worker
+st agents queue move agent/example/example/worker mission-run/release/2026-09-26 --top \
   --reason "the release needs this first" --as person/operator
-st agents queue move agent/fleet/example/worker mission-run/docs/2026-09-26 \
+st agents queue move agent/example/example/worker mission-run/docs/2026-09-26 \
   --after mission-run/release/2026-09-26 --as person/operator
 ```
 
@@ -1233,7 +1233,7 @@ Declare a durable seat directly at the publication root:
 
 ```kdl
 version 2
-agent "fleet/cos/standing/cos" {
+agent "example/cos/standing/cos" {
   host "local"
   workspace "/work/cos"
   restart "always"
@@ -1242,7 +1242,7 @@ agent "fleet/cos/standing/cos" {
 }
 ```
 
-The subject is exactly `agent/fleet/cos/standing/cos`; placement does not change its identity.
+The subject is exactly `agent/example/cos/standing/cos`; placement does not change its identity.
 The seat's bare `fresh-context` node starts a new harness session before each step it claims, even when the step has no `fresh-context` node. Omit it when the seat should retain context across ordinary steps.
 Typed harnesses always run their real interactive TUI in a PTY. Claude always loads the native st
 channel. Use `exec {}` for non-interactive provider commands.
@@ -1301,6 +1301,39 @@ schedule "cycle" {
   }
 }
 ```
+For one run per local calendar day, use an IANA timezone instead of a fixed-duration UTC interval:
+
+```kdl
+schedule "daily" {
+  calendar { at "08:00"; timezone "Europe/Berlin" }
+  catch-up "latest"
+  work {
+    mission "fabric/cycle@REVISION"
+    workspace "/work/fabric-cycles"
+  }
+}
+```
+
+For a weekly cycle, use `calendar { at "Mon 09:00"; timezone "Europe/Berlin" }`
+inside the same schedule shape. The supported weekday names are `Mon`, `Tue`, `Wed`,
+`Thu`, `Fri`, `Sat`, and `Sun`. `calendar` accepts daily `HH:MM` or weekly
+`DAY HH:MM` in 24-hour local time plus an IANA timezone. It cannot be combined
+with `at`, `every`, or `anchor`. Absolute UTC `at` still fires once; `every` with
+a UTC `anchor` still measures fixed elapsed intervals. Daily and weekly calendar
+occurrences use the matching local date (`YYYYMMDD`) as their durable key.
+A nonexistent wall time in a spring DST gap fires once at the first valid instant after
+the gap (02:30 Europe/Berlin on 2027-03-28
+fires at 03:00 local). A repeated time in an autumn fold fires once at the earlier instant
+(02:30 Europe/Berlin on 2026-10-25 fires at 02:30 CEST, not again at 02:30 CET).
+
+The timezone rules are bundled with the daemon's `chrono-tz` dependency. Upgrading the
+daemon with newer timezone data can change the resolved UTC instant of an occurrence not
+yet scheduled; once an occurrence is recorded as scheduled, its claimed UTC instant remains
+authoritative across restarts and upgrades. The local-date key does not change with the
+offset. On first publication, the earliest candidate is today's local date for
+daily rules or the next matching weekday for weekly rules; missed occurrences
+afterward follow the declared catch-up policy.
+
 
 Publication requires an unpinned mission's name to exist in the publication scope or
 the stored graph, in any state; an unknown name is refused before occurrences begin.
@@ -1536,15 +1569,15 @@ Planning mode asks one durable Codex harness to author Markdown and KDL for revi
 ```sh
 st launch start --id release-mission request.md \
   --workspace ./project \
-  --as person/nathan \
+  --as person/alex \
   --model gpt-5.6-sol \
   --effort medium
 
 st launch show SESSION
 st launch preview SESSION
-st launch revise SESSION feedback.md --as person/nathan
-st launch approve SESSION PREVIEW_TOKEN --as person/nathan
-st launch cancel SESSION --as person/nathan --reason "The request changed."
+st launch revise SESSION feedback.md --as person/alex
+st launch approve SESSION PREVIEW_TOKEN --as person/alex
+st launch cancel SESSION --as person/alex --reason "The request changed."
 ```
 
 Planning can also prepare a revision for one current mission run:
@@ -1552,13 +1585,13 @@ Planning can also prepare a revision for one current mission run:
 ```sh
 st launch start --run MISSION_RUN request.md \
   --workspace ./project \
-  --as person/nathan
+  --as person/alex
 
 st launch preview SESSION --variant compact
 st launch preview SESSION --variant extended
 st launch compare SESSION compact extended
 st launch propose SESSION extended \
-  --as person/nathan \
+  --as person/alex \
   --reason "The extended variant covers the discovered risk."
 ```
 

@@ -11,24 +11,24 @@ use st2::message;
 static EVENT_FAIL_ENV: Mutex<()> = Mutex::new(());
 
 fn declare_agent(root: &Path, desired: &str, streams: &str) -> PathBuf {
-    let directory = root.join("agents/hetz/worker");
+    let directory = root.join("agents/example-linux/worker");
     fs::create_dir_all(&directory).unwrap();
     fs::write(
         directory.join("agent.kdl"),
         format!(
-            "agent \"worker\" {{\n  host \"hetz\"\n  desired-state {desired}\n  command \"agent\"\n{streams}}}\n"
+            "agent \"worker\" {{\n  host \"example-linux\"\n  desired-state {desired}\n  command \"agent\"\n{streams}}}\n"
         ),
     )
     .unwrap();
-    event::publish_owner_binding_for_test(root, "hetz").unwrap();
+    event::publish_owner_binding_for_test(root, "example-linux").unwrap();
     directory
 }
 
 fn emit(root: &Path, id: &str, key: Option<&str>, supersede: bool) -> event::EventReceipt {
     event::emit(
         root,
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         id,
         key,
@@ -52,7 +52,7 @@ fn stable_event_identity_publishes_exactly_one_canonical_message() {
     assert_eq!(first.filename, replay.filename);
     let inbox = message::list_inbox(&message::inbox_dir(&agent)).unwrap();
     assert_eq!(inbox.len(), 1);
-    assert_eq!(inbox[0].from.as_deref(), Some("hetz.worker/gh-ci"));
+    assert_eq!(inbox[0].from.as_deref(), Some("example-linux.worker/gh-ci"));
     assert_eq!(inbox[0].stream.as_deref(), Some("gh-ci"));
     assert_eq!(inbox[0].event_id.as_deref(), Some("run-812"));
     assert!(!agent.join("resources/sent").exists());
@@ -65,8 +65,8 @@ fn public_emit_requires_a_declared_stream_even_for_reserved_resync() {
 
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "resync",
         "forged-resync",
         Some("goal"),
@@ -94,8 +94,8 @@ fn completed_event_replay_rejects_changed_supersession_intent() {
 
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "stable-intent",
         Some("pr-1"),
@@ -119,8 +119,8 @@ fn durable_successor_failure_retains_replayable_pending_receipt() {
     unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "durable-successor:durable") };
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "durable-successor",
         None,
@@ -143,8 +143,8 @@ fn durable_successor_failure_retains_replayable_pending_receipt() {
 
     let replay = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "durable-successor",
         None,
@@ -203,8 +203,8 @@ fn conflicting_reuse_and_undeclared_or_suspended_ingress_fail_closed() {
     emit(catalog.path(), "same", None, false);
     let conflict = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "same",
         None,
@@ -220,8 +220,8 @@ fn conflicting_reuse_and_undeclared_or_suspended_ingress_fail_closed() {
     );
     let undeclared = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "other",
         "1",
         None,
@@ -238,13 +238,13 @@ fn conflicting_reuse_and_undeclared_or_suspended_ingress_fail_closed() {
 
     fs::write(
         agent.join("agent.kdl"),
-        "agent \"worker\" {\n  host \"hetz\"\n  desired-state \"suspended\" reason=\"hold\"\n  command \"agent\"\n  stream \"gh-ci\" {}\n}\n",
+        "agent \"worker\" {\n  host \"example-linux\"\n  desired-state \"suspended\" reason=\"hold\"\n  command \"agent\"\n  stream \"gh-ci\" {}\n}\n",
     )
     .unwrap();
     let suspended = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "2",
         None,
@@ -267,19 +267,19 @@ fn conflicting_reuse_and_undeclared_or_suspended_ingress_fail_closed() {
 fn ambiguous_recipient_matching_a_bus_id_and_local_identity_fails_closed() {
     let catalog = tempfile::tempdir().unwrap();
     let canonical = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
-    let ambiguous = catalog.path().join("agents/hetz/ambiguous");
+    let ambiguous = catalog.path().join("agents/example-linux/ambiguous");
     fs::create_dir_all(&ambiguous).unwrap();
     fs::write(
         ambiguous.join("agent.kdl"),
-        "agent \"hetz.worker\" {\n  host \"hetz\"\n  desired-state \"running\"\n  command \"agent\"\n  stream \"gh-ci\" {}\n}\n",
+        "agent \"example-linux.worker\" {\n  host \"example-linux\"\n  desired-state \"running\"\n  command \"agent\"\n  stream \"gh-ci\" {}\n}\n",
     )
     .unwrap();
-    event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+    event::publish_owner_binding_for_test(catalog.path(), "example-linux").unwrap();
 
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "ambiguous",
         None,
@@ -291,7 +291,7 @@ fn ambiguous_recipient_matching_a_bus_id_and_local_identity_fails_closed() {
     .to_string();
 
     assert!(
-        error.contains("recipient 'hetz.worker' is ambiguous"),
+        error.contains("recipient 'example-linux.worker' is ambiguous"),
         "{error}"
     );
     assert!(!message::inbox_dir(&canonical).exists());
@@ -308,11 +308,11 @@ fn exact_remote_bus_id_cannot_bypass_the_owner_host_lock_domain() {
         "agent \"worker\" {\n  host \"berlin\"\n  desired-state \"running\"\n  command \"agent\"\n  stream \"gh-ci\" {}\n}\n",
     )
     .unwrap();
-    event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+    event::publish_owner_binding_for_test(catalog.path(), "example-linux").unwrap();
 
     let error = event::emit(
         catalog.path(),
-        "hetz",
+        "example-linux",
         "berlin.worker",
         "gh-ci",
         "remote-attempt",
@@ -360,7 +360,7 @@ fn public_host_flag_cannot_override_detected_event_authority() {
             "--host",
             "berlin",
         ])
-        .env("ST2_TEST_EVENT_HOST", "hetz")
+        .env("ST2_TEST_EVENT_HOST", "example-linux")
         .output()
         .unwrap();
 
@@ -432,8 +432,8 @@ fn unobservable_declaration_entry_blocks_event_recipient_resolution() {
 
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "strict-discovery",
         None,
@@ -462,8 +462,8 @@ fn symlinked_stream_state_ancestor_cannot_escape_the_agent_capability() {
 
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "escape-state",
         None,
@@ -500,8 +500,8 @@ fn predictable_stream_state_temporary_symlink_is_never_followed() {
 
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "temp-symlink",
         None,
@@ -542,8 +542,8 @@ fn stream_state_symlink_and_fifo_fail_without_following_or_blocking() {
 
         let error = event::emit(
             catalog.path(),
-            "hetz",
-            "hetz.worker",
+            "example-linux",
+            "example-linux.worker",
             "gh-ci",
             entry,
             None,
@@ -570,8 +570,8 @@ fn symlinked_inbox_cannot_escape_the_agent_capability() {
 
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "escape-inbox",
         None,
@@ -667,8 +667,8 @@ fn initial_supersession_authenticates_predecessor_immediately_before_archive() {
 
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "initial-passed",
         Some("pr-1"),
@@ -712,8 +712,8 @@ fn predecessor_replacement_after_validation_cannot_forge_archive_receipt() {
     let publish = std::thread::spawn(move || {
         event::emit(
             &root,
-            "hetz",
-            "hetz.worker",
+            "example-linux",
+            "example-linux.worker",
             "gh-ci",
             "race-passed",
             Some("pr-1"),
@@ -763,7 +763,7 @@ fn catalog_authoring_and_emit_linearize_without_deadlock() {
     let root = catalog.path().to_path_buf();
     let (done_tx, done_rx) = mpsc::channel();
     let author = std::thread::spawn(move || {
-        let result = st2::agent_author::remove_stream(&root, "hetz.worker", "hetz", None, "gh-ci");
+        let result = st2::agent_author::remove_stream(&root, "example-linux.worker", "example-linux", None, "gh-ci");
         done_tx.send(result).unwrap();
     });
     assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
@@ -779,8 +779,8 @@ fn catalog_authoring_and_emit_linearize_without_deadlock() {
 
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "after-remove",
         None,
@@ -805,8 +805,8 @@ fn desired_state_authoring_and_emit_linearize_without_deadlock() {
     let author = std::thread::spawn(move || {
         let result = st2::agent_author::set_desired_state(
             &root,
-            "hetz.worker",
-            "hetz",
+            "example-linux.worker",
+            "example-linux",
             None,
             st2::agent_author::DesiredStateValue::Suspended,
             Some("maintenance"),
@@ -829,8 +829,8 @@ fn desired_state_authoring_and_emit_linearize_without_deadlock() {
 
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "after-suspend",
         None,
@@ -853,8 +853,8 @@ fn invalid_archive_receipt_blocks_supersession_before_successor_publication() {
 
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "pr1-pass",
         Some("pr-1"),
@@ -899,8 +899,8 @@ fn a_different_event_reconciles_both_pending_crash_windows() {
     unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "reserved-a:pending") };
     let before_materialization = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "reserved-a",
         None,
@@ -923,8 +923,8 @@ fn a_different_event_reconciles_both_pending_crash_windows() {
     unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "materialized-a:materialized") };
     let after_materialization = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "materialized-a",
         Some("pr-1"),
@@ -950,8 +950,8 @@ fn a_different_event_reconciles_both_pending_crash_windows() {
     assert_eq!(after_materialized.status, EventReceiptStatus::Created);
     let replay = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "materialized-a",
         Some("pr-1"),
@@ -980,8 +980,8 @@ fn pending_reconciliation_rejects_corrupt_and_forged_reserved_files() {
     unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "reserved:pending") };
     let _ = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "reserved",
         Some("pr-1"),
@@ -999,7 +999,7 @@ fn pending_reconciliation_rejects_corrupt_and_forged_reserved_files() {
     let inbox = message::inbox_dir(&agent);
     fs::create_dir_all(&inbox).unwrap();
     let forged = event::render_event(
-        "hetz.worker/gh-ci",
+        "example-linux.worker/gh-ci",
         Some("forged"),
         "gh-ci",
         "different",
@@ -1010,8 +1010,8 @@ fn pending_reconciliation_rejects_corrupt_and_forged_reserved_files() {
 
     let corrupt = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "next",
         None,
@@ -1030,8 +1030,8 @@ fn pending_reconciliation_rejects_corrupt_and_forged_reserved_files() {
     fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
     let forged_identity = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "next",
         None,
@@ -1066,8 +1066,8 @@ fn pending_reconciliation_rejects_a_fifo_without_blocking() {
     unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "reserved-fifo:pending") };
     let _ = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "reserved-fifo",
         None,
@@ -1091,8 +1091,8 @@ fn pending_reconciliation_rejects_a_fifo_without_blocking() {
     let started = std::time::Instant::now();
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "next",
         None,
@@ -1117,8 +1117,8 @@ fn a_different_event_completes_pending_successor_compaction() {
     unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "passed:materialized") };
     let _ = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "passed",
         Some("pr-1"),
@@ -1163,8 +1163,8 @@ fn pending_supersession_authenticates_its_predecessor_before_archive() {
     unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "passed:materialized") };
     let _ = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "passed",
         Some("pr-1"),
@@ -1179,8 +1179,8 @@ fn pending_supersession_authenticates_its_predecessor_before_archive() {
 
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "unrelated",
         None,
@@ -1214,8 +1214,8 @@ fn pending_supersession_accepts_an_authenticated_archive_only_predecessor() {
     unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "passed:materialized") };
     let _ = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "passed",
         Some("pr-1"),
@@ -1250,8 +1250,8 @@ fn pending_supersession_recovery_unlinks_a_durably_archived_predecessor() {
     unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "passed:materialized") };
     let _ = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "passed",
         Some("pr-1"),
@@ -1285,8 +1285,8 @@ fn archived_pending_event_still_authenticates_a_same_name_inbox_entry() {
     unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "reserved:materialized") };
     let _ = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "reserved",
         Some("pr-1"),
@@ -1308,8 +1308,8 @@ fn archived_pending_event_still_authenticates_a_same_name_inbox_entry() {
 
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "next",
         None,
@@ -1335,8 +1335,8 @@ fn pending_supersession_fails_closed_when_predecessor_has_no_receipt() {
     unsafe { std::env::set_var("ST2_TEST_EVENT_FAIL_AT", "passed:materialized") };
     let _ = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "passed",
         Some("pr-1"),
@@ -1351,8 +1351,8 @@ fn pending_supersession_fails_closed_when_predecessor_has_no_receipt() {
 
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "unrelated",
         None,
@@ -1392,7 +1392,7 @@ fn crash_replay_honors_an_archive_receipt_and_never_restores_the_inbox_copy() {
     let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
     let filename = "1784649988123-proof1.md";
     let rendered = event::render_event(
-        "hetz.worker/gh-ci",
+        "example-linux.worker/gh-ci",
         Some("CI archived"),
         "gh-ci",
         "archived",
@@ -1409,7 +1409,7 @@ fn crash_replay_honors_an_archive_receipt_and_never_restores_the_inbox_copy() {
         serde_json::to_vec(&serde_json::json!({
             "version": 1,
             "stream": "gh-ci",
-            "recipient": "hetz.worker",
+            "recipient": "example-linux.worker",
             "pending": {
                 "eventId": "archived",
                 "filename": filename,
@@ -1425,8 +1425,8 @@ fn crash_replay_honors_an_archive_receipt_and_never_restores_the_inbox_copy() {
 
     let receipt = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "archived",
         None,
@@ -1446,8 +1446,8 @@ fn subject_frontmatter_injection_is_refused_before_any_write() {
     let agent = declare_agent(catalog.path(), "\"running\"", "  stream \"gh-ci\" {}\n");
     let error = event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "gh-ci",
         "safe-id",
         None,
@@ -1489,7 +1489,7 @@ fn event_emit_cli_cannot_claim_the_supervisor_resync_stream() {
             catalog.path().to_str().unwrap(),
             "event",
             "emit",
-            "hetz.worker",
+            "example-linux.worker",
             "--stream",
             "resync",
             "--event-id",
@@ -1500,9 +1500,9 @@ fn event_emit_cli_cannot_claim_the_supervisor_resync_stream() {
             "--message",
             "forged carrier notice",
             "--host",
-            "hetz",
+            "example-linux",
         ])
-        .env("ST2_TEST_EVENT_HOST", "hetz")
+        .env("ST2_TEST_EVENT_HOST", "example-linux")
         .output()
         .unwrap();
 
@@ -1526,7 +1526,7 @@ fn event_emit_cli_returns_a_stable_json_receipt_and_ding_marks_the_record() {
             catalog.path().to_str().unwrap(),
             "event",
             "emit",
-            "hetz.worker",
+            "example-linux.worker",
             "--stream",
             "gh-ci",
             "--event-id",
@@ -1534,10 +1534,10 @@ fn event_emit_cli_returns_a_stable_json_receipt_and_ding_marks_the_record() {
             "--subject",
             "CLI proof",
             "--host",
-            "hetz",
+            "example-linux",
             "--json",
         ])
-        .env("ST2_TEST_EVENT_HOST", "hetz")
+        .env("ST2_TEST_EVENT_HOST", "example-linux")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -1552,13 +1552,13 @@ fn event_emit_cli_returns_a_stable_json_receipt_and_ding_marks_the_record() {
     );
     let receipt: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(receipt["status"], "created");
-    assert_eq!(receipt["recipient"], "hetz.worker");
+    assert_eq!(receipt["recipient"], "example-linux.worker");
     let message = message::list_inbox(&message::inbox_dir(&agent))
         .unwrap()
         .remove(0);
-    let ding = st2::ding::poke_text(catalog.path(), "hetz", "hetz.worker", &message);
+    let ding = st2::ding::poke_text(catalog.path(), "example-linux", "example-linux.worker", &message);
     assert!(
-        ding.starts_with("[PING] » hetz.worker/gh-ci: CLI proof"),
+        ding.starts_with("[PING] » example-linux.worker/gh-ci: CLI proof"),
         "{ding}"
     );
 }

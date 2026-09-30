@@ -2,7 +2,7 @@
 
 ## Question
 
-2026-08-23, OpenCode 1.18.19 (`/home/schickling/.nix-profile/bin/opencode`), Linux, isolated
+2026-08-23, OpenCode 1.18.19 (`/home/example/.nix-profile/bin/opencode`), Linux, isolated
 `XDG_DATA_HOME`/`XDG_CONFIG_HOME`, headless `opencode serve --port 43123 --print-logs`. The free
 anonymous model (`opencode/big-pickle`) answered prompts with no credentials, so every claim below
 is reproducible without an API key.

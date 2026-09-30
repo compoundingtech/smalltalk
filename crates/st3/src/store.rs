@@ -43,6 +43,7 @@ use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
 mod canonical;
 mod checkpoint;
+mod projection_digest;
 use canonical::{CANONICAL_ORDER, CANONICAL_ORDER_DESC, canonical_sql};
 mod checkpoint_agreement;
 mod checkpoint_trim;
@@ -367,6 +368,13 @@ CREATE TABLE IF NOT EXISTS replication_peers (
     updated_at_unix_ms TEXT NOT NULL
 );
 
+-- Direct route policy is local cache state, outside the replicated claim vocabulary.
+CREATE TABLE IF NOT EXISTS replication_refusals (
+    peer TEXT PRIMARY KEY,
+    reason TEXT NOT NULL,
+    updated_at_unix_ms TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS capabilities (
     secret_hash TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -683,7 +691,7 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);
 CREATE INDEX IF NOT EXISTS checkpoint_claims_operation
 ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
-PRAGMA user_version = 13;
+PRAGMA user_version = 14;
 "#;
 
 /// The writer connection's clock offset. Only a simulation sets it; see `write_time`.
@@ -1714,7 +1722,10 @@ struct ReplicationSnapshot {
     digest_prefixes: Vec<Sha256>,
     authority_digest: String,
     graph_generation: i64,
+    projection_generation: i64,
     graph_digest: String,
+    legacy_graph_digest: String,
+    projection_digests: BTreeMap<String, String>,
 }
 
 /// Nanoseconds every SQLite statement in this process has taken, from SQLite's profile hook.
@@ -2188,11 +2199,11 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || matches!(version, 10..=13),
+        table_count == 0 || matches!(version, 10..=14),
         "this database uses an unsupported st schema; start with a new state directory"
     );
     anyhow::ensure!(
-        matches!(version, 0 | 10 | 11 | 12 | 13),
+        matches!(version, 0 | 10 | 11 | 12 | 13 | 14),
         "this database uses unsupported st schema version {version}"
     );
     Ok(())
@@ -2200,7 +2211,7 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
 
 fn migrate_schema(connection: &Connection) -> Result<()> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version == 0 || version == 13 {
+    if version == 0 || version == 13 || version == 14 {
         return Ok(());
     }
     if version == 12 {
@@ -2324,10 +2335,6 @@ fn subscription_request_view(
         requested_at_unix_ms: request.accepted_at_unix_ms,
     }
 }
-
-/// The most mission runs one resource observation requests at once for one subscription. The
-/// remaining requests wait for a person.
-pub const MAX_OBSERVATION_DELIVERIES: usize = 5;
 
 /// One repository item whose recorded facts changed. `deliver` says whether the change asks a
 /// subscription for a review or a triage.
@@ -2522,7 +2529,7 @@ fn collection_delivery_was_requested_tx(
 /// Item claims written before items carried `head_sha` still cite the repository listing they
 /// came from, and that listing names the head.
 fn listed_head_tx(
-    transaction: &rusqlite::Transaction<'_>,
+    connection: &Connection,
     item: Option<&Value>,
 ) -> rusqlite::Result<Option<String>> {
     let Some(item) = item else {
@@ -2534,7 +2541,7 @@ fn listed_head_tx(
     ) else {
         return Ok(None);
     };
-    let listing = transaction
+    let listing = connection
         .query_row("SELECT body FROM claims WHERE id=?1", [listing], |row| {
             row.get::<_, String>(0)
         })
@@ -2655,6 +2662,13 @@ fn claims_page_query(subject: bool, descending: bool) -> String {
     )
 }
 
+/// Configure a separately opened writer that changes shared projection rows, such as an
+/// offline maintenance or fault-injection connection. Store's own writers configure this
+/// automatically; readers do not need the SQL functions.
+pub fn configure_projection_writer(connection: &Connection) -> Result<()> {
+    projection_digest::register(connection)
+}
+
 impl Store {
     pub fn open(path: &Path, origin: impl Into<String>) -> Result<Self> {
         let origin = origin.into();
@@ -2663,6 +2677,7 @@ impl Store {
         }
         let mut connection = Connection::open(path)
             .with_context(|| format!("open st database {}", path.display()))?;
+        projection_digest::register(&connection)?;
         connection.profile(Some(record_sqlite_time));
         connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         // Keep the hot graph and replication index pages in SQLite's bounded
@@ -2675,9 +2690,27 @@ impl Store {
         backfill_message_index(&connection)?;
         connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(&connection)?;
+        projection_digest::initialize(&connection)?;
         {
             let transaction = connection.transaction()?;
-            rebuild_derived_tables_once_tx(&transaction)?;
+            let upgraded: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='canonical_shared_projection_rules')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !upgraded {
+                replay_graph_from_nothing_tx(&transaction)?;
+                transaction.execute(
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES('derived_tables_version',?1)",
+                    [DERIVED_TABLES_VERSION],
+                )?;
+                transaction.execute(
+                    "INSERT INTO meta(key,value) VALUES('canonical_shared_projection_rules','1')",
+                    [],
+                )?;
+            } else {
+                rebuild_derived_tables_once_tx(&transaction)?;
+            }
             seed_replica_envelopes_tx(&transaction, &origin, None)?;
             transaction.commit()?;
         }
@@ -2723,6 +2756,7 @@ impl Store {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
+        projection_digest::register(&connection)?;
         connection.profile(Some(record_sqlite_time));
         connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         reject_old_schema(&connection)?;
@@ -2731,6 +2765,7 @@ impl Store {
         backfill_message_index(&connection)?;
         connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(&connection)?;
+        projection_digest::initialize(&connection)?;
         {
             let transaction = connection.transaction()?;
             rebuild_operations_tx(&transaction)?;
@@ -12125,7 +12160,6 @@ impl Store {
                                     .map(|claim| vec![(resource.to_owned(), claim.id.clone())])
                                     .unwrap_or_default()
                             };
-                            let mut requested_count = 0;
                             for (delivery_resource, discovery) in discoveries {
                                 let discovery_body = transaction
                                     .query_row("SELECT body FROM claims WHERE id=?1", [&discovery], |row| {
@@ -12192,14 +12226,6 @@ impl Store {
                                         .expect("subscription request fields are an object")
                                         .insert("mission_revision".into(), Value::String(revision.into()));
                                 }
-                                // One observation starts a bounded number of runs. A person releases or
-                                // cancels the rest.
-                                if requested_count >= MAX_OBSERVATION_DELIVERIES {
-                                    request_fields
-                                        .as_object_mut()
-                                        .expect("subscription request fields are an object")
-                                        .insert("held".into(), Value::Bool(true));
-                                }
                                 if let Some(requester) = subscription.requester.as_deref() {
                                     request_fields
                                         .as_object_mut()
@@ -12217,7 +12243,6 @@ impl Store {
                                     Some(&batch_id),
                                 )
                                 .map_err(claim_append_error)?;
-                                requested_count += 1;
                             }
                             continue;
                         }
@@ -12444,12 +12469,17 @@ impl Store {
             return Ok(Some(format!("pull request {number} is a draft again")));
         }
         let short = |head: &str| head.chars().take(12).collect::<String>();
-        let requested_head = requested
+        let requested_head = match requested
             .body
             .pointer("/fields/facts/head_sha")
-            .and_then(Value::as_str);
+            .and_then(Value::as_str)
+        {
+            Some(head) => Some(head.to_owned()),
+            None => listed_head_tx(&self.readers.get(), Some(&requested.body))?,
+        };
         let current_head = current.get("head_sha").and_then(Value::as_str);
-        if let (Some(requested_head), Some(current_head)) = (requested_head, current_head)
+        if let (Some(requested_head), Some(current_head)) =
+            (requested_head.as_deref(), current_head)
             && requested_head != current_head
         {
             return Ok(Some(format!(
@@ -13696,6 +13726,7 @@ impl Store {
             // an envelope row.
             let reader = store.readers.get();
             let current_graph_generation = graph_generation(&reader)?;
+            let current_projection_generation = projection_digest::generation(&reader)?;
             let envelope_rowid = max_envelope_rowid(&reader)?;
             Ok(store
                 .replication_snapshot
@@ -13706,6 +13737,7 @@ impl Store {
                     snapshot.store_index == store_index
                         && snapshot.replica_generation == replica_generation
                         && snapshot.graph_generation == current_graph_generation
+                        && snapshot.projection_generation == current_projection_generation
                         && snapshot.max_envelope_rowid == envelope_rowid
                 })
                 .cloned())
@@ -13736,13 +13768,13 @@ impl Store {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        // Harness observations, timelines, usage and lease renewals change none of the digested
-        // tables, so their writes leave the generation, and the graph digest, unchanged.
+        // The six-table digest stays on the legacy peer wire format. Its generation lets us
+        // retain compatibility without rescanning those tables for unrelated source changes.
         let graph_generation = graph_generation(connection)?;
         let reusable_graph_digest = previous
             .as_ref()
             .filter(|previous| previous.graph_generation == graph_generation)
-            .map(|previous| previous.graph_digest.clone());
+            .map(|previous| previous.legacy_graph_digest.clone());
         let envelope_count: usize =
             connection.query_row("SELECT COUNT(*) FROM replica_envelopes", [], |row| {
                 row.get(0)
@@ -13839,10 +13871,13 @@ impl Store {
         // inventory digest therefore commits the authority log without hex-encoding and hashing
         // every payload again on each graph change.
         let authority_digest = inventory.digest.clone();
-        let graph_digest = match reusable_graph_digest {
+        let legacy_graph_digest = match reusable_graph_digest {
             Some(digest) => digest,
-            None => graph_digest(connection)?,
+            None => legacy_graph_digest(connection)?,
         };
+        let projection_generation = projection_digest::generation(connection)?;
+        let projection_digests = projection_digest::tables(connection)?;
+        let graph_digest = projection_digest::root(&projection_digests);
         let snapshot = Arc::new(ReplicationSnapshot {
             store_index: current_index(connection)?,
             replica_generation: self.replica_generation.load(Ordering::Acquire),
@@ -13854,7 +13889,10 @@ impl Store {
             digest_prefixes,
             authority_digest,
             graph_generation,
+            projection_generation,
             graph_digest,
+            legacy_graph_digest,
+            projection_digests,
         });
         *self
             .replication_snapshot
@@ -13872,7 +13910,8 @@ impl Store {
             fleet_id: fleet_id.to_owned(),
             schema_digest: st3_schema::registry().digest(),
             authority_digest: snapshot.authority_digest.clone(),
-            graph_digest: snapshot.graph_digest.clone(),
+            graph_digest: snapshot.legacy_graph_digest.clone(),
+            projection_digests: snapshot.projection_digests.clone(),
             inventory: ReplicationInventory {
                 digest: snapshot.inventory.digest.clone(),
                 envelopes: Vec::new(),
@@ -13930,7 +13969,8 @@ impl Store {
                 fleet_id: fleet_id.to_owned(),
                 schema_digest: st3_schema::registry().digest(),
                 authority_digest: snapshot.authority_digest.clone(),
-                graph_digest: snapshot.graph_digest.clone(),
+                graph_digest: snapshot.legacy_graph_digest.clone(),
+                projection_digests: snapshot.projection_digests.clone(),
                 inventory: ReplicationInventory {
                     digest: snapshot.inventory.digest.clone(),
                     envelopes: listed,
@@ -13971,7 +14011,8 @@ impl Store {
             fleet_id: fleet_id.to_owned(),
             schema_digest: st3_schema::registry().digest(),
             authority_digest: snapshot.authority_digest.clone(),
-            graph_digest: snapshot.graph_digest.clone(),
+            graph_digest: snapshot.legacy_graph_digest.clone(),
+            projection_digests: snapshot.projection_digests.clone(),
             inventory: ReplicationInventory {
                 accepts: Some(REPLICATION_PAGE_LIMIT),
                 checkpoint: self.trimmed_checkpoint()?,
@@ -14161,6 +14202,20 @@ impl Store {
                         params![relay, now, input.schema_digest, input.authority_digest, input.graph_digest],
                     )
                     .map_err(internal)?;
+                transaction.execute(
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
+                    params![format!("peer_projection_digests:{relay}"),
+                        serde_json::to_string(&input.projection_digests).map_err(internal)?],
+                ).map_err(internal)?;
+                transaction.execute(
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
+                    params![format!("peer_projection_inventory:{relay}"), input.inventory.digest],
+                ).map_err(internal)?;
+                // A response to our own dial proves the outbound grants now permit it.
+                // Incoming exchanges only prove the reverse route.
+                if asks {
+                    transaction.execute("DELETE FROM replication_refusals WHERE peer=?1", [relay]).map_err(internal)?;
+                }
                 Ok((received, duplicate, signatures))
             })
             .map_err(|error| St3Error::new("internal", error))??;
@@ -14183,13 +14238,24 @@ impl Store {
         // Each graph projects the envelopes its node holds, so the digests are comparable only
         // while both nodes hold the same ones, and only once this node has projected them all:
         // nothing new arrived that still waits for admission, and no projection is deferred.
+        let (local_graph, remote_graph) = if input.projection_digests.is_empty() {
+            (
+                snapshot.legacy_graph_digest.clone(),
+                input.graph_digest.clone(),
+            )
+        } else {
+            (
+                snapshot.graph_digest.clone(),
+                projection_digest::root(&input.projection_digests),
+            )
+        };
         let graph_equal = (!input.inventory.digest.is_empty()
             && input.inventory.digest == snapshot.inventory.digest
             && !input.graph_digest.is_empty()
             && received == 0
             && signatures == 0
             && !self.replication_projection_deferred())
-        .then(|| input.graph_digest == snapshot.graph_digest);
+        .then(|| remote_graph == local_graph);
         // A first sync ends at its first comparison, and a difference there heals at once.
         let first_sync_differs = match graph_equal {
             Some(equal) => self
@@ -14197,8 +14263,8 @@ impl Store {
                     relay,
                     equal,
                     snapshot.inventory.envelopes.len() as u64,
-                    &snapshot.graph_digest,
-                    &input.graph_digest,
+                    &local_graph,
+                    &remote_graph,
                 )
                 .map_err(internal)?,
             None => false,
@@ -14808,6 +14874,16 @@ impl Store {
     }
 
     pub fn record_peer_failure(&self, peer: &str, status: &str, error: &str) -> Result<bool> {
+        if status == "refused" {
+            self.connection.batched(|transaction| {
+                transaction.execute(
+                    "INSERT INTO replication_refusals(peer, reason, updated_at_unix_ms) VALUES (?1, ?2, ?3)
+                     ON CONFLICT(peer) DO UPDATE SET reason=excluded.reason, updated_at_unix_ms=excluded.updated_at_unix_ms",
+                    params![peer, error, now_ms().to_string()],
+                )
+            }).map_err(anyhow::Error::msg)??;
+            return Ok(true);
+        }
         // Keep the existing storage and claim vocabulary for mixed-version fleets.
         // Unknown reachability projects as last-seen in current product views.
         let status = if status == "down" { "unknown" } else { status };
@@ -14901,7 +14977,12 @@ impl Store {
         reason: Option<&str>,
         last_success_at: Option<u128>,
     ) -> Result<()> {
-        let status = if status == "down" { "unknown" } else { status };
+        // Keep route refusals local so older members can admit transport observations.
+        let status = if matches!(status, "down" | "refused") {
+            "unknown"
+        } else {
+            status
+        };
         let reason = if status == "unknown" { None } else { reason };
         let subject = format!("host/{peer}");
         let already_current = self
@@ -14944,6 +15025,19 @@ impl Store {
             )),
         })?;
         Ok(())
+    }
+
+    /// A direct Fabric refusal is local route state; it does not assert that the member is away.
+    pub fn replication_peer_refusal(&self, peer: &str) -> Result<Option<String>> {
+        Ok(self
+            .readers
+            .get()
+            .query_row(
+                "SELECT reason FROM replication_refusals WHERE peer=?1",
+                [peer],
+                |row| row.get(0),
+            )
+            .optional()?)
     }
 
     /// When this replica last exchanged records with `peer`. The peer row records every
@@ -15094,9 +15188,12 @@ impl Store {
                                 .get::<_, Option<String>>(1)?
                                 .and_then(|value| value.parse().ok()),
                             last_error: row.get(2)?,
+                            refusal_reason: None,
                             schema_digest: row.get(3)?,
                             authority_digest: row.get(4)?,
                             graph_digest: row.get(5)?,
+                            projection_digests: BTreeMap::new(),
+                            differing_tables: Vec::new(),
                             sync: None,
                         })
                     },
@@ -15107,9 +15204,12 @@ impl Store {
                     status: "unknown".into(),
                     last_success_at_unix_ms: None,
                     last_error: None,
+                    refusal_reason: None,
                     schema_digest: None,
                     authority_digest: None,
                     graph_digest: None,
+                    projection_digests: BTreeMap::new(),
+                    differing_tables: Vec::new(),
                     sync: None,
                 });
             if matches!(
@@ -15127,7 +15227,48 @@ impl Store {
                 .into();
                 status.last_error = None;
             }
+            let refusal = connection
+                .query_row(
+                    "SELECT reason FROM replication_refusals WHERE peer=?1",
+                    [peer],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(reason) = refusal {
+                status.status = "refused".into();
+                status.refusal_reason = Some(reason);
+                status.last_error = None;
+            }
             status.sync = sync.get(peer).cloned();
+            let encoded: Option<String> = connection
+                .query_row(
+                    "SELECT value FROM meta WHERE key=?1",
+                    [format!("peer_projection_digests:{peer}")],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            status.projection_digests = encoded
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?
+                .unwrap_or_default();
+            if !status.projection_digests.is_empty() {
+                status.graph_digest = Some(projection_digest::root(&status.projection_digests));
+                let peer_inventory: Option<String> = connection
+                    .query_row(
+                        "SELECT value FROM meta WHERE key=?1",
+                        [format!("peer_projection_inventory:{peer}")],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if peer_inventory.as_deref() == Some(snapshot.inventory.digest.as_str())
+                    && !self.replication_projection_deferred()
+                {
+                    status.differing_tables = projection_digest::differing(
+                        &snapshot.projection_digests,
+                        &status.projection_digests,
+                    );
+                }
+            }
             peers.push(status);
         }
         Ok(ReplicationStatus {
@@ -15135,6 +15276,7 @@ impl Store {
             fleet_id: fleet_id.map(str::to_owned),
             authority_digest: snapshot.authority_digest.clone(),
             graph_digest: snapshot.graph_digest.clone(),
+            projection_digests: snapshot.projection_digests.clone(),
             received_envelopes: connection.query_row(
                 "SELECT COUNT(*) FROM replica_envelopes",
                 [],
@@ -18907,6 +19049,7 @@ fn append_claim_tx(
         now,
     )?;
     insert_event(transaction, store_index, kind, subject, body)?;
+    normalize_local_projection_timestamps_tx(transaction, subject, kind, body, now)?;
     Ok(ClaimRecord {
         id,
         store_index,
@@ -18921,6 +19064,115 @@ fn append_claim_tx(
         predecessors: predecessors.to_vec(),
         accepted_at_unix_ms: now,
     })
+}
+
+fn mission_run_creation_time(fields: &Value, accepted_at: u128) -> u128 {
+    fields
+        .get("deadline_at_unix_ms")
+        .and_then(Value::as_u64)
+        .zip(fields.get("timeout_ms").and_then(Value::as_u64))
+        .and_then(|(deadline, timeout)| deadline.checked_sub(timeout))
+        .map(u128::from)
+        .unwrap_or(accepted_at)
+}
+
+/// Local writers often prepare rows before appending their claim. Use the resulting claim's
+/// immutable acceptance timestamp, exactly as replay does, for shared creation/change dates.
+/// Local lease renewal dates remain separate overlays.
+fn normalize_local_projection_timestamps_tx(
+    transaction: &Transaction<'_>,
+    subject: &str,
+    kind: &str,
+    body: &Value,
+    at: u128,
+) -> Result<()> {
+    let fields = body.get("fields").unwrap_or(body);
+    let at = at.to_string();
+    match kind {
+        "mission-run.created" => {
+            let at = mission_run_creation_time(fields, at.parse()?).to_string();
+            transaction.execute(
+                "UPDATE mission_runs SET created_at_unix_ms=?2,updated_at_unix_ms=?2 WHERE id=?1",
+                params![subject.strip_prefix("mission-run/").unwrap_or(subject), at],
+            )?;
+            if let Some(generation) = fields.get("current_generation").and_then(Value::as_str) {
+                let generation = generation_id_from_subject(generation);
+                transaction.execute("UPDATE run_generations SET created_at_unix_ms=?2,updated_at_unix_ms=?2 WHERE id=?1",params![generation,at])?;
+                transaction.execute("UPDATE step_runs SET created_at_unix_ms=?2,updated_at_unix_ms=?2 WHERE generation_id=?1",params![generation,at])?;
+            }
+        }
+        "mission-run.state" => {
+            transaction.execute(
+                "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE id=?1",
+                params![subject.strip_prefix("mission-run/").unwrap_or(subject), at],
+            )?;
+        }
+        "run-generation.created" if fields.get("predecessor").and_then(Value::as_str).is_some() => {
+            let generation = generation_id_from_subject(subject);
+            transaction.execute("UPDATE run_generations SET created_at_unix_ms=?2,updated_at_unix_ms=?2 WHERE id=?1",params![generation,at])?;
+            transaction.execute("UPDATE step_runs SET created_at_unix_ms=?2,updated_at_unix_ms=?2 WHERE generation_id=?1",params![generation,at])?;
+            transaction.execute(
+                "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE current_generation_id=?1",
+                params![generation, at],
+            )?;
+        }
+        "run-generation.state" | "run-generation.superseded" => {
+            transaction.execute(
+                "UPDATE run_generations SET updated_at_unix_ms=?2 WHERE id=?1",
+                params![generation_id_from_subject(subject), at],
+            )?;
+        }
+        "revision-proposal.created" => {
+            transaction.execute("UPDATE revision_proposals SET created_at_unix_ms=?2,updated_at_unix_ms=?2 WHERE id=?1",
+                params![subject.strip_prefix("revision-proposal/").unwrap_or(subject),at])?;
+        }
+        "revision-proposal.approved"
+        | "revision-proposal.cancelled"
+        | "revision-proposal.applied" => {
+            transaction.execute(
+                "UPDATE revision_proposals SET updated_at_unix_ms=?2 WHERE id=?1",
+                params![
+                    subject
+                        .strip_prefix("revision-proposal/")
+                        .unwrap_or(subject),
+                    at
+                ],
+            )?;
+        }
+        "step-run.state" if fields.get("status").and_then(Value::as_str) == Some("ready") => {
+            transaction.execute(
+                "UPDATE step_runs SET activated_at_unix_ms=?2 WHERE subject=?1",
+                params![subject, at],
+            )?;
+        }
+        "planning-session.started" => {
+            transaction.execute("UPDATE planning_sessions SET created_at_unix_ms=?2,updated_at_unix_ms=?2 WHERE id=?1",
+                params![subject.trim_start_matches("planning-session/"),at])?;
+        }
+        "planning-session.candidate" => {
+            let id = subject.trim_start_matches("planning-session/");
+            transaction.execute(
+                "UPDATE planning_sessions SET updated_at_unix_ms=?2 WHERE id=?1",
+                params![id, at],
+            )?;
+            transaction.execute("UPDATE planning_candidates SET submitted_at_unix_ms=?4 WHERE session_id=?1 AND variant=?2 AND revision=?3",
+                params![id,fields.get("variant").and_then(Value::as_str).unwrap_or("default"),fields.get("candidate_revision").or_else(||fields.get("revision")).and_then(Value::as_u64),at])?;
+        }
+        "planning-session.previewed" => {
+            transaction.execute("UPDATE planning_previews SET created_at_unix_ms=?3 WHERE session_id=?1 AND variant=?2",
+                params![subject.trim_start_matches("planning-session/"),fields.get("variant").and_then(Value::as_str).unwrap_or("default"),at])?;
+        }
+        "planning-session.approved"
+        | "planning-session.cancelled"
+        | "planning-session.revision-requested" => {
+            transaction.execute(
+                "UPDATE planning_sessions SET updated_at_unix_ms=?2 WHERE id=?1",
+                params![subject.trim_start_matches("planning-session/"), at],
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn schema_fields_for_body(kind: &str, body: &Value) -> Result<BTreeMap<String, Value>> {
@@ -24481,6 +24733,12 @@ const GRAPH_DIGEST_TABLES: [(&str, &str, &[&str], &str); 6] = [
 ];
 
 fn graph_digest(connection: &Connection) -> Result<String> {
+    Ok(projection_digest::root(&projection_digest::tables(
+        connection,
+    )?))
+}
+
+fn legacy_graph_digest(connection: &Connection) -> Result<String> {
     #[cfg(test)]
     GRAPH_DIGESTS_COMPUTED.with(|computed| computed.set(computed.get() + 1));
     let queries = GRAPH_DIGEST_TABLES
@@ -24751,26 +25009,26 @@ fn replication_snapshot_keeps_compact_envelope_identifiers() {
 #[test]
 fn compact_replication_inventory_matches_its_public_identities() {
     let mut identities = [
-        test_envelope_ids("silber-like", 1..=300, "a"),
-        test_envelope_ids("hetz-like", 250..=600, "a"),
-        test_envelope_ids("hetz-like", [255, 256, 511], "b"),
+        test_envelope_ids("example-mac-like", 1..=300, "a"),
+        test_envelope_ids("example-linux-like", 250..=600, "a"),
+        test_envelope_ids("example-linux-like", [255, 256, 511], "b"),
     ]
     .concat();
     // Hashes a peer could send that are not lowercase SHA-256 hex keep their exact text.
     let upper = identities[0].hash.to_uppercase();
     identities.extend([
         ReplicaEnvelopeId {
-            writer: "hetz-like".into(),
+            writer: "example-linux-like".into(),
             sequence: 256,
             hash: upper.clone(),
         },
         ReplicaEnvelopeId {
-            writer: "bluey-like".into(),
+            writer: "example-peer-like".into(),
             sequence: 7,
             hash: "not-a-hash".into(),
         },
         ReplicaEnvelopeId {
-            writer: "silber-like".into(),
+            writer: "example-mac-like".into(),
             sequence: 7,
             hash: String::new(),
         },
@@ -24798,18 +25056,18 @@ fn compact_replication_inventory_matches_its_public_identities() {
         assert_eq!(inventory.digest, replication_inventory_digest(&sorted));
         assert_eq!(inventory.buckets(), test_replication_buckets(&sorted));
         assert_eq!(inventory.irregular_hashes.len(), 3);
-        let range = inventory.range("hetz-like", 256);
+        let range = inventory.range("example-linux-like", 256);
         assert_eq!(
             inventory.identities(range),
             sorted
                 .iter()
-                .filter(|id| id.writer == "hetz-like" && (256..512).contains(&id.sequence))
+                .filter(|id| id.writer == "example-linux-like" && (256..512).contains(&id.sequence))
                 .cloned()
                 .collect::<Vec<_>>()
         );
     }
-    assert!(inventory_holds(&incremental, "hetz-like", 256, &upper));
-    assert!(inventory_holds(&incremental, "bluey-like", 7, "not-a-hash"));
+    assert!(inventory_holds(&incremental, "example-linux-like", 256, &upper));
+    assert!(inventory_holds(&incremental, "example-peer-like", 7, "not-a-hash"));
     assert!(bulk.range("absent", 0).is_empty());
 
     fn inventory_holds(
@@ -24830,9 +25088,9 @@ fn compact_replication_inventory_matches_its_public_identities() {
 #[cfg(test)]
 #[test]
 fn a_tombstoned_identity_held_again_is_listed_once() {
-    let mut identities = test_envelope_ids("hetz-like", [1, 2], "a");
+    let mut identities = test_envelope_ids("example-linux-like", [1, 2], "a");
     identities.push(ReplicaEnvelopeId {
-        writer: "hetz-like".into(),
+        writer: "example-linux-like".into(),
         sequence: 3,
         hash: "not-a-hash".into(),
     });
@@ -25001,8 +25259,8 @@ impl TestReplica {
 #[test]
 fn compact_replication_exchange_lists_only_ranges_that_differ() {
     let shared = [
-        test_envelope_ids("hetz-like", 1..=20_000, "a"),
-        test_envelope_ids("silber-like", 1..=20_000, "a"),
+        test_envelope_ids("example-linux-like", 1..=20_000, "a"),
+        test_envelope_ids("example-mac-like", 1..=20_000, "a"),
     ]
     .concat();
     let mut left = TestReplica(shared.iter().cloned().collect());
@@ -25010,15 +25268,15 @@ fn compact_replication_exchange_lists_only_ranges_that_differ() {
     // A new publish on one side, a sparse gap relayed around the other, and two candidates
     // at one writer sequence all fall inside ranges both peers already hold.
     left.0
-        .extend(test_envelope_ids("silber-like", [20_001], "a"));
+        .extend(test_envelope_ids("example-mac-like", [20_001], "a"));
     right
         .0
-        .extend(test_envelope_ids("hetz-like", 20_001..=20_003, "a"));
+        .extend(test_envelope_ids("example-linux-like", 20_001..=20_003, "a"));
     left.0
-        .remove(&test_envelope_ids("hetz-like", [19_990], "a")[0]);
+        .remove(&test_envelope_ids("example-linux-like", [19_990], "a")[0]);
     right
         .0
-        .extend(test_envelope_ids("silber-like", [20_000], "b"));
+        .extend(test_envelope_ids("example-mac-like", [20_000], "b"));
 
     let listed = left.exchange(&mut right);
     assert_eq!(left.0, right.0, "one exchange converges both peers");
@@ -25050,7 +25308,7 @@ fn compact_replication_exchange_lists_only_ranges_that_differ() {
 #[cfg(test)]
 #[test]
 fn compact_replication_exchange_bounds_the_listing_of_many_differing_ranges() {
-    let all = test_envelope_ids("hetz-like", 1..=5_000, "a");
+    let all = test_envelope_ids("example-linux-like", 1..=5_000, "a");
     let ranges = 5_000 / REPLICATION_BUCKET_WIDTH as usize + 1;
     let replica = |skip: u64| {
         TestReplica(
@@ -25518,6 +25776,7 @@ fn batches_accepted_in_one_millisecond_extend_the_projection_without_a_replay() 
             .filter(|claim| claim.kind == "doc.bound")
             .collect::<Vec<_>>()
     };
+    source.set_write_clock_at(now_ms()).unwrap();
     let mut index = 1;
     loop {
         put(index);
@@ -27564,7 +27823,7 @@ fn project_mission_run_created(
         .execute(
             "INSERT OR IGNORE INTO mission_runs(id, mission_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, inputs, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'running', 'normal', ?12, ?12)",
-            params![run_id, mission_id, revision, generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, serde_json::to_string(&inputs).map_err(internal)?, mode, claim.accepted_at_unix_ms.to_string()],
+            params![run_id, mission_id, revision, generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, serde_json::to_string(&inputs).map_err(internal)?, mode, mission_run_creation_time(fields, claim.accepted_at_unix_ms).to_string()],
         )
         .map_err(internal)?;
     if let Some(after) = after {
@@ -27591,7 +27850,7 @@ fn project_mission_run_created(
         .execute(
             "INSERT OR IGNORE INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
              VALUES (?1, ?2, ?3, NULL, 'running', ?4, 'initial mission run', ?5, ?5)",
-            params![generation_id, run_id, revision, requester, claim.accepted_at_unix_ms.to_string()],
+            params![generation_id, run_id, revision, requester, mission_run_creation_time(fields, claim.accepted_at_unix_ms).to_string()],
         )
         .map_err(internal)?;
     let view = mission_run_view_tx(transaction, run_id).map_err(internal)?;
@@ -27624,7 +27883,7 @@ fn project_mission_run_created(
             .execute(
                 "INSERT OR IGNORE INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, created_at_unix_ms, updated_at_unix_ms, constraints)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)",
-                params![subject, run_id, generation_id, step.path, step.definition_hash, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, claim.accepted_at_unix_ms.to_string(), constraints],
+                params![subject, run_id, generation_id, step.path, step.definition_hash, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, mission_run_creation_time(fields, claim.accepted_at_unix_ms).to_string(), constraints],
             )
             .map_err(internal)?;
     }
@@ -31638,6 +31897,46 @@ mod tests {
     }
 
     #[test]
+    fn an_inbound_exchange_keeps_the_outbound_grant_refusal_until_a_dial_succeeds() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("amber.db");
+        let fleet = "94cd11ba-c582-4558-9c84-c3bda922eb6d";
+        let store = Store::open(&path, "amber").unwrap();
+        store.bind_fleet(fleet).unwrap();
+        store
+            .record_peer_failure(
+                "cobalt",
+                "refused",
+                "refused by that member's Fabric grants",
+            )
+            .unwrap();
+        drop(store);
+        let store = Store::open(&path, "amber").unwrap();
+        let peer = Store::open_memory("cobalt").unwrap();
+        peer.bind_fleet(fleet).unwrap();
+        let exchange = peer
+            .export_replication_exchange(fleet, &ReplicationInventory::default())
+            .unwrap();
+        store
+            .receive_replication_exchange("cobalt", fleet, &exchange)
+            .unwrap();
+        let status = store
+            .replication_status(true, Some(fleet), &["cobalt".into()])
+            .unwrap();
+        assert_eq!(status.peers[0].status, "refused");
+        assert!(status.peers[0].last_success_at_unix_ms.is_some());
+        assert!(status.peers[0].last_error.is_none());
+        store
+            .receive_replication_exchange_asking("cobalt", fleet, &exchange, true)
+            .unwrap();
+        let status = store
+            .replication_status(true, Some(fleet), &["cobalt".into()])
+            .unwrap();
+        assert_eq!(status.peers[0].status, "up");
+        assert!(status.peers[0].refusal_reason.is_none());
+    }
+
+    #[test]
     fn recent_up_observation_prevents_a_transport_timeout_flap() {
         let store = Store::open_memory("source").unwrap();
         store
@@ -31966,6 +32265,7 @@ mod tests {
         drop(Store::open(&path, "node").unwrap());
         {
             let connection = Connection::open(&path).unwrap();
+            projection_digest::register(&connection).unwrap();
             connection
                 .execute_batch("PRAGMA foreign_keys = OFF")
                 .unwrap();
@@ -34758,28 +35058,28 @@ version 2
 
     #[test]
     fn a_remote_stop_without_process_authority_cannot_poison_the_running_owner() {
-        let owner = json!({"fields": {"status": "running", "host": "Silber"}});
+        let owner = json!({"fields": {"status": "running", "host": "ExampleMac"}});
         let remote_stop = json!({"fields": {"status": "stopped"}});
-        let remote_running = json!({"fields": {"status": "running", "host": "hetz"}});
+        let remote_running = json!({"fields": {"status": "running", "host": "example-linux"}});
         assert!(nonowner_terminal_observation(
             None,
-            "Silber",
+            "ExampleMac",
             &owner,
-            "hetz",
+            "example-linux",
             &remote_stop,
         ));
         assert!(!nonowner_terminal_observation(
-            Some("hetz"),
-            "Silber",
+            Some("example-linux"),
+            "ExampleMac",
             &owner,
-            "hetz",
+            "example-linux",
             &remote_stop,
         ));
         assert!(!nonowner_terminal_observation(
             None,
-            "Silber",
+            "ExampleMac",
             &owner,
-            "hetz",
+            "example-linux",
             &remote_running,
         ));
     }
@@ -37257,6 +37557,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                 .insert("0".repeat(64), b"wrong bytes".to_vec());
         });
         let input = ReplicationExchange {
+            projection_digests: Default::default(),
             peer: "source".into(),
             fleet_id: TEST_FLEET.into(),
             schema_digest: st3_schema::registry().digest(),
@@ -37327,6 +37628,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             .unwrap();
         });
         let make_exchange = |envelopes: Vec<ReplicaEnvelope>| ReplicationExchange {
+            projection_digests: Default::default(),
             peer: "source".into(),
             fleet_id: TEST_FLEET.into(),
             schema_digest: st3_schema::registry().digest(),
@@ -37374,6 +37676,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     /// One exchange carrying exactly `envelopes`, as a peer that holds only those would send it.
     fn exchange_of(peer: &str, envelopes: Vec<ReplicaEnvelope>) -> ReplicationExchange {
         ReplicationExchange {
+            projection_digests: Default::default(),
             peer: peer.into(),
             fleet_id: TEST_FLEET.into(),
             schema_digest: st3_schema::registry().digest(),
@@ -37396,6 +37699,110 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             envelopes,
             signature_requests: Vec::new(),
             signatures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn planning_state_and_attention_agree_when_claims_arrive_in_different_orders() {
+        let source = Store::open_memory("source").unwrap();
+        let kdl = "version 2\nmission \"release\" state=\"ready\" { goal \"Ship a release\" }\n";
+        let intent = crate::graph::parse_test_intent(kdl, "source").unwrap();
+        let mission = source
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        let doc = source
+            .put_document(
+                "doc/planning/release/request",
+                b"Ship a release",
+                &None,
+                "request",
+            )
+            .unwrap();
+        let reference = format!("{}@{}", doc.name, doc.hash);
+        let subject = "planning-session/planning/release/one";
+        let events = [
+            (
+                "started",
+                json!({"mission": "mission/release", "request": reference, "workspace": "/work/release", "requester": "person/avery", "planner": "agent/source.planner"}),
+            ),
+            (
+                "candidate-submitted",
+                json!({"candidate_revision": 1, "markdown": reference, "kdl": reference, "mission_revision": "revision-one"}),
+            ),
+            (
+                "previewed",
+                json!({"candidate_revision": 1, "preview_hash": "preview-one", "store_index": mission.store_index, "graph": "release", "diff": "new", "mission": mission}),
+            ),
+            (
+                "approved",
+                json!({"mission_revision": "revision-one", "requester": "person/avery"}),
+            ),
+        ];
+        for (kind, fields) in events {
+            // Distinct accepted times also prove this is independent of the receiver's indexes.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            source
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: format!("planning-session.{kind}"),
+                    actor: Some("person/avery".into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("planning-{kind}")),
+                })
+                .unwrap();
+            if kind == "previewed" {
+                source.replay_replication_graph().unwrap();
+                let attention = source.attention_items(Some("person/avery")).unwrap();
+                assert_eq!(attention.len(), 1);
+                assert_eq!(attention[0].kind, "launch-approval");
+            }
+        }
+        let envelopes = exchange_from(&source, &ReplicationInventory::default()).envelopes;
+        let in_order = Store::open_memory("in-order").unwrap();
+        receive_and_project(
+            &in_order,
+            "source",
+            &exchange_of("source", envelopes.clone()),
+        );
+        let reversed = Store::open_memory("reversed").unwrap();
+        for envelope in envelopes.iter().rev() {
+            receive_and_project(
+                &reversed,
+                "source",
+                &exchange_of("source", vec![envelope.clone()]),
+            );
+        }
+        assert_eq!(graph_digest_of(&in_order), graph_digest_of(&reversed));
+        for store in [&in_order, &reversed] {
+            let launch = store.planning_session(subject).unwrap().unwrap();
+            assert_eq!(launch.status, "approved");
+            assert_eq!(launch.published_revision.as_deref(), Some("revision-one"));
+            assert!(
+                store
+                    .attention_items(Some("person/avery"))
+                    .unwrap()
+                    .is_empty()
+            );
+            // Startup replay must retain the same result, too.
+            store.replay_replication_graph().unwrap();
+            assert_eq!(
+                store.planning_session(subject).unwrap().unwrap().status,
+                "approved"
+            );
+            assert!(
+                store
+                    .attention_items(Some("person/avery"))
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 
@@ -37748,6 +38155,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         let unmatched = "f".repeat(64);
         let mut summary = source.export_replication_summary(TEST_FLEET).unwrap();
         summary.graph_digest = unmatched.clone();
+        summary.projection_digests.clear();
         let receipt = newcomer
             .receive_replication_exchange_asking("source", TEST_FLEET, &summary, true)
             .unwrap();
@@ -37756,12 +38164,14 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             match source.heal_answer("newcomer", query).unwrap() {
                 ReplicationHealAnswer::Ranges { ranges, .. } => ReplicationHealAnswer::Ranges {
                     graph_digest: unmatched.clone(),
+                    projection_digests: Default::default(),
                     ranges,
                 },
                 ReplicationHealAnswer::Replayed { replayed, .. } => {
                     ReplicationHealAnswer::Replayed {
                         replayed,
                         graph_digest: unmatched.clone(),
+                        projection_digests: Default::default(),
                     }
                 }
                 other => other,
@@ -38361,6 +38771,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                     "source",
                     FLEET,
                     &ReplicationExchange {
+                        projection_digests: Default::default(),
                         peer: "source".into(),
                         fleet_id: FLEET.into(),
                         schema_digest: String::new(),
@@ -39145,7 +39556,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            13
+            14
         );
         assert_eq!(
             connection
@@ -39219,7 +39630,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            13
+            14
         );
     }
 
@@ -39231,7 +39642,10 @@ version 2
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "ALTER TABLE planning_sessions DROP COLUMN planner_spec_json;
+                "DROP TRIGGER projection_digest_planning_sessions_insert;
+                 DROP TRIGGER projection_digest_planning_sessions_update;
+                 DROP TRIGGER projection_digest_planning_sessions_delete;
+                 ALTER TABLE planning_sessions DROP COLUMN planner_spec_json;
                  PRAGMA user_version = 12;",
             )
             .unwrap();
@@ -39249,7 +39663,7 @@ version 2
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 14);
         assert_eq!(planner_column, 1);
     }
 
@@ -39709,7 +40123,7 @@ version 2
 
     #[test]
     fn a_local_write_rehashes_only_its_own_inventory_range() {
-        let store = Store::open_memory("hetz").unwrap();
+        let store = Store::open_memory("example-linux").unwrap();
         for observed_at_ms in 0..600 {
             observe_harness(&store, observed_at_ms);
         }
@@ -39745,7 +40159,7 @@ version 2
                 1..6,
             ),
         ) {
-            let writers = ["Silber", "fleet-node", "hetz"];
+            let writers = ["ExampleMac", "fleet-node", "example-linux"];
             // Some hashes are not SHA-256 hex, so the digest also covers verbatim hashes.
             let identity = |(writer, sequence): (usize, u64)| ReplicaEnvelopeId {
                 writer: writers[writer].into(),
@@ -39788,8 +40202,8 @@ version 2
     }
 
     #[test]
-    fn replication_reuses_the_graph_digest_until_a_digested_column_changes() {
-        let store = Store::open_memory("hetz").unwrap();
+    fn replication_reuses_legacy_digest_while_complete_source_digest_changes() {
+        let store = Store::open_memory("example-linux").unwrap();
         observe_harness(&store, 0);
         let first = store.replication_snapshot().unwrap();
         GRAPH_DIGESTS_COMPUTED.with(|computed| computed.set(0));
@@ -39801,7 +40215,12 @@ version 2
             0,
             "a harness observation must not recompute the graph digest"
         );
-        assert_eq!(second.graph_digest, first.graph_digest);
+        assert_eq!(second.legacy_graph_digest, first.legacy_graph_digest);
+        assert_ne!(second.graph_digest, first.graph_digest);
+        assert_ne!(
+            second.projection_digests["claim_sources"],
+            first.projection_digests["claim_sources"]
+        );
 
         let generation =
             |store: &Store| graph_generation(&store.connection.lock().unwrap()).unwrap();
@@ -40352,7 +40771,7 @@ mission "asks" state="ready" {
                 mission: "asks".into(),
                 revision: None,
                 workspace: "/tmp".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "asks-run".into(),
@@ -40365,7 +40784,7 @@ mission "asks" state="ready" {
             store.request_attention_closing(
                 &format!("attention/{key}"),
                 &AttentionRequest {
-                    reviewer: "person/nathan".into(),
+                    reviewer: "person/alex".into(),
                     title: format!("Decide {key}"),
                     reason: "A person needs to decide before the work goes on.".into(),
                     severity: "warning".into(),
@@ -40378,15 +40797,15 @@ mission "asks" state="ready" {
         };
         let open = |subject: &str| {
             store
-                .attention_items(Some("person/nathan"))
+                .attention_items(Some("person/alex"))
                 .unwrap()
                 .iter()
                 .any(|item| item.subject == subject)
         };
-        let context = ["resource/fabric/queue", "host/silber"];
+        let context = ["resource/fabric/queue", "host/ExampleMac"];
 
         // Context and hosts never end an item, so a request naming only those is refused.
-        for (key, actor) in [("agent-unclaimed", agent), ("person", "person/nathan")] {
+        for (key, actor) in [("agent-unclaimed", agent), ("person", "person/alex")] {
             assert_eq!(
                 ask(key, actor, &context, AttentionClosing::default())
                     .unwrap_err()
@@ -40485,7 +40904,7 @@ mission "asks" state="ready" {
         assert_eq!(
             ask(
                 "late",
-                "person/nathan",
+                "person/alex",
                 &context,
                 AttentionClosing {
                     step: Some(step.clone()),
@@ -40529,7 +40948,7 @@ mission "external-blocker" state="ready" {
                 mission: "external-blocker".into(),
                 revision: None,
                 workspace: "/tmp".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "external-blocker-run".into(),
@@ -40550,19 +40969,19 @@ mission "external-blocker" state="ready" {
             .unwrap();
         let attention = store
             .request_attention(
-                "attention/silber-xcode",
+                "attention/example-mac-xcode",
                 &AttentionRequest {
-                    reviewer: "person/nathan".into(),
-                    title: "Silber needs its Xcode simulator components updated".into(),
+                    reviewer: "person/alex".into(),
+                    title: "ExampleMac needs its Xcode simulator components updated".into(),
                     reason: "CoreSimulator must be repaired before automated proof can run.".into(),
                     severity: "error".into(),
-                    targets: vec!["host/silber".into(), subject.clone()],
+                    targets: vec!["host/example-mac".into(), subject.clone()],
                     actor: "agent/source.ios-owner".into(),
-                    idempotency_key: "silber-xcode-attention".into(),
+                    idempotency_key: "example-mac-xcode-attention".into(),
                 },
             )
             .unwrap();
-        let reason = "Silber has an exact CoreSimulator/CoreDevice mismatch; renewing this claim would be idle and misleading.";
+        let reason = "ExampleMac has an exact CoreSimulator/CoreDevice mismatch; renewing this claim would be idle and misleading.";
         store
             .work_action(
                 &subject,
@@ -40619,8 +41038,8 @@ mission "external-blocker" state="ready" {
                 &AttentionResolveRequest {
                     outcome: "resolved".into(),
                     reason: Some("Xcode first-launch setup now succeeds.".into()),
-                    actor: "person/nathan".into(),
-                    idempotency_key: "resolve-silber-xcode".into(),
+                    actor: "person/alex".into(),
+                    idempotency_key: "resolve-example-mac-xcode".into(),
                 },
             )
             .unwrap();
@@ -43132,6 +43551,11 @@ mission "takeover" state="ready" {
             ("reversed", &reversed),
             ("late", &late),
         ] {
+            assert_eq!(
+                canonical_audit::shared_rows(target),
+                canonical_audit::shared_rows(&source),
+                "{name}: every shared column"
+            );
             assert_eq!(graph(target), expected, "{name}");
         }
     }
@@ -46203,7 +46627,7 @@ mission "review-current" state="ready" revision-cutover="restart-active" {{
                     actor: None,
                     fields: BTreeMap::from([
                         ("owner".into(), Value::String(owner.into())),
-                        ("reviewer".into(), Value::String("person/nathan".into())),
+                        ("reviewer".into(), Value::String("person/alex".into())),
                         ("question".into(), Value::String("Approve it?".into())),
                         ("review_targets".into(), Value::Array(Vec::new())),
                         (
@@ -46323,7 +46747,7 @@ mission "asked-again" state="ready" {
         let ask = |operation: &str, mode: Option<&str>| {
             let mut fields = BTreeMap::from([
                 ("owner".into(), Value::String(step.subject.clone())),
-                ("reviewer".into(), Value::String("person/nathan".into())),
+                ("reviewer".into(), Value::String("person/alex".into())),
                 ("question".into(), Value::String("Approve it?".into())),
                 ("review_targets".into(), Value::Array(Vec::new())),
                 (
@@ -46372,7 +46796,7 @@ mission "asked-again" state="ready" {
         );
         assert_eq!(reviews[0].requested_at_unix_ms, first.accepted_at_unix_ms);
 
-        let items = store.attention_items(Some("person/nathan")).unwrap();
+        let items = store.attention_items(Some("person/alex")).unwrap();
         let gates = items
             .iter()
             .filter(|item| item.kind == "human-gate")
@@ -46386,7 +46810,7 @@ mission "asked-again" state="ready" {
             .request_attention(
                 subject,
                 &AttentionRequest {
-                    reviewer: "person/nathan".into(),
+                    reviewer: "person/alex".into(),
                     title: format!("Fault {subject}"),
                     reason: "a person must decide".into(),
                     severity: "warning".into(),
@@ -46400,7 +46824,7 @@ mission "asked-again" state="ready" {
 
     fn fault_is_current(store: &Store, subject: &str) -> bool {
         store
-            .attention_items(Some("person/nathan"))
+            .attention_items(Some("person/alex"))
             .unwrap()
             .iter()
             .any(|item| item.kind == "fault" && item.subject == subject)
@@ -46423,7 +46847,7 @@ mission "{mission}" state="ready" {{
                 mission: mission.into(),
                 revision: None,
                 workspace: ".".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: format!("{mission}-run"),
@@ -46466,7 +46890,7 @@ mission "{mission}" state="ready" {{
                 actor: None,
                 fields: BTreeMap::from([
                     ("owner".into(), Value::String(step.subject.clone())),
-                    ("reviewer".into(), Value::String("person/nathan".into())),
+                    ("reviewer".into(), Value::String("person/alex".into())),
                     ("question".into(), Value::String("Approve it?".into())),
                     ("review_targets".into(), Value::Array(Vec::new())),
                     (
@@ -46507,7 +46931,7 @@ mission "{mission}" state="ready" {{
                 &AttentionResolveRequest {
                     outcome: "resolved".into(),
                     reason: None,
-                    actor: "person/nathan".into(),
+                    actor: "person/alex".into(),
                     idempotency_key: "other-review-resolved".into(),
                 },
             )
@@ -46797,14 +47221,14 @@ mission "typecase" state="ready" {
                 mission: "typecase".into(),
                 revision: None,
                 workspace: ".".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "typecase-run".into(),
             })
             .unwrap();
         let request = AttentionRequest {
-            reviewer: "person/nathan".into(),
+            reviewer: "person/alex".into(),
             title: "Another fault".into(),
             reason: "a person must decide".into(),
             severity: "warning".into(),
@@ -46890,7 +47314,7 @@ mission "typecase" state="ready" {
     fn explicit_attention_is_idempotent_authorized_and_terminal() {
         let store = Store::open_memory("node").unwrap();
         let request = AttentionRequest {
-            reviewer: "nathan".into(),
+            reviewer: "alex".into(),
             title: "Fabric needs review".into(),
             reason: "The queue did not recover.".into(),
             severity: "error".into(),
@@ -46905,9 +47329,9 @@ mission "typecase" state="ready" {
             .request_attention("attention/fabric-queue", &request)
             .unwrap();
         assert_eq!(first.request, retry.request);
-        assert_eq!(first.reviewer, "person/nathan");
+        assert_eq!(first.reviewer, "person/alex");
         assert_eq!(first.status, "pending");
-        let items = store.attention_items(Some("person/nathan")).unwrap();
+        let items = store.attention_items(Some("person/alex")).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, "agent-request");
         assert_eq!(items[0].actions[0].label, "answer");
@@ -46964,7 +47388,7 @@ mission "typecase" state="ready" {
     fn attention_until_needs_a_known_condition_and_a_target() {
         let store = Store::open_memory("node").unwrap();
         let request = |targets: Vec<String>, key: &str| AttentionRequest {
-            reviewer: "person/nathan".into(),
+            reviewer: "person/alex".into(),
             title: "Publish this revision".into(),
             reason: "Publish the prepared revision as a person.".into(),
             severity: "warning".into(),
@@ -47026,7 +47450,7 @@ mission "typecase" state="ready" {
 version 2
 message "human-attention" {
   from "agent/demo/worker"
-  to "person/nathan"
+  to "person/alex"
   title "Please review"
   content "The declarative message is ready."
 }
@@ -47045,7 +47469,7 @@ message "human-attention" {
             .apply(&intent, &preview.subject_tokens, "desired-human-attention")
             .unwrap();
 
-        let items = store.attention_items(Some("person/nathan")).unwrap();
+        let items = store.attention_items(Some("person/alex")).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, "unread-message");
         assert_eq!(items[0].title, "Please review");
@@ -47058,7 +47482,7 @@ message "human-attention" {
                 "read",
                 "message/human-attention",
                 "--as",
-                "person/nathan",
+                "person/alex",
             ]
         );
         assert!(
@@ -47079,7 +47503,7 @@ message "human-attention" {
                 actor: Some("agent/demo/worker".into()),
                 fields: BTreeMap::from([
                     ("from".into(), Value::String("agent/demo/worker".into())),
-                    ("to".into(), Value::String("person/nathan".into())),
+                    ("to".into(), Value::String("person/alex".into())),
                     ("content".into(), Value::String("Please read this.".into())),
                     ("status".into(), Value::String("sent".into())),
                 ]),
@@ -47088,7 +47512,7 @@ message "human-attention" {
                 idempotency_key: Some("human-attention-message".into()),
             })
             .unwrap();
-        let items = store.attention_items(Some("person/nathan")).unwrap();
+        let items = store.attention_items(Some("person/alex")).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].kind, "unread-message");
         assert_eq!(items[0].actions[0].label, "read");
@@ -47100,7 +47524,7 @@ message "human-attention" {
                 actor: None,
                 fields: BTreeMap::from([
                     ("status".into(), Value::String("delivered".into())),
-                    ("recipient".into(), Value::String("person/nathan".into())),
+                    ("recipient".into(), Value::String("person/alex".into())),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -47108,14 +47532,14 @@ message "human-attention" {
             })
             .unwrap();
         assert_eq!(
-            store.attention_items(Some("person/nathan")).unwrap()[0].kind,
+            store.attention_items(Some("person/alex")).unwrap()[0].kind,
             "unread-message"
         );
         store
             .append_claim(&ClaimInput {
                 subject: message.subject,
                 kind: "message.read".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([("status".into(), Value::String("read".into()))]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -47124,7 +47548,7 @@ message "human-attention" {
             .unwrap();
         assert!(
             store
-                .attention_items(Some("person/nathan"))
+                .attention_items(Some("person/alex"))
                 .unwrap()
                 .is_empty()
         );

@@ -298,17 +298,17 @@ mod tests {
         std::fs::write(
             agent_dir.join("agent.kdl"),
             format!(
-                "agent \"fleet/seat\" {{\n  identity \"fleet/seat\"\n  host {host:?}\n  workspace \"/tmp\"\n  command \"true\"\n}}\n"
+                "agent \"example/seat\" {{\n  identity \"example/seat\"\n  host {host:?}\n  workspace \"/tmp\"\n  command \"true\"\n}}\n"
             ),
         )
         .unwrap();
         let env = BTreeMap::from([
             ("CATALOG".to_owned(), catalog.display().to_string()),
-            ("ST2_CLAUDE_IDENTITY".to_owned(), "fleet/seat".to_owned()),
-            ("ST2_CLAUDE_RUNTIME_ID".to_owned(), "fleet/seat".to_owned()),
+            ("ST2_CLAUDE_IDENTITY".to_owned(), "example/seat".to_owned()),
+            ("ST2_CLAUDE_RUNTIME_ID".to_owned(), "example/seat".to_owned()),
             ("ST2_CLAUDE_SESSION".to_owned(), "wrapper-1".to_owned()),
             ("ST2_CLAUDE_SESSION_SEQ".to_owned(), "1".to_owned()),
-            ("ST3_SUBJECT".to_owned(), "agent/fleet/seat".to_owned()),
+            ("ST3_SUBJECT".to_owned(), "agent/example/seat".to_owned()),
             (
                 "ST3_DRIVER_STATE_DIR".to_owned(),
                 root.join("drivers").display().to_string(),
@@ -368,7 +368,7 @@ mod tests {
         let (code, reported) = hook("claude-observe", &["SessionStart"], &env, "{}");
         assert_eq!(code, 1);
         assert_eq!(reported.len(), 1);
-        assert_eq!(reported[0].subject, "agent/fleet/seat");
+        assert_eq!(reported[0].subject, "agent/example/seat");
         assert_eq!(reported[0].code, UNBOUND_CODE);
         assert!(reported[0].reason.contains("session_id"), "{reported:?}");
 
