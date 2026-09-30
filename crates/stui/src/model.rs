@@ -834,6 +834,12 @@ pub fn conversation_needs_older_page(entries: &[TimelineEntry], has_more: bool) 
 
 pub fn clean_message_text(raw: &str) -> String {
     let normalized = raw.replace("\r\n", "\n");
+    // st keeps 8 KB of a transcript value and says so in its own words.
+    let (normalized, cut) =
+        match normalized.strip_suffix("\n[st truncated this native timeline value]") {
+            Some(kept) => (kept.to_owned(), true),
+            None => (normalized, false),
+        };
     let mut output = String::new();
     let mut plain = String::new();
     let mut code = false;
@@ -861,12 +867,17 @@ pub fn clean_message_text(raw: &str) -> String {
         .strip_prefix("[PING] ?")
         .unwrap_or(safe.trim())
         .trim();
-    if let Some(start) = text.rfind(" [id:message/")
+    let text = if let Some(start) = text.rfind(" [id:message/")
         && text.ends_with(']')
     {
         text[..start].trim_end().to_owned()
     } else {
         text.to_owned()
+    };
+    if cut {
+        format!("{text}\n\n… st kept only the start of this")
+    } else {
+        text
     }
 }
 fn strip_internal_markup(input: &str) -> String {
@@ -905,20 +916,38 @@ fn strip_internal_markup(input: &str) -> String {
         "function_calls",
         "tool_result",
     ] {
+        let open = format!("<{tag}");
+        let close = format!("</{tag}>");
+        let mut from = 0;
         loop {
             let lower = text.to_ascii_lowercase();
-            let Some(start) = lower.find(&format!("<{tag}")) else {
+            let Some(start) = lower[from..].find(&open).map(|offset| from + offset) else {
                 break;
             };
-            let Some(open_end) = lower[start..].find('>').map(|offset| start + offset + 1) else {
-                text.truncate(start);
-                break;
-            };
-            let Some(close) = lower[open_end..].find(&format!("</{tag}>")) else {
-                text.truncate(start);
-                break;
-            };
-            text.replace_range(start..open_end + close + tag.len() + 3, "");
+            // `<think` is not `<thinking`, and a tag named in `code` or mid-sentence is prose:
+            // people write about these tags, and a mention must not cut their message short.
+            let named = !lower[start + open.len()..].starts_with(['>', ' ', '/', '\n'])
+                || in_inline_code(&text, start);
+            let block = lower[..start]
+                .rsplit('\n')
+                .next()
+                .is_some_and(|before| before.trim().is_empty());
+            let open_end = lower[start..].find('>').map(|offset| start + offset + 1);
+            let close = open_end.and_then(|open_end| {
+                lower[open_end..]
+                    .find(&close)
+                    .map(|offset| open_end + offset + close.len())
+            });
+            match (named, close) {
+                (true, _) => from = start + open.len(),
+                (false, Some(end)) => text.replace_range(start..end, ""),
+                // Hidden reasoning that never closed hides the rest; a mention does not.
+                (false, None) if block => {
+                    text.truncate(start);
+                    break;
+                }
+                (false, None) => from = start + open.len(),
+            }
         }
     }
     loop {
@@ -950,6 +979,11 @@ fn strip_internal_markup(input: &str) -> String {
         text = text.replace(token, "");
     }
     text
+}
+/// Whether `at` falls inside a `code span` on its line.
+fn in_inline_code(text: &str, at: usize) -> bool {
+    let line_start = text[..at].rfind('\n').map_or(0, |index| index + 1);
+    text[line_start..at].matches('`').count() % 2 == 1
 }
 fn markdown_like(input: &str) -> String {
     let mut code = false;
@@ -1101,6 +1135,25 @@ mod tests {
         assert!(conversation_needs_older_page(&statuses, true));
         let hidden: TimelineEntry = serde_json::from_str(r#"{"id":"timeline/hidden","sequence":100,"revision":1,"timestamp":"2026-09-25T08:00:00Z","role":"assistant","type":"content","final":true,"body":{"media_type":"text/plain","text":"<thinking>private</thinking>"}}"#).unwrap();
         assert!(conversation_needs_older_page(&[hidden], true));
+    }
+
+    #[test]
+    fn a_message_that_names_a_hidden_tag_is_not_cut_short() {
+        let text = "Hooks wrap context in `<system-reminder>` blocks, and a <thinking> mention \
+                    stays too (agent/postel-transcripts). I checked both harnesses.";
+        assert_eq!(clean_message_text(text), text);
+        assert_eq!(
+            clean_message_text("Done.\n<thinking>\nprivate, never closed"),
+            "Done."
+        );
+        assert_eq!(
+            clean_message_text("Before <thinking>private</thinking>after"),
+            "Before after"
+        );
+        assert_eq!(
+            clean_message_text("A long report\n[st truncated this native timeline value]"),
+            "A long report\n\n… st kept only the start of this"
+        );
     }
 
     #[test]
