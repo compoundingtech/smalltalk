@@ -81,7 +81,8 @@ const READS: &[(&str, &str)] = &[
     ("subscriptions", "/v1/client/subscriptions"),
     ("operations", "/v1/client/operations"),
     ("status of a seat", "/v1/status?subject={seat}"),
-    ("status", "/v1/status"),
+    // No client or command reads every subject's status at once; it is here to show its cost.
+    ("status of every subject", "/v1/status"),
     (
         "seat mailbox",
         "/v1/messages/page?include_closed=false&limit=100&to={seat}",
@@ -116,6 +117,7 @@ async fn person_facing_reads_answer_within_their_budget() {
         })
         .collect::<Vec<_>>();
     let settings = Settings {
+        reads: READS,
         seconds: env_number("ST_BENCH_SECONDS", 60),
         seats: env_number("ST_BENCH_SEATS", 30),
         people: env_number("ST_BENCH_PEOPLE", 3),
@@ -179,7 +181,75 @@ async fn person_facing_reads_answer_within_their_budget() {
     );
 }
 
+/// The reads a person makes of status, agents, missions, attention, messages and attach, which
+/// must answer within their budget however busy the fleet is.
+const PERSON_READS: &[(&str, &str)] = &[
+    ("status of a seat", "/v1/status?subject={seat}"),
+    ("now", "/v1/client/now"),
+    ("agents", "/v1/client/agents"),
+    ("agent", "/v1/client/agents/{agent}"),
+    ("missions", "/v1/client/missions"),
+    ("mission", "/v1/client/missions/{mission}"),
+    ("attention", "/v1/client/attention"),
+    ("attention list", "/v1/attention"),
+    (
+        "seat mailbox",
+        "/v1/messages/page?include_closed=false&limit=100&to={seat}",
+    ),
+    ("messages", "/v1/client/messages"),
+    ("message read", "/v1/messages/read/{message}"),
+    ("terminals", "/v1/client/terminals"),
+];
+
+/// The load test that runs with every other test: thirty seats and a busy writer against a
+/// small generated store, while a person reads status, agents, missions, attention, messages
+/// and terminals. Each read's p99 must stay under 200 ms (`ST_LOAD_P99_MS`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn person_reads_stay_within_budget_while_thirty_seats_and_a_writer_work() {
+    if std::env::var_os("NIX_BUILD_TOP").is_some() {
+        println!("skipped: a Nix build sandbox is no place to time reads");
+        return;
+    }
+    let keep = tempfile::tempdir().unwrap();
+    let store = generated_store(keep.path(), 0.01).await;
+    let settings = Settings {
+        reads: PERSON_READS,
+        seconds: env_number("ST_LOAD_SECONDS", 20),
+        seats: 30,
+        people: 1,
+        budget: Duration::from_millis(env_number("ST_LOAD_P99_MS", 200)),
+        reconciler: true,
+    };
+    let run = bench("load test", &store, &settings).await;
+    run.print();
+    let over = run
+        .reads
+        .iter()
+        .map(|(read, samples)| (read, percentile(samples, 99)))
+        .filter(|(_, p99)| *p99 > settings.budget)
+        .map(|(read, p99)| format!("{read} p99 {} ms", p99.as_millis()))
+        .collect::<Vec<_>>();
+    assert!(
+        over.is_empty(),
+        "reads over {} ms: {}",
+        settings.budget.as_millis(),
+        over.join(", ")
+    );
+    let unanswered = PERSON_READS
+        .iter()
+        .filter(|(read, _)| run.reads.get(*read).is_none_or(Vec::is_empty))
+        .map(|(read, _)| *read)
+        .collect::<Vec<_>>();
+    assert!(
+        unanswered.is_empty(),
+        "reads that never answered: {unanswered:?}; failures {:?}",
+        run.failed
+    );
+}
+
 struct Settings {
+    /// The reads the people make, in turn.
+    reads: &'static [(&'static str, &'static str)],
     seconds: u64,
     seats: usize,
     people: usize,
@@ -320,6 +390,15 @@ async fn bench(name: &str, source: &Path, settings: &Settings) -> Run {
     while UnixStream::connect(&socket).is_err() {
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
+    let subjects = {
+        let store = store.clone();
+        let seats = settings.seats;
+        tokio::task::spawn_blocking(move || fleet_subjects(&store, seats))
+            .await
+            .unwrap()
+    };
+    // The fleet takes its steps before the reconciler starts, which could otherwise block a step
+    // between its turning ready and its claim.
     let reconciler = settings.reconciler.then(|| {
         let reconciler = Arc::new(
             st3::reconcile::Reconciler::native(
@@ -338,13 +417,6 @@ async fn bench(name: &str, source: &Path, settings: &Settings) -> Run {
         tokio::spawn(reconciler.supervise())
     });
 
-    let subjects = {
-        let store = store.clone();
-        let seats = settings.seats;
-        tokio::task::spawn_blocking(move || fleet_subjects(&store, seats))
-            .await
-            .unwrap()
-    };
     let client = Client::unix(&socket);
     let mut subjects = subjects;
     subjects.agents = listed(&client, "/v1/client/agents").await;
@@ -407,19 +479,20 @@ async fn bench(name: &str, source: &Path, settings: &Settings) -> Run {
     let mut people = Vec::new();
     for person in 0..settings.people {
         let (client, subjects, failed) = (client.clone(), subjects.clone(), failed.clone());
+        let reads = settings.reads;
         people.push(tokio::spawn(async move {
-            let mut reads = BTreeMap::<String, Vec<Duration>>::new();
+            let mut timings = BTreeMap::<String, Vec<Duration>>::new();
             let mut round = person;
             while Instant::now() < deadline {
-                for offset in 0..READS.len() {
-                    let (read, path) = READS[(offset + person * READS.len() / 3) % READS.len()];
+                for offset in 0..reads.len() {
+                    let (read, path) = reads[(offset + person * reads.len() / 3) % reads.len()];
                     let path = fill(path, &subjects, round);
                     let started = Instant::now();
                     let answer =
                         tokio::time::timeout(Duration::from_secs(60), client.get::<Value>(&path))
                             .await;
                     match answer {
-                        Ok(Ok(_)) => reads
+                        Ok(Ok(_)) => timings
                             .entry(read.into())
                             .or_default()
                             .push(started.elapsed()),
@@ -445,7 +518,7 @@ async fn bench(name: &str, source: &Path, settings: &Settings) -> Run {
                 round += 1;
                 tokio::time::sleep(Duration::from_millis(250)).await;
             }
-            reads
+            timings
         }));
     }
     let mut reads = BTreeMap::<String, Vec<Duration>>::new();
