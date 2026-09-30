@@ -3509,7 +3509,13 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
     unique_child(work_body, "mission")?;
     unique_child(work_body, "workspace")?;
     let reference = required_child_string(work_body, "mission", "schedule work")?;
-    validate_exact_mission_reference(&reference)?;
+    if reference.contains('@') {
+        validate_exact_mission_reference(&reference)?;
+    } else {
+        crate::mission::validate_mission_id(
+            reference.strip_prefix("mission/").unwrap_or(&reference),
+        )?;
+    }
     let workspace = required_child_string(work_body, "workspace", "schedule work")?;
     if workspace.trim().is_empty() {
         return Err(St3Error::new(
@@ -3731,7 +3737,10 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
         .find(|child| child.get("name").and_then(Value::as_str) == Some("work"))?;
     let reference = canonical_child_value(work_node, "mission")?.as_str()?;
     let reference = reference.strip_prefix("mission/").unwrap_or(reference);
-    let (mission, revision) = reference.rsplit_once('@')?;
+    let (mission, revision) = match reference.rsplit_once('@') {
+        Some((mission, revision)) => (mission, Some(revision.to_owned())),
+        None => (reference, None),
+    };
     let mut inputs = BTreeMap::new();
     for input in work_node
         .get("children")?
@@ -3755,7 +3764,7 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
         max_catch_up,
         work: Some(crate::model::ScheduledWork {
             mission: mission.to_owned(),
-            revision: revision.to_owned(),
+            revision,
             workspace: canonical_child_value(work_node, "workspace")?
                 .as_str()?
                 .to_owned(),
@@ -5712,6 +5721,44 @@ subscription "green" {
         assert_eq!(
             parse_test_intent(&invalid, "node").unwrap_err().code,
             "unknown-subscription-condition"
+        );
+    }
+    #[test]
+    fn only_scheduled_work_accepts_an_unpinned_mission() {
+        for anchor in ["2026-10-25T01:00:00Z", "2027-03-28T01:00:00Z"] {
+            let source = format!(r#"version 2
+schedule "cycle" {{
+  host "local"
+  every "1h"
+  anchor "{anchor}"
+  work {{ mission "mission/fabric/cycle"; workspace "/tmp/cycles" }}
+}}"#);
+            let intent = parse_test_intent(&source, "node").unwrap();
+            let schedule = intent.subjects.values().find(|item| item.kind == "schedule").unwrap();
+            let spec = schedule_spec(&schedule.desired, "node").unwrap();
+            assert_eq!(spec.anchor_unix_ms, Some(parse_utc_time(anchor).unwrap()));
+            let work = spec.work.unwrap();
+            assert_eq!(work.mission, "fabric/cycle");
+            assert_eq!(work.revision, None);
+            let pinned = source.replace(
+                "mission/fabric/cycle\"",
+                &format!("mission/fabric/cycle@{}\"", "a".repeat(64)),
+            );
+            let intent = parse_test_intent(&pinned, "node").unwrap();
+            let schedule = intent.subjects.values().find(|item| item.kind == "schedule").unwrap();
+            assert_eq!(
+                schedule_spec(&schedule.desired, "node").unwrap().work.unwrap().revision,
+                Some("a".repeat(64)),
+            );
+        }
+        assert_eq!(
+            parse_test_intent(
+                "version 2\nmission-run \"cycle\" { mission \"fabric/cycle\"; workspace \"/tmp/cycles\"; requester \"person/operator\" }",
+                "node",
+            )
+            .unwrap_err()
+            .code,
+            "unpinned-mission-run",
         );
     }
 }

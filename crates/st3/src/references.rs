@@ -414,13 +414,12 @@ fn subject_references(
                 return Ok(());
             };
             if let Some(work) = schedule.work.filter(|_| !schedule.stopped)
-                && scope
-                    .revision(graph, &work.mission, &work.revision)?
-                    .is_none()
+                && let Some(revision) = work.revision.as_deref()
+                && scope.revision(graph, &work.mission, revision)?.is_none()
             {
                 refusals.push(format!(
                     "{owner}schedule `{subject}` runs a mission that is not stored: {}",
-                    graph.missing_revision(&work.mission, &work.revision)?
+                    graph.missing_revision(&work.mission, revision)?
                 ));
             }
         }

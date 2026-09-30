@@ -1285,6 +1285,9 @@ st sends a cancellation message to each active claimant. The message tells the a
 A continuous mission stays open after its current steps are exhausted. It does not need a separate mission type.
 
 A recurring schedule creates a durable request for one exact finite mission revision.
+The schedule's work may name either a pinned `mission "fabric/cycle@REVISION"` or an
+unpinned `mission "fabric/cycle"`. Only scheduled work accepts the unpinned form;
+an explicit mission run still requires an exact revision.
 
 ```kdl
 schedule "cycle" {
@@ -1298,6 +1301,16 @@ schedule "cycle" {
   }
 }
 ```
+
+When an unpinned occurrence reaches its request time, the schedule host resolves its
+authoritative local published head. It requests work only when that head is ready.
+If there is no published head or the current head is draft or retired, the occurrence
+records `schedule.work-failed` with `no-ready-mission-revision`; it never falls back
+to an older ready revision. The request records the selected exact `mission_revision`,
+which the child run uses even if another revision is published before it starts.
+Publishing a new revision does not change already-requested or active occurrences.
+Pinned schedules keep requesting their named exact revision, including when that
+revision has not yet replicated to the schedule host.
 
 The runtime gives each occurrence a deterministic mission run and a unique workspace below the declared root.
 
