@@ -1417,7 +1417,7 @@ async fn a_config_peer_fleet_migrates_to_membership() {
     // b and the laptop migrate with codes from a.
     let code = a.invite("b", &["--migrate"]);
     b.stop();
-    b.migrate(&[&code]);
+    b.migrate(&[&code, "--via", &format!("http://127.0.0.1:{}", a.port)]);
     b.start().await;
     let code = a.invite("l", &["--migrate"]);
     l.stop();
@@ -1738,6 +1738,178 @@ esac
     .unwrap();
     fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
     shim
+}
+
+/// Legacy helper ports must be unnecessary after membership advertises native Fabric routes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_legacy_helper_fleet_migrates_to_native_fabric_without_losing_history() {
+    let root = tempfile::tempdir().unwrap();
+    let fleet_id = "8f14e45f-ceea-467a-9a2b-5c3d6e7f8091";
+    let secret = root.path().join("fleet.secret");
+    fs::write(&secret, hex::encode([42_u8; 32])).unwrap();
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut a = Node::new(root.path(), "a");
+    let mut b = Node::new(root.path(), "b");
+    let mut helpers = Vec::new();
+    let mut helper_ports = Vec::new();
+    let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    for target in [a.port, b.port] {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", free_port()))
+            .await
+            .unwrap();
+        helper_ports.push(listener.local_addr().unwrap().port());
+        let connections = connections.clone();
+        helpers.push(tokio::spawn(async move {
+            while let Ok((mut incoming, _)) = listener.accept().await {
+                connections.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tokio::spawn(async move {
+                    if let Ok(mut outgoing) =
+                        tokio::net::TcpStream::connect(("127.0.0.1", target)).await
+                    {
+                        let _ = tokio::io::copy_bidirectional(&mut incoming, &mut outgoing).await;
+                    }
+                });
+            }
+        }));
+    }
+    a.legacy_config(fleet_id, &secret, &[("b", helper_ports[1])]);
+    b.legacy_config(fleet_id, &secret, &[("a", helper_ports[0])]);
+    a.start().await;
+    b.start().await;
+    a.note("legacy-a").await;
+    b.note("legacy-b").await;
+    let mut expected = BTreeSet::from([
+        "custom/fleet-test/legacy-a".to_owned(),
+        "custom/fleet-test/legacy-b".to_owned(),
+    ]);
+    for node in [&a, &b] {
+        wait_for_notes(node, &expected, 60, &[&a, &b]).await;
+    }
+    assert!(connections.load(std::sync::atomic::Ordering::Relaxed) > 0);
+
+    let shim_a = fabric_shim(root.path(), "a");
+    let shim_b = fabric_shim(root.path(), "b");
+    let absent_tailscale = root.path().join("no-tailscale");
+    a.stop();
+    a.st_ok(&[
+        "fleet",
+        "migrate",
+        "--anchor",
+        "--no-service",
+        "--transports",
+        "fabric",
+        "--fabric-protocol",
+        "st3-peer-v1",
+        "--fabric",
+        shim_a.to_str().unwrap(),
+        "--tailscale",
+        absent_tailscale.to_str().unwrap(),
+    ]);
+    a.start().await;
+    a.wait_listening().await;
+    // The still-legacy member continues exchanging during the sequential upgrade.
+    a.note("anchor-migrated").await;
+    expected.insert("custom/fleet-test/anchor-migrated".into());
+    wait_for_notes(&b, &expected, 60, &[&a, &b]).await;
+    let code = a.st_ok(&[
+        "fleet",
+        "invite",
+        "b",
+        "--migrate",
+        "--via",
+        "fabric",
+        "--code-only",
+        "--as",
+        PERSON,
+    ]);
+    b.stop();
+    b.st_ok(&[
+        "fleet",
+        "migrate",
+        code.trim(),
+        "--via",
+        "fabric://a-fabric-id/st3-peer-v1",
+        "--no-service",
+        "--transports",
+        "fabric",
+        "--fabric-protocol",
+        "st3-peer-v1",
+        "--fabric",
+        shim_b.to_str().unwrap(),
+        "--tailscale",
+        absent_tailscale.to_str().unwrap(),
+    ]);
+    let file = st3::config::FleetFile::load(&b.state_dir())
+        .unwrap()
+        .unwrap();
+    assert_eq!(file.fleet_id, fleet_id);
+    assert_eq!(file.sponsor_routes, ["fabric://a-fabric-id/st3-peer-v1"]);
+    assert_eq!(file.fabric_protocol.as_deref(), Some("st3-peer-v1"));
+    assert_eq!(
+        fs::read(&secret).unwrap(),
+        hex::encode([42_u8; 32]).as_bytes()
+    );
+    b.start().await;
+    b.wait_listening().await;
+    b.note("member-migrated").await;
+    expected.insert("custom/fleet-test/member-migrated".into());
+    for node in [&a, &b] {
+        wait_for_notes(node, &expected, 60, &[&a, &b]).await;
+        let status = node.st_json(&["replication", "status"]);
+        assert_eq!(status["unsigned_envelopes"], 0, "{status}");
+        assert_eq!(status["fenced_envelopes"], 0, "{status}");
+        node.st_ok(&["fleet", "migrate", "--finish", "--no-service"]);
+        fs::write(
+            node.root.join("config/st3/config.toml"),
+            format!("node = \"{}\"\nperson = \"{PERSON}\"\n", node.name),
+        )
+        .unwrap();
+    }
+    // Retire every helper and restart every member with no legacy fields or peer arguments.
+    for helper in helpers {
+        helper.abort();
+        let _ = helper.await;
+    }
+    for port in helper_ports {
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err()
+        );
+    }
+    a.restart().await;
+    b.restart().await;
+    for node in [&a, &b] {
+        node.note(&format!("native-{}", node.name)).await;
+        expected.insert(format!("custom/fleet-test/native-{}", node.name));
+    }
+    for node in [&a, &b] {
+        wait_for_notes(node, &expected, 60, &[&a, &b]).await;
+        let file = st3::config::FleetFile::load(&node.state_dir())
+            .unwrap()
+            .unwrap();
+        assert!(!file.legacy_peers);
+        assert_eq!(file.fleet_id, fleet_id);
+    }
+    // Lose the Fabric declarations as on a daemon restart: the workers repair them themselves.
+    let registry = root.path().join("fabric-registry");
+    for name in ["a", "b"] {
+        fs::remove_file(registry.join(format!("{name}-fabric-id.st3-peer-v1"))).unwrap();
+    }
+    fs::write(registry.join("epoch"), "1").unwrap();
+    for node in [&a, &b] {
+        node.note(&format!("recovered-{}", node.name)).await;
+        expected.insert(format!("custom/fleet-test/recovered-{}", node.name));
+    }
+    for node in [&a, &b] {
+        wait_for_notes(node, &expected, 10, &[&a, &b]).await;
+    }
+    let calls = fs::read_to_string(registry.join("calls")).unwrap();
+    assert!(
+        calls.contains("dial a-fabric-id st3-peer-v1")
+            || calls.contains("dial b-fabric-id st3-peer-v1")
+    );
+    assert!(!calls.contains("--ephemeral"));
 }
 
 #[tokio::test(flavor = "multi_thread")]

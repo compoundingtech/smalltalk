@@ -1504,10 +1504,20 @@ Keep the legacy configuration and helpers until the native routes have exchanged
    lines it prints, then run `st service install` so both services read the membership settings.
    Confirm new writes arrive in both directions using `st replication status`.
 
-5. Remove that member's old dial-helper unit and executable. The replication worker now asks
+5. Disable that member's old dial-helper unit, keeping its definition for rollback. Restart
+   the member services and verify another exchange in each direction with the helper disabled.
+   Restart Fabric under its usual supervisor and verify that its declarations survive and sync
+   resumes. Only then remove the helper unit and executable. The replication worker now asks
    Fabric for its own tunnel, and Fabric 0.2.21 restores persistent dial declarations after a
    restart. Remove workaround exposures and grants only after the native path has been verified;
    retain the member protocol grant used by its advertised endpoints.
+
+Keep the original config, service definitions, and secret file through acceptance. Before
+`--finish`, rollback restores the legacy config and helper units. After `--finish`, restore
+the saved legacy peer entries on every member that must accept an old build, run
+`st fleet migrate --unfinish`, and restart its worker. Then restore the old member's config
+and helper units. Preserve the current store,
+member keys, and fleet history throughout; see [Rollback](#rollback) for unsigned writes.
 
 For a new member, `st fleet join --via http://100.64.0.10:31313` or
 `st fleet join --via fabric://NODE_ID/st3-peer-v1` redeems the code and starts normal replication.
