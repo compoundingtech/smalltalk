@@ -4111,6 +4111,7 @@ struct NativeDeliveryPeer {
     agent: String,
     transport: &'static str,
     pid: u32,
+    archives_inbox: bool,
 }
 
 fn native_delivery_peer(pid: u32) -> Option<NativeDeliveryPeer> {
@@ -4118,21 +4119,18 @@ fn native_delivery_peer(pid: u32) -> Option<NativeDeliveryPeer> {
     native_delivery_identity(pid, &args, &env)
 }
 
-fn native_delivery_identity(
-    pid: u32,
-    args: &[String],
-    env: &[String],
-) -> Option<NativeDeliveryPeer> {
-    let transport = args.windows(2).find_map(|pair| {
+fn native_delivery_identity(pid: u32, args: &[String], env: &[String]) -> Option<NativeDeliveryPeer> {
+    let (transport, archives_inbox) = args.windows(2).find_map(|pair| {
         if pair[0] != "driver" {
             return None;
         }
         match pair[1].as_str() {
-            "omp-channel" => Some("omp-channel"),
-            "pi-channel" => Some("pi-channel"),
-            "claude" | "claude-mcp" => Some("claude-channel"),
-            "codex" => Some("app-server"),
-            "opencode" => Some("opencode-server"),
+            "omp-channel" => Some(("omp-channel", false)),
+            "pi-channel" => Some(("pi-channel", false)),
+            "claude-mcp" => Some(("claude-channel", false)),
+            "claude" => Some(("claude-channel", true)),
+            "codex" => Some(("app-server", true)),
+            "opencode" => Some(("opencode-server", true)),
             _ => None,
         }
     })?;
@@ -4145,6 +4143,7 @@ fn native_delivery_identity(
         agent,
         transport,
         pid,
+        archives_inbox,
     })
 }
 
@@ -4262,9 +4261,12 @@ fn record_legacy_poll(
     recipient: Option<&str>,
     include_closed: bool,
 ) {
-    if !include_closed
-        && let Some(peer) = peer
+    // Older outer drivers project closed messages too, so they can archive
+    // native inbox files. Their poll still proves liveness. Channel processes
+    // have no archive projection; a history query from one does not count.
+    if let Some(peer) = peer
         && recipient == Some(peer.agent.as_str())
+        && (!include_closed || peer.archives_inbox)
     {
         delivery_presence::record_legacy(&peer.agent, peer.transport, peer.pid);
     }
@@ -11629,6 +11631,7 @@ mod tests {
             agent: recipient.into(),
             transport: "omp-channel",
             pid: 37,
+            archives_inbox: false,
         };
         record_legacy_poll(Some(&peer), Some("agent/eval/other-mailbox"), false);
         record_legacy_poll(Some(&peer), Some(recipient), true);
@@ -11647,6 +11650,71 @@ mod tests {
         let query = ["st3", "conversations", "ls"].map(str::to_owned);
         assert!(native_delivery_identity(37, &query, &env).is_none());
         assert!(native_delivery_identity(37, &args, &[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_native_drivers_renew_delivery_when_their_projection_includes_closed_mail() {
+        // Before a63824ef, native drivers polled include_closed=true to archive
+        // inbox files. This is the real pre-September-25 request shape, rather
+        // than the newer pre-reexec channel's active-mail-only poll.
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        for driver in ["claude", "codex", "opencode"] {
+            for endpoint in ["messages/page", "messages"] {
+                let recipient = format!(
+                    "agent/example/closed-{driver}-{}",
+                    endpoint.replace('/', "-")
+                );
+                let query = format!("/v1/{endpoint}?to={recipient}&include_closed=true&limit=100");
+                let (status, _) = get_request(app.clone(), &query).await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(
+                    delivery_presence::known(&recipient).is_none(),
+                    "ordinary history query renewed a beat"
+                );
+
+                let args = ["st3", "driver", driver].map(str::to_owned);
+                let env = vec![format!("ST_AGENT={recipient}")];
+                let peer = native_delivery_identity(37, &args, &env).unwrap();
+                let other = format!("{recipient}-other");
+                let other_query = format!("/v1/{endpoint}?to={other}&include_closed=true&limit=100");
+                let (status, _) =
+                    get_request(app.clone().layer(Extension(peer.clone())), &other_query).await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(delivery_presence::known(&other).is_none());
+                assert!(delivery_presence::known(&recipient).is_none());
+                let (status, _) = get_request(app.clone().layer(Extension(peer)), &query).await;
+                assert_eq!(status, StatusCode::OK);
+                let assessment = delivery_presence::known(&recipient)
+                    .expect("native projection did not renew its beat");
+                assert_eq!(assessment.state, "legacy");
+                assert_eq!(assessment.polled_seconds_ago, Some(0));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_history_queries_do_not_renew_delivery() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        for driver in ["claude-mcp", "pi-channel", "omp-channel"] {
+            for endpoint in ["messages/page", "messages"] {
+                let recipient = format!(
+                    "agent/example/history-{driver}-{}",
+                    endpoint.replace('/', "-")
+                );
+                let args = ["st3", "driver", driver].map(str::to_owned);
+                let env = vec![format!("ST_AGENT={recipient}")];
+                let peer = native_delivery_identity(37, &args, &env).unwrap();
+                let query = format!("/v1/{endpoint}?to={recipient}&include_closed=true&limit=100");
+                let (status, _) = get_request(app.clone().layer(Extension(peer)), &query).await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(
+                    delivery_presence::known(&recipient).is_none(),
+                    "channel history query renewed a beat"
+                );
+            }
+        }
     }
 
     #[test]

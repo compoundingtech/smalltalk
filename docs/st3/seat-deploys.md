@@ -116,6 +116,12 @@ does not prove that its provider failed to consume the envelope. Reading the mes
 pending-read warning. Both `driver claude` and the older `driver claude-mcp` are recognized as
 native delivery peers; ordinary mailbox inspection never refreshes this health assessment.
 
+Older Claude, Codex and OpenCode outer drivers poll with `include_closed=true` to archive
+consumed inbox files. Those polls count as legacy delivery activity when the local Unix peer
+is proven to be that recipient's native outer driver. An ordinary CLI history read, a poll for
+another recipient, or a channel process's history query does not count. Claude's MCP child
+watches inbox files; the outer `driver claude` process supplies the mailbox poll.
+
 The path must stay the same. A deploy that starts the daemon from a new path, such as a new store
 path, leaves every running seat on the old one, and st reports them as stale.
 
