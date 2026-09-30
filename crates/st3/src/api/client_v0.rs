@@ -1084,15 +1084,7 @@ fn mission_visualization(
     })).collect::<Vec<_>>();
     let timeline = mission.display_order.iter().enumerate().filter_map(|(ordinal, id)| mission.steps.get(id).map(|step| json!({"id":format!("timeline/{}", step.path), "node":format!("step/{}", step.path), "ordinal":ordinal, "dependencies":step.dependencies, "timeout_ms":step.timeout_ms}))).collect::<Vec<_>>();
     let mut decisions = Vec::new();
-    for session in store
-        .planning_sessions(true)?
-        .into_iter()
-        .filter(|session| {
-            session.mission == mission_id
-                || format!("mission/{}", session.mission) == mission_id
-                || session.mission == mission_id.trim_start_matches("mission/")
-        })
-    {
+    for session in store.planning_sessions_for_mission(mission_id)? {
         decisions.extend(super::client_launch_decision_resources(store, &session)?);
     }
     Ok(Some(json!({
@@ -1121,18 +1113,15 @@ fn mission_resources_filtered(
     selected_id: Option<&str>,
     page_ids: Option<&[String]>,
 ) -> anyhow::Result<Vec<Value>> {
-    let attention = store.attention_items(None)?;
-    let human_attention_runs = attention
-        .iter()
-        .filter_map(|item| item.mission_run.as_deref())
-        .collect::<BTreeSet<_>>();
+    let human_attention_runs = store.human_attention_runs()?;
     let mut missions = BTreeMap::<String, Vec<MissionRunView>>::new();
     // A detail or a page reads only its own missions' runs, definitions, seats and states.
     let scope = selected_id
         .map(|selected| vec![selected.to_owned()])
         .or_else(|| page_ids.map(|ids| ids.to_vec()));
+    // A detail reads its runs' current steps with their headers, two reads for every run.
     let runs = if let Some(selected) = selected_id {
-        store.mission_run_headers_for_missions(&[selected.to_owned()])?
+        store.mission_run_summaries_for_missions(&[selected.to_owned()])?
     } else if let Some(ids) = page_ids {
         store.mission_run_summaries_for_missions(ids)?
     } else {
@@ -1258,10 +1247,10 @@ fn mission_resources_filtered(
             let run_details = runs
                 .iter()
                 .map(|header| {
+                    // A detail shows each step's effective state and latest progress, and none of
+                    // the timing and wake history a work view reads for every step.
                     let run = if selected_id.is_some() {
-                        store
-                            .mission_run(&header.id)?
-                            .unwrap_or_else(|| header.clone())
+                        store.with_step_states(header.clone(), true)?
                     } else {
                         header.clone()
                     };
@@ -2344,11 +2333,7 @@ fn missions_tree_value_within(
             truncated.insert(part.into(), json!({ "shown": shown, "total": total }));
         }
     };
-    let mut runs = store
-        .mission_run_headers()?
-        .into_iter()
-        .filter(|run| matches!(run.status.as_str(), "running" | "standing" | "blocked"))
-        .collect::<Vec<_>>();
+    let mut runs = store.open_mission_run_headers()?;
     runs.sort_by(|a, b| {
         a.mission
             .cmp(&b.mission)
@@ -2359,8 +2344,9 @@ fn missions_tree_value_within(
     let mut run_values = Vec::with_capacity(runs.len());
     let (mut steps_shown, mut steps_total) = (0, 0);
     for run in runs {
+        // The tree shows each step's state, not its timing, wake or progress.
         let full = store
-            .mission_run(&run.subject)?
+            .mission_run_steps(&run.subject, false)?
             .ok_or_else(|| anyhow::anyhow!("run disappeared: {}", run.subject))?;
         steps_total += full.steps.len();
         steps_shown += full.steps.len().min(items);
@@ -2372,27 +2358,41 @@ fn missions_tree_value_within(
             })).collect::<Vec<_>>()
         }));
     }
-    let mut unstarted = mission_resources(store, index, false, None)?
+    // A mission that never ran and can start, as the current mission list shows it: its
+    // definition is ready or a draft, and st3's internal loop definitions stay out.
+    let mut unstarted = store
+        .mission_definitions_without_runs()?
         .into_iter()
-        .filter(|mission| {
-            matches!(mission["state"].as_str(), Some("ready" | "draft"))
-                && mission["runs"].as_array().is_some_and(Vec::is_empty)
+        .filter(|definition| !definition.mission.subject.starts_with("mission/__st3/"))
+        .filter_map(|definition| {
+            let state = match definition.mission.state {
+                crate::model::MissionState::Draft => "draft",
+                crate::model::MissionState::Ready => "ready",
+                crate::model::MissionState::Retired => return None,
+            };
+            let id = definition.mission.subject;
+            let title = id.strip_prefix("mission/").unwrap_or(&id).to_owned();
+            Some(json!({ "id": id, "title": title, "state": state }))
         })
-        .map(|mission| json!({ "id": mission["id"], "title": mission["title"], "state": mission["state"] }))
         .collect::<Vec<_>>();
     note("steps", steps_shown, steps_total);
     unstarted.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     note("unstarted_missions", items, unstarted.len());
     unstarted.truncate(items);
 
-    let desired = store
-        .desired_subjects()?
-        .into_iter()
-        .map(|seat| (seat.subject.clone(), seat))
-        .collect::<BTreeMap<_, _>>();
     let mut agents = client_agent_resources(store, false, at, index)?;
     note("agents", items, agents.len());
     agents.truncate(items);
+    // The declarations of the agents shown, not of every seat the fleet ever declared.
+    let shown = agents
+        .iter()
+        .filter_map(|agent| agent["id"].as_str().map(str::to_owned))
+        .collect::<Vec<_>>();
+    let desired = store
+        .desired_subjects_named(&shown)?
+        .into_iter()
+        .map(|seat| (seat.subject.clone(), seat))
+        .collect::<BTreeMap<_, _>>();
     for agent in &mut agents {
         let Some(id) = agent["id"].as_str() else {
             continue;
@@ -8137,6 +8137,191 @@ mission "example/looped" state="ready" {
             bounded["truncated"],
             json!({"unstarted_missions": {"shown": 2, "total": 3}})
         );
+    }
+
+    /// A mission detail and the missions tree show each step's state and latest progress
+    /// without reading the timing, wake and definition history a work view reads for every
+    /// step: they enrich no step, and they show what the enriched runs show.
+    #[test]
+    fn mission_detail_and_the_tree_read_no_step_history() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state_named(root.path(), "steps-node");
+        let publish = |source: &str, key: &str| {
+            let intent = crate::graph::parse_intent(source, "steps-node").unwrap();
+            let preview = state
+                .store
+                .mission(
+                    &intent,
+                    crate::model::IntentInput {
+                        kdl: source.into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            state
+                .store
+                .apply_as(
+                    &intent,
+                    &preview.subject_tokens,
+                    key,
+                    Some("person/operator"),
+                )
+                .unwrap();
+        };
+        publish(
+            r#"version 2
+mission "example/steps" state="ready" {
+  goal "Build and review."
+  concurrent-runs max=10
+  step "build" { assigned-to "agent/builder" }
+  step "review" { assigned-to "agent/reviewer" }
+}"#,
+            "publish-steps",
+        );
+        for (mission, state_name) in [("example/waiting", "ready"), ("example/drafted", "draft")] {
+            publish(
+                &format!(
+                    "version 2\nmission \"{mission}\" state=\"{state_name}\" {{\n  goal \"Wait to start.\"\n}}\n"
+                ),
+                &format!("publish-{mission}"),
+            );
+        }
+        let mut runs = Vec::new();
+        for run in 0..2 {
+            let view = state
+                .store
+                .create_mission_run(&crate::model::MissionRunRequest {
+                    mission: "example/steps".into(),
+                    revision: None,
+                    workspace: root.path().display().to_string(),
+                    requester: Some("person/operator".into()),
+                    mode: None,
+                    inputs: BTreeMap::new(),
+                    idempotency_key: format!("steps-{run}"),
+                })
+                .unwrap();
+            let build = view.steps.iter().find(|step| step.step == "build").unwrap();
+            let (build, builder) = (
+                build.subject.clone(),
+                build
+                    .assigned_to
+                    .clone()
+                    .expect("the build step is assigned"),
+            );
+            state.store.set_step_state(&build, "ready", None).unwrap();
+            // A seat holds one step at a time: the first run's is claimed and under way.
+            if run == 0 {
+                let request = |summary: Option<&str>, key: &str| crate::model::WorkRequest {
+                    actor: Some(builder.clone()),
+                    incarnation: Some("builder-1".into()),
+                    summary: summary.map(str::to_owned),
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: key.into(),
+                };
+                state
+                    .store
+                    .work_action(&build, "claim", &request(None, "claim"))
+                    .unwrap();
+                state
+                    .store
+                    .work_action(
+                        &build,
+                        "progress",
+                        &request(Some("Half built."), "progress"),
+                    )
+                    .unwrap();
+            }
+            runs.push(view.subject);
+        }
+        let index = state.store.index().unwrap();
+
+        crate::store::STEPS_ENRICHED.with(|enriched| enriched.set(0));
+        let detail =
+            mission_resources(&state.store, index, true, Some("mission/example/steps")).unwrap();
+        let tree = missions_tree_value(&state.store, "now", index).unwrap();
+        assert_eq!(crate::store::STEPS_ENRICHED.with(std::cell::Cell::get), 0);
+
+        let shown = |run: &crate::model::MissionRunView| {
+            run.steps
+                .iter()
+                .map(|step| {
+                    json!([
+                        step.subject,
+                        step.status,
+                        step.claimant,
+                        step.assigned_to,
+                        step.attempt,
+                        step.blocked_reason,
+                        step.blockers,
+                        step.progress_summary,
+                        step.progress_at_unix_ms,
+                        step.completion_summary,
+                        step.updated_at_unix_ms,
+                    ])
+                })
+                .collect::<Vec<_>>()
+        };
+        for run in &runs {
+            let enriched = state.store.mission_run(run).unwrap().unwrap();
+            let light = state.store.mission_run_steps(run, true).unwrap().unwrap();
+            assert_eq!(shown(&light), shown(&enriched), "{run}");
+        }
+        let claimed = state.store.mission_run(&runs[0]).unwrap().unwrap();
+        assert!(claimed.steps.iter().any(|step| step.status == "working"
+            && step.progress_summary.as_deref() == Some("Half built.")));
+        let details = detail[0]["run_details"].as_array().unwrap();
+        assert_eq!(details.len(), 2);
+        let progress = details
+            .iter()
+            .map(|run| (run["id"].as_str().unwrap(), run["last_progress"].clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(progress[runs[0].as_str()], "Half built.");
+        assert_eq!(progress[runs[1].as_str()], Value::Null);
+        let tree_runs = tree["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|run| {
+                let steps = run["steps"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|step| json!([step["id"], step["state"]]))
+                    .collect::<Vec<_>>();
+                (run["id"].as_str().unwrap().to_owned(), steps)
+            })
+            .collect::<BTreeMap<_, _>>();
+        let enriched_runs = runs
+            .iter()
+            .map(|run| {
+                let steps = state
+                    .store
+                    .mission_run(run)
+                    .unwrap()
+                    .unwrap()
+                    .steps
+                    .iter()
+                    .map(|step| json!([step.subject, step.status]))
+                    .collect::<Vec<_>>();
+                (run.clone(), steps)
+            })
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(tree_runs, enriched_runs);
+        // The tree's unstarted missions are the current list's ready and draft missions that
+        // never ran.
+        let mut unstarted = mission_resources(&state.store, index, false, None)
+            .unwrap()
+            .into_iter()
+            .filter(|mission| {
+                matches!(mission["state"].as_str(), Some("ready" | "draft"))
+                    && mission["runs"].as_array().is_some_and(Vec::is_empty)
+            })
+            .map(|mission| json!({"id": mission["id"], "title": mission["title"], "state": mission["state"]}))
+            .collect::<Vec<_>>();
+        unstarted.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        assert_eq!(unstarted.len(), 2);
+        assert_eq!(tree["unstarted_missions"], json!(unstarted));
     }
 
     #[test]
