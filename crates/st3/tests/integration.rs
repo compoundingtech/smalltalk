@@ -15,6 +15,7 @@ mod fault_isolation;
 mod first_sync;
 mod fleet;
 mod log_diet;
+mod messaging_faults;
 mod operational_state_contract;
 mod recorder_report;
 mod seat_queue_perf;

@@ -31,6 +31,10 @@ struct Report {
     transport: Option<String>,
     pid: Option<u32>,
     image: Option<String>,
+    ready: Option<bool>,
+    reason: Option<String>,
+    #[serde(skip)]
+    legacy: bool,
     #[serde(default)]
     channel: Option<ChannelReport>,
 }
@@ -84,6 +88,25 @@ pub(crate) fn record(recipient: &str, report: &str) {
     }
 }
 
+/// A metadata-free poll from a Unix peer proven to be this seat's native delivery process.
+/// This proves liveness, not that an old executable matches the installed binary.
+pub(crate) fn record_legacy(recipient: &str, transport: &str, pid: u32) {
+    if let Ok(mut beats) = presence().beats.lock() {
+        beats.insert(
+            recipient.into(),
+            Beat {
+                at: Instant::now(),
+                report: Report {
+                    transport: Some(transport.into()),
+                    pid: Some(pid),
+                    legacy: true,
+                    ..Report::default()
+                },
+            },
+        );
+    }
+}
+
 /// How one seat's delivery path looks from this daemon.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Assessment {
@@ -122,6 +145,26 @@ pub(crate) fn assess(recipient: &str, driver: &str) -> Assessment {
         beat.map(|(at, report)| (at.elapsed(), report)),
         driver,
     )
+}
+
+/// A message view may include a local poll when one exists; absent remote evidence stays absent.
+pub(crate) fn known(recipient: &str) -> Option<Assessment> {
+    let transport = presence()
+        .beats
+        .lock()
+        .ok()?
+        .get(recipient)?
+        .report
+        .transport
+        .clone()?;
+    Some(assess(
+        recipient,
+        if transport == "claude-channel" {
+            "claude"
+        } else {
+            "other"
+        },
+    ))
 }
 
 fn assess_beat(
@@ -163,6 +206,22 @@ fn assess_beat(
             "the delivery process last polled this seat's mailbox {}s ago",
             age.as_secs()
         ));
+    }
+    if report.legacy {
+        return Assessment {
+            state: "legacy",
+            reason: Some(format!(
+                "a legacy delivery process (pid {}) is polling; its binary and readiness are not reported",
+                report.pid.unwrap_or_default()
+            )),
+            polled_seconds_ago: Some(age.as_secs()),
+            transport: report.transport,
+        };
+    }
+    if report.ready == Some(false) {
+        return stale(report.reason.clone().unwrap_or_else(|| {
+            "the channel is polling but has not received the provider's initial idle proof".into()
+        }));
     }
     let current_image = |image: Option<&str>| match (image, daemon_image) {
         (Some(image), Some(daemon)) => image == daemon,
@@ -217,6 +276,9 @@ mod tests {
             transport: Some("claude-channel".into()),
             pid: Some(7),
             image: image.map(str::to_owned),
+            ready: None,
+            reason: None,
+            legacy: false,
             channel: channel.map(|(image, age_ms)| ChannelReport {
                 pid: Some(8),
                 image: image.map(str::to_owned),
@@ -246,6 +308,53 @@ mod tests {
         );
         assert_eq!(assessment.state, "current", "{assessment:?}");
         assert_eq!(assessment.transport.as_deref(), Some("claude-channel"));
+    }
+
+    #[test]
+    fn a_legacy_poll_proves_liveness_without_claiming_a_current_binary() {
+        let legacy = Report {
+            legacy: true,
+            transport: Some("omp-channel".into()),
+            pid: Some(17),
+            ..Report::default()
+        };
+        let live = assess_beat(
+            Duration::from_secs(60),
+            Some("new"),
+            Some((Duration::from_secs(1), legacy.clone())),
+            "omp",
+        );
+        assert_eq!(live.state, "legacy");
+        assert!(!live.stale());
+        assert!(live.reason.unwrap().contains("not reported"));
+        let stopped = assess_beat(
+            Duration::from_secs(60),
+            Some("new"),
+            Some((Duration::from_secs(46), legacy)),
+            "omp",
+        );
+        assert!(stopped.stale());
+    }
+
+    #[test]
+    fn polling_before_provider_readiness_is_not_current() {
+        let mut report = report(Some("new"), None);
+        report.ready = Some(false);
+        let starting = assess_beat(
+            Duration::from_secs(60),
+            Some("new"),
+            Some((Duration::from_secs(1), report.clone())),
+            "omp",
+        );
+        assert!(starting.stale());
+        report.ready = Some(true);
+        let ready = assess_beat(
+            Duration::from_secs(60),
+            Some("new"),
+            Some((Duration::from_secs(1), report)),
+            "omp",
+        );
+        assert_eq!(ready.state, "current");
     }
 
     #[test]

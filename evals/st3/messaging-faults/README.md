@@ -41,6 +41,7 @@ fault. The cases are:
 | harness-restart | Kill the provider, queue a message, let the daemon restart its seat | New provider process exists |
 | channel-killed | Kill the live channel and send a message | Kill completes and sender accepts the message; recovery belongs to the real extension |
 | old-channel | Start a real historical channel under the candidate's driver and extension, then deploy the candidate while queueing remotely | New daemon answers and peer link opens |
+| handoff-failed | Refuse native handoffs past the third failure; check agent, doctor and sender visibility | The provider API accepts handoffs again |
 
 Receiver-down models an unavailable receiving node's messaging services with its
 seat still alive. It does not simulate a host reboot. Harness-restart necessarily
@@ -66,7 +67,9 @@ Duplicates after that bounded observation window are not covered.
 
 Delivery and reporting are separate results: a working old channel that st reports
 as stale fails the reporting gate even if the message arrives. `result.json` records
-both receipt timing and the delivery assessment. Per-case evidence keeps graph
+both receipt timing and the delivery assessment. Modern paths must be `current`; the historical
+path must be `legacy`, which exposes recent polling without inventing image/readiness evidence.
+The failed-handoff case also requires a visible blockage in the agent, doctor and sender views. Per-case evidence keeps graph
 traces, native receipts, process snapshots, agent cards, replication status and
 daemon/worker logs. Paths are normalized before publishing; stores, configuration
 secrets and credential profiles are not copied.
@@ -85,3 +88,13 @@ The oracle's negative controls run with:
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
   -s scripts/st3-messaging-faults-eval -p 'test_*.py'
 ```
+
+The normal Linux Cargo integration suite runs the complete matrix in
+`messaging_faults::messages_recover_across_transport_and_process_faults`, so `st/ci`
+gates every case on the candidate binary. It builds the actual historical source
+pinned by `.github/messaging-compat-baseline.json` through Nix. That build omits
+checks, other binaries and the retired package's PTY wrapper; its channel source
+and locked Rust dependencies are unchanged. Nix caches the immutable package.
+Set `ST3_MESSAGING_COMPAT_BIN` to use an already built historical executable.
+`ST3_MESSAGING_FAULTS_EVIDENCE` can select a new evidence directory for a local run;
+on failure the default temporary evidence directory is retained.

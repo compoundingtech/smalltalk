@@ -421,6 +421,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/messages/page", get(list_messages_page))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
         .route("/v1/messages/read/{*subject}", get(read_message))
+        .route("/v1/messages/delivery/{*subject}", get(message_delivery))
         .route("/v1/status", get(status))
         .route("/v1/events", get(events))
         .route("/v1/doctor", get(doctor))
@@ -2591,6 +2592,7 @@ fn client_message_resources(
             "title": message.title,
             "content": message.content,
             "state": message.status,
+            "delivery": message_delivery_value(&message.to, &message.status, sent_at, client_now_ms()),
             "sent_at": client_timestamp(sent_at),
             "session_id": session_id,
             "in_reply_to": message.in_reply_to,
@@ -2605,6 +2607,53 @@ fn client_message_resources(
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
     Ok(resources)
+}
+
+/// Native acceptance and recipient read are separate evidence. A pending read never expires,
+/// and its age remains visible even on the sender's node, which cannot inspect a remote process.
+fn message_delivery_value(to: &str, status: &str, sent_at: u128, now: u128) -> Value {
+    let read = matches!(status, "read" | "closed");
+    let age_ms = now.saturating_sub(sent_at);
+    let path = delivery_presence::known(to);
+    let blocked = !read && path.as_ref().is_some_and(|path| path.stale());
+    let reason = if read {
+        "the recipient has read the message"
+    } else if blocked {
+        path.as_ref()
+            .and_then(|path| path.reason.as_deref())
+            .unwrap_or("the delivery path is stale")
+    } else {
+        match status {
+            "sent" => "waiting for delivery; the durable message remains queued",
+            "staged" => "waiting for native handoff; failed handoffs retry automatically",
+            "delivered" => "the native transport accepted the message; waiting for recipient read",
+            _ => "waiting for recipient read",
+        }
+    };
+    json!({
+        "state": if read { "read" } else if blocked || age_ms > 10_000 { "waiting" } else { "pending" },
+        "phase": status, "reason": reason, "age_ms": age_ms,
+        "recipient_delivery": path.map(|path| path.to_value()),
+    })
+}
+
+async fn message_delivery(
+    State(state): State<AppState>,
+    AxumPath(subject): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let subject = if subject.starts_with("message/") {
+        subject
+    } else {
+        format!("message/{subject}")
+    };
+    blocking_api(move || {
+        let message = state.store.message(&subject).map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found(format!("message `{subject}` does not exist")))?;
+        let claims = state.store.claims_for(&subject, Some("message.sent")).map_err(ApiError::internal)?;
+        let sent_at = claims.first().map(|claim| claim.accepted_at_unix_ms).unwrap_or_default();
+        Ok(Json(json!({ "id": subject, "from": message.from, "to": message.to,
+            "delivery": message_delivery_value(&message.to, &message.status, sent_at, client_now_ms()) })))
+    }).await
 }
 
 fn launch_session_id(id: &str) -> &str {
@@ -3974,11 +4023,7 @@ async fn serve_unix_with_ancestor(
             }
         };
         let peer_pid = if bind_harness || crate::profile::enabled() {
-            stream
-                .peer_cred()
-                .ok()
-                .and_then(|cred| cred.pid())
-                .and_then(|pid| u32::try_from(pid).ok())
+            local_peer_pid(&stream)
         } else {
             None
         };
@@ -3986,23 +4031,28 @@ async fn serve_unix_with_ancestor(
         tokio::spawn(async move {
             // /proc ancestry may fault in pages on a loaded host. Keep that work
             // out of the accept loop so a slow lookup delays only this peer.
-            let (bound_agent, caller) = match peer_pid {
+            let (bound_agent, caller, delivery_peer) = match peer_pid {
                 Some(pid) => tokio::task::spawn_blocking(move || {
                     let bound_agent = bind_harness.then(|| ancestor(pid)).flatten();
                     let caller = crate::profile::enabled()
                         .then(|| crate::profile::Caller::of_peer(pid, bound_agent.as_deref()));
-                    (bound_agent, caller)
+                    let delivery_peer = bind_harness.then(|| native_delivery_peer(pid)).flatten();
+                    (bound_agent, caller, delivery_peer)
                 })
                 .await
                 .unwrap_or_default(),
-                None => (None, None),
+                None => (None, None, None),
             };
             let service = hyper::service::service_fn(move |request: Request<Incoming>| {
                 let app = app.clone();
                 let bound_agent = bound_agent.clone();
                 let caller = caller.clone();
+                let delivery_peer = delivery_peer.clone();
                 async move {
                     let mut request = request.map(Body::new);
+                    if let Some(peer) = delivery_peer {
+                        request.extensions_mut().insert(peer);
+                    }
                     if let Some(caller) = caller {
                         request.extensions_mut().insert(caller);
                     }
@@ -4053,6 +4103,162 @@ fn harness_ancestor(mut pid: u32) -> Option<String> {
 #[cfg(not(target_os = "linux"))]
 fn harness_ancestor(_pid: u32) -> Option<String> {
     None
+}
+
+#[derive(Clone)]
+struct NativeDeliveryPeer {
+    agent: String,
+    transport: &'static str,
+    pid: u32,
+}
+
+fn native_delivery_peer(pid: u32) -> Option<NativeDeliveryPeer> {
+    let (args, env) = local_process_arguments(pid)?;
+    let transport = args.windows(2).find_map(|pair| {
+        if pair[0] != "driver" {
+            return None;
+        }
+        match pair[1].as_str() {
+            "omp-channel" => Some("omp-channel"),
+            "pi-channel" => Some("pi-channel"),
+            "claude" => Some("claude-channel"),
+            "codex" => Some("app-server"),
+            "opencode" => Some("opencode-server"),
+            _ => None,
+        }
+    })?;
+    let agent = env.iter().find_map(|entry| {
+        entry
+            .strip_prefix("ST_AGENT=agent/")
+            .map(|suffix| format!("agent/{suffix}"))
+    })?;
+    Some(NativeDeliveryPeer {
+        agent,
+        transport,
+        pid,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn local_peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
+    stream
+        .peer_cred()
+        .ok()?
+        .pid()
+        .and_then(|pid| u32::try_from(pid).ok())
+}
+
+#[cfg(target_os = "macos")]
+fn local_peer_pid(stream: &tokio::net::UnixStream) -> Option<u32> {
+    use std::os::fd::AsRawFd as _;
+    let mut pid: libc::pid_t = 0;
+    let mut size = std::mem::size_of_val(&pid) as libc::socklen_t;
+    // Darwin's getpeereid reports uid/gid only; LOCAL_PEERPID identifies this connection's peer.
+    let result = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_LOCAL,
+            libc::LOCAL_PEERPID,
+            (&mut pid as *mut libc::pid_t).cast(),
+            &mut size,
+        )
+    };
+    (result == 0).then(|| u32::try_from(pid).ok()).flatten()
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn local_peer_pid(_stream: &tokio::net::UnixStream) -> Option<u32> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn local_process_arguments(pid: u32) -> Option<(Vec<String>, Vec<String>)> {
+    let split = |bytes: Vec<u8>| {
+        bytes
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| String::from_utf8_lossy(part).into_owned())
+            .collect()
+    };
+    Some((
+        split(fs::read(format!("/proc/{pid}/cmdline")).ok()?),
+        split(fs::read(format!("/proc/{pid}/environ")).ok()?),
+    ))
+}
+
+#[cfg(target_os = "macos")]
+fn local_process_arguments(pid: u32) -> Option<(Vec<String>, Vec<String>)> {
+    let mut mib = [
+        libc::CTL_KERN,
+        libc::KERN_PROCARGS2,
+        i32::try_from(pid).ok()?,
+    ];
+    let mut size = 0;
+    // Obtain the kernel's bounded argv/environment buffer for this same-user process.
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            std::ptr::null_mut(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+        || size > 1024 * 1024
+    {
+        return None;
+    }
+    let mut bytes = vec![0u8; size];
+    if unsafe {
+        libc::sysctl(
+            mib.as_mut_ptr(),
+            3,
+            bytes.as_mut_ptr().cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    } != 0
+    {
+        return None;
+    }
+    bytes.truncate(size);
+    let count = i32::from_ne_bytes(bytes.get(..4)?.try_into().ok()?);
+    let mut tail = bytes.get(4..)?;
+    tail = tail.get(tail.iter().position(|byte| *byte == 0)? + 1..)?; // executable path
+    let padding = tail.iter().take_while(|byte| **byte == 0).count();
+    let mut parts = tail[padding..].split(|byte| *byte == 0);
+    let args = (0..usize::try_from(count).ok()?)
+        .map(|_| {
+            parts
+                .next()
+                .map(|part| String::from_utf8_lossy(part).into_owned())
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let env = parts
+        .filter(|part| !part.is_empty())
+        .map(|part| String::from_utf8_lossy(part).into_owned())
+        .collect();
+    Some((args, env))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn local_process_arguments(_pid: u32) -> Option<(Vec<String>, Vec<String>)> {
+    None
+}
+
+fn record_legacy_poll(
+    peer: Option<&NativeDeliveryPeer>,
+    recipient: Option<&str>,
+    include_closed: bool,
+) {
+    if !include_closed
+        && let Some(peer) = peer
+        && recipient == Some(peer.agent.as_str())
+    {
+        delivery_presence::record_legacy(&peer.agent, peer.transport, peer.pid);
+    }
 }
 
 async fn guard_bound_request(
@@ -4828,6 +5034,68 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         status: if recording { "pass" } else { "warn" }.into(),
         message,
     });
+    match (
+        client_agent_resources(
+            &state.store,
+            false,
+            "",
+            state.store.index().map_err(ApiError::internal)?,
+        ),
+        state.store.operational_messages(None, false),
+    ) {
+        (Ok(agents), Ok(messages)) => {
+            let mut blocked = agents
+                .iter()
+                .filter(|agent| {
+                    agent.pointer("/delivery/state").and_then(Value::as_str) == Some("stale")
+                })
+                .map(|agent| {
+                    format!(
+                        "{}: {}",
+                        agent["id"].as_str().unwrap_or("agent"),
+                        agent
+                            .pointer("/delivery/reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("delivery is stale")
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut pending = 0;
+            for message in messages.iter().filter(|message| {
+                message.to.starts_with("agent/")
+                    && !matches!(message.status.as_str(), "read" | "closed")
+            }) {
+                let claims = state
+                    .store
+                    .claims_for(&message.subject, Some("message.sent"))
+                    .map_err(ApiError::internal)?;
+                let sent_at = claims
+                    .first()
+                    .map(|claim| claim.accepted_at_unix_ms)
+                    .unwrap_or_default();
+                if client_now_ms().saturating_sub(sent_at) > 10_000 {
+                    pending += 1;
+                }
+            }
+            if pending > 0 {
+                blocked.push(format!("{pending} messages have waited more than 10s for recipient read; inspect `st conversations status MESSAGE`"));
+            }
+            checks.push(DoctorCheck {
+                name: "message-delivery".into(),
+                status: if blocked.is_empty() { "pass" } else { "warn" }.into(),
+                message: if blocked.is_empty() {
+                    "no stalled local delivery paths or overdue agent messages were observed".into()
+                } else {
+                    blocked.join("; ")
+                },
+            });
+        }
+        (Err(error), _) | (_, Err(error)) => checks.push(DoctorCheck {
+            name: "message-delivery".into(),
+            status: "warn".into(),
+            message: error.to_string(),
+        }),
+    }
     // Once a node pins a fleet anchor, membership decides admission. Report what waits for a
     // signature, what is fenced, and what was admitted before this node knew better.
     match state.store.fleet_anchor() {
@@ -8255,11 +8523,18 @@ struct MessagesPageCursor {
 async fn list_messages_page(
     State(state): State<AppState>,
     Query(query): Query<MessagesPageQuery>,
+    peer: Option<Extension<NativeDeliveryPeer>>,
 ) -> Result<Json<MessagePage>, ApiError> {
     let limit = query.limit.unwrap_or(100).clamp(1, 200);
     let to = query.to.as_deref().map(normalize_message_party);
     if let (Some(to), Some(report)) = (to.as_deref(), query.delivery.as_deref()) {
         delivery_presence::record(to, report);
+    } else {
+        record_legacy_poll(
+            peer.as_ref().map(|Extension(peer)| peer),
+            to.as_deref(),
+            query.include_closed,
+        );
     }
     let cursor = query
         .cursor
@@ -8324,8 +8599,14 @@ async fn list_messages_page(
 async fn list_messages(
     State(state): State<AppState>,
     Query(query): Query<MessagesQuery>,
+    peer: Option<Extension<NativeDeliveryPeer>>,
 ) -> Result<Json<Vec<MessageView>>, ApiError> {
     let recipient = query.to.as_deref().map(normalize_message_party);
+    record_legacy_poll(
+        peer.as_ref().map(|Extension(peer)| peer),
+        recipient.as_deref(),
+        query.include_closed,
+    );
     let store = state.store.clone();
     blocking_store(move || store.messages(recipient.as_deref(), query.include_closed))
         .await
@@ -11263,6 +11544,48 @@ mod tests {
         held.join().unwrap();
         read.join().unwrap();
         assert!(result.unwrap().unwrap().is_empty());
+    }
+
+    #[test]
+    fn message_delivery_distinguishes_pending_acceptance_and_recipient_read() {
+        let to = "agent/remote/message-delivery-test";
+        assert_eq!(
+            message_delivery_value(to, "sent", 1_000, 2_000)["state"],
+            "pending"
+        );
+        let late = message_delivery_value(to, "staged", 1_000, 12_000);
+        assert_eq!(late["state"], "waiting");
+        assert_eq!(late["phase"], "staged");
+        assert_eq!(late["recipient_delivery"], Value::Null);
+        let accepted = message_delivery_value(to, "delivered", 1_000, 12_000);
+        assert_eq!(accepted["state"], "waiting");
+        assert!(
+            accepted["reason"]
+                .as_str()
+                .unwrap()
+                .contains("waiting for recipient read")
+        );
+        assert_eq!(
+            message_delivery_value(to, "read", 1_000, 12_000)["state"],
+            "read"
+        );
+    }
+
+    #[test]
+    fn mailbox_reads_do_not_renew_a_native_delivery_beat() {
+        let recipient = "agent/eval/ordinary-mailbox-read";
+        record_legacy_poll(None, Some(recipient), false);
+        assert!(delivery_presence::known(recipient).is_none());
+        let peer = NativeDeliveryPeer {
+            agent: recipient.into(),
+            transport: "omp-channel",
+            pid: 37,
+        };
+        record_legacy_poll(Some(&peer), Some("agent/eval/other-mailbox"), false);
+        record_legacy_poll(Some(&peer), Some(recipient), true);
+        assert!(delivery_presence::known(recipient).is_none());
+        record_legacy_poll(Some(&peer), Some(recipient), false);
+        assert_eq!(delivery_presence::known(recipient).unwrap().state, "legacy");
     }
 
     fn state(root: &Path) -> AppState {

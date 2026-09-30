@@ -58,6 +58,9 @@ type Stash = {
   session?: string;
   seq?: string;
   child?: childProcess.ChildProcess;
+  reconnectTimer?: ReturnType<typeof setTimeout>;
+  reconnectAttempt?: number;
+  shuttingDown?: boolean;
   /**
    * The last assistant message's `usage.cost.total`.
    *
@@ -176,7 +179,7 @@ export default function (pi: ExtensionAPI) {
   };
 
   /** Open a channel and resolve with the hello's restored context (empty if none, or on timeout). */
-  const open = async (ctx: ExtensionContext): Promise<string> => {
+  const open = async (ctx: ExtensionContext, reconnecting = false): Promise<string> => {
     if (!bin || !catalog || !identity) return Promise.resolve("");
     if (typeof ctx.isIdle !== "function") {
       // Refuse rather than degrade. Without a positive idle proof this extension cannot choose
@@ -193,13 +196,16 @@ export default function (pi: ExtensionAPI) {
     // it — and WAITS (bounded) for it to exit before the replacement spawns: the successor
     // shares the seat's record, and a predecessor draining its queued frames after the new
     // session's seed would land stale state into fresh records.
+    state.shuttingDown = false;
+    if (state.reconnectTimer !== undefined) clearTimeout(state.reconnectTimer);
+    state.reconnectTimer = undefined;
     const previous = state.child;
     closeChild(previous);
     await awaitExit(previous, 2000);
     // The predecessor's cost belongs to the predecessor. The stash outlives session replacement
     // by design, so without this a `/new` session's first frames would restate the old session's
     // cost as their own.
-    state.lastCostUsd = undefined;
+    if (!reconnecting) state.lastCostUsd = undefined;
 
     const channelEnv: NodeJS.ProcessEnv = { ...process.env };
     if (runtimeId) channelEnv[RUNTIME_ID] = runtimeId;
@@ -221,17 +227,18 @@ export default function (pi: ExtensionAPI) {
       };
       const timer = setTimeout(() => settle(""), HELLO_TIMEOUT_MS);
       timer.unref?.();
-      child.on("error", () => {
-        if (state.child === child) state.child = undefined;
+      const retire = () => {
+        if (state.child !== child) return;
+        state.child = undefined;
         settle("");
-      });
+        scheduleReconnect(ctx);
+      };
+      child.on("error", retire);
       // An observability pipe must never take pi down: a channel that closed its stdin mid-write
       // surfaces EPIPE on the stream, which without a listener is an uncaught exception in the
       // host process. Retire the channel instead — frames simply stop, fail-open.
-      child.stdin.on("error", () => {
-        if (state.child === child) state.child = undefined;
-      });
-      child.on("exit", () => settle(""));
+      child.stdin.on("error", retire);
+      child.on("exit", retire);
 
       const send = (frame: Record<string, unknown>) => {
         if (child.stdin.destroyed) return;
@@ -245,6 +252,7 @@ export default function (pi: ExtensionAPI) {
         } catch {
           return;
         }
+        if (state.child !== child) return;
         if (frame.type === "hello") {
           // A newer control plane may speak a wire this asset was not written against. Refusing is
           // the honest outcome: presence still decays, so the agent reads as unreachable rather
@@ -257,6 +265,8 @@ export default function (pi: ExtensionAPI) {
             settle("");
             return;
           }
+          state.reconnectAttempt = 0;
+          settleAfterStart(ctx, child);
           clearTimeout(timer);
           settle(typeof frame.sessionContext === "string" ? frame.sessionContext : "");
           return;
@@ -294,6 +304,17 @@ export default function (pi: ExtensionAPI) {
         }
       });
     });
+  };
+
+  const scheduleReconnect = (ctx: ExtensionContext) => {
+    if (state.shuttingDown || state.reconnectTimer !== undefined) return;
+    const attempt = Math.min((state.reconnectAttempt ?? 0) + 1, 6);
+    state.reconnectAttempt = attempt;
+    state.reconnectTimer = setTimeout(() => {
+      state.reconnectTimer = undefined;
+      if (!state.shuttingDown && !state.child) void open(ctx, true);
+    }, Math.min(500 * (2 ** (attempt - 1)), 5_000));
+    state.reconnectTimer.unref?.();
   };
 
   // Observed harness state, extension side. pi's own turn boundaries are the positive signal,
@@ -535,7 +556,7 @@ export default function (pi: ExtensionAPI) {
     // and a post-compaction restart reads `{tokens: null}` — both are honest answers pi gives.
     if (opened) {
       sendContext(ctx);
-      settleAfterStart(ctx, opened);
+
     }
     if (restored.trim()) {
       // A custom message participates in LLM context without triggering a turn of its own — the
@@ -553,6 +574,11 @@ export default function (pi: ExtensionAPI) {
   // new session just opened — measured: delivery stopped entirely after `/new`. Replacement is
   // handled by `open()` closing its predecessor instead.
   pi.on("session_shutdown", async (event: SessionShutdownEvent) => {
-    if (event.reason === "quit") closeChild(state.child);
+    if (event.reason === "quit") {
+      state.shuttingDown = true;
+      if (state.reconnectTimer !== undefined) clearTimeout(state.reconnectTimer);
+      state.reconnectTimer = undefined;
+      closeChild(state.child);
+    }
   });
 }

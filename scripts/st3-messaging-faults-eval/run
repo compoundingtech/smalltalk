@@ -17,7 +17,7 @@ import uuid
 
 HERE = Path(__file__).resolve().parent
 CASES = ("baseline", "daemon-restart", "binary-swap", "link-seconds", "link-minutes",
-         "receiver-down", "harness-restart", "channel-killed", "old-channel")
+         "receiver-down", "harness-restart", "channel-killed", "old-channel", "handoff-failed")
 
 
 def now_ms():
@@ -276,8 +276,13 @@ def judge(proof):
             failures.append("provider process changed after the fault")
         if proof["incarnation_before"] is None or proof["incarnation_before"] != proof["incarnation_after"]:
             failures.append("runtime incarnation changed after the fault")
+    if proof["case"] == "handoff-failed":
+        for field in ("failed_path_visible", "failed_doctor_visible", "failed_sender_visible"):
+            if not proof.get(field):
+                failures.append(f"blocked handoff was not visible: {field}")
     delivery = proof["delivery_after"]
-    if delivery.get("state") != "current":
+    expected_delivery = "legacy" if proof["case"] == "old-channel" else "current"
+    if delivery.get("state") != expected_delivery:
         failures.append(f"delivery report is {delivery.get('state', 'unreported')}: {delivery.get('reason')}")
     if proof["graph_read_claims"] != 1:
         failures.append(f"graph contains {proof['graph_read_claims']} read claims (expected 1)")
@@ -387,6 +392,25 @@ agent "fault-probe" {{
             subject = await send(source, case)
             await asyncio.sleep(args.long_seconds if case == "link-minutes" else args.short_seconds)
             link.enabled = True
+        elif case == "handoff-failed":
+            (target.root / "ws/handoff-blocked").touch()
+            subject = await send(source, case)
+            async def refused():
+                return len([row for row in receipts(target) if row.get("subject") == subject
+                            and row["event"] == "handoff-refused"]) >= 3
+            await until(refused, 30)
+            await asyncio.sleep(5)  # also cross the sender's ten-second read threshold
+            blocked_agent = await agent(target)
+            blocked_doctor = await target.api("/v1/doctor")
+            blocked_sender = await source.api("/v1/messages/delivery/" + subject)
+            write_json(directory / "blocked-agent.json", blocked_agent)
+            write_json(directory / "blocked-doctor.json", blocked_doctor)
+            write_json(directory / "blocked-sender.json", blocked_sender)
+            result["failed_path_visible"] = blocked_agent.get("delivery", {}).get("state") == "stale"
+            result["failed_doctor_visible"] = any(row.get("name") == "message-delivery" and row.get("status") == "warn"
+                for row in (blocked_doctor or {}).get("checks", []))
+            result["failed_sender_visible"] = (blocked_sender or {}).get("delivery", {}).get("state") == "waiting"
+            (target.root / "ws/handoff-blocked").unlink()
         elif case == "channel-killed":
             channels = [row for row in before if " driver omp-channel " in row["argv"]]
             if len(channels) != 1:

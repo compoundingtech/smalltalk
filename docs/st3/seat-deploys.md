@@ -79,7 +79,12 @@ state; a restarted daemon learns every live path again within a second.
 can take work:
 
 - `current`: a poll arrived in the last 45 seconds from a process running the daemon's own image,
-  and for Claude the channel reported in the last ten seconds from that image too;
+  and for Claude the channel reported in the last ten seconds from that image too. Pi-family
+  channels must also have received the provider's idle proof and have no rejected handoff waiting;
+- `legacy`: a recent metadata-free mailbox poll came from this seat's native delivery process.
+  The daemon identifies the Unix peer PID, native driver command and inherited seat identity;
+  ordinary mailbox reads do not count. This proves polling, while binary version and readiness
+  remain unverified;
 - `unknown`: the daemon started less than 20 seconds ago and the seat has not polled yet;
 - `stale`, with the reason: no poll since then, a poll from a replaced or unidentified binary, or a
   silent or replaced Claude channel.
@@ -89,10 +94,23 @@ A stale seat shows as `waiting` instead of `running`, and `st agents show` print
 
 ## Deploys
 
-A deploy only needs to install the binary and restart the daemon. Each seat follows the replacement
-within about two seconds of the install. The first deploy of this change is the exception: seats
-started before it run drivers that cannot follow a replacement and do not identify themselves, so
-they show as `waiting` with a delivery path that predates delivery reports. Restart each of them once.
+A deploy only needs to install the binary and restart the daemon. Drivers with reexec support
+follow the replacement within about two seconds of the install. Older native paths can keep
+delivering and report `legacy`; an older executable is not represented as a current one. A deploy
+does not require restarting their provider sessions.
+
+Pi and omp extensions reopen an unexpectedly exited channel with bounded backoff. Each new
+handshake samples the provider's idle proof, even when no turn runs. Negative handoff receipts
+retry indefinitely with a delay capped at five seconds; the third failure records a diagnostic
+without stopping retries. The channel reports the rejected handoff as stale until native
+acceptance or an authoritative delivery/read/close receipt settles it. This never authorizes
+repeating a handoff already accepted by the native transport.
+
+`st conversations status MESSAGE` shows delivery/read progress without changing its lifecycle.
+The client message view carries the same `delivery` assessment, including the local recipient
+path when one is known. A remote path stays unverified. A message waiting more than ten seconds
+for read is visible as `waiting`; it stays durable. `st doctor` warns about stale local paths and
+overdue messages to current agents. Reading the message clears its pending-read warning.
 
 The path must stay the same. A deploy that starts the daemon from a new path, such as a new store
 path, leaves every running seat on the old one, and st reports them as stale.
