@@ -3,8 +3,8 @@ set -Eeuo pipefail
 
 report="$(/usr/bin/dirname "$0")/st3-message-soak-report"
 base='2026-09-24T00:00:00Z monitor-started evidence_format=2
-2026-09-24T00:00:03Z ok direction=hetz-to-silber subject=message/a token=a latency_seconds=1 matching_replies=1
-2026-09-24T00:00:12Z ok direction=silber-to-hetz subject=message/b token=b latency_seconds=1 matching_replies=1'
+2026-09-24T00:00:03Z ok direction=example-linux-to-example-mac subject=message/a token=a latency_seconds=1 matching_replies=1
+2026-09-24T00:00:12Z ok direction=example-mac-to-example-linux subject=message/b token=b latency_seconds=1 matching_replies=1'
 
 check() {
   local expected=$1 evidence=$2 result status
@@ -18,8 +18,8 @@ check() {
 
 check 0 "$base"
 check 1 "${base/2026-09-24T00:00:12Z/2026-09-24T00:00:14Z}"
-check 1 "${base/2026-09-24T00:00:12Z/2026-09-24T00:00:12Z FAILED direction=silber-to-hetz stage=send token=x
+check 1 "${base/2026-09-24T00:00:12Z/2026-09-24T00:00:12Z FAILED direction=example-mac-to-example-linux stage=send token=x
 2026-09-24T00:00:12Z}"
 check 1 "${base/monitor-started evidence_format=2/monitor-started evidence_format=1}"
-check 1 "${base/silber-to-hetz/hetz-to-silber}"
+check 1 "${base/example-mac-to-example-linux/example-linux-to-example-mac}"
 /usr/bin/printf 'st3 message soak report tests passed\n'

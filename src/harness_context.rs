@@ -740,7 +740,7 @@ mod tests {
     use super::*;
 
     fn writer(dir: &Path) -> Writer {
-        Writer::new(dir, "hetz.worker", Harness::Codex).unwrap()
+        Writer::new(dir, "example-linux.worker", Harness::Codex).unwrap()
     }
 
     /// A Codex-shaped reading: the operands and the percent the producer computed from them.
@@ -756,7 +756,7 @@ mod tests {
     /// A catalog-shaped tree: a control directory at the root and the agent below it.
     fn catalog(root: &Path) -> PathBuf {
         fs::create_dir_all(root.join(crate::catalog_lock::CONTROL_DIR)).unwrap();
-        let agent_dir = root.join("agents").join("hetz").join("worker");
+        let agent_dir = root.join("agents").join("example-linux").join("worker");
         fs::create_dir_all(&agent_dir).unwrap();
         agent_dir
     }
@@ -822,7 +822,7 @@ mod tests {
     fn withheld_values_are_null_and_are_never_fabricated() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = catalog(tmp.path());
-        let mut writer = Writer::new(&agent_dir, "hetz.worker", Harness::Claude).unwrap();
+        let mut writer = Writer::new(&agent_dir, "example-linux.worker", Harness::Claude).unwrap();
         // Claude before its first API response: the window is populated, the rest is not.
         writer
             .observe(Reading {
@@ -880,7 +880,7 @@ mod tests {
     fn a_reading_above_the_window_is_carried_unclamped() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = catalog(tmp.path());
-        let mut writer = Writer::new(&agent_dir, "hetz.worker", Harness::Pi).unwrap();
+        let mut writer = Writer::new(&agent_dir, "example-linux.worker", Harness::Pi).unwrap();
         writer
             .observe(Reading {
                 used_tokens: Some(23_424),
@@ -939,7 +939,7 @@ mod tests {
     fn claude_rate_limit_exhaustion_and_reset_crossings_land_inside_one_usage_bucket() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = catalog(tmp.path());
-        let mut writer = Writer::new(&agent_dir, "hetz.worker", Harness::Claude).unwrap();
+        let mut writer = Writer::new(&agent_dir, "example-linux.worker", Harness::Claude).unwrap();
         let at_limit = |used_tokens, used_percent, five_hour| Reading {
             rate_limits: RateLimits {
                 five_hour: Some(five_hour),
@@ -1013,7 +1013,7 @@ mod tests {
     fn a_withheld_percent_has_no_bucket_and_only_a_compaction_or_heartbeat_writes() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = catalog(tmp.path());
-        let mut writer = Writer::new(&agent_dir, "hetz.worker", Harness::Pi).unwrap();
+        let mut writer = Writer::new(&agent_dir, "example-linux.worker", Harness::Pi).unwrap();
         let withheld = |used: Option<u64>| Reading {
             used_tokens: used,
             window_tokens: Some(200_000),
@@ -1246,7 +1246,7 @@ mod tests {
     fn an_unrecognized_harness_cannot_be_written() {
         let tmp = tempfile::tempdir().unwrap();
         let agent_dir = catalog(tmp.path());
-        assert!(Writer::new(&agent_dir, "hetz.worker", Harness::Unrecognized).is_err());
+        assert!(Writer::new(&agent_dir, "example-linux.worker", Harness::Unrecognized).is_err());
     }
 
     /// HC-R05: publication stages below this catalog's control directory, never in `agents`, and

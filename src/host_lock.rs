@@ -89,7 +89,7 @@ mod tests {
     #[test]
     fn acquire_release_cycle() {
         let tmp = tempfile::tempdir().unwrap();
-        let lock = HostLock::new(tmp.path(), "hetz");
+        let lock = HostLock::new(tmp.path(), "example-linux");
         assert!(lock.live_owner().is_none());
         assert!(!lock.has_stale_lock());
 
@@ -107,8 +107,8 @@ mod tests {
     #[test]
     fn lock_path_is_host_scoped_and_dot_prefixed() {
         let tmp = tempfile::tempdir().unwrap();
-        let a = HostLock::new(tmp.path(), "hetz");
-        let b = HostLock::new(tmp.path(), "silber");
+        let a = HostLock::new(tmp.path(), "example-linux");
+        let b = HostLock::new(tmp.path(), "example-mac");
         assert_ne!(a.pid_path(), b.pid_path(), "per-host lock files");
         assert!(
             a.pid_path()
@@ -123,7 +123,7 @@ mod tests {
     #[test]
     fn stale_lock_from_dead_pid_is_detected_and_not_an_owner() {
         let tmp = tempfile::tempdir().unwrap();
-        let lock = HostLock::new(tmp.path(), "hetz");
+        let lock = HostLock::new(tmp.path(), "example-linux");
         fs::write(lock.pid_path(), "2000000000").unwrap(); // almost certainly dead
         assert!(lock.live_owner().is_none());
         assert!(lock.has_stale_lock());
@@ -132,7 +132,7 @@ mod tests {
     #[test]
     fn a_live_foreign_pid_is_reported_as_owner() {
         let tmp = tempfile::tempdir().unwrap();
-        let lock = HostLock::new(tmp.path(), "hetz");
+        let lock = HostLock::new(tmp.path(), "example-linux");
         fs::write(lock.pid_path(), "1").unwrap(); // init — always alive, not us
         assert_eq!(lock.live_owner(), Some(1));
     }
@@ -140,7 +140,7 @@ mod tests {
     #[test]
     fn release_does_not_clobber_a_foreign_lock() {
         let tmp = tempfile::tempdir().unwrap();
-        let lock = HostLock::new(tmp.path(), "hetz");
+        let lock = HostLock::new(tmp.path(), "example-linux");
         fs::write(lock.pid_path(), "1").unwrap(); // not ours
         lock.release();
         assert!(lock.pid_path().exists(), "must not remove a foreign lock");
