@@ -23,6 +23,8 @@ tests, Clippy, the generated client check and the fleet compatibility test run s
 the run fails if any of them fails. The tests run under nextest, 8 at a time, with the tests
 that take a minute or more started first. A failed test is retried twice, 30 seconds apart, and
 one that passes on a retry is reported as flaky rather than failing the run.
+The messaging fault matrix has a higher repository priority so its long retries have the full
+25-minute CI test window.
 
 st2's catalog, supervisor and end-to-end tests cover st2 code that st3 does not use: the
 `agent_author`, `catalog*`, `eval_run`, `resync` and `resource_profile_supervisor` modules and

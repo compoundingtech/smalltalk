@@ -1429,6 +1429,15 @@ fn client_work_item(
     Ok(client_work_values(store, vec![work], &desired, snapshot_index)?.pop())
 }
 
+/// Translate internal step states once for every client projection.
+fn client_work_state(status: &str) -> &str {
+    match status {
+        "pending" => "waiting",
+        "working" => "claimed",
+        other => other,
+    }
+}
+
 /// Client resources for `work`, with the usage of the seats in `desired` that its steps own.
 fn client_work_values(
     store: &Store,
@@ -1483,11 +1492,7 @@ fn client_work_values(
             let operational = work_annotations
                 .get(&work.subject)
                 .expect("every work item has an annotation");
-            let state = match work.status.as_str() {
-                "pending" => "waiting",
-                "working" => "claimed",
-                other => other,
-            };
+            let state = client_work_state(&work.status);
             let usage = aggregate_usage_values(
                 usage_by_step
                     .get(work.subject.as_str())
@@ -1769,7 +1774,7 @@ fn client_agent_resources_uncached(
                 "path": step.path,
                 "title": step.title,
                 "goal": step.goal,
-                "state": step.status,
+                "state": client_work_state(&step.status),
                 "since": client_timestamp(step.updated_at_unix_ms),
             })
         })
@@ -2094,31 +2099,7 @@ fn client_session_resources(
         }));
     }
     for unresolved in external.unresolved_processes {
-        sessions.push(json!({
-            "id": unresolved.id,
-            "kind": "session",
-            "revision": unresolved.revision,
-            "updated_at": crate::external_sessions::timestamp(snapshot_time_ms(at)),
-            "owner_id": format!("external-process/{}/{}", unresolved.driver.as_str(), unresolved.process.pid),
-            "state": "running",
-            "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
-            "ended_at": null,
-            "timeline_cursor": format!("timeline-cursor/process-{}/latest", unresolved.process.pid),
-            "usage": null,
-            "managed": false,
-            "driver": unresolved.driver.as_str(),
-            "native_session_id": null,
-            "workspace": unresolved.process.cwd.map(|path| path.display().to_string()),
-            "title": null,
-            "importable": false,
-            "import_reason": "a running harness in this workspace does not expose its exact native session ID; select a saved session and explicitly confirm this PID before takeover",
-            "process": {
-                "pid": unresolved.process.pid,
-                "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
-                "fingerprint": unresolved.process.fingerprint,
-                "exact_session": false
-            }
-        }));
+        sessions.push(unresolved_session_resource(unresolved, at));
     }
     sessions.sort_by(|left, right| {
         right["updated_at"]
@@ -2127,6 +2108,37 @@ fn client_session_resources(
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
     Ok(sessions)
+}
+
+fn unresolved_session_resource(
+    unresolved: crate::external_sessions::UnresolvedProcess,
+    at: &str,
+) -> Value {
+    json!({
+        "id": unresolved.id,
+        "kind": "session",
+        "revision": unresolved.revision,
+        "updated_at": crate::external_sessions::timestamp(snapshot_time_ms(at)),
+        "owner_id": format!("external-process/{}/{}", unresolved.driver.as_str(), unresolved.process.pid),
+        "state": "running",
+        "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
+        "ended_at": null,
+        "timeline_cursor": format!("timeline-cursor/process-{}/latest", unresolved.process.pid),
+        "usage": null,
+        "managed": false,
+        "driver": unresolved.driver.as_str(),
+        "native_session_id": null,
+        "workspace": unresolved.process.cwd.map(|path| path.display().to_string()),
+        "title": null,
+        "importable": false,
+        "import_reason": "a running harness in this workspace does not expose its exact native session ID; select a saved session and explicitly confirm this PID before takeover",
+        "process": {
+            "pid": unresolved.process.pid,
+            "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
+            "fingerprint": unresolved.process.fingerprint,
+            "exact_session": false
+        }
+    })
 }
 
 fn managed_session_resources(
@@ -3668,14 +3680,21 @@ async fn client_launches_detail(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    client_detail(
-        client_launch_resources(&state, query.history).map_err(ApiError::internal)?,
-        "launch",
-        &id,
-    )
+    let items = client_launch_resources(&state, query.history).map_err(ApiError::internal)?;
+    // The route carries a session ID. A native ID may itself start with `launch/`.
+    let resource_id = format!("launch/{id}");
+    let id = if items.iter().any(|item| item["id"] == resource_id) {
+        resource_id
+    } else {
+        id
+    };
+    client_detail(items, "launch", &id)
 }
 
 fn client_launch_session(state: &AppState, id: &str) -> Result<PlanningSessionView, ApiError> {
+    if let Some(session) = state.store.planning_session(id).map_err(ApiError::internal)? {
+        return Ok(session);
+    }
     state
         .store
         .planning_session(launch_session_id(id))
@@ -4005,6 +4024,13 @@ async fn serve_unix_with_ancestor(
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent)?;
     }
+    // A second daemon must never detach an active listener by unlinking its pathname.
+    if tokio::net::UnixStream::connect(socket).await.is_ok() {
+        anyhow::bail!(
+            "refusing to replace live Unix socket listener at {}",
+            socket.display()
+        );
+    }
     match fs::remove_file(socket) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -4071,6 +4097,26 @@ async fn serve_unix_with_ancestor(
                 .with_upgrades()
                 .await;
         });
+    }
+}
+
+#[cfg(test)]
+mod gateway_listener_tests {
+    #[tokio::test]
+    async fn live_listener_cannot_be_unlinked_by_another_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("gateway.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let error = super::serve_unix(&socket, axum::Router::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("refusing to replace live Unix socket listener"),
+            "{error}"
+        );
+        assert!(tokio::net::UnixStream::connect(&socket).await.is_ok());
+        drop(listener);
     }
 }
 
@@ -16105,7 +16151,7 @@ mission "labelled" state="ready" {
                     step["state"].as_str().unwrap()
                 ))
                 .collect::<Vec<_>>(),
-            [("first", "ready"), ("second", "pending")]
+            [("first", "ready"), ("second", "waiting")]
         );
         assert_eq!(steps[0]["goals"], json!(["Greet the fleet."]));
         assert_eq!(steps[0]["assignee"], format!("agent/{}/worker", run.id));

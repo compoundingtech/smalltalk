@@ -2332,10 +2332,6 @@ fn subscription_request_view(
     }
 }
 
-/// The most mission runs one resource observation requests at once for one subscription. The
-/// remaining requests wait for a person.
-pub const MAX_OBSERVATION_DELIVERIES: usize = 5;
-
 /// One repository item whose recorded facts changed. `deliver` says whether the change asks a
 /// subscription for a review or a triage.
 struct DiscoveredItem {
@@ -2529,7 +2525,7 @@ fn collection_delivery_was_requested_tx(
 /// Item claims written before items carried `head_sha` still cite the repository listing they
 /// came from, and that listing names the head.
 fn listed_head_tx(
-    transaction: &rusqlite::Transaction<'_>,
+    connection: &Connection,
     item: Option<&Value>,
 ) -> rusqlite::Result<Option<String>> {
     let Some(item) = item else {
@@ -2541,7 +2537,7 @@ fn listed_head_tx(
     ) else {
         return Ok(None);
     };
-    let listing = transaction
+    let listing = connection
         .query_row("SELECT body FROM claims WHERE id=?1", [listing], |row| {
             row.get::<_, String>(0)
         })
@@ -12132,7 +12128,6 @@ impl Store {
                                     .map(|claim| vec![(resource.to_owned(), claim.id.clone())])
                                     .unwrap_or_default()
                             };
-                            let mut requested_count = 0;
                             for (delivery_resource, discovery) in discoveries {
                                 let discovery_body = transaction
                                     .query_row("SELECT body FROM claims WHERE id=?1", [&discovery], |row| {
@@ -12199,14 +12194,6 @@ impl Store {
                                         .expect("subscription request fields are an object")
                                         .insert("mission_revision".into(), Value::String(revision.into()));
                                 }
-                                // One observation starts a bounded number of runs. A person releases or
-                                // cancels the rest.
-                                if requested_count >= MAX_OBSERVATION_DELIVERIES {
-                                    request_fields
-                                        .as_object_mut()
-                                        .expect("subscription request fields are an object")
-                                        .insert("held".into(), Value::Bool(true));
-                                }
                                 if let Some(requester) = subscription.requester.as_deref() {
                                     request_fields
                                         .as_object_mut()
@@ -12224,7 +12211,6 @@ impl Store {
                                     Some(&batch_id),
                                 )
                                 .map_err(claim_append_error)?;
-                                requested_count += 1;
                             }
                             continue;
                         }
@@ -12451,12 +12437,17 @@ impl Store {
             return Ok(Some(format!("pull request {number} is a draft again")));
         }
         let short = |head: &str| head.chars().take(12).collect::<String>();
-        let requested_head = requested
+        let requested_head = match requested
             .body
             .pointer("/fields/facts/head_sha")
-            .and_then(Value::as_str);
+            .and_then(Value::as_str)
+        {
+            Some(head) => Some(head.to_owned()),
+            None => listed_head_tx(&self.readers.get(), Some(&requested.body))?,
+        };
         let current_head = current.get("head_sha").and_then(Value::as_str);
-        if let (Some(requested_head), Some(current_head)) = (requested_head, current_head)
+        if let (Some(requested_head), Some(current_head)) =
+            (requested_head.as_deref(), current_head)
             && requested_head != current_head
         {
             return Ok(Some(format!(
@@ -37490,6 +37481,110 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             envelopes,
             signature_requests: Vec::new(),
             signatures: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn planning_state_and_attention_agree_when_claims_arrive_in_different_orders() {
+        let source = Store::open_memory("source").unwrap();
+        let kdl = "version 2\nmission \"release\" state=\"ready\" { goal \"Ship a release\" }\n";
+        let intent = crate::graph::parse_test_intent(kdl, "source").unwrap();
+        let mission = source
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        let doc = source
+            .put_document(
+                "doc/planning/release/request",
+                b"Ship a release",
+                &None,
+                "request",
+            )
+            .unwrap();
+        let reference = format!("{}@{}", doc.name, doc.hash);
+        let subject = "planning-session/planning/release/one";
+        let events = [
+            (
+                "started",
+                json!({"mission": "mission/release", "request": reference, "workspace": "/work/release", "requester": "person/avery", "planner": "agent/source.planner"}),
+            ),
+            (
+                "candidate-submitted",
+                json!({"candidate_revision": 1, "markdown": reference, "kdl": reference, "mission_revision": "revision-one"}),
+            ),
+            (
+                "previewed",
+                json!({"candidate_revision": 1, "preview_hash": "preview-one", "store_index": mission.store_index, "graph": "release", "diff": "new", "mission": mission}),
+            ),
+            (
+                "approved",
+                json!({"mission_revision": "revision-one", "requester": "person/avery"}),
+            ),
+        ];
+        for (kind, fields) in events {
+            // Distinct accepted times also prove this is independent of the receiver's indexes.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            source
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: format!("planning-session.{kind}"),
+                    actor: Some("person/avery".into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("planning-{kind}")),
+                })
+                .unwrap();
+            if kind == "previewed" {
+                source.replay_replication_graph().unwrap();
+                let attention = source.attention_items(Some("person/avery")).unwrap();
+                assert_eq!(attention.len(), 1);
+                assert_eq!(attention[0].kind, "launch-approval");
+            }
+        }
+        let envelopes = exchange_from(&source, &ReplicationInventory::default()).envelopes;
+        let in_order = Store::open_memory("in-order").unwrap();
+        receive_and_project(
+            &in_order,
+            "source",
+            &exchange_of("source", envelopes.clone()),
+        );
+        let reversed = Store::open_memory("reversed").unwrap();
+        for envelope in envelopes.iter().rev() {
+            receive_and_project(
+                &reversed,
+                "source",
+                &exchange_of("source", vec![envelope.clone()]),
+            );
+        }
+        assert_eq!(graph_digest_of(&in_order), graph_digest_of(&reversed));
+        for store in [&in_order, &reversed] {
+            let launch = store.planning_session(subject).unwrap().unwrap();
+            assert_eq!(launch.status, "approved");
+            assert_eq!(launch.published_revision.as_deref(), Some("revision-one"));
+            assert!(
+                store
+                    .attention_items(Some("person/avery"))
+                    .unwrap()
+                    .is_empty()
+            );
+            // Startup replay must retain the same result, too.
+            store.replay_replication_graph().unwrap();
+            assert_eq!(
+                store.planning_session(subject).unwrap().unwrap().status,
+                "approved"
+            );
+            assert!(
+                store
+                    .attention_items(Some("person/avery"))
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 

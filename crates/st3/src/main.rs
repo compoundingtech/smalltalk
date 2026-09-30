@@ -1548,14 +1548,14 @@ enum MissionViewCommand {
         /// Exact seat subject or its identity without the `agent/` prefix.
         agent: String,
     },
-    /// List the open mission requests that one subscription recorded.
+    /// Show one subscription's automatic mission request queue.
     Requests {
         subscription: String,
         /// Include started, cancelled, and failed requests.
         #[arg(long)]
         all: bool,
     },
-    /// Start one mission request that an observation held for a person.
+    /// Release a legacy held request; new requests are queued automatically.
     Release(SubscriptionRequestArgs),
     /// Close one pending or held mission request without starting it.
     CancelRequest(SubscriptionRequestArgs),
@@ -3511,7 +3511,63 @@ fn raise_open_file_limit() {
     }
 }
 
+fn select_private_gateway(config: &mut Config, private_state: bool, private_socket: bool) {
+    if !(private_state || private_socket) {
+        return;
+    }
+    let defaults = Config::default();
+    if config.state_dir == defaults.state_dir && config.socket == defaults.socket {
+        return;
+    }
+    let parent = if private_socket {
+        config
+            .socket
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+    } else {
+        Some(config.state_dir.as_path())
+    };
+    config.client_gateway_socket = parent
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("st3-client.sock");
+}
+
+#[cfg(test)]
+mod private_gateway_tests {
+    use super::*;
+
+    #[test]
+    fn private_state_and_socket_derive_a_private_gateway() {
+        let mut config = Config::default();
+        let default_gateway = config.client_gateway_socket.clone();
+        config.state_dir = "/tmp/private-state".into();
+        select_private_gateway(&mut config, true, false);
+        assert_eq!(
+            config.client_gateway_socket,
+            PathBuf::from("/tmp/private-state/st3-client.sock")
+        );
+        config.socket = "/tmp/private-socket/api.sock".into();
+        select_private_gateway(&mut config, true, true);
+        assert_eq!(
+            config.client_gateway_socket,
+            PathBuf::from("/tmp/private-socket/st3-client.sock")
+        );
+        assert_ne!(config.client_gateway_socket, default_gateway);
+    }
+
+    #[test]
+    fn default_daemon_keeps_its_default_gateway() {
+        let mut config = Config::default();
+        let gateway = config.client_gateway_socket.clone();
+        select_private_gateway(&mut config, false, false);
+        assert_eq!(config.client_gateway_socket, gateway);
+    }
+}
+
 async fn run_up(args: UpArgs) -> Result<()> {
+    let private_state = args.state_dir.is_some();
+    let private_socket = args.socket.is_some();
+    let explicit_gateway = args.client_gateway_socket.is_some();
     let mut config = Config::load_unvalidated(args.config.as_deref())?;
     if let Some(node) = args.node {
         config.node = node;
@@ -3527,6 +3583,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
     }
     if let Some(socket) = args.client_gateway_socket {
         config.client_gateway_socket = socket;
+    }
+    if !explicit_gateway {
+        select_private_gateway(&mut config, private_state, private_socket);
     }
     if let Some(peer_listen) = args.peer_listen {
         config.peer_listen = Some(peer_listen);

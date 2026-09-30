@@ -150,6 +150,12 @@ the stable `id` ascending. No locale-sensitive ordering is permitted.
 | Sessions | `/sessions`, `/sessions/{id}` | updated time descending, ID |
 | Session timeline | `/sessions/{id}/timeline` | sequence ascending |
 
+Work resources, mission steps (including `current_steps`), and agent work labels use the same
+`WorkState` vocabulary: `waiting`, `ready`, `claimed`, `blocked`, `verifying`, `completed`,
+`failed`, and `cancelled`. The API translates internal `pending` to `waiting` and `working` to
+`claimed` in every projection. Clients treat held or verifying work as active even when its
+successors are waiting.
+
 A page carries an optional `sync` notice while its host is catching up with a fleet peer. Its
 projections can then show early history as current, such as an attention request that a
 not-yet-received envelope resolves. The notice lists each peer that holds more envelopes than one
@@ -246,6 +252,14 @@ Incremental timeline events use `append`, `replace`, or `finalize`. `replace` ta
 entry and increments its revision; it cannot change the entry's ID, sequence, role, or type.
 `finalize` makes the entry immutable. Tool results must refer to a preceding tool call. Timeline
 pages and updates are bounded by the negotiated byte and item limits.
+
+External process sessions remain listed even when st cannot identify a native transcript.
+Opening their timeline returns a non-retryable `unsupported-capability` error with
+`details.reason: native-session-unidentified` and `details.session_id`, explaining that the
+agent was not started by st and its saved session could not be identified. Clients show this
+as the no-conversation state, rather than treating the listed session as missing. The same
+verdict applies to the conversation stream. OMP `__omp_worker_*` internal modes are helpers,
+not external harness sessions, and are excluded from discovery.
 
 ## Launches, variants, decisions, and approvals
 
