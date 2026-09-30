@@ -1,0 +1,57 @@
+[package]
+name = "st-drivers"
+version = "0.1.0"
+edition = "2024"
+description = "Harness drivers, native delivery, and catalog support shared by st2 and st3"
+license = "MIT"
+build = "../../build.rs"
+autotests = false
+
+[dependencies]
+# Sync by design: the runner is I/O-light (shell-outs to `pty` plus a
+# folder watch + a sleep), so no tokio.
+agent-spec = { path = "../agent-spec" }
+anyhow = "1"
+kdl = "6"
+libc = "0.2"
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+st2-resource-protocol = { path = "../st2-resource-protocol" }
+st2-resource-providers = { path = "../st2-resource-providers", optional = true }
+st2-resource-wasip2 = { path = "../st2-resource-wasip2", optional = true, features = ["runtime"] }
+st2-wire = { path = "../st2-wire" }
+tempfile = "3"
+toml = "0.9"
+opentelemetry = "0.30"
+opentelemetry-otlp = { version = "0.30", default-features = false, features = ["http-json", "reqwest-blocking-client", "internal-logs", "logs"] }
+opentelemetry_sdk = { version = "0.30", features = ["spec_unstable_metrics_views", "logs"] }
+# `experimental_use_tracing_span_context` stamps the active tracing span's trace/span ids onto
+# emitted log records — required so logs correlate with spans without manual context plumbing.
+opentelemetry-appender-tracing = { version = "0.30", features = ["experimental_use_tracing_span_context"] }
+tracing = "0.1"
+tracing-opentelemetry = "0.31"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt", "registry", "std"] }
+tungstenite = "0.30"
+
+[dev-dependencies]
+parking_lot = "0.12"
+toml = "0.9"
+wat = "1"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+[features]
+# Sandbox wasm resource-profile resolvers (`agent-spec/profile_wasm`). Off by default: the
+# runner binary carries no wasmtime unless a build opts in.
+wasm-resolver = ["agent-spec/wasm-resolver"]
+# Typed Component Model resource providers. This is the sole feature that admits Wasmtime for
+# observation; default members and the default st2 binary remain Wasmtime-free.
+wasip2-provider-runtime = [
+  "wasm-resolver",
+  "dep:st2-resource-providers",
+  "dep:st2-resource-wasip2",
+]

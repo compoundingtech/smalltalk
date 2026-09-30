@@ -6,8 +6,8 @@
 use std::fs;
 use std::path::Path;
 
-use st2::identity::AgentSelector;
-use st2::message::{
+use st_drivers::identity::AgentSelector;
+use st_drivers::message::{
     archive_dir, archive_msg, collect_thread, inbox_dir, list_dir, read_msg, reply_subject,
     resolve_agent_dir, send_to_inbox,
 };

@@ -83,7 +83,7 @@
         # pure input, so baking it lets a hermetic build know its own identity
         # without an impure `.git` read. Same env var + JSON shape as the rest of
         # the fleet (TS `@overeng/utils/node/cli-version`; the otel-scrape Rust
-        # reader) — `src/version.rs` reads it via `option_env!("CLI_BUILD_STAMP")`.
+        # reader) — `crates/st-drivers/src/version.rs` reads it via `option_env!("CLI_BUILD_STAMP")`.
         # `self.shortRev`/`lastModified` are absent only for a dirty tree, where
         # `dirtyShortRev` and the working-tree mtime stand in and `dirty` is true.
         sourceRev = self.shortRev or self.dirtyShortRev or "unknown";
@@ -216,7 +216,7 @@
           # over the LocalStamp `build.rs` bakes from git (which is empty here
           # anyway — a flake source carries no `.git`). Reaches rustc as a plain
           # env var, captured at compile time by `option_env!` (see
-          # src/version.rs). A derivation env var change rebuilds the crate.
+          # crates/st-drivers/src/version.rs). A derivation env var change rebuilds the crate.
           CLI_BUILD_STAMP = buildStamp;
           ST2_EXECUTOR_BUILD_IDENTITY = buildStamp;
           AGENT_SPEC_REVISION = agentSpecRevision;
@@ -832,7 +832,7 @@
               pkgs.typescript
             ];
           } ''
-            cp -R ${self}/hooks hooks
+            cp -R ${self}/crates/st-drivers/hooks hooks
             chmod -R u+w hooks
 
             modules=hooks/typecheck/node_modules
@@ -857,7 +857,7 @@
             # every telemetry pull throws — because a bare context takes the fail-open branch and
             # never executes the harness-context producer's body at all, which is the same blind
             # spot in a new place. The channel is a recorder rather than `true`, so the smoke reads
-            # the frames back and asserts the wire `src/pi_channel.rs` decodes: with a pipe nobody
+            # the frames back and asserts the wire `crates/st-drivers/src/pi_channel.rs` decodes: with a pipe nobody
             # reads, a producer that silently emits nothing is indistinguishable from a working
             # one, and that failure looks exactly like the pre-producer state where every
             # declaration's context reads null. Nothing else couples the two halves of that wire —

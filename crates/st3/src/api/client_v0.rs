@@ -3195,7 +3195,7 @@ fn managed_claude_transcript(
         .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
         .join("catalog")
         .join("agents")
-        .join(st2::run::detect_host())
+        .join(st_drivers::run::detect_host())
         .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16]);
     // The current wrapper's SessionStart hook binds the Claude session it started. A previous
     // provider's binding can survive a restart, so it counts only when it names the same
@@ -3251,7 +3251,7 @@ fn managed_omp_transcript(
         .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
         .join("catalog")
         .join("agents")
-        .join(st2::run::detect_host())
+        .join(st_drivers::run::detect_host())
         .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16])
         .join("provider-sessions");
     match crate::external_sessions::find_managed_omp_transcript(
@@ -9917,7 +9917,7 @@ mission "example/zero-run" state="ready" {
             .join("drivers")
             .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
             .join("catalog/agents")
-            .join(st2::run::detect_host())
+            .join(st_drivers::run::detect_host())
             .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16]);
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
@@ -10115,7 +10115,7 @@ mission "example/zero-run" state="ready" {
             .join("drivers")
             .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
             .join("catalog/agents")
-            .join(st2::run::detect_host())
+            .join(st_drivers::run::detect_host())
             .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16])
             .join("provider-sessions");
         std::fs::create_dir_all(&directory).unwrap();
