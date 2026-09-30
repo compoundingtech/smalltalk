@@ -2094,31 +2094,7 @@ fn client_session_resources(
         }));
     }
     for unresolved in external.unresolved_processes {
-        sessions.push(json!({
-            "id": unresolved.id,
-            "kind": "session",
-            "revision": unresolved.revision,
-            "updated_at": crate::external_sessions::timestamp(snapshot_time_ms(at)),
-            "owner_id": format!("external-process/{}/{}", unresolved.driver.as_str(), unresolved.process.pid),
-            "state": "running",
-            "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
-            "ended_at": null,
-            "timeline_cursor": format!("timeline-cursor/process-{}/latest", unresolved.process.pid),
-            "usage": null,
-            "managed": false,
-            "driver": unresolved.driver.as_str(),
-            "native_session_id": null,
-            "workspace": unresolved.process.cwd.map(|path| path.display().to_string()),
-            "title": null,
-            "importable": false,
-            "import_reason": "a running harness in this workspace does not expose its exact native session ID; select a saved session and explicitly confirm this PID before takeover",
-            "process": {
-                "pid": unresolved.process.pid,
-                "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
-                "fingerprint": unresolved.process.fingerprint,
-                "exact_session": false
-            }
-        }));
+        sessions.push(unresolved_session_resource(unresolved, at));
     }
     sessions.sort_by(|left, right| {
         right["updated_at"]
@@ -2127,6 +2103,37 @@ fn client_session_resources(
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
     Ok(sessions)
+}
+
+fn unresolved_session_resource(
+    unresolved: crate::external_sessions::UnresolvedProcess,
+    at: &str,
+) -> Value {
+    json!({
+        "id": unresolved.id,
+        "kind": "session",
+        "revision": unresolved.revision,
+        "updated_at": crate::external_sessions::timestamp(snapshot_time_ms(at)),
+        "owner_id": format!("external-process/{}/{}", unresolved.driver.as_str(), unresolved.process.pid),
+        "state": "running",
+        "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
+        "ended_at": null,
+        "timeline_cursor": format!("timeline-cursor/process-{}/latest", unresolved.process.pid),
+        "usage": null,
+        "managed": false,
+        "driver": unresolved.driver.as_str(),
+        "native_session_id": null,
+        "workspace": unresolved.process.cwd.map(|path| path.display().to_string()),
+        "title": null,
+        "importable": false,
+        "import_reason": "a running harness in this workspace does not expose its exact native session ID; select a saved session and explicitly confirm this PID before takeover",
+        "process": {
+            "pid": unresolved.process.pid,
+            "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
+            "fingerprint": unresolved.process.fingerprint,
+            "exact_session": false
+        }
+    })
 }
 
 fn managed_session_resources(

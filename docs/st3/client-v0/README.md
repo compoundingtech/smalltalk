@@ -247,6 +247,14 @@ entry and increments its revision; it cannot change the entry's ID, sequence, ro
 `finalize` makes the entry immutable. Tool results must refer to a preceding tool call. Timeline
 pages and updates are bounded by the negotiated byte and item limits.
 
+External process sessions remain listed even when st cannot identify a native transcript.
+Opening their timeline returns a non-retryable `unsupported-capability` error with
+`details.reason: native-session-unidentified` and `details.session_id`, explaining that the
+agent was not started by st and its saved session could not be identified. Clients show this
+as the no-conversation state, rather than treating the listed session as missing. The same
+verdict applies to the conversation stream. OMP `__omp_worker_*` internal modes are helpers,
+not external harness sessions, and are excluded from discovery.
+
 ## Launches, variants, decisions, and approvals
 
 `launch` is the only user-facing noun for authoring and reviewing a mission. Planning remains an
