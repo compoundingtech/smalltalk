@@ -34,6 +34,12 @@ local exceptions. Its regression intentionally fails on the audited baseline: th
 digest covers only selected columns of six tables. A matching legacy graph digest is therefore
 not yet proof that these invariants hold for every shared outcome.
 
+Shared reducers use `store/canonical.rs`. `canonical_sql` expands `CANONICAL_ASC(ALIAS)` and
+`CANONICAL_DESC(ALIAS)` in a query; `CANONICAL_ORDER` and its descending counterpart format the
+same order for existing claim queries. In-memory comparisons use `claim_key` or
+`key_from_record`, and claim-to-claim predicates use `after_sql`. Legacy batch position is its
+relative position within the batch. A global arrival index never chooses a shared winner.
+
 ## Add any machine
 
 Install st on the new machine and configure the person who operates it, as described in the

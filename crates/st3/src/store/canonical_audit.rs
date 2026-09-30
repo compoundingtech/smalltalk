@@ -134,7 +134,7 @@ fn shared_folds_never_order_by_local_arrival() {
                     None
                 }
             })
-            .last()
+            .next_back()
             .unwrap();
         if !allowed.contains(&scope) {
             violations.push(format!(
@@ -248,6 +248,24 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
     if usage(expected) != usage(actual) {
         mismatches.push(format!("{phase}: usage summary"));
     }
+    let targets = vec!["observer/audit".into(), "loop-run/audit/repeat".into()];
+    let target_states = |store: &Store| {
+        serde_json::to_value(store.attention_target_states(&targets).unwrap()).unwrap()
+    };
+    if target_states(expected) != target_states(actual) {
+        mismatches.push(format!("{phase}: attention source states"));
+    }
+    if expected.reconcile_fault("daemon/alder", "audit").unwrap()
+        != actual.reconcile_fault("daemon/alder", "audit").unwrap()
+    {
+        mismatches.push(format!("{phase}: fault/recovery episode"));
+    }
+    if expected.usage_period_rows(0, 3000).unwrap() != actual.usage_period_rows(0, 3000).unwrap() {
+        mismatches.push(format!("{phase}: period usage"));
+    }
+    if expected.transport_links().unwrap() != actual.transport_links().unwrap() {
+        mismatches.push(format!("{phase}: replicated transport observations"));
+    }
 }
 
 fn write_audit_history(source: &Store) {
@@ -276,6 +294,12 @@ fn write_audit_history(source: &Store) {
     // Raw claim append is the daemon's internal writer path. Replicas still perform ordinary
     // schema admission, envelope verification and projection; no projection rows are seeded.
     let events = [
+        ("host/beacon", "transport.observed", json!({"status": "up"})),
+        (
+            "host/beacon",
+            "transport.observed",
+            json!({"status": "unknown"}),
+        ),
         (
             "planning-session/audit",
             "planning-session.started",
@@ -322,6 +346,36 @@ fn write_audit_history(source: &Store) {
             "message/audit",
             "message.closed",
             json!({"status": "closed"}),
+        ),
+        (
+            "observer/audit",
+            "observer.state",
+            json!({"state": "unreachable"}),
+        ),
+        (
+            "observer/audit",
+            "observer.state",
+            json!({"state": "healthy"}),
+        ),
+        (
+            "loop-run/audit/repeat",
+            "loop.state",
+            json!({"status": "failed", "round": 1}),
+        ),
+        (
+            "loop-run/audit/repeat",
+            "loop.state",
+            json!({"status": "running", "round": 2}),
+        ),
+        (
+            "daemon/alder",
+            "reconcile.fault",
+            json!({"scope": "audit", "status": "faulted", "reason": "Retry the probe."}),
+        ),
+        (
+            "daemon/alder",
+            "reconcile.fault",
+            json!({"scope": "audit", "status": "recovered"}),
         ),
         (
             "agent/alder.worker",
@@ -470,5 +524,65 @@ fn every_shared_projection_agrees_after_shuffle_restart_and_checkpoint() {
         mismatches.is_empty(),
         "shared projection divergence:\n{}",
         mismatches.join("\n")
+    );
+}
+
+#[test]
+fn equal_time_writers_choose_the_same_shared_source() {
+    let at = now_ms();
+    let writers = [
+        Store::open_memory("alder").unwrap(),
+        Store::open_memory("cedar").unwrap(),
+    ];
+    let mut envelopes = Vec::new();
+    for (writer, state) in writers.iter().zip(["unreachable", "healthy"]) {
+        writer.set_write_clock_at(at).unwrap();
+        writer
+            .append_claim(&ClaimInput {
+                subject: "observer/audit".into(),
+                kind: "observer.state".into(),
+                actor: None,
+                fields: BTreeMap::from([("state".into(), json!(state))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("audit-{state}")),
+            })
+            .unwrap();
+        envelopes.extend(exchange_from(writer, &ReplicationInventory::default()).envelopes);
+    }
+    let ordered = Store::open_memory("birch").unwrap();
+    let reversed = Store::open_memory("elm").unwrap();
+    for target in [&ordered, &reversed] {
+        let order = if target.origin == "birch" {
+            envelopes.clone()
+        } else {
+            envelopes.iter().rev().cloned().collect()
+        };
+        for envelope in order {
+            receive_and_project(target, "relay", &exchange_of("relay", vec![envelope]));
+        }
+        let claims = target.claims_for("observer/audit", None).unwrap();
+        assert_eq!(
+            claims
+                .iter()
+                .map(|claim| canonical::claim_key(&target.readers.get(), &claim.id).unwrap())
+                .collect::<Vec<_>>(),
+            {
+                let mut keys = claims
+                    .iter()
+                    .map(|claim| canonical::claim_key(&target.readers.get(), &claim.id).unwrap())
+                    .collect::<Vec<_>>();
+                keys.sort();
+                keys
+            }
+        );
+        let states = target
+            .attention_target_states(&["observer/audit".into()])
+            .unwrap();
+        assert_eq!(states[0].state, "healthy");
+    }
+    assert_eq!(
+        serde_json::to_value(ordered.latest_actual_value("observer/audit").unwrap()).unwrap(),
+        serde_json::to_value(reversed.latest_actual_value("observer/audit").unwrap()).unwrap()
     );
 }

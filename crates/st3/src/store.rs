@@ -41,7 +41,9 @@ use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
 use crate::model::{SeatQueueMoveRequest, SeatQueueMoveView, SeatQueueRunView, SeatQueueView};
 use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
+mod canonical;
 mod checkpoint;
+use canonical::{CANONICAL_ORDER, CANONICAL_ORDER_DESC, canonical_sql};
 mod checkpoint_agreement;
 mod checkpoint_trim;
 #[cfg(test)]
@@ -698,15 +700,7 @@ const STATUS_WORKERS: usize = 4;
 /// for every subject.
 const STATEMENT_CACHE_CAPACITY: usize = 128;
 
-/// Claims in canonical order: accepted time, then writer, batch sequence and position in the
-/// batch. Every node that holds the same claims orders them the same way, as the full replay does.
-/// `store_index` is arrival order, which differs from node to node, so a fold over one subject's
-/// history uses this order. Queries that use it join `batches` on `claims.batch_id`.
-const CANONICAL_ORDER: &str = "length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
-     batches.origin, batches.replica_sequence, claims.batch_id, claims.store_index";
-const CANONICAL_ORDER_DESC: &str = "length(claims.accepted_at_unix_ms) DESC,
-     claims.accepted_at_unix_ms DESC, batches.origin DESC, batches.replica_sequence DESC,
-     claims.batch_id DESC, claims.store_index DESC";
+/// Columns shared claim readers deserialize; canonical ordering lives in `store/canonical.rs`.
 const CLAIM_COLUMNS: &str = "claims.id, claims.store_index, claims.batch_id, claims.subject,
      claims.kind, claims.origin, claims.actor, claims.body, claims.predecessors,
      claims.accepted_at_unix_ms";
@@ -770,6 +764,7 @@ fn prefix_upper_bound(prefix: &str) -> Option<String> {
 /// The batches of the claims accepted at `?2` at or before store index `?1`. The `length` term is
 /// the first column of `claims_accepted_order_index`, so SQLite seeks the index instead of
 /// reading every claim.
+#[cfg(test)]
 const LAST_ACCEPTED_BATCHES: &str = "SELECT batch_id FROM claims
      WHERE length(accepted_at_unix_ms)=length(?2) AND accepted_at_unix_ms=?2 AND store_index<=?1";
 
@@ -2573,14 +2568,14 @@ fn authoring_pull_request_runs_tx(
         return Ok(Vec::new());
     }
     let head = facts.get("head_sha").and_then(Value::as_str);
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&canonical_sql(
         "SELECT subject, body FROM claims WHERE kind='resource.observed'
          AND subject LIKE 'resource/mission-run/%/pull-request'
          AND (json_extract(body, '$.fields.facts.url')=?1
            OR (json_extract(body, '$.fields.facts.repository')=?2
                AND json_extract(body, '$.fields.facts.number')=?3))
-         ORDER BY store_index",
-    )?;
+         ORDER BY CANONICAL_ASC(claims)",
+    ))?;
     let candidates = statement
         .query_map(params![url, repository, number], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -5744,11 +5739,11 @@ impl Store {
         origin: &str,
     ) -> Result<BTreeMap<(String, String), String>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare(&canonical_sql(
             "SELECT subject, body FROM claims
              WHERE kind='reconcile.fault' AND origin=?1
-             ORDER BY store_index",
-        )?;
+             ORDER BY CANONICAL_ASC(claims)",
+        ))?;
         let rows = statement
             .query_map([origin], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -5785,11 +5780,13 @@ impl Store {
         let connection = self.readers.get();
         let claim = connection
             .query_row(
-                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                &canonical_sql(
+                    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
                         predecessors, accepted_at_unix_ms
                  FROM claims WHERE subject=?1 AND kind='reconcile.fault'
                    AND origin=?2 AND json_extract(body, '$.fields.scope')=?3
-                 ORDER BY store_index DESC LIMIT 1",
+                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                ),
                 params![subject, self.origin, scope],
                 claim_from_row,
             )
@@ -5804,9 +5801,11 @@ impl Store {
         let connection = self.readers.get();
         let body: Option<String> = connection
             .query_row(
-                "SELECT body FROM claims WHERE subject=?1 AND kind='reconcile.fault'
+                &canonical_sql(
+                    "SELECT body FROM claims WHERE subject=?1 AND kind='reconcile.fault'
                    AND json_extract(body, '$.fields.scope')=?2
-                 ORDER BY store_index DESC LIMIT 1",
+                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                ),
                 params![subject, scope],
                 |row| row.get(0),
             )
@@ -5930,7 +5929,7 @@ impl Store {
         let connection = self.readers.get();
         connection
             .query_row(
-                "SELECT origin FROM claims WHERE subject=?1 AND kind='mission-run.created' ORDER BY store_index LIMIT 1",
+                &canonical_sql("SELECT origin FROM claims WHERE subject=?1 AND kind='mission-run.created' ORDER BY CANONICAL_ASC(claims) LIMIT 1"),
                 [subject],
                 |row| row.get(0),
             )
@@ -7499,7 +7498,7 @@ impl Store {
             }
             let latest: Option<String> = connection
                 .query_row(
-                    "SELECT hash FROM documents WHERE name = ?1 AND created_index<=?2 ORDER BY created_index DESC LIMIT 1",
+                    &canonical_sql("SELECT documents.hash FROM documents JOIN claims ON claims.id=documents.binding_claim_id WHERE documents.name = ?1 AND documents.created_index<=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
                     params![name, store_index],
                     |row| row.get(0),
                 )
@@ -8764,7 +8763,7 @@ impl Store {
                 }
                 let current: Option<String> = transaction
                     .query_row(
-                        "SELECT binding_claim_id FROM documents WHERE name=?1 ORDER BY created_index DESC LIMIT 1",
+                        &canonical_sql("SELECT documents.binding_claim_id FROM documents JOIN claims ON claims.id=documents.binding_claim_id WHERE documents.name=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
                         [name],
                         |row| row.get(0),
                     )
@@ -9358,9 +9357,11 @@ impl Store {
         let transaction = connection.transaction().map_err(internal)?;
         if let Some(receipt) = transaction
             .query_row(
-                "SELECT id, body FROM claims
+                &canonical_sql(
+                    "SELECT id, body FROM claims
                  WHERE subject=?1 AND kind='repair.applied'
-                 ORDER BY store_index DESC LIMIT 1",
+                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                ),
                 [&repair_subject],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
             )
@@ -10442,7 +10443,7 @@ impl Store {
         let mut records = BTreeMap::new();
         {
             let mut statement = connection.prepare(
-                "SELECT body FROM claims WHERE kind='intent.desired' ORDER BY store_index",
+                &canonical_sql("SELECT body FROM claims WHERE kind='intent.desired' ORDER BY CANONICAL_ASC(claims)"),
             )?;
             let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
             for row in rows {
@@ -10480,7 +10481,7 @@ impl Store {
         }
         {
             let mut statement = connection.prepare(
-                "SELECT subject, body FROM claims WHERE kind='gate.requested' ORDER BY store_index",
+                &canonical_sql("SELECT subject, body FROM claims WHERE kind='gate.requested' ORDER BY CANONICAL_ASC(claims)"),
             )?;
             let rows = statement.query_map([], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -10875,7 +10876,8 @@ impl Store {
         let connection = self.readers.get();
         connection
             .query_row(
-                "SELECT json_extract(request.body, '$.fields.attempt')
+                &canonical_sql(
+                    "SELECT json_extract(request.body, '$.fields.attempt')
                  FROM claims request
                  WHERE request.subject=?1
                    AND request.kind='observer.refresh-requested'
@@ -10886,8 +10888,9 @@ impl Store {
                        AND json_extract(result.body, '$.fields.attempt')=
                            json_extract(request.body, '$.fields.attempt')
                    )
-                 ORDER BY request.store_index
+                 ORDER BY CANONICAL_ASC(request)
                  LIMIT 1",
+                ),
                 [observer],
                 |row| row.get(0),
             )
@@ -10899,10 +10902,10 @@ impl Store {
         let connection = self.readers.get();
         connection
             .query_row(
-                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+                &canonical_sql("SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
                  FROM claims WHERE kind='gate.requested'
                  AND json_extract(body, '$.fields.owner')=?1
-                 ORDER BY store_index DESC LIMIT 1",
+                 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
                 [owner],
                 claim_from_row,
             )
@@ -11207,7 +11210,7 @@ impl Store {
         origin: &str,
     ) -> Result<Vec<AttentionRequestView>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare(&canonical_sql(
             "SELECT request.subject FROM claims request
              WHERE request.kind='attention.requested'
                AND request.origin=?1
@@ -11218,8 +11221,8 @@ impl Store {
                  WHERE resolution.subject=request.subject
                    AND resolution.kind='attention.resolved'
                )
-             ORDER BY request.store_index",
-        )?;
+             ORDER BY CANONICAL_ASC(request)",
+        ))?;
         let subjects = statement
             .query_map([origin], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -11311,12 +11314,12 @@ impl Store {
         include_resolved: bool,
     ) -> Result<Vec<AttentionRequestView>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare(&canonical_sql(
             "SELECT DISTINCT subject FROM claims
              WHERE kind='attention.requested'
                AND (?1 IS NULL OR json_extract(body, '$.fields.reviewer')=?1)
-             ORDER BY store_index",
-        )?;
+             ORDER BY CANONICAL_ASC(claims)",
+        ))?;
         let subjects = statement
             .query_map([person], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -11337,7 +11340,7 @@ impl Store {
         origin: &str,
     ) -> Result<Vec<AttentionRequestView>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare(&canonical_sql(
             "SELECT request.subject FROM claims request
              WHERE request.kind='attention.requested'
                AND request.actor=?1
@@ -11347,8 +11350,8 @@ impl Store {
                  WHERE resolution.subject=request.subject
                    AND resolution.kind='attention.resolved'
                )
-             ORDER BY request.store_index",
-        )?;
+             ORDER BY CANONICAL_ASC(request)",
+        ))?;
         let subjects = statement
             .query_map([actor, origin], |row| row.get::<_, String>(0))?
             .collect::<Result<Vec<_>, _>>()?;
@@ -11497,10 +11500,12 @@ impl Store {
                 // The message's first claim in canonical order, so every node that holds it
                 // shows the same wait.
                 let requested_at_unix_ms = connection.query_row(
-                    "SELECT accepted_at_unix_ms FROM claims
+                    &canonical_sql(
+                        "SELECT accepted_at_unix_ms FROM claims
                      WHERE subject=?1
-                     ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms, store_index
+                     ORDER BY CANONICAL_ASC(claims)
                      LIMIT 1",
+                    ),
                     [&message.subject],
                     |row| row.get::<_, String>(0),
                 )?;
@@ -11528,9 +11533,9 @@ impl Store {
         {
             let connection = self.readers.get();
             let mut statement = connection.prepare(
-                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                &canonical_sql("SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
                         predecessors, accepted_at_unix_ms
-                 FROM claims WHERE kind='subscription.mission-failed' ORDER BY store_index",
+                 FROM claims WHERE kind='subscription.mission-failed' ORDER BY CANONICAL_ASC(claims)"),
             )?;
             let failures = statement
                 .query_map([], claim_from_row)?
@@ -11692,9 +11697,11 @@ impl Store {
         let connection = self.readers.get();
         let runtime_origin = connection
             .query_row(
-                "SELECT origin FROM claims
+                &canonical_sql(
+                    "SELECT origin FROM claims
                  WHERE subject=?1 AND kind='runtime.observed'
-                 ORDER BY store_index DESC LIMIT 1",
+                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                ),
                 [subject],
                 |row| row.get(0),
             )
@@ -11704,12 +11711,14 @@ impl Store {
         }
         connection
             .query_row(
-                "SELECT origin FROM claims
+                &canonical_sql(
+                    "SELECT origin FROM claims
                  WHERE subject=?1 AND kind!='intent.desired'
                    AND kind NOT LIKE 'harness.%'
                    AND kind!='runtime.readiness-deadline-reached'
                    AND kind!='reconcile.fault'
-                 ORDER BY store_index DESC LIMIT 1",
+                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                ),
                 [subject],
                 |row| row.get(0),
             )
@@ -12377,7 +12386,7 @@ impl Store {
 
     pub fn pending_subscription_mission_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare(&canonical_sql(
             "SELECT request.id, request.store_index, request.batch_id, request.subject,
                     request.kind, request.origin, request.actor, request.body,
                     request.predecessors, request.accepted_at_unix_ms
@@ -12393,8 +12402,8 @@ impl Store {
                    )
                    AND json_extract(finished.body, '$.fields.request')=request.id
                )
-             ORDER BY request.store_index",
-        )?;
+             ORDER BY CANONICAL_ASC(request)",
+        ))?;
         statement
             .query_map([subject], claim_from_row)?
             .collect::<Result<Vec<_>, _>>()
@@ -12516,11 +12525,13 @@ impl Store {
             return Ok(None);
         }
         let deadline: Option<u64> = connection.query_row(
-            "SELECT CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER)
+            &canonical_sql(
+                "SELECT CAST(json_extract(body, '$.fields.not_before_unix_ms') AS INTEGER)
              FROM claims
              WHERE subject=?1 AND kind='subscription.mission-deferred'
                AND json_extract(body, '$.fields.request')=?2
-             ORDER BY store_index DESC LIMIT 1",
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+            ),
             params![subject, request],
             |row| row.get(0),
         )?;
@@ -12553,7 +12564,7 @@ impl Store {
 
     pub fn pending_schedule_work_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare(&canonical_sql(
             "SELECT request.id, request.store_index, request.batch_id, request.subject,
                     request.kind, request.origin, request.actor, request.body,
                     request.predecessors, request.accepted_at_unix_ms
@@ -12565,8 +12576,8 @@ impl Store {
                    AND closed.kind IN ('schedule.work-started','schedule.work-failed')
                    AND json_extract(closed.body, '$.fields.request')=request.id
                )
-             ORDER BY request.store_index",
-        )?;
+             ORDER BY CANONICAL_ASC(request)",
+        ))?;
         statement
             .query_map([subject], claim_from_row)?
             .collect::<Result<Vec<_>, _>>()
@@ -12581,11 +12592,13 @@ impl Store {
         let connection = self.readers.get();
         connection
             .query_row(
-                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+                &canonical_sql(
+                    "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
                         predecessors, accepted_at_unix_ms
                  FROM claims WHERE subject=?1 AND kind='schedule.work-started'
                    AND json_extract(body, '$.fields.request')=?2
-                 ORDER BY store_index DESC LIMIT 1",
+                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                ),
                 params![subject, request],
                 claim_from_row,
             )
@@ -12621,11 +12634,11 @@ impl Store {
     ) -> Result<Option<UsageSummary>> {
         let connection = self.readers.get();
         let at_index = at_index.unwrap_or(i64::MAX as u64);
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare(&canonical_sql(
             "SELECT store_index, body, accepted_at_unix_ms FROM claims
              WHERE subject=?1 AND kind='harness.usage' AND store_index<=?2
-             ORDER BY store_index",
-        )?;
+             ORDER BY CANONICAL_ASC(claims)",
+        ))?;
         let rows = statement.query_map(params![subject, at_index], |row| {
             Ok((
                 row.get::<_, u64>(0)?,
@@ -12655,12 +12668,12 @@ impl Store {
                 continue;
             }
             let placeholders = vec!["?"; chunk.len()].join(",");
-            let sql = format!(
+            let sql = canonical_sql(&format!(
                 "SELECT subject, store_index, body, accepted_at_unix_ms FROM claims
                  WHERE kind='harness.usage' AND store_index<={} AND subject IN ({placeholders})
-                 ORDER BY subject, store_index",
+                 ORDER BY subject, CANONICAL_ASC(claims)",
                 at_index.unwrap_or(i64::MAX as u64)
-            );
+            ));
             let mut statement = connection.prepare(&sql)?;
             for row in statement.query_map(rusqlite::params_from_iter(chunk), |row| {
                 Ok((
@@ -12907,7 +12920,6 @@ impl Store {
         #[derive(Clone, Copy, Default)]
         struct Bucket {
             at: u64,
-            index: u64,
             total: u64,
             input: u64,
             output: u64,
@@ -12915,11 +12927,11 @@ impl Store {
             reads: u64,
         }
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare(&canonical_sql(
             "SELECT subject, store_index, body FROM claims WHERE kind='harness.usage'
              AND json_extract(body, '$.fields.semantics')='response_rollup'
-             ORDER BY store_index",
-        )?;
+             ORDER BY CANONICAL_ASC(claims)",
+        ))?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -12932,7 +12944,7 @@ impl Store {
             (Option<Bucket>, Option<Bucket>),
         >::new();
         for row in rows {
-            let (subject, index, body) = row?;
+            let (subject, _index, body) = row?;
             let body: Value = serde_json::from_str(&body)?;
             let fields = &body["fields"];
             let at = fields["observed_at_unix_ms"].as_u64().unwrap_or(0);
@@ -12942,7 +12954,6 @@ impl Store {
             let value = |name| fields[name].as_u64().unwrap_or(0);
             let bucket = Bucket {
                 at,
-                index,
                 total: value("total_tokens"),
                 input: value("input_tokens"),
                 output: value("output_tokens"),
@@ -12960,7 +12971,7 @@ impl Store {
             );
             let (baseline, latest) = groups.entry(key).or_default();
             let target = if at <= since_ms { baseline } else { latest };
-            if target.is_none_or(|previous| (at, index) > (previous.at, previous.index)) {
+            if target.is_none_or(|previous| at >= previous.at) {
                 *target = Some(bucket);
             }
         }
@@ -13429,11 +13440,11 @@ impl Store {
             return Ok(false);
         };
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare(&canonical_sql(
             "SELECT body FROM claims
              WHERE subject=?1 AND kind='runtime.observed'
-             ORDER BY store_index DESC",
-        )?;
+             ORDER BY CANONICAL_DESC(claims)",
+        ))?;
         let bodies = statement.query_map([actor], |row| row.get::<_, String>(0))?;
         for body in bodies {
             let body: Value = serde_json::from_str(&body?)?;
@@ -13457,7 +13468,7 @@ impl Store {
         let connection = self.readers.get();
         connection
             .query_row(
-                "SELECT hash FROM documents WHERE name=?1 ORDER BY created_index DESC LIMIT 1",
+                &canonical_sql("SELECT documents.hash FROM documents JOIN claims ON claims.id=documents.binding_claim_id WHERE documents.name=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
                 [name],
                 |row| row.get(0),
             )
@@ -13487,7 +13498,7 @@ impl Store {
         {
             if let Some(hash) = connection
                 .query_row(
-                    "SELECT hash FROM documents WHERE name=?1 AND created_index<=?2 ORDER BY created_index DESC LIMIT 1",
+                    &canonical_sql("SELECT documents.hash FROM documents JOIN claims ON claims.id=documents.binding_claim_id WHERE documents.name=?1 AND documents.created_index<=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
                     params![reference, selected],
                     |row| row.get(0),
                 )
@@ -13503,7 +13514,7 @@ impl Store {
         let connection = self.readers.get();
         connection
             .query_row(
-                "SELECT binding_claim_id FROM documents WHERE name=?1 ORDER BY created_index DESC LIMIT 1",
+                &canonical_sql("SELECT documents.binding_claim_id FROM documents JOIN claims ON claims.id=documents.binding_claim_id WHERE documents.name=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
                 [name],
                 |row| row.get(0),
             )
@@ -14858,10 +14869,13 @@ impl Store {
     /// names: each observer's latest observation of each peer, from every replicated node.
     pub fn transport_links(&self) -> Result<Vec<(String, String)>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare_cached(
-            "SELECT origin, subject, json_extract(body, '$.fields.status'), MAX(store_index)
-             FROM claims WHERE kind='transport.observed' GROUP BY origin, subject",
-        )?;
+        let mut statement = connection.prepare_cached(&canonical_sql(
+            "SELECT origin, subject, json_extract(body, '$.fields.status') FROM (
+                SELECT origin, subject, body,
+                    ROW_NUMBER() OVER (PARTITION BY origin, subject ORDER BY CANONICAL_DESC(claims)) AS canonical_rank
+                FROM claims WHERE kind='transport.observed'
+             ) WHERE canonical_rank=1 ORDER BY origin, subject",
+        ))?;
         let rows = statement.query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -16927,7 +16941,7 @@ fn resolve_mission_run_inputs(
                 } else {
                     transaction
                         .query_row(
-                            "SELECT id FROM claims WHERE subject=?1 AND kind='resource.observed' ORDER BY store_index DESC LIMIT 1",
+                            &canonical_sql("SELECT id FROM claims WHERE subject=?1 AND kind='resource.observed' ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
                             [subject],
                             |row| row.get(0),
                         )
@@ -17055,7 +17069,7 @@ fn desired_row_at(
     let Some(at_index) = at_index else {
         return current_desired_row(connection, subject);
     };
-    let mut statement = connection.prepare_cached(
+    let mut statement = connection.prepare_cached(&canonical_sql(
         "SELECT id, body, predecessors FROM claims
          WHERE subject=?1 AND kind='intent.desired' AND store_index<=?2
            AND NOT EXISTS (
@@ -17063,8 +17077,8 @@ fn desired_row_at(
                WHERE replica_records.claim_id=claims.id
                  AND replica_records.state='repaired'
            )
-         ORDER BY store_index",
-    )?;
+         ORDER BY CANONICAL_ASC(claims)",
+    ))?;
     let rows = statement
         .query_map(params![subject, at_index], |row| {
             Ok((
@@ -17593,7 +17607,7 @@ fn latest_resource_kind(
     let bodies = {
         let mut statement = transaction
             .prepare(
-                "SELECT body FROM claims WHERE subject=?1 AND kind='resource.observed' ORDER BY store_index DESC",
+                &canonical_sql("SELECT body FROM claims WHERE subject=?1 AND kind='resource.observed' ORDER BY CANONICAL_DESC(claims)"),
             )
             .map_err(internal)?;
         statement
@@ -18498,9 +18512,9 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute("DELETE FROM planning_candidates", [])?;
     transaction.execute("DELETE FROM planning_sessions", [])?;
     let mut statement = transaction.prepare(
-        "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
+        &canonical_sql("SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
          FROM claims WHERE kind >= 'planning-session.' AND kind < 'planning-session/'
-         ORDER BY store_index",
+         ORDER BY CANONICAL_ASC(claims)"),
     )?;
     let claims = statement
         .query_map([], claim_from_row)?
@@ -18782,7 +18796,7 @@ fn validate_message_transition(
 
     let current: Option<String> = transaction
         .query_row(
-            "SELECT kind FROM claims WHERE subject=?1 AND kind IN ('message.sent','message.staged','message.delivered','message.read','message.closed') ORDER BY store_index DESC LIMIT 1",
+            &canonical_sql("SELECT kind FROM claims WHERE subject=?1 AND kind IN ('message.sent','message.staged','message.delivered','message.read','message.closed') ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
             [&input.subject],
             |row| row.get(0),
         )
@@ -19014,7 +19028,9 @@ fn previous_batch_hash(transaction: &Transaction<'_>, origin: &str) -> Result<Op
 fn latest_claim_id_tx(transaction: &Transaction<'_>, subject: &str) -> Result<Option<String>> {
     transaction
         .query_row(
-            "SELECT id FROM claims WHERE subject=?1 ORDER BY store_index DESC LIMIT 1",
+            &canonical_sql(
+                "SELECT id FROM claims WHERE subject=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+            ),
             [subject],
             |row| row.get(0),
         )
@@ -19337,15 +19353,16 @@ fn current_harness_at(
     let runtime = connection
         .prepare_cached(&format!(
             "{} LIMIT 1",
-            newest_claims_of_kind_query("claims.store_index, claims.body", "runtime.observed")
+            newest_claims_of_kind_query("claims.id, claims.body", "runtime.observed")
         ))?
         .query_row(params![subject, at_index], |row| {
-            Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
         })
         .optional()?;
-    let Some((runtime_index, runtime_body)) = runtime else {
+    let Some((runtime_claim, runtime_body)) = runtime else {
         return Ok(None);
     };
+    let runtime_key = canonical::claim_key(connection, &runtime_claim)?;
     let runtime_body: Value = serde_json::from_str(&runtime_body)?;
     let runtime_fields = runtime_body.get("fields").unwrap_or(&runtime_body);
     if runtime_fields.get("status").and_then(Value::as_str) != Some("running") {
@@ -19422,14 +19439,15 @@ fn current_harness_at(
     let mut current = None;
     let mut optional = BTreeMap::<&'static str, Option<String>>::new();
     for row in rows {
-        let (claim, store_index, body, observed_at_unix_ms) = row?;
+        let (claim, _store_index, body, observed_at_unix_ms) = row?;
+        let key = canonical::claim_key(connection, &claim)?;
         let observed_at_unix_ms = observed_at_unix_ms.parse::<u128>()?;
         let body: Value = serde_json::from_str(&body)?;
         let fields = body.get("fields").unwrap_or(&body);
         let observed_incarnation = fields.get("incarnation_id").and_then(Value::as_str);
         let belongs_to_epoch = match observed_incarnation {
             Some(value) => value == incarnation_id,
-            None => store_index > runtime_index,
+            None => key > runtime_key,
         };
         if !belongs_to_epoch {
             continue;
@@ -19437,7 +19455,7 @@ fn current_harness_at(
         if current.is_none()
             && let Some(state) = fields.get("state").and_then(Value::as_str)
         {
-            current = Some((state.to_owned(), claim, observed_at_unix_ms, store_index));
+            current = Some((state.to_owned(), claim, observed_at_unix_ms, key));
         }
         for name in [
             "driver",
@@ -19463,12 +19481,14 @@ fn current_harness_at(
     }
     let work_activity = connection
         .query_row(
-            "SELECT id, store_index, accepted_at_unix_ms FROM claims
-             WHERE actor=?1 AND store_index>?2 AND store_index<=?3
+            &canonical_sql(
+                "SELECT id, store_index, accepted_at_unix_ms FROM claims
+             WHERE actor=?1 AND store_index<=?2
                AND kind IN ('work.claimed','work.progress')
-               AND json_extract(body, '$.fields.claim_incarnation')=?4
-             ORDER BY store_index DESC LIMIT 1",
-            params![subject, runtime_index, at_index, incarnation_id],
+               AND json_extract(body, '$.fields.claim_incarnation')=?3
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+            ),
+            params![subject, at_index, incarnation_id],
             |row| {
                 Ok((
                     row.get::<_, String>(0)?,
@@ -19477,11 +19497,17 @@ fn current_harness_at(
                 ))
             },
         )
-        .optional()?;
-    if let Some((claim, store_index, observed_at_unix_ms)) = work_activity
+        .optional()?
+        .map(|(claim, store_index, observed_at_unix_ms)| {
+            let key = canonical::claim_key(connection, &claim)?;
+            Ok::<_, anyhow::Error>((claim, store_index, observed_at_unix_ms, key))
+        })
+        .transpose()?;
+    if let Some((claim, _store_index, observed_at_unix_ms, key)) = work_activity
+        && key > runtime_key
         && current
             .as_ref()
-            .is_none_or(|(_, _, _, harness_index)| store_index > *harness_index)
+            .is_none_or(|(_, _, _, harness_key)| key > *harness_key)
     {
         return Ok(Some(crate::model::CurrentHarnessView {
             state: "working".into(),
@@ -19521,9 +19547,9 @@ fn claim_ids_at(
     at_index: Option<u64>,
 ) -> Result<Vec<String>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
-    let mut statement = connection.prepare_cached(
-        "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2 ORDER BY store_index",
-    )?;
+    let mut statement = connection.prepare_cached(&canonical_sql(
+        "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2 ORDER BY CANONICAL_ASC(claims)",
+    ))?;
     let rows = statement.query_map(params![subject, at_index], |row| row.get(0))?;
     rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
@@ -19535,7 +19561,7 @@ fn desired_conflicts_at(
     at_index: Option<u64>,
 ) -> Result<Vec<String>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
-    let mut statement = connection.prepare_cached(
+    let mut statement = connection.prepare_cached(&canonical_sql(
         "SELECT id, predecessors FROM claims
          WHERE subject=?1 AND kind='intent.desired' AND store_index<=?2
            AND NOT EXISTS (
@@ -19543,8 +19569,8 @@ fn desired_conflicts_at(
                WHERE replica_records.claim_id=claims.id
                  AND replica_records.state='repaired'
            )
-         ORDER BY store_index",
-    )?;
+         ORDER BY CANONICAL_ASC(claims)",
+    ))?;
     let rows = statement
         .query_map(params![subject, at_index], |row| {
             Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
@@ -19806,7 +19832,7 @@ fn pending_human_reviews_tx(
     reviewer: Option<&str>,
 ) -> Result<Vec<HumanReviewView>> {
     let requests = {
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare(&canonical_sql(
             "SELECT request.id, request.store_index, request.batch_id, request.subject,
                     request.kind, request.origin, request.actor, request.body,
                     request.predecessors, request.accepted_at_unix_ms
@@ -19822,8 +19848,8 @@ fn pending_human_reviews_tx(
                    AND result.actor=json_extract(request.body, '$.fields.reviewer')
                    AND json_extract(result.body, '$.fields.verdict') IN ('pass','fail','feedback')
                )
-             ORDER BY request.store_index",
-        )?;
+             ORDER BY CANONICAL_ASC(request)",
+        ))?;
         statement
             .query_map([reviewer], claim_from_row)?
             .collect::<Result<Vec<_>, _>>()?
@@ -19860,10 +19886,12 @@ fn attention_request_view_tx(
 ) -> Result<Option<AttentionRequestView>> {
     let requested = connection
         .query_row(
-            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+            &canonical_sql(
+                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
                     predecessors, accepted_at_unix_ms
              FROM claims WHERE subject=?1 AND kind='attention.requested'
-             ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms, store_index LIMIT 1",
+             ORDER BY CANONICAL_ASC(claims) LIMIT 1",
+            ),
             [subject],
             claim_from_row,
         )
@@ -19873,11 +19901,13 @@ fn attention_request_view_tx(
     };
     let resolved = connection
         .query_row(
-            "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
+            &canonical_sql(
+                "SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
                     predecessors, accepted_at_unix_ms
              FROM claims WHERE subject=?1 AND kind='attention.resolved'
-             ORDER BY length(accepted_at_unix_ms) DESC, accepted_at_unix_ms DESC, store_index DESC
+             ORDER BY CANONICAL_DESC(claims)
              LIMIT 1",
+            ),
             [subject],
             claim_from_row,
         )
@@ -19956,7 +19986,7 @@ fn pending_attention_requests_tx(
     connection: &Connection,
     person: Option<&str>,
 ) -> Result<Vec<AttentionRequestView>> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&canonical_sql(
         "SELECT request.subject FROM claims request
          WHERE request.kind='attention.requested'
            AND (?1 IS NULL OR json_extract(request.body, '$.fields.reviewer')=?1)
@@ -19965,8 +19995,8 @@ fn pending_attention_requests_tx(
              WHERE resolution.subject=request.subject
                AND resolution.kind='attention.resolved'
            )
-         ORDER BY request.store_index",
-    )?;
+         ORDER BY CANONICAL_ASC(request)",
+    ))?;
     let subjects = statement
         .query_map([person], |row| row.get::<_, String>(0))?
         .collect::<Result<Vec<_>, _>>()?;
@@ -20212,13 +20242,13 @@ fn attention_request_is_current_tx(
         return Ok(true);
     }
     let since = connection.query_row(
-        "SELECT accepted_at_unix_ms, store_index FROM claims WHERE id=?1",
+        "SELECT accepted_at_unix_ms, id FROM claims WHERE id=?1",
         [&request.request],
-        claim_moment,
+        |row| claim_moment(connection, row),
     )?;
     let mut moved_on = false;
     for target in &request.targets {
-        match attention_target_moved_on_tx(connection, target, since)? {
+        match attention_target_moved_on_tx(connection, target, since.clone())? {
             Some(true) => moved_on = true,
             Some(false) => return Ok(true),
             None => {}
@@ -20227,13 +20257,13 @@ fn attention_request_is_current_tx(
     Ok(!moved_on)
 }
 
-/// When a claim was accepted, ordered by time and then by store order for claims accepted in
-/// the same millisecond.
-type ClaimMoment = (u128, u64);
+/// The same canonical total-order key used by shared SQL folds, including equal-time episodes.
+type ClaimMoment = canonical::ClaimKey;
 
-fn claim_moment(row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimMoment> {
-    let accepted_at = row.get::<_, String>(0)?;
-    Ok((accepted_at.parse().unwrap_or_default(), row.get(1)?))
+fn claim_moment(connection: &Connection, row: &rusqlite::Row<'_>) -> rusqlite::Result<ClaimMoment> {
+    canonical::claim_key(connection, &row.get::<_, String>(1)?).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(1, rusqlite::types::Type::Text, error.into())
+    })
 }
 
 /// Whether `target` reached an ending state after `since`: `None` when the target is context
@@ -20247,13 +20277,13 @@ fn attention_target_moved_on_tx(
     if let Some(mission) = target.strip_prefix("mission/") {
         let retired = connection
             .query_row(
-                "SELECT claims.accepted_at_unix_ms, claims.store_index
+                "SELECT claims.accepted_at_unix_ms, claims.id
                  FROM mission_definitions
                  JOIN claims ON claims.id=mission_definitions.claim_id
                  WHERE mission_definitions.mission_id=?1
                    AND mission_definitions.state='retired'",
                 [mission],
-                claim_moment,
+                |row| claim_moment(connection, row),
             )
             .optional()?;
         if retired.is_some() {
@@ -20289,11 +20319,13 @@ fn attention_target_moved_on_tx(
         if attention_request_view_tx(connection, target)?.is_some() {
             let resolved = connection
                 .query_row(
-                    "SELECT accepted_at_unix_ms, store_index FROM claims
+                    &canonical_sql(
+                        "SELECT accepted_at_unix_ms, id FROM claims
                      WHERE subject=?1 AND kind='attention.resolved'
-                     ORDER BY store_index DESC LIMIT 1",
+                     ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                    ),
                     [target],
-                    claim_moment,
+                    |row| claim_moment(connection, row),
                 )
                 .optional()?;
             return Ok(after(resolved));
@@ -20312,7 +20344,7 @@ fn attention_target_moved_on_tx(
             return Ok(Some(false));
         }
         let mut statement = connection.prepare(
-            "SELECT json_extract(body, '$.fields.owner'), accepted_at_unix_ms, store_index
+            "SELECT json_extract(body, '$.fields.owner'), accepted_at_unix_ms, id
              FROM claims
              WHERE kind='gate.requested'
                AND json_extract(body, '$.fields.reviewer') IS NOT NULL",
@@ -20320,13 +20352,18 @@ fn attention_target_moved_on_tx(
         let requested_before = statement
             .query_map([], |row| {
                 let owner = row.get::<_, Option<String>>(0)?;
-                let accepted_at = row.get::<_, String>(1)?;
+                let _accepted_at = row.get::<_, String>(1)?;
                 Ok((
                     owner,
-                    (
-                        accepted_at.parse().unwrap_or_default(),
-                        row.get::<_, u64>(2)?,
-                    ),
+                    canonical::claim_key(connection, &row.get::<_, String>(2)?).map_err(
+                        |error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Text,
+                                error.into(),
+                            )
+                        },
+                    )?,
                 ))
             })?
             .collect::<Result<Vec<(Option<String>, ClaimMoment)>, _>>()?
@@ -20339,11 +20376,11 @@ fn attention_target_moved_on_tx(
     if target.starts_with("agent/") {
         let stopped = connection
             .query_row(
-                "SELECT claims.accepted_at_unix_ms, claims.store_index
+                "SELECT claims.accepted_at_unix_ms, claims.id
                  FROM desired JOIN claims ON claims.id=desired.claim_id
                  WHERE desired.subject=?1 AND desired.kind='stop'",
                 [target],
-                claim_moment,
+                |row| claim_moment(connection, row),
             )
             .optional()?;
         if stopped.is_some() {
@@ -20359,12 +20396,14 @@ fn attention_target_moved_on_tx(
         }
         let started = connection
             .query_row(
-                "SELECT accepted_at_unix_ms, store_index FROM claims
+                &canonical_sql(
+                    "SELECT accepted_at_unix_ms, id FROM claims
                  WHERE subject=?1 AND kind='runtime.observed'
                    AND json_extract(body, '$.fields.incarnation_id')=?2
-                 ORDER BY store_index LIMIT 1",
+                 ORDER BY CANONICAL_ASC(claims) LIMIT 1",
+                ),
                 params![target, harness.incarnation_id],
-                claim_moment,
+                |row| claim_moment(connection, row),
             )
             .optional()?;
         return Ok(after(started));
@@ -20377,18 +20416,24 @@ fn attention_target_moved_on_tx(
         }
         let state = connection
             .query_row(
-                "SELECT json_extract(body, '$.fields.state'), accepted_at_unix_ms, store_index
+                &canonical_sql(
+                    "SELECT json_extract(body, '$.fields.state'), accepted_at_unix_ms, id
                  FROM claims WHERE subject=?1 AND kind='observer.state'
-                 ORDER BY store_index DESC LIMIT 1",
+                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                ),
                 [target],
                 |row| {
-                    let accepted_at = row.get::<_, String>(1)?;
                     Ok((
                         row.get::<_, Option<String>>(0)?,
-                        (
-                            accepted_at.parse().unwrap_or_default(),
-                            row.get::<_, u64>(2)?,
-                        ),
+                        canonical::claim_key(connection, &row.get::<_, String>(2)?).map_err(
+                            |error| {
+                                rusqlite::Error::FromSqlConversionFailure(
+                                    2,
+                                    rusqlite::types::Type::Text,
+                                    error.into(),
+                                )
+                            },
+                        )?,
                     ))
                 },
             )
@@ -20407,11 +20452,13 @@ fn attention_target_moved_on_tx(
     if target.starts_with("message/") {
         let closed = connection
             .query_row(
-                "SELECT accepted_at_unix_ms, store_index FROM claims
+                &canonical_sql(
+                    "SELECT accepted_at_unix_ms, id FROM claims
                  WHERE subject=?1 AND kind='message.closed'
-                 ORDER BY store_index DESC LIMIT 1",
+                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                ),
                 [target],
-                claim_moment,
+                |row| claim_moment(connection, row),
             )
             .optional()?;
         return Ok(after(closed));
@@ -20442,9 +20489,11 @@ fn pull_request_state_tx(connection: &Connection, target: &str) -> Result<Option
     }
     let observed = connection
         .query_row(
-            "SELECT json_extract(body, '$.fields'), accepted_at_unix_ms FROM claims
+            &canonical_sql(
+                "SELECT json_extract(body, '$.fields'), accepted_at_unix_ms FROM claims
              WHERE subject=?1 AND kind='resource.observed'
-             ORDER BY store_index DESC LIMIT 1",
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+            ),
             [subject],
             |row| Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?)),
         )
@@ -20497,9 +20546,9 @@ fn declaration_stopped_tx(connection: &Connection, subject: &str) -> Result<Opti
     }
     Ok(connection
         .query_row(
-            "SELECT accepted_at_unix_ms, store_index FROM claims WHERE id=?1",
+            "SELECT accepted_at_unix_ms, id FROM claims WHERE id=?1",
             [&row.claim_id],
-            claim_moment,
+            |row| claim_moment(connection, row),
         )
         .optional()?)
 }
@@ -20516,12 +20565,14 @@ fn loop_run_moved_on_tx(
     let after = |moment: Option<ClaimMoment>| Some(moment.is_some_and(|moment| moment > since));
     let running_again = connection
         .query_row(
-            "SELECT accepted_at_unix_ms, store_index FROM claims
+            &canonical_sql(
+                "SELECT accepted_at_unix_ms, id FROM claims
              WHERE subject=?1 AND kind='loop.state'
                AND json_extract(body, '$.fields.status')!='failed'
-             ORDER BY store_index DESC LIMIT 1",
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+            ),
             [target],
-            claim_moment,
+            |row| claim_moment(connection, row),
         )
         .optional()?;
     if after(running_again) == Some(true) {
@@ -20572,12 +20623,14 @@ fn mission_run_ended_tx(connection: &Connection, run: &str) -> Result<Option<Cla
     }
     connection
         .query_row(
-            "SELECT accepted_at_unix_ms, store_index FROM claims
+            &canonical_sql(
+                "SELECT accepted_at_unix_ms, id FROM claims
              WHERE subject=?1 AND kind='mission-run.state'
                AND json_extract(body, '$.fields.status') IN ('completed','failed','cancelled')
-             ORDER BY store_index LIMIT 1",
+             ORDER BY CANONICAL_ASC(claims) LIMIT 1",
+            ),
             [format!("mission-run/{run}")],
-            claim_moment,
+            |row| claim_moment(connection, row),
         )
         .optional()
         .map_err(Into::into)
@@ -20678,37 +20731,37 @@ fn attention_target_state_tx(connection: &Connection, target: &str) -> Result<Op
             return Ok(Some((harness.state, Some(harness.observed_at_unix_ms))));
         }
         return row(
-            "SELECT coalesce(json_extract(body, '$.fields.status'), 'unknown'), accepted_at_unix_ms
+            &canonical_sql("SELECT coalesce(json_extract(body, '$.fields.status'), 'unknown'), accepted_at_unix_ms
              FROM claims WHERE subject=?1 AND kind='runtime.observed'
-             ORDER BY store_index DESC LIMIT 1",
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
             target,
         );
     }
     if target.starts_with("observer/") || target.starts_with("subscription/") {
-        if let Some((stopped_at, _)) = declaration_stopped_tx(connection, target)? {
+        if let Some((stopped_at, ..)) = declaration_stopped_tx(connection, target)? {
             return Ok(Some(("stopped".into(), Some(stopped_at))));
         }
         return row(
-            "SELECT coalesce(json_extract(body, '$.fields.state'), 'unknown'), accepted_at_unix_ms
+            &canonical_sql("SELECT coalesce(json_extract(body, '$.fields.state'), 'unknown'), accepted_at_unix_ms
              FROM claims WHERE subject=?1 AND kind IN ('observer.state', 'subscription.state')
-             ORDER BY store_index DESC LIMIT 1",
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
             target,
         );
     }
     if target.starts_with("loop-run/") {
         return row(
-            "SELECT coalesce(json_extract(body, '$.fields.status'), 'unknown'), accepted_at_unix_ms
+            &canonical_sql("SELECT coalesce(json_extract(body, '$.fields.status'), 'unknown'), accepted_at_unix_ms
              FROM claims WHERE subject=?1 AND kind='loop.state'
-             ORDER BY store_index DESC LIMIT 1",
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
             target,
         );
     }
     if target.starts_with("message/") {
         return row(
-            "SELECT substr(kind, 9), accepted_at_unix_ms FROM claims
+            &canonical_sql("SELECT substr(kind, 9), accepted_at_unix_ms FROM claims
              WHERE subject=?1 AND kind IN
                ('message.sent', 'message.staged', 'message.delivered', 'message.read', 'message.closed')
-             ORDER BY store_index DESC LIMIT 1",
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
             target,
         );
     }
@@ -21172,13 +21225,13 @@ fn operational_repair_plan_tx(
 
     let mut latest_wake_diagnostics =
         BTreeMap::<(String, String, String), (String, Value, u128)>::new();
-    let mut wake_statement = connection.prepare(
+    let mut wake_statement = connection.prepare(&canonical_sql(
         "SELECT id, subject, body, accepted_at_unix_ms FROM claims
          WHERE kind='harness.diagnostic'
            AND json_extract(body, '$.fields.code')='work-wake-exhausted'
            AND accepted_at_unix_ms<=?1
-         ORDER BY store_index",
-    )?;
+         ORDER BY CANONICAL_ASC(claims)",
+    ))?;
     let wake_rows = wake_statement.query_map([snapshot_unix_ms.to_string()], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -23301,11 +23354,11 @@ impl Store {
     /// Invites as the fleet knows them, from their claims.
     pub fn fleet_invites(&self, all: bool) -> Result<Vec<FleetInviteView>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
+        let mut statement = connection.prepare(&canonical_sql(
             "SELECT subject, kind, body, accepted_at_unix_ms FROM claims
              WHERE kind IN ('fleet.invite-created','fleet.invite-redeemed','fleet.invite-revoked')
-             ORDER BY store_index",
-        )?;
+             ORDER BY CANONICAL_ASC(claims)",
+        ))?;
         let rows = statement
             .query_map([], |row| {
                 Ok((
@@ -26033,14 +26086,6 @@ fn reapply_local_work_lease_renewals_tx(transaction: &Transaction<'_>) -> Result
     Ok(())
 }
 
-/// A batch's writer and sequence from its ID, `batch/WRITER/SEQUENCE/HASH`.
-fn batch_order_key(batch_id: &str) -> Option<(String, u64)> {
-    let rest = batch_id.strip_prefix("batch/")?;
-    let (rest, _hash) = rest.rsplit_once('/')?;
-    let (writer, sequence) = rest.rsplit_once('/')?;
-    Some((writer.to_owned(), sequence.parse().ok()?))
-}
-
 /// Advance from a healthy frontier when the new claims have unambiguous operation IDs and
 /// structural claims sort after everything projected, in the order the full replay uses.
 /// Whether a full replay projects claims of `kind` into the graph tables the graph digest
@@ -26120,8 +26165,8 @@ fn generation_run_tx(
     let subject = format!("run-generation/{generation}");
     let created = transaction
         .query_row(
-            "SELECT json_extract(body, '$.fields.run') FROM claims
-             WHERE subject=?1 AND kind='run-generation.created' ORDER BY store_index LIMIT 1",
+            &canonical_sql("SELECT json_extract(body, '$.fields.run') FROM claims
+             WHERE subject=?1 AND kind='run-generation.created' ORDER BY CANONICAL_ASC(claims) LIMIT 1"),
             [&subject],
             |row| row.get::<_, Option<String>>(0),
         )
@@ -26134,9 +26179,11 @@ fn generation_run_tx(
     // A run's first generation is named by the claim that creates the run.
     Ok(transaction
         .query_row(
-            "SELECT subject FROM claims WHERE kind='mission-run.created'
+            &canonical_sql(
+                "SELECT subject FROM claims WHERE kind='mission-run.created'
                AND json_extract(body, '$.fields.current_generation')=?1
-             ORDER BY store_index LIMIT 1",
+             ORDER BY CANONICAL_ASC(claims) LIMIT 1",
+            ),
             [&subject],
             |row| row.get::<_, String>(0),
         )
@@ -26170,9 +26217,11 @@ fn run_tree_of_tx(
             Some(run) => Some(run),
             None => transaction
                 .query_row(
-                    "SELECT json_extract(body, '$.fields.run') FROM claims
+                    &canonical_sql(
+                        "SELECT json_extract(body, '$.fields.run') FROM claims
                      WHERE subject=?1 AND kind='revision-proposal.created'
-                     ORDER BY store_index LIMIT 1",
+                     ORDER BY CANONICAL_ASC(claims) LIMIT 1",
+                    ),
                     [subject],
                     |row| row.get::<_, Option<String>>(0),
                 )
@@ -26200,8 +26249,8 @@ fn run_tree_of_tx(
     }
     let root = transaction
         .query_row(
-            "SELECT json_extract(body, '$.fields.root_mission_run') FROM claims
-             WHERE subject=?1 AND kind='mission-run.created' ORDER BY store_index LIMIT 1",
+            &canonical_sql("SELECT json_extract(body, '$.fields.root_mission_run') FROM claims
+             WHERE subject=?1 AND kind='mission-run.created' ORDER BY CANONICAL_ASC(claims) LIMIT 1"),
             [format!("mission-run/{run}")],
             |row| row.get::<_, Option<String>>(0),
         )
@@ -26237,22 +26286,19 @@ fn claims_in_replay_order_tx(
     let query = |filter: &str| {
         format!(
             "SELECT {CLAIM_COLUMNS}, batches.origin, batches.replica_sequence,
-                    COALESCE((SELECT MIN(position) FROM replica_records
-                              WHERE replica_records.claim_id=claims.id), 0)
+                    {}
              FROM claims JOIN batches ON batches.id=claims.batch_id
              WHERE {filter}{kind_filter}
                AND NOT EXISTS (SELECT 1 FROM replica_records
                                WHERE replica_records.claim_id=claims.id
-                                 AND replica_records.state='repaired')"
+                                 AND replica_records.state='repaired')",
+            canonical::position_sql("claims")
         )
     };
     let row = |row: &rusqlite::Row<'_>| {
-        Ok((
-            claim_from_row(row)?,
-            row.get::<_, String>(10)?,
-            row.get::<_, i64>(11)?,
-            row.get::<_, i64>(12)?,
-        ))
+        let claim = claim_from_row(row)?;
+        let key = canonical::key_from_record(&claim, row.get(10)?, row.get(11)?, row.get(12)?);
+        Ok((claim, key))
     };
     let mut found = Vec::new();
     let mut by_subject = transaction
@@ -26277,22 +26323,7 @@ fn claims_in_replay_order_tx(
             found.push(claim.map_err(internal)?);
         }
     }
-    found.sort_by(|left, right| {
-        (
-            &left.0.accepted_at_unix_ms,
-            &left.1,
-            left.2,
-            left.3,
-            &left.0.id,
-        )
-            .cmp(&(
-                &right.0.accepted_at_unix_ms,
-                &right.1,
-                right.2,
-                right.3,
-                &right.0.id,
-            ))
-    });
+    found.sort_by(|left, right| left.1.cmp(&right.1));
     found.dedup_by(|left, right| left.0.id == right.0.id);
     Ok(found.into_iter().map(|(claim, ..)| claim).collect())
 }
@@ -26534,44 +26565,31 @@ fn try_project_simple_replication_tx(
         .iter()
         .filter(|claim| claim.kind.starts_with("work.") && claim.origin != origin)
         .collect::<Vec<_>>();
-    work_claims.sort_by_key(|claim| claim.accepted_at_unix_ms);
+    let order_keys = claims
+        .iter()
+        .filter(|claim| run_tree_kind(&claim.kind))
+        .map(|claim| {
+            Ok((
+                claim.id.clone(),
+                canonical::claim_key(transaction, &claim.id).map_err(internal)?,
+            ))
+        })
+        .collect::<Result<BTreeMap<_, _>, St3Error>>()?;
+    work_claims.sort_by_key(|claim| &order_keys[&claim.id]);
     // The full replay orders claims by accepted time, then by batch writer and sequence. A
     // structural claim extends the projection only when it sorts after everything projected
     // so far; the claims of one batch share that key and keep their order within the batch.
-    let mut last_key: Option<(u128, String, u64)> = None;
-    if claims
+    let mut last_key = if claims
         .iter()
         .any(|claim| !Store::simple_replication_kind(&claim.kind))
     {
-        let last_accepted = transaction
-            .query_row(
-                "SELECT accepted_at_unix_ms FROM claims WHERE store_index<=?1
-                 ORDER BY length(accepted_at_unix_ms) DESC, accepted_at_unix_ms DESC LIMIT 1",
-                [frontier],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()
-            .map_err(internal)?;
-        if let Some(accepted) = last_accepted {
-            let mut statement = transaction
-                .prepare_cached(LAST_ACCEPTED_BATCHES)
-                .map_err(internal)?;
-            let batches = statement
-                .query_map(params![frontier, accepted], |row| row.get::<_, String>(0))
-                .map_err(internal)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(internal)?;
-            let Some((writer, sequence)) = batches
-                .iter()
-                .map(|batch| batch_order_key(batch))
-                .collect::<Option<Vec<_>>>()
-                .and_then(|keys| keys.into_iter().max())
-            else {
-                return Ok(replay_needed("projected batch has no order key".into()));
-            };
-            last_key = Some((accepted.parse().map_err(internal)?, writer, sequence));
-        }
-    }
+        transaction.query_row(&canonical_sql(
+            "SELECT id FROM claims INDEXED BY claims_accepted_order_index WHERE store_index<=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1"
+        ), [frontier], |row| row.get::<_, String>(0)).optional().map_err(internal)?
+            .map(|id| canonical::claim_key(transaction, &id).map_err(internal)).transpose()?
+    } else {
+        None
+    };
     // A claim that reaches a part of the graph out of the replay's order marks that part to be
     // rebuilt from its own claims; everything else extends the graph as it arrives.
     let mut dirty = BTreeSet::<Aggregate>::new();
@@ -26627,10 +26645,7 @@ fn try_project_simple_replication_tx(
             )));
         }
         if !Store::simple_replication_kind(&claim.kind) {
-            let Some((writer, sequence)) = batch_order_key(&claim.batch_id) else {
-                return Ok(replay_needed("claim batch has no order key".into()));
-            };
-            let key = (claim.accepted_at_unix_ms, writer, sequence);
+            let key = canonical::claim_key(transaction, &claim.id).map_err(internal)?;
             let out_of_order = last_key.as_ref().is_some_and(|last| key < *last);
             if last_key.as_ref().is_none_or(|last| key > *last) {
                 last_key = Some(key);
@@ -26851,7 +26866,7 @@ fn try_project_simple_replication_tx(
                 )
         })
         .collect::<Vec<_>>();
-    run_updates.sort_by_key(|claim| claim.accepted_at_unix_ms);
+    run_updates.sort_by_key(|claim| &order_keys[&claim.id]);
     for claim in run_updates {
         if in_dirty(claim)? {
             continue;
@@ -27044,7 +27059,7 @@ fn replay_graph_from_nothing_tx(transaction: &Transaction<'_>) -> Result<(), St3
 
 fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), St3Error> {
     let mut statement = transaction
-        .prepare(
+        .prepare(&canonical_sql(
             "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
                     claims.origin, claims.actor, claims.body, claims.predecessors,
                     claims.accepted_at_unix_ms
@@ -27054,11 +27069,8 @@ fn project_replicated_base_claims(transaction: &Transaction<'_>) -> Result<(), S
                  WHERE replica_records.claim_id=claims.id
                    AND replica_records.state='repaired'
              )
-             ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
-                      batches.origin, batches.replica_sequence,
-                      COALESCE((SELECT MIN(position) FROM replica_records
-                                WHERE replica_records.claim_id=claims.id), 0), claims.id",
-        )
+             ORDER BY CANONICAL_ASC(claims)",
+        ))
         .map_err(internal)?;
     // Read every claim before projecting any: rolling back one claim's savepoint aborts a
     // statement that is still stepping, which would fail the whole replay.
@@ -27370,16 +27382,13 @@ fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), 
             _ => "claims.kind='step-run.carried'",
         };
         let mut statement = transaction
-            .prepare(&format!(
+            .prepare(&canonical_sql(&format!(
                 "SELECT claims.id, claims.store_index, claims.batch_id, claims.subject, claims.kind,
                         claims.origin, claims.actor, claims.body, claims.predecessors,
                         claims.accepted_at_unix_ms
                  FROM claims JOIN batches ON batches.id=claims.batch_id WHERE {filter}
-                 ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
-                          batches.origin, batches.replica_sequence,
-                          COALESCE((SELECT MIN(position) FROM replica_records
-                                    WHERE replica_records.claim_id=claims.id), 0), claims.id"
-            ))
+                 ORDER BY CANONICAL_ASC(claims)"
+            )))
             .map_err(internal)?;
         let claims = statement
             .query_map([], claim_from_row)
@@ -28587,7 +28596,7 @@ fn seat_queue_inputs_tx(
     agent: Option<&str>,
 ) -> Result<BTreeMap<String, SeatQueueInputs>> {
     let mut seats = BTreeMap::<String, SeatQueueInputs>::new();
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&canonical_sql(
         "SELECT claims.id, claims.subject, claims.actor, claims.body, claims.accepted_at_unix_ms
          FROM claims JOIN batches ON batches.id=claims.batch_id
          WHERE claims.kind=?1 AND (?2 IS NULL OR claims.subject=?2)
@@ -28596,9 +28605,8 @@ fn seat_queue_inputs_tx(
                WHERE replica_records.claim_id=claims.id
                  AND replica_records.state='repaired'
            )
-         ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
-                  batches.origin, batches.replica_sequence, claims.store_index",
-    )?;
+         ORDER BY CANONICAL_ASC(claims)",
+    ))?;
     let rows = statement.query_map(params![seat_queue::MOVED_CLAIM, agent], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -29270,7 +29278,7 @@ fn carried_claimants_tx<'a>(
         return Ok(HashMap::new());
     }
     Ok(connection
-        .prepare_cached(
+        .prepare_cached(&format!(
             "SELECT carried.subject, json_extract(carried.body, '$.fields.claimant')
              FROM json_each(?1) AS ready
              CROSS JOIN claims AS carried
@@ -29280,9 +29288,10 @@ fn carried_claimants_tx<'a>(
                AND NOT EXISTS (
                    SELECT 1 FROM claims AS later
                    WHERE later.subject=carried.subject AND later.kind='work.claimed'
-                     AND later.store_index>carried.store_index
+                     AND {}
                )",
-        )?
+            canonical::after_sql("later", "carried")
+        ))?
         .query_map([serde_json::to_string(&ready)?], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?
@@ -29542,11 +29551,11 @@ fn enrich_step_summaries_at(
     view: &mut StepRunView,
     snapshot_unix_ms: u128,
 ) -> rusqlite::Result<()> {
-    let mut statement = connection.prepare_cached(
+    let mut statement = connection.prepare_cached(&canonical_sql(
         "SELECT kind, body, accepted_at_unix_ms FROM claims
          WHERE subject=?1 AND kind IN ('work.progress','work.submitted')
-         ORDER BY length(accepted_at_unix_ms), accepted_at_unix_ms, store_index",
-    )?;
+         ORDER BY CANONICAL_ASC(claims)",
+    ))?;
     let events = statement
         .query_map([&view.subject], |row| {
             Ok((
@@ -29708,7 +29717,7 @@ fn enrich_step_wake_at(
         .strip_prefix("agent/")
         .filter(|suffix| !suffix.contains('/'))
         .unwrap_or(assignee);
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&canonical_sql(
         "SELECT claims.body, claims.accepted_at_unix_ms,
                 EXISTS(SELECT 1 FROM claims consumed
                        WHERE consumed.subject=claims.subject
@@ -29726,8 +29735,8 @@ fn enrich_step_wake_at(
          WHERE claims.kind='message.sent' AND claims.accepted_at_unix_ms<=?1
            AND instr(claims.body, ?2)>0
            AND json_extract(claims.body, '$.fields.to') IN (?3, ?4)
-         ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms, claims.id",
-    )?;
+         ORDER BY CANONICAL_ASC(claims)",
+    ))?;
     let rows = statement.query_map(
         params![
             snapshot_unix_ms.to_string(),
@@ -29836,14 +29845,16 @@ fn enrich_step_wake_at(
     };
     let failure = connection
         .query_row(
-            "SELECT body FROM claims
+            &canonical_sql(
+                "SELECT body FROM claims
              WHERE subject=?1 AND kind='harness.diagnostic' AND accepted_at_unix_ms<=?2
                AND json_extract(body, '$.fields.code')='work-wake-exhausted'
                AND json_extract(body, '$.fields.step_run')=?3
                AND json_extract(body, '$.fields.incarnation_id')=?4
                AND json_extract(body, '$.fields.attempt')=?5
                AND json_extract(body, '$.fields.readiness_epoch')=?6
-             ORDER BY store_index DESC LIMIT 1",
+             ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+            ),
             params![
                 assignee,
                 snapshot_unix_ms.to_string(),
@@ -29902,11 +29913,11 @@ fn harness_incarnation_for_key_at(
     incarnation_key: &str,
     snapshot_unix_ms: u128,
 ) -> rusqlite::Result<Option<String>> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&canonical_sql(
         "SELECT body FROM claims
          WHERE subject=?1 AND kind='harness.observed' AND accepted_at_unix_ms<=?2
-         ORDER BY store_index DESC",
-    )?;
+         ORDER BY CANONICAL_DESC(claims)",
+    ))?;
     let rows = statement.query_map(params![subject, snapshot_unix_ms.to_string()], |row| {
         row.get::<_, String>(0)
     })?;
@@ -29931,17 +29942,14 @@ fn step_execution_timing_at(
     snapshot_unix_ms: u128,
     currently_active: bool,
 ) -> rusqlite::Result<(Option<u128>, u128)> {
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&canonical_sql(
         "SELECT claims.kind, claims.body, claims.accepted_at_unix_ms
          FROM claims JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1
            AND claims.kind IN ('step-run.state','step-run.carried','work.claimed','work.renewed',
                                'work.progress','work.submitted','work.failed','work.released')
-         ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
-                  batches.origin, batches.replica_sequence,
-                  COALESCE((SELECT MIN(position) FROM replica_records
-                            WHERE replica_records.claim_id=claims.id), 0), claims.id",
-    )?;
+         ORDER BY CANONICAL_ASC(claims)",
+    ))?;
     let events = statement
         .query_map([subject], |row| {
             Ok((
@@ -30183,7 +30191,7 @@ fn active_step_blockers_tx(
     snapshot_unix_ms: u128,
 ) -> rusqlite::Result<Vec<String>> {
     let snapshot = snapshot_unix_ms.to_string();
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare(&canonical_sql(
         "SELECT DISTINCT request.subject
          FROM claims request, json_each(json_extract(request.body, '$.fields.targets')) target
          WHERE request.kind='attention.requested'
@@ -30199,8 +30207,8 @@ fn active_step_blockers_tx(
                     OR (length(resolution.accepted_at_unix_ms)=length(?2)
                         AND resolution.accepted_at_unix_ms<=?2))
            )
-         ORDER BY request.store_index, request.subject",
-    )?;
+         ORDER BY CANONICAL_ASC(request), request.subject",
+    ))?;
     statement
         .query_map(params![subject, snapshot], |row| row.get::<_, String>(0))?
         .collect()
@@ -31213,7 +31221,7 @@ fn loop_run_views_tx(
         let subject = format!("loop-run/{generation}/{}", spec.path);
         let state = connection
             .query_row(
-                "SELECT body FROM claims WHERE subject=?1 AND kind='loop.state' ORDER BY store_index DESC LIMIT 1",
+                &canonical_sql("SELECT body FROM claims WHERE subject=?1 AND kind='loop.state' ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
                 [&subject],
                 |row| row.get::<_, String>(0),
             )
@@ -31228,10 +31236,10 @@ fn loop_run_views_tx(
             .or_else(|| step_view.map(|view| view.status.as_str()))
             .unwrap_or("pending")
             .to_owned();
-        let mut results_statement = connection.prepare(
+        let mut results_statement = connection.prepare(&canonical_sql(
             "SELECT id, body, accepted_at_unix_ms FROM claims
-             WHERE subject=?1 AND kind='loop.round-result' ORDER BY store_index",
-        )?;
+             WHERE subject=?1 AND kind='loop.round-result' ORDER BY CANONICAL_ASC(claims)",
+        ))?;
         let results = results_statement
             .query_map([&subject], |row| {
                 let body =
