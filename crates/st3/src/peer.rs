@@ -25,8 +25,9 @@ use tokio::sync::watch;
 use crate::client::Client;
 use crate::config::{Config, PeerConfig};
 use crate::fleet::transport::{
-    Fabric, LocalTransports, Route, bindable_tailnet_addresses, default_fabric_protocol,
-    local_addresses, parse_route, resolve_tool, routes_from_endpoints, tailscale_addresses,
+    Fabric, FabricGrantRefusal, LocalTransports, Route, bindable_tailnet_addresses,
+    default_fabric_protocol, local_addresses, parse_route, resolve_tool, routes_from_endpoints,
+    tailscale_addresses,
 };
 use crate::fleet::{Acceptance, FleetView, MemberKey, Refusal, Sender, verify_signature};
 use crate::model::InventoryCheckpoint;
@@ -2167,6 +2168,7 @@ async fn dial_peer(
     let mut connectivity = fleet.connectivity_changed.subscribe();
     let mut must_send = false;
     let mut route = 0_usize;
+    let mut refused = Vec::<(Route, tokio::time::Instant)>::new();
     loop {
         // A removed node stops dialing; `st3 doctor` says what to do next.
         if fleet.is_removed() {
@@ -2233,25 +2235,57 @@ async fn dial_peer(
                 continue;
             }
         }
+        // Grant refusals belong to the route. Graph writes, inbound exchanges, presence
+        // and local network changes cannot make that member grant this service.
+        if routes.has_changed().unwrap_or(false) {
+            refused.clear();
+        }
         let selected = {
             let routes = routes.borrow_and_update();
-            if routes.is_empty() {
-                None
-            } else {
-                Some(routes[route % routes.len()].clone())
-            }
+            let now = tokio::time::Instant::now();
+            refused.retain(|(route, until)| routes.contains(route) && *until > now);
+            (0..routes.len())
+                .map(|offset| routes[(route.wrapping_add(offset)) % routes.len()].clone())
+                .find(|candidate| !refused.iter().any(|(route, _)| route == candidate))
         };
+        if selected.is_none() && !refused.is_empty() {
+            let deadline = refused.iter().map(|(_, until)| *until).min().unwrap();
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => {}
+                _ = routes.changed() => { refused.clear(); }
+            }
+            continue;
+        }
         let url = match selected {
             Some(Route::Http(url)) => Some(url),
-            // The worker dials Fabric itself: a local tunnel, reused while it lives.
-            Some(Route::Fabric { node, protocol }) => match &fleet.fabric {
-                Some(fabric) => fabric
-                    .dial(&node, &protocol)
-                    .await
-                    .ok()
-                    .map(|address| format!("http://{address}")),
-                None => None,
-            },
+            Some(selected @ Route::Fabric { .. }) => {
+                let Route::Fabric { node, protocol } = &selected else {
+                    unreachable!()
+                };
+                match &fleet.fabric {
+                    Some(fabric) => match fabric.dial(node, protocol).await {
+                        Ok(address) => Some(format!("http://{address}")),
+                        Err(error) => {
+                            if error.is::<FabricGrantRefusal>() {
+                                refused.push((
+                                    selected,
+                                    tokio::time::Instant::now() + fabric_refusal_delay(),
+                                ));
+                                let _ = backend
+                                    .record_failure(&name, "refused", &error.to_string())
+                                    .await;
+                                route = route.wrapping_add(1);
+                                continue;
+                            }
+                            let _ = backend
+                                .record_failure(&name, "down", &error.to_string())
+                                .await;
+                            None
+                        }
+                    },
+                    None => None,
+                }
+            }
             None => None,
         };
         let Some(url) = url else {
@@ -2336,6 +2370,18 @@ async fn dial_peer(
             }
         }
     }
+}
+
+/// Probe grants again without depending on Fabric's event version. Even the shortest jitter
+/// allows at most three dials per hour, including the first refusal. Never apply worker caps.
+fn fabric_refusal_delay() -> Duration {
+    let mut random = [0; 2];
+    let _ = getrandom::fill(&mut random);
+    fabric_refusal_delay_with_jitter(u16::from_le_bytes(random))
+}
+
+fn fabric_refusal_delay_with_jitter(jitter: u16) -> Duration {
+    Duration::from_millis(1800 * (800 + u64::from(jitter) % 401))
 }
 
 /// Failed connections have no graph wake dependency: unrelated local writes must not
@@ -5835,6 +5881,237 @@ mod tests {
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+
+    #[test]
+    fn refused_routes_allow_at_most_three_attempts_per_hour_from_the_first_refusal() {
+        for jitter in [0, 200, 400, u16::MAX] {
+            let delay = fabric_refusal_delay_with_jitter(jitter);
+            assert!(delay >= Duration::from_secs(24 * 60));
+            assert!(delay <= Duration::from_secs(36 * 60));
+            let attempts = 1 + 3600 / delay.as_secs();
+            assert!(attempts <= 3, "{attempts} attempts per hour");
+        }
+    }
+
+    #[tokio::test]
+    async fn isolated_leaves_refuse_direct_fabric_routes_and_converge_through_the_hub() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let names = ["indigo", "amber", "cobalt"];
+        let fleet_id = "94cd11ba-c582-4558-9c84-c3bda922eb6d";
+        let auth = FleetAuth::test(fleet_id, &[37; 32]);
+        let stores = names.map(|name| {
+            let store =
+                Arc::new(Store::open(&root.path().join(format!("{name}.db")), name).unwrap());
+            store.bind_fleet(fleet_id).unwrap();
+            store
+        });
+        let log = root.path().join("refusals");
+        let grant = root.path().join("grant");
+        let program = root.path().join("fabric");
+        std::fs::write(&program, format!(
+            "#!/bin/sh\nif test -f '{}'; then cat '{}'; exit 0; fi\necho \"$2\" >> '{}'\necho 'peer not permitted for service st3-peer-v1' >&2\nexit 1\n",
+            grant.display(), grant.display(), log.display()
+        )).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let contexts = names.map(|name| {
+            let mut context = FleetContext::legacy(
+                names
+                    .iter()
+                    .filter(|peer| **peer != name)
+                    .map(|peer| (*peer).into())
+                    .collect(),
+            );
+            context.fabric = Some(Fabric::new(program.clone()));
+            context
+        });
+        let wakes = names.map(|_| watch::channel(0).0);
+        let mut tasks = Vec::new();
+        let mut addresses = Vec::new();
+        for index in 0..3 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addresses.push(listener.local_addr().unwrap());
+            let state = PeerState {
+                backend: PeerBackend::Local(stores[index].clone()),
+                node: names[index].into(),
+                auth: auth.clone(),
+                fleet: contexts[index].clone(),
+                main_socket: root.path().join("unused.sock"),
+                outbound_notify: wakes[index].clone(),
+            };
+            tasks.push(tokio::spawn(async move {
+                axum::serve(listener, peer_router(state)).await.unwrap();
+            }));
+        }
+        let mut routes = Vec::new();
+        for (from, to) in [(1, 0), (2, 0), (1, 2), (2, 1)] {
+            let route = if to == 0 {
+                Route::Http(format!("http://{}", addresses[to]))
+            } else {
+                Route::Fabric {
+                    node: names[to].into(),
+                    protocol: "st3-peer-v1".into(),
+                }
+            };
+            let (sender, receiver) = watch::channel(vec![route]);
+            routes.push(sender);
+            tasks.push(tokio::spawn(dial_peer(
+                PeerBackend::Local(stores[from].clone()),
+                names[from].into(),
+                names[to].into(),
+                receiver,
+                auth.clone(),
+                contexts[from].clone(),
+                root.path().join("unused.sock"),
+                wakes[from].subscribe(),
+            )));
+        }
+        let write = |index: usize, note: &str| {
+            stores[index]
+                .append_claim(&crate::model::ClaimInput {
+                    subject: format!("daemon/{note}"),
+                    kind: "daemon.diagnostic".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("severity".into(), Value::String("warning".into())),
+                        (
+                            "code".into(),
+                            Value::String("isolated-refusal-proof".into()),
+                        ),
+                        ("reason".into(), Value::String(note.into())),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            wakes[index].send_modify(|generation| *generation += 1);
+        };
+        async fn converge(stores: &[Arc<Store>]) {
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    let snapshots = stores
+                        .iter()
+                        .map(|store| store.replication_status(true, None, &[]).unwrap())
+                        .collect::<Vec<_>>();
+                    if snapshots.iter().all(|snapshot| {
+                        snapshot.authority_digest == snapshots[0].authority_digest
+                            && snapshot.graph_digest == snapshots[0].graph_digest
+                    }) {
+                        return;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("the leaves must converge through the hub");
+        }
+        for index in 0..3 {
+            write(index, &format!("initial-{}", names[index]));
+        }
+        converge(&stores).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .count()
+                < 2
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        for (from, to) in [(1, 2), (2, 1)] {
+            let status = stores[from]
+                .replication_status(true, Some(fleet_id), &[names[to].into()])
+                .unwrap();
+            assert_eq!(status.peers[0].status, "refused");
+            assert!(status.peers[0].last_error.is_none());
+            assert!(
+                status.peers[0]
+                    .refusal_reason
+                    .as_ref()
+                    .unwrap()
+                    .contains("that member's Fabric grants")
+            );
+        }
+        // Busy graph, network and online events must leave both refused routes asleep.
+        for round in 0..8 {
+            for index in 0..3 {
+                write(index, &format!("busy-{round}-{}", names[index]));
+                contexts[index]
+                    .connectivity_changed
+                    .send_modify(|generation| *generation += 1);
+                contexts[index]
+                    .online
+                    .write()
+                    .unwrap()
+                    .insert("cobalt".into(), tokio::time::Instant::now());
+                contexts[index]
+                    .inbound_changed
+                    .send_modify(|generation| *generation += 1);
+            }
+            converge(&stores).await;
+        }
+        assert_eq!(std::fs::read_to_string(&log).unwrap().lines().count(), 2);
+        // Advance an hour on the real dialers. Let shell I/O finish in real time between
+        // advances so the command timeout measures a dial, not our simulated hour.
+        tokio::time::pause();
+        for _ in 0..6 {
+            tokio::time::advance(Duration::from_secs(10 * 60)).await;
+            tokio::time::resume();
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tokio::time::pause();
+        }
+        tokio::time::resume();
+        let attempts = std::fs::read_to_string(&log).unwrap();
+        for name in ["amber", "cobalt"] {
+            let count = attempts.lines().filter(|line| *line == name).count();
+            assert!((2..=3).contains(&count), "{name}: {count} dials in an hour");
+            println!(
+                "isolated refusal proof: {name}: {count} direct attempts in a simulated hour; leaves converged through indigo"
+            );
+        }
+        // A refused Fabric route must not hold up another route to the same member.
+        routes[2].send_replace(vec![
+            Route::Fabric { node: "cobalt".into(), protocol: "st3-peer-v1".into() },
+            Route::Http(format!("http://{}", addresses[2])),
+        ]);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while stores[1].replication_status(true, Some(fleet_id), &["cobalt".into()]).unwrap().peers[0].status != "up" {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await.expect("a refused Fabric route must not block the HTTP fallback");
+        // A changed membership route is usable immediately, despite the grant cooldown.
+        let before_route_change = stores[1].replication_peer_last_success("cobalt").unwrap();
+        std::fs::write(&grant, addresses[2].to_string()).unwrap();
+        routes[2].send_replace(vec![Route::Fabric {
+            node: "cobalt-new-route".into(),
+            protocol: "st3-peer-v1".into(),
+        }]);
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if stores[1]
+                    .replication_status(true, Some(fleet_id), &["cobalt".into()])
+                    .unwrap()
+                    .peers[0]
+                    .status
+                    == "up"
+                    && stores[1].replication_peer_last_success("cobalt").unwrap() > before_route_change
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a changed route must interrupt the refusal cooldown");
+        for task in tasks {
+            task.abort();
+            let _ = task.await;
+        }
+    }
 
     #[test]
     fn absent_members_cost_a_few_attempts_per_hour_after_exponential_backoff() {

@@ -40,6 +40,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "replica_records",
         "projection_health",
         "replication_peers",
+        "replication_refusals",
         "capabilities",
         "local_work_lease_renewals",
         "local_observations",

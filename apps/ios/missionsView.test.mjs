@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { isSystemMission, missionRows, missionSections, missionTitle, missionWord } from './missionsView.ts';
+import { isSystemMission, missionRows, missionSections, missionTitle, missionWord, stepStyle } from './missionsView.ts';
 
 const step = (id, state, extra = {}) => ({ id: `step-run/${id}`, path: id, state, attempt: 1, since: '2026-09-30T11:00:00Z', ...extra });
 const mission = (id, state, steps = [], extra = {}) => ({ id: `mission/${id}`, kind: 'mission', title: id, state, runs: ['r'], run_details: [{ id: 'mission-run/r', status: state, steps }], updated_at: '2026-09-30T11:00:00Z', ...extra });
@@ -13,6 +13,18 @@ assert.equal(missionWord(mission('a', 'running', [step('s', 'ready')]), [], [{ s
 assert.equal(missionWord(mission('a', 'running', [step('s', 'ready')]), [], [{ state: 'running', next_work_id: 'step-run/s' }]), 'queued');
 assert.equal(missionWord(mission('a', 'completed', [step('s', 'failed')]), [], []), 'done');
 assert.equal(missionWord(mission('a', 'standing', []), [], []), 'idle');
+
+for (const [state, word] of Object.entries({ waiting: 'waiting', ready: 'ready', claimed: 'working', blocked: 'waiting', verifying: 'working', completed: 'done', failed: 'failed', cancelled: 'cancelled' })) {
+  assert.equal(stepStyle(state).word, word, state);
+}
+for (const state of ['claimed', 'verifying', 'working', 'running']) {
+  assert.equal(missionWord(mission('a', 'running', [step('held', state), step('next', 'waiting')]), [], []), 'working', state);
+  assert.equal(stepStyle(state, '*').glyph, '*', state);
+}
+assert.equal(missionWord(mission('a', 'running', [step('next', 'pending')]), [], []), 'held');
+assert.equal(stepStyle('pending').word, 'waiting');
+assert.equal(missionWord(mission('a', 'standing', [step('keep-watch', 'verifying', { agentless: true })]), [], []), 'watching');
+assert.equal(missionWord(mission('a', 'cancelled', [step('held', 'cancelled')]), [], []), 'cancelled');
 
 assert.equal(missionTitle({ id: 'mission/fleet/stui/client-api', title: 'fleet/stui/client-api' }), 'fleet/stui · Client API');
 assert.equal(isSystemMission('mission/fleet/smalltalk/ci/run'), true);

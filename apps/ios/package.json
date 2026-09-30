@@ -5,6 +5,7 @@
   "main": "index.ts",
   "scripts": {
     "start": "expo start",
+    "pods": "sh ./scripts/pods.sh",
     "typecheck": "tsc --noEmit",
     "export:ios": "expo export --platform ios",
     "test": "node --experimental-transform-types --import ./testHooks.mjs --test"
