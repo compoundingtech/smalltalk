@@ -226,7 +226,7 @@ fn rust_operation_methods(
         } else if id == "agent-declaration.get" {
             writeln!(
                 out,
-                "    pub async fn agent_declaration_get(&self, id: &str, revision: Option<&str>) -> Result<Envelope<AgentDeclaration>, ClientError> {{ let path = format!(\"/v1/client/agent-declarations/{{}}\", percent_encode(id)); let path = if let Some(revision) = revision {{ format!(\"{{path}}?revision={{}}\", percent_encode(revision)) }} else {{ path }}; self.get(&path).await }}"
+                "    pub async fn agent_declaration_get(&self, id: &str, revision: Option<&str>, show_env_values: bool) -> Result<Envelope<AgentDeclaration>, ClientError> {{ let path = format!(\"/v1/client/agent-declarations/{{}}?show_env_values={{show_env_values}}\", percent_encode(id)); let path = if let Some(revision) = revision {{ format!(\"{{path}}&revision={{}}\", percent_encode(revision)) }} else {{ path }}; self.get(&path).await }}"
             )?;
         } else if id.ends_with(".get") {
             let collection = path
@@ -296,7 +296,7 @@ fn swift_operation_methods(
         } else if id == "agent-declaration.get" {
             writeln!(
                 out,
-                "    public func agentDeclarationGet(id: String, revision: String? = nil) async throws -> Envelope<AgentDeclaration> {{ let query: [URLQueryItem] = revision.map {{ [.init(name: \"revision\", value: $0)] }} ?? []; return try await get(\"v1/client/agent-declarations/\\(id)\", query: query) }}"
+                "    public func agentDeclarationGet(id: String, revision: String? = nil, showEnvValues: Bool = false) async throws -> Envelope<AgentDeclaration> {{ var query: [URLQueryItem] = [.init(name: \"show_env_values\", value: showEnvValues ? \"true\" : \"false\")]; if let revision {{ query.append(.init(name: \"revision\", value: revision)) }}; return try await get(\"v1/client/agent-declarations/\\(id)\", query: query) }}"
             )?;
         } else if id.ends_with(".get") {
             let collection = path
@@ -969,7 +969,7 @@ fn typescript_operation_methods(
         } else if id == "agent-declaration.get" {
             writeln!(
                 out,
-                "    async {method}(id: string, revision?: string): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query({{ revision }})); }}"
+                "    async {method}(id: string, revision?: string, showEnvValues = false): Promise<EnvelopeOf<{response}>> {{ return this.get(`{route}` + query({{ revision, show_env_values: showEnvValues }})); }}"
             )?;
         } else if id == "conversation.changes" {
             writeln!(

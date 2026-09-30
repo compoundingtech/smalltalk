@@ -908,10 +908,14 @@ impl Client {
         &self,
         id: &str,
         revision: Option<&str>,
+        show_env_values: bool,
     ) -> Result<Envelope<AgentDeclaration>, ClientError> {
-        let path = format!("/v1/client/agent-declarations/{}", percent_encode(id));
+        let path = format!(
+            "/v1/client/agent-declarations/{}?show_env_values={show_env_values}",
+            percent_encode(id)
+        );
         let path = if let Some(revision) = revision {
-            format!("{path}?revision={}", percent_encode(revision))
+            format!("{path}&revision={}", percent_encode(revision))
         } else {
             path
         };

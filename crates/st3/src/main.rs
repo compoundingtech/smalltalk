@@ -2070,6 +2070,9 @@ struct SubjectShowArgs {
     /// Print the current managed agent declaration as canonical KDL v2.
     #[arg(long)]
     kdl: bool,
+    /// Include literal environment values in the KDL output.
+    #[arg(long, requires = "kdl")]
+    show_env_values: bool,
 }
 
 #[derive(Subcommand)]
@@ -6644,16 +6647,27 @@ async fn run_subject(client: &Client, command: SubjectCommand, json_output: bool
                     "--kdl is supported for managed agents only"
                 );
                 let status = status_for(client, &args.subject).await?;
-                let desired = status
+                let mut desired = status
                     .subjects
                     .iter()
                     .find(|subject| subject.subject == args.subject)
                     .and_then(|subject| subject.desired.as_ref())
+                    .cloned()
                     .context("No managed declaration")?;
-                print!("{}", st3::graph::render_agent_desired_kdl(desired)?);
+                if !args.show_env_values {
+                    st3::graph::redact_agent_env_values(&mut desired);
+                }
+                print!("{}", st3::graph::render_agent_desired_kdl(&desired)?);
                 Ok(())
             } else {
-                run_inspect(client, InspectArgs { subject: args.subject }, json_output).await
+                run_inspect(
+                    client,
+                    InspectArgs {
+                        subject: args.subject,
+                    },
+                    json_output,
+                )
+                .await
             }
         }
         SubjectCommand::History(args) => run_trace(client, args, json_output).await,

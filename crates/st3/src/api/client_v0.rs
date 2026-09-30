@@ -673,10 +673,11 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
 #[derive(Deserialize)]
 pub(super) struct AgentDeclarationQuery {
     revision: Option<String>,
+    #[serde(default)]
+    show_env_values: bool,
 }
 
-/// Declarations contain raw environment values, potentially secrets; ordinary
-/// projection readers must not be able to retrieve either current or old bodies.
+/// Both redacted and explicit environment-value reads require declaration scope.
 pub(super) async fn agent_declaration(
     State(state): State<AppState>,
     Extension(session): Extension<ClientSession>,
@@ -694,9 +695,12 @@ pub(super) async fn agent_declaration(
         Ok((declaration, revisions))
     })
     .await?;
-    let Some((revision, tree)) = declaration else {
+    let Some((revision, mut tree)) = declaration else {
         return Err(ApiError::not_found("managed agent declaration not found"));
     };
+    if !query.show_env_values {
+        crate::graph::redact_agent_env_values(&mut tree);
+    }
     let kdl = crate::graph::render_agent_desired_kdl(&tree).map_err(ApiError::bad)?;
     Ok(Json(json!({
         "id": subject,
@@ -1056,7 +1060,11 @@ pub(super) fn authenticate(
         scopes,
     };
     if request.method() == axum::http::Method::GET {
-        let scope = if request.uri().path().starts_with("/v1/client/agent-declarations/") {
+        let scope = if request
+            .uri()
+            .path()
+            .starts_with("/v1/client/agent-declarations/")
+        {
             "read.declarations"
         } else if request.uri().path().starts_with("/v1/client/terminals/") {
             "terminal.read"
@@ -7402,30 +7410,75 @@ mod tests {
                 .apply(&intent, &planned.subject_tokens, source)
                 .unwrap();
         };
-        publish("version 2\nagent \"dotfiles/steward\" { workspace \"/tmp\"; command \"true\"; env { TOKEN \"old-secret\" } }");
-        let original = state.store.agent_declaration_revisions("agent/dotfiles/steward").unwrap()[0].clone();
-        publish("version 2\nagent \"dotfiles/steward\" { workspace \"/tmp\"; command \"true\"; env { TOKEN \"new-secret\" } }");
-        let read = |revision| agent_declaration(
-            State(state.clone()),
-            Extension(ClientSession::local(Some("person/test")).unwrap()),
-            AxumPath("dotfiles/steward".into()),
-            Query(AgentDeclarationQuery { revision }),
+        publish(
+            "version 2\nagent \"dotfiles/steward\" { workspace \"/tmp\"; command \"true\"; env { TOKEN \"old-secret\" } }",
         );
-        let current = read(None).await.unwrap().0;
-        assert!(current["kdl"].as_str().unwrap().contains("new-secret"), "{current}");
-        assert_eq!(current["revisions"].as_array().unwrap().len(), 2);
-        let previous = read(Some(original.clone())).await.unwrap().0;
-        assert_eq!(previous["revision"], original);
-        assert!(previous["kdl"].as_str().unwrap().contains("old-secret"));
-        assert!(read(Some("not-a-revision".into())).await.is_err());
-        assert!(agent_declaration(
-            State(state),
-            Extension(ClientSession::local(None).unwrap()),
-            AxumPath("dotfiles/steward".into()),
-            Query(AgentDeclarationQuery { revision: None }),
-        )
-        .await
-        .is_err());
+        let original = state
+            .store
+            .agent_declaration_revisions("agent/dotfiles/steward")
+            .unwrap()[0]
+            .clone();
+        publish(
+            "version 2\nagent \"dotfiles/steward\" { workspace \"/tmp\"; command \"true\"; env { TOKEN \"new-secret\" } }",
+        );
+        let read = |revision, show_env_values| {
+            agent_declaration(
+                State(state.clone()),
+                Extension(ClientSession::local(Some("person/test")).unwrap()),
+                AxumPath("dotfiles/steward".into()),
+                Query(AgentDeclarationQuery {
+                    revision,
+                    show_env_values,
+                }),
+            )
+        };
+        for (revision, secret) in [(None, "new-secret"), (Some(original.clone()), "old-secret")] {
+            let redacted = read(revision.clone(), false).await.unwrap().0;
+            let kdl = redacted["kdl"].as_str().unwrap();
+            let parsed = crate::graph::parse_intent(kdl, "terminal-test").unwrap();
+            assert_eq!(
+                parsed.subjects["agent/dotfiles/steward"].desired,
+                redacted["tree"]
+            );
+            let env = redacted["tree"]["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["name"] == "env")
+                .unwrap();
+            assert_eq!(env["children"][0]["name"], "TOKEN");
+            assert_eq!(env["children"][0]["arguments"][0], "<redacted>");
+            assert!(!redacted.to_string().contains(secret));
+            let visible = read(revision, true).await.unwrap().0;
+            assert!(
+                visible["kdl"].as_str().unwrap().contains(secret),
+                "{visible}"
+            );
+            assert!(visible["tree"].to_string().contains(secret), "{visible}");
+            assert_eq!(visible["revision"], redacted["revision"]);
+            assert_eq!(visible["revisions"].as_array().unwrap().len(), 2);
+            if secret == "old-secret" {
+                assert_eq!(visible["revision"], original);
+            }
+        }
+        assert!(read(Some("not-a-revision".into()), false).await.is_err());
+        for revision in [None, Some(original)] {
+            for show_env_values in [false, true] {
+                assert!(
+                    agent_declaration(
+                        State(state.clone()),
+                        Extension(ClientSession::local(None).unwrap()),
+                        AxumPath("dotfiles/steward".into()),
+                        Query(AgentDeclarationQuery {
+                            revision: revision.clone(),
+                            show_env_values,
+                        }),
+                    )
+                    .await
+                    .is_err()
+                );
+            }
+        }
     }
 
     #[test]
