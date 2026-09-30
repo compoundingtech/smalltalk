@@ -15974,7 +15974,7 @@ mission "labelled" state="ready" {
                     step["state"].as_str().unwrap()
                 ))
                 .collect::<Vec<_>>(),
-            [("first", "ready"), ("second", "pending")]
+            [("first", "ready"), ("second", "waiting")]
         );
         assert_eq!(steps[0]["goals"], json!(["Greet the fleet."]));
         assert_eq!(steps[0]["assignee"], format!("agent/{}/worker", run.id));
