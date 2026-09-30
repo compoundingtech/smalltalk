@@ -50,7 +50,17 @@ fn messages_recover_across_transport_and_process_faults() {
         "historical st3 is missing: {}",
         old.display()
     );
-    let mut output_root = Some(tempfile::tempdir().unwrap());
+    let in_ci = std::env::var_os("CI_RUN_ID").is_some();
+    let mut output_root = Some(if in_ci {
+        let artifacts = repo.join("target/messaging-faults");
+        std::fs::create_dir_all(&artifacts).unwrap();
+        tempfile::Builder::new()
+            .prefix("run-")
+            .tempdir_in(artifacts)
+            .unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    });
     let evidence = std::env::var_os("ST3_MESSAGING_FAULTS_EVIDENCE")
         .map(PathBuf::from)
         .unwrap_or_else(|| output_root.as_ref().unwrap().path().join("evidence"));
@@ -71,7 +81,7 @@ fn messages_recover_across_transport_and_process_faults() {
         .ok()
         .and_then(|text| serde_json::from_str::<serde_json::Value>(text).ok())
         .is_some_and(|result| result["verdict"] == "pass" && result.get("ended").is_some());
-    if !passed {
+    if !passed || in_ci {
         eprintln!("messaging fault evidence: {}", evidence.display());
         let _ = output_root.take().unwrap().keep();
     }

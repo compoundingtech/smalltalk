@@ -97,4 +97,5 @@ checks, other binaries and the retired package's PTY wrapper; its channel source
 and locked Rust dependencies are unchanged. Nix caches the immutable package.
 Set `ST3_MESSAGING_COMPAT_BIN` to use an already built historical executable.
 `ST3_MESSAGING_FAULTS_EVIDENCE` can select a new evidence directory for a local run;
-on failure the default temporary evidence directory is retained.
+on failure the default temporary evidence directory is retained. CI also retains
+successful normalized evidence under its checkout's `target/messaging-faults/run-*/evidence/`.
