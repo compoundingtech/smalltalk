@@ -1270,6 +1270,9 @@ struct FleetMigrateArgs {
     code_file: Option<PathBuf>,
     #[arg(long)]
     fabric_inbox: bool,
+    /// A loopback/tailnet http:// or fabric:// route to the sponsor.
+    #[arg(long, conflicts_with_all = ["anchor", "finish", "unfinish"])]
+    via: Option<String>,
     /// Make this machine the anchor: the first machine of the fleet to migrate.
     #[arg(long, conflicts_with_all = ["code", "code_file", "fabric_inbox", "finish", "unfinish"])]
     anchor: bool,
@@ -1405,7 +1408,7 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
             configured_node: config.node.clone(),
             code: code.trim().to_owned(),
             name: Some(config.node.clone()),
-            via: None,
+            via: args.via.clone(),
             settings,
             legacy_secret_file: Some(secret_file),
             fabric_protocol: args.fabric_protocol.clone(),
