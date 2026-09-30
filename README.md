@@ -131,6 +131,9 @@ routes and Fabric inbox invitations, and [fleet join](docs/fleet-join.md) for tr
 removal, and migrating an existing fleet off local dial helpers. A client-only stui or app
 instead pairs as a [device](docs/st3/client-only.md), keeping a cache rather than a full replica.
 
+The [sync invariants](docs/st3/replication.md#sync-invariants) require canonical shared ordering
+and digest coverage for every synced logical source and shared projection.
+
 ## First commands
 
 ```sh

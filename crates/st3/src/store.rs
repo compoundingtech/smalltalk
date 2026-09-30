@@ -31461,6 +31461,11 @@ mod tests {
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
 
+    mod canonical_audit {
+        use super::*;
+        include!("store/canonical_audit.rs");
+    }
+
     #[test]
     fn subject_claim_pages_seek_the_subject_index() {
         let store = Store::open_memory("node").unwrap();
