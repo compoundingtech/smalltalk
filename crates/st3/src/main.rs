@@ -64,7 +64,6 @@ use presentation::{
     name = "st",
     bin_name = "st",
     version,
-    disable_help_subcommand = true,
     about = "Coordinate durable agent work across machines without losing operational truth"
 )]
 struct Cli {
@@ -94,14 +93,6 @@ const DEFAULT_DAEMON_WAIT_SECS: u64 = 30;
 
 #[derive(Subcommand)]
 enum Command {
-    /// Print help, including plumbing with --all.
-    #[command(hide = true)]
-    Help {
-        #[arg(long)]
-        all: bool,
-        /// Command path, such as agents new.
-        command: Vec<String>,
-    },
     /// Start the HTTP API, readers, peers, and reconciler.
     Up(UpArgs),
     /// Understand what needs action now.
@@ -3054,34 +3045,15 @@ fn main() -> ExitCode {
         st2::provider_session::install_stop_handlers();
         st2::reexec::unblock_stop_signals();
     }
-    let matches = Cli::command()
-        .override_help(cli_help::root_help(false))
-        .get_matches();
-    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
-    if let Command::Help { all, command } = &cli.command {
-        if command.is_empty() {
-            print!("{}", cli_help::root_help(*all));
-        } else {
-            let mut help = Cli::command();
-            help.build();
-            let mut path = String::from("st");
-            for name in command {
-                let Some(child) = help.find_subcommand(name).cloned() else {
-                    eprintln!("Unknown command: {path} {name}");
-                    return ExitCode::from(2);
-                };
-                help = child;
-                path.push(' ');
-                path.push_str(name);
-            }
-            help = help.bin_name(path.clone());
-            // Let clap choose the same short/long format as the command's --help flag.
-            help.try_get_matches_from([path, "--help".into()])
-                .expect_err("--help renders help")
-                .exit();
-        }
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    if cli_help::all_help_requested(&arguments) {
+        print!("{}", cli_help::root_help(true));
         return ExitCode::SUCCESS;
     }
+    let matches = Cli::command()
+        .override_help(cli_help::root_help(false))
+        .get_matches_from(arguments);
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     if let Command::Up(args) = &cli.command {
         record_daemon_commands(args);
     }
@@ -3208,7 +3180,6 @@ async fn run(cli: Cli) -> Result<()> {
     // Drivers outlive daemon restarts and handle an outage in their own loops; doctor reports one.
     let immediate = Client::new(endpoint.clone());
     match cli.command {
-        Command::Help { .. } => unreachable!(),
         Command::Up(_) => unreachable!(),
         Command::Skill(_) => unreachable!(),
         Command::ReplicationWorker(_) => unreachable!(),

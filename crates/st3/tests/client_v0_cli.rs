@@ -1890,6 +1890,11 @@ fn help_starts_with_examples_and_keeps_plumbing_reachable() {
     assert!(default.contains("Running st on a machine or fleet:"));
     assert!(!default.contains("Plumbing:"));
     assert!(help(&["help", "--all"]).contains("Plumbing:"));
+    assert_eq!(
+        help(&["help", "--all"]),
+        help(&["--endpoint", "help", "help", "--all"])
+    );
+    assert!(!help(&["agents", "ls", "--all", "--help"]).contains("Plumbing:"));
     for path in [
         vec!["schema"],
         vec!["agents", "new"],
@@ -1898,8 +1903,11 @@ fn help_starts_with_examples_and_keeps_plumbing_reachable() {
         let mut flag = path.clone();
         flag.push("--help");
         let mut named = vec!["help"];
-        named.extend(path);
+        named.extend(path.clone());
         assert_eq!(help(&flag), help(&named));
+        let mut nested = path;
+        nested.insert(1, "help");
+        assert_eq!(help(&flag), help(&nested));
     }
     let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
         .args(["help", "missing-command"])

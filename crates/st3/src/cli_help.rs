@@ -52,6 +52,30 @@ const GROUPS: &[(&str, &[&str])] = &[
     ),
 ];
 
+/// Only intercept root `help --all`. All other help paths remain clap's native help tree.
+pub(super) fn all_help_requested(arguments: &[std::ffi::OsString]) -> bool {
+    if !arguments.iter().any(|argument| argument == "--all") {
+        return false;
+    }
+    // Use the real global options to find the root command, so option values such as a
+    // device name or endpoint containing "help" cannot accidentally trigger this path.
+    let parser = Cli::command().disable_help_subcommand(true).subcommand(
+        clap::Command::new("help").arg(
+            clap::Arg::new("all")
+                .long("all")
+                .action(clap::ArgAction::SetTrue),
+        ),
+    );
+    parser
+        .try_get_matches_from(arguments)
+        .ok()
+        .is_some_and(|matches| {
+            matches
+                .subcommand_matches("help")
+                .is_some_and(|help| help.get_flag("all"))
+        })
+}
+
 pub(super) fn root_help(all: bool) -> String {
     let command = Cli::command();
     let mut output = String::from(
