@@ -641,6 +641,12 @@ fn step_owner(model: &Model, step: &MissionStep) -> Option<String> {
 }
 
 fn missions(model: &Model) -> Vec<Mission> {
+    // A step a person's gate holds: its attention item is about the step itself.
+    let gated = model
+        .attention()
+        .filter(|item| item.attention_kind == "human-gate")
+        .map(|item| item.source_id.as_str())
+        .collect::<BTreeSet<_>>();
     model
         .missions()
         .map(|mission| {
@@ -674,8 +680,10 @@ fn missions(model: &Model) -> Vec<Mission> {
             } else if !work.is_empty()
                 && work.iter().all(|step| {
                     step.state == "completed"
-                        || (matches!(step.state.as_str(), "claimed" | "running")
-                            && step.agentless
+                        || (matches!(
+                            step.state.as_str(),
+                            "claimed" | "running" | "working" | "verifying"
+                        ) && step.agentless
                             && keeps_open(&step.path))
                 })
                 && work.iter().any(|step| step.state != "completed")
@@ -684,7 +692,7 @@ fn missions(model: &Model) -> Vec<Mission> {
                 Word::Watching
             } else if states
                 .iter()
-                .any(|state| matches!(*state, "claimed" | "running"))
+                .any(|state| matches!(*state, "claimed" | "running" | "working" | "verifying"))
             {
                 Word::Working
             } else if let Some(ready) = work
@@ -716,8 +724,9 @@ fn missions(model: &Model) -> Vec<Mission> {
                 .iter()
                 .map(|step| {
                     let state = match step.state.as_str() {
+                        _ if gated.contains(step.id.as_str()) => StepState::NeedsYou,
                         "completed" => StepState::Done,
-                        "claimed" | "running" => StepState::Working,
+                        "claimed" | "running" | "working" | "verifying" => StepState::Working,
                         "ready" => StepState::Ready,
                         "waiting" => StepState::Waiting,
                         "blocked" => StepState::Waiting,
@@ -745,7 +754,11 @@ fn missions(model: &Model) -> Vec<Mission> {
                     Step {
                         name: step.path.clone(),
                         state,
-                        owner: step_owner(model, step),
+                        owner: if state == StepState::NeedsYou {
+                            Some("you".into())
+                        } else {
+                            step_owner(model, step)
+                        },
                         // st keeps a step's last reason after it moves on; only a step still
                         // waiting is held up by it.
                         note: note.or_else(|| {
@@ -2252,6 +2265,32 @@ mod tests {
             .find(|mission| mission.title.contains("Gate"))
             .unwrap();
         assert_eq!(gate.steps[0].note, None);
+        assert_eq!(
+            gate.steps[0].state,
+            StepState::Working,
+            "st calls it working"
+        );
+
+        // The same step, once st asks a person to answer it.
+        model.actor = "person/avery".into();
+        model.now = window(vec![json!({
+            "id": "attention/gate", "kind": "attention", "revision": "r",
+            "updated_at": "2026-09-29T09:58:00Z", "attention_kind": "human-gate",
+            "source_id": "step-run/gate-1/answer", "person_id": "person/avery",
+            "mission_id": "mission/fleet/harbor/gate", "title": "answer",
+            "detail": "Which tide table?", "priority": "normal", "state": "open",
+            "requested_at": "2026-09-29T09:58:00Z", "targets": [], "target_states": [],
+        })]);
+        let world = super::world(&model, "person/avery", &Extras::default());
+        let Load::Ready(missions) = &world.missions else {
+            panic!("missions load")
+        };
+        let gate = missions
+            .iter()
+            .find(|mission| mission.title.contains("Gate"))
+            .unwrap();
+        assert_eq!(gate.steps[0].state, StepState::NeedsYou);
+        assert_eq!(gate.steps[0].owner.as_deref(), Some("you"));
     }
 
     #[test]

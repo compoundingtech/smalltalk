@@ -412,7 +412,7 @@ impl Reach {
         match self {
             Reach::Here => "this machine",
             Reach::Direct => "connected",
-            Reach::Indirect => "online, through another machine",
+            Reach::Indirect => "online via others",
             Reach::Offline => "offline",
             Reach::Unknown => "st cannot tell",
         }
