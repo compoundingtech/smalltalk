@@ -3579,6 +3579,21 @@ async fn run_up(args: UpArgs) -> Result<()> {
         recorder.map(|installation| installation.directory),
     )?);
     tokio::spawn(reconciler.supervise());
+    // A start no longer rebuilds the operation projection; check it once the API serves.
+    tokio::spawn({
+        let store = store.clone();
+        async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            match tokio::task::spawn_blocking(move || store.repair_operation_projection_drift())
+                .await
+            {
+                Ok(Ok(true)) => eprintln!("st3: rebuilt an operation projection that drifted"),
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => eprintln!("st3: operation projection check failed: {error:#}"),
+                Err(error) => eprintln!("st3: operation projection check stopped: {error}"),
+            }
+        }
+    });
     tokio::spawn(st3::profile::watch_runtime_lag());
     tokio::spawn(trim_local_observations(
         store.clone(),
