@@ -3093,7 +3093,8 @@ fn run_driver_hook() -> ExitCode {
         name,
         rest,
         &env,
-        &mut std::io::stdin().lock(),
+        // Unlocked: the status-line tee reads stdin itself, and a held lock would deadlock it.
+        &mut std::io::stdin(),
         &mut |diagnostic| {
             if let Err(error) = st3::driver_hook::post_diagnostic(&env, &diagnostic) {
                 eprintln!(
@@ -14267,6 +14268,32 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_claude_session_without_a_binding_is_reported_once_after_the_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = Instant::now();
+        let mut watch = ClaudeBindingWatch::default();
+        assert_eq!(watch.overdue(dir.path(), None, start), None);
+        assert_eq!(watch.overdue(dir.path(), Some("wrapper-1"), start), None);
+        let late = start + CLAUDE_BINDING_GRACE;
+        let reason = watch.overdue(dir.path(), Some("wrapper-1"), late).unwrap();
+        assert!(reason.contains("bound no native session"), "{reason}");
+        assert_eq!(watch.overdue(dir.path(), Some("wrapper-1"), late), None);
+        watch.retry();
+        assert!(watch.overdue(dir.path(), Some("wrapper-1"), late).is_some());
+        // A new wrapper session gets its own grace, and a bound one is never reported.
+        assert_eq!(watch.overdue(dir.path(), Some("wrapper-2"), late), None);
+        fs::write(
+            dir.path().join(st3::hooks::CLAUDE_BINDING_FILE),
+            r#"{"incarnation":"wrapper-2","native_session_id":"native-2"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            watch.overdue(dir.path(), Some("wrapper-2"), late + CLAUDE_BINDING_GRACE),
+            None
+        );
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn peer_status(peer: &str, digest: Option<&str>) -> st3::model::ReplicationPeerStatus {

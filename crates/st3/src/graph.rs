@@ -5049,6 +5049,36 @@ message "external" {
     }
 
     #[test]
+    fn no_harness_launch_reaches_st2() {
+        for harness in ["claude", "codex", "pi", "omp", "opencode"] {
+            let intent = parse_test_intent(
+                &format!(
+                    "version 2\n\n  agent \"worker\" {{\n    workspace \"/work\"\n    harness \"{harness}\" {{}}\n  }}\n"
+                ),
+                "node",
+            )
+            .expect("new KDL parses");
+            let member = intent.subjects["agent/node.worker"]
+                .member
+                .as_ref()
+                .unwrap();
+            let crate::model::LaunchSpec::Argv(argv) = &member.launch else {
+                panic!("the native driver needs argv");
+            };
+            for text in argv
+                .iter()
+                .chain(member.environment.keys())
+                .chain(member.environment.values())
+            {
+                assert!(
+                    !crate::hooks::mentions_st2_surface(text),
+                    "the {harness} launch reaches st2: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn claude_always_uses_the_native_interactive_channel() {
         let intent = parse_test_intent(
             r#"
