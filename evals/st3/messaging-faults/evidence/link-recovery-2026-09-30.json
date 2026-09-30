@@ -453,5 +453,6 @@
       "delivery_state": "current"
     }
   ],
-  "reproduction": "Run scripts/st3-messaging-faults-eval/run CANDIDATE OUT --old-binary HISTORICAL --cases link-minutes outside an st seat, twenty times with up to eight concurrent processes and distinct OUT directories. All default durations and the read deadline remain unchanged."
+  "reproduction": "Run scripts/st3-messaging-faults-eval/run CANDIDATE OUT --old-binary HISTORICAL --cases link-minutes outside an st seat, twenty times with up to eight concurrent processes and distinct OUT directories. All default durations and the read deadline remain unchanged.",
+  "pull_request": "https://github.com/compoundingtech/smalltalk/pull/830"
 }
