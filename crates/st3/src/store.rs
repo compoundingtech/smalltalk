@@ -2237,8 +2237,7 @@ impl Store {
         create_graph_generation_triggers(&connection)?;
         {
             let transaction = connection.transaction()?;
-            rebuild_operations_tx(&transaction)?;
-            rebuild_planning_tx(&transaction)?;
+            rebuild_derived_tables_once_tx(&transaction)?;
             seed_replica_envelopes_tx(&transaction, &origin, None)?;
             transaction.commit()?;
         }
@@ -2437,6 +2436,20 @@ impl Store {
             cache.pop_front();
         }
         Ok(items)
+    }
+
+    /// Rebuild the operation projection when it no longer matches the claim log, and say
+    /// whether it had to. A start no longer rebuilds it; the daemon checks off the request path
+    /// once it serves.
+    pub fn repair_operation_projection_drift(&self) -> Result<bool> {
+        if self.operation_projection_drift()?.is_empty() {
+            return Ok(false);
+        }
+        let mut connection = self.connection.write();
+        let transaction = connection.transaction()?;
+        rebuild_operations_tx(&transaction)?;
+        transaction.commit()?;
+        Ok(true)
     }
 
     pub fn operation_projection_drift(&self) -> Result<Vec<String>> {
@@ -17478,6 +17491,33 @@ fn expected_operations(
         .collect())
 }
 
+/// The version of the rules that derive `operations` and the planning tables from claims. Every
+/// write and projection keeps both current, so a start rebuilds them only when this changes, or
+/// for a store no build with this rule has opened. Rebuilding them read every claim and held a
+/// start for seconds before the API could answer.
+const DERIVED_TABLES_VERSION: &str = "1";
+
+fn rebuild_derived_tables_once_tx(transaction: &Transaction<'_>) -> Result<()> {
+    let built: Option<String> = transaction
+        .query_row(
+            "SELECT value FROM meta WHERE key='derived_tables_version'",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if built.as_deref() == Some(DERIVED_TABLES_VERSION) {
+        return Ok(());
+    }
+    rebuild_operations_tx(transaction)?;
+    rebuild_planning_tx(transaction)?;
+    transaction.execute(
+        "INSERT INTO meta(key, value) VALUES ('derived_tables_version', ?1)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+        [DERIVED_TABLES_VERSION],
+    )?;
+    Ok(())
+}
+
 fn rebuild_operations_tx(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute("DELETE FROM operations", [])?;
     for (id, (request_digest, canonical_claim_id, state)) in expected_operations(transaction)? {
@@ -30260,6 +30300,57 @@ mod tests {
         );
     }
 
+    /// A start rebuilds the tables derived from claims once, then keeps them: every write keeps
+    /// them current, and rebuilding them read every claim before the API could answer.
+    #[test]
+    fn a_start_keeps_the_derived_tables_it_built_before() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("claims.sqlite3");
+        drop(Store::open(&path, "node").unwrap());
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection.execute_batch("PRAGMA foreign_keys = OFF").unwrap();
+            connection
+                .execute(
+                    "INSERT INTO operations(id, request_digest, canonical_claim_id, state)
+                     VALUES ('op/kept', 'digest', 'claim/kept', 'active')",
+                    [],
+                )
+                .unwrap();
+        }
+        let reopened = Store::open(&path, "node").unwrap();
+        let kept: bool = reopened
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations WHERE id='op/kept')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(kept, "a start with current derived tables must not rebuild them");
+        drop(reopened);
+        {
+            let connection = Connection::open(&path).unwrap();
+            connection
+                .execute("DELETE FROM meta WHERE key='derived_tables_version'", [])
+                .unwrap();
+        }
+        let rebuilt = Store::open(&path, "node").unwrap();
+        let kept: bool = rebuilt
+            .connection
+            .lock()
+            .unwrap()
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM operations WHERE id='op/kept')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(!kept, "a store no build with this rule opened is rebuilt");
+    }
+
     #[test]
     fn simple_replication_advances_events_without_full_replay() {
         let store = Store::open_memory("node").unwrap();
@@ -36777,7 +36868,7 @@ version 2
     }
 
     #[test]
-    fn operation_projection_drift_is_detected_and_rebuilt_on_open() {
+    fn operation_projection_drift_is_detected_and_repaired() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("state.sqlite3");
         let store = Store::open(&path, "node").unwrap();
@@ -36805,8 +36896,12 @@ version 2
         assert_eq!(store.operation_projection_drift().unwrap().len(), 1);
         drop(store);
 
+        // A start keeps it, so it can answer at once; the repair finds and rebuilds it.
         let reopened = Store::open(&path, "node").unwrap();
+        assert_eq!(reopened.operation_projection_drift().unwrap().len(), 1);
+        assert!(reopened.repair_operation_projection_drift().unwrap());
         assert!(reopened.operation_projection_drift().unwrap().is_empty());
+        assert!(!reopened.repair_operation_projection_drift().unwrap());
     }
 
     #[test]
