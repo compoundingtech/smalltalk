@@ -236,7 +236,15 @@ agent "probe/{node.name}" {{
 
             first = await faults.until(both_read, 40)
             self.assertTrue(all(row["latency_ms"] < 3000 for row in first), first)
-            doctor = json.loads(await nodes[0].cli("doctor", "--json"))
+            # latest.json is written locally after publishing its report. The other
+            # node's doctor can still have the preceding report until replication
+            # carries the new success, especially after a late startup probe.
+            async def healthy_reports():
+                doctor = json.loads(await nodes[0].cli("doctor", "--json"))
+                return doctor if any(check["name"] == "delivery-probes" and check["status"] == "pass"
+                                     for check in doctor["checks"]) else None
+
+            doctor = await faults.until(healthy_reports, 10)
             self.assertTrue(any(check["name"] == "delivery-probes" and check["status"] == "pass" for check in doctor["checks"]), doctor)
             # Kill only this test's declared recipient, never a shared seat.
             await nodes[1].cli("agents", "stop", "agent/probe/cobalt", "--as", "person/eval")
