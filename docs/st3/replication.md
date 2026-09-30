@@ -131,6 +131,34 @@ arrived in, since a writer may put related claims in separate batches. The repla
 claim before it projects any, so a claim that fails to project is quarantined without ending the
 replay.
 
+A replay from nothing is not the normal path. A projection extends the graph with the claims it
+admits. A claim that reaches part of the graph out of the replay's order rebuilds only that part
+from its own claims, in the replay's order and passes. The parts are:
+
+- a mission run tree, which is a root run with its child runs, generations, steps, work and
+  revision proposals;
+- one desired subject;
+- one document;
+- one mission.
+
+So does every run tree that holds a claim this node wrote since the last projection, because this
+node applied that claim when it wrote it. A claim whose run or generation has not arrived waits in
+the claim log, and the claim that creates the run or generation rebuilds its tree. A revision that
+arrives after a run, generation or proposal that uses it rebuilds those trees. Claims of every
+other kind only add events and operations, whose order does not matter.
+
+The graph is replayed from nothing only in these cases:
+
+- a stale or unhealthy projection;
+- an operation whose digests conflict;
+- an operation claim without a digest;
+- a work claim that carries an operation;
+- a heal;
+- the first start of a build with the rule below.
+
+A rebuilt part costs what its own history costs, while a replay holds the store's only writer for
+as long as the whole graph takes.
+
 The first start of a build with this rule replays from nothing once. A run that this node created
 could show as over in its old graph while its claims say it runs. Starting that work again long
 after anyone expected it would surprise people, so the node writes the claims that end the run as
