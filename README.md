@@ -72,6 +72,15 @@ disables this step. Reapplying is safe, but removing a file does **not** delete
 its previously published declaration until managed-set apply exists (#646).
 The optional `ptyPackage` replaces the bundled `pty` for both the daemon and
 seats, working around the executable-directory PATH precedence in #633.
+
+Activation atomically installs a real `st3` executable at `stateDir/bin/st3` (by default
+`~/.local/state/st3/bin/st3`) before restarting the daemon, with `st` as an alias in that directory.
+The daemon, declaration-apply service, and service PATH use this stable location so running seats
+can follow new builds without ending their harness sessions. Unchanged contents are not rewritten.
+Package references in the systemd unit or launchd plist still trigger daemon restarts on upgrades.
+Seats started from store paths before this change remain stale until restarted; see
+[seats across deploys](docs/st3/seat-deploys.md).
+
 Linux user-manager lingering and macOS `st service permissions` remain host
 setup prerequisites. Fleet/replication setup is not managed by this module.
 
