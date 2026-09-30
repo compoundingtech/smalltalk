@@ -59,9 +59,12 @@ class Link:
         self.enabled = True
         self.connections = set()
         self.servers = []
+        self.events = []
 
     async def listen(self, target_port):
         async def accept(reader, writer):
+            self.events.append({"at_unix_ms": now_ms(), "event": "connect", "port": target_port,
+                                "enabled": self.enabled})
             self.connections.add(writer)
             upstream = None
             try:
@@ -70,16 +73,20 @@ class Link:
                 peer_reader, upstream = await asyncio.open_connection("127.0.0.1", target_port)
                 self.connections.add(upstream)
 
-                async def copy(source, destination):
+                async def copy(source, destination, direction):
                     while self.enabled:
                         chunk = await source.read(65536)
                         if not chunk:
                             break
+                        if chunk.startswith((b"POST ", b"GET ", b"HEAD ", b"HTTP/")):
+                            self.events.append({"at_unix_ms": now_ms(), "event": direction,
+                                                "port": target_port,
+                                                "line": chunk.split(b"\r\n", 1)[0].decode(errors="replace")})
                         destination.write(chunk)
                         await destination.drain()
                     destination.close()
 
-                await asyncio.gather(copy(reader, upstream), copy(peer_reader, writer))
+                await asyncio.gather(copy(reader, upstream, "request"), copy(peer_reader, writer, "response"))
             except (OSError, ConnectionError):
                 pass
             finally:
@@ -448,6 +455,12 @@ agent "fault-probe" {{
         reads = [row for row in relevant if row["event"] == "read"]
         read_at = min((row["accepted_at_unix_ms"] for row in reads), default=None)
         delay = read_at - cleared if read_at is not None else None
+        requests = [event["at_unix_ms"] for event in link.events
+                    if event["event"] == "request" and event["at_unix_ms"] >= cleared]
+        first_request = min(requests, default=None)
+        result.update(first_request_after_clear_ms=first_request - cleared if first_request is not None else None,
+                      read_after_first_request_ms=read_at - first_request
+                          if read_at is not None and first_request is not None else None)
         starts = [row for row in all_receipts if row["event"] == "started"]
         expected_starts = 2 if case == "harness-restart" else 1
         trace_text = await target.cli("trace", "show", subject, "--json", "--limit", "100")
@@ -478,6 +491,7 @@ agent "fault-probe" {{
             trace = await node.cli("trace", "show", "agent/eval/fault-probe", "--json", "--limit", "100", check=False)
             (directory / f"{node.name}-error-trace.jsonl").write_text(trace)
     finally:
+        write_json(directory / "link-events.json", link.events)
         await link.close()
         for node in reversed(nodes):
             terminal = await asyncio.create_subprocess_exec("pty", "peek", "--plain", "--full", "eval.fault-probe",

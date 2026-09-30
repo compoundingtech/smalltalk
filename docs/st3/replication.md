@@ -153,8 +153,9 @@ The worker coalesces wake bursts for one second, so new authority, such as a mis
 The worker also runs a 30-second anti-entropy exchange. A recent inbound exchange suppresses
 a redundant connection in the opposite direction; local graph changes still request a prompt
 push. Failed attempts back off exponentially from one second through minutes to one hour, with 20 percent
-jitter. Graph wakes do not reset failure backoff. A successful inbound exchange or a change to
-the member's routes interrupts it immediately. A returning outbound-only member starts its own
+jitter. Graph wakes do not reset failure backoff. An authenticated inbound request, a successful
+peer request, a change to the member's routes, or a local connectivity change interrupts it
+immediately, including activity received while an outbound request is still failing. A returning outbound-only member starts its own
 push and pull without waiting for the other members' retry timers. Fabric tunnels are obtained
 again on each attempt, so a restarted Fabric does not leave a stale cached tunnel. With Fabric
 0.2.21 or later, the worker also consumes its passive `peer-events --watch` stream: an online
@@ -163,6 +164,14 @@ node. Offline transport events create no fault. Older Fabric keeps using address
 suspend-gap, and anti-entropy recovery. Tailnet listeners and advertised endpoints also
 refresh on local connectivity changes, without waiting for their minute timer; disappeared
 interface addresses stop being advertised.
+
+An HTTP link can return silently without changing either machine's addresses. For five minutes
+after a successful outbound exchange, a failed dialer's retry wait probes that same HTTP route
+every three seconds, with a one-second timeout. The probe uses `HEAD` on the existing exchange
+route: any HTTP response, including an older build's `405`, wakes a signed exchange at once.
+It neither exports an inventory nor records a failure. A route that has never worked, a replaced
+route, or a peer absent for more than five minutes keeps the long retry schedule. Transport life
+only schedules an exchange; the exchange still authenticates every claim and peer.
 
 The same recovery applies to every member. A server may be absent for hours just as a laptop
 may be asleep. On daemon start, wake from sleep, network change or Fabric recovery, a member

@@ -74,6 +74,11 @@ traces, native receipts, process snapshots, agent cards, replication status and
 daemon/worker logs. Paths are normalized before publishing; stores, configuration
 secrets and credential profiles are not copied.
 
+`link-events.json` records connection attempts and HTTP request/response timestamps at the
+proxy. `first_request_after_clear_ms` and `read_after_first_request_ms` separate waiting for
+replication to reconnect from the time taken to deliver and acknowledge the message. These
+diagnostics do not change the fault, observation window, or ten-second read gate.
+
 The default swap appends a marker to a copied executable, producing a different
 image at the same path. `--swap-binary` tests a real other build instead. `--cases`
 selects cases for diagnosis. `--short-seconds`, `--long-seconds`,
