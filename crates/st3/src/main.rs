@@ -858,8 +858,9 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                     "PEER  {}  {}{}",
                     peer.peer,
                     peer.status,
-                    peer.last_error
+                    peer.refusal_reason
                         .as_deref()
+                        .or(peer.last_error.as_deref())
                         .map(|error| format!("  {error}"))
                         .unwrap_or_default()
                 );
@@ -6979,7 +6980,10 @@ fn render_replication_peers(
             "peer\t{}\t{}\t{}",
             peer.peer,
             peer.status,
-            peer.last_error.as_deref().unwrap_or("")
+            peer.refusal_reason
+                .as_deref()
+                .or(peer.last_error.as_deref())
+                .unwrap_or("")
         );
         if let Some(at) = peer.last_success_at_unix_ms {
             let _ = writeln!(output, "  last seen {}", relative_time(at, now));
@@ -14302,6 +14306,7 @@ mod tests {
             status: "up".into(),
             last_success_at_unix_ms: None,
             last_error: None,
+            refusal_reason: None,
             schema_digest: None,
             authority_digest: digest.map(str::to_owned),
             graph_digest: None,
@@ -15352,6 +15357,17 @@ mod tests {
     }
 
     #[test]
+    fn replication_status_renders_the_fabric_grant_reason() {
+        let mut peer = peer_status("cobalt", None);
+        peer.status = "refused".into();
+        peer.refusal_reason =
+            Some("refused by that member's Fabric grants (service st3-peer-v1)".into());
+        let output = render_replication_peers(&[peer], "local", 2000);
+        assert!(output.contains("peer\tcobalt\trefused\trefused by that member's Fabric grants"));
+        assert!(!output.contains("down"));
+    }
+
+    #[test]
     fn replication_status_says_which_side_holds_what_and_how_long_catching_up_takes() {
         let now = 1_000_000;
         let local = "1111111111111111aaaa";
@@ -15362,6 +15378,7 @@ mod tests {
                     status: "up".into(),
                     last_success_at_unix_ms: Some(now - 2_000),
                     last_error: None,
+                    refusal_reason: None,
                     schema_digest: None,
                     authority_digest: None,
                     graph_digest: graph.map(str::to_owned),

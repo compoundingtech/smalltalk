@@ -39,6 +39,7 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `replica_records` | Shared storage, with stated local fields | Shared raw record/position/claim identity and replicated repair meaning; admission status/errors/updated_at are local. Normalize from retained records plus tombstones; never compare physical receipt rows. |
 | `projection_health` | Local | Local admission/projection/quarantine status, frontier, errors and observation timestamps. Deterministic shared degraded-state summaries must be separate from receipt health. |
 | `replication_peers` | Local | Local connectivity, peer digest observations, receive timings and errors. |
+| `replication_refusals` | Local | Added after this audit: direct outbound Fabric grant refusals and observation timestamps. Route policy cache, never a replicated outcome. |
 | `capabilities` | Local | Local secret-bearing authorization tokens, expiry/use bookkeeping. |
 | `mission_revisions` | Shared projection | Shared full immutable mission revision/state/body and binding claim. created_index is a local historical cursor; repeated identical revision bindings need a deterministic representative claim. |
 | `mission_definitions` | Shared projection | Shared selected mission revision/state/claim. |
