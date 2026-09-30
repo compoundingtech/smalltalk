@@ -13,6 +13,22 @@ local Unix socket and authenticated Fabric-loopback HTTP. The Swift package is
 clients' contract tables with `cargo run -p st3-client-codegen`;
 CI and local verification use `cargo run -p st3-client-codegen -- --check` for byte stability.
 
+### Agent activity and human blocking
+
+An agent's `harness_state` describes activity independently of its optional `blocked_on`, `ask`,
+and diagnostic `reason`. A current `blocked_on: "human"` observation with ready, working, or idle
+activity makes the canonical agent `state: "waiting"`; clients present that combination as needing
+a person. It takes precedence over working or idle, not over a terminal runtime, an ended/failed or
+indeterminate harness, a reconcile fault, or an observation fenced out by the current incarnation.
+`ask` names the structured question, permission, or review, not text inferred from the terminal.
+
+The omp extension correlates an ask with its tool-call ID. Unrelated results leave it blocked; the
+matching answer emits a new unblocked activity frame. The pi-family channel retains all three axes
+while retrying publication and across st binary replacement. Each published harness observation is
+a complete snapshot, including explicit null clearing for absent blocking metadata, composer state,
+and exit, so legacy optional-field backfill cannot resurrect an answered ask. A delayed observation
+from a previous runtime incarnation never changes the current agent.
+
 ## Boundary and transport
 
 The client API is a projection and command gateway, not a graph replica. Its version is
