@@ -122,6 +122,9 @@ struct ClientSnapshot {
     created_at: String,
 }
 
+/// A client page and the snapshot it was read in, which the envelope names.
+type ClientPageResponse = (Extension<ClientSnapshot>, Json<ClientResourcePage>);
+
 #[derive(Clone, Debug, Default, Deserialize)]
 struct ClientListQuery {
     limit: Option<usize>,
@@ -683,6 +686,12 @@ async fn response_envelope(
     let enveloping = Instant::now();
     let status = response.status();
     let (mut parts, body) = response.into_parts();
+    // A page read inside one SQLite snapshot names that snapshot, which can be newer than the
+    // one this request was admitted at.
+    let client_snapshot = parts
+        .extensions
+        .remove::<ClientSnapshot>()
+        .or(client_snapshot);
     let raw = match to_bytes(body, usize::MAX).await {
         Ok(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|error| {
             json!({
@@ -1002,6 +1011,20 @@ fn client_page(
     items: Vec<Value>,
     query: &ClientListQuery,
 ) -> Result<ClientResourcePage, ApiError> {
+    client_page_read(state, snapshot, collection, items, query, false)
+}
+
+/// A page of `items`, or of the cached first page a cursor continues. `pinned` says the items
+/// were read in `snapshot` itself, so a commit since then cannot have torn them; otherwise a
+/// first page is refused once the store has moved past the snapshot.
+fn client_page_read(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    collection: &str,
+    items: Vec<Value>,
+    query: &ClientListQuery,
+    pinned: bool,
+) -> Result<ClientResourcePage, ApiError> {
     let requested_limit = query
         .limit
         .unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
@@ -1052,7 +1075,7 @@ fn client_page(
             cursor.expires_at_unix_ms,
         )
     } else {
-        if state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
+        if !pinned && state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
             return Err(client_page_expired(
                 "the snapshot changed; restart pagination from the first page",
             ));
@@ -1159,6 +1182,36 @@ fn client_page_filters(query: &ClientListQuery) -> BTreeMap<String, String> {
         filters.insert("native_only".into(), "true".into());
     }
     filters
+}
+
+/// A page of `collection` whose first page `read` computes inside one SQLite snapshot. The page
+/// names that snapshot, so a commit that lands while it reads neither tears it nor refuses it;
+/// a later page comes from the first page's cache, as every cached page does.
+async fn client_snapshot_page<F>(
+    state: &AppState,
+    snapshot: ClientSnapshot,
+    collection: &'static str,
+    query: &ClientListQuery,
+    read: F,
+) -> Result<ClientPageResponse, ApiError>
+where
+    F: FnOnce(&AppState, &ClientSnapshot) -> anyhow::Result<Vec<Value>> + Send + 'static,
+{
+    if query.cursor.is_some() {
+        let page = client_page(state, &snapshot, collection, Vec::new(), query)?;
+        return Ok((Extension(snapshot), Json(page)));
+    }
+    let reader = state.clone();
+    let (snapshot, items) = blocking_store(move || {
+        reader.store.clone().read_snapshot(|index| {
+            let snapshot = client_snapshot_at(&reader, index);
+            let items = read(&reader, &snapshot)?;
+            Ok((snapshot, items))
+        })
+    })
+    .await?;
+    let page = client_page_read(state, &snapshot, collection, items, query, true)?;
+    Ok((Extension(snapshot), Json(page)))
 }
 
 /// A host catching up with a peer can show early history as current, and a host whose graph
@@ -3127,39 +3180,31 @@ async fn client_work(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     if query.history {
-        return client_work_history(&state, &snapshot, &query)
-            .await
-            .map(Json);
+        return client_work_history(&state, snapshot, &query).await;
     }
-    if query.cursor.is_some() {
-        return client_page(&state, &snapshot, "work", Vec::new(), &query).map(Json);
-    }
-    let store = state.store.clone();
     let actor = query.actor.clone();
-    let history = query.history;
-    let snapshot_unix_ms = client_snapshot_time(&snapshot);
-    let items = blocking_store(move || {
+    client_snapshot_page(&state, snapshot, "work", &query, move |state, snapshot| {
         client_work_resources(
-            &store,
+            &state.store,
             actor.as_deref(),
-            history,
-            snapshot_unix_ms,
+            false,
+            client_snapshot_time(snapshot),
             snapshot.store_index,
         )
     })
-    .await?;
-    client_page(&state, &snapshot, "work", items, &query).map(Json)
+    .await
 }
 
-/// The work history, read a page at a time in the order it shows. Like the mission list, a
-/// later page reads its steps again, so it holds only while the store has not changed.
+/// The work history, read a page at a time in the order it shows, each page inside one SQLite
+/// snapshot. Like the mission list, a later page reads its steps again, so it holds only while
+/// that is still its first page's snapshot.
 async fn client_work_history(
     state: &AppState,
-    snapshot: &ClientSnapshot,
+    snapshot: ClientSnapshot,
     query: &ClientListQuery,
-) -> Result<ClientResourcePage, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     let (offset, limit, expires_at_unix_ms) = if let Some(encoded) = &query.cursor {
         let cursor = decode_client_cursor(encoded)?;
         if cursor.collection != "work"
@@ -3194,31 +3239,36 @@ async fn client_work_history(
             client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS),
         )
     };
-    let unchanged = || -> Result<(), ApiError> {
-        if state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
-            return Err(client_page_expired(
-                "the snapshot changed; restart pagination from the first page",
-            ));
-        }
-        Ok(())
-    };
-    unchanged()?;
-    let store = state.store.clone();
+    let reader = state.clone();
     let actor = query.actor.clone();
-    let snapshot_unix_ms = client_snapshot_time(snapshot);
-    let snapshot_index = snapshot.store_index;
-    let (items, has_more) = blocking_store(move || {
-        client_work_history_page(
-            &store,
-            actor.as_deref(),
-            snapshot_unix_ms,
-            snapshot_index,
-            offset,
-            limit,
-        )
+    let later_page = query.cursor.is_some();
+    let read = blocking_store(move || {
+        reader.store.clone().read_snapshot(|index| {
+            if later_page && index != snapshot.store_index {
+                return Ok(None);
+            }
+            let snapshot = if later_page {
+                snapshot
+            } else {
+                client_snapshot_at(&reader, index)
+            };
+            let (items, has_more) = client_work_history_page(
+                &reader.store,
+                actor.as_deref(),
+                client_snapshot_time(&snapshot),
+                index,
+                offset,
+                limit,
+            )?;
+            Ok(Some((snapshot, items, has_more)))
+        })
     })
     .await?;
-    unchanged()?;
+    let Some((snapshot, items, has_more)) = read else {
+        return Err(client_page_expired(
+            "the snapshot changed; restart pagination from the first page",
+        ));
+    };
     let next_cursor = has_more
         .then(|| {
             encode_client_cursor(&ClientPageCursor {
@@ -3238,7 +3288,7 @@ async fn client_work_history(
             })
         })
         .transpose()?;
-    Ok(ClientResourcePage {
+    let page = ClientResourcePage {
         kind: "page".into(),
         collection: "work".into(),
         filters: client_page_filters(query),
@@ -3250,7 +3300,8 @@ async fn client_work_history(
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
         sync: client_sync_notice(state),
-    })
+    };
+    Ok((Extension(snapshot), Json(page)))
 }
 
 async fn client_work_detail(
@@ -3285,22 +3336,28 @@ async fn client_agents(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
-    if query.cursor.is_some() {
-        return client_page(&state, &snapshot, "agents", Vec::new(), &query).map(Json);
-    }
-    let store = state.store.clone();
+) -> Result<ClientPageResponse, ApiError> {
     let history = query.history;
-    let created_at = snapshot.created_at.clone();
-    let snapshot_index = snapshot.store_index;
-    let mut items = blocking_store(move || {
-        client_agent_resources(&store, history, &created_at, snapshot_index)
-    })
-    .await?;
-    if let Some(status) = query.status.as_deref() {
-        items.retain(|item| item.get("state").and_then(Value::as_str) == Some(status));
-    }
-    client_page(&state, &snapshot, "agents", items, &query).map(Json)
+    let status = query.status.clone();
+    client_snapshot_page(
+        &state,
+        snapshot,
+        "agents",
+        &query,
+        move |state, snapshot| {
+            let mut items = client_agent_resources(
+                &state.store,
+                history,
+                &snapshot.created_at,
+                snapshot.store_index,
+            )?;
+            if let Some(status) = status.as_deref() {
+                items.retain(|item| item.get("state").and_then(Value::as_str) == Some(status));
+            }
+            Ok(items)
+        },
+    )
+    .await
 }
 
 async fn client_agents_detail(
@@ -3324,31 +3381,30 @@ async fn client_sessions(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
-    if query.cursor.is_some() {
-        return client_page(&state, &snapshot, "sessions", Vec::new(), &query).map(Json);
-    }
-    let store = state.store.clone();
+) -> Result<ClientPageResponse, ApiError> {
     let history = query.history;
-    let created_at = snapshot.created_at.clone();
-    let snapshot_index = snapshot.store_index;
-    let native_session_home = state.native_session_home.clone();
     let native_only = query.native_only;
-    let mut items = blocking_store(move || {
-        client_session_resources(
-            &store,
-            history,
-            &created_at,
-            snapshot_index,
-            native_session_home.as_deref(),
-            native_only,
-        )
-    })
-    .await?;
-    if query.native_only {
-        items.retain(|item| item.get("managed") == Some(&Value::Bool(false)));
-    }
-    client_page(&state, &snapshot, "sessions", items, &query).map(Json)
+    client_snapshot_page(
+        &state,
+        snapshot,
+        "sessions",
+        &query,
+        move |state, snapshot| {
+            let mut items = client_session_resources(
+                &state.store,
+                history,
+                &snapshot.created_at,
+                snapshot.store_index,
+                state.native_session_home.as_deref(),
+                native_only,
+            )?;
+            if native_only {
+                items.retain(|item| item.get("managed") == Some(&Value::Bool(false)));
+            }
+            Ok(items)
+        },
+    )
+    .await
 }
 
 async fn client_sessions_detail(
@@ -3480,16 +3536,19 @@ async fn client_attention(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<client_v0::ClientSession>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
-    if effective_query.cursor.is_some() {
-        return client_page(&state, &snapshot, "attention", Vec::new(), &effective_query).map(Json);
-    }
-    let items = client_attention_resources_with_previews(&state, person.as_deref(), query.history)
-        .map_err(ApiError::internal)?;
-    client_page(&state, &snapshot, "attention", items, &effective_query).map(Json)
+    let history = query.history;
+    client_snapshot_page(
+        &state,
+        snapshot,
+        "attention",
+        &effective_query,
+        move |state, _| client_attention_resources_with_previews(state, person.as_deref(), history),
+    )
+    .await
 }
 
 async fn client_attention_detail(
@@ -3512,21 +3571,21 @@ async fn client_messages(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<client_v0::ClientSession>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
-    if effective_query.cursor.is_some() {
-        return client_page(&state, &snapshot, "messages", Vec::new(), &effective_query).map(Json);
-    }
-    let items = client_message_resources(
-        &state.store,
-        person.as_deref(),
-        query.history,
-        query.actor.as_deref(),
+    let (history, actor) = (query.history, query.actor.clone());
+    client_snapshot_page(
+        &state,
+        snapshot,
+        "messages",
+        &effective_query,
+        move |state, _| {
+            client_message_resources(&state.store, person.as_deref(), history, actor.as_deref())
+        },
     )
-    .map_err(ApiError::internal)?;
-    client_page(&state, &snapshot, "messages", items, &effective_query).map(Json)
+    .await
 }
 
 async fn client_messages_detail(
@@ -11478,6 +11537,110 @@ mod tests {
         }
         read_holder.join().unwrap();
         write_holder.join().unwrap();
+    }
+
+    fn probe_claim(key: &str, state: &str) -> ClaimInput {
+        ClaimInput {
+            subject: "agent/probe".into(),
+            kind: "harness.observed".into(),
+            actor: Some("agent/probe".into()),
+            fields: BTreeMap::from([("state".into(), Value::String(state.into()))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(key.into()),
+        }
+    }
+
+    /// A page whose read a commit lands in, as another thread commits it midway.
+    async fn page_read_across_a_commit(
+        State(state): State<AppState>,
+        Extension(snapshot): Extension<ClientSnapshot>,
+        Query(query): Query<ClientListQuery>,
+    ) -> Result<ClientPageResponse, ApiError> {
+        client_snapshot_page(&state, snapshot, "probes", &query, |state, snapshot| {
+            let newest = |store: &Store| -> anyhow::Result<u64> {
+                Ok(store
+                    .claims_page(None, None, 0, None, true, 1)?
+                    .claims
+                    .first()
+                    .map_or(0, |claim| claim.store_index))
+            };
+            let before = newest(&state.store)?;
+            let store = state.store.clone();
+            std::thread::spawn(move || store.append_claim(&probe_claim("during", "working")))
+                .join()
+                .unwrap()?;
+            anyhow::ensure!(state.store.index()? > snapshot.store_index);
+            Ok(vec![json!({
+                "id": "probe/page",
+                "read_at": snapshot.store_index,
+                "before": before,
+                "after": newest(&state.store)?,
+            })])
+        })
+        .await
+    }
+
+    /// A first page reads inside one snapshot: a commit that lands while it reads neither tears
+    /// it nor refuses it, and the envelope names the snapshot the page was read in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_first_page_answers_from_its_snapshot_when_a_commit_lands_during_it() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        // A file store, as the daemon runs: in shared-cache memory a reader locks writers out.
+        state.store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), "node").unwrap());
+        state
+            .store
+            .append_claim(&probe_claim("first", "idle"))
+            .unwrap();
+        let admitted_at = state.store.index().unwrap();
+        // A page read at the store's first claim names that snapshot, not the newer one the
+        // request was admitted at.
+        async fn page_read_earlier(
+            State(state): State<AppState>,
+            Query(query): Query<ClientListQuery>,
+        ) -> Result<ClientPageResponse, ApiError> {
+            let snapshot = client_snapshot_at(&state, 1);
+            let page = client_page_read(&state, &snapshot, "earlier", Vec::new(), &query, true)?;
+            Ok((Extension(snapshot), Json(page)))
+        }
+        let app = Router::new()
+            .route("/v1/client/probes", get(page_read_across_a_commit))
+            .route("/v1/client/earlier", get(page_read_earlier))
+            .layer(from_fn_with_state(
+                (state.clone(), ClientTransportBoundary::Unix),
+                response_envelope,
+            ))
+            .with_state(state.clone());
+        let envelope = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+        let (status, page) = envelope("/v1/client/probes").await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let item = &page["value"]["items"][0];
+        assert_eq!(item["read_at"], admitted_at);
+        assert_eq!(page["snapshot"]["store_index"], admitted_at);
+        // The page saw neither the claim committed while it read nor anything after its snapshot.
+        assert_eq!(item["before"], admitted_at);
+        assert_eq!(item["after"], admitted_at);
+        assert!(state.store.index().unwrap() > admitted_at);
+
+        state
+            .store
+            .append_claim(&probe_claim("second", "idle"))
+            .unwrap();
+        let (status, page) = envelope("/v1/client/earlier").await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["snapshot"], json!(client_snapshot_at(&state, 1)));
     }
 
     /// A seat's mailbox poll, one subject's status, a client's admission, and replication and

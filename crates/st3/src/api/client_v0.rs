@@ -2171,7 +2171,7 @@ pub(super) async fn missions(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     require_scope(&session, "read.projections")?;
     let requested_limit = query
         .limit
@@ -2208,27 +2208,37 @@ pub(super) async fn missions(
             client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS),
         )
     };
-    if state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
-        return Err(client_page_expired(
-            "the mission collection changed; restart pagination",
-        ));
-    }
-    let store = state.store.clone();
-    let snapshot_index = snapshot.store_index;
+    // Each page reads its missions inside one SQLite snapshot. A first page names that snapshot;
+    // a later page reads the missions again, so it holds only while that is still its first
+    // page's snapshot.
+    let reader = state.clone();
     let history = query.history;
-    let (items, has_more) = super::blocking_store(move || {
-        let mut ids = store.mission_collection_ids(history, offset, limit.saturating_add(1))?;
-        let has_more = ids.len() > limit;
-        ids.truncate(limit);
-        let items = mission_resources_filtered(&store, snapshot_index, history, None, Some(&ids))?;
-        Ok::<_, anyhow::Error>((items, has_more))
+    let later_page = query.cursor.is_some();
+    let requested = snapshot;
+    let read = super::blocking_store(move || {
+        let store = reader.store.clone();
+        store.read_snapshot(|index| {
+            if later_page && index != requested.store_index {
+                return Ok(None);
+            }
+            let snapshot = if later_page {
+                requested
+            } else {
+                client_snapshot_at(&reader, index)
+            };
+            let mut ids = store.mission_collection_ids(history, offset, limit.saturating_add(1))?;
+            let has_more = ids.len() > limit;
+            ids.truncate(limit);
+            let items = mission_resources_filtered(&store, index, history, None, Some(&ids))?;
+            Ok(Some((snapshot, items, has_more)))
+        })
     })
     .await?;
-    if state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
+    let Some((snapshot, items, has_more)) = read else {
         return Err(client_page_expired(
             "the mission collection changed; restart pagination",
         ));
-    }
+    };
     let next_cursor = has_more
         .then(|| {
             encode_client_cursor(&ClientPageCursor {
@@ -2248,7 +2258,7 @@ pub(super) async fn missions(
             })
         })
         .transpose()?;
-    Ok(Json(ClientResourcePage {
+    let page = ClientResourcePage {
         kind: "page".into(),
         collection: "missions".into(),
         filters: if history {
@@ -2264,7 +2274,8 @@ pub(super) async fn missions(
             cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
         },
         sync: client_sync_notice(&state),
-    }))
+    };
+    Ok((Extension(snapshot), Json(page)))
 }
 
 /// A single read of the projections used by mission show, agent tree, and seat queues.
@@ -2458,14 +2469,17 @@ pub(super) async fn runtimes(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     require_scope(&session, "read.projections")?;
-    if query.cursor.is_some() {
-        return client_page(&state, &snapshot, "runtimes", Vec::new(), &query).map(Json);
-    }
-    let items = runtime_resources(&state, query.history, &snapshot, &session)
-        .map_err(ApiError::internal)?;
-    client_page(&state, &snapshot, "runtimes", items, &query).map(Json)
+    let history = query.history;
+    client_snapshot_page(
+        &state,
+        snapshot,
+        "runtimes",
+        &query,
+        move |state, snapshot| runtime_resources(state, history, snapshot, &session),
+    )
+    .await
 }
 
 pub(super) async fn terminals(
@@ -2473,15 +2487,21 @@ pub(super) async fn terminals(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     require_scope(&session, "read.projections")?;
-    if query.cursor.is_some() {
-        return client_page(&state, &snapshot, "terminals", Vec::new(), &query).map(Json);
-    }
-    let mut items = runtime_resources(&state, query.history, &snapshot, &session)
-        .map_err(ApiError::internal)?;
-    items.retain(|item| item.get("terminal_id").is_some_and(Value::is_string));
-    client_page(&state, &snapshot, "terminals", items, &query).map(Json)
+    let history = query.history;
+    client_snapshot_page(
+        &state,
+        snapshot,
+        "terminals",
+        &query,
+        move |state, snapshot| {
+            let mut items = runtime_resources(state, history, snapshot, &session)?;
+            items.retain(|item| item.get("terminal_id").is_some_and(Value::is_string));
+            Ok(items)
+        },
+    )
+    .await
 }
 
 pub(super) async fn runtime_detail(
@@ -2514,32 +2534,40 @@ pub(super) async fn now(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     require_scope(&session, "read.projections")?;
     let person = person_filter(&session, query.person.as_deref())?;
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
-    let mut items =
-        super::client_attention_resources_with_previews(&state, person.as_deref(), query.history)
-            .map_err(ApiError::internal)?;
-    // The default Now view is the person's attention queue. Mission work belongs
-    // in Control; only an explicit work filter opts it into this combined view.
-    if query.actor.is_some() || query.owner_run.is_some() {
-        let mut work = super::client_work_resources(
-            &state.store,
-            query.actor.as_deref(),
-            query.history,
-            client_snapshot_time(&snapshot),
-            snapshot.store_index,
-        )
-        .map_err(ApiError::internal)?;
-        if let Some(owner_run) = query.owner_run.as_deref() {
-            work.retain(|item| item["mission_run_id"].as_str() == Some(owner_run));
-        }
-        items.extend(work);
-    }
-    // Attention is already ranked by the daemon. Keep that order when work is included.
-    client_page(&state, &snapshot, "now", items, &effective_query).map(Json)
+    let (history, actor, owner_run) = (query.history, query.actor.clone(), query.owner_run.clone());
+    client_snapshot_page(
+        &state,
+        snapshot,
+        "now",
+        &effective_query,
+        move |state, snapshot| {
+            let mut items =
+                super::client_attention_resources_with_previews(state, person.as_deref(), history)?;
+            // The default Now view is the person's attention queue. Mission work belongs
+            // in Control; only an explicit work filter opts it into this combined view.
+            if actor.is_some() || owner_run.is_some() {
+                let mut work = super::client_work_resources(
+                    &state.store,
+                    actor.as_deref(),
+                    history,
+                    client_snapshot_time(snapshot),
+                    snapshot.store_index,
+                )?;
+                if let Some(owner_run) = owner_run.as_deref() {
+                    work.retain(|item| item["mission_run_id"].as_str() == Some(owner_run));
+                }
+                items.extend(work);
+            }
+            // Attention is already ranked by the daemon. Keep that order when work is included.
+            Ok(items)
+        },
+    )
+    .await
 }
 
 pub(super) async fn machines(
@@ -2547,11 +2575,17 @@ pub(super) async fn machines(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     require_scope(&session, "read.projections")?;
-    let items = machine_resources(&state, query.history, &snapshot, &session)
-        .map_err(ApiError::internal)?;
-    client_page(&state, &snapshot, "machines", items, &query).map(Json)
+    let history = query.history;
+    client_snapshot_page(
+        &state,
+        snapshot,
+        "machines",
+        &query,
+        move |state, snapshot| machine_resources(state, history, snapshot, &session),
+    )
+    .await
 }
 
 fn device_resources(

@@ -1090,6 +1090,7 @@ impl WriterConnection {
     /// this one. A panic while it is lent rolls back the open transaction as it unwinds and still
     /// gives the connection back, so it cannot disable the store.
     fn write(&self) -> WriterGuard<'_> {
+        debug_assert_no_pinned_read();
         let wait = crate::profile::writer_waiting();
         let (lent, lent_here) = std::sync::mpsc::sync_channel(1);
         let (give_back, returned) = std::sync::mpsc::sync_channel(1);
@@ -1113,6 +1114,7 @@ impl WriterConnection {
         &self,
         job: impl FnOnce(&Transaction<'_>) -> std::result::Result<T, E> + Send + 'job,
     ) -> std::result::Result<std::result::Result<T, E>, String> {
+        debug_assert_no_pinned_read();
         let outcome = Mutex::new(None);
         let slot = &outcome;
         let run: Box<dyn FnOnce(&Transaction<'_>) -> bool + Send + '_> = Box::new(move |tx| {
@@ -1340,6 +1342,15 @@ thread_local! {
     /// While `Store::read_snapshot` runs on this thread: the pool it pinned a connection from,
     /// and that connection, held inside one read transaction.
     static PINNED_READER: RefCell<Option<(usize, Rc<Connection>)>> = const { RefCell::new(None) };
+}
+
+/// A write from inside `Store::read_snapshot` commits after the snapshot its thread reads, so
+/// the reads that follow it there cannot see it. Nothing writes from a pinned read.
+fn debug_assert_no_pinned_read() {
+    debug_assert!(
+        PINNED_READER.with(|slot| slot.borrow().is_none()),
+        "a write from inside a pinned read"
+    );
 }
 
 /// Ends a pinned read on every exit path, panics included.
@@ -9497,7 +9508,9 @@ impl Store {
         // snapshot so concurrent callers share one reduction, then serve clones at the same
         // store index. A later index always rebuilds, preserving snapshot semantics.
         if prefix == "agent/" {
-            let current = self.index()?;
+            // What this thread's reads can see, as every snapshot read checks: a read pinned to
+            // a snapshot can see a commit a moment before the writer publishes its index.
+            let current = current_index(&self.readers.get())?;
             let index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
             let mut cache = self
                 .agent_status_cache
@@ -31269,8 +31282,11 @@ mod tests {
         let seen = store
             .read_snapshot(|index| {
                 assert_eq!(index, before);
-                // A commit lands in the middle of the read. The writer sees it; the read does not.
-                observe(1);
+                // Another thread commits in the middle of the read. The writer sees it; the read
+                // does not.
+                std::thread::scope(|scope| {
+                    scope.spawn(|| observe(1));
+                });
                 assert!(store.index().unwrap() > index);
                 let claims = store.claims_for("resource/pinned", None)?.len();
                 let nested = store.read_snapshot(|nested| {
