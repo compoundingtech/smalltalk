@@ -32,7 +32,7 @@ This design replaces each step:
 | Edit another member's config | Membership is a set of claims in the graph; every member learns it by replication |
 | Reinstall services to change peers | Service files carry no peers; the worker reads membership at run time |
 | A helper keeps a Fabric dial alive | The worker dials Fabric itself; Tailscale needs no dial at all |
-| A laptop is listed at a dead port and reported down | A dial-out member is never dialed and never reported down |
+| A peer is listed at a dead port and reported down | Any absent member is last seen; successful connections sync both directions |
 
 ## What a person types
 
@@ -45,12 +45,13 @@ st fleet invite laptop
 On the new machine, after installing a release:
 
 ```sh
-st fleet join --dial-out
+st fleet join
 ```
 
 `join` asks for the code, receives the fleet secret, installs the services, and waits until the
-new machine has the fleet's full history. `--dial-out` is for a machine that is often asleep or
-offline, such as a laptop. Leave it out for a machine that stays on.
+new machine has the fleet's full history. Offline is normal for every member, with no machine
+kind or roaming flag. `--dial-out` only prevents opening a listener, when explicitly desired;
+a firewall or NAT that blocks inbound traffic needs no special setup.
 
 When both machines are Fabric peers, the code never has to appear on a screen or in a command
 line. `st` sends it as a file to the new machine's Fabric inbox, and `join` reads and deletes it:
@@ -415,7 +416,7 @@ continues from the last completed step:
    `local`. Names match `[A-Za-z0-9][A-Za-z0-9._-]{0,62}`.
 2. **Key.** Create `STATE/fleet/node.key` if it does not exist, and sync it to disk before any
    request. Checkpoint `key-created`.
-3. **Route.** Pick the sponsor endpoint: `--via URL` if given (loopback only), else tailnet if this
+3. **Route.** Pick the sponsor endpoint: `--via ROUTE` if given (loopback or tailnet HTTP, or Fabric), else tailnet if this
    machine's Tailscale is up, else Fabric if `fabric probe` reports the sponsor serves the fleet
    protocol, else an advertised loopback endpoint. If Fabric is the only route and the probe says
    `unsupported`, print the exact grant the sponsor needs:
@@ -896,10 +897,10 @@ in use for each member.
 - **Protocol name.** `st3/fleet/FLEET_ID` by default, so a throwaway fleet never collides with a
   real one on the same machines. `fabric_protocol` overrides it; a migrated fleet can keep the
   exposure name it already uses.
-- **Inbound.** The worker runs `fabric expose PROTOCOL --tcp 127.0.0.1:PORT --ephemeral` at start
-  and every 60 seconds. The exposure is not persisted in Fabric's configuration, so a crash leaves
-  nothing behind after Fabric restarts. `st fleet leave`, `st fleet mode dial-out`, and
-  `st uninstall` run `fabric unexpose PROTOCOL`.
+- **Inbound.** The worker runs `fabric expose PROTOCOL --tcp 127.0.0.1:PORT` at start,
+  on a local reconnect, and every 60 seconds. Fabric persists and restores the exposure after a
+  restart. `st fleet leave`, `st fleet mode dial-out`, and `st uninstall` remove it with
+  `fabric unexpose PROTOCOL`.
 - **Outbound.** Before an exchange over Fabric, the worker runs
   `fabric dial NODE_ID PROTOCOL --tcp 127.0.0.1:0`. Fabric's daemon creates or reuses a loopback
   TCP tunnel to that peer's exposure and the command prints its address. The worker sends the
@@ -956,7 +957,7 @@ st fleet migrate --anchor
 # For each other machine, on any migrated member:
 st fleet invite server --migrate --send-fabric
 # and on that machine:
-st fleet migrate --fabric-inbox          # add --dial-out on a laptop
+st fleet migrate --fabric-inbox          # no machine-kind option is needed
 ```
 
 A migration code works like a join code, and it can be pasted or read from a file the same ways.
@@ -997,9 +998,9 @@ It checks that condition, sets `legacy_peers = false`, and prints the `[[peers]]
 A hand-written Fabric dial helper and its launchd agent or systemd unit are no longer needed once
 `st fleet status` shows the Fabric route in use for that member. Remove them then.
 
-A config peer that is a laptop listed at an unused port becomes a dial-out member when it migrates
-with `--dial-out`. Every other member then stops dialing it, and the `[[peers]]` entry is ignored
-until it is deleted.
+A member with an unreachable advertised port still joins and exchanges in both directions by
+initiating connections itself. Other members suppress redundant dials after inbound exchanges,
+back off through minutes and hours during absence, and display its last exchange time.
 
 A config peer that will be wiped does not need to migrate. Remove it with `st fleet remove NAME`
 on a migrated member, wipe it, and join it again with a normal invite.
@@ -1167,7 +1168,7 @@ The worker gains hidden settings for tests: `--anti-entropy-interval-ms` and
 - `a_dial_out_member_never_appends_transport_observations`
 - `a_listening_member_records_a_dial_out_exchange_only_locally`
 - `the_fabric_route_dials_through_the_cli_and_dials_again_after_a_lost_socket` (shim)
-- `the_fabric_exposure_is_ephemeral_and_removed_on_leave` (shim)
+- `the_fabric_route_dials_through_the_cli_and_refuses_a_non_loopback_tunnel` (shim)
 - `the_tailnet_listener_binds_only_tailscale_addresses_in_the_tailnet_ranges` (injected
   interface and command output)
 - `the_join_route_is_absent_without_invites_and_bounds_body_size_and_rate`
@@ -1460,3 +1461,54 @@ differences, found while building it or raised by intake reviews:
   step. That is a Fabric change.
 - **Remote terminal reads of a dial-out member's seats.**
 - **Windows.**
+
+
+## Move an existing fleet off local dial helpers
+
+This keeps each member's name, fleet ID, secret, and history. The names below are invented;
+substitute the existing member names. Install the same current st build on all members first.
+Keep the legacy configuration and helpers until the native routes have exchanged successfully.
+
+1. On `harbor`, the chosen anchor, migrate and retain the already granted Fabric protocol:
+
+   ```sh
+   st fleet migrate --anchor --transports tailscale,fabric --fabric-protocol st3-peer-v1
+   st fleet status
+   ```
+
+2. On `harbor`, invite each remaining existing member through the transport it can reach:
+
+   ```sh
+   st fleet invite beacon --migrate --via fabric --send-fabric
+   ```
+
+   On `beacon`, redeem it in one command. Repeat for every remaining member:
+
+   ```sh
+   st fleet migrate --fabric-inbox --transports tailscale,fabric --fabric-protocol st3-peer-v1
+   ```
+
+   When using Tailscale instead, issue `st fleet invite beacon --migrate --via tailscale`,
+   then pass its code to `st fleet migrate --via http://100.64.0.10:31313` on `beacon`.
+   Use the sponsor's actual tailnet address and port. A Fabric code can likewise be redeemed
+   with `st fleet migrate --via fabric://NODE_ID/st3-peer-v1`. The worker saves the lasting
+   Fabric route and obtains its local TCP tunnel itself.
+
+3. On every member, inspect `st fleet status` and `st replication status`. Require current
+   membership for every retained name and a successful signed exchange over the native route.
+   Members advertise all available Tailscale and Fabric endpoints; the worker tries alternatives
+   if one route fails. A member may also list several `[[peers]]` overrides for the same name,
+   each with a different `url`, including `fabric://NODE_ID/PROTOCOL` and tailnet HTTP.
+
+4. On every member, run `st fleet migrate --finish`. Delete exactly the legacy configuration
+   lines it prints, then run `st service install` so both services read the membership settings.
+   Confirm new writes arrive in both directions using `st replication status`.
+
+5. Remove that member's old dial-helper unit and executable. The replication worker now asks
+   Fabric for its own tunnel, and Fabric 0.2.21 restores persistent dial declarations after a
+   restart. Remove workaround exposures and grants only after the native path has been verified;
+   retain the member protocol grant used by its advertised endpoints.
+
+For a new member, `st fleet join --via http://100.64.0.10:31313` or
+`st fleet join --via fabric://NODE_ID/st3-peer-v1` redeems the code and starts normal replication.
+No member type changes the sync policy.

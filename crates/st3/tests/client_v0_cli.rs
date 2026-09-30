@@ -712,7 +712,7 @@ mission "cli/child" state="ready" {
             .is_empty()
     );
     assert_eq!(machines["value"]["items"][1]["id"], "machine/offline-peer");
-    assert_eq!(machines["value"]["items"][1]["state"], "indeterminate");
+    assert_eq!(machines["value"]["items"][1]["state"], "last-seen");
     assert!(
         machines["value"]["items"]
             .as_array()

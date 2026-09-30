@@ -51,6 +51,7 @@ uuid = { version = "1", features = ["v7"] }
 walkdir = "2"
 
 [dev-dependencies]
+tokio = { version = "1", features = ["test-util"] }
 agent-spec = { path = "../agent-spec" }
 assert_cmd = "2"
 portable-pty = "0.9"

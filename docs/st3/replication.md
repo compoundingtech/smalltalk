@@ -23,7 +23,12 @@ The fleet ID is a persistent UUID. A store rejects another fleet ID after its fi
 
 The secret contains 32 raw bytes or 64 hexadecimal characters. Its file mode must deny group and other access.
 
-The listener and every peer URL must use loopback. Fabric or a similar local port exposer carries traffic between hosts.
+The peer listener binds loopback; the worker can additionally bind discovered tailnet addresses.
+Explicit routes accept loopback or tailnet HTTP and `fabric://NODE_ID/PROTOCOL`. Fabric routes
+name the lasting remote endpoint: the worker creates or reacquires the local tunnel itself.
+Several peer entries may name the same member with distinct routes. Arbitrary LAN/public HTTP
+addresses remain rejected. See [the migration procedure](../fleet-join.md#move-an-existing-fleet-off-local-dial-helpers)
+to replace a legacy local dial helper.
 
 On a node that only receives connections from a peer, list its name without a URL:
 
@@ -34,16 +39,21 @@ name = "node-b"
 
 This accepts node-b's authenticated exchanges and never dials it. The equivalent command-line
 entry is `--peer node-b`. A peer is observed as up after a successful exchange in either
-direction; it becomes down only after 90 seconds without a success. The worker checks peers
-without URLs once a minute. Repeated checks do not write repeated transport claims.
+direction. After 90 seconds without an exchange it is shown as `last-seen`, with the time
+of its last successful exchange, rather than as a fault. Doctor does not warn about absence,
+and delivery probes and their attention streaks wait for the member to exchange again.
+A config-peer node can omit `peer_listen` and initiate every exchange itself; it still pushes
+and pulls the full graph.
 
 ### Fleet members
 
 A node that joined or migrated keeps its fleet settings in `STATE/fleet/fleet.toml`, written by
 `st fleet` commands, and needs no `[[peers]]`. Its peers come from membership claims in the graph:
 it dials every current listening member and accepts exchanges from current members that sign with
-their member keys. A dial-out member accepts no connections, is never dialed, and neither records
-nor receives transport observations. A `[[peers]]` entry for a member is that member's first route
+their member keys. The existing dial-out mode controls whether the worker opens a listener; it needs no separate
+presence policy. Every current member appears in replication status and machine views with its
+last exchange time. Members behind NAT can initiate exchanges and converge in both directions,
+even while other members' attempts to reach their advertised addresses fail. A `[[peers]]` entry for a member is that member's first route
 from this machine. Service units for a member carry no peer, fleet, or secret arguments. See
 [Fleet join](../fleet-join.md) for invites, removal, and migration.
 
@@ -59,7 +69,17 @@ A local graph change writes `replication.wake`. The worker watches only this fil
 
 The worker coalesces wake bursts for one second, so new authority, such as a mission publish, reaches every peer within seconds. An exchange that stored new envelopes on either side runs again at once until a backlog drains. An exchange that stored nothing new waits for the next wake, even if it carried envelopes the other side already held.
 
-The worker also runs a 30-second anti-entropy exchange. This timer repairs a missed file event or a network interruption.
+The worker also runs a 30-second anti-entropy exchange. A recent inbound exchange suppresses
+a redundant connection in the opposite direction; local graph changes still request a prompt
+push. Failed attempts back off exponentially from one second through minutes to one hour, with 20 percent
+jitter. Graph wakes do not reset failure backoff. A successful inbound exchange or a change to
+the member's routes interrupts it immediately. A returning outbound-only member starts its own
+push and pull without waiting for the other members' retry timers. Fabric tunnels are obtained
+again on each attempt, so a restarted Fabric does not leave a stale cached tunnel. With Fabric
+0.2.21 or later, the worker also consumes its passive `peer-events --watch` stream: an online
+admission resets that member's retry, and a daemon reset refreshes exposures and announces this
+node. Offline transport events create no fault. Older Fabric keeps using address-change,
+suspend-gap, and anti-entropy recovery.
 
 ## Protocol
 

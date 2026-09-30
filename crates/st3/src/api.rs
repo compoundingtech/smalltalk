@@ -4953,7 +4953,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             let unavailable = replication
                 .peers
                 .iter()
-                .filter(|peer| peer.status != "up")
+                .filter(|peer| !matches!(peer.status.as_str(), "up" | "last-seen" | "unknown"))
                 .map(|peer| format!("{}={}", peer.peer, peer.status))
                 .collect::<Vec<_>>();
             let unresolved = replication.invalid_records + replication.unknown_records;
@@ -5065,6 +5065,25 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 message.to.starts_with("agent/")
                     && !matches!(message.status.as_str(), "read" | "closed")
             }) {
+                // A message for an absent remote host remains queued. Delivery is judged
+                // only once that host has exchanged with us again.
+                let owners = state
+                    .store
+                    .desired_subjects_named(std::slice::from_ref(&message.to))
+                    .map_err(ApiError::internal)?;
+                if let Some(host) = owners
+                    .first()
+                    .and_then(|owner| owner.member.as_ref())
+                    .map(|member| member.host.as_str())
+                    && host != state.node
+                    && !state
+                        .store
+                        .replication_peer_last_success(host)
+                        .map_err(ApiError::internal)?
+                        .is_some_and(|at| client_now_ms().saturating_sub(at) < 90_000)
+                {
+                    continue;
+                }
                 let claims = state
                     .store
                     .claims_for(&message.subject, Some("message.sent"))
@@ -5555,16 +5574,13 @@ fn replication_peer_names(state: &AppState) -> Vec<String> {
     names.extend(
         view.members
             .iter()
-            .filter(|member| member.state == "current" && member.mode == "listening")
+            .filter(|member| member.state == "current")
             .map(|member| member.name.clone()),
     );
     names.retain(|name| {
         let current = view.current(name);
         let ended = view.members.iter().any(|member| member.name == *name) && current.is_empty();
-        *name != state.node
-            && !ended
-            && !view.legacy_removed.contains(name)
-            && current.iter().all(|member| member.mode != "dial-out")
+        *name != state.node && !ended && !view.legacy_removed.contains(name)
     });
     names.into_iter().collect()
 }

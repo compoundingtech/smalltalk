@@ -50,10 +50,24 @@ recover_sent_subject() {
   return 1
 }
 
+# Both directions depend on the same remote member. Absence pauses the probe and
+# its attention streak; a fresh exchange makes it eligible again without intervention.
+route_available() {
+  local direction=$1 status
+  status=$(/usr/bin/timeout 15s "$ST3_BIN" replication status --json 2>/dev/null) || return 1
+  /usr/bin/jq -e --arg source "${direction%%-to-*}" --arg target "${direction#*-to-}" \
+    '[.peers[] | select(.peer == $source or .peer == $target)] | length > 0 and all(.status == "up")' \
+    <<<"$status" >/dev/null
+}
+
 probe() {
   local direction=$1 recipient response subject token started deadline thread count reply_ids reply_id
   LAST_SUBJECT=
   LAST_TOKEN=
+  if ! route_available "$direction"; then
+    log "waiting direction=$direction reason=member-last-seen"
+    return 3
+  fi
   token="probe-$(/usr/bin/date -u +%Y%m%dT%H%M%S)-${RANDOM}-${direction}"
   LAST_TOKEN=$token
   started=$(/usr/bin/date +%s)
@@ -130,6 +144,10 @@ probe() {
     fi
     /usr/bin/sleep 2
   done
+  if ! route_available "$direction"; then
+    log "waiting direction=$direction reason=member-last-seen subject=$subject"
+    return 3
+  fi
   log "FAILED direction=$direction subject=$subject token=$token timeout_seconds=$DEADLINE_SECONDS"
   return 1
 }
@@ -211,8 +229,15 @@ while true; do
   if probe "$direction"; then
     record_result "$direction" true
   else
-    record_result "$direction" false
-    log "delivery soak will retry after ${INTERVAL_SECONDS}s"
+    result=$?
+    # A member can go away while the probe is in flight. Keep its message queued
+    # and wait for a new exchange before attributing a delivery fault to its route.
+    if (( result == 3 )) || ! route_available "$direction"; then
+      log "waiting direction=$direction reason=member-last-seen"
+    else
+      record_result "$direction" false
+      log "delivery soak will retry after ${INTERVAL_SECONDS}s"
+    fi
   fi
   if [[ $direction == hetz-to-silber ]]; then
     direction=silber-to-hetz

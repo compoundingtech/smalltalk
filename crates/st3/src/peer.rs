@@ -18,6 +18,7 @@ use notify::Watcher as _;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
+use tokio::io::AsyncBufReadExt as _;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
@@ -25,7 +26,7 @@ use crate::client::Client;
 use crate::config::{Config, PeerConfig};
 use crate::fleet::transport::{
     Fabric, LocalTransports, Route, bindable_tailnet_addresses, default_fabric_protocol,
-    local_addresses, resolve_tool, routes_from_endpoints, tailscale_addresses,
+    local_addresses, parse_route, resolve_tool, routes_from_endpoints, tailscale_addresses,
 };
 use crate::fleet::{Acceptance, FleetView, MemberKey, Refusal, Sender, verify_signature};
 use crate::model::InventoryCheckpoint;
@@ -121,9 +122,11 @@ fn inflate(body: &[u8]) -> Result<Vec<u8>> {
 }
 
 fn deflated(headers: &HeaderMap) -> bool {
-    headers
-        .get("content-encoding")
-        .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(EXCHANGE_ENCODING.as_bytes()))
+    headers.get("content-encoding").is_some_and(|value| {
+        value
+            .as_bytes()
+            .eq_ignore_ascii_case(EXCHANGE_ENCODING.as_bytes())
+    })
 }
 
 fn accepts_deflate(headers: &HeaderMap) -> bool {
@@ -487,6 +490,7 @@ pub struct ClientRelay {
     links: Option<Arc<Store>>,
     /// The links last read from that store, and when, so a busy gateway reads them rarely.
     observed: Arc<std::sync::Mutex<Option<ObservedLinks>>>,
+    fabric: Option<Fabric>,
 }
 
 impl ClientRelay {
@@ -531,21 +535,42 @@ impl ClientRelay {
     /// The peers to try, in order, for a read bound for `target`: the target itself when it is a
     /// peer, then the peers with the shortest observed path to it. With no observation of the
     /// target at all, every peer is worth a try. Nodes the read already passed are never chosen.
-    fn next_hops(&self, target: &str, visited: &[String]) -> Vec<&PeerConfig> {
-        let dialable = self
-            .peers
-            .iter()
-            .filter(|peer| !peer.url.is_empty() && peer.name != self.node)
-            .filter(|peer| !visited.contains(&peer.name))
+    fn next_hops(&self, target: &str, visited: &[String]) -> Vec<PeerConfig> {
+        let view = self
+            .links
+            .as_ref()
+            .and_then(|store| store.fleet_view_sealed().ok())
+            .unwrap_or_default();
+        let local = LocalTransports {
+            fabric: self.fabric.is_some(),
+            tailscale: local_addresses()
+                .iter()
+                .any(crate::fleet::transport::is_tailnet_address),
+        };
+        let dialable = dial_targets(&view, &self.node, &self.peers, local);
+        let names = dialable
+            .keys()
+            .filter(|name| !visited.contains(name))
+            .cloned()
             .collect::<Vec<_>>();
         let links = self.observed_links();
-        let names = dialable
-            .iter()
-            .map(|peer| peer.name.clone())
-            .collect::<Vec<_>>();
         client_read_next_hops(&self.node, target, &names, visited, &links)
             .into_iter()
-            .filter_map(|name| dialable.iter().copied().find(|peer| peer.name == name))
+            .flat_map(|name| {
+                dialable
+                    .get(&name)
+                    .into_iter()
+                    .flatten()
+                    .map(move |route| PeerConfig {
+                        name: name.clone(),
+                        url: match route {
+                            Route::Http(url) => url.clone(),
+                            Route::Fabric { node, protocol } => {
+                                format!("fabric://{node}/{protocol}")
+                            }
+                        },
+                    })
+            })
             .collect()
     }
 
@@ -559,12 +584,28 @@ impl ClientRelay {
         Ok(Some(Self {
             node: config.node.clone(),
             peers: config.peers.clone(),
-            auth: FleetAuth::load(fleet, secret)?,
+            auth: FleetAuth::load(fleet, secret)?.with_member_key(
+                config
+                    .fleet
+                    .as_ref()
+                    .map(|file| {
+                        MemberKey::load(&file.node_key_path(&config.state_dir)).map(Arc::new)
+                    })
+                    .transpose()?,
+            ),
             http: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(3))
                 .build()?,
             links: None,
             observed: Arc::default(),
+            fabric: resolve_tool(
+                config
+                    .fleet
+                    .as_ref()
+                    .and_then(|file| file.fabric.as_deref()),
+                "fabric",
+            )
+            .map(Fabric::new),
         }))
     }
 
@@ -634,7 +675,7 @@ impl ClientRelay {
                 request: request.request.clone(),
                 relay,
             };
-            match self.send(peer, &outgoing).await {
+            match self.send(&peer, &outgoing).await {
                 Ok(value) => return Ok(value),
                 Err(error)
                     if error
@@ -657,6 +698,18 @@ impl ClientRelay {
         request: &ClientReadRequest,
     ) -> Result<serde_json::Value> {
         let name = peer.name.as_str();
+        let url = match parse_route(&peer.url).context("invalid peer client route")? {
+            Route::Http(url) => url,
+            Route::Fabric { node, protocol } => {
+                let address = self
+                    .fabric
+                    .as_ref()
+                    .context("Fabric is unavailable")?
+                    .dial(&node, &protocol)
+                    .await?;
+                format!("http://{address}")
+            }
+        };
         // A relayed read may pass through more nodes, each waiting a little less than the last.
         let timeout = CLIENT_READ_TIMEOUT
             + request.request.wait()
@@ -674,11 +727,7 @@ impl ClientRelay {
             .request_headers_for(CLIENT_READ_PATH, &self.node, &body)?;
         let mut response = self
             .http
-            .post(format!(
-                "{}{}",
-                peer.url.trim_end_matches('/'),
-                CLIENT_READ_PATH
-            ))
+            .post(format!("{}{}", url.trim_end_matches('/'), CLIENT_READ_PATH))
             .headers(headers)
             .header("content-type", "application/json")
             .timeout(timeout)
@@ -834,6 +883,7 @@ struct FleetContext {
     /// Bumped whenever the view changes, so the dial set follows membership.
     view_changed: watch::Sender<u64>,
     config_peers: BTreeSet<String>,
+    configured_fabric_peers: BTreeMap<String, String>,
     /// True on a node without `fleet.toml`, or with `legacy_peers = true`.
     legacy: bool,
     own_key: Option<String>,
@@ -848,6 +898,14 @@ struct FleetContext {
     /// Set once a member refused this node with a signed refusal naming its own key.
     removed: Arc<std::sync::atomic::AtomicBool>,
     state_dir: Option<PathBuf>,
+    /// Successful inbound exchanges suppress redundant dials and interrupt failure backoff.
+    inbound: Arc<std::sync::RwLock<BTreeMap<String, tokio::time::Instant>>>,
+    inbound_changed: watch::Sender<u64>,
+    /// Inventory advertised by the last inbound response; graph wakes it covers need no dial.
+    inbound_authority: Arc<std::sync::RwLock<BTreeMap<String, String>>>,
+    connectivity_changed: watch::Sender<u64>,
+    /// Sign of life from Fabric, distinct from a completed replication exchange.
+    online: Arc<std::sync::RwLock<BTreeMap<String, tokio::time::Instant>>>,
 }
 
 impl FleetContext {
@@ -858,6 +916,7 @@ impl FleetContext {
             view: Arc::default(),
             view_changed: watch::channel(0).0,
             config_peers,
+            configured_fabric_peers: BTreeMap::new(),
             legacy: true,
             own_key: None,
             bootstrap_keys: BTreeSet::new(),
@@ -866,6 +925,11 @@ impl FleetContext {
             bootstrap: None,
             removed: Arc::default(),
             state_dir: None,
+            inbound: Arc::default(),
+            inbound_changed: watch::channel(0).0,
+            inbound_authority: Arc::default(),
+            connectivity_changed: watch::channel(0).0,
+            online: Arc::default(),
         }
     }
 
@@ -1231,12 +1295,23 @@ pub async fn run_worker(config: Config) -> Result<()> {
         .as_ref()
         .filter(|_| wants("tailscale"))
         .and_then(|file| resolve_tool(file.tailscale.as_deref(), "tailscale"));
-    let fabric = config
-        .fleet
-        .as_ref()
-        .filter(|_| wants("fabric"))
-        .and_then(|file| resolve_tool(file.fabric.as_deref(), "fabric"))
-        .map(Fabric::new);
+    let fabric = if wants("fabric")
+        || config
+            .peers
+            .iter()
+            .any(|peer| peer.url.starts_with("fabric://"))
+    {
+        resolve_tool(
+            config
+                .fleet
+                .as_ref()
+                .and_then(|file| file.fabric.as_deref()),
+            "fabric",
+        )
+        .map(Fabric::new)
+    } else {
+        None
+    };
     let fleet = FleetContext {
         view: Arc::default(),
         view_changed: watch::channel(0).0,
@@ -1255,6 +1330,14 @@ pub async fn run_worker(config: Config) -> Result<()> {
             (!routes.is_empty()).then_some((sponsor, routes))
         }),
         config_peers: config.peers.iter().map(|peer| peer.name.clone()).collect(),
+        configured_fabric_peers: config
+            .peers
+            .iter()
+            .filter_map(|peer| match parse_route(&peer.url)? {
+                Route::Fabric { node, .. } => Some((node, peer.name.clone())),
+                Route::Http(_) => None,
+            })
+            .collect(),
         legacy: config.fleet.as_ref().is_none_or(|file| file.legacy_peers),
         own_key: member_key.as_ref().map(|key| key.public().to_owned()),
         bootstrap_keys: config
@@ -1270,7 +1353,16 @@ pub async fn run_worker(config: Config) -> Result<()> {
                 .is_some_and(|file| file.removed.is_some()),
         )),
         state_dir: Some(config.state_dir.clone()),
+        inbound: Arc::default(),
+        inbound_changed: watch::channel(0).0,
+        inbound_authority: Arc::default(),
+        connectivity_changed: watch::channel(0).0,
+        online: Arc::default(),
     };
+    tokio::spawn(keep_connectivity_current(fleet.clone()));
+    if let Some(fabric) = fabric.clone() {
+        tokio::spawn(keep_fabric_presence_current(fabric, fleet.clone()));
+    }
     wait_for_main_daemon(&config.socket).await;
     let backend = PeerBackend::Main(Client::unix(config.socket.clone()));
     let (notify, _notify_receiver) = watch::channel(0_u64);
@@ -1319,7 +1411,7 @@ pub async fn run_worker(config: Config) -> Result<()> {
         config.node.clone(),
         config.peers,
         auth,
-        fleet,
+        fleet.clone(),
         config.socket,
         notify,
     );
@@ -1363,6 +1455,7 @@ pub async fn run_worker(config: Config) -> Result<()> {
                 protocol,
                 address,
                 endpoints.clone(),
+                fleet.connectivity_changed.subscribe(),
             ));
         }
         tokio::spawn(keep_endpoints_published(
@@ -1479,19 +1572,119 @@ async fn keep_tailnet_current(
     }
 }
 
-/// Keep the loopback listener exposed through Fabric. The exposure is ephemeral, so it is
-/// asserted again every minute and vanishes when Fabric restarts without this worker.
+/// Keep a persisted loopback listener exposed through Fabric, refreshing it on a local
+/// reconnect and periodically for older Fabric. Leave/uninstall removes the declaration.
 async fn keep_fabric_exposed(
     fabric: Fabric,
     protocol: String,
     address: SocketAddr,
     endpoints: Endpoints,
+    mut connectivity: watch::Receiver<u64>,
 ) {
     loop {
         if fabric.expose(&protocol, &address.to_string()).await.is_ok()
             && let Ok(node) = fabric.id().await
         {
             endpoints.update(|set| set.fabric = Some((node, protocol.clone())));
+        }
+        tokio::select! {
+            _ = connectivity.changed() => {},
+            _ = tokio::time::sleep(worker_interval(Duration::from_secs(60))) => {},
+        }
+    }
+}
+
+/// A return from suspend or a local network/Fabric change announces this node to every
+/// reachable member, regardless of how far their individual retries have backed off.
+async fn keep_connectivity_current(fleet: FleetContext) {
+    let interval = Duration::from_secs(5);
+    let mut previous = None;
+    let mut last_wall = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    loop {
+        let addresses = local_addresses();
+        let fabric = match &fleet.fabric {
+            Some(fabric) => fabric.addresses().await.ok(),
+            None => None,
+        };
+        let current = (addresses, fabric);
+        let wall = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        if previous.as_ref().is_some_and(|before| *before != current)
+            || wall.saturating_sub(last_wall) > 15_000
+        {
+            fleet
+                .connectivity_changed
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
+        previous = Some(current);
+        last_wall = wall;
+        tokio::time::sleep(worker_interval(interval)).await;
+    }
+}
+
+/// Consume authenticated transport admissions without probing a remote peer. Offline
+/// transitions are normal; online transitions wake only the member named by its endpoints.
+fn apply_fabric_presence(fleet: &FleetContext, value: &Value) {
+    if value["reset"] == true {
+        fleet
+            .connectivity_changed
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+    let Some(events) = value["events"].as_array() else {
+        return;
+    };
+    let view = fleet.view.read().expect("fleet view lock poisoned");
+    let mut online = fleet.online.write().expect("online lock poisoned");
+    let mut changed = false;
+    for event in events.iter().filter(|event| event["online"] == true) {
+        let Some(id) = event["peer_id"].as_str() else {
+            continue;
+        };
+        if let Some(name) = fleet.configured_fabric_peers.get(id) {
+            online.insert(name.clone(), tokio::time::Instant::now());
+            changed = true;
+        }
+        for member in view
+            .members
+            .iter()
+            .filter(|member| member.state == "current")
+        {
+            if member
+                .endpoints
+                .iter()
+                .any(|endpoint| endpoint["transport"] == "fabric" && endpoint["node"] == id)
+            {
+                online.insert(member.name.clone(), tokio::time::Instant::now());
+                changed = true;
+            }
+        }
+    }
+    drop(online);
+    drop(view);
+    if changed {
+        fleet
+            .inbound_changed
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+}
+
+async fn keep_fabric_presence_current(fabric: Fabric, fleet: FleetContext) {
+    loop {
+        if let Ok(mut child) = fabric.peer_events() {
+            if let Some(output) = child.stdout.take() {
+                let mut lines = tokio::io::BufReader::new(output).lines();
+                while let Ok(Some(line)) = lines.next_line().await {
+                    if let Ok(value) = serde_json::from_str(&line) {
+                        apply_fabric_presence(&fleet, &value);
+                    }
+                }
+            }
+            let _ = child.wait().await;
         }
         tokio::time::sleep(worker_interval(Duration::from_secs(60))).await;
     }
@@ -1521,20 +1714,6 @@ async fn keep_endpoints_published(backend: PeerBackend, mode: &'static str, endp
     }
 }
 
-/// A route recorded in `fleet.toml`: an `http://` URL or `fabric://NODE_ID/PROTOCOL`.
-fn parse_route(route: &str) -> Option<Route> {
-    if let Some(rest) = route.strip_prefix("fabric://") {
-        let (node, protocol) = rest.split_once('/')?;
-        return Some(Route::Fabric {
-            node: node.into(),
-            protocol: protocol.into(),
-        });
-    }
-    route
-        .starts_with("http://")
-        .then(|| Route::Http(route.into()))
-}
-
 /// Who this node dials, and the loopback URLs that reach each, most preferred first: every
 /// current listening member other than itself, and every config peer that has never been a
 /// member. A dial-out member is never dialed. A config peer entry for a member is that
@@ -1553,7 +1732,7 @@ fn dial_targets(
         let mut routes = config_peers
             .iter()
             .filter(|peer| peer.name == member.name && !peer.url.is_empty())
-            .map(|peer| Route::Http(peer.url.clone()))
+            .filter_map(|peer| parse_route(&peer.url))
             .collect::<Vec<_>>();
         routes.extend(routes_from_endpoints(&member.endpoints, local));
         if !routes.is_empty() {
@@ -1563,8 +1742,12 @@ fn dial_targets(
     for peer in config_peers {
         let known = view.members.iter().any(|member| member.name == peer.name)
             || view.legacy_removed.contains(&peer.name);
-        if !known && peer.name != own && !peer.url.is_empty() {
-            targets.insert(peer.name.clone(), vec![Route::Http(peer.url.clone())]);
+        if !known
+            && peer.name != own
+            && !peer.url.is_empty()
+            && let Some(route) = parse_route(&peer.url)
+        {
+            targets.entry(peer.name.clone()).or_default().push(route);
         }
     }
     targets
@@ -1886,10 +2069,7 @@ async fn wait_for_main_daemon(socket: &Path) {
 }
 
 /// One dialer: its peer's current routes and the task that uses them.
-type Dialer = (
-    Arc<std::sync::RwLock<Vec<Route>>>,
-    tokio::task::JoinHandle<()>,
-);
+type Dialer = (watch::Sender<Vec<Route>>, tokio::task::JoinHandle<()>);
 
 fn start_outbound(
     backend: PeerBackend,
@@ -1930,15 +2110,17 @@ fn start_outbound(
             });
             for (name, routes) in targets {
                 if let Some((current, _)) = dialers.get(&name) {
-                    *current.write().expect("route lock poisoned") = routes;
+                    if *current.borrow() != routes {
+                        current.send_replace(routes);
+                    }
                     continue;
                 }
-                let routes = Arc::new(std::sync::RwLock::new(routes));
+                let (routes, route_changes) = watch::channel(routes);
                 let task = tokio::spawn(dial_peer(
                     backend.clone(),
                     node.clone(),
                     name.clone(),
-                    routes.clone(),
+                    route_changes,
                     auth.clone(),
                     fleet.clone(),
                     main_socket.clone(),
@@ -1965,7 +2147,7 @@ async fn dial_peer(
     backend: PeerBackend,
     node: String,
     name: String,
-    routes: Arc<std::sync::RwLock<Vec<Route>>>,
+    mut routes: watch::Receiver<Vec<Route>>,
     auth: FleetAuth,
     fleet: FleetContext,
     main_socket: PathBuf,
@@ -1973,7 +2155,10 @@ async fn dial_peer(
 ) {
     // Retain the connection pool across both phases and later wakeups for this peer.
     let mut http = replication_http_client();
-    let mut backoff = Duration::from_secs(1);
+    let mut backoff = PeerBackoff::default();
+    let mut inbound_changes = fleet.inbound_changed.subscribe();
+    let mut connectivity = fleet.connectivity_changed.subscribe();
+    let mut must_send = false;
     let mut route = 0_usize;
     loop {
         // A removed node stops dialing; `st3 doctor` says what to do next.
@@ -1981,8 +2166,68 @@ async fn dial_peer(
             tokio::time::sleep(worker_interval(Duration::from_secs(60))).await;
             continue;
         }
+        // A connection in either direction exchanges both inventories. Local changes can
+        // still request a push; quiet anti-entropy does not open a second connection.
+        if connectivity.has_changed().unwrap_or(false) {
+            connectivity.borrow_and_update();
+            backoff = PeerBackoff::default();
+            must_send = true;
+        }
+        if fleet
+            .online
+            .read()
+            .expect("online lock poisoned")
+            .get(&name)
+            .is_some_and(|at| at.elapsed() < REPLICATION_WAKE_COALESCE)
+        {
+            backoff = PeerBackoff::default();
+            must_send = true;
+        }
+        let inbound_at = fleet
+            .inbound
+            .read()
+            .expect("inbound lock poisoned")
+            .get(&name)
+            .copied();
+        if let Some(at) = inbound_at {
+            if must_send && at.elapsed() < worker_interval(Duration::from_secs(30)) {
+                let offered = fleet
+                    .inbound_authority
+                    .read()
+                    .expect("inbound inventory lock poisoned")
+                    .get(&name)
+                    .cloned();
+                if let Some(offered) = offered
+                    && let Ok(current) = backend
+                        .export(auth.fleet_id(), &ReplicationInventory::default(), true, &[])
+                        .await
+                {
+                    // The other side already knows this inventory and is draining both
+                    // queues. Notifications from that exchange must not trigger a reverse
+                    // connection. A genuinely new local envelope still requests a push.
+                    if current.exchange.authority_digest == offered {
+                        must_send = false;
+                    }
+                }
+            }
+            let window = if must_send {
+                REPLICATION_WAKE_COALESCE
+            } else {
+                worker_interval(Duration::from_secs(30))
+            };
+            if at.elapsed() < window {
+                tokio::select! {
+                    _ = tokio::time::sleep_until(at + window) => {}
+                    _ = notify.changed() => { must_send = true; }
+                    _ = routes.changed() => { must_send = true; }
+                    _ = inbound_changes.changed() => {}
+                    _ = connectivity.changed() => { backoff = PeerBackoff::default(); must_send = true; }
+                }
+                continue;
+            }
+        }
         let selected = {
-            let routes = routes.read().expect("route lock poisoned");
+            let routes = routes.borrow_and_update();
             if routes.is_empty() {
                 None
             } else {
@@ -2004,8 +2249,18 @@ async fn dial_peer(
         };
         let Some(url) = url else {
             route = route.wrapping_add(1);
-            tokio::time::sleep(backoff).await;
-            backoff = (backoff * 2).min(Duration::from_secs(30));
+            if wait_peer_retry(
+                backoff.next(),
+                &mut routes,
+                &mut inbound_changes,
+                &mut connectivity,
+                &fleet,
+                &name,
+            )
+            .await
+            {
+                backoff = PeerBackoff::default();
+            }
             continue;
         };
         let peer = PeerConfig {
@@ -2014,7 +2269,8 @@ async fn dial_peer(
         };
         match exchange(&http, &backend, &node, &peer, &auth, &fleet, &main_socket).await {
             Ok((moved, heal_now)) => {
-                backoff = Duration::from_secs(1);
+                backoff = PeerBackoff::default();
+                must_send = false;
                 if heal_now {
                     heal(&backend, &node, &peer, &auth, &fleet, &main_socket).await;
                 }
@@ -2029,7 +2285,10 @@ async fn dial_peer(
                     // short so a publish is startable on every peer within seconds.
                     let not_before = tokio::time::Instant::now() + REPLICATION_WAKE_COALESCE;
                     tokio::select! {
-                        _ = notify.changed() => {}
+                        _ = notify.changed() => { must_send = true; }
+                        _ = routes.changed() => { must_send = true; }
+                        _ = inbound_changes.changed() => {}
+                        _ = connectivity.changed() => { backoff = PeerBackoff::default(); must_send = true; }
                         _ = tokio::time::sleep(worker_interval(Duration::from_secs(30))) => {}
                     }
                     tokio::time::sleep_until(not_before).await;
@@ -2055,8 +2314,68 @@ async fn dial_peer(
                 let _ = backend
                     .record_failure(&peer.name, status, &error.to_string())
                     .await;
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(Duration::from_secs(30));
+                if wait_peer_retry(
+                    backoff.next(),
+                    &mut routes,
+                    &mut inbound_changes,
+                    &mut connectivity,
+                    &fleet,
+                    &name,
+                )
+                .await
+                {
+                    backoff = PeerBackoff::default();
+                }
+            }
+        }
+    }
+}
+
+/// Failed connections have no graph wake dependency: unrelated local writes must not
+/// turn an absent member into a hot loop. Jitter spreads fleet retries across an hour.
+#[derive(Default)]
+struct PeerBackoff {
+    failures: u32,
+}
+
+impl PeerBackoff {
+    fn delay(failures: u32, jitter: u16) -> Duration {
+        // The first retries cover brief interruptions; long absences grow to an hour.
+        let seconds = (1_u64 << failures.min(12)).min(3600);
+        Duration::from_millis(seconds * (800 + u64::from(jitter) % 401))
+    }
+
+    fn next(&mut self) -> Duration {
+        let mut random = [0; 2];
+        let _ = getrandom::fill(&mut random);
+        let delay = Self::delay(self.failures, u16::from_le_bytes(random));
+        self.failures = self.failures.saturating_add(1);
+        delay
+    }
+}
+
+async fn wait_peer_retry(
+    delay: Duration,
+    routes: &mut watch::Receiver<Vec<Route>>,
+    inbound_changes: &mut watch::Receiver<u64>,
+    connectivity: &mut watch::Receiver<u64>,
+    fleet: &FleetContext,
+    name: &str,
+) -> bool {
+    let started = tokio::time::Instant::now();
+    let deadline = started + delay;
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => return false,
+            changed = routes.changed() => return changed.is_ok(),
+            changed = connectivity.changed() => return changed.is_ok(),
+            changed = inbound_changes.changed() => {
+                if changed.is_err() { return false; }
+                if fleet.inbound.read().expect("inbound lock poisoned").get(name).is_some_and(|at| *at >= started)
+                    || fleet.online.read().expect("online lock poisoned").get(name).is_some_and(|at| *at >= started)
+                {
+                    return true;
+                }
             }
         }
     }
@@ -2147,17 +2466,37 @@ async fn receive_exchange(
                 &request.signature_requests,
             )
             .await?;
+        let authority_digest = response.exchange.authority_digest.clone();
         let response = signed_response(
             &state,
             &request_digest,
             response.store_index,
             response.exchange,
         )?;
-        deflate_response(response, accepts_deflate(&headers)).await
+        let response = deflate_response(response, accepts_deflate(&headers)).await?;
+        Ok::<_, anyhow::Error>((response, authority_digest))
     }
     .await;
     match result {
-        Ok(response) => response,
+        Ok((response, authority_digest)) => {
+            state
+                .fleet
+                .inbound_authority
+                .write()
+                .expect("inbound inventory lock poisoned")
+                .insert(relay.clone(), authority_digest);
+            state
+                .fleet
+                .inbound
+                .write()
+                .expect("inbound lock poisoned")
+                .insert(relay.clone(), tokio::time::Instant::now());
+            state
+                .fleet
+                .inbound_changed
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+            response
+        }
         Err(error) => {
             let message = format!("replication request failed: {error:#}");
             let _ = state.backend.record_failure(&relay, "down", &message).await;
@@ -4358,9 +4697,15 @@ mod tests {
 
         let mut headers = HeaderMap::new();
         assert!(!accepts_deflate(&headers));
-        headers.insert("accept-encoding", HeaderValue::from_static("gzip, Deflate;q=0.5"));
+        headers.insert(
+            "accept-encoding",
+            HeaderValue::from_static("gzip, Deflate;q=0.5"),
+        );
         assert!(accepts_deflate(&headers));
-        headers.insert("accept-encoding", HeaderValue::from_static("gzip, deflated"));
+        headers.insert(
+            "accept-encoding",
+            HeaderValue::from_static("gzip, deflated"),
+        );
         assert!(!accepts_deflate(&headers));
     }
 
@@ -5027,7 +5372,7 @@ mod tests {
             .latest_claim("host/source", Some("transport.observed"))
             .unwrap()
             .unwrap();
-        assert_eq!(down.body["fields"]["status"], "down");
+        assert_eq!(down.body["fields"]["status"], "unknown");
         assert_eq!(
             store
                 .claims_for("host/source", Some("transport.observed"))
@@ -5328,6 +5673,7 @@ mod tests {
             view: Arc::new(std::sync::RwLock::new(store.fleet_view().unwrap())),
             view_changed: watch::channel(0).0,
             config_peers: config_peers.iter().map(|peer| (*peer).into()).collect(),
+            configured_fabric_peers: BTreeMap::new(),
             legacy,
             own_key: Some(own.public().into()),
             bootstrap_keys: bootstrap.iter().map(|key| (*key).into()).collect(),
@@ -5336,6 +5682,11 @@ mod tests {
             bootstrap: None,
             removed: Arc::default(),
             state_dir: None,
+            inbound: Arc::default(),
+            inbound_changed: watch::channel(0).0,
+            inbound_authority: Arc::default(),
+            connectivity_changed: watch::channel(0).0,
+            online: Arc::default(),
         }
     }
 
@@ -5468,5 +5819,359 @@ mod tests {
             assert!(error.to_string().contains("403"), "{error:#}");
         }
         server.abort();
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn absent_members_cost_a_few_attempts_per_hour_after_exponential_backoff() {
+        // Use the shortest jitter so this bounds the most aggressive retry schedule.
+        for away in [Duration::from_secs(120), Duration::from_secs(4 * 3600)] {
+            let mut elapsed = Duration::ZERO;
+            let mut attempts = 0;
+            while elapsed < away {
+                elapsed += PeerBackoff::delay(attempts, 0);
+                attempts += 1;
+            }
+            assert!(
+                attempts <= if away.as_secs() == 120 { 9 } else { 20 },
+                "{attempts} retries in {away:?}"
+            );
+        }
+        assert_ne!(PeerBackoff::delay(10, 0), PeerBackoff::delay(10, 400));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_inbound_return_or_changed_route_interrupts_even_hours_of_absence() {
+        let fleet = FleetContext::legacy(BTreeSet::new());
+        let (route_tx, mut routes) = watch::channel(vec![Route::Http("http://127.0.0.1:1".into())]);
+        let mut inbound = fleet.inbound_changed.subscribe();
+        let mut connectivity = fleet.connectivity_changed.subscribe();
+        for away in [Duration::from_secs(120), Duration::from_secs(4 * 3600)] {
+            tokio::time::advance(away).await;
+            let wait = wait_peer_retry(
+                Duration::from_secs(300),
+                &mut routes,
+                &mut inbound,
+                &mut connectivity,
+                &fleet,
+                "traveller",
+            );
+            tokio::pin!(wait);
+            assert!(futures_util::poll!(&mut wait).is_pending());
+            // Another peer returning must not reset this member's backoff.
+            fleet
+                .inbound
+                .write()
+                .unwrap()
+                .insert("other".into(), tokio::time::Instant::now());
+            fleet
+                .inbound_changed
+                .send_modify(|generation| *generation += 1);
+            assert!(futures_util::poll!(&mut wait).is_pending());
+            fleet
+                .inbound
+                .write()
+                .unwrap()
+                .insert("traveller".into(), tokio::time::Instant::now());
+            fleet
+                .inbound_changed
+                .send_modify(|generation| *generation += 1);
+            assert!(wait.await);
+        }
+        let wait = wait_peer_retry(
+            Duration::from_secs(300),
+            &mut routes,
+            &mut inbound,
+            &mut connectivity,
+            &fleet,
+            "traveller",
+        );
+        tokio::pin!(wait);
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        route_tx.send_replace(vec![Route::Http("http://127.0.0.1:2".into())]);
+        assert!(wait.await);
+    }
+
+    #[tokio::test]
+    async fn isolated_outbound_only_node_converges_after_two_minutes_and_four_hours() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let fleet_id = "d706eab5-433c-474b-ae43-fd2a7891d85d";
+        let auth = FleetAuth::test(fleet_id, &[41; 32]);
+        let root = tempfile::tempdir().unwrap();
+        let names = ["harbor", "beacon", "traveller"];
+        let stores = names.map(|name| {
+            let store =
+                Arc::new(Store::open(&root.path().join(format!("{name}.db")), name).unwrap());
+            store.bind_fleet(fleet_id).unwrap();
+            store
+        });
+        let contexts = names.map(|name| {
+            FleetContext::legacy(
+                names
+                    .iter()
+                    .filter(|peer| **peer != name)
+                    .map(|peer| (*peer).into())
+                    .collect(),
+            )
+        });
+        let wakes = names.map(|_| watch::channel(0).0);
+        let mut tasks = Vec::new();
+        let mut addresses = Vec::new();
+        let mut shutdowns = Vec::new();
+        for index in 0..2 {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            addresses.push(format!("http://{}", listener.local_addr().unwrap()));
+            let state = PeerState {
+                backend: PeerBackend::Local(stores[index].clone()),
+                node: names[index].into(),
+                auth: auth.clone(),
+                fleet: contexts[index].clone(),
+                main_socket: root.path().join("unused.sock"),
+                outbound_notify: wakes[index].clone(),
+            };
+            let (shutdown, stopped) = tokio::sync::oneshot::channel();
+            shutdowns.push(shutdown);
+            tasks.push(tokio::spawn(async move {
+                axum::serve(listener, peer_router(state))
+                    .with_graceful_shutdown(async {
+                        let _ = stopped.await;
+                    })
+                    .await
+                    .unwrap();
+            }));
+        }
+        // The traveller accepts no inbound requests. The rejector counts costly redundant
+        // attempts, while its real node can initiate authenticated exchanges to both servers.
+        let rejector = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        addresses.push(format!("http://{}", rejector.local_addr().unwrap()));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = attempts.clone();
+        tasks.push(tokio::spawn(async move {
+            while let Ok((stream, _)) = rejector.accept().await {
+                count.fetch_add(1, Ordering::Relaxed);
+                drop(stream);
+            }
+        }));
+        let start = |from: usize, to: usize| {
+            let (routes, receiver) = watch::channel(vec![Route::Http(addresses[to].clone())]);
+            let task = tokio::spawn(dial_peer(
+                PeerBackend::Local(stores[from].clone()),
+                names[from].into(),
+                names[to].into(),
+                receiver,
+                auth.clone(),
+                contexts[from].clone(),
+                root.path().join("unused.sock"),
+                wakes[from].subscribe(),
+            ));
+            (routes, task)
+        };
+        let mut dialers = vec![start(0, 1), start(1, 0), start(0, 2), start(1, 2)];
+        let mut outbound = vec![start(2, 0), start(2, 1)];
+        let write = |index: usize, note: &str| {
+            stores[index]
+                .append_claim(&crate::model::ClaimInput {
+                    subject: format!("daemon/{note}"),
+                    kind: "daemon.diagnostic".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("severity".into(), Value::String("warning".into())),
+                        ("code".into(), Value::String("isolated-proof".into())),
+                        ("reason".into(), Value::String(note.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            wakes[index].send_modify(|generation| *generation += 1);
+        };
+        async fn converge(stores: &[Arc<Store>]) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+            loop {
+                let digests = stores
+                    .iter()
+                    .map(|store| {
+                        store
+                            .replication_status(true, None, &[])
+                            .unwrap()
+                            .authority_digest
+                    })
+                    .collect::<BTreeSet<_>>();
+                if digests.len() == 1 {
+                    return;
+                }
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "isolated nodes did not converge within ten seconds"
+                );
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+        write(0, "initial-harbor");
+        write(1, "initial-beacon");
+        write(2, "initial-traveller");
+        converge(&stores).await;
+        for (label, away) in [("minutes", 120), ("hours", 4 * 3600)] {
+            for (_, task) in outbound.drain(..) {
+                task.abort();
+                let _ = task.await;
+            }
+            let before = attempts.load(Ordering::Relaxed);
+            write(0, &format!("{label}-harbor"));
+            write(1, &format!("{label}-beacon"));
+            write(2, &format!("{label}-traveller"));
+            // Run actual worker timers over minutes and hours on a virtual clock. Local
+            // wakes throughout the absence must not undo the failed peers' backoff.
+            tokio::time::pause();
+            for _ in 0..away / 10 {
+                tokio::time::advance(Duration::from_secs(10)).await;
+                for wake in &wakes[..2] {
+                    wake.send_modify(|generation| *generation += 1);
+                }
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+            }
+            tokio::time::resume();
+            let retries = attempts.load(Ordering::Relaxed) - before;
+            assert!(
+                retries <= if away == 120 { 20 } else { 40 },
+                "{retries} connection attempts in {away}s"
+            );
+            for server in &stores[..2] {
+                server.age_replication_peer_for_test("traveller");
+                let status = server
+                    .replication_status(true, Some(fleet_id), &["traveller".into()])
+                    .unwrap();
+                assert_eq!(status.peers[0].status, "last-seen");
+                assert!(status.peers[0].last_error.is_none());
+            }
+            // A changed source address is irrelevant: only the returning side needs to
+            // reach the stable servers. Both queues drain despite server hour-long backoff.
+            outbound = vec![start(2, 0), start(2, 1)];
+            converge(&stores).await;
+            let before = attempts.load(Ordering::Relaxed);
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert_eq!(
+                attempts.load(Ordering::Relaxed),
+                before,
+                "recent inbound exchange opened a redundant connection"
+            );
+        }
+        for (_, task) in outbound.drain(..) {
+            task.abort();
+            let _ = task.await;
+        }
+        // An always-on server uses exactly the same absence policy. Stop its listener and
+        // dialers for four virtual hours; return on a different port, while its neighbor
+        // retains the old address and an hour-long retry. Its own announcement converges.
+        let (_, harbor_dialer) = dialers.remove(0);
+        harbor_dialer.abort();
+        let _ = harbor_dialer.await;
+        let (_, harbor_dialer) = dialers.remove(1);
+        harbor_dialer.abort();
+        let _ = harbor_dialer.await;
+        shutdowns.remove(0).send(()).unwrap();
+        tasks.remove(0).await.unwrap();
+        write(0, "server-offline-queued");
+        write(1, "server-peer-queued");
+        tokio::time::pause();
+        for _ in 0..4 * 3600 / 10 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            wakes[1].send_modify(|generation| *generation += 1);
+            for _ in 0..8 {
+                tokio::task::yield_now().await;
+            }
+        }
+        tokio::time::resume();
+        stores[1].age_replication_peer_for_test("harbor");
+        assert_eq!(
+            stores[1]
+                .replication_status(true, Some(fleet_id), &["harbor".into()])
+                .unwrap()
+                .peers[0]
+                .status,
+            "last-seen"
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        assert_ne!(
+            format!("http://{}", listener.local_addr().unwrap()),
+            addresses[0]
+        );
+        let state = PeerState {
+            backend: PeerBackend::Local(stores[0].clone()),
+            node: names[0].into(),
+            auth: auth.clone(),
+            fleet: contexts[0].clone(),
+            main_socket: root.path().join("unused.sock"),
+            outbound_notify: wakes[0].clone(),
+        };
+        tasks.push(tokio::spawn(async move {
+            axum::serve(listener, peer_router(state)).await.unwrap();
+        }));
+        dialers.push(start(0, 1));
+        converge(&stores[..2]).await;
+        for (_, task) in dialers.drain(..) {
+            task.abort();
+        }
+        for task in tasks {
+            task.abort();
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fabric_online_events_reset_only_the_member_they_name() {
+        let mut fleet = FleetContext::legacy(BTreeSet::new());
+        let member = crate::fleet::MemberView {
+            name: "traveller".into(),
+            state: "current".into(),
+            mode: "listening".into(),
+            member_key: "member-key".into(),
+            start: 0,
+            end: None,
+            ended: None,
+            endpoints: vec![
+                serde_json::json!({"transport":"fabric", "node":"invented-node-id", "protocol":"sync"}),
+            ],
+        };
+        fleet.view.write().unwrap().members.push(member);
+        fleet
+            .configured_fabric_peers
+            .insert("configured-id".into(), "beacon".into());
+        let (_route_tx, mut routes) =
+            watch::channel(vec![Route::Http("http://127.0.0.1:1".into())]);
+        let mut inbound = fleet.inbound_changed.subscribe();
+        let mut connectivity = fleet.connectivity_changed.subscribe();
+        let wait = wait_peer_retry(
+            Duration::from_secs(3600),
+            &mut routes,
+            &mut inbound,
+            &mut connectivity,
+            &fleet,
+            "traveller",
+        );
+        tokio::pin!(wait);
+        // Retain the routes sender while waiting.
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        apply_fabric_presence(
+            &fleet,
+            &serde_json::json!({"reset":false,"events":[{"peer_id":"invented-node-id","online":false}]}),
+        );
+        assert!(futures_util::poll!(&mut wait).is_pending());
+        apply_fabric_presence(
+            &fleet,
+            &serde_json::json!({"reset":false,"events":[{"peer_id":"invented-node-id","online":true}]}),
+        );
+        assert!(wait.await);
+        apply_fabric_presence(
+            &fleet,
+            &serde_json::json!({"reset":false,"events":[{"peer_id":"configured-id","online":true}]}),
+        );
+        assert!(fleet.online.read().unwrap().contains_key("beacon"));
     }
 }
