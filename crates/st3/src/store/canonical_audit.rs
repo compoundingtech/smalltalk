@@ -528,7 +528,7 @@ message "audit-declared" {
             json!({
                 "run":failed.subject,"source_generation":failed.generation,"candidate_revision":failed.revision,
                 "reason":"Compare an equal-time proposal.","status":"pending-approval","cutover":"restart-active",
-                "compatible_steps":[],"reviewers":["person/avery","person/river"],"preview_hash":"audit-other-preview"
+                "compatible_steps":[],"reviewers":["person/avery","person/robin"],"preview_hash":"audit-other-preview"
             }),
         ),
         (
@@ -1068,7 +1068,7 @@ fn proposal_phase_dates_match_source_replay_and_replication() {
         source.set_write_clock_at(now_ms() + 10_000).unwrap();
         let publish = |goal: &str, key: &str| {
             let reviewers = if reviewed {
-                "revisions=\"human-only\" revision-reviewer=\"person/river\""
+                "revisions=\"human-only\" revision-reviewer=\"person/robin\""
             } else {
                 ""
             };
@@ -1126,7 +1126,7 @@ mission "audit-phase" state="ready" revision-cutover="when-idle" {reviewers} {{
             source
                 .approve_revision_proposal(
                     &proposal.id,
-                    "person/river",
+                    "person/robin",
                     proposal.preview_hash.as_deref().unwrap(),
                     "audit-phase-approve",
                 )
@@ -1155,7 +1155,7 @@ mission "audit-phase" state="ready" revision-cutover="when-idle" {reviewers} {{
             source
                 .approve_revision_proposal(
                     &replacement.id,
-                    "person/river",
+                    "person/robin",
                     replacement.preview_hash.as_deref().unwrap(),
                     "audit-phase-reapprove",
                 )
