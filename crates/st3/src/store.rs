@@ -2518,7 +2518,7 @@ fn collection_delivery_was_requested_tx(
 /// Item claims written before items carried `head_sha` still cite the repository listing they
 /// came from, and that listing names the head.
 fn listed_head_tx(
-    transaction: &rusqlite::Transaction<'_>,
+    connection: &Connection,
     item: Option<&Value>,
 ) -> rusqlite::Result<Option<String>> {
     let Some(item) = item else {
@@ -2530,7 +2530,7 @@ fn listed_head_tx(
     ) else {
         return Ok(None);
     };
-    let listing = transaction
+    let listing = connection
         .query_row("SELECT body FROM claims WHERE id=?1", [listing], |row| {
             row.get::<_, String>(0)
         })
@@ -12430,12 +12430,17 @@ impl Store {
             return Ok(Some(format!("pull request {number} is a draft again")));
         }
         let short = |head: &str| head.chars().take(12).collect::<String>();
-        let requested_head = requested
+        let requested_head = match requested
             .body
             .pointer("/fields/facts/head_sha")
-            .and_then(Value::as_str);
+            .and_then(Value::as_str)
+        {
+            Some(head) => Some(head.to_owned()),
+            None => listed_head_tx(&self.readers.get(), Some(&requested.body))?,
+        };
         let current_head = current.get("head_sha").and_then(Value::as_str);
-        if let (Some(requested_head), Some(current_head)) = (requested_head, current_head)
+        if let (Some(requested_head), Some(current_head)) =
+            (requested_head.as_deref(), current_head)
             && requested_head != current_head
         {
             return Ok(Some(format!(

@@ -21978,12 +21978,34 @@ subscription "reviews" {
         let legacy = (1..=4)
             .map(|number| {
                 let resource = format!("resource/repo/pull-request/{number}");
-                let discovery = store
+                let mut discovery = store
                     .claims_for(&resource, Some("resource.observed"))
                     .unwrap()
                     .pop()
-                    .unwrap()
-                    .id;
+                    .unwrap();
+                if number == 2 {
+                    // This held request predates item head_sha. Its cited listing still pins
+                    // the old head, so migration must cancel it when the new head arrives.
+                    let mut facts = discovery.body["fields"]["facts"].clone();
+                    facts.as_object_mut().unwrap().remove("head_sha");
+                    discovery = store
+                        .append_claim(&ClaimInput {
+                            subject: resource.clone(),
+                            kind: "resource.observed".into(),
+                            actor: None,
+                            fields: BTreeMap::from([
+                                ("kind".into(), Value::String("vcs.pull-request".into())),
+                                ("facts".into(), facts),
+                            ]),
+                            evidence: vec![discovery.body["evidence"][0]
+                                .as_str()
+                                .unwrap()
+                                .to_owned()],
+                            expected_subject: None,
+                            idempotency_key: Some("legacy-headless-item".into()),
+                        })
+                        .unwrap();
+                }
                 store
                     .append_claim(&ClaimInput {
                         subject: "subscription/reviews".into(),
@@ -21997,7 +22019,7 @@ subscription "reviews" {
                                 "workspace".into(),
                                 Value::String(directory.path().to_string_lossy().into_owned()),
                             ),
-                            ("discovery".into(), Value::String(discovery)),
+                            ("discovery".into(), Value::String(discovery.id)),
                             ("held".into(), Value::Bool(true)),
                         ]),
                         evidence: vec![],
