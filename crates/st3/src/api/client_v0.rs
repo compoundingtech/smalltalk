@@ -2982,10 +2982,8 @@ fn native_timeline_page(
     snapshot: &ClientSnapshot,
     session_id: &str,
     query: &ClientListQuery,
-    external: &crate::external_sessions::ExternalSession,
+    mut items: Vec<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let mut items =
-        crate::external_sessions::normalized_timeline(external).map_err(ApiError::internal)?;
     if let Some((owner, incarnation, _)) =
         super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
             .map_err(ApiError::internal)?
@@ -3034,13 +3032,96 @@ fn native_timeline_page(
     })))
 }
 
-fn managed_codex_transcript(
+/// What st3 established about a managed seat's native transcript.
+struct ManagedTranscript {
+    /// The harness the seat's latest observation names.
+    driver: String,
+    /// The `harness.observed` claim the verdict rests on. A notice about a missing transcript is
+    /// placed beside it in the timeline, so it moves forward when the observation changes.
+    anchor: ClaimRecord,
+    /// The seat's exact native session, or why st3 could not bind one.
+    transcript: Result<crate::external_sessions::ExternalSession, String>,
+}
+
+/// Bind a managed seat to its exact native transcript, when its harness keeps one st3 reads.
+///
+/// `None` means the seat runs no such harness (or has not reported one), and its timeline is
+/// built from claims alone as before. Otherwise the result either carries the exact session or
+/// says why none could be bound, so the timeline can say so rather than silently showing only
+/// status entries. The binding is never widened to a guess: a transcript that cannot be tied to
+/// this seat's current incarnation is not shown.
+fn managed_transcript(
     state: &AppState,
     owner: &str,
     incarnation: &str,
-) -> Result<Option<crate::external_sessions::ExternalSession>, ApiError> {
-    let Some(home) = state.native_session_home.as_deref() else {
+) -> Result<Option<ManagedTranscript>, ApiError> {
+    let Some(anchor) = state
+        .store
+        .latest_claim(owner, Some("harness.observed"))
+        .map_err(ApiError::internal)?
+    else {
         return Ok(None);
+    };
+    let fields = anchor.body.get("fields").unwrap_or(&anchor.body);
+    let driver = fields["driver"].as_str().unwrap_or_default().to_owned();
+    if !matches!(driver.as_str(), "codex" | "claude" | "omp") {
+        return Ok(None);
+    }
+    let transcript = if fields["incarnation_id"] != incarnation {
+        Err("the harness has not reported on the seat's current incarnation yet".to_owned())
+    } else {
+        let evidence = fields["evidence_incarnation"].as_str();
+        match driver.as_str() {
+            "codex" => managed_codex_transcript(state, owner, evidence),
+            "claude" => managed_claude_transcript(state, owner, evidence),
+            _ => managed_omp_transcript(state, owner, incarnation),
+        }
+    };
+    Ok(Some(ManagedTranscript {
+        driver,
+        anchor,
+        transcript,
+    }))
+}
+
+/// The timeline entry that says a managed seat's native transcript is not shown, and why.
+fn transcript_notice(session_id: &str, managed: &ManagedTranscript, reason: &str) -> Value {
+    let anchor = &managed.anchor;
+    let fields = anchor.body.get("fields").unwrap_or(&anchor.body);
+    let digest = hex::encode(Sha256::digest(
+        format!("{}:transcript-not-bound", anchor.id).as_bytes(),
+    ));
+    json!({
+        "id": format!("timeline-entry/{}/{}", session_id.trim_start_matches("session/"), &digest[..24]),
+        // Slot 2 of the observation's four sequence slots is otherwise unused.
+        "sequence": anchor.store_index.saturating_mul(4).saturating_add(2),
+        "revision": 1,
+        "timestamp": client_timestamp(
+            fields
+                .get("observed_at_unix_ms")
+                .and_then(Value::as_u64)
+                .map(u128::from)
+                .unwrap_or(anchor.accepted_at_unix_ms),
+        ),
+        "role": "system",
+        "type": "error",
+        "final": true,
+        "body": {
+            "code": "transcript-not-bound",
+            "message": format!("transcript not bound: {reason}"),
+            "retryable": true,
+            "details": { "driver": managed.driver, "claim_id": anchor.id }
+        }
+    })
+}
+
+fn managed_codex_transcript(
+    state: &AppState,
+    owner: &str,
+    evidence: Option<&str>,
+) -> Result<crate::external_sessions::ExternalSession, String> {
+    let Some(home) = state.native_session_home.as_deref() else {
+        return Err("this daemon has no home directory to read native sessions from".into());
     };
     // The wrapper owns this path; never resolve a path from client input. A reused
     // driver directory is only authoritative when its runtime and a durable
@@ -3050,61 +3131,62 @@ fn managed_codex_transcript(
         .join("drivers")
         .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
         .join("state");
-    let Ok(runtime) = std::fs::read(directory.join("runtime.json")) else {
-        return Ok(None);
-    };
-    let Ok(binding) = std::fs::read(directory.join("binding.json")) else {
-        return Ok(None);
-    };
+    let runtime = std::fs::read(directory.join("runtime.json"))
+        .map_err(|_| "the Codex driver has not written its runtime record".to_owned())?;
+    let binding = std::fs::read(directory.join("binding.json"))
+        .map_err(|_| "the Codex driver has not bound a thread yet".to_owned())?;
     let (Ok(runtime), Ok(binding)) = (
         serde_json::from_slice::<Value>(&runtime),
         serde_json::from_slice::<Value>(&binding),
     ) else {
-        return Ok(None);
+        return Err("the Codex driver's runtime or binding record is unreadable".into());
     };
     let identity = owner.strip_prefix("agent/").unwrap_or(owner);
     let Some(provider_incarnation) = runtime["incarnation"].as_str() else {
-        return Ok(None);
+        return Err("the Codex runtime record names no incarnation".into());
     };
     let Some(native_id) = binding["threadId"].as_str() else {
-        return Ok(None);
+        return Err("the Codex binding names no thread".into());
     };
     if runtime["agent"] != identity
         || binding["agent"] != identity
         || binding["runtimeIncarnation"] != provider_incarnation
     {
-        return Ok(None);
+        return Err("the Codex binding belongs to a different runtime".into());
     }
-    let observed = state
-        .store
-        .latest_claim(owner, Some("harness.observed"))
-        .map_err(ApiError::internal)?
-        .is_some_and(|claim| {
-            let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            fields["driver"] == "codex"
-                && fields["incarnation_id"] == incarnation
-                && fields["evidence_incarnation"] == provider_incarnation
-        });
-    if !observed {
-        return Ok(None);
+    if evidence != Some(provider_incarnation) {
+        return Err("the Codex binding is from a different provider incarnation".into());
     }
-    Ok(crate::external_sessions::discover(Some(home), true)
-        .map_err(ApiError::internal)?
-        .sessions
-        .into_iter()
-        .find(|session| {
-            session.driver == crate::external_sessions::ExternalDriver::Codex
-                && session.native_id == native_id
-        }))
+    // Codex names the rollout after its thread, so look it up directly first; a rollout whose
+    // name does not follow that convention is still found by the thread ID inside it.
+    let bound = match crate::external_sessions::find_bound_transcript(
+        home,
+        crate::external_sessions::ExternalDriver::Codex,
+        native_id,
+    ) {
+        Ok(Some(session)) => Some(session),
+        _ => crate::external_sessions::discover(Some(home), true)
+            .map_err(|error| format!("listing Codex sessions failed: {error:#}"))?
+            .sessions
+            .into_iter()
+            .find(|session| {
+                session.driver == crate::external_sessions::ExternalDriver::Codex
+                    && session.native_id == native_id
+            }),
+    };
+    bound.ok_or_else(|| format!("Codex thread {native_id} has no rollout file yet"))
 }
 
 fn managed_claude_transcript(
     state: &AppState,
     owner: &str,
-    incarnation: &str,
-) -> Result<Option<crate::external_sessions::ExternalSession>, ApiError> {
+    evidence: Option<&str>,
+) -> Result<crate::external_sessions::ExternalSession, String> {
     let Some(home) = state.native_session_home.as_deref() else {
-        return Ok(None);
+        return Err("this daemon has no home directory to read native sessions from".into());
+    };
+    let Some(evidence) = evidence else {
+        return Err("the Claude driver has not reported which process owns the seat".into());
     };
     let identity = owner.strip_prefix("agent/").unwrap_or(owner);
     let directory = state
@@ -3115,64 +3197,53 @@ fn managed_claude_transcript(
         .join("agents")
         .join(st2::run::detect_host())
         .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16]);
-    // Only the current wrapper's SessionStart hook may bind a Claude transcript.
-    // A previous provider's session-id file can survive a restart, so neither
-    // its presence nor the newest transcript in a workspace is sufficient.
-    let Ok(binding) = std::fs::read(directory.join("claude-native-session")) else {
-        return Ok(None);
-    };
-    let Ok(binding) = serde_json::from_slice::<Value>(&binding) else {
-        return Ok(None);
-    };
-    let (Some(provider_incarnation), Some(native_id)) = (
-        binding["incarnation"].as_str(),
-        binding["native_session_id"].as_str(),
-    ) else {
-        return Ok(None);
-    };
-    let observed = state
-        .store
-        .latest_claim(owner, Some("harness.observed"))
-        .map_err(ApiError::internal)?
-        .is_some_and(|claim| {
-            let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            fields["driver"] == "claude"
-                && fields["incarnation_id"] == incarnation
-                && fields["evidence_incarnation"] == provider_incarnation
+    // The current wrapper's SessionStart hook binds the Claude session it started. A previous
+    // provider's binding can survive a restart, so it counts only when it names the same
+    // provider incarnation as the seat's current observation; neither its presence nor the
+    // newest transcript in a workspace is sufficient.
+    let hook_binding = std::fs::read(directory.join("claude-native-session"))
+        .ok()
+        .and_then(|binding| serde_json::from_slice::<Value>(&binding).ok())
+        .and_then(|binding| {
+            (binding["incarnation"].as_str() == Some(evidence))
+                .then(|| binding["native_session_id"].as_str().map(str::to_owned))
+                .flatten()
         });
-    if !observed {
-        return Ok(None);
-    }
-    crate::external_sessions::find_bound_transcript(
+    let native_id = match hook_binding {
+        Some(native_id) => native_id,
+        // Without the hook, prove the session from the live processes instead; see
+        // `claude_session_of_managed_driver` for why that cannot pick another session.
+        None => crate::external_sessions::claude_session_of_managed_driver(home, owner, evidence)
+            .map_err(|reason| {
+            format!("the SessionStart hook did not bind this incarnation, and {reason}")
+        })?,
+    };
+    match crate::external_sessions::find_bound_transcript(
         home,
         crate::external_sessions::ExternalDriver::Claude,
-        native_id,
-    )
-    .map_err(ApiError::internal)
+        &native_id,
+    ) {
+        Ok(Some(session)) => Ok(session),
+        Ok(None) => Err(format!(
+            "Claude session {native_id} has no transcript file yet"
+        )),
+        Err(error) => Err(format!(
+            "finding Claude session {native_id} failed: {error:#}"
+        )),
+    }
 }
 
 fn managed_omp_transcript(
     state: &AppState,
     owner: &str,
     incarnation: &str,
-) -> Result<Option<crate::external_sessions::ExternalSession>, ApiError> {
-    let Some((_, started_at)) = incarnation.split_once(':') else {
-        return Ok(None);
-    };
-    let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(started_at) else {
-        return Ok(None);
-    };
-    let observed = state
-        .store
-        .latest_claim(owner, Some("harness.observed"))
-        .map_err(ApiError::internal)?
-        .is_some_and(|claim| {
-            let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            fields["driver"] == "omp" && fields["incarnation_id"] == incarnation
-        });
-    if !observed {
-        return Ok(None);
-    }
+) -> Result<crate::external_sessions::ExternalSession, String> {
+    let started_at = incarnation
+        .split_once(':')
+        .and_then(|(_, started_at)| chrono::DateTime::parse_from_rfc3339(started_at).ok())
+        .ok_or_else(|| {
+            format!("the OMP incarnation `{incarnation}` does not carry its start time")
+        })?;
     let identity = owner.strip_prefix("agent/").unwrap_or(owner);
     let directory = state
         .state_dir
@@ -3183,11 +3254,16 @@ fn managed_omp_transcript(
         .join(st2::run::detect_host())
         .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16])
         .join("provider-sessions");
-    crate::external_sessions::find_managed_omp_transcript(
+    match crate::external_sessions::find_managed_omp_transcript(
         &directory,
         (started_at.timestamp_millis().max(0) as u128).saturating_sub(2_000),
-    )
-    .map_err(ApiError::internal)
+    ) {
+        Ok(Some(session)) => Ok(session),
+        Ok(None) => Err("OMP has not saved a session for this incarnation yet".into()),
+        Err(error) => Err(format!(
+            "reading the OMP session directory failed: {error:#}"
+        )),
+    }
 }
 
 pub(super) fn timeline_value(
@@ -3224,20 +3300,31 @@ pub(super) fn timeline_value(
                 .ok_or_else(|| {
                     ApiError::not_found(format!("session `{session_id}` does not exist"))
                 })?;
-        return native_timeline_page(state, snapshot, &session_id, query, &external);
+        let items =
+            crate::external_sessions::normalized_timeline(&external).map_err(ApiError::internal)?;
+        return native_timeline_page(state, snapshot, &session_id, query, items);
     };
     let owner = owner.as_str();
     let incarnation = incarnation.as_deref();
-    if let Some(incarnation) = incarnation {
-        let external = match managed_codex_transcript(state, owner, incarnation)? {
-            Some(external) => Some(external),
-            None => match managed_claude_transcript(state, owner, incarnation)? {
-                Some(external) => Some(external),
-                None => managed_omp_transcript(state, owner, incarnation)?,
-            },
-        };
-        if let Some(external) = external {
-            return native_timeline_page(state, snapshot, &session_id, query, &external);
+    // When the seat's harness keeps a transcript st3 cannot bind or read, the claim timeline
+    // below is shown with one entry that says why, never silently in its place.
+    let mut transcript_notice_entry = None;
+    if let Some(incarnation) = incarnation
+        && let Some(managed) = managed_transcript(state, owner, incarnation)?
+    {
+        let read = managed
+            .transcript
+            .as_ref()
+            .map_err(String::clone)
+            .and_then(|external| {
+                crate::external_sessions::normalized_timeline(external)
+                    .map_err(|error| format!("the transcript could not be read: {error:#}"))
+            });
+        match read {
+            Ok(items) => return native_timeline_page(state, snapshot, &session_id, query, items),
+            Err(reason) => {
+                transcript_notice_entry = Some(transcript_notice(&session_id, &managed, &reason));
+            }
         }
     }
     let desired = state.store.desired_subjects().map_err(ApiError::internal)?;
@@ -3542,6 +3629,7 @@ pub(super) fn timeline_value(
             }));
         }
     }
+    items.extend(transcript_notice_entry);
     items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
     // A conversation opens at its newest bounded window. The cursor walks toward older
     // windows, while each individual page remains chronological for straightforward rendering.
@@ -3879,15 +3967,8 @@ impl ConversationMark {
             .unwrap_or_default();
         // Resolve the transcript once: finding it walks the harness's session directories.
         let transcript = match (&owner, &incarnation) {
-            (Some(owner), Some(incarnation)) => {
-                match managed_codex_transcript(state, owner, incarnation)? {
-                    Some(external) => Some(external),
-                    None => match managed_claude_transcript(state, owner, incarnation)? {
-                        Some(external) => Some(external),
-                        None => managed_omp_transcript(state, owner, incarnation)?,
-                    },
-                }
-            }
+            (Some(owner), Some(incarnation)) => managed_transcript(state, owner, incarnation)?
+                .and_then(|managed| managed.transcript.ok()),
             _ => crate::external_sessions::find(state.native_session_home.as_deref(), session_id)
                 .map_err(ApiError::internal)?,
         }
@@ -9729,11 +9810,27 @@ mission "example/zero-run" state="ready" {
             .unwrap(),
         )
         .unwrap();
-        assert!(
-            managed_codex_transcript(&state, owner, incarnation)
-                .unwrap()
-                .is_none()
+        let stale = managed_transcript(&state, owner, incarnation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stale.transcript.unwrap_err(),
+            "the Codex binding belongs to a different runtime"
         );
+        let unbound = timeline_value(
+            &state,
+            &new_client_snapshot(&state),
+            &session,
+            &session_id,
+            &ClientListQuery::default(),
+        )
+        .unwrap()
+        .0;
+        assert!(unbound["items"].as_array().unwrap().iter().any(|item| {
+            item["type"] == "error"
+                && item["body"]["code"] == "transcript-not-bound"
+                && item["body"]["details"]["driver"] == "codex"
+        }));
     }
 
     #[test]
@@ -9789,8 +9886,10 @@ mission "example/zero-run" state="ready" {
                 idempotency_key: None,
             })
             .unwrap();
-        let exact = super::managed_claude_transcript(&state, owner, incarnation)
+        let exact = super::managed_transcript(&state, owner, incarnation)
             .unwrap()
+            .unwrap()
+            .transcript
             .unwrap();
         let timeline = crate::external_sessions::normalized_timeline(&exact).unwrap();
         assert!(
@@ -9799,9 +9898,11 @@ mission "example/zero-run" state="ready" {
                 .any(|entry| entry["body"]["text"] == "Current Claude answer")
         );
         assert!(
-            super::managed_claude_transcript(&state, owner, "native-pty:old")
+            super::managed_transcript(&state, owner, "native-pty:old")
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .transcript
+                .is_err()
         );
         std::fs::write(
             directory.join("claude-native-session"),
@@ -9811,11 +9912,133 @@ mission "example/zero-run" state="ready" {
             .unwrap(),
         )
         .unwrap();
-        assert!(
-            super::managed_claude_transcript(&state, owner, incarnation)
-                .unwrap()
-                .is_none()
+        // A stale hook binding is not used, and the process fallback refuses evidence that
+        // does not name a driver process.
+        let stale = super::managed_transcript(&state, owner, incarnation)
+            .unwrap()
+            .unwrap()
+            .transcript
+            .unwrap_err();
+        assert!(stale.contains("does not name a driver process"), "{stale}");
+    }
+
+    #[test]
+    fn managed_claude_without_a_hook_binding_is_proved_from_its_driver_or_says_why_not() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let native_id = "22222222-2222-4222-8222-222222222222";
+        let transcript = home.join(format!(".claude/projects/-test/{native_id}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            format!("{}\n", json!({"type":"assistant","sessionId":native_id,"timestamp":"2026-09-30T12:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Recovered without the hook"}]}})),
+        )
+        .unwrap();
+        let mut state = test_state_named(root.path(), "managed-claude-fallback-test");
+        state.native_session_home = Some(home.clone());
+        let owner = "agent/managed-claude-fallback";
+        let incarnation = "native-pty:current";
+        let append = |kind: &str, fields: BTreeMap<String, Value>| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: owner.into(),
+                    kind: kind.into(),
+                    actor: Some(owner.into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        let observe = |evidence: &str| {
+            append(
+                "harness.observed",
+                BTreeMap::from([
+                    ("state".into(), json!("working")),
+                    ("driver".into(), json!("claude")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("evidence_incarnation".into(), json!(evidence)),
+                ]),
+            );
+        };
+        append(
+            "runtime.observed",
+            BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("runtime_id".into(), json!("managed-claude-pty")),
+                ("incarnation_id".into(), json!(incarnation)),
+                ("terminal".into(), json!(true)),
+            ]),
         );
+        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session_id = super::managed_session_id(owner, incarnation);
+        let timeline = || {
+            timeline_value(
+                &state,
+                &new_client_snapshot(&state),
+                &session,
+                &session_id,
+                &ClientListQuery::default(),
+            )
+            .unwrap()
+            .0["items"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+
+        // The hook never bound a session and the evidence names a driver that is gone: the
+        // claim timeline says so instead of silently standing in for the conversation.
+        observe("4194303-1000-0");
+        let unbound = timeline();
+        let notice = unbound
+            .iter()
+            .find(|item| item["body"]["code"] == "transcript-not-bound")
+            .expect("the timeline should say why the transcript is missing");
+        assert_eq!(notice["type"], "error");
+        assert_eq!(notice["role"], "system");
+        assert_eq!(notice["body"]["details"]["driver"], "claude");
+        assert!(
+            notice["body"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("transcript not bound: the SessionStart hook did not bind"),
+            "{notice:#}"
+        );
+        assert!(
+            !unbound
+                .iter()
+                .any(|item| item["body"]["text"] == "Recovered without the hook")
+        );
+
+        // The live driver named by the evidence proves its Claude child's session.
+        #[cfg(target_os = "linux")]
+        {
+            let fake = crate::external_sessions::test_support::FakeClaudeDriver::start(owner);
+            fake.record_session(&home, native_id, None);
+            observe(&fake.token());
+            let bound = timeline();
+            assert!(
+                bound
+                    .iter()
+                    .any(|item| item["body"]["text"] == "Recovered without the hook"),
+                "{bound:#?}"
+            );
+            assert!(
+                !bound
+                    .iter()
+                    .any(|item| item["body"]["code"] == "transcript-not-bound")
+            );
+            // A different seat's evidence naming this driver binds nothing.
+            let other = crate::external_sessions::claude_session_of_managed_driver(
+                &home,
+                "agent/someone-else",
+                &fake.token(),
+            );
+            assert!(other.is_err());
+        }
     }
 
     #[test]
@@ -9870,8 +10093,10 @@ mission "example/zero-run" state="ready" {
                 idempotency_key: None,
             })
             .unwrap();
-        let exact = super::managed_omp_transcript(&state, owner, incarnation)
+        let exact = super::managed_transcript(&state, owner, incarnation)
             .unwrap()
+            .unwrap()
+            .transcript
             .unwrap();
         assert_eq!(exact.native_id, "current");
         let timeline = crate::external_sessions::normalized_timeline(&exact).unwrap();
@@ -9888,9 +10113,11 @@ mission "example/zero-run" state="ready" {
                     && entry["body"]["text"] == "{\"presence\":null}")
         );
         assert!(
-            super::managed_omp_transcript(&state, owner, "123:2026-09-25T14:00:00Z")
+            super::managed_transcript(&state, owner, "123:2026-09-25T14:00:00Z")
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .transcript
+                .is_err()
         );
     }
 

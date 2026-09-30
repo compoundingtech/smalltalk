@@ -22,7 +22,7 @@ not an invitation to start the trial while this hold is active.
 
 | Capability | Current evidence | Remaining check |
 | --- | --- | --- |
-| Declarative agents | Standing and mission-owned seats are visible in the graph; OMP and OpenCode were declared in `st3-network` main and started on their assigned hosts. The pty-rust seat is restored as a top-level durable agent, with its observer and subscriptions in an active intake run. The restarted OMP seat uses a supported model; both strict doctors pass. | Keep the seats and pty-rust intake active overnight. |
+| Declarative agents | Standing and mission-owned seats are visible in the graph; OMP and OpenCode were declared in the fleet configuration repository and started on their assigned hosts. The pty-rust seat is restored as a top-level durable agent, with its observer and subscriptions in an active intake run. The restarted OMP seat uses a supported model; both strict doctors pass. | Keep the seats and pty-rust intake active overnight. |
 | Addressable inboxes | The continuous monitor has exact linked receipts, and a temporary OMP seat answered one request exactly once before and after its restart on the repaired daemon. | Keep the monitor running through the new 72-hour window. |
 | Clean-session recovery | Codex's controlled fresh-thread restart retained graph work; the latest controlled OMP restart produced a new ready incarnation and an exact linked native inbox reply. | Keep the new incarnation ready overnight. |
 | Visible work | CLI mission/work detail and iOS Control expose current runs; the installed TUI has cards, actions, readable mission labels, active-first nested Chat agents, cleaned channel wrappers, usable mouse navigation, scrolling and selectable text. Installed PTY interaction QA passed on both hosts. The managed OMP timeline now reads saved turns, tool calls, and tool results on both hosts. CoS's matched quiet CPU retest found a 0.6% core viewer cost. | Full release soak; Nathan is not the TUI acceptance tester. |
@@ -216,7 +216,7 @@ the release gates after the final tested rollout.
   notice; the TUI clears it after a successful model refresh.
 - Transient `st` driver API warnings now append to a private host state log
   instead of stderr shared with the harness PTY. Silber's idle Fabric steward
-  was restarted from its unchanged `st3-network` KDL at 20:38:29 UTC to pick
+  was restarted from its unchanged fleet configuration KDL at 20:38:29 UTC to pick
   up the driver fix; it returned to an idle new incarnation with no active
   work and strict doctor passing. Its old session had referenced an immutable
   Claude hook set missing on Silber. The exact set was copied from Hetz and
@@ -304,7 +304,7 @@ the release gates after the final tested rollout.
   and active PR and issue subscriptions. Its agentless retirement gate keeps
   the run open without occupying the agent's one available work claim, so PR
   route steps remain claimable. The declarations and corrected mission are on
-  `st3-network` main at `236ecd7`.
+  the fleet configuration repository at `236ecd7`.
 - The completed UI mission was stuck `revision-draining` because a late
   `revision-proposal.created` projection reset the successor generation's
   phase. `08dbe1a` fences draining claims to their source generation and
@@ -402,7 +402,7 @@ the release gates after the final tested rollout.
   removal of one test PTY. No daemon or replication worker was restarted, so
   the 13:55:44 UTC soak markers remain in force.
 - OMP 18.1.22 lists `openai-codex/gpt-5.6-sol` as an exact supported selector.
-  `st3-network` main commit `c144f37` declares it, and the controlled OMP
+  the fleet configuration repository commit `c144f37` declares it, and the controlled OMP
   restart at 15:11:54 UTC launched with that exact model and medium effort.
   The new incarnation answered an exact linked native inbox probe. The staged
   model-registry gate from `5e3b80f` remains reverted in the deployed daemon;
@@ -496,7 +496,7 @@ the release gates after the final tested rollout.
   establish a flat 24-hour result. OMP 18.1.22 silently fell back from its
   declared `openai-codex/gpt-6-sol` model to `gpt-5.6-sol` because the former
   is absent from its registry. COS is obtaining Nathan's model choice before
-  changing the `st3-network` declaration. The declared model must be honored
+  changing the fleet configuration declaration. The declared model must be honored
   or fail visibly before this seat can be called friend-ready.
 - Source commit `5e3b80f` adds an exact OMP registry check before the wrapper
   claims its seat. The new regression rejects the unavailable requested model
@@ -582,7 +582,7 @@ the release gates after the final tested rollout.
   to the existing UI run. The completed initial fixes carried forward; the
   active integration step restarted under its original `restart-active` policy
   and was completed with the same rollout evidence. The new TUI layout step is
-  claimed. The revised source is committed on `st3-network` main at
+  claimed. The revised source is committed on the fleet configuration repository at
   `e19d61d`. It selects `when-idle` for future
   revisions; that setting did not change this cutover.
 - All prior 24-hour idle and 72-hour delivery markers remain diagnostic only.
