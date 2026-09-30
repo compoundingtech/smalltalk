@@ -285,7 +285,7 @@ impl Client {
                 );
                 announced = true;
             }
-            tokio::time::sleep(pause.min(self.outage_wait - waited)).await;
+            tokio::time::sleep(jittered(pause).min(self.outage_wait - waited)).await;
             pause = (pause * 2).min(Duration::from_secs(1));
         }
     }
@@ -935,6 +935,17 @@ fn request_deadline(path: &str, deadlines: ClientDeadlines) -> Duration {
     }
 }
 
+/// Half to one and a half times `pause`. Every seat and command waiting out one daemon restart
+/// retries on the same doubling schedule; without a random share they would all reach the daemon
+/// in the same instant it starts to listen.
+fn jittered(pause: Duration) -> Duration {
+    let mut share = [0_u8; 1];
+    if getrandom::fill(&mut share).is_err() {
+        return pause;
+    }
+    pause.mul_f64(0.5 + f64::from(share[0]) / 255.0)
+}
+
 /// A connect that times out never delivered the request, so it is an outage, not a slow answer.
 fn connect_deadline_error(endpoint: &str, deadline: Duration) -> anyhow::Error {
     DaemonUnreachable::connect(
@@ -1296,6 +1307,24 @@ mod tests {
             .unwrap();
         assert_eq!(post, json!({"method": "post"}));
         server.abort();
+    }
+
+    /// Clients waiting out one restart retry at different times, each within half to one and a
+    /// half of its pause.
+    #[test]
+    fn restart_retries_are_spread_around_their_pause() {
+        let pause = Duration::from_millis(400);
+        let pauses = (0..64).map(|_| jittered(pause)).collect::<Vec<_>>();
+        assert!(pauses.iter().all(|jittered| {
+            (Duration::from_millis(200)..=Duration::from_millis(600)).contains(jittered)
+        }));
+        assert!(
+            pauses
+                .iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                > 8
+        );
     }
 
     #[tokio::test]
