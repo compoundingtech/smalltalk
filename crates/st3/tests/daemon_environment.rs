@@ -73,6 +73,11 @@ fn client_without_runtime_dir_reaches_daemon_with_different_socket() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     std::fs::create_dir_all(&home).unwrap();
+    // The service has no PATH; its login shell must provide one before socket discovery.
+    let profile = format!("export PATH='{}'\n", std::env::var("PATH").unwrap());
+    for name in [".bash_profile", ".zprofile", ".zshrc"] {
+        std::fs::write(home.join(name), &profile).unwrap();
+    }
     let state_home = root.path().join("state").join("long".repeat(26));
     let (_service, socket) = start_service(root.path(), &home, &state_home);
     let state_socket = state_home.join("st3/run/st3.sock");
