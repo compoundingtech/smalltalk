@@ -1209,7 +1209,7 @@ fn observe_payload(
                 .and_then(serde_json::Value::as_str),
         ) {
             if !native_id.is_empty() {
-                if let Err(error) = write_native_session_binding(&agent_dir, incarnation, native_id)
+                if let Err(error) = write_native_session_binding(agent_dir, incarnation, native_id)
                 {
                     tracing::warn!(
                         "st2 claude-observe: native session binding write failed: {error:#}"
@@ -1223,7 +1223,7 @@ fn observe_payload(
         .or_else(|| wrapperless_token(&payload))
         .unwrap_or_else(|| format!("unattributed:{}", runtime_id.unwrap_or(identity)));
     let mut timeline =
-        crate::harness_timeline::Writer::new(&agent_dir, "claude", timeline_incarnation);
+        crate::harness_timeline::Writer::new(agent_dir, "claude", timeline_incarnation);
     if let Err(error) = crate::harness_timeline::observe_claude(&mut timeline, event, &payload) {
         // Timeline observability is fail-open just like state/context publication: a record fault
         // must not hold up the hook process Claude is waiting on.
@@ -1244,7 +1244,7 @@ fn observe_payload(
     // events that carry a compaction edge say nothing about top-level harness state and would
     // otherwise return below. Fail-open: a context record that cannot be written must never stop
     // a hook the harness is waiting on, and the numbers authorize nothing (HC-A02).
-    if let Err(error) = observe_compaction(&agent_dir, identity, event, &payload) {
+    if let Err(error) = observe_compaction(agent_dir, identity, event, &payload) {
         tracing::warn!("st2 claude-observe: harness-context compaction write failed: {error:#}");
     }
     // The credential axis is independent of both the numbers and the categorical state, and is
@@ -1252,7 +1252,7 @@ fn observe_payload(
     // an edge that carries no top-level state change must still reach its own record.
     if let Some(edge) = provider_auth_edge(event, &payload) {
         driver_diagnostic::publish_provider_auth(
-            &agent_dir,
+            agent_dir,
             driver_diagnostic::Driver::Claude,
             edge,
         );
@@ -1261,7 +1261,7 @@ fn observe_payload(
         return Ok(());
     };
     let mut writer = observe_writer(
-        &agent_dir,
+        agent_dir,
         identity,
         runtime_id,
         event,
