@@ -442,13 +442,9 @@ impl Config {
             );
         }
         if let Some(address) = &self.peer_listen {
-            let address = address
+            address
                 .parse::<SocketAddr>()
                 .with_context(|| format!("parse peer listener `{address}`"))?;
-            anyhow::ensure!(
-                address.ip().is_loopback(),
-                "the peer listener must bind to a loopback address"
-            );
         }
         anyhow::ensure!(
             self.peers.iter().all(|peer| !peer.name.is_empty()),
@@ -635,9 +631,9 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_listener_must_use_a_loopback_address() {
+    fn a_peer_listener_accepts_configured_ip_addresses() {
         let mut config = Config {
-            peer_listen: Some("0.0.0.0:31313".into()),
+            peer_listen: None,
             fleet_id: Some("1f91ca65-7793-48cc-866e-ac15690130e1".into()),
             shared_secret_file: Some("/tmp/st3-test-secret".into()),
             peers: vec![PeerConfig {
@@ -646,18 +642,32 @@ mod tests {
             }],
             ..Config::default()
         };
-        assert!(
-            config
-                .validate()
-                .unwrap_err()
-                .to_string()
-                .contains("loopback")
-        );
-
-        config.peer_listen = Some("127.0.0.1:31313".into());
-        config.validate().unwrap();
-        config.peer_listen = Some("[::1]:31313".into());
-        config.validate().unwrap();
+        for address in [
+            "127.0.0.1:31313",
+            "[::1]:31313",
+            "100.101.102.103:31313",
+            "[fd7a:115c:a1e0::1234]:31313",
+            "192.0.2.1:31313",
+        ] {
+            config.peer_listen = Some(address.into());
+            config.validate().unwrap();
+        }
+        for address in [
+            "localhost:31313",
+            "100.101.102.103",
+            "fd7a:115c:a1e0::1234:31313",
+            "127.0.0.1:65536",
+        ] {
+            config.peer_listen = Some(address.into());
+            assert!(
+                config
+                    .validate()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("parse peer listener"),
+                "{address}"
+            );
+        }
     }
 
     #[test]

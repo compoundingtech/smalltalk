@@ -3,6 +3,8 @@ use axum::http::HeaderMap;
 use axum::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
 use std::collections::BTreeSet;
 
+pub(super) mod raw_terminal;
+
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
 const COLLECTION_SUBPROTOCOL: &str = "st3.client.collections.v0";
@@ -5638,6 +5640,17 @@ fn consume_terminal_attachment(
     incarnation: &str,
     capability: Option<&str>,
 ) -> Result<(), ApiError> {
+    consume_terminal_attachment_mode(state, session, terminal_id, incarnation, capability, None)
+}
+
+fn consume_terminal_attachment_mode(
+    state: &AppState,
+    session: &ClientSession,
+    terminal_id: &str,
+    incarnation: &str,
+    capability: Option<&str>,
+    raw_mode: Option<&str>,
+) -> Result<(), ApiError> {
     let capability = capability
         .filter(|value| !value.is_empty())
         .ok_or_else(|| forbidden("a terminal stream capability is required"))?;
@@ -5665,9 +5678,20 @@ fn consume_terminal_attachment(
         .max_by_key(|claim| claim.store_index)
         .ok_or_else(|| ApiError::internal("the terminal attachment has no head"))?;
     let field = |name: &str| attached.body.pointer(&format!("/fields/{name}"));
+    let raw_live = raw_mode.map(|_| {
+        remote_terminal_live_session(state, &terminal_subject(terminal_id), incarnation)
+    }).transpose()?;
     let valid = latest.id == attached.id
         && attached.origin == state.store.origin()
         && field("session_actor").and_then(Value::as_str) == Some(session.actor.as_str())
+        && field("raw_mode").and_then(Value::as_str) == raw_mode
+        && raw_mode.is_none_or(|_| {
+            field("person_id").and_then(Value::as_str) == Some(session.authority_actor.as_str())
+        })
+        && raw_live.as_ref().is_none_or(|live| {
+            field("owner_host_id").and_then(Value::as_str) == Some(live.owner_host_id.as_str())
+                && field("runtime_id").and_then(Value::as_str) == Some(live.runtime_id.as_str())
+        })
         && field("owner_host_id")
             .and_then(Value::as_str)
             .is_some_and(|owner| {
