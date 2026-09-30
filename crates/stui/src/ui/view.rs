@@ -286,6 +286,8 @@ pub enum Word {
     Failed,
     /// Someone or something stopped it before it finished.
     Cancelled,
+    /// Published, and nobody has started a run of it.
+    NotStarted,
 }
 
 impl Word {
@@ -303,6 +305,7 @@ impl Word {
             Word::Done => "done",
             Word::Failed => "failed",
             Word::Cancelled => "cancelled",
+            Word::NotStarted => "not started",
         }
     }
     pub fn explain(self) -> &'static str {
@@ -319,6 +322,7 @@ impl Word {
             Word::Done => "every step finished",
             Word::Failed => "a step failed and nothing retried it",
             Word::Cancelled => "it was stopped before it finished",
+            Word::NotStarted => "published, and never started",
         }
     }
 }

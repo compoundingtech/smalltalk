@@ -96,6 +96,7 @@ pub fn word_style(word: Word, spinner: &'static str) -> (&'static str, Color) {
         Word::Done => ("✓", theme::DONE),
         Word::Failed => ("✕", theme::FAULT),
         Word::Cancelled => ("⊘", theme::QUIET),
+        Word::NotStarted => ("○", theme::QUIET),
     }
 }
 
@@ -754,13 +755,12 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
     card.blank();
     // What the item is about, as links wherever st names a graph subject.
     card.section("related", None, inner);
-    card.line(Line::from(vec![
-        span(format!("{:<10}", "raised by"), theme::dim()),
-        match &item.raised_by {
-            Some(who) => span(who.clone(), theme::soft()),
-            None => span("st does not say yet", theme::dim()),
-        },
-    ]));
+    if let Some(who) = &item.raised_by {
+        card.line(Line::from(vec![
+            span(format!("{:<10}", "raised by"), theme::dim()),
+            span(who.clone(), theme::soft()),
+        ]));
+    }
     if item.related.is_empty() && item.mission.is_none() && item.agent.is_none() {
         card.line(Line::from(span(
             "st names no agent, mission or step for this item.",
@@ -876,17 +876,12 @@ fn flow<'a>(
             .filter(|(index, _)| depth[*index] == layer)
             .map(|(_, step)| *step)
             .collect::<Vec<_>>();
-        if names.len() > 1 {
-            runs.push(run("{", theme::dim()));
-        }
+        // Steps that can run side by side read as a list: `a, b → c`.
         for (index, (name, _, color)) in names.iter().enumerate() {
             if index > 0 {
                 runs.push(run(", ", theme::dim()));
             }
             runs.push(run(name.to_string(), theme::fg(*color)));
-        }
-        if names.len() > 1 {
-            runs.push(run("}", theme::dim()));
         }
     }
     text::wrap(
@@ -1036,10 +1031,15 @@ pub fn mission_order(world: &World, system: bool) -> Vec<&Mission> {
         .missions
         .items()
         .iter()
-        .filter(|mission| system || !mission.system)
+        .filter(|mission| system || !hidden_by_default(mission))
         .collect::<Vec<_>>();
     missions.sort_by_key(|mission| (mission.word, mission.title.to_lowercase()));
     missions
+}
+
+/// Missions a person rarely looks for: st's own, and ones nobody has started. `x` shows them.
+fn hidden_by_default(mission: &Mission) -> bool {
+    mission.system || mission.word == Word::NotStarted
 }
 
 pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> Listing {
@@ -1063,7 +1063,9 @@ pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> List
         let (glyph, color) = word_style(mission.word, spinner);
         let (done, total) = mission.progress();
         // st reports only current steps for many runs, so a 0/1 meter would claim too much.
-        let right = if done > 0 {
+        let right = if mission.word == Word::NotStarted {
+            vec![]
+        } else if done > 0 {
             let mut right = meter(done, total, 5, color);
             right.push(span(format!(" {done}/{total}"), theme::dim()));
             right
@@ -1091,17 +1093,32 @@ pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> List
         });
         ids.push(mission.id.clone());
     }
-    let hidden = world
-        .missions
-        .items()
-        .iter()
-        .filter(|mission| mission.system && !system)
-        .count();
-    if hidden > 0 {
-        items.push(Item::Note(Line::from(span(
-            format!(" {hidden} system missions hidden · x shows them"),
-            theme::dim(),
-        ))));
+    if !system {
+        let count = |hidden: fn(&Mission) -> bool| {
+            world
+                .missions
+                .items()
+                .iter()
+                .filter(|mission| hidden(mission))
+                .count()
+        };
+        let kinds = [
+            (count(|mission| mission.system), "from st"),
+            (
+                count(|mission| !mission.system && mission.word == Word::NotStarted),
+                "not started",
+            ),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, kind)| format!("{count} {kind}"))
+        .collect::<Vec<_>>();
+        if !kinds.is_empty() {
+            items.push(Item::Note(Line::from(span(
+                format!(" hidden: {} · x shows them", kinds.join(", ")),
+                theme::dim(),
+            ))));
+        }
     }
     Listing {
         items,
@@ -1202,16 +1219,19 @@ pub fn mission_detail(
     let mut bar = meter(done, total, 20, theme::DONE);
     bar.push(span(format!("  {done}/{total} done"), theme::dim()));
     steps.line(Line::from(bar));
-    steps.lines(flow(
-        mission.steps.iter().map(|step| {
-            (
-                step.name.as_str(),
-                step.after.as_slice(),
-                step_style(step.state, spinner).1,
-            )
-        }),
-        inner,
-    ));
+    // The order only says something when a step waits for another.
+    if mission.steps.iter().any(|step| !step.after.is_empty()) {
+        steps.lines(flow(
+            mission.steps.iter().map(|step| {
+                (
+                    step.name.as_str(),
+                    step.after.as_slice(),
+                    step_style(step.state, spinner).1,
+                )
+            }),
+            inner,
+        ));
+    }
     let name_width = mission
         .steps
         .iter()

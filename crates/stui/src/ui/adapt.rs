@@ -130,7 +130,7 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
         .filter(|mission| {
             !matches!(
                 mission.word,
-                Word::Decision | Word::Done | Word::Failed | Word::Cancelled
+                Word::Decision | Word::Done | Word::Failed | Word::Cancelled | Word::NotStarted
             ) && !mission.system
         })
         .count();
@@ -359,6 +359,12 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                         .find(|candidate| candidate.header.id == who)
                         .map(|candidate| format!("{} · {who}", crate::agent_label(candidate)))
                         .unwrap_or(who),
+                })
+                // A gate or fault nobody filed by hand comes from its mission.
+                .or_else(|| {
+                    item.mission_id.as_ref().map(|mission| {
+                        format!("the {} mission", mission.trim_start_matches("mission/"))
+                    })
                 });
             Attention {
                 id: item.header.id.clone(),
@@ -652,6 +658,8 @@ fn missions(model: &Model) -> Vec<Mission> {
                 .collect::<Vec<_>>();
             let word = if decision.is_some() {
                 Word::Decision
+            } else if mission.runs.is_empty() && mission.run_details.is_empty() && work.is_empty() {
+                Word::NotStarted
             } else if mission.state == "blocked" || states.contains(&"blocked") {
                 Word::Stalled
             } else if mission.state == "completed" {
@@ -738,7 +746,13 @@ fn missions(model: &Model) -> Vec<Mission> {
                         name: step.path.clone(),
                         state,
                         owner: step_owner(model, step),
-                        note: note.or_else(|| step.blocked_reason.clone()),
+                        // st keeps a step's last reason after it moves on; only a step still
+                        // waiting is held up by it.
+                        note: note.or_else(|| {
+                            matches!(step.state.as_str(), "waiting" | "blocked")
+                                .then(|| step.blocked_reason.clone())
+                                .flatten()
+                        }),
                         after: vec![],
                         age: age(&step.since),
                         goals: step
