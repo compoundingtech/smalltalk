@@ -6,7 +6,7 @@
 //! it could not admit, claims it lost, and graphs it projected by another rule. Each run ends
 //! with every link up and every node restarted on this build. After exchanges and heals, every
 //! node must hold the same envelopes and project the same graph, and a run without faults must
-//! agree before any heal.
+//! agree before any heal without ever replaying its graph from nothing.
 //!
 //! `ST3_CONVERGENCE_RUNS` (default 8) and `ST3_CONVERGENCE_STEPS` (default 80) size the test;
 //! `ST3_CONVERGENCE_SEED` repeats one run. A failing run names its seed.
@@ -784,6 +784,7 @@ fn env_number(name: &str, default: u64) -> u64 {
 /// One run: random steps with or without faults, then settle, then heal.
 fn run(seed: u64, steps: u64) -> std::result::Result<(), String> {
     let directory = tempfile::tempdir().unwrap();
+    FULL_REPLAYS.with(|replays| replays.set(0));
     let mut simulation = Simulation::new(seed, directory.path());
     let faults = simulation.rng.chance(50);
     for _ in 0..steps {
@@ -814,6 +815,15 @@ fn run(seed: u64, steps: u64) -> std::result::Result<(), String> {
         .collect::<BTreeSet<_>>();
     if authorities.len() != 1 {
         return Err(report(&simulation, "the nodes hold different envelopes"));
+    }
+    // Every claim extends the graph incrementally, or rebuilds the one run tree, desired
+    // subject, document or mission it reaches out of order. Only a fault needs the full replay.
+    let replays = FULL_REPLAYS.with(std::cell::Cell::get);
+    if simulation.faults.is_empty() && replays != 0 {
+        return Err(report(
+            &simulation,
+            &format!("without faults, projections replayed the graph from nothing {replays} times"),
+        ));
     }
     let graphs_before_heal = simulation
         .digests()
