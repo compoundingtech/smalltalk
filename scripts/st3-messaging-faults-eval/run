@@ -1,0 +1,535 @@
+#!/usr/bin/env python3
+"""Two isolated nodes, real replication/native delivery, zero model tokens."""
+import argparse
+import asyncio
+import datetime
+import hashlib
+import json
+import os
+from pathlib import Path
+import shlex
+import shutil
+import signal
+import socket
+import tempfile
+import time
+import uuid
+
+HERE = Path(__file__).resolve().parent
+CASES = ("baseline", "daemon-restart", "binary-swap", "link-seconds", "link-minutes",
+         "receiver-down", "harness-restart", "channel-killed", "old-channel")
+
+
+def now_ms():
+    return time.time_ns() // 1_000_000
+
+
+def write_json(path, value):
+    path.write_text(json.dumps(value, indent=2) + "\n")
+
+
+def digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+async def until(predicate, timeout=30):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = await predicate()
+        if value:
+            return value
+        await asyncio.sleep(0.1)
+    raise TimeoutError("condition did not become true")
+
+
+async def stop(process):
+    if process and process.returncode is None:
+        process.terminate()
+        try:
+            await asyncio.wait_for(process.wait(), 10)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+
+
+class Link:
+    """Drop BOTH directions and all open TCP connections, including keepalive."""
+    def __init__(self):
+        self.enabled = True
+        self.connections = set()
+        self.servers = []
+
+    async def listen(self, target_port):
+        async def accept(reader, writer):
+            self.connections.add(writer)
+            upstream = None
+            try:
+                if not self.enabled:
+                    return
+                peer_reader, upstream = await asyncio.open_connection("127.0.0.1", target_port)
+                self.connections.add(upstream)
+
+                async def copy(source, destination):
+                    while self.enabled:
+                        chunk = await source.read(65536)
+                        if not chunk:
+                            break
+                        destination.write(chunk)
+                        await destination.drain()
+                    destination.close()
+
+                await asyncio.gather(copy(reader, upstream), copy(peer_reader, writer))
+            except (OSError, ConnectionError):
+                pass
+            finally:
+                for connection in (writer, upstream):
+                    if connection:
+                        connection.close()
+                        self.connections.discard(connection)
+        server = await asyncio.start_server(accept, "127.0.0.1", 0)
+        self.servers.append(server)
+        return server.sockets[0].getsockname()[1]
+
+    def drop(self):
+        self.enabled = False
+        for connection in tuple(self.connections):
+            connection.close()
+
+    async def close(self):
+        self.drop()
+        for server in self.servers:
+            server.close()
+            await server.wait_closed()
+
+
+def free_port():
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        return listener.getsockname()[1]
+
+
+class Node:
+    def __init__(self, root, name, binary, env):
+        self.root = root / name
+        self.name = name
+        for sub in ("bin", "state", "pty", "home", "run", "ws"):
+            (self.root / sub).mkdir(parents=True, exist_ok=True)
+        self.binary = self.root / "bin/st3"
+        shutil.copy2(binary, self.binary)
+        hostname = self.root / "bin/hostname"
+        hostname.write_text(f"#!/bin/sh\nprintf '%s\\n' {shlex.quote(name)}\n")
+        hostname.chmod(0o755)
+        self.endpoint = self.root / "run/st3.sock"
+        self.env = {**env, "HOME": str(self.root / "home"),
+                    "XDG_STATE_HOME": str(self.root / "home/state"),
+                    "XDG_CONFIG_HOME": str(self.root / "home/config"),
+                    "XDG_RUNTIME_DIR": os.environ.get("XDG_RUNTIME_DIR", str(self.root / "run")),
+                    "ST3_ENDPOINT": str(self.endpoint), "ST3_DAEMON_WAIT": "0",
+                    "PATH": f"{self.root / 'bin'}:{env['PATH']}"}
+        # Historical daemons rebuild PATH from a login shell. Pin that shell's
+        # fixture executables too, so it cannot launch an installed real provider.
+        profile = "export PATH=" + shlex.quote(self.env["PATH"]) + "\n"
+        for filename in (".profile", ".bash_profile", ".zprofile", ".zshenv"):
+            (self.root / "home" / filename).write_text(profile)
+        self.daemon = self.worker = None
+        self.processes = []
+        self.logs = []
+
+    async def spawn(self, args, log):
+        stream = (self.root / log).open("ab")
+        self.logs.append(stream)
+        process = await asyncio.create_subprocess_exec(str(self.binary), *args,
+            env=self.env, cwd=self.root / "ws", stdin=asyncio.subprocess.DEVNULL,
+            stdout=stream, stderr=stream, start_new_session=True)
+        self.processes.append(process)
+        return process
+
+    async def cli(self, *args, check=True):
+        process = await asyncio.create_subprocess_exec(str(self.binary), "--endpoint", str(self.endpoint),
+            *args, env=self.env, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), 5)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.wait()
+            raise
+        if check and process.returncode:
+            raise RuntimeError(stderr.decode().strip())
+        return stdout.decode()
+
+    async def api(self, path):
+        try:
+            reader, writer = await asyncio.wait_for(asyncio.open_unix_connection(str(self.endpoint)), 1)
+            try:
+                writer.write(f"GET {path} HTTP/1.0\r\nHost: localhost\r\n\r\n".encode())
+                await writer.drain()
+                response = await asyncio.wait_for(reader.read(), 2)
+                headers, body = response.split(b"\r\n\r\n", 1)
+                if b" 200 " not in headers.split(b"\r\n")[0]:
+                    return None
+                payload = json.loads(body)
+                return payload.get("value", payload)
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        except (OSError, ValueError, asyncio.TimeoutError):
+            return None
+
+    async def start(self):
+        self.daemon = await self.spawn(["up", "--config", str(self.root / "config.toml")], "daemon.log")
+        async def ready():
+            if self.daemon.returncode is not None:
+                raise RuntimeError("isolated daemon exited: " + (self.root / "daemon.log").read_text()[-2000:])
+            return await self.api("/v1/replication/status")
+        await until(ready)
+        self.worker = await self.spawn(["replication-worker", "--config", str(self.root / "config.toml")], "worker.log")
+
+    async def down(self):
+        await stop(self.worker)
+        await stop(self.daemon)
+
+    def seats(self):
+        """Only PIDs with this eval's exact private endpoint, never shared seats."""
+        rows = []
+        for proc in Path("/proc").glob("[0-9]*"):
+            try:
+                env = (proc / "environ").read_bytes().split(b"\0")
+                if f"ST3_ENDPOINT={self.endpoint}".encode() not in env or b"ST_AGENT=agent/eval/fault-probe" not in env:
+                    continue
+                argv = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+                rows.append({"pid": int(proc.name), "argv": argv, "image": os.readlink(proc / "exe")})
+            except (OSError, UnicodeError):
+                pass
+        return rows
+
+    async def cleanup(self):
+        # Stop reconciliation before closing PTYs, otherwise restart=always can
+        # launch a replacement while the registry is being drained.
+        await self.down()
+        # PTY servers are detached, so first close the exact private registry.
+        process = await asyncio.create_subprocess_exec("pty", "list", "--json", env={**self.env, "PTY_ROOT": str(self.root / "pty")},
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        stdout, _ = await process.communicate()
+        try:
+            for row in json.loads(stdout):
+                child = await asyncio.create_subprocess_exec("pty", "kill", row["name"],
+                    env={**self.env, "PTY_ROOT": str(self.root / "pty")},
+                    stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL)
+                await child.wait()
+        except (ValueError, KeyError):
+            pass
+        for process in reversed(self.processes):
+            await stop(process)
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for row in self.seats():
+                try:
+                    os.kill(row["pid"], sig)
+                except ProcessLookupError:
+                    pass
+            await asyncio.sleep(0.2)
+        for stream in self.logs:
+            stream.close()
+
+
+def receipts(node):
+    path = node.root / "ws/receipts.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line]
+
+
+def provider_pids(rows):
+    return sorted(row["pid"] for row in rows if "provider.mjs" in row["argv"])
+
+
+async def agent(node):
+    result = await node.cli("agents", "show", "agent/eval/fault-probe", "--json", check=False)
+    try:
+        return json.loads(result).get("value", {})
+    except ValueError:
+        return {}
+
+
+async def send(node, case):
+    return json.loads(await node.cli("conversations", "send", "agent/eval/fault-probe",
+        "--from", "person/eval", "--subject", f"Fault probe: {case}",
+        "--body", f"receipt-token:{case}", "--json"))["subject"]
+
+
+def judge(proof):
+    """Require independent native, graph, runtime, and sender evidence."""
+    failures = []
+    delay = proof["read_after_clear_ms"]
+    if delay is None:
+        failures.append("message was not read")
+    elif delay > 10_000:
+        failures.append(f"message read {delay} ms after fault clearing (limit 10000)")
+    if proof.get("delivered_during_outage"):
+        failures.append("message reached the reader before the injected outage cleared")
+    if proof["received_copies"] != 1:
+        failures.append(f"native provider received {proof['received_copies']} copies (expected 1)")
+    if proof["provider_starts"] != proof["expected_provider_starts"]:
+        failures.append(f"provider started {proof['provider_starts']} times (expected {proof['expected_provider_starts']})")
+    if proof["case"] != "harness-restart":
+        if proof["provider_pids_after"] != proof["provider_pids_before"]:
+            failures.append("provider process changed after the fault")
+        if proof["incarnation_before"] is None or proof["incarnation_before"] != proof["incarnation_after"]:
+            failures.append("runtime incarnation changed after the fault")
+    delivery = proof["delivery_after"]
+    if delivery.get("state") != "current":
+        failures.append(f"delivery report is {delivery.get('state', 'unreported')}: {delivery.get('reason')}")
+    if proof["graph_read_claims"] != 1:
+        failures.append(f"graph contains {proof['graph_read_claims']} read claims (expected 1)")
+    elif not proof["read_receipt_matches_graph"]:
+        failures.append("reader receipt and graph read time differ")
+    if proof["sender_message_status"] not in ("read", "closed"):
+        failures.append("sender node has not converged to the read receipt")
+    return failures
+
+
+async def run_case(args, case, directory, candidate, old, replacement):
+    root = Path(tempfile.mkdtemp(prefix="mfe-"))
+    nodes = []
+    link = Link()
+    result = {"case": case, "verdict": "error", "failures": []}
+    try:
+        env = {"PATH": os.environ["PATH"], "USER": os.environ.get("USER", "eval"),
+               "LOGNAME": os.environ.get("USER", "eval"), "SHELL": "/bin/bash", "LANG": "C.UTF-8"}
+        if os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+            env["DBUS_SESSION_BUS_ADDRESS"] = os.environ["DBUS_SESSION_BUS_ADDRESS"]
+        source = Node(root, "amber", candidate, env)
+        target = Node(root, "cobalt", candidate, env)
+        nodes = [source, target]
+        ports = [free_port(), free_port()]
+        proxies = [await link.listen(port) for port in ports]
+        secret = root / "secret"
+        secret.write_text("7" * 64)
+        secret.chmod(0o600)
+        fleet = str(uuid.uuid4())
+        for i, node in enumerate(nodes):
+            peer = nodes[1 - i]
+            (node.root / "config.toml").write_text(f'''node = "{node.name}"
+person = "person/eval"
+fleet_id = "{fleet}"
+shared_secret_file = "{secret}"
+state_dir = "{node.root / 'state'}"
+pty_root = "{node.root / 'pty'}"
+socket = "{node.endpoint}"
+client_gateway_socket = "{node.root / 'run/client.sock'}"
+peer_listen = "127.0.0.1:{ports[i]}"
+[[peers]]
+name = "{peer.name}"
+url = "http://127.0.0.1:{proxies[1 - i]}"
+''')
+            wrapper = node.root / "bin/omp"
+            wrapper.write_text(f"#!/bin/sh\nexec {shlex.quote(shutil.which('node'))} {shlex.quote(str(HERE / 'provider.mjs'))} \"$@\"\n")
+            wrapper.chmod(0o755)
+            await node.start()
+        legacy_env = ""
+        if case == "old-channel":
+            legacy = target.root / "bin/legacy-st3"
+            shutil.copy2(old, legacy)
+            legacy_env = f'  env {{ FAULT_OLD_CHANNEL_BIN "{legacy}"; }}\n'
+        seats = target.root / "seats.kdl"
+        seats.write_text(f'''version 2
+agent "fault-probe" {{
+  identity "eval/fault-probe"
+  workspace "{target.root / 'ws'}"
+  restart "always"
+{legacy_env}\
+  harness "omp" {{}}
+}}
+''')
+        await target.cli("agents", "apply", str(seats), "--as", "person/eval")
+
+        async def ready():
+            value = await agent(target)
+            return value if value.get("harness_state") == "idle" and provider_pids(target.seats()) else None
+        await until(ready, args.ready_seconds)
+        # A cross-node warmup proves the fixture before injecting any fault.
+        warmup = await send(source, "warmup")
+        async def warm():
+            return any(row.get("event") == "read" and row.get("subject") == warmup for row in receipts(target))
+        await until(warm, 30)
+        before = target.seats()
+        before_card = await agent(target)
+        initial = provider_pids(before)
+        fault_started = now_ms()
+        fault_monotonic = time.monotonic()
+        subject = None
+        if case == "daemon-restart":
+            # Queue before shutting down, without racing a successful handoff.
+            # The temporary link gate is removed while the daemon is still down.
+            link.drop()
+            subject = await send(source, case)
+            await target.down()
+            link.enabled = True
+            await asyncio.sleep(args.short_seconds)
+            await target.start()
+        elif case == "receiver-down":
+            await target.down()
+            subject = await send(source, case)
+            await asyncio.sleep(args.short_seconds)
+            await target.start()
+        elif case in ("binary-swap", "old-channel"):
+            link.drop()
+            subject = await send(source, case)
+            # Atomic install at the exact path watched by the existing driver/channel.
+            next_binary = target.binary.with_suffix(".next")
+            shutil.copy2(candidate if case == "old-channel" else replacement, next_binary)
+            os.replace(next_binary, target.binary)
+            await target.down()
+            await target.start()
+            link.enabled = True
+        elif case in ("link-seconds", "link-minutes"):
+            link.drop()
+            subject = await send(source, case)
+            await asyncio.sleep(args.long_seconds if case == "link-minutes" else args.short_seconds)
+            link.enabled = True
+        elif case == "channel-killed":
+            channels = [row for row in before if " driver omp-channel " in row["argv"]]
+            if len(channels) != 1:
+                raise RuntimeError(f"expected one channel, got {len(channels)}")
+            os.kill(channels[0]["pid"], signal.SIGKILL)
+            subject = await send(source, case)
+        elif case == "harness-restart":
+            if len(initial) != 1:
+                raise RuntimeError("expected exactly one provider")
+            os.kill(initial[0], signal.SIGKILL)
+            subject = await send(source, case)
+            async def restarted():
+                current = provider_pids(target.seats())
+                return current if current and current != initial else None
+            await until(restarted, args.ready_seconds)
+        else:
+            subject = await send(source, case)
+        cleared = now_ms()
+        result.update(message=subject, fault_started_at_unix_ms=fault_started,
+                      fault_cleared_at_unix_ms=cleared,
+                      fault_duration_ms=round((time.monotonic() - fault_monotonic) * 1000))
+        # Fixed tail: a first successful read does not end duplicate observation.
+        # Also wait beyond delivery-presence's startup grace, including old channels.
+        await asyncio.sleep(args.observe_seconds)
+        after = target.seats()
+        after_card = await agent(target)
+        all_receipts = receipts(target)
+        relevant = [row for row in all_receipts if row.get("subject") == subject]
+        received = [row for row in relevant if row["event"] == "received"]
+        reads = [row for row in relevant if row["event"] == "read"]
+        read_at = min((row["accepted_at_unix_ms"] for row in reads), default=None)
+        delay = read_at - cleared if read_at is not None else None
+        starts = [row for row in all_receipts if row["event"] == "started"]
+        expected_starts = 2 if case == "harness-restart" else 1
+        trace_text = await target.cli("trace", "show", subject, "--json", "--limit", "100")
+        claims = [json.loads(line) for line in trace_text.splitlines() if line]
+        graph_reads = [claim for claim in claims if claim.get("kind") == "message.read"]
+        source_view = await source.api("/v1/messages/read/" + subject)
+        result.update(
+            read_after_clear_ms=delay, received_copies=len(received), graph_read_claims=len(graph_reads),
+            provider_starts=len(starts), expected_provider_starts=expected_starts,
+            provider_pids_before=initial, provider_pids_after=provider_pids(after),
+            incarnation_before=before_card.get("incarnation_id"), incarnation_after=after_card.get("incarnation_id"),
+            delivery_after=after_card.get("delivery", {}), sender_message_status=(source_view or {}).get("status"),
+            delivered_during_outage=case in ("daemon-restart", "receiver-down", "binary-swap", "old-channel", "link-seconds", "link-minutes")
+                and any(row["at_unix_ms"] < cleared for row in received),
+            read_receipt_matches_graph=len(graph_reads) == 1 and graph_reads[0]["accepted_at_unix_ms"] == read_at)
+        result["failures"] = judge(result)
+        result["verdict"] = "fail" if result["failures"] else "pass"
+        write_json(directory / "before.json", {"agent": before_card, "processes": before})
+        write_json(directory / "after.json", {"agent": after_card, "processes": after})
+        write_json(directory / "trace.json", claims)
+        write_json(directory / "reader.json", all_receipts)
+        for node in nodes:
+            write_json(directory / f"{node.name}-replication.json", await node.api("/v1/replication/status"))
+    except Exception as error:
+        result["failures"].append(f"fixture error: {type(error).__name__}: {error}")
+        for node in nodes:
+            write_json(directory / f"{node.name}-error-agent.json", await agent(node))
+            trace = await node.cli("trace", "show", "agent/eval/fault-probe", "--json", "--limit", "100", check=False)
+            (directory / f"{node.name}-error-trace.jsonl").write_text(trace)
+    finally:
+        await link.close()
+        for node in reversed(nodes):
+            terminal = await asyncio.create_subprocess_exec("pty", "peek", "--plain", "--full", "eval.fault-probe",
+                env={**node.env, "PTY_ROOT": str(node.root / "pty")},
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+            stdout, stderr = await terminal.communicate()
+            (directory / f"{node.name}-terminal.txt").write_bytes(stdout + stderr)
+            await node.cleanup()
+            for log in ("daemon.log", "worker.log", "native.log", "ws/receipts.jsonl", "home/state/st3/driver-api-warnings.log"):
+                path = node.root / log
+                if path.exists():
+                    (directory / f"{node.name}-{Path(log).name}").write_text(path.read_text(errors="replace"))
+        # Public evidence contains invented names and portable paths only.
+        substitutions = [(str(root), "<eval-root>"), (str(HERE.parent.parent), "<repo>"),
+                         (str(Path.home()), "<home>")]
+        for path in directory.iterdir():
+            text = path.read_text()
+            for actual, portable in substitutions:
+                text = text.replace(actual, portable)
+            path.write_text(text)
+        for actual, portable in substitutions:
+            result = json.loads(json.dumps(result).replace(actual, portable))
+        shutil.rmtree(root)
+    return result
+
+
+async def main(args):
+    args.out.mkdir(parents=True, exist_ok=False)
+    started = datetime.datetime.now(datetime.timezone.utc)
+    # Pin binaries once: a shared deploy during the eval cannot change its input.
+    with tempfile.TemporaryDirectory(prefix="mfi-") as inputs:
+        inputs = Path(inputs)
+        candidate, old, replacement = [inputs / name for name in ("candidate", "old", "replacement")]
+        shutil.copy2(args.binary, candidate)
+        shutil.copy2(args.old_binary, old)
+        shutil.copy2(args.swap_binary or args.binary, replacement)
+        probe = await asyncio.create_subprocess_exec(str(old), "resume-probe",
+            env={"PATH": os.environ["PATH"]}, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        probe_stdout, _ = await asyncio.wait_for(probe.communicate(), 5)
+        if "old-channel" in args.cases and probe.returncode == 0:
+            raise ValueError("--old-binary supports resume-probe; supply a pre-reexec channel build")
+        if not args.swap_binary:
+            with replacement.open("ab") as stream:
+                stream.write(b"\nmessaging-faults replacement\n")
+        report = {"started": started.isoformat(), "candidate_sha256": digest(candidate),
+                  "old_binary_sha256": digest(old), "replacement_sha256": digest(replacement),
+                  "old_binary_resume_probe_exit_code": probe.returncode,
+                  "old_binary_resume_probe_stdout": probe_stdout.decode().strip(),
+                  "read_deadline_ms": 10000, "observe_seconds": args.observe_seconds,
+                  "short_seconds": args.short_seconds, "long_seconds": args.long_seconds,
+                  "agent_tokens": 0, "judge_tokens": 0, "cases": []}
+        for case in args.cases:
+            directory = args.out / case
+            directory.mkdir()
+            result = await run_case(args, case, directory, candidate, old, replacement)
+            report["cases"].append(result)
+            report["verdict"] = "pass" if all(row["verdict"] == "pass" for row in report["cases"]) else "fail"
+            write_json(args.out / "result.json", report)
+            print(f"{case}: {result['verdict']} read={result.get('read_after_clear_ms')} ms; " + "; ".join(result["failures"]), flush=True)
+    ended = datetime.datetime.now(datetime.timezone.utc)
+    report.update(ended=ended.isoformat(), duration_seconds=(ended - started).total_seconds())
+    write_json(args.out / "result.json", report)
+    return 0 if report["verdict"] == "pass" else 1
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("out", type=Path)
+    parser.add_argument("--old-binary", type=Path, required=True, help="actual pre-reexec build; not a simulated old client")
+    parser.add_argument("--swap-binary", type=Path)
+    parser.add_argument("--cases", nargs="+", choices=CASES, default=list(CASES))
+    parser.add_argument("--short-seconds", type=float, default=3)
+    parser.add_argument("--long-seconds", type=float, default=120)
+    parser.add_argument("--observe-seconds", type=float, default=25)
+    parser.add_argument("--ready-seconds", type=float, default=60)
+    args = parser.parse_args()
+    if args.observe_seconds < 25 or args.long_seconds < 120 or args.short_seconds < 2:
+        parser.error("observe >=25s, long outage >=120s, short outage >=2s are required")
+    if os.environ.get("ST_AGENT"):
+        parser.error("run detached outside an st seat; see the eval README")
+    if not shutil.which("node") or not shutil.which("pty"):
+        parser.error("node (with native TypeScript support) and pty must be on PATH")
+    raise SystemExit(asyncio.run(main(args)))
