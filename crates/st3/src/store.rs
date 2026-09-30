@@ -175,6 +175,19 @@ WHERE kind='intent.desired'
 CREATE INDEX IF NOT EXISTS claims_human_gate_request_index
 ON claims(json_extract(body, '$.fields.reviewer'), store_index)
 WHERE kind='gate.requested' AND json_extract(body, '$.fields.reviewer') IS NOT NULL;
+-- A runtime incarnation's claims about a subject by acceptance time, so when a session began
+-- and last changed are two seeks instead of a read of every claim the subject has. The
+-- expression is INCARNATION_OF_CLAIM, which queries repeat so the planner uses this index.
+CREATE INDEX IF NOT EXISTS claims_incarnation_accepted_index
+ON claims(
+    subject,
+    json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+        THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END),
+    length(accepted_at_unix_ms),
+    accepted_at_unix_ms
+)
+WHERE json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+    THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END) IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS operations (
     id TEXT PRIMARY KEY,
@@ -391,6 +404,10 @@ CREATE TABLE IF NOT EXISTS mission_runs (
     updated_at_unix_ms TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS mission_runs_mission_index ON mission_runs(mission_id, created_at_unix_ms);
+-- The runs that have not finished, a few of every run a fleet has made. The predicate is
+-- OPEN_MISSION_RUN, which queries repeat so the planner uses this index.
+CREATE INDEX IF NOT EXISTS mission_runs_open_index ON mission_runs(created_at_unix_ms, id)
+WHERE status NOT IN ('completed','failed','cancelled');
 
 CREATE TABLE IF NOT EXISTS mission_run_deadlines (
     run_id TEXT PRIMARY KEY REFERENCES mission_runs(id),
@@ -445,6 +462,9 @@ CREATE TABLE IF NOT EXISTS step_runs (
 );
 CREATE INDEX IF NOT EXISTS step_runs_run_index ON step_runs(run_id, generation_id, step_path);
 CREATE INDEX IF NOT EXISTS step_runs_assignee_index ON step_runs(assignee, status);
+-- The steps that have not finished, a few of every step a fleet has run.
+CREATE INDEX IF NOT EXISTS step_runs_open_index ON step_runs(created_at_unix_ms, step_path)
+WHERE status NOT IN ('completed','failed','cancelled');
 CREATE TABLE IF NOT EXISTS local_work_lease_renewals (
     subject TEXT PRIMARY KEY,
     attempt INTEGER NOT NULL,
@@ -687,6 +707,34 @@ const CLAIM_COLUMNS: &str = "claims.id, claims.store_index, claims.batch_id, cla
 const CURRENT_VIEW_CLAIM: &str = "(kind='intent.desired'
    OR json_extract(body, '$.fields.status') NOT IN ('stopped', 'absent', 'exited')
    OR json_extract(body, '$.status') NOT IN ('stopped', 'absent', 'exited'))";
+
+/// The runtime incarnation a claim names, read as a view of the claim does: from its `fields`,
+/// or from the body itself when it has none. The expression of
+/// `claims_incarnation_accepted_index`, word for word, so SQLite can use the index.
+const INCARNATION_OF_CLAIM: &str =
+    "json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+        THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END)";
+
+/// The predicate of `mission_runs_open_index`, word for word, so SQLite can use the index.
+const OPEN_MISSION_RUN: &str = "mission_runs.status NOT IN ('completed','failed','cancelled')";
+
+/// The first (`ASC`) or last (`DESC`) acceptance time of the claims about subject `?1` that
+/// name incarnation `?2`, at or before store index `?3`: one seek into the incarnation's claims.
+fn incarnation_claim_time_query(order: &str) -> String {
+    format!(
+        "SELECT accepted_at_unix_ms
+         FROM claims INDEXED BY claims_incarnation_accepted_index
+         WHERE subject=?1 AND {INCARNATION_OF_CLAIM}=?2 AND store_index<=?3
+         ORDER BY length(accepted_at_unix_ms) {order}, accepted_at_unix_ms {order}
+         LIMIT 1"
+    )
+}
+
+/// The newest claim at or before a snapshot that an agent status can depend on.
+const AGENT_STATUS_INDEX_QUERY: &str = "SELECT store_index FROM claims WHERE store_index<=?1
+     AND (+subject GLOB 'agent/*' OR +subject GLOB 'mission-run/*'
+          OR +subject GLOB 'run-generation/*')
+     ORDER BY store_index DESC LIMIT 1";
 
 /// Whether `subject` names a runtime, whose stopped or undeclared state puts it in history.
 fn runtime_subject(subject: &str) -> bool {
@@ -2701,17 +2749,12 @@ impl Store {
     /// gates, subscriptions and diagnostics commit far more often and change no agent status.
     fn agent_status_index(&self, snapshot_index: u64) -> Result<u64> {
         // Walk back from the snapshot: about one recent claim in ten matches, so this stops
-        // after a few rows instead of scanning every agent observation.
+        // after a few rows instead of scanning every agent observation. The unary `+` keeps
+        // SQLite from answering the three patterns from the subject index instead, which reads
+        // every agent, run and generation claim the store holds and sorts them.
         let connection = self.readers.get();
         Ok(connection
-            .query_row(
-                "SELECT store_index FROM claims WHERE store_index<=?1
-                 AND (subject GLOB 'agent/*' OR subject GLOB 'mission-run/*'
-                      OR subject GLOB 'run-generation/*')
-                 ORDER BY store_index DESC LIMIT 1",
-                [snapshot_index],
-                |row| row.get(0),
-            )
+            .query_row(AGENT_STATUS_INDEX_QUERY, [snapshot_index], |row| row.get(0))
             .optional()?
             .unwrap_or_default())
     }
@@ -2998,6 +3041,33 @@ impl Store {
             .collect()
     }
 
+    /// The definitions of the missions that have no run, as `mission_definitions` reads them,
+    /// without reading any run or the definitions of missions that ran.
+    pub fn mission_definitions_without_runs(&self) -> Result<Vec<MissionDefinitionView>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT r.body, c.accepted_at_unix_ms
+             FROM mission_definitions d
+             JOIN mission_revisions r
+               ON r.mission_id=d.mission_id AND r.revision=d.revision
+             JOIN claims c ON c.id=d.claim_id
+             WHERE NOT EXISTS (SELECT 1 FROM mission_runs WHERE mission_runs.mission_id=d.mission_id)
+             ORDER BY d.mission_id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .map(|row| {
+                let (body, accepted) = row?;
+                Ok(MissionDefinitionView {
+                    mission: serde_json::from_str(&body)?,
+                    updated_at_unix_ms: accepted.parse()?,
+                })
+            })
+            .collect()
+    }
+
     /// Ordered mission IDs for one bounded collection page. Selection and
     /// history filtering happen in SQL before resource joins are hydrated.
     pub fn mission_collection_ids(
@@ -3125,6 +3195,30 @@ impl Store {
         )?;
         let ids = statement
             .query_map([include_history], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        ids.into_iter()
+            .filter_map(|id| planning_session_view_tx(&connection, &id).transpose())
+            .collect()
+    }
+
+    /// The launches of one mission, newest first as `planning_sessions(true)` orders them, with
+    /// or without its `mission/` prefix, read without every other mission's launches.
+    pub fn planning_sessions_for_mission(&self, mission: &str) -> Result<Vec<PlanningSessionView>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare_cached(
+            "SELECT id FROM planning_sessions
+             WHERE mission_id IN (?1, ?2, ?3)
+             ORDER BY updated_at_unix_ms DESC, id",
+        )?;
+        let ids = statement
+            .query_map(
+                params![
+                    mission,
+                    mission.trim_start_matches("mission/"),
+                    mission.strip_prefix("mission/").unwrap_or(mission)
+                ],
+                |row| row.get::<_, String>(0),
+            )?
             .collect::<Result<Vec<_>, _>>()?;
         ids.into_iter()
             .filter_map(|id| planning_session_view_tx(&connection, &id).transpose())
@@ -3830,6 +3924,28 @@ impl Store {
         let run = run.strip_prefix("mission-run/").unwrap_or(run);
         let connection = self.readers.get();
         Ok(mission_run_view_tx(&connection, run).optional()?)
+    }
+
+    /// A run with each step's effective state, and with `summaries` its latest progress and
+    /// completion summaries, as `mission_run` shows them, without reading each step's timing,
+    /// wake and definition history. Its loops and outcome are left empty.
+    pub fn mission_run_steps(&self, run: &str, summaries: bool) -> Result<Option<MissionRunView>> {
+        let run = run.strip_prefix("mission-run/").unwrap_or(run);
+        let connection = self.readers.get();
+        Ok(mission_run_steps_view_tx(&connection, run, summaries).optional()?)
+    }
+
+    /// `run`, a header with its current generation's steps as `mission_run_summaries_for_missions`
+    /// reads them, with each step's effective state and, with `summaries`, its latest progress
+    /// and completion summaries: `mission_run_steps` for a run whose steps are already read.
+    pub fn with_step_states(
+        &self,
+        mut run: MissionRunView,
+        summaries: bool,
+    ) -> Result<MissionRunView> {
+        let connection = self.readers.get();
+        apply_step_states_tx(&connection, &mut run.steps, summaries)?;
+        Ok(run)
     }
 
     /// Read one run's status without hydrating its step history.
@@ -5321,6 +5437,16 @@ impl Store {
             .map_err(Into::into)
     }
 
+    /// The headers of the runs still running, standing or blocked, without the finished ones.
+    pub fn open_mission_run_headers(&self) -> Result<Vec<MissionRunView>> {
+        let connection = self.readers.get();
+        connection
+            .prepare_cached(&open_mission_run_headers_query())?
+            .query_map([], mission_run_header_from_row)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
     /// Current generation steps for all runs in two SQL scans. Collection reads
     /// never hydrate each run and each step through their detail endpoints.
     pub fn mission_run_summaries(&self) -> Result<Vec<MissionRunView>> {
@@ -5795,6 +5921,7 @@ impl Store {
             snapshot_unix_ms,
             true,
             true,
+            false,
         )
     }
 
@@ -5895,7 +6022,7 @@ impl Store {
             (inputs, order)
         };
         let work = self
-            .work_at_snapshot_internal(Some(&agent), true, now_ms(), false)?
+            .open_work_for_seat(&agent)?
             .into_iter()
             .filter(|step| !matches!(step.status.as_str(), "completed" | "failed" | "cancelled"))
             .collect::<Vec<_>>();
@@ -6067,6 +6194,22 @@ impl Store {
             snapshot_unix_ms,
             detailed,
             false,
+            false,
+        )
+    }
+
+    /// A seat's steps that have not finished, pending ones included, as the reconciler's
+    /// `work_for_reconcile` reads them less the completed, failed and cancelled ones. A finished
+    /// step stays finished in every view, so they are left out before reading, and the open
+    /// steps index keeps the read to the fleet's open steps, not every step it ever ran.
+    fn open_work_for_seat(&self, agent: &str) -> Result<Vec<StepRunView>> {
+        self.work_at_snapshot_internal_with_agentless(
+            Some(agent),
+            true,
+            now_ms(),
+            false,
+            false,
+            true,
         )
     }
 
@@ -6077,22 +6220,11 @@ impl Store {
         snapshot_unix_ms: u128,
         detailed: bool,
         include_agentless: bool,
+        open_only: bool,
     ) -> Result<Vec<StepRunView>> {
         let actor = actor.map(|value| normalize_actor(value, "agent"));
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
-                    lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
-             FROM step_runs
-             WHERE (agentless=0 OR (?3 AND ?1 IS NULL))
-               AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
-               AND (?1 IS NULL
-                    OR assignee=?1
-                    OR lease_owner=?1
-                    OR EXISTS (SELECT 1 FROM json_each(step_runs.available_to) WHERE value=?1))
-               AND (?2 OR status NOT IN ('pending','completed','failed','cancelled'))
-             ORDER BY created_at_unix_ms, step_path",
-        )?;
+        let mut statement = connection.prepare(&work_at_snapshot_query(open_only))?;
         let rows = statement.query_map(
             params![actor.as_deref(), include_terminal, include_agentless],
             step_run_from_row,
@@ -11001,7 +11133,20 @@ impl Store {
             .collect()
     }
 
-    pub fn attention_items(&self, person: Option<&str>) -> Result<Vec<AttentionItemView>> {
+    /// The runs a person's attention waits on: those with a gate review, a launch approval or a
+    /// revision approval pending, which `attention_items` lists with their mission run. Messages
+    /// and attention requests name no run, so a mission view reads none of them.
+    pub fn human_attention_runs(&self) -> Result<BTreeSet<String>> {
+        Ok(self
+            .mission_run_attention_items(None)?
+            .into_iter()
+            .filter_map(|item| item.mission_run)
+            .collect())
+    }
+
+    /// The attention items that belong to a mission run: gate reviews, launch approvals and
+    /// revision approvals. A run's header is all they read of the run.
+    fn mission_run_attention_items(&self, person: Option<&str>) -> Result<Vec<AttentionItemView>> {
         let mut items = Vec::new();
         let reviews = self.pending_human_reviews(person)?;
         items.extend(reviews.into_iter().map(attention_item_from_review));
@@ -11030,7 +11175,7 @@ impl Store {
                     continue;
                 }
                 if let Some(run) = &session.target_mission_run {
-                    let Some(run) = mission_run_view_tx(
+                    let Some(run) = mission_run_header_tx(
                         &connection,
                         run.strip_prefix("mission-run/").unwrap_or(run),
                     )
@@ -11060,7 +11205,7 @@ impl Store {
                 .collect::<Result<Vec<_>, _>>()?;
             for id in ids {
                 let proposal = revision_proposal_view_tx(&connection, &id)?;
-                let run = mission_run_view_tx(
+                let run = mission_run_header_tx(
                     &connection,
                     proposal
                         .run
@@ -11086,6 +11231,11 @@ impl Store {
                 }
             }
         }
+        Ok(items)
+    }
+
+    pub fn attention_items(&self, person: Option<&str>) -> Result<Vec<AttentionItemView>> {
+        let mut items = self.mission_run_attention_items(person)?;
 
         // Only a person's messages need attention. Without a person, read each person's
         // mailbox through the recipient index instead of every open message in the fleet.
@@ -12738,6 +12888,63 @@ impl Store {
             .optional()
             .map(|value| value.map(|value| value.max(0) as u128))
             .map_err(Into::into)
+    }
+
+    /// The earliest and latest acceptance times of the claims about `subject` that belong to one
+    /// runtime: those that name `incarnation`, or, for a runtime without one, those that name
+    /// `runtime`. Only claims at or before `through` count, and when `through_claim` names one of
+    /// the subject's claims, only those up to it. An incarnation takes two index seeks however
+    /// many claims the subject has; a runtime without one reads the subject's claims.
+    pub fn runtime_claim_span_at(
+        &self,
+        subject: &str,
+        incarnation: Option<&str>,
+        runtime: Option<&str>,
+        through: u64,
+        through_claim: Option<&str>,
+    ) -> Result<Option<(u128, u128)>> {
+        let connection = self.readers.get();
+        let through = match through_claim {
+            Some(claim) => connection
+                .prepare_cached("SELECT store_index FROM claims WHERE id=?1")?
+                .query_row([claim], |row| row.get::<_, u64>(0))
+                .optional()?
+                .map_or(through, |index| index.min(through)),
+            None => through,
+        };
+        let accepted = |text: String| text.parse::<u128>().unwrap_or_default();
+        if let Some(incarnation) = incarnation {
+            let mut span = [None, None];
+            for (slot, order) in span.iter_mut().zip(["ASC", "DESC"]) {
+                *slot = connection
+                    .prepare_cached(&incarnation_claim_time_query(order))?
+                    .query_row(params![subject, incarnation, through], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .optional()?
+                    .map(accepted);
+            }
+            return Ok(span[0].zip(span[1]));
+        }
+        let Some(runtime) = runtime else {
+            return Ok(None);
+        };
+        let mut statement = connection.prepare_cached(
+            "SELECT accepted_at_unix_ms FROM claims
+             WHERE subject=?1 AND store_index<=?3
+               AND json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+                   THEN '$.runtime_id' ELSE '$.fields.runtime_id' END)=?2",
+        )?;
+        let mut span = None::<(u128, u128)>;
+        for time in statement.query_map(params![subject, runtime, through], |row| {
+            row.get::<_, String>(0)
+        })? {
+            let time = accepted(time?);
+            span = Some(span.map_or((time, time), |(first, last)| {
+                (first.min(time), last.max(time))
+            }));
+        }
+        Ok(span)
     }
 
     /// Last substantive activity for an agent, excluding heartbeat and usage observations.
@@ -18805,6 +19012,21 @@ fn latest_actual_at(
     Ok(Some(Value::Object(merged)))
 }
 
+/// `columns` of subject `?1`'s claims of one `kind` at or before store index `?2`, newest first
+/// in canonical order. SQLite walks the accepted-time index newest first and sorts only claims
+/// accepted in the same millisecond, so a fold that stops early reads only what it uses. Left to
+/// itself it reads the kind by store index and sorts every claim of the kind the subject ever
+/// had, every observation a seat ever made, before it returns the first.
+fn newest_claims_of_kind_query(columns: &str, kind: &str) -> String {
+    format!(
+        "SELECT {columns}
+         FROM claims INDEXED BY claims_subject_kind_accepted_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind='{kind}' AND +claims.store_index<=?2
+         ORDER BY {CANONICAL_ORDER_DESC}"
+    )
+}
+
 fn current_harness_at(
     connection: &Connection,
     subject: &str,
@@ -18813,10 +19035,8 @@ fn current_harness_at(
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     let runtime = connection
         .prepare_cached(&format!(
-            "SELECT claims.store_index, claims.body
-             FROM claims JOIN batches ON batches.id=claims.batch_id
-             WHERE claims.subject=?1 AND claims.kind='runtime.observed' AND claims.store_index<=?2
-             ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+            "{} LIMIT 1",
+            newest_claims_of_kind_query("claims.store_index, claims.body", "runtime.observed")
         ))?
         .query_row(params![subject, at_index], |row| {
             Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?))
@@ -18886,11 +19106,9 @@ fn current_harness_at(
 
     // Newest first in canonical order, so every node that holds the same claims shows the same
     // harness state.
-    let mut statement = connection.prepare_cached(&format!(
-        "SELECT claims.id, claims.store_index, claims.body, claims.accepted_at_unix_ms
-         FROM claims JOIN batches ON batches.id=claims.batch_id
-         WHERE claims.subject=?1 AND claims.kind='harness.observed' AND claims.store_index<=?2
-         ORDER BY {CANONICAL_ORDER_DESC}"
+    let mut statement = connection.prepare_cached(&newest_claims_of_kind_query(
+        "claims.id, claims.store_index, claims.body, claims.accepted_at_unix_ms",
+        "harness.observed",
     ))?;
     let rows = statement.query_map(params![subject, at_index], |row| {
         Ok((
@@ -28008,6 +28226,51 @@ fn seat_run_orders_tx(
         .collect())
 }
 
+/// When each seat `?1` (every seat when null) joined each open run it has a step in, and the
+/// run's status. It reads from the open runs to their steps, in that order: from the steps,
+/// SQLite reads every step any seat was ever assigned before it finds the open runs among them.
+fn seat_queue_joins_query() -> String {
+    format!(
+        "SELECT step_runs.assignee, step_runs.run_id,
+                MIN(CAST(step_runs.created_at_unix_ms AS INTEGER)), mission_runs.status
+         FROM mission_runs CROSS JOIN step_runs ON step_runs.run_id=mission_runs.id
+         WHERE {OPEN_MISSION_RUN}
+           AND mission_runs.phase<>'terminal'
+           AND step_runs.agentless=0
+           AND step_runs.assignee IS NOT NULL
+           AND (?1 IS NULL OR step_runs.assignee=?1)
+         GROUP BY step_runs.assignee, step_runs.run_id
+         HAVING MAX(step_runs.generation_id=mission_runs.current_generation_id)=1
+         ORDER BY step_runs.assignee, step_runs.run_id"
+    )
+}
+
+/// The current generation's steps of actor `?1` (every actor when null), with finished and
+/// pending ones when `?2`, and agentless ones when `?3` and no actor is named. With `open_only`
+/// the finished steps are left out in SQL, word for word the predicate of
+/// `step_runs_open_index`, so the read covers the fleet's open steps and not every step it ran.
+fn work_at_snapshot_query(open_only: bool) -> String {
+    let open = if open_only {
+        "AND status NOT IN ('completed','failed','cancelled')"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+         FROM step_runs
+         WHERE (agentless=0 OR (?3 AND ?1 IS NULL))
+           AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
+           AND (?1 IS NULL
+                OR assignee=?1
+                OR lease_owner=?1
+                OR EXISTS (SELECT 1 FROM json_each(step_runs.available_to) WHERE value=?1))
+           AND (?2 OR status NOT IN ('pending','completed','failed','cancelled'))
+           {open}
+         ORDER BY created_at_unix_ms, step_path"
+    )
+}
+
 /// Read seat-queue inputs for one seat or the whole roster. A live run is queued
 /// while its current generation has a step for the seat, and it keeps the join
 /// time of its first such step in any generation. Runs that are no longer
@@ -28076,18 +28339,7 @@ fn seat_queue_inputs_tx(
     }
     drop(statement);
 
-    let mut statement = connection.prepare(
-        "SELECT step_runs.assignee, step_runs.run_id,
-                MIN(CAST(step_runs.created_at_unix_ms AS INTEGER)), mission_runs.status
-         FROM mission_runs JOIN step_runs ON step_runs.run_id=mission_runs.id
-         WHERE mission_runs.status NOT IN ('completed', 'failed', 'cancelled')
-           AND mission_runs.phase<>'terminal'
-           AND step_runs.agentless=0
-           AND step_runs.assignee IS NOT NULL
-           AND (?1 IS NULL OR step_runs.assignee=?1)
-         GROUP BY step_runs.assignee, step_runs.run_id
-         HAVING MAX(step_runs.generation_id=mission_runs.current_generation_id)=1",
-    )?;
+    let mut statement = connection.prepare(&seat_queue_joins_query())?;
     let rows = statement.query_map(params![agent], |row| {
         Ok((
             row.get::<_, String>(0)?,
@@ -30426,6 +30678,49 @@ fn mission_run_view_for_projection_tx(
     Ok(view)
 }
 
+/// A run's header and each step's effective state, and with `summaries` each step's latest
+/// progress and completion summaries: what a mission detail and the missions tree show of a
+/// run. The work view's enrichment also folds every step's execution timing, reads the wake
+/// messages and harness history of its assignee and parses the mission for its queue, none of
+/// which those views show; `mission_run_view_tx` does that.
+fn mission_run_steps_view_tx(
+    connection: &Connection,
+    run_id: &str,
+    summaries: bool,
+) -> rusqlite::Result<MissionRunView> {
+    let mut view = mission_run_header_tx(connection, run_id)?;
+    let mut statement = connection.prepare_cached(
+        "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+         FROM step_runs WHERE generation_id=?1 ORDER BY created_at_unix_ms, step_path",
+    )?;
+    view.steps = statement
+        .query_map(
+            [generation_id_from_subject(&view.generation)],
+            step_run_from_row,
+        )?
+        .collect::<Result<Vec<_>, _>>()?;
+    apply_step_states_tx(connection, &mut view.steps, summaries)?;
+    Ok(view)
+}
+
+/// Each step's effective state, and with `summaries` its latest progress and completion
+/// summaries, as a run's presentation view shows them.
+fn apply_step_states_tx(
+    connection: &Connection,
+    steps: &mut [StepRunView],
+    summaries: bool,
+) -> rusqlite::Result<()> {
+    for step in steps {
+        let snapshot_unix_ms = now_ms();
+        apply_effective_step_state(connection, step, snapshot_unix_ms)?;
+        if summaries {
+            enrich_step_summaries_at(connection, step, snapshot_unix_ms)?;
+        }
+    }
+    Ok(())
+}
+
 fn mission_run_view_with_enrichment_tx(
     connection: &Connection,
     run_id: &str,
@@ -30526,6 +30821,18 @@ const MISSION_RUN_HEADER_SELECT: &str =
          LEFT JOIN mission_run_deadlines ON mission_run_deadlines.run_id=mission_runs.id
          LEFT JOIN mission_run_after ON mission_run_after.run_id=mission_runs.id
          ORDER BY mission_runs.created_at_unix_ms, mission_runs.id";
+
+/// The headers of the runs still running, standing or blocked, read through the open runs index.
+fn open_mission_run_headers_query() -> String {
+    MISSION_RUN_HEADER_SELECT.replace(
+        "ORDER BY mission_runs.created_at_unix_ms, mission_runs.id",
+        &format!(
+            "WHERE {OPEN_MISSION_RUN}
+               AND mission_runs.status IN ('running','standing','blocked')
+             ORDER BY mission_runs.created_at_unix_ms, mission_runs.id"
+        ),
+    )
+}
 
 fn mission_run_header_tx(
     connection: &Connection,
@@ -38177,6 +38484,263 @@ version 2
         assert_eq!(store.claims_for("agent/example", None).unwrap().len(), 21);
     }
 
+    /// The reads behind the session list, a mission detail and the missions tree seek or walk an
+    /// index whose part they read is what they show: one incarnation's claims, the newest
+    /// observations, the open runs and steps. None reads or sorts every claim of a kind, every
+    /// claim of a subject, or every step and run the store holds.
+    #[test]
+    fn person_reads_seek_what_they_show() {
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.connection.lock().unwrap();
+        let plan = |sql: &str| {
+            let mut statement = connection
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let parameters = vec!["agent/example"; statement.parameter_count()];
+            statement
+                .query_map(rusqlite::params_from_iter(parameters), |row| {
+                    row.get::<_, String>(3)
+                })
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap()
+                .join("\n")
+        };
+        for order in ["ASC", "DESC"] {
+            let plan = plan(&incarnation_claim_time_query(order));
+            assert!(
+                plan.contains("claims_incarnation_accepted_index (subject=? AND <expr>=?)")
+                    && !plan.contains("TEMP B-TREE"),
+                "a session's {order} date must be one seek into its incarnation's claims:\n{plan}"
+            );
+        }
+        let agents = plan(AGENT_STATUS_INDEX_QUERY);
+        assert!(
+            agents.contains("USING INTEGER PRIMARY KEY") && !agents.contains("MULTI-INDEX OR"),
+            "the newest agent claim must be a walk back from the snapshot:\n{agents}"
+        );
+        let harness = plan(&newest_claims_of_kind_query(
+            "claims.id",
+            "harness.observed",
+        ));
+        assert!(
+            harness.contains("claims_subject_kind_accepted_index (subject=? AND kind=?)")
+                && !harness.contains("TEMP B-TREE FOR ORDER BY"),
+            "a seat's newest observation must not sort every observation it made:\n{harness}"
+        );
+        let open_steps = plan(&work_at_snapshot_query(true));
+        assert!(
+            open_steps.contains("step_runs_open_index"),
+            "a seat queue must read the open steps, not every step:\n{open_steps}"
+        );
+        let joins = plan(&seat_queue_joins_query());
+        assert!(
+            joins.contains("SCAN mission_runs USING INDEX mission_runs_open_index")
+                && joins.contains("step_runs_run_index (run_id=?)"),
+            "a seat queue must read the open runs' steps, not every assigned step:\n{joins}"
+        );
+        let runs = plan(&open_mission_run_headers_query());
+        assert!(
+            runs.contains("mission_runs_open_index"),
+            "the missions tree must read the open runs, not every run:\n{runs}"
+        );
+    }
+
+    /// A claim names its incarnation in its fields, or, when it has none, in its body, exactly as
+    /// a view that reads the claim finds it; the index expression agrees with that reading.
+    #[test]
+    fn the_incarnation_index_reads_a_claim_as_a_view_does() {
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.connection.lock().unwrap();
+        for body in [
+            json!({"fields": {"incarnation_id": "current"}}),
+            json!({"fields": {"incarnation_id": "current"}, "incarnation_id": "other"}),
+            json!({"fields": {"state": "idle"}, "incarnation_id": "other"}),
+            json!({"fields": null, "incarnation_id": "other"}),
+            json!({"incarnation_id": "current"}),
+            json!({"incarnation_id": 7}),
+            json!({"state": "idle"}),
+            json!(["current"]),
+        ] {
+            let viewed = body
+                .get("fields")
+                .unwrap_or(&body)
+                .get("incarnation_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let indexed = connection
+                .query_row(
+                    &format!("SELECT {INCARNATION_OF_CLAIM} FROM (SELECT ?1 AS body)"),
+                    [body.to_string()],
+                    |row| row.get::<_, rusqlite::types::Value>(0),
+                )
+                .unwrap();
+            let indexed = match indexed {
+                rusqlite::types::Value::Text(text) => Some(text),
+                _ => None,
+            };
+            assert_eq!(indexed, viewed, "{body}");
+        }
+    }
+
+    /// A session is dated by the first and last acceptance times of the claims that name its
+    /// incarnation, or its runtime when it has none, as reading every claim of the subject and
+    /// keeping those dated it; `through_claim` keeps only the claims up to it.
+    #[test]
+    fn a_runtime_claim_span_is_its_first_and_last_claim() {
+        let store = Store::open_memory("node").unwrap();
+        let subject = "agent/example";
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            for (kind, fields) in [
+                (
+                    "runtime.observed",
+                    json!({"status": "running", "runtime_id": "runtime-a", "incarnation_id": "first"}),
+                ),
+                (
+                    "harness.observed",
+                    json!({"state": "working", "incarnation_id": "first"}),
+                ),
+                (
+                    "runtime.observed",
+                    json!({"status": "running", "runtime_id": "runtime-b", "incarnation_id": "second"}),
+                ),
+                (
+                    "harness.observed",
+                    json!({"state": "idle", "incarnation_id": "second"}),
+                ),
+                ("harness.observed", json!({"state": "working"})),
+                (
+                    "runtime.observed",
+                    json!({"status": "running", "runtime_id": "runtime-c"}),
+                ),
+                (
+                    "harness.observed",
+                    json!({"state": "idle", "incarnation_id": "second"}),
+                ),
+                (
+                    "runtime.observed",
+                    json!({"status": "exited", "runtime_id": "runtime-c"}),
+                ),
+            ] {
+                append_claim_tx(
+                    &transaction,
+                    &store.origin,
+                    subject,
+                    kind,
+                    None,
+                    &json!({ "fields": fields }),
+                    &[],
+                    None,
+                )
+                .unwrap();
+            }
+            // Acceptance times out of store order, as claims replicated from a peer arrive.
+            transaction
+                .execute(
+                    "UPDATE claims SET accepted_at_unix_ms=CAST(1000 + (store_index * 37) % 97 AS TEXT)
+                     WHERE subject=?1",
+                    [subject],
+                )
+                .unwrap();
+            transaction.commit().unwrap();
+        }
+        let index = store.index().unwrap();
+        let all = store
+            .claims_page(Some(subject), None, 0, None, false, 100)
+            .unwrap()
+            .claims;
+        for window in [3, 6, all.len()] {
+            let read = &all[..window];
+            let through_claim = (window < all.len()).then(|| read[window - 1].id.as_str());
+            for (incarnation, runtime) in [
+                (Some("first"), None),
+                (Some("second"), Some("runtime-b")),
+                (Some("missing"), Some("runtime-a")),
+                (None, Some("runtime-c")),
+                (None, Some("runtime-a")),
+                (None, None),
+            ] {
+                let times = read
+                    .iter()
+                    .filter(|claim| {
+                        let fields = claim.body.get("fields").unwrap_or(&claim.body);
+                        let named = |name: &str, expected: Option<&str>| {
+                            expected.is_some_and(|expected| {
+                                fields.get(name).and_then(Value::as_str) == Some(expected)
+                            })
+                        };
+                        named("incarnation_id", incarnation)
+                            || (incarnation.is_none() && named("runtime_id", runtime))
+                    })
+                    .map(|claim| claim.accepted_at_unix_ms)
+                    .collect::<Vec<_>>();
+                let expected = times.iter().min().copied().zip(times.iter().max().copied());
+                assert_eq!(
+                    store
+                        .runtime_claim_span_at(subject, incarnation, runtime, index, through_claim)
+                        .unwrap(),
+                    expected,
+                    "{incarnation:?} {runtime:?} through {window}"
+                );
+            }
+        }
+    }
+
+    /// A mission's launches are the ones every launch lists for it, named with or without its
+    /// `mission/` prefix, in the same order, read without every other mission's launches.
+    #[test]
+    fn a_missions_launches_are_read_by_mission() {
+        let store = Store::open_memory("node").unwrap();
+        for (id, mission) in [
+            ("one", "example/alpha"),
+            ("two", "mission/example/alpha"),
+            ("three", "example/beta"),
+            ("four", "example/alpha-two"),
+        ] {
+            store
+                .create_planning_session(
+                    id,
+                    mission,
+                    "doc/request",
+                    "/tmp",
+                    "person/operator",
+                    "codex",
+                    &crate::model::PlannerSpec::default(),
+                    None,
+                    None,
+                )
+                .unwrap();
+        }
+        for mission in [
+            "mission/example/alpha",
+            "example/alpha",
+            "mission/mission/example/alpha",
+            "mission/example/beta",
+            "mission/example/missing",
+        ] {
+            let listed = store
+                .planning_sessions(true)
+                .unwrap()
+                .into_iter()
+                .filter(|session| {
+                    session.mission == mission
+                        || format!("mission/{}", session.mission) == mission
+                        || session.mission == mission.trim_start_matches("mission/")
+                })
+                .map(|session| session.id)
+                .collect::<Vec<_>>();
+            let read = store
+                .planning_sessions_for_mission(mission)
+                .unwrap()
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>();
+            assert_eq!(read, listed, "{mission}");
+        }
+    }
+
     #[test]
     fn owned_subject_queries_look_owners_up_by_primary_key() {
         let store = Store::open_memory("node").unwrap();
@@ -43164,6 +43728,20 @@ version 2
             vec!["person/mission-reviewer", "person/step-reviewer"]
         );
         assert_eq!(store.attention_items(None).unwrap().len(), 2);
+        // A mission view reads only the attention that names a run, and finds the same runs.
+        assert_eq!(
+            store.human_attention_runs().unwrap(),
+            store
+                .attention_items(None)
+                .unwrap()
+                .into_iter()
+                .filter_map(|item| item.mission_run)
+                .collect::<BTreeSet<_>>()
+        );
+        assert_eq!(
+            store.human_attention_runs().unwrap(),
+            BTreeSet::from([run.subject.clone()])
+        );
         assert_eq!(
             store
                 .attention_items(Some("person/mission-reviewer"))
