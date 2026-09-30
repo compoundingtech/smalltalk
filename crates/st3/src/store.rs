@@ -175,6 +175,11 @@ WHERE kind='intent.desired'
 CREATE INDEX IF NOT EXISTS claims_human_gate_request_index
 ON claims(json_extract(body, '$.fields.reviewer'), store_index)
 WHERE kind='gate.requested' AND json_extract(body, '$.fields.reviewer') IS NOT NULL;
+-- The subjects that ever observed a runtime, found one seek per subject (RUNTIME_SUBJECTS)
+-- instead of reading every runtime observation. It holds runtime observations alone, so queries
+-- of other kinds plan as they did.
+CREATE INDEX IF NOT EXISTS claims_runtime_subject_index ON claims(subject, store_index)
+WHERE kind='runtime.observed';
 -- A runtime incarnation's claims about a subject by acceptance time, so when a session began
 -- and last changed are two seeks instead of a read of every claim the subject has. The
 -- expression is INCARNATION_OF_CLAIM, which queries repeat so the planner uses this index.
@@ -462,6 +467,9 @@ CREATE TABLE IF NOT EXISTS step_runs (
 );
 CREATE INDEX IF NOT EXISTS step_runs_run_index ON step_runs(run_id, generation_id, step_path);
 CREATE INDEX IF NOT EXISTS step_runs_assignee_index ON step_runs(assignee, status);
+-- The steps a lease holds, a handful of all the steps a fleet has ever run.
+CREATE INDEX IF NOT EXISTS step_runs_lease_index ON step_runs(lease_owner)
+WHERE lease_owner IS NOT NULL;
 -- The steps that have not finished, a few of every step a fleet has run.
 CREATE INDEX IF NOT EXISTS step_runs_open_index ON step_runs(created_at_unix_ms, step_path)
 WHERE status NOT IN ('completed','failed','cancelled');
@@ -717,6 +725,47 @@ const ACTUAL_STATE_CLAIM: &str = "(claims.kind<'harness.' OR claims.kind>='harne
 const CURRENT_VIEW_CLAIM: &str = "(kind='intent.desired'
    OR json_extract(body, '$.fields.status') NOT IN ('stopped', 'absent', 'exited')
    OR json_extract(body, '$.status') NOT IN ('stopped', 'absent', 'exited'))";
+
+/// The subjects with a runtime observation at or before store index `?1`, in subject order. Each
+/// step seeks past the subject before it in `claims_runtime_subject_index`, so the query reads
+/// about one index entry per subject, not every runtime observation.
+const RUNTIME_SUBJECTS: &str = "WITH RECURSIVE runtime_subjects(subject) AS (
+         SELECT (SELECT subject FROM claims INDEXED BY claims_runtime_subject_index
+                 WHERE kind='runtime.observed' AND store_index<=?1 ORDER BY subject LIMIT 1)
+         UNION ALL
+         SELECT (SELECT subject FROM claims INDEXED BY claims_runtime_subject_index
+                 WHERE kind='runtime.observed' AND subject>runtime_subjects.subject
+                   AND store_index<=?1
+                 ORDER BY subject LIMIT 1)
+         FROM runtime_subjects WHERE runtime_subjects.subject IS NOT NULL
+     )
+     SELECT subject FROM runtime_subjects WHERE subject IS NOT NULL";
+
+/// The subjects from `?2` up to but not including `?3` with a claim at or before store index
+/// `?1`, in subject order, by one seek per subject in `claims_subject_index`.
+const RANGE_SUBJECTS: &str = "WITH RECURSIVE range_subjects(subject) AS (
+         SELECT (SELECT subject FROM claims INDEXED BY claims_subject_index
+                 WHERE subject>=?2 AND subject<?3 AND store_index<=?1 ORDER BY subject LIMIT 1)
+         UNION ALL
+         SELECT (SELECT subject FROM claims INDEXED BY claims_subject_index
+                 WHERE subject>range_subjects.subject AND subject<?3 AND store_index<=?1
+                 ORDER BY subject LIMIT 1)
+         FROM range_subjects WHERE range_subjects.subject IS NOT NULL
+     )
+     SELECT subject FROM range_subjects WHERE subject IS NOT NULL";
+
+/// The least string above every string that begins with `prefix`, when `prefix` is plain ASCII
+/// without GLOB wildcards, so `subject GLOB 'prefix*'` holds exactly when
+/// `prefix <= subject < bound`.
+fn prefix_upper_bound(prefix: &str) -> Option<String> {
+    if !prefix.is_ascii() || prefix.contains(['*', '?', '[']) {
+        return None;
+    }
+    let mut bytes = prefix.as_bytes().to_vec();
+    let last = bytes.last_mut().filter(|last| **last < 0x7f)?;
+    *last += 1;
+    String::from_utf8(bytes).ok()
+}
 
 /// The runtime incarnation a claim names, read as a view of the claim does: from its `fields`,
 /// or from the body itself when it has none. The expression of
@@ -1666,6 +1715,8 @@ static SQLITE_COMMITS: AtomicU64 = AtomicU64::new(0);
 static SQLITE_COMMIT_NANOS: AtomicU64 = AtomicU64::new(0);
 
 fn record_sqlite_time(statement: &str, duration: std::time::Duration) {
+    #[cfg(test)]
+    STATEMENTS_RUN.with(|run| run.set(run.get() + 1));
     crate::profile::sql(statement, duration);
     SQLITE_NANOS.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
     if statement == "COMMIT" {
@@ -5946,6 +5997,61 @@ impl Store {
         )
     }
 
+    /// The steps of the client work list, or with `history` of the work history, that a
+    /// claimant holds at the snapshot, with the status and claimant those lists show. Only a
+    /// step whose lease names an owner can have a claimant, so this reads the leased steps by
+    /// their index rather than reading and enriching every step the store has run. The machine
+    /// list needs only who holds which step.
+    pub fn client_work_claims_at_snapshot(
+        &self,
+        history: bool,
+        snapshot_unix_ms: u128,
+    ) -> Result<Vec<StepRunView>> {
+        let connection = self.readers.get();
+        let views = connection
+            .prepare_cached(
+                "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                        lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+                 FROM step_runs INDEXED BY step_runs_lease_index
+                 WHERE lease_owner IS NOT NULL
+                   AND (?1 OR (generation_id=(SELECT current_generation_id FROM mission_runs
+                                              WHERE id=step_runs.run_id)
+                               AND status NOT IN ('pending','completed','failed','cancelled')))
+                 ORDER BY subject",
+            )?
+            .query_map([history], step_run_from_row)?
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut held = Vec::new();
+        for mut view in views {
+            apply_effective_step_state(&connection, &mut view, snapshot_unix_ms)?;
+            if !history {
+                // The current work list leaves out ended steps, and a run draining for a
+                // revision shows only the steps still being worked.
+                let draining = connection
+                    .prepare_cached("SELECT phase FROM mission_runs WHERE id=?1")?
+                    .query_row(
+                        [view.run.strip_prefix("mission-run/").unwrap_or(&view.run)],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .is_some_and(|phase| phase == "revision-draining");
+                if (draining
+                    && !matches!(view.status.as_str(), "claimed" | "working" | "verifying"))
+                    || matches!(
+                        view.status.as_str(),
+                        "pending" | "completed" | "failed" | "cancelled"
+                    )
+                {
+                    continue;
+                }
+            }
+            if view.claimant.is_some() {
+                held.push(view);
+            }
+        }
+        Ok(held)
+    }
+
     /// Return the work fields needed by the reconciler without computing CLI-only
     /// timing and wake annotations. Those annotations scan immutable history and
     /// are intentionally too expensive for the daemon's inner control loop.
@@ -9569,15 +9675,24 @@ impl Store {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
         let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
-        let pattern = format!("{prefix}*");
-        let mut statement = connection.prepare(
-            "SELECT DISTINCT subject FROM claims
-             WHERE store_index<=?1 AND subject GLOB ?2 ORDER BY subject",
-        )?;
-        let subjects = statement
-            .query_map(params![store_index, pattern], |row| row.get::<_, String>(0))?
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        drop(statement);
+        let subjects = match prefix_upper_bound(prefix) {
+            // One seek per subject instead of every claim of every subject in the range.
+            Some(bound) => connection
+                .prepare_cached(RANGE_SUBJECTS)?
+                .query_map(params![store_index, prefix, bound], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<BTreeSet<_>, _>>()?,
+            None => connection
+                .prepare(
+                    "SELECT DISTINCT subject FROM claims
+                     WHERE store_index<=?1 AND subject GLOB ?2 ORDER BY subject",
+                )?
+                .query_map(params![store_index, format!("{prefix}*")], |row| {
+                    row.get::<_, String>(0)
+                })?
+                .collect::<Result<BTreeSet<_>, _>>()?,
+        };
         drop(connection);
         self.status_for_subject_names_at(subjects, store_index, include_history)
     }
@@ -9592,14 +9707,21 @@ impl Store {
         let connection = self.readers.get();
         let current = current_index(&connection)?;
         let store_index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
-        let mut statement = connection.prepare(
-            "SELECT DISTINCT subject FROM claims
-             WHERE kind=?1 AND store_index<=?2 ORDER BY subject",
-        )?;
-        let subjects = statement
-            .query_map(params![kind, store_index], |row| row.get::<_, String>(0))?
-            .collect::<Result<BTreeSet<_>, _>>()?;
-        drop(statement);
+        let subjects = if kind == "runtime.observed" {
+            // One seek per runtime instead of every runtime observation.
+            connection
+                .prepare_cached(RUNTIME_SUBJECTS)?
+                .query_map([store_index], |row| row.get::<_, String>(0))?
+                .collect::<Result<BTreeSet<_>, _>>()?
+        } else {
+            connection
+                .prepare(
+                    "SELECT DISTINCT subject FROM claims
+                     WHERE kind=?1 AND store_index<=?2 ORDER BY subject",
+                )?
+                .query_map(params![kind, store_index], |row| row.get::<_, String>(0))?
+                .collect::<Result<BTreeSet<_>, _>>()?
+        };
         drop(connection);
         self.status_for_subject_names_at(subjects, store_index, include_history)
     }
@@ -10645,29 +10767,33 @@ impl Store {
         )
     }
 
-    /// Current member faults for an agent collection, reduced in one SQL scan.
-    pub fn member_reconcile_faults_at(&self, at_index: u64) -> Result<BTreeMap<String, String>> {
+    /// The member fault of each of `subjects` that has one at `at_index`, as
+    /// `member_reconcile_fault` reads it: one seek per subject rather than a scan of every
+    /// reconcile decision the store holds.
+    pub fn member_reconcile_faults_for(
+        &self,
+        subjects: &[String],
+        at_index: u64,
+    ) -> Result<BTreeMap<String, String>> {
         let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT subject, body FROM (
-                 SELECT subject, body,
-                        ROW_NUMBER() OVER (PARTITION BY subject ORDER BY store_index DESC) AS rank
-                 FROM claims
-                 WHERE subject LIKE 'agent/%' AND kind='runtime.reconcile-decision'
-                   AND store_index<=?1
-                   AND json_extract(body, '$.fields.key')='member-reconcile'
-             ) WHERE rank=1",
+        let mut statement = connection.prepare_cached(
+            "SELECT body FROM claims WHERE subject=?1 AND kind='runtime.reconcile-decision'
+               AND store_index<=?2 AND json_extract(body, '$.fields.key')='member-reconcile'
+             ORDER BY store_index DESC LIMIT 1",
         )?;
         let mut faults = BTreeMap::new();
-        for row in statement.query_map([at_index], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-        })? {
-            let (subject, body) = row?;
+        for subject in subjects {
+            let Some(body) = statement
+                .query_row(params![subject, at_index], |row| row.get::<_, String>(0))
+                .optional()?
+            else {
+                continue;
+            };
             let body: Value = serde_json::from_str(&body)?;
             let fields = body.get("fields").unwrap_or(&body);
             if fields.get("decision").and_then(Value::as_str) == Some("member-fault") {
                 faults.insert(
-                    subject,
+                    subject.clone(),
                     fields
                         .get("reason")
                         .and_then(Value::as_str)
@@ -11485,6 +11611,40 @@ impl Store {
     pub fn selected_desired_token(&self, subject: &str) -> Result<Option<String>> {
         let connection = self.readers.get();
         current_desired_row(&connection, subject).map(|row| row.map(|row| row.claim_id))
+    }
+
+    /// `selected_desired_token` of each of `subjects` that has a declaration, in one statement.
+    pub fn selected_desired_tokens(&self, subjects: &[&str]) -> Result<BTreeMap<String, String>> {
+        let connection = self.readers.get();
+        connection
+            .prepare_cached(
+                "SELECT subject, claim_id FROM desired
+                 WHERE subject IN (SELECT value FROM json_each(?1))",
+            )?
+            .query_map([serde_json::to_string(subjects)?], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// The acceptance time of each of `ids` that names a claim, as `claim_by_id` reads it, in
+    /// one statement.
+    pub fn claim_acceptance_times(&self, ids: &[&str]) -> Result<BTreeMap<String, u128>> {
+        let connection = self.readers.get();
+        connection
+            .prepare_cached(
+                "SELECT id, accepted_at_unix_ms FROM claims
+                 WHERE id IN (SELECT value FROM json_each(?1))",
+            )?
+            .query_map([serde_json::to_string(ids)?], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?.parse().unwrap_or_default(),
+                ))
+            })?
+            .collect::<Result<BTreeMap<_, _>, _>>()
+            .map_err(Into::into)
     }
 
     pub fn selected_desired_revision(&self, subject: &str) -> Result<Option<String>> {
@@ -24152,6 +24312,8 @@ thread_local! {
     static SUBJECT_REDUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Steps whose queue, timing and wake a read enriched, so a test can see a read's work.
     pub(crate) static STEPS_ENRICHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// SQLite statements this thread ran, so a test can see how a read's work grows.
+    pub(crate) static STATEMENTS_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The projected tables the graph digest commits: digest label, table, digested columns in
@@ -28213,20 +28375,24 @@ impl RosterStepRow {
     }
 }
 
+/// The held and ready agent steps of seat `?1`, or of every seat when null. The unfinished-step
+/// predicate, word for word that of `step_runs_open_index`, reads the fleet's open steps rather
+/// than every step the store has run.
+const SEAT_STEP_ROWS: &str = "SELECT subject, run_id, step_path, status, assignee, lease_owner,
+            available_to, created_at_unix_ms
+     FROM step_runs
+     WHERE agentless=0
+       AND status IN ('ready', 'claimed', 'working', 'verifying')
+       AND status NOT IN ('completed','failed','cancelled')
+       AND (?1 IS NULL OR assignee=?1 OR lease_owner=?1)
+       AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
+       AND NOT (status='ready'
+                AND (SELECT phase FROM mission_runs WHERE id=step_runs.run_id)='revision-draining')
+     ORDER BY length(created_at_unix_ms), created_at_unix_ms, subject";
+
 /// Current held and ready agent steps, for every seat or for one seat.
 fn seat_step_rows_tx(connection: &Connection, agent: Option<&str>) -> Result<Vec<RosterStepRow>> {
-    let mut statement = connection.prepare(
-        "SELECT subject, run_id, step_path, status, assignee, lease_owner, available_to,
-                created_at_unix_ms
-         FROM step_runs
-         WHERE agentless=0
-           AND status IN ('ready', 'claimed', 'working', 'verifying')
-           AND (?1 IS NULL OR assignee=?1 OR lease_owner=?1)
-           AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
-           AND NOT (status='ready'
-                    AND (SELECT phase FROM mission_runs WHERE id=step_runs.run_id)='revision-draining')
-         ORDER BY length(created_at_unix_ms), created_at_unix_ms, subject",
-    )?;
+    let mut statement = connection.prepare_cached(SEAT_STEP_ROWS)?;
     let mut rows = statement
         .query_map([agent], |row| {
             Ok(RosterStepRow {
@@ -33852,6 +34018,351 @@ observer "ordered/file" {
             plan.iter()
                 .any(|step| step.contains("claims_message_to_order_index")),
             "{plan:?}"
+        );
+    }
+
+    fn query_plan(store: &Store, sql: &str, params: impl rusqlite::Params) -> Vec<String> {
+        store
+            .readers
+            .get()
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap()
+            .query_map(params, |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    fn listed(store: &Store, sql: &str, params: impl rusqlite::Params) -> Vec<String> {
+        store
+            .readers
+            .get()
+            .prepare(sql)
+            .unwrap()
+            .query_map(params, |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap()
+    }
+
+    /// Claims written as bare rows, about subjects no claim spec admits, and the store index of
+    /// the last one.
+    fn insert_raw_claims(store: &Store, claims: &[(&str, &str)]) -> u64 {
+        let connection = store.connection.lock().unwrap();
+        connection
+            .execute_batch("PRAGMA foreign_keys = OFF")
+            .unwrap();
+        for (subject, kind) in claims {
+            connection
+                .execute(
+                    "INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body,
+                                        predecessors, accepted_at_unix_ms)
+                     VALUES (?1, 'batch/raw', ?2, ?3, 'node', NULL, '{}', '[]', '1')",
+                    params![Uuid::now_v7().to_string(), subject, kind],
+                )
+                .unwrap();
+        }
+        connection
+            .execute_batch("PRAGMA foreign_keys = ON")
+            .unwrap();
+        connection
+            .query_row("SELECT MAX(store_index) FROM claims", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// The runtimes' subjects are found one index seek per subject, not by reading every runtime
+    /// observation, and they are the subjects a scan finds at every snapshot.
+    #[test]
+    fn runtime_subjects_are_read_one_seek_per_subject() {
+        let store = Store::open_memory("node").unwrap();
+        let mut snapshots = Vec::new();
+        for round in 0..4 {
+            let subjects = (0..=round)
+                .map(|number| format!("agent/kind/runtime-{number}"))
+                .collect::<Vec<_>>();
+            let mut claims = subjects
+                .iter()
+                .flat_map(|subject| {
+                    [
+                        (subject.as_str(), "runtime.observed"),
+                        (subject.as_str(), "harness.observed"),
+                    ]
+                })
+                .collect::<Vec<_>>();
+            let other = format!("agent/kind/other-{round}");
+            claims.push((&other, "harness.observed"));
+            snapshots.push(insert_raw_claims(&store, &claims));
+        }
+        let scan = "SELECT DISTINCT subject FROM claims WHERE kind='runtime.observed'
+                    AND store_index<=?1 ORDER BY subject";
+        for snapshot in [0, 1, snapshots[0], snapshots[1], snapshots[3]] {
+            assert_eq!(
+                listed(&store, RUNTIME_SUBJECTS, [snapshot]),
+                listed(&store, scan, [snapshot]),
+                "at {snapshot}"
+            );
+        }
+        let plan = query_plan(&store, RUNTIME_SUBJECTS, [10]);
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("claims_runtime_subject_index (subject>?)")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().all(|step| !step.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
+    }
+
+    /// A prefix's subjects are found one index seek per subject, and they are the subjects a
+    /// GLOB scan finds, including the neighbours just outside the prefix's range.
+    #[test]
+    fn a_prefixs_subjects_are_read_one_seek_per_subject() {
+        assert_eq!(prefix_upper_bound("agent/").as_deref(), Some("agent0"));
+        assert_eq!(prefix_upper_bound("host/").as_deref(), Some("host0"));
+        for unbounded in ["", "agent*", "a?", "[a]/", "agent/\u{e9}", "agent\u{7f}"] {
+            assert_eq!(prefix_upper_bound(unbounded), None, "{unbounded:?}");
+        }
+        let store = Store::open_memory("node").unwrap();
+        let first = insert_raw_claims(
+            &store,
+            &[
+                ("agen/x", "harness.observed"),
+                ("agent", "harness.observed"),
+                ("agent/", "harness.observed"),
+                ("agent/a", "harness.observed"),
+                ("agent/a", "runtime.observed"),
+                ("agent/a/b", "harness.observed"),
+                ("agent0", "harness.observed"),
+                ("agents/x", "harness.observed"),
+                ("Agent/x", "harness.observed"),
+                ("host/one", "transport.observed"),
+            ],
+        );
+        let last = insert_raw_claims(
+            &store,
+            &[
+                ("agent/a", "harness.observed"),
+                ("agent/late", "harness.observed"),
+                ("agent/z", "harness.observed"),
+                ("host/two", "transport.observed"),
+            ],
+        );
+        let scan = "SELECT DISTINCT subject FROM claims WHERE store_index<=?1 AND subject GLOB ?2
+                    ORDER BY subject";
+        for snapshot in [0, 1, 4, first, last] {
+            for prefix in ["agent/", "host/", "agent/a/"] {
+                let bound = prefix_upper_bound(prefix).unwrap();
+                assert_eq!(
+                    listed(&store, RANGE_SUBJECTS, params![snapshot, prefix, bound]),
+                    listed(&store, scan, params![snapshot, format!("{prefix}*")]),
+                    "{prefix} at {snapshot}"
+                );
+            }
+        }
+        let plan = query_plan(&store, RANGE_SUBJECTS, params![last, "agent/", "agent0"]);
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("claims_subject_index (subject>? AND subject<?)")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter().all(|step| !step.contains("TEMP B-TREE")),
+            "{plan:?}"
+        );
+    }
+
+    /// A seat's held and ready steps are read from the fleet's open steps, not from every step the
+    /// store has run.
+    #[test]
+    fn seat_steps_are_read_from_the_open_steps() {
+        let store = Store::open_memory("node").unwrap();
+        for agent in [None, Some("agent/seat")] {
+            let steps = query_plan(&store, SEAT_STEP_ROWS, params![agent]);
+            assert!(
+                steps
+                    .iter()
+                    .any(|step| step.contains("step_runs_open_index")),
+                "{steps:?}"
+            );
+        }
+    }
+
+    /// The machine list's held steps are the client work list's and work history's steps that
+    /// a claimant holds, read from the leased steps alone.
+    #[test]
+    fn held_work_is_read_from_the_leased_steps() {
+        let store = Store::open_memory("node").unwrap();
+        let source = r#"
+version 2
+
+  mission "held-work" state="ready" {
+    goal "Hold some steps."
+    concurrent-runs max=2
+    step "active" { assigned-to "agent/worker" }
+    step "expired" { assigned-to "agent/worker" }
+    step "ready" { assigned-to "agent/worker" }
+    step "pending" { assigned-to "agent/worker" }
+    step "watch" { agentless }
+  }
+
+"#;
+        let intent = crate::graph::parse_test_intent(source, "node").unwrap();
+        let planned = store
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: source.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        store
+            .apply(&intent, &planned.subject_tokens, "held-work-mission")
+            .unwrap();
+        let mut runs = Vec::new();
+        for number in 0..2 {
+            runs.push(
+                store
+                    .create_mission_run(&MissionRunRequest {
+                        mission: "held-work".into(),
+                        revision: None,
+                        workspace: "/tmp".into(),
+                        requester: Some("person/test".into()),
+                        mode: Some("run".into()),
+                        inputs: BTreeMap::new(),
+                        idempotency_key: format!("held-work-run-{number}"),
+                    })
+                    .unwrap(),
+            );
+        }
+        let request = |key: &str| WorkRequest {
+            actor: Some("agent/node.worker".into()),
+            incarnation: Some("worker-one".into()),
+            summary: None,
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        // The second run holds a step until it ends; then the first run holds one.
+        for (number, run) in runs.iter().enumerate().rev() {
+            let subjects = run
+                .steps
+                .iter()
+                .map(|step| (step.step.clone(), step.subject.clone()))
+                .collect::<BTreeMap<_, _>>();
+            for path in ["active", "expired", "ready"] {
+                store
+                    .set_step_state(&subjects[path], "ready", None)
+                    .unwrap();
+            }
+            for path in ["expired", "active"] {
+                store
+                    .work_action(
+                        &subjects[path],
+                        "claim",
+                        &request(&format!("{path}-{number}")),
+                    )
+                    .unwrap();
+                if path == "expired" {
+                    expire_work_lease_by_claim(
+                        &store,
+                        &subjects[path],
+                        "agent/node.worker",
+                        "worker-one",
+                    );
+                }
+            }
+            if number == 1 {
+                assert!(
+                    store
+                        .set_mission_run_state(&run.id, "cancelled", "terminal", Some("stopped"))
+                        .unwrap()
+                );
+            }
+        }
+        let held = |views: Vec<StepRunView>| {
+            views
+                .into_iter()
+                .filter(|view| view.claimant.is_some())
+                .map(|view| (view.subject, view.claimant, view.updated_at_unix_ms))
+                .collect::<BTreeSet<_>>()
+        };
+        let now = now_ms();
+        // Later, the active lease has expired too.
+        for at in [now, now + 86_400_000] {
+            let current = held(store.client_work_at_snapshot(None, false, at).unwrap());
+            let history = held(store.client_work_history_at_snapshot(None, at).unwrap());
+            assert_eq!(
+                held(store.client_work_claims_at_snapshot(false, at).unwrap()),
+                current
+            );
+            assert_eq!(
+                held(store.client_work_claims_at_snapshot(true, at).unwrap()),
+                history
+            );
+            assert_eq!(current.len(), usize::from(at == now), "{current:?}");
+        }
+        STEPS_ENRICHED.with(|enriched| enriched.set(0));
+        store.client_work_claims_at_snapshot(true, now).unwrap();
+        assert_eq!(STEPS_ENRICHED.with(std::cell::Cell::get), 0);
+    }
+
+    /// Each listed agent's member fault is its newest member-reconcile decision, read per agent.
+    #[test]
+    fn member_faults_are_read_for_the_listed_agents() {
+        let store = Store::open_memory("node").unwrap();
+        let decide = |subject: &str, decision: &str, reason: &str| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "runtime.reconcile-decision".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("key".into(), Value::String("member-reconcile".into())),
+                        ("decision".into(), Value::String(decision.into())),
+                        ("reason".into(), Value::String(reason.into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        decide("agent/faults/healed", "member-fault", "it failed once");
+        let failed = decide("agent/faults/failed", "member-fault", "it cannot start");
+        decide("agent/faults/healed", "member-started", "it started");
+        decide("agent/faults/failed", "member-started", "it started");
+        let subjects = [
+            "agent/faults/healed",
+            "agent/faults/failed",
+            "agent/faults/none",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        let index = store.index().unwrap();
+        for at in [failed.store_index, index] {
+            let expected = subjects
+                .iter()
+                .filter_map(|subject| {
+                    store
+                        .member_reconcile_fault(subject, Some(at))
+                        .unwrap()
+                        .map(|fault| (subject.clone(), fault))
+                })
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(
+                store.member_reconcile_faults_for(&subjects, at).unwrap(),
+                expected
+            );
+        }
+        assert_eq!(
+            store
+                .member_reconcile_faults_for(&subjects, failed.store_index)
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["agent/faults/failed", "agent/faults/healed"]
         );
     }
 

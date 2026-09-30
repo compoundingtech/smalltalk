@@ -3640,6 +3640,8 @@ async fn run_up(args: UpArgs) -> Result<()> {
     );
     let local_socket = config.socket.clone();
     let client_gateway_socket = config.client_gateway_socket.clone();
+    // The first diagnostic report reads the whole claim log; no read waits for it.
+    st3::api::start_operation_report(&state);
     tokio::try_join!(
         st3::api::serve_unix_bound(&local_socket, router(state.clone())),
         serve_unix(&client_gateway_socket, fabric_router(state)),

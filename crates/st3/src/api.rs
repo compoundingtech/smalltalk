@@ -1713,14 +1713,6 @@ fn client_agent_resources_uncached(
     // ones; the filters below keep the current layer either way.
     let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
     let work_queues = store.agent_work_queues()?;
-    let desired_hosts = store
-        .desired_subjects()?
-        .into_iter()
-        .filter_map(|desired| {
-            let host = desired.member.map(|member| member.host)?;
-            Some((desired.subject, client_host_id(&host)))
-        })
-        .collect::<BTreeMap<_, _>>();
     let mission_authorities = store
         .agent_declarations_with_writers()?
         .into_iter()
@@ -1741,8 +1733,17 @@ fn client_agent_resources_uncached(
         })
         .map(|subject| subject.subject.clone())
         .collect::<Vec<_>>();
+    // Declarations, usage and faults of the listed agents only, not of every subject.
+    let desired_hosts = store
+        .desired_subjects_named(&agent_subjects)?
+        .into_iter()
+        .filter_map(|desired| {
+            let host = desired.member.map(|member| member.host)?;
+            Some((desired.subject, client_host_id(&host)))
+        })
+        .collect::<BTreeMap<_, _>>();
     let usage_summaries = store.usage_summaries_at(&agent_subjects, Some(snapshot_index))?;
-    let member_faults = store.member_reconcile_faults_at(snapshot_index)?;
+    let member_faults = store.member_reconcile_faults_for(&agent_subjects, snapshot_index)?;
     let queued_steps = work_queues
         .values()
         .flat_map(|queue| {
@@ -3912,6 +3913,13 @@ where
 
 pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
     serve_unix_inner(socket, app, false).await
+}
+
+/// Make the daemon's first diagnostic report, which the operations collection lists, off the
+/// request path. Some of its checks read the whole claim log, seconds of work on a busy host's
+/// store; until it is made, the collection says so instead of making a read wait for it.
+pub fn start_operation_report(state: &AppState) {
+    client_v0::start_operation_report(state);
 }
 
 /// The local daemon binds a Unix peer to the harness identity inherited by that peer or one of
@@ -11699,6 +11707,8 @@ mod tests {
             ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         }
 
+        // As the daemon does when it starts, so no read makes the first diagnostic report.
+        start_operation_report(&state);
         let app = router(state);
         for path in [
             "/v1/messages/page?include_closed=false&limit=100&to=agent%2Fprobe",
