@@ -3519,7 +3519,10 @@ fn select_private_gateway(config: &mut Config, private_state: bool, private_sock
         return;
     }
     let parent = if private_socket {
-        config.socket.parent().filter(|path| !path.as_os_str().is_empty())
+        config
+            .socket
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
     } else {
         Some(config.state_dir.as_path())
     };
@@ -3538,10 +3541,16 @@ mod private_gateway_tests {
         let default_gateway = config.client_gateway_socket.clone();
         config.state_dir = "/tmp/private-state".into();
         select_private_gateway(&mut config, true, false);
-        assert_eq!(config.client_gateway_socket, PathBuf::from("/tmp/private-state/st3-client.sock"));
+        assert_eq!(
+            config.client_gateway_socket,
+            PathBuf::from("/tmp/private-state/st3-client.sock")
+        );
         config.socket = "/tmp/private-socket/api.sock".into();
         select_private_gateway(&mut config, true, true);
-        assert_eq!(config.client_gateway_socket, PathBuf::from("/tmp/private-socket/st3-client.sock"));
+        assert_eq!(
+            config.client_gateway_socket,
+            PathBuf::from("/tmp/private-socket/st3-client.sock")
+        );
         assert_ne!(config.client_gateway_socket, default_gateway);
     }
 

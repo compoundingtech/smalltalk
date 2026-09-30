@@ -4007,7 +4007,10 @@ async fn serve_unix_with_ancestor(
     }
     // A second daemon must never detach an active listener by unlinking its pathname.
     if tokio::net::UnixStream::connect(socket).await.is_ok() {
-        anyhow::bail!("refusing to replace live Unix socket listener at {}", socket.display());
+        anyhow::bail!(
+            "refusing to replace live Unix socket listener at {}",
+            socket.display()
+        );
     }
     match fs::remove_file(socket) {
         Ok(()) => {}
@@ -4089,7 +4092,10 @@ mod gateway_listener_tests {
             .await
             .unwrap_err()
             .to_string();
-        assert!(error.contains("refusing to replace live Unix socket listener"), "{error}");
+        assert!(
+            error.contains("refusing to replace live Unix socket listener"),
+            "{error}"
+        );
         assert!(tokio::net::UnixStream::connect(&socket).await.is_ok());
         drop(listener);
     }
