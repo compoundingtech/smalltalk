@@ -5093,7 +5093,12 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             let unavailable = replication
                 .peers
                 .iter()
-                .filter(|peer| !matches!(peer.status.as_str(), "up" | "last-seen" | "unknown"))
+                .filter(|peer| {
+                    !matches!(
+                        peer.status.as_str(),
+                        "up" | "last-seen" | "unknown" | "refused"
+                    )
+                })
                 .map(|peer| format!("{}={}", peer.peer, peer.status))
                 .collect::<Vec<_>>();
             let unresolved = replication.invalid_records + replication.unknown_records;
@@ -5154,11 +5159,17 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                                 .unwrap_or("no reason recorded")
                         ))
                         .unwrap_or_default(),
-                    if unavailable.is_empty() {
-                        "up".into()
-                    } else {
-                        unavailable.join(", ")
-                    }
+                    replication
+                        .peers
+                        .iter()
+                        .map(|peer| {
+                            match &peer.refusal_reason {
+                                Some(reason) => format!("{}: {reason}", peer.peer),
+                                None => format!("{}={}", peer.peer, peer.status),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             });
         }
@@ -13208,6 +13219,44 @@ agent "good" {{ workspace {:?}; command "true" }}
         assert!(
             disk["message"].as_str().unwrap().contains("GiB free"),
             "{disk}"
+        );
+    }
+
+    #[tokio::test]
+    async fn doctor_and_replication_status_explain_fabric_refusals_without_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.fleet_id = Some("94cd11ba-c582-4558-9c84-c3bda922eb6d".into());
+        state.configured_peers = vec!["cobalt".into()];
+        let app = router(state.clone());
+        let (status, recorded) = json_request(app.clone(), "/v1/internal/replication/peer-failure", json!({
+            "peer": "cobalt", "status": "refused", "error": "refused by that member's Fabric grants (service st3-peer-v1); replication can continue through other members"
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{recorded}");
+        let (status, replication) = get_request(app.clone(), "/v1/replication/status").await;
+        assert_eq!(status, StatusCode::OK, "{replication}");
+        assert_eq!(replication["peers"][0]["status"], "refused");
+        assert!(replication["peers"][0]["last_error"].is_null());
+        assert!(
+            replication["peers"][0]["refusal_reason"]
+                .as_str()
+                .unwrap()
+                .contains("Fabric grants")
+        );
+        let (status, doctor) = get_request(app, "/v1/doctor").await;
+        assert_eq!(status, StatusCode::OK, "{doctor}");
+        let check = doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "replication")
+            .unwrap();
+        assert_eq!(check["status"], "pass", "{check}");
+        assert!(
+            check["message"]
+                .as_str()
+                .unwrap()
+                .contains("cobalt: refused by that member's Fabric grants")
         );
     }
 
