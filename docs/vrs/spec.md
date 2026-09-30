@@ -1589,7 +1589,7 @@ propagation under R17 is a separate axis and stays open as DQ5.
 
 The owner updates this spec whenever implementation changes.
 Changing [vision.md](./vision.md) or [requirements.md](./requirements.md)
-requires Nathan's explicit approval.
+requires Alex's explicit approval.
 
 ## pi native delivery
 
@@ -1759,7 +1759,7 @@ the resident supervisor continues to reconcile the complete local catalog.
 - **DQ1 Scheduled work:** The vision includes per-machine schedulers that form a
   distributed workflow engine, but the KDL shape, event inbox, deduplication
   boundary, and execution receipts are not yet specified. A successful
-  executable eval and Nathan's approval should resolve this before adding
+  executable eval and Alex's approval should resolve this before adding
   scheduler requirements. Three of the four unspecified items now have accepted
   answers in the [stream subsystem](04-stream/requirements.md): the event inbox
   is the ordinary agent inbox, deduplication is `(stream, event-id)` per

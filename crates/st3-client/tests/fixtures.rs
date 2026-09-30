@@ -168,7 +168,7 @@ fn generated_resource_union_decodes_all_kinds() {
             _ => None,
         })
         .unwrap();
-    assert_eq!(device.person_id, "person/nathan");
+    assert_eq!(device.person_id, "person/alex");
     assert_eq!(device.state, "active");
 }
 

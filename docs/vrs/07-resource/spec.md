@@ -147,7 +147,7 @@ refuses an invalid URI, an empty reason, and a Nix-owned declaration, and
 preserves the URI byte-for-byte along with the declaration's unrelated bytes.
 
 Bindings remain projected through `st2 agents --json` as opaque descriptors, per
-`INVARIANTS.md`.
+`invariants.md`.
 
 ## The retired plane
 

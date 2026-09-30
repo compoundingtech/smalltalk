@@ -79,31 +79,31 @@ fn roster_projects_presence_name_and_enrich_across_the_catalog() {
     let root = tmp.path();
     write(
         root,
-        "hetz/st2-claude/agent.kdl",
-        &presented_agent_kdl("st2-claude", "hetz"),
+        "example-linux/st2-claude/agent.kdl",
+        &presented_agent_kdl("st2-claude", "example-linux"),
     );
     write(
         root,
-        "hetz/cos-claude/agent.kdl",
-        &agent_kdl("cos-claude", "hetz"),
+        "example-linux/cos-claude/agent.kdl",
+        &agent_kdl("cos-claude", "example-linux"),
     );
     write(
         root,
-        "silber/fabric-claude/agent.kdl",
-        &agent_kdl("fabric-claude", "silber"),
+        "example-mac/fabric-claude/agent.kdl",
+        &agent_kdl("fabric-claude", "example-mac"),
     );
 
     // Presence: st2-claude busy, cos-claude available, fabric-claude unset (→ offline). Presentation
     // metadata and an inbox message belong to st2-claude's declaration.
-    set_state(&status_path(&root.join("hetz/st2-claude")), State::Busy).unwrap();
+    set_state(&status_path(&root.join("example-linux/st2-claude")), State::Busy).unwrap();
     set_state(
-        &status_path(&root.join("hetz/cos-claude")),
+        &status_path(&root.join("example-linux/cos-claude")),
         State::Available,
     )
     .unwrap();
     send_to_inbox(
-        &st2::message::inbox_dir(&root.join("hetz/st2-claude")),
-        "hetz.cos-claude",
+        &st2::message::inbox_dir(&root.join("example-linux/st2-claude")),
+        "example-linux.cos-claude",
         None,
         None,
         &[],
@@ -111,33 +111,33 @@ fn roster_projects_presence_name_and_enrich_across_the_catalog() {
     )
     .unwrap();
     let restored = send_to_inbox(
-        &st2::message::inbox_dir(&root.join("hetz/st2-claude")),
-        "hetz.cos-claude",
+        &st2::message::inbox_dir(&root.join("example-linux/st2-claude")),
+        "example-linux.cos-claude",
         Some("already handled"),
         None,
         &[],
         "must not count twice",
     )
     .unwrap();
-    let archive = st2::message::archive_dir(&root.join("hetz/st2-claude"));
+    let archive = st2::message::archive_dir(&root.join("example-linux/st2-claude"));
     fs::create_dir_all(&archive).unwrap();
     fs::copy(
-        st2::message::inbox_dir(&root.join("hetz/st2-claude")).join(&restored),
+        st2::message::inbox_dir(&root.join("example-linux/st2-claude")).join(&restored),
         archive.join(&restored),
     )
     .unwrap();
 
-    let rows = roster(root, "hetz");
+    let rows = roster(root, "example-linux");
     // Sorted by bus id, spanning hosts.
     let ids: Vec<&str> = rows.iter().map(|r| r.identity.as_str()).collect();
     assert_eq!(
         ids,
-        ["hetz.cos-claude", "hetz.st2-claude", "silber.fabric-claude"]
+        ["example-linux.cos-claude", "example-linux.st2-claude", "example-mac.fabric-claude"]
     );
 
     let st2c = rows
         .iter()
-        .find(|r| r.identity == "hetz.st2-claude")
+        .find(|r| r.identity == "example-linux.st2-claude")
         .unwrap();
     assert_eq!(st2c.status, State::Busy);
     assert_eq!(st2c.name.as_deref(), Some("st2 owner"));
@@ -154,7 +154,7 @@ fn roster_projects_presence_name_and_enrich_across_the_catalog() {
 
     let cos = rows
         .iter()
-        .find(|r| r.identity == "hetz.cos-claude")
+        .find(|r| r.identity == "example-linux.cos-claude")
         .unwrap();
     assert_eq!(cos.status, State::Available);
     assert_eq!(cos.name, None);
@@ -164,7 +164,7 @@ fn roster_projects_presence_name_and_enrich_across_the_catalog() {
     // fabric-claude: no status file, nothing touched → offline, no activity.
     let fab = rows
         .iter()
-        .find(|r| r.identity == "silber.fabric-claude")
+        .find(|r| r.identity == "example-mac.fabric-claude")
         .unwrap();
     assert_eq!(fab.status, State::Offline);
     assert!(!fab.retired);
@@ -530,18 +530,18 @@ agent "two" {
 fn roster_derives_unknown_from_a_stale_version_1_heartbeat() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    write(root, "hetz/idle/agent.kdl", &agent_kdl("idle", "hetz"));
-    let sp = status_path(&root.join("hetz/idle"));
+    write(root, "example-linux/idle/agent.kdl", &agent_kdl("idle", "example-linux"));
+    let sp = status_path(&root.join("example-linux/idle"));
     set_state(&sp, State::Available).unwrap();
 
     // Fresh → available.
-    assert_eq!(roster(root, "hetz")[0].status, State::Available);
+    assert_eq!(roster(root, "example-linux")[0].status, State::Available);
 
     // Backdate the embedded heartbeat past the stale window → unknown.
     let stale_ms = st2::message::now_ms()
         - u64::try_from((st2::status::STATUS_STALE + Duration::from_secs(60)).as_millis()).unwrap();
     fs::write(&sp, format!("available\nv1 {stale_ms}\n")).unwrap();
-    assert_eq!(roster(root, "hetz")[0].status, State::Unknown);
+    assert_eq!(roster(root, "example-linux")[0].status, State::Unknown);
 }
 
 /// HC-R14/HC-R07: a real harness-context record on disk joins the roster as a fourth axis, in
@@ -559,16 +559,16 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
     fs::create_dir_all(root.join(st2::catalog_lock::CONTROL_DIR)).unwrap();
     write(
         root,
-        "agents/hetz/filling/agent.kdl",
-        &agent_kdl("filling", "hetz"),
+        "agents/example-linux/filling/agent.kdl",
+        &agent_kdl("filling", "example-linux"),
     );
-    let agent_dir = root.join("agents/hetz/filling");
+    let agent_dir = root.join("agents/example-linux/filling");
     set_state(&status_path(&agent_dir), State::Busy).unwrap();
 
     // No record: the axis is emitted as `null`, not omitted.
-    assert!(roster(root, "hetz")[0].context.is_none());
+    assert!(roster(root, "example-linux")[0].context.is_none());
 
-    let mut writer = Writer::new(&agent_dir, "hetz.filling", Harness::Claude).unwrap();
+    let mut writer = Writer::new(&agent_dir, "example-linux.filling", Harness::Claude).unwrap();
     writer
         .observe(Reading {
             used_tokens: Some(184_000),
@@ -588,7 +588,7 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
         .unwrap();
 
     // The state record is absent, so `observedState` is null — and the numbers are still there.
-    let row = &roster(root, "hetz")[0];
+    let row = &roster(root, "example-linux")[0];
     assert!(row.observed.is_none());
     let context = row.context.as_ref().expect("the record joins the roster");
     assert_eq!(context.used_percent, Some(92.0));
@@ -599,7 +599,7 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
         let out = Command::new(env!("CARGO_BIN_EXE_st2"))
             .arg("agents")
             .arg(root)
-            .args(["--host", "hetz"])
+            .args(["--host", "example-linux"])
             .args(&form)
             .output()
             .unwrap();
@@ -625,7 +625,7 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
         let out = Command::new(env!("CARGO_BIN_EXE_st2"))
             .arg("agents")
             .arg(root)
-            .args(["--host", "hetz"])
+            .args(["--host", "example-linux"])
             .output()
             .unwrap();
         assert!(
@@ -637,40 +637,40 @@ fn roster_joins_a_real_context_record_independently_of_observed_state() {
     };
     assert_eq!(
         human(root),
-        "hetz.filling\tbusy\tobs:-\tctx:92% rate-limited \u{27f3}1\t\t\n"
+        "example-linux.filling\tbusy\tobs:-\tctx:92% rate-limited \u{27f3}1\t\t\n"
     );
 
     // A record whose percent the harness withheld — Claude before its first API response — must
     // not render like no record at all: the producer is watching and honestly does not know.
-    Writer::new(&agent_dir, "hetz.filling", Harness::Claude)
+    Writer::new(&agent_dir, "example-linux.filling", Harness::Claude)
         .unwrap()
         .observe(Reading {
             window_tokens: Some(200_000),
             ..Reading::default()
         })
         .unwrap();
-    let row = &roster(root, "hetz")[0];
+    let row = &roster(root, "example-linux")[0];
     assert!(row.context.as_ref().unwrap().used_percent.is_none());
     assert_eq!(
         human(root),
-        "hetz.filling\tbusy\tobs:-\tctx:? \u{27f3}1\t\t\n"
+        "example-linux.filling\tbusy\tobs:-\tctx:? \u{27f3}1\t\t\n"
     );
 
     // …and no record at all still reads `-`.
     fs::remove_file(st2::harness_context::harness_context_path(&agent_dir)).unwrap();
-    assert_eq!(human(root), "hetz.filling\tbusy\tobs:-\tctx:-\t\t\n");
+    assert_eq!(human(root), "example-linux.filling\tbusy\tobs:-\tctx:-\t\t\n");
 }
 
 #[test]
 fn roster_uses_version_1_origin_time_for_last_activity() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
-    write(root, "hetz/idle/agent.kdl", &agent_kdl("idle", "hetz"));
-    let sp = status_path(&root.join("hetz/idle"));
+    write(root, "example-linux/idle/agent.kdl", &agent_kdl("idle", "example-linux"));
+    let sp = status_path(&root.join("example-linux/idle"));
     let heartbeat_ms = st2::message::now_ms() - 1_000;
     fs::write(&sp, format!("available\nv1 {heartbeat_ms}\n")).unwrap();
 
-    let row = &roster(root, "hetz")[0];
+    let row = &roster(root, "example-linux")[0];
     assert_eq!(row.status, State::Available);
     assert_eq!(row.last_activity_ms, Some(heartbeat_ms as f64));
 }

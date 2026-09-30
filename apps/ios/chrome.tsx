@@ -9,7 +9,7 @@ import { Banner, Button, T } from './ui';
 // What every screen's content shares: the connection, problems worth reading, and pull to refresh.
 // The navigation bar and tab bar above and below are native and styled only through their options.
 
-/** `● live hetz · person/nathan`, as stui's top-right corner says it. The first line of a list. */
+/** `● live example-linux · person/alex`, as stui's top-right corner says it. The first line of a list. */
 export function StatusLine() {
   const { status, hasSynced, gatewayHost, caps } = useStore();
   const [glyph, color, word] = status === 'online' ? ['●', theme.idle, 'live']
