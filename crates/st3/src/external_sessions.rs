@@ -702,12 +702,16 @@ fn discover_files(
                     if *driver != candidate.driver {
                         return false;
                     }
-                    let relative = path.strip_prefix(root).ok().or_else(|| {
-                        fs::canonicalize(root)
-                            .ok()
-                            .and_then(|canonical| path.strip_prefix(canonical).ok())
-                    });
-                    relative.is_some_and(|relative| {
+                    let Ok(canonical_root) = fs::canonicalize(root) else {
+                        return false;
+                    };
+                    if !path.starts_with(root) && !path.starts_with(&canonical_root) {
+                        return false;
+                    }
+                    let Ok(canonical_path) = fs::canonicalize(path) else {
+                        return false;
+                    };
+                    canonical_path.strip_prefix(canonical_root).is_ok_and(|relative| {
                         let depth = relative.components().count();
                         depth >= 2 && (*driver != ExternalDriver::Omp || depth == 2)
                     })
@@ -1864,6 +1868,34 @@ mod tests {
         let found = discover_files(home.path(), false, &[candidate]).unwrap();
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].native_id, "live");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_only_inventory_does_not_follow_a_transcript_symlink_outside_provider_root() {
+        let home = tempfile::tempdir().unwrap();
+        let project = home.path().join(".omp/agent/sessions/project");
+        fs::create_dir_all(&project).unwrap();
+        let outside = home.path().join("outside.jsonl");
+        fs::write(&outside, "{\"type\":\"session\",\"id\":\"outside\"}\n").unwrap();
+        let alias = project.join("escape.jsonl");
+        std::os::unix::fs::symlink(&outside, &alias).unwrap();
+        let candidate = ProcessCandidate {
+            driver: ExternalDriver::Omp,
+            managed_by_st3: false,
+            process: ExternalProcess {
+                pid: 42,
+                parent_pid: 1,
+                started_at_unix_ms: 1,
+                fingerprint: "live".into(),
+                cwd: None,
+                command: format!("omp --resume={}", alias.display()),
+                exact_session: false,
+            },
+        };
+        assert!(discover_files(home.path(), false, &[candidate])
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
