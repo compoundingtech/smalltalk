@@ -288,6 +288,11 @@ running. A running harness whose command line does not name its session is liste
 it, and import its saved session from `import ls --all`. Check the workspace before you import:
 do not import a session that a seat is already running.
 
+For omp, the inventory reads only session transcripts, not JSONL tool logs within a session's
+attachment directory. If several transcript copies have the same native ID, st prefers a copy
+whose workspace matches the live process and then the newest copy; import refuses copies still
+indistinguishable by those rules before stopping any process.
+
 ```sh
 st import run SESSION --as person/ada
 ```
