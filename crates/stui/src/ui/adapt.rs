@@ -666,8 +666,10 @@ fn missions(model: &Model) -> Vec<Mission> {
             } else if !work.is_empty()
                 && work.iter().all(|step| {
                     step.state == "completed"
-                        || (matches!(step.state.as_str(), "claimed" | "running")
-                            && step.agentless
+                        || (matches!(
+                            step.state.as_str(),
+                            "claimed" | "working" | "running" | "verifying"
+                        ) && step.agentless
                             && keeps_open(&step.path))
                 })
                 && work.iter().any(|step| step.state != "completed")
@@ -676,7 +678,7 @@ fn missions(model: &Model) -> Vec<Mission> {
                 Word::Watching
             } else if states
                 .iter()
-                .any(|state| matches!(*state, "claimed" | "running"))
+                .any(|state| matches!(*state, "claimed" | "working" | "running" | "verifying"))
             {
                 Word::Working
             } else if let Some(ready) = work
@@ -694,7 +696,10 @@ fn missions(model: &Model) -> Vec<Mission> {
                     Some(_) => Word::Queued,
                     None => Word::Unclaimed,
                 }
-            } else if states.contains(&"waiting") {
+            } else if states
+                .iter()
+                .any(|state| matches!(*state, "waiting" | "pending"))
+            {
                 Word::Held
             } else if matches!(
                 mission.state.as_str(),
@@ -709,10 +714,10 @@ fn missions(model: &Model) -> Vec<Mission> {
                 .map(|step| {
                     let state = match step.state.as_str() {
                         "completed" => StepState::Done,
-                        "claimed" | "running" => StepState::Working,
+                        "claimed" | "working" | "running" | "verifying" => StepState::Working,
                         "ready" => StepState::Ready,
-                        "waiting" => StepState::Waiting,
-                        "blocked" => StepState::Waiting,
+                        "waiting" | "pending" | "blocked" => StepState::Waiting,
+                        "cancelled" => StepState::Cancelled,
                         "failed" => StepState::Failed,
                         _ => StepState::Pending,
                     };
@@ -762,7 +767,7 @@ fn missions(model: &Model) -> Vec<Mission> {
             // one working now.
             let mut steps = steps;
             steps.sort_by_key(|step| match step.state {
-                StepState::Done => 0,
+                StepState::Done | StepState::Cancelled => 0,
                 StepState::NeedsYou | StepState::Failed => 1,
                 StepState::Working => 2,
                 StepState::Ready => 3,
@@ -1617,6 +1622,49 @@ mod tests {
                 && outcome.ends_with(" ago: the change merged after its gate was fixed"),
             "{outcome}"
         );
+    }
+
+    #[test]
+    fn mission_steps_map_every_contract_state_and_held_work_is_working() {
+        for (state, expected) in [
+            ("waiting", StepState::Waiting),
+            ("ready", StepState::Ready),
+            ("claimed", StepState::Working),
+            ("blocked", StepState::Waiting),
+            ("verifying", StepState::Working),
+            ("completed", StepState::Done),
+            ("failed", StepState::Failed),
+            ("cancelled", StepState::Cancelled),
+            // Cached projections from older daemons keep their meaning.
+            ("working", StepState::Working),
+            ("pending", StepState::Waiting),
+        ] {
+            let mut model = Model::default();
+            model.missions = window(vec![serde_json::json!({
+                "id": "mission/fleet/harbor/build", "kind": "mission", "revision": "r1",
+                "updated_at": "2026-09-29T09:58:00Z", "title": "fleet/harbor/build",
+                "state": "running", "mission_revision": "r1", "runs": ["mission-run/build-1"],
+                "run_details": [{
+                    "id": "mission-run/build-1", "requester": "person/avery", "status": "running",
+                    "phase": "normal", "progress": {"done": 0, "total": 2}, "current_steps": [],
+                    "must_act": "agent", "state_since": "2026-09-29T09:58:00Z",
+                    "steps": [
+                        {"id": "step-run/build-1/build", "path": "build", "state": state, "attempt": 1,
+                         "claimant": "agent/example/harbor/builder", "since": "2026-09-29T09:58:00Z"},
+                        {"id": "step-run/build-1/deploy", "path": "deploy", "state": "waiting", "attempt": 0,
+                         "since": "2026-09-29T09:58:00Z"}
+                    ],
+                }],
+            })]);
+            let world = world(&model, "person/avery", &Extras::default());
+            let Load::Ready(missions) = &world.missions else {
+                panic!("missions loaded")
+            };
+            assert_eq!(missions[0].steps[0].state, expected, "{state}");
+            if expected == StepState::Working {
+                assert_eq!(missions[0].word, Word::Working, "{state}");
+            }
+        }
     }
 
     #[test]

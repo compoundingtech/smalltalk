@@ -104,6 +104,36 @@ pub fn resolve_tool(override_path: Option<&Path>, name: &str) -> Option<PathBuf>
     })
 }
 
+#[derive(Debug)]
+struct CommandFailure(String);
+
+impl std::fmt::Display for CommandFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CommandFailure {}
+
+/// Fabric answered the dial but this member has not granted the requested service.
+#[derive(Debug)]
+pub struct FabricGrantRefusal {
+    pub node: String,
+    pub protocol: String,
+}
+
+impl std::fmt::Display for FabricGrantRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refused by that member's Fabric grants (node {}, service {}); retrying in about 30 minutes; replication can continue through other members",
+            self.node, self.protocol
+        )
+    }
+}
+
+impl std::error::Error for FabricGrantRefusal {}
+
 async fn run(program: &Path, arguments: &[&str]) -> Result<String> {
     let output = tokio::time::timeout(
         COMMAND_TIMEOUT,
@@ -116,13 +146,16 @@ async fn run(program: &Path, arguments: &[&str]) -> Result<String> {
     .await
     .with_context(|| format!("{} {} timed out", program.display(), arguments.join(" ")))?
     .with_context(|| format!("run {}", program.display()))?;
-    anyhow::ensure!(
-        output.status.success(),
-        "{} {} failed: {}",
-        program.display(),
-        arguments.join(" "),
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
+    if !output.status.success() {
+        return Err(anyhow::Error::new(CommandFailure(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ))
+        .context(format!(
+            "{} {} failed",
+            program.display(),
+            arguments.join(" ")
+        )));
+    }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
@@ -237,7 +270,21 @@ impl Fabric {
             &self.program,
             &["dial", node, protocol, "--tcp", "127.0.0.1:0"],
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            if error
+                .downcast_ref::<CommandFailure>()
+                .is_some_and(|failure| failure.0.contains("peer not permitted for service"))
+            {
+                FabricGrantRefusal {
+                    node: node.into(),
+                    protocol: protocol.into(),
+                }
+                .into()
+            } else {
+                error
+            }
+        })?;
         let address: SocketAddr = printed
             .trim()
             .parse()
@@ -459,6 +506,29 @@ mod tests {
 
         let remote = Fabric::new(shim(root.path(), "echo 192.168.1.4:45678"));
         assert!(remote.dial("node-b", "p").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fabric_grant_refusals_are_distinct_from_unavailable_peers() {
+        let root = tempfile::tempdir().unwrap();
+        let refused = Fabric::new(shim(
+            root.path(),
+            "echo 'peer not permitted for service st3-peer-v1' >&2; exit 1",
+        ));
+        let error = refused
+            .dial("invented-leaf", "st3-peer-v1")
+            .await
+            .unwrap_err();
+        assert!(error.is::<FabricGrantRefusal>(), "{error:#}");
+        assert!(error.to_string().contains("that member's Fabric grants"));
+        let away = Fabric::new(shim(root.path(), "echo 'peer offline' >&2; exit 1"));
+        assert!(
+            !away
+                .dial("invented-leaf", "st3-peer-v1")
+                .await
+                .unwrap_err()
+                .is::<FabricGrantRefusal>()
+        );
     }
 
     #[tokio::test]
