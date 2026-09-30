@@ -26,10 +26,6 @@ one that passes on a retry is reported as flaky rather than failing the run.
 The messaging fault matrix has a higher repository priority so its long retries have the full
 25-minute CI test window.
 
-The repository's nextest configuration starts the full messaging fault matrix before shorter
-tests. Its retries need most of the 25-minute test limit, so starting it at the end can cut off
-the last attempt even when the other tests pass. Recovery deadlines and assertions stay the same.
-
 st2's catalog, supervisor and end-to-end tests cover st2 code that st3 does not use: the
 `agent_author`, `catalog*`, `eval_run`, `resync` and `resource_profile_supervisor` modules and
 the `catalog_*`, `nomad_survival`, `event_e2e`, `eval_run_e2e`, `resync*`,
