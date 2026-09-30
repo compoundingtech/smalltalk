@@ -314,7 +314,7 @@
           };
         };
 
-        st3 = pkgs.rustPlatform.buildRustPackage {
+        st3Args = {
           pname = "st3";
           inherit version;
           src = self;
@@ -401,6 +401,11 @@
             mainProgram = "st3";
           };
         };
+
+        # Install a binary without making every consumer rerun the full workspace suite.
+        # CI still realizes the same source and flags with checks enabled via checks.st3.
+        st3 = pkgs.rustPlatform.buildRustPackage (st3Args // { doCheck = false; });
+        st3Check = pkgs.rustPlatform.buildRustPackage (st3Args // { doCheck = true; });
 
         st3Help = pkgs.runCommand "st3-help-${version}" { } ''
           test "$(readlink ${st3}/bin/st)" = st3
@@ -686,9 +691,9 @@
         packages.st2-vista-component = st2ProviderComponents;
         packages.default = st2;
 
-        # `nix flake check` is the whole CI: it builds the package — which runs
-        # the hermetic portion of the in-tree `cargo test` suite via doCheck —
-        # and evaluates the `--help` + completions smoke tests below.
+        # `nix flake check` is the whole CI: checks.st3 runs the hermetic in-tree
+        # `cargo test` suite, while packages.st3 supplies the installable binary.
+        # The `--help` and completions smoke tests below exercise that binary.
         #
         # `cargo fmt --check` / `clippy -D warnings` are intentionally NOT gated:
         # this is a packaging PR on an actively-developed, hand-crafted tree, and a
@@ -696,7 +701,7 @@
         # commits on every rebase. The devShell ships rustfmt + clippy for whoever
         # wants them.
         checks.st2 = st2;
-        checks.st3 = st3;
+        checks.st3 = st3Check;
         checks.st3-help = st3Help;
         checks.install-layout = installLayout;
         checks.release-integration = st2ReleaseIntegration;
