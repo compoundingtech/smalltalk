@@ -378,6 +378,8 @@ impl Store {
     #[cfg_attr(not(test), allow(dead_code))] // The trim calls it (P5).
     pub(crate) fn replica_rows_changed(&self) {
         self.replica_generation.fetch_add(1, Ordering::AcqRel);
+        // A trim deleted claims, so answers read from them may no longer hold.
+        self.forget_current_views();
     }
 
     /// Whether evidence may cite this claim: it is stored, or a checkpoint dropped it.
