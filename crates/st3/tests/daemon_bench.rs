@@ -87,7 +87,9 @@ const READS: &[(&str, &str)] = &[
         "seat mailbox",
         "/v1/messages/page?include_closed=false&limit=100&to={seat}",
     ),
-    ("seat work", "/v1/work"),
+    // A seat reads its own work to renew its leases each minute.
+    ("seat work", "/v1/work?actor={seat}"),
+    ("every seat's work", "/v1/work"),
     ("mission runs", "/v1/mission-runs?mission={mission}"),
     ("attention list", "/v1/attention"),
     ("replication status", "/v1/replication/status"),
@@ -244,6 +246,59 @@ async fn person_reads_stay_within_budget_while_thirty_seats_and_a_writer_work() 
         unanswered.is_empty(),
         "reads that never answered: {unanswered:?}; failures {:?}",
         run.failed
+    );
+}
+
+/// A burst of writes, as when every seat reconnects after a restart: each seat writes a
+/// heartbeat at the same moment, twenty times over. Prints each write's latency and how many
+/// commits, each a disk flush, the store made for them. Run it in a release build with
+/// `ST_BENCH=1`; `TMPDIR` picks the disk.
+#[test]
+fn write_bursts_share_their_commits() {
+    if std::env::var_os("ST_BENCH").is_none() {
+        println!("skipped: set ST_BENCH=1 to run the daemon benchmark");
+        return;
+    }
+    if cfg!(debug_assertions) {
+        println!("skipped: a debug build is too slow to measure; run with cargo test --release");
+        return;
+    }
+    let seats = env_number("ST_BENCH_SEATS", 30);
+    let rounds = 20;
+    let directory = tempfile::tempdir().unwrap();
+    let store = Arc::new(Store::open(&directory.path().join("claims.sqlite3"), NODE).unwrap());
+    let commits_before = store.replication_timings().commits;
+    let started = Instant::now();
+    let mut latencies = Vec::new();
+    for round in 0..rounds {
+        let start = Arc::new(std::sync::Barrier::new(seats));
+        let writers = (0..seats)
+            .map(|seat| {
+                let (store, start) = (store.clone(), start.clone());
+                std::thread::spawn(move || {
+                    let index = round * seats + seat;
+                    let input =
+                        claim_input("harness.observed", &format!("burst-{index}"), index, "");
+                    start.wait();
+                    let started = Instant::now();
+                    store.append_claim(&input).unwrap();
+                    started.elapsed()
+                })
+            })
+            .collect::<Vec<_>>();
+        latencies.extend(writers.into_iter().map(|writer| writer.join().unwrap()));
+    }
+    let elapsed = started.elapsed();
+    let commits = store.replication_timings().commits - commits_before;
+    println!(
+        "write bursts: {seats} seats x {rounds} rounds, {} writes in {} ms, {commits} commits; \
+         p50 {} ms, p90 {} ms, p99 {} ms, max {} ms",
+        latencies.len(),
+        elapsed.as_millis(),
+        percentile(&latencies, 50).as_millis(),
+        percentile(&latencies, 90).as_millis(),
+        percentile(&latencies, 99).as_millis(),
+        latencies.iter().max().unwrap().as_millis(),
     );
 }
 
@@ -924,35 +979,41 @@ async fn peer_loop(
         let (peer_for_write, store_for_receive) = (peer.clone(), store.clone());
         let started = Instant::now();
         let received = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            if tick.is_multiple_of(6) {
-                let run = peer_for_write.create_mission_run(&MissionRunRequest {
-                    mission: "bench/peer-work".into(),
-                    revision: None,
-                    workspace: "/srv/bench/peer".into(),
-                    requester: Some("person/bench-operator".into()),
-                    mode: Some("run".into()),
-                    inputs: BTreeMap::new(),
-                    idempotency_key: format!("bench-peer-run-{tick}-{}", std::process::id()),
-                })?;
-                for step in &run.steps {
-                    peer_for_write.set_step_state(&step.subject, "ready", None)?;
+            // The profiler counts the peer's own writes and the daemon's receipt apart.
+            st3::profile::task("bench peer writes", || -> anyhow::Result<()> {
+                if tick.is_multiple_of(6) {
+                    let run = peer_for_write.create_mission_run(&MissionRunRequest {
+                        mission: "bench/peer-work".into(),
+                        revision: None,
+                        workspace: "/srv/bench/peer".into(),
+                        requester: Some("person/bench-operator".into()),
+                        mode: Some("run".into()),
+                        inputs: BTreeMap::new(),
+                        idempotency_key: format!("bench-peer-run-{tick}-{}", std::process::id()),
+                    })?;
+                    for step in &run.steps {
+                        peer_for_write.set_step_state(&step.subject, "ready", None)?;
+                    }
                 }
-            }
-            peer_for_write.append_claim(&claim_input(
-                "harness.observed",
-                &format!("bench-peer-heartbeat-{tick}-{}", std::process::id()),
-                tick,
-                "",
-            ))?;
+                peer_for_write.append_claim(&claim_input(
+                    "harness.observed",
+                    &format!("bench-peer-heartbeat-{tick}-{}", std::process::id()),
+                    tick,
+                    "",
+                ))?;
+                Ok(())
+            })?;
             let exchange = peer_for_write
                 .export_replication_exchange(FLEET, &store_for_receive.replication_inventory()?)?;
-            store_for_receive
-                .receive_replication_exchange(PEER, FLEET, &exchange)
-                .map_err(|error| anyhow::anyhow!(error.message))?;
-            store_for_receive.validate_replication_backlog()?;
-            store_for_receive.apply_replication_repairs()?;
-            store_for_receive.project_replication_backlog()?;
-            Ok(())
+            st3::profile::task("bench replication receive", || -> anyhow::Result<()> {
+                store_for_receive
+                    .receive_replication_exchange(PEER, FLEET, &exchange)
+                    .map_err(|error| anyhow::anyhow!(error.message))?;
+                store_for_receive.validate_replication_backlog()?;
+                store_for_receive.apply_replication_repairs()?;
+                store_for_receive.project_replication_backlog()?;
+                Ok(())
+            })
         })
         .await
         .unwrap();
