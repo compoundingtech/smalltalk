@@ -122,6 +122,9 @@ struct ClientSnapshot {
     created_at: String,
 }
 
+/// A client page and the snapshot it was read in, which the envelope names.
+type ClientPageResponse = (Extension<ClientSnapshot>, Json<ClientResourcePage>);
+
 #[derive(Clone, Debug, Default, Deserialize)]
 struct ClientListQuery {
     limit: Option<usize>,
@@ -574,22 +577,6 @@ async fn response_envelope(
 ) -> Response {
     let started = Instant::now();
     let request_path = request.uri().path().to_owned();
-    // Keep these small control-plane reads out of the pool used by potentially
-    // long client projections and history queries. In particular, authentication
-    // and snapshot admission must use the same reserved lane as the handler.
-    let read_class = if request.method() == axum::http::Method::GET
-        && (request_path == "/v1/status"
-            || request_path == "/v1/client/agents"
-            || request_path.starts_with("/v1/client/agents/"))
-    {
-        crate::store::ReadClass::Critical
-    } else if request.method() == axum::http::Method::GET
-        && request_path == "/v1/client/machines"
-    {
-        crate::store::ReadClass::Operational
-    } else {
-        crate::store::ReadClass::Interactive
-    };
     let request_route = request
         .extensions()
         .get::<axum::extract::MatchedPath>()
@@ -641,11 +628,9 @@ async fn response_envelope(
         let auth_profile = profile.clone();
         let admitted = tokio::task::spawn_blocking(move || {
             let _entered = crate::profile::enter(auth_profile.as_ref());
-            crate::store::with_read_class(read_class, || {
-                let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
-                let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
-                (authentication, snapshot)
-            })
+            let authentication = client_v0::authenticate(&auth_state, &auth_request, transport);
+            let snapshot = client_request_snapshot(&auth_state, cursor_snapshot.flatten());
+            (authentication, snapshot)
         })
         .await;
         match admitted {
@@ -664,8 +649,9 @@ async fn response_envelope(
     let response = match (fabric_boundary_error, client_authentication) {
         (Some(error), _) | (None, Err(error)) => error.into_response(),
         // Most handlers use synchronous SQLite and filesystem APIs. Run the whole
-        // handler on a blocking thread so a busy projection, replication pass, or
-        // reader pool cannot occupy an async worker needed to accept another call.
+        // handler on a blocking thread so a busy projection or replication pass cannot
+        // occupy an async worker needed to accept another call. Each read on that
+        // thread takes its own read connection, so it never waits for another read.
         (None, Ok(_)) if request_path == "/v1/health" => next.run(request).await,
         (None, Ok(_)) => {
             let runtime = tokio::runtime::Handle::current();
@@ -675,7 +661,7 @@ async fn response_envelope(
                     profile.queued();
                 }
                 let _entered = crate::profile::enter(handler_profile.as_ref());
-                crate::store::with_read_class(read_class, || runtime.block_on(next.run(request)))
+                runtime.block_on(next.run(request))
             })
             .await
             {
@@ -700,6 +686,12 @@ async fn response_envelope(
     let enveloping = Instant::now();
     let status = response.status();
     let (mut parts, body) = response.into_parts();
+    // A page read inside one SQLite snapshot names that snapshot, which can be newer than the
+    // one this request was admitted at.
+    let client_snapshot = parts
+        .extensions
+        .remove::<ClientSnapshot>()
+        .or(client_snapshot);
     let raw = match to_bytes(body, usize::MAX).await {
         Ok(bytes) => serde_json::from_slice::<Value>(&bytes).unwrap_or_else(|error| {
             json!({
@@ -1019,6 +1011,20 @@ fn client_page(
     items: Vec<Value>,
     query: &ClientListQuery,
 ) -> Result<ClientResourcePage, ApiError> {
+    client_page_read(state, snapshot, collection, items, query, false)
+}
+
+/// A page of `items`, or of the cached first page a cursor continues. `pinned` says the items
+/// were read in `snapshot` itself, so a commit since then cannot have torn them; otherwise a
+/// first page is refused once the store has moved past the snapshot.
+fn client_page_read(
+    state: &AppState,
+    snapshot: &ClientSnapshot,
+    collection: &str,
+    items: Vec<Value>,
+    query: &ClientListQuery,
+    pinned: bool,
+) -> Result<ClientResourcePage, ApiError> {
     let requested_limit = query
         .limit
         .unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
@@ -1069,7 +1075,7 @@ fn client_page(
             cursor.expires_at_unix_ms,
         )
     } else {
-        if state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
+        if !pinned && state.store.index().map_err(ApiError::internal)? != snapshot.store_index {
             return Err(client_page_expired(
                 "the snapshot changed; restart pagination from the first page",
             ));
@@ -1141,6 +1147,23 @@ fn client_page(
     } else {
         None
     };
+    Ok(ClientResourcePage {
+        kind: "page".into(),
+        collection: collection.into(),
+        filters: client_page_filters(query),
+        items: page_items,
+        page: ClientPageInfo {
+            limit,
+            has_more,
+            next_cursor,
+            cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
+        },
+        sync: client_sync_notice(state),
+    })
+}
+
+/// The filters a page names: the ones its query applied.
+fn client_page_filters(query: &ClientListQuery) -> BTreeMap<String, String> {
     let mut filters = BTreeMap::new();
     if query.history {
         filters.insert("history".into(), "all".into());
@@ -1158,19 +1181,37 @@ fn client_page(
     if query.native_only {
         filters.insert("native_only".into(), "true".into());
     }
-    Ok(ClientResourcePage {
-        kind: "page".into(),
-        collection: collection.into(),
-        filters,
-        items: page_items,
-        page: ClientPageInfo {
-            limit,
-            has_more,
-            next_cursor,
-            cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
-        },
-        sync: client_sync_notice(state),
+    filters
+}
+
+/// A page of `collection` whose first page `read` computes inside one SQLite snapshot. The page
+/// names that snapshot, so a commit that lands while it reads neither tears it nor refuses it;
+/// a later page comes from the first page's cache, as every cached page does.
+async fn client_snapshot_page<F>(
+    state: &AppState,
+    snapshot: ClientSnapshot,
+    collection: &'static str,
+    query: &ClientListQuery,
+    read: F,
+) -> Result<ClientPageResponse, ApiError>
+where
+    F: FnOnce(&AppState, &ClientSnapshot) -> anyhow::Result<Vec<Value>> + Send + 'static,
+{
+    if query.cursor.is_some() {
+        let page = client_page(state, &snapshot, collection, Vec::new(), query)?;
+        return Ok((Extension(snapshot), Json(page)));
+    }
+    let reader = state.clone();
+    let (snapshot, items) = blocking_store(move || {
+        reader.store.clone().read_snapshot(|index| {
+            let snapshot = client_snapshot_at(&reader, index);
+            let items = read(&reader, &snapshot)?;
+            Ok((snapshot, items))
+        })
     })
+    .await?;
+    let page = client_page_read(state, &snapshot, collection, items, query, true)?;
+    Ok((Extension(snapshot), Json(page)))
 }
 
 /// A host catching up with a peer can show early history as current, and a host whose graph
@@ -1335,7 +1376,64 @@ fn client_work_resources(
                 .then_with(|| left.subject.cmp(&right.subject))
         });
     }
-    let desired = store.desired_subjects()?;
+    // Only the seats these steps own, not every subject the fleet has ever declared.
+    let desired = store.desired_subjects_for_owner_steps(
+        &work
+            .iter()
+            .map(|step| step.subject.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    client_work_values(store, work, &desired, snapshot_index)
+}
+
+/// One page of the work history, newest update first, and whether more follow. Rendering the
+/// whole history to show a page of it enriched every step the store had ever run: seconds on
+/// a busy host's store.
+fn client_work_history_page(
+    store: &Store,
+    actor: Option<&str>,
+    snapshot_unix_ms: u128,
+    snapshot_index: u64,
+    offset: usize,
+    limit: usize,
+) -> anyhow::Result<(Vec<Value>, bool)> {
+    let (work, has_more) =
+        store.client_work_history_page_at_snapshot(actor, snapshot_unix_ms, offset, limit)?;
+    let desired = store.desired_subjects_for_owner_steps(
+        &work
+            .iter()
+            .map(|step| step.subject.clone())
+            .collect::<Vec<_>>(),
+    )?;
+    Ok((
+        client_work_values(store, work, &desired, snapshot_index)?,
+        has_more,
+    ))
+}
+
+/// One work item, read and rendered alone. Rendering the whole history to pick one item
+/// enriched every step the store had ever run: seconds on a busy host's store.
+fn client_work_item(
+    store: &Store,
+    id: &str,
+    actor: Option<&str>,
+    snapshot_unix_ms: u128,
+    snapshot_index: u64,
+) -> anyhow::Result<Option<Value>> {
+    let Some(work) = store.client_work_item_at_snapshot(id, actor, snapshot_unix_ms)? else {
+        return Ok(None);
+    };
+    let desired = store.desired_subjects_for_owner_step(&work.subject)?;
+    Ok(client_work_values(store, vec![work], &desired, snapshot_index)?.pop())
+}
+
+/// Client resources for `work`, with the usage of the seats in `desired` that its steps own.
+fn client_work_values(
+    store: &Store,
+    work: Vec<crate::model::StepRunView>,
+    desired: &[crate::model::DesiredSubject],
+    snapshot_index: u64,
+) -> anyhow::Result<Vec<Value>> {
     let work_subjects = work
         .iter()
         .map(|step| step.subject.as_str())
@@ -1351,7 +1449,7 @@ fn client_work_resources(
         .collect::<Vec<_>>();
     let usage_summaries = store.usage_summaries_at(&usage_subjects, Some(snapshot_index))?;
     let mut usage_by_step = BTreeMap::<&str, Vec<&crate::model::UsageSummary>>::new();
-    for seat in &desired {
+    for seat in desired {
         if let (Some(step), Some(usage)) = (
             seat.owner_step.as_deref(),
             usage_summaries.get(&seat.subject),
@@ -1611,9 +1709,9 @@ fn client_agent_resources_uncached(
     history: bool,
     snapshot_index: u64,
 ) -> anyhow::Result<Vec<Value>> {
-    // The default store status scan omits unhealthy current agents along with
-    // history. Scan both, then keep current-layer agents below.
-    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), true)?;
+    // Without history the store reduces only agents that can be current, including unhealthy
+    // ones; the filters below keep the current layer either way.
+    let status = store.status_for_subject_prefix_at("agent/", Some(snapshot_index), history)?;
     let work_queues = store.agent_work_queues()?;
     let desired_hosts = store
         .desired_subjects()?
@@ -1917,6 +2015,9 @@ fn managed_session_owner_at(
     Ok(None)
 }
 
+/// How many of a subject's claims, oldest first, date its session in the session list.
+const SESSION_CLAIMS: usize = 10_000;
+
 fn client_session_resources(
     store: &Arc<Store>,
     history: bool,
@@ -2072,29 +2173,22 @@ fn managed_session_resources(
             "stopped" | "exited" | "absent" => "completed",
             _ => "waiting",
         };
-        let claims = store
-            .claims_page(
-                Some(&subject.subject),
-                None,
-                0,
-                snapshot_index.checked_add(1),
-                false,
-                10_000,
+        // A session is dated by the subject's first SESSION_CLAIMS claims, the page this list
+        // once read whole and filtered, so a subject with more keeps the dates it had.
+        let through_claim = subject
+            .claims
+            .get(SESSION_CLAIMS - 1)
+            .filter(|_| subject.claims.len() > SESSION_CLAIMS);
+        let mut accepted_times = store
+            .runtime_claim_span_at(
+                &subject.subject,
+                incarnation,
+                runtime,
+                snapshot_index,
+                through_claim.map(String::as_str),
             )?
-            .claims;
-        let incarnation_claims = claims.iter().filter(|claim| {
-            let claim_fields = claim.body.get("fields").unwrap_or(&claim.body);
-            let same_incarnation = incarnation.is_some_and(|expected| {
-                claim_fields.get("incarnation_id").and_then(Value::as_str) == Some(expected)
-            });
-            let same_runtime = runtime.is_some_and(|expected| {
-                claim_fields.get("runtime_id").and_then(Value::as_str) == Some(expected)
-            });
-            same_incarnation || (incarnation.is_none() && same_runtime)
-        });
-        let mut accepted_times = incarnation_claims
-            .map(|claim| claim.accepted_at_unix_ms)
-            .collect::<Vec<_>>();
+            .map(|(first, last)| vec![first, last])
+            .unwrap_or_default();
         if let Some(incarnation) = incarnation
             && let Some(observed) =
                 store.latest_local_timeline_at(&subject.subject, incarnation, snapshot_index)?
@@ -2445,12 +2539,16 @@ fn client_message_resources(
     history: bool,
     peer: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
-    let current_ids = store
-        .operational_messages(person, false)?
-        .into_iter()
-        .map(|message| message.subject)
+    let current = store.operational_messages(person, false)?;
+    let current_ids = current
+        .iter()
+        .map(|message| message.subject.clone())
         .collect::<std::collections::BTreeSet<_>>();
-    let messages = store.operational_messages(person, history)?;
+    let messages = if history {
+        store.operational_messages(person, true)?
+    } else {
+        current
+    };
     let mut resources = Vec::new();
     for message in messages {
         if peer.is_some_and(|peer| message.from != peer && message.to != peer) {
@@ -3082,25 +3180,128 @@ async fn client_work(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
-    if query.cursor.is_some() {
-        return client_page(&state, &snapshot, "work", Vec::new(), &query).map(Json);
+) -> Result<ClientPageResponse, ApiError> {
+    if query.history {
+        return client_work_history(&state, snapshot, &query).await;
     }
-    let store = state.store.clone();
     let actor = query.actor.clone();
-    let history = query.history;
-    let snapshot_unix_ms = client_snapshot_time(&snapshot);
-    let items = blocking_store(move || {
+    client_snapshot_page(&state, snapshot, "work", &query, move |state, snapshot| {
         client_work_resources(
-            &store,
+            &state.store,
             actor.as_deref(),
-            history,
-            snapshot_unix_ms,
+            false,
+            client_snapshot_time(snapshot),
             snapshot.store_index,
         )
     })
+    .await
+}
+
+/// The work history, read a page at a time in the order it shows, each page inside one SQLite
+/// snapshot. Like the mission list, a later page reads its steps again, so it holds only while
+/// that is still its first page's snapshot.
+async fn client_work_history(
+    state: &AppState,
+    snapshot: ClientSnapshot,
+    query: &ClientListQuery,
+) -> Result<ClientPageResponse, ApiError> {
+    let (offset, limit, expires_at_unix_ms) = if let Some(encoded) = &query.cursor {
+        let cursor = decode_client_cursor(encoded)?;
+        if cursor.collection != "work"
+            || cursor.snapshot.id != snapshot.id
+            || cursor.snapshot.store_index != snapshot.store_index
+            || cursor.history != query.history
+            || cursor.person != query.person
+            || cursor.actor != query.actor
+            || cursor.owner_run != query.owner_run
+            || cursor.status != query.status
+            || cursor.native_only != query.native_only
+            || cursor.items_digest != "sql-page"
+            || query
+                .limit
+                .is_some_and(|limit| limit.clamp(1, CLIENT_MAX_PAGE_ITEMS) != cursor.limit)
+        {
+            return Err(client_page_expired(
+                "the page cursor does not match this collection, snapshot, or filter",
+            ));
+        }
+        if client_now_ms() > cursor.expires_at_unix_ms {
+            return Err(client_page_expired("the page cursor expired"));
+        }
+        (cursor.offset, cursor.limit, cursor.expires_at_unix_ms)
+    } else {
+        (
+            0,
+            query
+                .limit
+                .unwrap_or(CLIENT_DEFAULT_PAGE_ITEMS)
+                .clamp(1, CLIENT_MAX_PAGE_ITEMS),
+            client_now_ms().saturating_add(CLIENT_PAGE_TTL_MS),
+        )
+    };
+    let reader = state.clone();
+    let actor = query.actor.clone();
+    let later_page = query.cursor.is_some();
+    let read = blocking_store(move || {
+        reader.store.clone().read_snapshot(|index| {
+            if later_page && index != snapshot.store_index {
+                return Ok(None);
+            }
+            let snapshot = if later_page {
+                snapshot
+            } else {
+                client_snapshot_at(&reader, index)
+            };
+            let (items, has_more) = client_work_history_page(
+                &reader.store,
+                actor.as_deref(),
+                client_snapshot_time(&snapshot),
+                index,
+                offset,
+                limit,
+            )?;
+            Ok(Some((snapshot, items, has_more)))
+        })
+    })
     .await?;
-    client_page(&state, &snapshot, "work", items, &query).map(Json)
+    let Some((snapshot, items, has_more)) = read else {
+        return Err(client_page_expired(
+            "the snapshot changed; restart pagination from the first page",
+        ));
+    };
+    let next_cursor = has_more
+        .then(|| {
+            encode_client_cursor(&ClientPageCursor {
+                snapshot: snapshot.clone(),
+                collection: "work".into(),
+                offset: offset.saturating_add(items.len()),
+                limit,
+                history: query.history,
+                person: query.person.clone(),
+                actor: query.actor.clone(),
+                owner_run: query.owner_run.clone(),
+                status: query.status.clone(),
+                native_only: query.native_only,
+                items_digest: "sql-page".into(),
+                before_index: None,
+                expires_at_unix_ms,
+            })
+        })
+        .transpose()?;
+    let page = ClientResourcePage {
+        kind: "page".into(),
+        collection: "work".into(),
+        filters: client_page_filters(query),
+        items,
+        page: ClientPageInfo {
+            limit,
+            has_more,
+            next_cursor,
+            cursor_expires_at: has_more.then(|| client_timestamp(expires_at_unix_ms)),
+        },
+        sync: client_sync_notice(state),
+    };
+    Ok((Extension(snapshot), Json(page)))
 }
 
 async fn client_work_detail(
@@ -3109,40 +3310,54 @@ async fn client_work_detail(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    client_detail(
-        client_work_resources(
-            &state.store,
-            query.actor.as_deref(),
-            true,
-            client_snapshot_time(&snapshot),
+    let store = state.store.clone();
+    let actor = query.actor.clone();
+    let snapshot_unix_ms = client_snapshot_time(&snapshot);
+    let requested = id.clone();
+    let item = blocking_store(move || {
+        client_work_item(
+            &store,
+            &requested,
+            actor.as_deref(),
+            snapshot_unix_ms,
             snapshot.store_index,
         )
-        .map_err(ApiError::internal)?,
-        "work",
-        &id,
-    )
+    })
+    .await?;
+    item.map(Json).ok_or_else(|| {
+        ApiError::not_found(format!(
+            "work `{}` does not exist",
+            client_detail_id("work", &id)
+        ))
+    })
 }
 
 async fn client_agents(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
-    if query.cursor.is_some() {
-        return client_page(&state, &snapshot, "agents", Vec::new(), &query).map(Json);
-    }
-    let store = state.store.clone();
+) -> Result<ClientPageResponse, ApiError> {
     let history = query.history;
-    let created_at = snapshot.created_at.clone();
-    let snapshot_index = snapshot.store_index;
-    let mut items = blocking_store(move || {
-        client_agent_resources(&store, history, &created_at, snapshot_index)
-    })
-    .await?;
-    if let Some(status) = query.status.as_deref() {
-        items.retain(|item| item.get("state").and_then(Value::as_str) == Some(status));
-    }
-    client_page(&state, &snapshot, "agents", items, &query).map(Json)
+    let status = query.status.clone();
+    client_snapshot_page(
+        &state,
+        snapshot,
+        "agents",
+        &query,
+        move |state, snapshot| {
+            let mut items = client_agent_resources(
+                &state.store,
+                history,
+                &snapshot.created_at,
+                snapshot.store_index,
+            )?;
+            if let Some(status) = status.as_deref() {
+                items.retain(|item| item.get("state").and_then(Value::as_str) == Some(status));
+            }
+            Ok(items)
+        },
+    )
+    .await
 }
 
 async fn client_agents_detail(
@@ -3166,31 +3381,30 @@ async fn client_sessions(
     State(state): State<AppState>,
     Extension(snapshot): Extension<ClientSnapshot>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
-    if query.cursor.is_some() {
-        return client_page(&state, &snapshot, "sessions", Vec::new(), &query).map(Json);
-    }
-    let store = state.store.clone();
+) -> Result<ClientPageResponse, ApiError> {
     let history = query.history;
-    let created_at = snapshot.created_at.clone();
-    let snapshot_index = snapshot.store_index;
-    let native_session_home = state.native_session_home.clone();
     let native_only = query.native_only;
-    let mut items = blocking_store(move || {
-        client_session_resources(
-            &store,
-            history,
-            &created_at,
-            snapshot_index,
-            native_session_home.as_deref(),
-            native_only,
-        )
-    })
-    .await?;
-    if query.native_only {
-        items.retain(|item| item.get("managed") == Some(&Value::Bool(false)));
-    }
-    client_page(&state, &snapshot, "sessions", items, &query).map(Json)
+    client_snapshot_page(
+        &state,
+        snapshot,
+        "sessions",
+        &query,
+        move |state, snapshot| {
+            let mut items = client_session_resources(
+                &state.store,
+                history,
+                &snapshot.created_at,
+                snapshot.store_index,
+                state.native_session_home.as_deref(),
+                native_only,
+            )?;
+            if native_only {
+                items.retain(|item| item.get("managed") == Some(&Value::Bool(false)));
+            }
+            Ok(items)
+        },
+    )
+    .await
 }
 
 async fn client_sessions_detail(
@@ -3322,16 +3536,19 @@ async fn client_attention(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<client_v0::ClientSession>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
-    if effective_query.cursor.is_some() {
-        return client_page(&state, &snapshot, "attention", Vec::new(), &effective_query).map(Json);
-    }
-    let items = client_attention_resources_with_previews(&state, person.as_deref(), query.history)
-        .map_err(ApiError::internal)?;
-    client_page(&state, &snapshot, "attention", items, &effective_query).map(Json)
+    let history = query.history;
+    client_snapshot_page(
+        &state,
+        snapshot,
+        "attention",
+        &effective_query,
+        move |state, _| client_attention_resources_with_previews(state, person.as_deref(), history),
+    )
+    .await
 }
 
 async fn client_attention_detail(
@@ -3354,21 +3571,21 @@ async fn client_messages(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<client_v0::ClientSession>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     let person = client_v0::person_filter(&session, query.person.as_deref())?;
     let mut effective_query = query.clone();
     effective_query.person.clone_from(&person);
-    if effective_query.cursor.is_some() {
-        return client_page(&state, &snapshot, "messages", Vec::new(), &effective_query).map(Json);
-    }
-    let items = client_message_resources(
-        &state.store,
-        person.as_deref(),
-        query.history,
-        query.actor.as_deref(),
+    let (history, actor) = (query.history, query.actor.clone());
+    client_snapshot_page(
+        &state,
+        snapshot,
+        "messages",
+        &effective_query,
+        move |state, _| {
+            client_message_resources(&state.store, person.as_deref(), history, actor.as_deref())
+        },
     )
-    .map_err(ApiError::internal)?;
-    client_page(&state, &snapshot, "messages", items, &effective_query).map(Json)
+    .await
 }
 
 async fn client_messages_detail(
@@ -3652,15 +3869,10 @@ where
     T: Send + 'static,
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
-    let read_class = match crate::store::read_class() {
-        crate::store::ReadClass::Critical => crate::store::ReadClass::Critical,
-        crate::store::ReadClass::Operational => crate::store::ReadClass::Operational,
-        _ => crate::store::ReadClass::Interactive,
-    };
     let profile = crate::profile::current();
     tokio::task::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
-        crate::store::with_read_class(read_class, operation)
+        operation()
     })
     .await
     .map_err(ApiError::internal)?
@@ -3672,19 +3884,30 @@ where
     T: Send + 'static,
     F: FnOnce() -> Result<T, St3Error> + Send + 'static,
 {
-    let read_class = match crate::store::read_class() {
-        crate::store::ReadClass::Critical => crate::store::ReadClass::Critical,
-        crate::store::ReadClass::Operational => crate::store::ReadClass::Operational,
-        _ => crate::store::ReadClass::Interactive,
-    };
     let profile = crate::profile::current();
     tokio::task::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
-        crate::store::with_read_class(read_class, operation)
+        operation()
     })
     .await
     .map_err(ApiError::internal)?
     .map_err(ApiError::bad)
+}
+
+/// Run a handler's store work on a blocking thread, so a write waiting for the writer's next
+/// commit never holds an async worker that other requests need.
+async fn blocking_api<T, F>(operation: F) -> Result<T, ApiError>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Result<T, ApiError> + Send + 'static,
+{
+    let profile = crate::profile::current();
+    tokio::task::spawn_blocking(move || {
+        let _entered = crate::profile::enter(profile.as_ref());
+        operation()
+    })
+    .await
+    .map_err(ApiError::internal)?
 }
 
 pub async fn serve_unix(socket: &Path, app: Router) -> anyhow::Result<()> {
@@ -3913,12 +4136,10 @@ async fn doctor(State(state): State<AppState>) -> Result<Json<DoctorReport>, Api
         st_runtime::priority_report(&observations)
     });
     let token = crate::resource::github_token().await;
-    let mut report = tokio::task::spawn_blocking(move || {
-        crate::store::with_interactive_reads(|| doctor_report(&state))
-    })
-    .await
-    .map_err(ApiError::internal)??
-    .0;
+    let mut report = tokio::task::spawn_blocking(move || doctor_report(&state))
+        .await
+        .map_err(ApiError::internal)??
+        .0;
     if let Some(build_tools) = build_tools {
         report.checks.push(build_tools_check(
             &build_tools.await.map_err(ApiError::internal)?,
@@ -4491,7 +4712,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             driver_gaps.join("; ")
         },
     });
-    match state.store.replication_status(
+    match state.store.replication_status_sealed(
         state.fleet_id.is_some(),
         state.fleet_id.as_deref(),
         &replication_peer_names(state),
@@ -4593,7 +4814,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         Ok(Some(_)) => match (
             state
                 .store
-                .replication_status(true, state.fleet_id.as_deref(), &[]),
+                .replication_status_sealed(true, state.fleet_id.as_deref(), &[]),
             state.store.fleet_admission_residue(),
         ) {
             (Ok(holds), Ok(residue)) => {
@@ -4680,7 +4901,7 @@ async fn replication_status(
     let configured = state.fleet_id.is_some();
     let fleet = state.fleet_id.clone();
     let peers = replication_peer_names(&state);
-    blocking_store(move || store.replication_status(configured, fleet.as_deref(), &peers))
+    blocking_store(move || store.replication_status_sealed(configured, fleet.as_deref(), &peers))
         .await
         .map(Json)
 }
@@ -5036,7 +5257,7 @@ async fn fleet_publish_endpoints(
 /// The peers a node reports on: its config peers and the current listening members it dials.
 /// A dial-out member is never dialed, and an ended name is history, so neither is reported.
 fn replication_peer_names(state: &AppState) -> Vec<String> {
-    let view = state.store.fleet_view().unwrap_or_default();
+    let view = state.store.fleet_view_sealed().unwrap_or_default();
     let mut names = state
         .configured_peers
         .iter()
@@ -5113,12 +5334,12 @@ async fn fleet_status(State(state): State<AppState>) -> Result<Json<FleetStatus>
     let fleet_id = state.fleet_id.clone();
     blocking_store(move || {
         let replication =
-            store.replication_status(fleet_id.is_some(), fleet_id.as_deref(), &peers)?;
+            store.replication_status_sealed(fleet_id.is_some(), fleet_id.as_deref(), &peers)?;
         Ok(FleetStatus {
             node,
             fleet_id,
             member_key: store.member_public_key(),
-            view: store.fleet_view()?,
+            view: store.fleet_view_sealed()?,
             peers: replication.peers,
             invites: store.fleet_invites(false)?,
         })
@@ -5422,7 +5643,9 @@ async fn fleet_membership_view(
     State(state): State<AppState>,
 ) -> Result<Json<crate::fleet::FleetView>, ApiError> {
     let store = state.store.clone();
-    blocking_store(move || store.fleet_view()).await.map(Json)
+    blocking_store(move || store.fleet_view_sealed())
+        .await
+        .map(Json)
 }
 
 async fn replication_wake(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -7826,7 +8049,7 @@ async fn send_message(
     State(state): State<AppState>,
     Json(request): Json<MessageSendRequest>,
 ) -> Result<Json<MessageView>, ApiError> {
-    accept_message(&state, request, None)
+    blocking_api(move || accept_message(&state, request, None)).await
 }
 
 fn accept_message(
@@ -8123,51 +8346,55 @@ async fn post_message_claim(
             )));
         }
     };
-    let message = state
-        .store
-        .messages(None, true)
-        .map_err(ApiError::internal)?
-        .into_iter()
-        .find(|message| message.subject == subject)
-        .ok_or_else(|| ApiError::not_found(format!("message `{subject}` does not exist")))?;
-    let actor = request.actor.ok_or_else(|| {
-        ApiError::bad(St3Error::new(
-            "missing-message-actor",
-            "message lifecycle transitions require the recipient actor",
-        ))
-    })?;
-    let actor = normalize_message_party(&actor);
-    if actor != message.to {
-        return Err(ApiError::bad(St3Error::new(
-            "wrong-message-recipient",
-            format!(
-                "message `{subject}` belongs to `{}`, not `{actor}`",
-                message.to
-            ),
-        )));
-    }
-    let mut fields = BTreeMap::from([("status".into(), Value::String(request.lifecycle.clone()))]);
-    if kind == "message.staged" {
-        fields.insert("recipient".into(), Value::String(actor.clone()));
-        if let Some(transport) = request.transport {
-            fields.insert("transport".into(), Value::String(transport));
+    let store = state.store.clone();
+    let record = blocking_api(move || {
+        // One message, not every message the store has ever held: a lifecycle post read and folded
+        // the whole mailbox, a quarter second on a busy host's store, while holding up the next write.
+        let message = store
+            .message(&subject)
+            .map_err(ApiError::internal)?
+            .ok_or_else(|| ApiError::not_found(format!("message `{subject}` does not exist")))?;
+        let actor = request.actor.ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "missing-message-actor",
+                "message lifecycle transitions require the recipient actor",
+            ))
+        })?;
+        let actor = normalize_message_party(&actor);
+        if actor != message.to {
+            return Err(ApiError::bad(St3Error::new(
+                "wrong-message-recipient",
+                format!(
+                    "message `{subject}` belongs to `{}`, not `{actor}`",
+                    message.to
+                ),
+            )));
         }
-        if let Some(runtime_id) = request.runtime_id {
-            fields.insert("runtime_id".into(), Value::String(runtime_id));
+        let mut fields =
+            BTreeMap::from([("status".into(), Value::String(request.lifecycle.clone()))]);
+        if kind == "message.staged" {
+            fields.insert("recipient".into(), Value::String(actor.clone()));
+            if let Some(transport) = request.transport {
+                fields.insert("transport".into(), Value::String(transport));
+            }
+            if let Some(runtime_id) = request.runtime_id {
+                fields.insert("runtime_id".into(), Value::String(runtime_id));
+            }
         }
-    }
-    let record = state
-        .store
-        .append_claim(&ClaimInput {
-            subject,
-            kind: kind.into(),
-            actor: Some(actor),
-            fields,
-            evidence: request.evidence,
-            expected_subject: request.expected_subject,
-            idempotency_key: Some(request.idempotency_key),
-        })
-        .map_err(ApiError::bad)?;
+        let record = store
+            .append_claim(&ClaimInput {
+                subject,
+                kind: kind.into(),
+                actor: Some(actor),
+                fields,
+                evidence: request.evidence,
+                expected_subject: request.expected_subject,
+                idempotency_key: Some(request.idempotency_key),
+            })
+            .map_err(ApiError::bad)?;
+        Ok(record)
+    })
+    .await?;
     signal_changed(&state);
     Ok(Json(record))
 }
@@ -8942,10 +9169,22 @@ async fn list_work(
 ) -> Result<Json<Vec<StepRunView>>, ApiError> {
     let store = state.store.clone();
     let (mut work, desired) = blocking_store(move || {
-        Ok((
-            store.work(query.actor.as_deref(), query.include_terminal)?,
-            store.desired_subjects()?,
-        ))
+        let work = store.work(query.actor.as_deref(), query.include_terminal)?;
+        // Only the agents these steps name, not every subject the fleet has ever declared.
+        let actors = work
+            .iter()
+            .flat_map(|step| {
+                step.claimant
+                    .iter()
+                    .chain(step.assigned_to.iter())
+                    .chain(step.available_to.iter())
+                    .cloned()
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        let desired = store.desired_subjects_named(&actors)?;
+        Ok((work, desired))
     })
     .await?;
     let agents = desired
@@ -9030,10 +9269,8 @@ async fn wake_work(
     {
         let message = state
             .store
-            .messages(None, true)
+            .message(&existing.subject)
             .map_err(ApiError::internal)?
-            .into_iter()
-            .find(|message| message.subject == existing.subject)
             .ok_or_else(|| ApiError::internal("the wake operation message is unavailable"))?;
         return Ok(Json(message));
     }
@@ -11193,7 +11430,7 @@ mod tests {
         let store = state.store.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
-            store.hold_interactive_read_connections_for_test(|| {
+            store.hold_read_connections_for_test(|| {
                 ready_tx.send(()).unwrap();
                 std::thread::sleep(Duration::from_millis(500));
             });
@@ -11230,7 +11467,7 @@ mod tests {
         let store = state.store.clone();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let holder = std::thread::spawn(move || {
-            store.hold_interactive_read_connections_for_test(|| {
+            store.hold_read_connections_for_test(|| {
                 ready_tx.send(()).unwrap();
                 std::thread::sleep(Duration::from_millis(500));
             });
@@ -11268,7 +11505,7 @@ mod tests {
         let store = state.store.clone();
         let (read_ready_tx, read_ready_rx) = std::sync::mpsc::channel();
         let read_holder = std::thread::spawn(move || {
-            store.hold_interactive_read_connections_for_test(|| {
+            store.hold_read_connections_for_test(|| {
                 read_ready_tx.send(()).unwrap();
                 std::thread::sleep(Duration::from_secs(30));
             });
@@ -11300,6 +11537,191 @@ mod tests {
         }
         read_holder.join().unwrap();
         write_holder.join().unwrap();
+    }
+
+    fn probe_claim(key: &str, state: &str) -> ClaimInput {
+        ClaimInput {
+            subject: "agent/probe".into(),
+            kind: "harness.observed".into(),
+            actor: Some("agent/probe".into()),
+            fields: BTreeMap::from([("state".into(), Value::String(state.into()))]),
+            evidence: Vec::new(),
+            expected_subject: None,
+            idempotency_key: Some(key.into()),
+        }
+    }
+
+    /// A page whose read a commit lands in, as another thread commits it midway.
+    async fn page_read_across_a_commit(
+        State(state): State<AppState>,
+        Extension(snapshot): Extension<ClientSnapshot>,
+        Query(query): Query<ClientListQuery>,
+    ) -> Result<ClientPageResponse, ApiError> {
+        client_snapshot_page(&state, snapshot, "probes", &query, |state, snapshot| {
+            let newest = |store: &Store| -> anyhow::Result<u64> {
+                Ok(store
+                    .claims_page(None, None, 0, None, true, 1)?
+                    .claims
+                    .first()
+                    .map_or(0, |claim| claim.store_index))
+            };
+            let before = newest(&state.store)?;
+            let store = state.store.clone();
+            std::thread::spawn(move || store.append_claim(&probe_claim("during", "working")))
+                .join()
+                .unwrap()?;
+            anyhow::ensure!(state.store.index()? > snapshot.store_index);
+            Ok(vec![json!({
+                "id": "probe/page",
+                "read_at": snapshot.store_index,
+                "before": before,
+                "after": newest(&state.store)?,
+            })])
+        })
+        .await
+    }
+
+    /// A first page reads inside one snapshot: a commit that lands while it reads neither tears
+    /// it nor refuses it, and the envelope names the snapshot the page was read in.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_first_page_answers_from_its_snapshot_when_a_commit_lands_during_it() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        // A file store, as the daemon runs: in shared-cache memory a reader locks writers out.
+        state.store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), "node").unwrap());
+        state
+            .store
+            .append_claim(&probe_claim("first", "idle"))
+            .unwrap();
+        let admitted_at = state.store.index().unwrap();
+        // A page read at the store's first claim names that snapshot, not the newer one the
+        // request was admitted at.
+        async fn page_read_earlier(
+            State(state): State<AppState>,
+            Query(query): Query<ClientListQuery>,
+        ) -> Result<ClientPageResponse, ApiError> {
+            let snapshot = client_snapshot_at(&state, 1);
+            let page = client_page_read(&state, &snapshot, "earlier", Vec::new(), &query, true)?;
+            Ok((Extension(snapshot), Json(page)))
+        }
+        let app = Router::new()
+            .route("/v1/client/probes", get(page_read_across_a_commit))
+            .route("/v1/client/earlier", get(page_read_earlier))
+            .layer(from_fn_with_state(
+                (state.clone(), ClientTransportBoundary::Unix),
+                response_envelope,
+            ))
+            .with_state(state.clone());
+        let envelope = |path: &'static str| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                (status, serde_json::from_slice::<Value>(&bytes).unwrap())
+            }
+        };
+        let (status, page) = envelope("/v1/client/probes").await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        let item = &page["value"]["items"][0];
+        assert_eq!(item["read_at"], admitted_at);
+        assert_eq!(page["snapshot"]["store_index"], admitted_at);
+        // The page saw neither the claim committed while it read nor anything after its snapshot.
+        assert_eq!(item["before"], admitted_at);
+        assert_eq!(item["after"], admitted_at);
+        assert!(state.store.index().unwrap() > admitted_at);
+
+        state
+            .store
+            .append_claim(&probe_claim("second", "idle"))
+            .unwrap();
+        let (status, page) = envelope("/v1/client/earlier").await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["snapshot"], json!(client_snapshot_at(&state, 1)));
+    }
+
+    /// A seat's mailbox poll, one subject's status, a client's admission, and replication and
+    /// fleet status each open a read connection of their own. They answer while the writer is
+    /// held, more reads than the pool keeps idle are held, and long snapshots run.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn small_reads_answer_while_the_writer_and_long_reads_are_held() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.store = Arc::new(Store::open(&root.path().join("claims.sqlite3"), "node").unwrap());
+        // A local batch that no exchange has sealed yet: sealing it would need the writer.
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "agent/probe".into(),
+                kind: "harness.observed".into(),
+                actor: Some("agent/probe".into()),
+                fields: BTreeMap::from([("state".into(), Value::String("idle".into()))]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let hold = Duration::from_secs(5);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let mut holders = Vec::new();
+        let store = state.store.clone();
+        let ready = ready_tx.clone();
+        holders.push(std::thread::spawn(move || {
+            store.hold_write_transaction_for_test(|| {
+                ready.send(()).unwrap();
+                std::thread::sleep(hold);
+            });
+        }));
+        let store = state.store.clone();
+        let ready = ready_tx.clone();
+        holders.push(std::thread::spawn(move || {
+            store.hold_read_connections_for_test(|| {
+                ready.send(()).unwrap();
+                std::thread::sleep(hold);
+            });
+        }));
+        for _ in 0..8 {
+            let (store, ready) = (state.store.clone(), ready_tx.clone());
+            holders.push(std::thread::spawn(move || {
+                store
+                    .read_snapshot(|_| {
+                        ready.send(()).unwrap();
+                        std::thread::sleep(hold);
+                        Ok(())
+                    })
+                    .unwrap();
+            }));
+        }
+        for _ in 0..holders.len() {
+            ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+
+        let app = router(state);
+        for path in [
+            "/v1/messages/page?include_closed=false&limit=100&to=agent%2Fprobe",
+            "/v1/status?subject=agent%2Fprobe",
+            "/v1/client/now",
+            "/v1/replication/status",
+            "/v1/internal/fleet/membership",
+            "/v1/client/operations",
+        ] {
+            let started = Instant::now();
+            let response =
+                tokio::time::timeout(Duration::from_millis(250), get_request(app.clone(), path))
+                    .await;
+            assert!(
+                response.is_ok(),
+                "{path} waited {:?} behind the writer or other reads",
+                started.elapsed()
+            );
+            assert_eq!(response.unwrap().0, StatusCode::OK, "{path}");
+        }
+        for holder in holders {
+            holder.join().unwrap();
+        }
     }
 
     #[test]
@@ -13626,6 +14048,197 @@ mission "visible-agentless" state="ready" {
             .unwrap()
             .is_empty()
         );
+    }
+
+    /// A work item is the resource the work history lists for it, read without enriching every
+    /// other step the store has run.
+    #[test]
+    fn a_work_item_reads_only_its_own_step() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let state = state(root.path());
+        let kdl = r#"version 2
+mission "many-runs" state="ready" {
+  goal "Run often."
+  concurrent-runs max=100
+  step "build" { assigned-to "agent/builder" }
+  step "watch" { agentless }
+}"#;
+        let intent = parse_intent(kdl, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "many-runs")
+            .unwrap();
+        for run in 0..8 {
+            state
+                .store
+                .create_mission_run(&MissionRunRequest {
+                    mission: "many-runs".into(),
+                    revision: None,
+                    workspace: workspace.display().to_string(),
+                    requester: Some("person/operator".into()),
+                    mode: None,
+                    inputs: BTreeMap::new(),
+                    idempotency_key: format!("many-runs-{run}"),
+                })
+                .unwrap();
+        }
+        let (now, index) = (client_now_ms(), state.store.index().unwrap());
+        let history = client_work_resources(&state.store, None, true, now, index).unwrap();
+        assert_eq!(history.len(), 16);
+        for item in &history {
+            let id = item["id"].as_str().unwrap();
+            let detail = client_work_item(&state.store, id, None, now, index)
+                .unwrap()
+                .unwrap();
+            assert_eq!(&detail, item, "{id}");
+        }
+        let id = history[0]["id"].as_str().unwrap();
+        crate::store::STEPS_ENRICHED.with(|enriched| enriched.set(0));
+        client_work_item(&state.store, id, None, now, index).unwrap();
+        assert_eq!(crate::store::STEPS_ENRICHED.with(std::cell::Cell::get), 1);
+        let (assigned, assignee) = history
+            .iter()
+            .find_map(|item| Some((item["id"].as_str()?, item["assigned_to"].as_str()?)))
+            .unwrap();
+        assert!(
+            client_work_item(&state.store, assigned, Some("agent/other"), now, index)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            client_work_item(&state.store, assigned, Some(assignee), now, index)
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            client_work_item(&state.store, "step-run/none/build", None, now, index)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// Each page of the work history is that page of the whole history, for every reader, and
+    /// reading it enriches only the steps it shows.
+    #[test]
+    fn work_history_pages_read_only_what_they_show() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let state = state(root.path());
+        let kdl = r#"version 2
+mission "paged" state="ready" {
+  goal "Run often."
+  concurrent-runs max=100
+  step "build" { assigned-to "agent/builder" }
+  step "watch" { agentless }
+}"#;
+        let intent = parse_intent(kdl, "node").unwrap();
+        let preview = state
+            .store
+            .mission(
+                &intent,
+                crate::model::IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        state
+            .store
+            .apply(&intent, &preview.subject_tokens, "paged")
+            .unwrap();
+        let (mut builds, mut builder) = (Vec::new(), String::new());
+        for run in 0..6 {
+            let view = state
+                .store
+                .create_mission_run(&MissionRunRequest {
+                    mission: "paged".into(),
+                    revision: None,
+                    workspace: workspace.display().to_string(),
+                    requester: Some("person/operator".into()),
+                    mode: None,
+                    inputs: BTreeMap::new(),
+                    idempotency_key: format!("paged-{run}"),
+                })
+                .unwrap();
+            let build = view.steps.iter().find(|step| step.step == "build").unwrap();
+            builder = build
+                .assigned_to
+                .clone()
+                .expect("the build step is assigned");
+            builds.push(build.subject.clone());
+        }
+        // Two builds change after the rest, so the history's newest-first order differs
+        // from the order the steps were made in; the builder claims the first.
+        for build in [&builds[4], &builds[0]] {
+            state.store.set_step_state(build, "ready", None).unwrap();
+        }
+        state
+            .store
+            .work_action(
+                &builds[0],
+                "claim",
+                &crate::model::WorkRequest {
+                    actor: Some(builder.clone()),
+                    incarnation: Some("builder-1".into()),
+                    summary: None,
+                    reason: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "claim-paged".into(),
+                },
+            )
+            .unwrap();
+        let (now, index) = (client_now_ms(), state.store.index().unwrap());
+        let bare = builder.strip_prefix("agent/").unwrap();
+        for actor in [
+            None,
+            Some(builder.as_str()),
+            Some(bare),
+            Some("agent/other"),
+        ] {
+            let whole = client_work_resources(&state.store, actor, true, now, index).unwrap();
+            assert_eq!(
+                whole.len(),
+                match actor {
+                    None => 12,
+                    Some("agent/other") => 0,
+                    Some(_) => 6,
+                },
+                "{actor:?}"
+            );
+            for limit in [1, 4, 5, 12, 50] {
+                let mut offset = 0;
+                loop {
+                    let (page, has_more) =
+                        client_work_history_page(&state.store, actor, now, index, offset, limit)
+                            .unwrap();
+                    let end = (offset + limit).min(whole.len());
+                    assert_eq!(page, whole[offset..end], "{actor:?} {limit} {offset}");
+                    assert_eq!(has_more, end < whole.len(), "{actor:?} {limit} {offset}");
+                    offset = end;
+                    if !has_more {
+                        break;
+                    }
+                }
+            }
+        }
+        crate::store::STEPS_ENRICHED.with(|enriched| enriched.set(0));
+        let (page, has_more) =
+            client_work_history_page(&state.store, None, now, index, 4, 3).unwrap();
+        assert_eq!((page.len(), has_more), (3, true));
+        assert_eq!(crate::store::STEPS_ENRICHED.with(std::cell::Cell::get), 3);
     }
 
     #[tokio::test]

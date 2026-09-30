@@ -7,6 +7,7 @@ mod client_v0_cli;
 mod client_v0_contract;
 mod command_recorder;
 mod convergence;
+mod daemon_bench;
 mod daemon_environment;
 mod daemon_restart;
 mod examples;

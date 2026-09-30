@@ -3407,6 +3407,37 @@ fn run_recorder(command: RecorderCommand, config: &Config, json_output: bool) ->
     }
 }
 
+/// Every read that runs at once has a SQLite connection of its own, a few open files each, and
+/// every seat and client holds a socket. Raise the soft open file limit, which is often 1024,
+/// toward the hard one, so a burst of requests cannot run out of descriptors. Children inherit
+/// it, so it stays modest.
+fn raise_open_file_limit() {
+    let mut limit = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit fills the rlimit it is given.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } != 0 {
+        return;
+    }
+    let wanted = limit.rlim_max.min(8_192);
+    if wanted <= limit.rlim_cur {
+        return;
+    }
+    let raised = libc::rlimit {
+        rlim_cur: wanted,
+        rlim_max: limit.rlim_max,
+    };
+    // SAFETY: setrlimit only reads the rlimit it is given.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+        eprintln!(
+            "st3: could not raise the open file limit from {}: {}",
+            limit.rlim_cur,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 async fn run_up(args: UpArgs) -> Result<()> {
     let mut config = Config::load_unvalidated(args.config.as_deref())?;
     if let Some(node) = args.node {
@@ -3445,6 +3476,7 @@ async fn run_up(args: UpArgs) -> Result<()> {
     )?;
     fs::create_dir_all(&config.state_dir)?;
     st3::profile::init_from_env();
+    raise_open_file_limit();
     let store = Arc::new(st3::profile::task("startup open-store", || {
         Store::open(&config.state_dir.join("claims.sqlite3"), &config.node)
     })?);
@@ -3547,6 +3579,21 @@ async fn run_up(args: UpArgs) -> Result<()> {
         recorder.map(|installation| installation.directory),
     )?);
     tokio::spawn(reconciler.supervise());
+    // A start no longer rebuilds the operation projection; check it once the API serves.
+    tokio::spawn({
+        let store = store.clone();
+        async move {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            match tokio::task::spawn_blocking(move || store.repair_operation_projection_drift())
+                .await
+            {
+                Ok(Ok(true)) => eprintln!("st3: rebuilt an operation projection that drifted"),
+                Ok(Ok(false)) => {}
+                Ok(Err(error)) => eprintln!("st3: operation projection check failed: {error:#}"),
+                Err(error) => eprintln!("st3: operation projection check stopped: {error}"),
+            }
+        }
+    });
     tokio::spawn(st3::profile::watch_runtime_lag());
     tokio::spawn(trim_local_observations(
         store.clone(),
