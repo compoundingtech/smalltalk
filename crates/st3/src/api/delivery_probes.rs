@@ -49,6 +49,7 @@ pub(super) fn check(
     let seen = |member: &str| -> anyhow::Result<bool> {
         Ok(member == store.origin()
             || !peers.iter().any(|peer| peer == member)
+            || store.replication_peer_refusal(member)?.is_some()
             || store
                 .replication_peer_last_success(member)?
                 .is_some_and(|at| now.saturating_sub(at) < STALE_MS))
@@ -90,6 +91,11 @@ pub(super) fn check(
         .flat_map(|report| report.members.iter().cloned())
         .collect::<BTreeSet<_>>();
     for member in &members {
+        if let Some(reason) = store.replication_peer_refusal(member)? {
+            notes.push(format!(
+                "{member}: {reason}; checking end-to-end delivery through other members"
+            ));
+        }
         if !seen(member)? {
             notes.push(format!("{member}: last seen; waiting for an exchange"));
             continue;
@@ -306,6 +312,29 @@ mod tests {
         assert_eq!(report.status, "pass");
         assert!(report.message.contains("last seen"));
         assert!(!report.message.contains("deadline"));
+    }
+
+    #[test]
+    fn a_refused_direct_route_checks_real_indirect_reads_without_warning_for_the_refusal() {
+        let store = Store::open_memory("amber").unwrap();
+        put(&store, "amber", 2000, "read", 400);
+        put(&store, "cobalt", 2000, "read", 600);
+        store
+            .record_peer_failure(
+                "cobalt",
+                "refused",
+                "refused by that member's Fabric grants; using other members",
+            )
+            .unwrap();
+        let good = check(&store, 2000, &["cobalt".into()]).unwrap().unwrap();
+        assert_eq!(good.status, "pass");
+        assert!(good.message.contains("Fabric grants"));
+        assert!(good.message.contains("amber → cobalt: read in 400ms"));
+        put(&store, "amber", 100_000, "overdue", 61_000);
+        put(&store, "cobalt", 100_000, "read", 600);
+        let overdue = check(&store, 100_000, &["cobalt".into()]).unwrap().unwrap();
+        assert_eq!(overdue.status, "warn");
+        assert!(overdue.message.contains("no read within the deadline"));
     }
 
     #[test]

@@ -3322,7 +3322,7 @@ pub fn surface_crash_loop(catalog_root: &Path, this_host: &str, cl: &CrashLoop) 
 /// Best-effort detection of this machine's short hostname (the catalog's host segment), used as the
 /// default reconcile host filter. Falls back to `localhost` if it can't be determined.
 pub fn detect_host() -> String {
-    // `hostname` is ubiquitous; take the first dotted label (short name, e.g. `hetz`).
+    // `hostname` is ubiquitous; take the first dotted label (short name, e.g. `example-linux`).
     if let Ok(out) = Command::new("hostname").output()
         && out.status.success()
     {

@@ -58,7 +58,7 @@
     },
     {
       "pid": 1505285,
-      "argv": "<home>/.nvm/versions/node/v24.18.0/bin/node <repo>/scripts/st3-messaging-faults-eval/provider.mjs --session-dir <eval-root>/cobalt/state/drivers/61ab2a675dbbb8b48329718b/catalog/agents/cobalt/54bf4d98c9bfd281/provider-sessions -e <eval-root>/cobalt/home/state/st2/hooks/sets/sha256-ef4ff47692eb36ae89c46c4d40b734055aff96e6e29c4b81989041cac133b17c/omp-channel.ts ",
+      "argv": "<home>/.nvm/versions/node/v24.18.0/bin/node <repo>/scripts/st3-messaging-faults-eval/provider.mjs --session-dir <eval-root>/cobalt/state/drivers/61ab2a675dbbb8b48329718b/catalog/agents/cobalt/54bf4d98c9bfd281/provider-sessions -e <eval-root>/cobalt/home/example/st2/hooks/sets/sha256-ef4ff47692eb36ae89c46c4d40b734055aff96e6e29c4b81989041cac133b17c/omp-channel.ts ",
       "image": "<home>/.nvm/versions/node/v24.18.0/bin/node"
     },
     {

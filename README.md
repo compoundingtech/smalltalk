@@ -123,6 +123,10 @@ log.
 
 If the state directory has a long path, set `XDG_RUNTIME_DIR` to a shorter directory or pass
 `--socket` and `--client-gateway-socket` to `st up` so both Unix socket paths fit the OS limit.
+When `st up` receives a private `--state-dir` or `--socket` without an explicit
+`--client-gateway-socket`, its paired gateway is placed beside that private socket (or
+in the private state directory when no socket is specified). An existing live listener
+at either socket path is never replaced; choose a different path instead.
 
 ## Run st on more than one machine
 
@@ -203,7 +207,7 @@ st agents start example/worker --harness claude --model claude-sonnet-5 --effort
 ```kdl
 version 2
 agent "example/worker" {
-    workspace "/home/ada/src/garden"
+    workspace "/home/example/src/garden"
     restart always
     harness claude {
         model claude-sonnet-5

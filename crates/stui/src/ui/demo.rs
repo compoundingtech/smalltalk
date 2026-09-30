@@ -13,16 +13,16 @@ fn s(text: &str) -> String {
 pub fn world() -> World {
     let mut conversations = BTreeMap::new();
     conversations.insert(
-        s("agent/fleet/atlas/builder"),
+        s("agent/example/atlas/builder"),
         Load::Ready(atlas_conversation()),
     );
-    conversations.insert(s("agent/fleet/cos"), Load::Ready(cos_conversation()));
+    conversations.insert(s("agent/example/cos"), Load::Ready(cos_conversation()));
     conversations.insert(
-        s("agent/fleet/docs/writer"),
+        s("agent/example/docs/writer"),
         Load::Ready(docs_conversation()),
     );
     conversations.insert(
-        s("agent/fleet/harbor/reviewer"),
+        s("agent/example/harbor/reviewer"),
         Load::Ready(vec![
             Entry {
                 id: s("h1"),
@@ -39,13 +39,13 @@ pub fn world() -> World {
         ]),
     );
     for (id, text) in [
-        ("agent/fleet/release/captain", "Tagging the weekly release."),
+        ("agent/example/release/captain", "Tagging the weekly release."),
         (
-            "agent/fleet/rekey/worker",
+            "agent/example/rekey/worker",
             "Inventory done: 5 signing keys, 3 services read them.",
         ),
         (
-            "agent/fleet/pi/sketcher",
+            "agent/example/pi/sketcher",
             "Sketched three layouts for the settings screen; they are in ~/src/sketches.",
         ),
     ] {
@@ -58,7 +58,7 @@ pub fn world() -> World {
             }]),
         );
     }
-    conversations.insert(s("agent/fleet/atlas/indexer"), Load::Ready(vec![]));
+    conversations.insert(s("agent/example/atlas/indexer"), Load::Ready(vec![]));
     conversations.insert(s("session/unmanaged-1"), Load::Failed(s(
         "This codex process was found running on lark, but st cannot tell which session file it writes, so there is no conversation to show. Start it through st to see it here.",
     )));
@@ -120,7 +120,7 @@ fn attention() -> Vec<Attention> {
             waiting: Some(s("Atlas Builder on harbor")),
             age: s("33m"),
             mission: Some(s("mission/fleet/atlas/store-move")),
-            agent: Some(s("agent/fleet/atlas/builder")),
+            agent: Some(s("agent/example/atlas/builder")),
             actions: vec![],
             related: vec![],
             raised_by: None,
@@ -152,7 +152,7 @@ fn attention() -> Vec<Attention> {
             waiting: Some(s("Docs Writer on harbor")),
             age: s("12m"),
             mission: Some(s("mission/fleet/site/pricing-page")),
-            agent: Some(s("agent/fleet/docs/writer")),
+            agent: Some(s("agent/example/docs/writer")),
             actions: vec![],
             related: vec![],
             raised_by: None,
@@ -180,7 +180,7 @@ fn attention() -> Vec<Attention> {
             waiting: Some(s("Planner on lark")),
             age: s("1h"),
             mission: None,
-            agent: Some(s("agent/fleet/planner")),
+            agent: Some(s("agent/example/planner")),
             actions: vec![],
             related: vec![],
             raised_by: None,
@@ -242,7 +242,7 @@ fn attention() -> Vec<Attention> {
             waiting: None,
             age: s("8m"),
             mission: Some(s("mission/fleet/release/weekly")),
-            agent: Some(s("agent/fleet/release/captain")),
+            agent: Some(s("agent/example/release/captain")),
             actions: vec![],
             related: vec![],
             raised_by: None,
@@ -264,7 +264,7 @@ fn attention() -> Vec<Attention> {
             waiting: Some(s("Rekey Worker on harbor")),
             age: s("19m"),
             mission: Some(s("mission/fleet/rekey")),
-            agent: Some(s("agent/fleet/rekey/worker")),
+            agent: Some(s("agent/example/rekey/worker")),
             actions: vec![],
             related: vec![],
             raised_by: None,
@@ -291,7 +291,7 @@ fn attention() -> Vec<Attention> {
             waiting: None,
             age: s("2h"),
             mission: None,
-            agent: Some(s("agent/fleet/cos")),
+            agent: Some(s("agent/example/cos")),
             actions: vec![],
             related: vec![],
             raised_by: None,
@@ -336,7 +336,7 @@ fn agent(
 fn agents() -> Vec<Agent> {
     let mut list = vec![
         agent(
-            "agent/fleet/atlas/builder",
+            "agent/example/atlas/builder",
             "Atlas Builder",
             Harness::Claude,
             AgentState::NeedsYou,
@@ -346,7 +346,7 @@ fn agents() -> Vec<Agent> {
             "33m",
         ),
         agent(
-            "agent/fleet/docs/writer",
+            "agent/example/docs/writer",
             "Docs Writer",
             Harness::Claude,
             AgentState::NeedsYou,
@@ -356,7 +356,7 @@ fn agents() -> Vec<Agent> {
             "12m",
         ),
         agent(
-            "agent/fleet/release/captain",
+            "agent/example/release/captain",
             "Release Captain",
             Harness::Codex,
             AgentState::Fault,
@@ -366,7 +366,7 @@ fn agents() -> Vec<Agent> {
             "8m",
         ),
         agent(
-            "agent/fleet/cos",
+            "agent/example/cos",
             "Chief of Staff",
             Harness::Claude,
             AgentState::Working,
@@ -376,7 +376,7 @@ fn agents() -> Vec<Agent> {
             "now",
         ),
         agent(
-            "agent/fleet/harbor/reviewer",
+            "agent/example/harbor/reviewer",
             "Harbor Reviewer",
             Harness::Claude,
             AgentState::Working,
@@ -386,7 +386,7 @@ fn agents() -> Vec<Agent> {
             "1m",
         ),
         agent(
-            "agent/fleet/rekey/worker",
+            "agent/example/rekey/worker",
             "Rekey Worker",
             Harness::Omp,
             AgentState::Idle,
@@ -396,7 +396,7 @@ fn agents() -> Vec<Agent> {
             "19m",
         ),
         agent(
-            "agent/fleet/pi/sketcher",
+            "agent/example/pi/sketcher",
             "Sketcher",
             Harness::Pi,
             AgentState::Idle,
@@ -406,7 +406,7 @@ fn agents() -> Vec<Agent> {
             "3h",
         ),
         agent(
-            "agent/fleet/atlas/indexer",
+            "agent/example/atlas/indexer",
             "Atlas Indexer",
             Harness::Codex,
             AgentState::Stopped,
@@ -417,7 +417,7 @@ fn agents() -> Vec<Agent> {
         ),
     ];
     list.push(agent(
-        "agent/fleet/planner",
+        "agent/example/planner",
         "Planner",
         Harness::Claude,
         AgentState::NeedsYou,
@@ -426,7 +426,7 @@ fn agents() -> Vec<Agent> {
         None,
         "1h",
     ));
-    list[4].parent = Some(s("agent/fleet/cos"));
+    list[4].parent = Some(s("agent/example/cos"));
     list.push(Agent {
         id: s("session/unmanaged-1"),
         name: s("codex in ~/src/scratch"),
@@ -530,14 +530,14 @@ mission "fleet/atlas/store-move" state="ready" {
   goal "Leave the old store readable until a person says otherwise."
   constraint "Never write to the old store."
 
-  step "snapshot" { assigned-to "agent/fleet/atlas/builder" }
+  step "snapshot" { assigned-to "agent/example/atlas/builder" }
   step "convert" {
-    assigned-to "agent/fleet/atlas/builder"
+    assigned-to "agent/example/atlas/builder"
     depends-on { step "snapshot" completed }
     gate "conversion-check" { exec "atlas-cli check --converted" }
   }
   step "compare" {
-    assigned-to "agent/fleet/atlas/builder"
+    assigned-to "agent/example/atlas/builder"
     depends-on { step "convert" completed }
   }
   step "cut-over" {
@@ -550,7 +550,7 @@ mission "fleet/atlas/store-move" state="ready" {
     }
   }
   step "cleanup" {
-    assigned-to "agent/fleet/atlas/builder"
+    assigned-to "agent/example/atlas/builder"
     depends-on { step "cut-over" completed }
   }
 }
@@ -640,7 +640,7 @@ fn all_missions() -> Vec<Mission> {
                     None,
                 ),
             ],
-            agents: vec![s("agent/fleet/atlas/builder")],
+            agents: vec![s("agent/example/atlas/builder")],
             decision: Some(s("attention/1")),
             worktree: Some(s("~/src/atlas--store-move")),
             parent: None,
@@ -673,7 +673,7 @@ fn all_missions() -> Vec<Mission> {
                     None,
                 ),
             ],
-            agents: vec![s("agent/fleet/docs/writer")],
+            agents: vec![s("agent/example/docs/writer")],
             decision: Some(s("attention/2")),
             worktree: Some(s("~/src/site--pricing")),
             parent: None,
@@ -714,7 +714,7 @@ fn all_missions() -> Vec<Mission> {
                     None,
                 ),
             ],
-            agents: vec![s("agent/fleet/release/captain")],
+            agents: vec![s("agent/example/release/captain")],
             decision: None,
             worktree: Some(s("~/src/atlas")),
             parent: None,
@@ -747,7 +747,7 @@ fn all_missions() -> Vec<Mission> {
                     None,
                 ),
             ],
-            agents: vec![s("agent/fleet/harbor/reviewer")],
+            agents: vec![s("agent/example/harbor/reviewer")],
             decision: None,
             worktree: Some(s("~/src/harbor--review-218")),
             parent: None,
@@ -790,7 +790,7 @@ fn all_missions() -> Vec<Mission> {
                     None,
                 ),
             ],
-            agents: vec![s("agent/fleet/rekey/worker")],
+            agents: vec![s("agent/example/rekey/worker")],
             decision: None,
             worktree: Some(s("~/src/harbor")),
             parent: None,
@@ -815,7 +815,7 @@ fn all_missions() -> Vec<Mission> {
                 "2h",
                 Some("standing; wakes on merged changes"),
             )],
-            agents: vec![s("agent/fleet/docs/writer")],
+            agents: vec![s("agent/example/docs/writer")],
             decision: None,
             worktree: None,
             parent: None,
@@ -923,7 +923,7 @@ fn worktrees() -> Vec<Worktree> {
             7,
             0,
             0,
-            &["agent/fleet/atlas/builder"],
+            &["agent/example/atlas/builder"],
             &["mission/fleet/atlas/store-move"],
         ),
         tree(
@@ -933,7 +933,7 @@ fn worktrees() -> Vec<Worktree> {
             2,
             1,
             3,
-            &["agent/fleet/docs/writer"],
+            &["agent/example/docs/writer"],
             &["mission/fleet/site/pricing-page"],
         ),
         tree(
@@ -943,7 +943,7 @@ fn worktrees() -> Vec<Worktree> {
             0,
             0,
             0,
-            &["agent/fleet/harbor/reviewer"],
+            &["agent/example/harbor/reviewer"],
             &["mission/fleet/harbor/pull-request-review"],
         ),
         tree(
@@ -953,7 +953,7 @@ fn worktrees() -> Vec<Worktree> {
             0,
             3,
             0,
-            &["agent/fleet/rekey/worker"],
+            &["agent/example/rekey/worker"],
             &["mission/fleet/rekey"],
         ),
         tree(
@@ -963,7 +963,7 @@ fn worktrees() -> Vec<Worktree> {
             0,
             0,
             1,
-            &["agent/fleet/release/captain"],
+            &["agent/example/release/captain"],
             &["mission/fleet/release/weekly"],
         ),
         tree(
@@ -973,7 +973,7 @@ fn worktrees() -> Vec<Worktree> {
             0,
             0,
             5,
-            &["agent/fleet/pi/sketcher"],
+            &["agent/example/pi/sketcher"],
             &[],
         ),
         tree(
