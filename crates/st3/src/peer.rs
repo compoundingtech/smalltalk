@@ -6081,6 +6081,7 @@ mod retry_tests {
             }
         }).await.expect("a refused Fabric route must not block the HTTP fallback");
         // A changed membership route is usable immediately, despite the grant cooldown.
+        let before_route_change = stores[1].replication_peer_last_success("cobalt").unwrap();
         std::fs::write(&grant, addresses[2].to_string()).unwrap();
         routes[2].send_replace(vec![Route::Fabric {
             node: "cobalt-new-route".into(),
@@ -6094,6 +6095,7 @@ mod retry_tests {
                     .peers[0]
                     .status
                     == "up"
+                    && stores[1].replication_peer_last_success("cobalt").unwrap() > before_route_change
                 {
                     return;
                 }
