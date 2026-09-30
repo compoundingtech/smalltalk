@@ -3,4 +3,4 @@
 # the last attempt even when the other tests all pass.
 [[profile.default.overrides]]
 filter = 'package(st3) and test(messages_recover_across_transport_and_process_faults)'
-priority = 200
+priority = 100
