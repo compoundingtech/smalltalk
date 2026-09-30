@@ -558,7 +558,7 @@ fn dead(id: &str) -> Session {
     }
 }
 
-const HOST: &str = "hetz";
+const HOST: &str = "example-linux";
 
 #[test]
 fn fresh_service_launches_all_tasks_pty_and_exec() {
@@ -569,14 +569,14 @@ fn fresh_service_launches_all_tasks_pty_and_exec() {
             task(
                 TaskKind::Pty,
                 "agent",
-                Some("hetz.st2-claude"),
+                Some("example-linux.st2-claude"),
                 Some("exec claude 'boot'"),
             ),
             task(
                 TaskKind::Exec,
                 "ding",
-                Some("hetz.st2.ding"),
-                Some("st2 ding hetz.st2"),
+                Some("example-linux.st2.ding"),
+                Some("st2 ding example-linux.st2"),
             ),
         ],
     )];
@@ -594,11 +594,11 @@ fn all_tasks_live_is_adopted() {
         "a",
         Some(HOST),
         vec![
-            task(TaskKind::Pty, "agent", Some("hetz.a"), Some("x")),
-            task(TaskKind::Exec, "ding", Some("hetz.a.ding"), Some("y")),
+            task(TaskKind::Pty, "agent", Some("example-linux.a"), Some("x")),
+            task(TaskKind::Exec, "ding", Some("example-linux.a.ding"), Some("y")),
         ],
     )];
-    let sessions = vec![live("hetz.a"), live("hetz.a.ding")];
+    let sessions = vec![live("example-linux.a"), live("example-linux.a.ding")];
     let plan = reconcile(&specs, &sessions, HOST);
     assert!(plan.launch.is_empty());
     assert_eq!(plan.adopt.len(), 1);
@@ -610,11 +610,11 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
         "worker",
         Some(HOST),
         vec![
-            task(TaskKind::Pty, "agent", Some("hetz.worker"), Some("codex")),
+            task(TaskKind::Pty, "agent", Some("example-linux.worker"), Some("codex")),
             task(
                 TaskKind::Pty,
                 "shell",
-                Some("hetz.worker.shell"),
+                Some("example-linux.worker.shell"),
                 Some("sh"),
             ),
         ],
@@ -624,7 +624,7 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
     let specs = [owner];
     let plan = reconcile(
         &specs,
-        &[live("hetz.worker"), live("hetz.worker.shell")],
+        &[live("example-linux.worker"), live("example-linux.worker.shell")],
         HOST,
     );
 
@@ -635,7 +635,7 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
     let primary = plan
         .presentation
         .iter()
-        .find(|item| item.pty_id == "hetz.worker")
+        .find(|item| item.pty_id == "example-linux.worker")
         .unwrap();
     assert_eq!(primary.display_name, Some(Some("Build owner".to_owned())));
     assert_eq!(
@@ -644,7 +644,7 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
             ("agent.presentation.schema".to_owned(), Some("1".to_owned())),
             (
                 "agent.actor.path".to_owned(),
-                Some("hetz.worker".to_owned())
+                Some("example-linux.worker".to_owned())
             ),
             (
                 "agent.presentation.description".to_owned(),
@@ -656,7 +656,7 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
     let secondary = plan
         .presentation
         .iter()
-        .find(|item| item.pty_id == "hetz.worker.shell")
+        .find(|item| item.pty_id == "example-linux.worker.shell")
         .unwrap();
     assert_eq!(secondary.display_name, None);
     assert_eq!(
@@ -665,7 +665,7 @@ fn live_pty_presentation_is_exact_id_metadata_and_not_lifecycle_drift() {
             ("agent.presentation.schema".to_owned(), Some("1".to_owned())),
             (
                 "agent.actor.path".to_owned(),
-                Some("hetz.worker".to_owned()),
+                Some("example-linux.worker".to_owned()),
             ),
             (
                 "agent.presentation.description".to_owned(),
@@ -684,14 +684,14 @@ fn lifecycle_equal_primary_name_is_cleared_during_live_reconciliation() {
         vec![task(
             TaskKind::Pty,
             "agent",
-            Some("hetz.worker"),
+            Some("example-linux.worker"),
             Some("codex"),
         )],
     );
-    owner.name = Some("hetz.worker".to_owned());
+    owner.name = Some("example-linux.worker".to_owned());
 
     let specs = [owner];
-    let plan = reconcile(&specs, &[live("hetz.worker")], HOST);
+    let plan = reconcile(&specs, &[live("example-linux.worker")], HOST);
     assert_eq!(plan.presentation.len(), 1);
     assert_eq!(plan.presentation[0].display_name, Some(None));
 }
@@ -704,7 +704,7 @@ fn live_pty_presentation_only_queues_observed_drift() {
         vec![task(
             TaskKind::Pty,
             "agent",
-            Some("hetz.worker"),
+            Some("example-linux.worker"),
             Some("codex"),
         )],
     );
@@ -713,7 +713,7 @@ fn live_pty_presentation_only_queues_observed_drift() {
     let specs = [owner];
     let exact_tags = BTreeMap::from([
         ("agent.presentation.schema".to_owned(), "1".to_owned()),
-        ("agent.actor.path".to_owned(), "hetz.worker".to_owned()),
+        ("agent.actor.path".to_owned(), "example-linux.worker".to_owned()),
         (
             "agent.presentation.description".to_owned(),
             "Owns build delivery".to_owned(),
@@ -723,7 +723,7 @@ fn live_pty_presentation_only_queues_observed_drift() {
         ("unrelated".to_owned(), "preserved".to_owned()),
     ]);
     let exact = Session {
-        pty_id: "hetz.worker".to_owned(),
+        pty_id: "example-linux.worker".to_owned(),
         alive: true,
         exit_code: None,
         presentation: Some(ObservedPtyPresentation {
@@ -734,7 +734,7 @@ fn live_pty_presentation_only_queues_observed_drift() {
     assert!(reconcile(&specs, &[exact], HOST).presentation.is_empty());
 
     let drifted = Session {
-        pty_id: "hetz.worker".to_owned(),
+        pty_id: "example-linux.worker".to_owned(),
         alive: true,
         exit_code: None,
         presentation: Some(ObservedPtyPresentation {
@@ -744,7 +744,7 @@ fn live_pty_presentation_only_queues_observed_drift() {
     };
     assert_eq!(reconcile(&specs, &[drifted], HOST).presentation.len(), 1);
     assert_eq!(
-        reconcile(&specs, &[live("hetz.worker")], HOST)
+        reconcile(&specs, &[live("example-linux.worker")], HOST)
             .presentation
             .len(),
         1
@@ -756,7 +756,7 @@ fn resource_only_changes_do_not_replace_or_relaunch_a_live_task() {
     let mut spec = svc(
         "a",
         Some(HOST),
-        vec![task(TaskKind::Pty, "agent", Some("hetz.a"), Some("x"))],
+        vec![task(TaskKind::Pty, "agent", Some("example-linux.a"), Some("x"))],
     );
     spec.resources.push(
         Resource::new(
@@ -768,7 +768,7 @@ fn resource_only_changes_do_not_replace_or_relaunch_a_live_task() {
     );
 
     let specs = [spec];
-    let plan = reconcile(&specs, &[live("hetz.a")], HOST);
+    let plan = reconcile(&specs, &[live("example-linux.a")], HOST);
     assert_eq!(plan.adopt.len(), 1);
     assert!(plan.launch.is_empty());
     assert!(plan.teardown.is_empty());
@@ -781,14 +781,14 @@ fn one_dead_task_launches_only_the_missing_one() {
         "a",
         Some(HOST),
         vec![
-            task(TaskKind::Pty, "agent", Some("hetz.a"), Some("x")),
-            task(TaskKind::Exec, "ding", Some("hetz.a.ding"), Some("y")),
+            task(TaskKind::Pty, "agent", Some("example-linux.a"), Some("x")),
+            task(TaskKind::Exec, "ding", Some("example-linux.a.ding"), Some("y")),
         ],
     )];
-    let plan = reconcile(&specs, &[live("hetz.a")], HOST);
+    let plan = reconcile(&specs, &[live("example-linux.a")], HOST);
     assert_eq!(plan.launch.len(), 1);
     assert_eq!(plan.launch[0].tasks.len(), 1);
-    assert_eq!(plan.launch[0].tasks[0].pty_id, "hetz.a.ding");
+    assert_eq!(plan.launch[0].tasks[0].pty_id, "example-linux.a.ding");
 }
 
 #[test]
@@ -796,24 +796,24 @@ fn exited_session_is_reaped_and_relaunched() {
     let specs = vec![svc(
         "a",
         Some(HOST),
-        vec![task(TaskKind::Pty, "agent", Some("hetz.a"), Some("x"))],
+        vec![task(TaskKind::Pty, "agent", Some("example-linux.a"), Some("x"))],
     )];
-    let plan = reconcile(&specs, &[dead("hetz.a")], HOST);
+    let plan = reconcile(&specs, &[dead("example-linux.a")], HOST);
     assert_eq!(plan.launch.len(), 1);
-    assert_eq!(plan.gc, vec!["hetz.a"]); // reap the corpse, then respawn
+    assert_eq!(plan.gc, vec!["example-linux.a"]); // reap the corpse, then respawn
 }
 
 #[test]
 fn adopt_only_task_holds_dead_or_absent_generation_without_replacement() {
-    let mut t = task(TaskKind::Pty, "agent", Some("hetz.a"), Some("x"));
+    let mut t = task(TaskKind::Pty, "agent", Some("example-linux.a"), Some("x"));
     t.lifecycle = TaskLifecycle::AdoptOnly;
     let specs = vec![svc("a", Some(HOST), vec![t])];
 
-    for sessions in [vec![dead("hetz.a")], vec![]] {
+    for sessions in [vec![dead("example-linux.a")], vec![]] {
         let plan = reconcile(&specs, &sessions, HOST);
         assert!(plan.launch.is_empty());
         assert!(plan.gc.is_empty());
-        assert_eq!(plan.held, vec!["hetz.a"]);
+        assert_eq!(plan.held, vec!["example-linux.a"]);
     }
 }
 
@@ -822,20 +822,20 @@ fn leaving_adopt_only_explicitly_restores_replacement_lifecycle() {
     let specs = vec![svc(
         "a",
         Some(HOST),
-        vec![task(TaskKind::Pty, "agent", Some("hetz.a"), Some("x"))],
+        vec![task(TaskKind::Pty, "agent", Some("example-linux.a"), Some("x"))],
     )];
-    let plan = reconcile(&specs, &[dead("hetz.a")], HOST);
-    assert_eq!(plan.gc, vec!["hetz.a"]);
-    assert_eq!(plan.launch[0].tasks[0].pty_id, "hetz.a");
+    let plan = reconcile(&specs, &[dead("example-linux.a")], HOST);
+    assert_eq!(plan.gc, vec!["example-linux.a"]);
+    assert_eq!(plan.launch[0].tasks[0].pty_id, "example-linux.a");
     assert!(plan.held.is_empty());
 }
 
 #[test]
 fn dead_keep_task_is_frozen_not_reaped() {
-    let mut t = task(TaskKind::Pty, "agent", Some("hetz.a"), Some("x"));
+    let mut t = task(TaskKind::Pty, "agent", Some("example-linux.a"), Some("x"));
     t.keep = true;
     let specs = vec![svc("a", Some(HOST), vec![t])];
-    let plan = reconcile(&specs, &[dead("hetz.a")], HOST);
+    let plan = reconcile(&specs, &[dead("example-linux.a")], HOST);
     assert!(plan.launch.is_empty());
     assert!(plan.gc.is_empty());
     assert_eq!(plan.adopt.len(), 1); // present (frozen)
@@ -848,11 +848,11 @@ fn retired_with_live_sessions_is_torn_down() {
         Some(HOST),
         JobType::Service,
         true,
-        vec![task(TaskKind::Pty, "agent", Some("hetz.old"), Some("x"))],
+        vec![task(TaskKind::Pty, "agent", Some("example-linux.old"), Some("x"))],
     )];
-    let plan = reconcile(&specs, &[live("hetz.old")], HOST);
+    let plan = reconcile(&specs, &[live("example-linux.old")], HOST);
     assert_eq!(plan.teardown.len(), 1);
-    assert_eq!(plan.teardown[0].pty_ids, vec!["hetz.old"]);
+    assert_eq!(plan.teardown[0].pty_ids, vec!["example-linux.old"]);
 }
 
 /// dotfiles#1535: retiring an agent that still declares `resource` bindings (including a `work://`
@@ -867,12 +867,12 @@ fn retired_agent_keeps_resources_and_still_reconciles_to_zero_live_tasks() {
             Some(HOST),
             JobType::Service,
             true,
-            vec![task(TaskKind::Pty, "agent", Some("hetz.worker"), Some("x"))],
+            vec![task(TaskKind::Pty, "agent", Some("example-linux.worker"), Some("x"))],
         );
         spec.resources.push(
             Resource::new(
                 "work".into(),
-                "work://hetz/current-task".into(),
+                "work://example-linux/current-task".into(),
                 "Current implementation task.".into(),
             )
             .unwrap(),
@@ -891,10 +891,10 @@ fn retired_agent_keeps_resources_and_still_reconciles_to_zero_live_tasks() {
     // Retired with a live seat: admits (no TaskIdentityAdmissionError), tears down the seat,
     // settles retirement, launches nothing. The declared resources do not block any of this.
     let retired = [with_resources()];
-    let plan = reconcile_result(&retired, &[live("hetz.worker")], HOST)
+    let plan = reconcile_result(&retired, &[live("example-linux.worker")], HOST)
         .expect("retired specs with resources are admitted");
     assert_eq!(plan.teardown.len(), 1);
-    assert_eq!(plan.teardown[0].pty_ids, vec!["hetz.worker"]);
+    assert_eq!(plan.teardown[0].pty_ids, vec!["example-linux.worker"]);
     assert_eq!(plan.settle_retirement.len(), 1);
     assert!(plan.launch.is_empty());
 
@@ -912,7 +912,7 @@ fn retired_agent_keeps_resources_and_still_reconciles_to_zero_live_tasks() {
     let specs = [unretired];
     let plan = reconcile_result(&specs, &[], HOST).expect("running specs with resources admit");
     assert_eq!(plan.launch.len(), 1);
-    assert_eq!(plan.launch[0].tasks[0].pty_id, "hetz.worker");
+    assert_eq!(plan.launch[0].tasks[0].pty_id, "example-linux.worker");
     assert!(plan.settle_retirement.is_empty());
 }
 
@@ -922,15 +922,15 @@ fn other_host_specs_are_skipped() {
         svc(
             "here",
             Some(HOST),
-            vec![task(TaskKind::Pty, "agent", Some("hetz.here"), Some("x"))],
+            vec![task(TaskKind::Pty, "agent", Some("example-linux.here"), Some("x"))],
         ),
         svc(
             "there",
-            Some("silber"),
+            Some("example-mac"),
             vec![task(
                 TaskKind::Pty,
                 "agent",
-                Some("silber.there"),
+                Some("example-mac.there"),
                 Some("y"),
             )],
         ),
@@ -951,7 +951,7 @@ fn host_none_defaults_to_this_host_with_fallback_id() {
     )];
     let plan = reconcile(&specs, &[], HOST);
     assert_eq!(plan.launch.len(), 1);
-    assert_eq!(plan.launch[0].tasks[0].pty_id, "hetz.local.agent"); // <bus_id>.<name>
+    assert_eq!(plan.launch[0].tasks[0].pty_id, "example-linux.local.agent"); // <bus_id>.<name>
 }
 
 #[test]
@@ -971,8 +971,8 @@ fn generated_ding_only_job_is_unrunnable_and_does_not_launch() {
     let mut ding = task(
         TaskKind::Exec,
         "ding",
-        Some("hetz.nr.ding"),
-        Some("st2 ding --identity hetz.nr --root $ST_ROOT"),
+        Some("example-linux.nr.ding"),
+        Some("st2 ding --identity example-linux.nr --root $ST_ROOT"),
     );
     ding.derived = true;
     let specs = vec![svc("nr", Some(HOST), vec![ding])];
@@ -983,12 +983,12 @@ fn generated_ding_only_job_is_unrunnable_and_does_not_launch() {
 
 #[test]
 fn generated_ding_launches_alongside_authored_work() {
-    let agent = task(TaskKind::Pty, "agent", Some("hetz.runnable"), Some("codex"));
+    let agent = task(TaskKind::Pty, "agent", Some("example-linux.runnable"), Some("codex"));
     let mut ding = task(
         TaskKind::Exec,
         "ding",
-        Some("hetz.runnable.ding"),
-        Some("st2 ding --identity hetz.runnable --root $ST_ROOT"),
+        Some("example-linux.runnable.ding"),
+        Some("st2 ding --identity example-linux.runnable --root $ST_ROOT"),
     );
     ding.derived = true;
     let specs = vec![svc("runnable", Some(HOST), vec![agent, ding])];
@@ -1003,8 +1003,8 @@ fn agent_level_keep_pins_all_task_targets() {
         "kept",
         Some(HOST),
         vec![
-            task(TaskKind::Pty, "agent", Some("hetz.kept"), Some("x")),
-            task(TaskKind::Exec, "ding", Some("hetz.kept.ding"), Some("y")),
+            task(TaskKind::Pty, "agent", Some("example-linux.kept"), Some("x")),
+            task(TaskKind::Exec, "ding", Some("example-linux.kept.ding"), Some("y")),
         ],
     );
     s.keep = true;
@@ -1017,7 +1017,7 @@ fn workspace_is_carried_into_task_targets_for_cwd_defaulting() {
     let mut s = svc(
         "w",
         Some(HOST),
-        vec![task(TaskKind::Pty, "agent", Some("hetz.w"), Some("x"))],
+        vec![task(TaskKind::Pty, "agent", Some("example-linux.w"), Some("x"))],
     );
     s.workspace = Some("/repos/w".into());
     let plan = reconcile(std::slice::from_ref(&s), &[], HOST);
@@ -1029,7 +1029,7 @@ fn workspace_is_carried_into_task_targets_for_cwd_defaulting() {
 
 #[test]
 fn declared_supervisor_is_the_single_source_for_the_spawn_environment() {
-    let mut t = task(TaskKind::Pty, "agent", Some("hetz.w"), Some("x"));
+    let mut t = task(TaskKind::Pty, "agent", Some("example-linux.w"), Some("x"));
     // A stale hand-authored value must not be able to disagree with the normative spec field.
     t.env
         .insert("ST_SUPERVISOR".into(), "stale-env-value".into());

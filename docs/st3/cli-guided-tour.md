@@ -16,7 +16,7 @@ git -C ~/src/github.com/compoundingtech/st2--st3 rev-parse HEAD
 st --help
 ```
 
-For each numbered stop I will explain the command's job and why it exists. Nathan will run the
+For each numbered stop I will explain the command's job and why it exists. Alex will run the
 root or subcommand help, run the safe example, and report anything surprising. We record each
 finding before moving on:
 
@@ -35,7 +35,7 @@ discoverable rather than surprising.
 
 ## Pass 1: the everyday product loop
 
-This pass answers three questions: what is happening, what needs Nathan, and how does Nathan launch
+This pass answers three questions: what is happening, what needs Alex, and how does Alex launch
 new work?
 
 ### 1. `now` — one bounded operational answer
@@ -45,8 +45,8 @@ commands.
 
 ```sh
 st now --help
-st now --as person/nathan
-st now --as person/nathan --json
+st now --as person/alex
+st now --as person/alex --json
 ```
 
 The default lists human attention only. Mission work is in `work ls` and Control; an explicit
@@ -84,7 +84,7 @@ Why: people need an unfiltered view of current work; agents need explicit, fence
 st work --help
 st work ls --help
 st work ls
-st work ls --as agent/fleet/st3/standing/st3
+st work ls --as agent/example/st3/standing/st3
 st work show --help
 st work show step-run/e3e841ba011236a21fe8bd3e50c21a1d/walkthrough-and-followup
 ```
@@ -113,14 +113,14 @@ st work revision cancel --help
 Check that a person can understand ownership, readiness, blockers, lease/incarnation, elapsed time,
 goals, constraints, and usage without learning internal graph vocabulary.
 
-### 4. `attention` — Nathan's explicit inbox
+### 4. `attention` — Alex's explicit inbox
 
 Why: decisions and faults needing a person belong in one low-noise, actor-specific inbox.
 
 ```sh
 st attention --help
 st attention ls --help
-st attention ls --as person/nathan
+st attention ls --as person/alex
 st attention show --help
 ```
 
@@ -134,7 +134,7 @@ st attention approve --help
 st attention reject --help
 ```
 
-Every row should say why Nathan is involved, what happens if he does nothing, whether it is stale,
+Every row should say why Alex is involved, what happens if he does nothing, whether it is stale,
 and the exact actions available now.
 
 A subscription that holds mission requests for a person raises one attention item. Inspect the
@@ -189,7 +189,7 @@ surface.
 ```sh
 st conversations --help
 st conversations ls --help
-st conversations ls person/nathan
+st conversations ls person/alex
 st conversations sessions --help
 st conversations sessions
 st conversations read --help
@@ -301,10 +301,10 @@ supplied by an untrusted request.
 
 ```sh
 st devices --help
-st devices --as person/nathan ls --help
-st devices --as person/nathan ls
-st devices --as person/nathan pair --help
-st devices --as person/nathan revoke --help
+st devices --as person/alex ls --help
+st devices --as person/alex ls
+st devices --as person/alex pair --help
+st devices --as person/alex revoke --help
 ```
 
 Pair and revoke only during the app/on-device proof. Check device name, scopes, expiry/revocation,
@@ -394,12 +394,12 @@ into normal product commands.
 ```sh
 st subject --help
 st subject show --help
-st subject show agent/fleet/st3/standing/st3
+st subject show agent/example/st3/standing/st3
 st subject history --help
-st subject history agent/fleet/st3/standing/st3 --limit 20
+st subject history agent/example/st3/standing/st3 --limit 20
 st trace --help
 st trace show --help
-st trace show agent/fleet/st3/standing/st3 --limit 20
+st trace show agent/example/st3/standing/st3 --limit 20
 st trace wait --help
 ```
 

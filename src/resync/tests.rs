@@ -194,12 +194,12 @@ fn declaration_parse_failure_retains_a_digest_fact_for_later_delivery() {
 #[test]
 fn watch_set_covers_declaration_and_local_bindings_only() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("agents/hetz/worker");
+    let dir = tmp.path().join("agents/example-linux/worker");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("agent.kdl"),
         r#"agent "worker" {
-  host "hetz"
+  host "example-linux"
   command "true"
   resource "goal" uri="resources/goal.md" reason="Mission."
   resource "journal" uri="resources/context/journal.md" reason="Memory."
@@ -209,8 +209,8 @@ fn watch_set_covers_declaration_and_local_bindings_only() {
     )
     .unwrap();
     let spec = discover(tmp.path());
-    let set = watch_set_for(&spec, "hetz", &Default::default());
-    assert_eq!(set.bus_id, "hetz.worker");
+    let set = watch_set_for(&spec, "example-linux", &Default::default());
+    assert_eq!(set.bus_id, "example-linux.worker");
     let mut labels: Vec<&str> = set.carriers.iter().map(|c| c.label.as_str()).collect();
     labels.sort();
     assert_eq!(labels, vec!["declaration", "goal"]);
@@ -702,12 +702,12 @@ fn dirty_entry_deadline_migrates_when_refresh_changes_notification_class() {
 
 #[test]
 fn malformed_declaration_retains_only_an_observed_live_seat_subscription() {
-    let declaration = PathBuf::from("/catalog/agents/hetz/worker/agent.kdl");
+    let declaration = PathBuf::from("/catalog/agents/example-linux/worker/agent.kdl");
     let previous = || {
         BTreeMap::from([(
             declaration.clone(),
             vec![Entry {
-                bus_id: "hetz.worker".to_owned(),
+                bus_id: "example-linux.worker".to_owned(),
                 seat_id: Some("custom-worker-seat".to_owned()),
                 label: "declaration".to_owned(),
                 class: CarrierClass::Immediate,
@@ -773,13 +773,13 @@ fn malformed_declaration_retains_only_an_observed_live_seat_subscription() {
 #[test]
 fn degraded_poll_replays_a_pending_transition_before_newer_bytes() {
     let root = tempfile::tempdir().unwrap();
-    let agent_dir = root.path().join("agents/hetz/worker");
+    let agent_dir = root.path().join("agents/example-linux/worker");
     let resources = agent_dir.join("resources");
     std::fs::create_dir_all(&resources).unwrap();
     std::fs::write(
         agent_dir.join("agent.kdl"),
         r#"agent "worker" {
-  host "hetz"
+  host "example-linux"
   command "agent"
   resource "goal" uri="resources/goal.md" reason="Mission."
 }"#,
@@ -787,16 +787,16 @@ fn degraded_poll_replays_a_pending_transition_before_newer_bytes() {
     .unwrap();
     let carrier = resources.join("goal.md");
     std::fs::write(&carrier, "newer live bytes").unwrap();
-    crate::event::publish_owner_binding_for_test(root.path(), "hetz").unwrap();
+    crate::event::publish_owner_binding_for_test(root.path(), "example-linux").unwrap();
 
-    let set = watch_set_for(&discover(root.path()), "hetz", &Default::default());
+    let set = watch_set_for(&discover(root.path()), "example-linux", &Default::default());
     let mut worker = Worker {
         root: root.path().to_path_buf(),
-        this_host: "hetz".to_owned(),
+        this_host: "example-linux".to_owned(),
         carriers: BTreeMap::from([(
             carrier.clone(),
             vec![Entry {
-                bus_id: "hetz.worker".to_owned(),
+                bus_id: "example-linux.worker".to_owned(),
                 seat_id: set.seat_id.clone(),
                 label: "goal".to_owned(),
                 class: CarrierClass::Immediate,
@@ -918,13 +918,13 @@ fn fallback_polling_preserves_the_coalesced_window() {
 #[test]
 fn notify_backend_error_rescans_every_carrier_digest() {
     let root = tempfile::tempdir().unwrap();
-    let agent_dir = root.path().join("agents/hetz/worker");
+    let agent_dir = root.path().join("agents/example-linux/worker");
     let resources = agent_dir.join("resources");
     std::fs::create_dir_all(&resources).unwrap();
     std::fs::write(
         agent_dir.join("agent.kdl"),
         r#"agent "worker" {
-  host "hetz"
+  host "example-linux"
   command "agent"
   resource "goal" uri="resources/goal.md" reason="Mission."
 }"#,
@@ -932,11 +932,11 @@ fn notify_backend_error_rescans_every_carrier_digest() {
     .unwrap();
     let goal = resources.join("goal.md");
     std::fs::write(&goal, "before\n").unwrap();
-    crate::event::publish_owner_binding_for_test(root.path(), "hetz").unwrap();
+    crate::event::publish_owner_binding_for_test(root.path(), "example-linux").unwrap();
 
     let mut worker = Worker {
         root: root.path().to_path_buf(),
-        this_host: "hetz".to_owned(),
+        this_host: "example-linux".to_owned(),
         carriers: BTreeMap::new(),
         subscription_sequences: BTreeMap::new(),
         parked_transitions: BTreeMap::new(),
@@ -947,7 +947,7 @@ fn notify_backend_error_rescans_every_carrier_digest() {
     };
     worker.apply_watch_sets(refresh_for(vec![watch_set_for(
         &discover(root.path()),
-        "hetz",
+        "example-linux",
         &Default::default(),
     )]));
     std::fs::write(&goal, "after\n").unwrap();
@@ -2117,7 +2117,7 @@ fn transition_identity_covers_every_rendered_transition_dimension() {
 
 #[test]
 fn local_path_resolution_parses_supported_file_uris_without_uri_metadata_bytes() {
-    let agent_dir = Path::new("/cat/agents/hetz/w");
+    let agent_dir = Path::new("/cat/agents/example-linux/w");
     assert_eq!(
         resolve_local_path(agent_dir, "file:///etc/demo.kdl"),
         Some(PathBuf::from("/etc/demo.kdl"))
@@ -2182,7 +2182,7 @@ fn local_path_resolution_parses_supported_file_uris_without_uri_metadata_bytes()
 
 #[test]
 fn classification_is_goal_immediate_stores_silent_other_coalesced() {
-    let agent_dir = Path::new("/cat/agents/hetz/w");
+    let agent_dir = Path::new("/cat/agents/example-linux/w");
     assert_eq!(
         classify(agent_dir, "mission", &agent_dir.join("resources/goal.md")),
         Some(CarrierClass::Immediate),
@@ -2231,14 +2231,14 @@ fn profile_classes_map_onto_carrier_notification() {
 #[test]
 fn registered_profile_failures_are_reported_while_other_bindings_survive() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("agents/hetz/worker");
+    let dir = tmp.path().join("agents/example-linux/worker");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("agent.kdl"),
         r#"agent "worker" {
-  host "hetz"
+  host "example-linux"
   command "true"
-  resource "goal" uri="dev.schickling.agent-goal://hetz/worker" reason="Mission."
+  resource "goal" uri="dev.schickling.agent-goal://example-linux/worker" reason="Mission."
   resource "issue" uri="worktree://repo/main" reason="Opaque scheme."
 }"#,
     )
@@ -2255,7 +2255,7 @@ fn registered_profile_failures_are_reported_while_other_bindings_survive() {
     let refresh = profiles.begin_refresh();
     let spec = discover(tmp.path());
     let (set, diagnostics) =
-        resolve_watch_set(&spec, std::slice::from_ref(&spec), "hetz", &refresh);
+        resolve_watch_set(&spec, std::slice::from_ref(&spec), "example-linux", &refresh);
     assert!(!set.carriers.iter().any(|c| c.label == "goal"));
     assert!(set.carriers.iter().any(|c| c.label == "declaration"));
     assert!(!set.carriers.iter().any(|c| c.label == "issue"));
@@ -2271,14 +2271,14 @@ fn registered_profile_failures_are_reported_while_other_bindings_survive() {
 #[test]
 fn silent_profile_skips_its_resolver_entirely() {
     let tmp = tempfile::tempdir().unwrap();
-    let dir = tmp.path().join("agents/hetz/worker");
+    let dir = tmp.path().join("agents/example-linux/worker");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
         dir.join("agent.kdl"),
         r#"agent "worker" {
-  host "hetz"
+  host "example-linux"
   command "true"
-  resource "goal" uri="dev.schickling.agent-goal://hetz/worker" reason="Mission."
+  resource "goal" uri="dev.schickling.agent-goal://example-linux/worker" reason="Mission."
 }"#,
     )
     .unwrap();
@@ -2292,7 +2292,7 @@ fn silent_profile_skips_its_resolver_entirely() {
     let refresh = profiles.begin_refresh();
     let spec = discover(tmp.path());
     let (set, diagnostics) =
-        resolve_watch_set(&spec, std::slice::from_ref(&spec), "hetz", &refresh);
+        resolve_watch_set(&spec, std::slice::from_ref(&spec), "example-linux", &refresh);
     assert!(!set.carriers.iter().any(|carrier| carrier.label == "goal"));
     assert!(
         diagnostics.is_empty(),

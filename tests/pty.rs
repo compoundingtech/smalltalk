@@ -86,7 +86,7 @@ fn pty_global_catalog_flag_overrides_the_environment() {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("--catalog")
         .arg(selected.path())
-        .args(["pty", "attach", "Silber.cos"])
+        .args(["pty", "attach", "ExampleMac.cos"])
         .env("PATH", path_with(bin.path()))
         .env("CATALOG", ambient.path())
         .output()
@@ -98,7 +98,7 @@ fn pty_global_catalog_flag_overrides_the_environment() {
         s.contains(&format!("CATALOG={}", selected.display())),
         "{s}"
     );
-    assert!(s.contains("ARGS=attach Silber.cos"), "{s}");
+    assert!(s.contains("ARGS=attach ExampleMac.cos"), "{s}");
 }
 
 #[test]

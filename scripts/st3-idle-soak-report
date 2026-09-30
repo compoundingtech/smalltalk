@@ -20,12 +20,12 @@ inputs=("$LOG")
 remote_rows=
 if [[ ${ST3_IDLE_REPORT_REMOTE:-0} == 1 ]]; then
   : "${FABRIC_BIN:?set FABRIC_BIN to the installed Fabric executable}"
-  if ! remote_rows=$(/usr/bin/timeout -k 5s 120s "$FABRIC_BIN" exec silber -- \
+  if ! remote_rows=$(/usr/bin/timeout -k 5s 120s "$FABRIC_BIN" exec example-mac -- \
     /bin/sh -c 'exec /bin/cat "$HOME/.local/state/st3/idle-soak/events.jsonl"'); then
-    echo 'Silber idle evidence is unavailable through Fabric' >&2
+    echo 'ExampleMac idle evidence is unavailable through Fabric' >&2
     exit 1
   fi
-  [[ -n $remote_rows ]] || { echo 'Silber idle evidence is empty' >&2; exit 1; }
+  [[ -n $remote_rows ]] || { echo 'ExampleMac idle evidence is empty' >&2; exit 1; }
   inputs+=(/dev/fd/3)
 fi
 
@@ -67,7 +67,7 @@ report=$("$JQ_BIN" -sc --argjson now "$NOW" --argjson duration "$DURATION" \
        and $quiet_cpu != null and $quiet_cpu >= 0 and $quiet_cpu <= $cpu_limit
        and $rss_first != null and $rss_last != null
        and ($rss_last - $rss_first) <= ([65536, $rss_first * 0.1] | max))};
-  [analyze("hetz"; 15), analyze("silber"; 50)] as $hosts |
+  [analyze("example-linux"; 15), analyze("example-mac"; 50)] as $hosts |
   {pass:($hosts | all(.pass)), window_seconds:$duration, hosts:$hosts}
 ' "${inputs[@]}" 3<<<"$remote_rows")
 /usr/bin/printf '%s\n' "$report"

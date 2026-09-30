@@ -318,16 +318,16 @@ mod tests {
     fn the_st2_surface_check_finds_programs_and_state_paths() {
         assert!(mentions_st2_surface("exec st2 --catalog x driver"));
         assert!(mentions_st2_surface("command -v st2 >/dev/null"));
-        assert!(mentions_st2_surface("\"/home/a/.local/bin/st2\" status"));
+        assert!(mentions_st2_surface("\"/home/example/.local/bin/st2\" status"));
         assert!(mentions_st2_surface(
-            "/home/a/.local/state/st2/hooks/sets/x"
+            "/home/example/.local/state/st2/hooks/sets/x"
         ));
         assert!(!mentions_st2_surface("ST2_CLAUDE_SESSION=abc"));
         assert!(!mentions_st2_surface(
             "\"$ST3_BIN\" driver-hook claude-observe"
         ));
         assert!(!mentions_st2_surface(
-            "/home/a/.local/state/st3/hooks/sets/x"
+            "/home/example/.local/state/st3/hooks/sets/x"
         ));
     }
 

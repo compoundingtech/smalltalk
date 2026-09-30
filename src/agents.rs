@@ -514,28 +514,28 @@ mod tests {
         }
     }
 
-    /// Field names, order, and null handling are stable (see INVARIANTS.md).
+    /// Field names, order, and null handling are stable (see docs/st2/invariants.md).
     #[test]
     fn agents_json_has_stable_wire_shape() {
         let rows = [
             row(
-                "hetz.cos-claude",
+                "example-linux.cos-claude",
                 State::Available,
                 None,
                 false,
                 Some(1784653027733.6138),
                 1,
             ),
-            row("hetz.st2-claude", State::Busy, Some("owner"), true, None, 0),
+            row("example-linux.st2-claude", State::Busy, Some("owner"), true, None, 0),
         ];
 
         assert_eq!(
             to_json(&rows, false),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.cos-claude","address":"cos-claude","busAddress":"hetz.cos-claude"},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.st2-claude","address":"st2-claude","busAddress":null}]"#
+            r#"[{"identity":"example-linux.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"example-linux.cos-claude","address":"cos-claude","busAddress":"example-linux.cos-claude"},{"identity":"example-linux.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"example-linux.st2-claude","address":"st2-claude","busAddress":null}]"#
         );
         assert_eq!(
             to_json(&rows, true),
-            r#"[{"identity":"hetz.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.cos-claude","address":"cos-claude","busAddress":"hetz.cos-claude"},{"identity":"hetz.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.st2-claude","address":"st2-claude","busAddress":null}]"#
+            r#"[{"identity":"example-linux.cos-claude","status":"available","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":1,"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"example-linux.cos-claude","address":"cos-claude","busAddress":"example-linux.cos-claude"},{"identity":"example-linux.st2-claude","status":"busy","name":"owner","description":null,"retired":true,"resources":[],"lastActivity":null,"inbox":0,"desiredState":"retired","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"example-linux.st2-claude","address":"st2-claude","busAddress":null}]"#
         );
         // Empty roster is `[]`, not `null`.
         assert_eq!(to_json(&[], true), "[]");
@@ -543,7 +543,7 @@ mod tests {
 
     #[test]
     fn agents_json_preserves_opaque_declared_resource_descriptors() {
-        let mut resource_row = row("hetz.worker", State::Available, None, false, None, 0);
+        let mut resource_row = row("example-linux.worker", State::Available, None, false, None, 0);
         resource_row.resources.push(
             Resource::new(
                 "work".into(),
@@ -558,7 +558,7 @@ mod tests {
 
         assert_eq!(
             to_json(&[resource_row], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task.","resync":"unsupported"}],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
+            r#"[{"identity":"example-linux.worker","status":"available","name":null,"description":null,"retired":false,"resources":[{"name":"work","uri":"vendor+thing://authority/exact%20identity","reason":"Current implementation task.","resync":"unsupported"}],"desiredState":"running","desiredStateReason":null,"observedState":null,"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"example-linux.worker","address":"worker","busAddress":"example-linux.worker"}]"#
         );
     }
 
@@ -568,7 +568,7 @@ mod tests {
     #[test]
     fn observed_state_joins_declared_presence_without_touching_either() {
         let mut wedged = row(
-            "hetz.worker",
+            "example-linux.worker",
             State::Busy,
             None,
             false,
@@ -592,14 +592,14 @@ mod tests {
 
         assert_eq!(
             to_json(&[wedged.clone()], false),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
+            r#"[{"identity":"example-linux.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"example-linux.worker","address":"worker","busAddress":"example-linux.worker"}]"#
         );
         assert_eq!(
             to_json(&[wedged], true),
-            r#"[{"identity":"hetz.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
+            r#"[{"identity":"example-linux.worker","status":"busy","name":null,"description":null,"retired":false,"resources":[],"lastActivity":1784653027733.6138,"inbox":0,"desiredState":"running","desiredStateReason":null,"observedState":{"state":"idle","blockedOn":"none","inputBuffer":"empty","ask":"none","harness":"codex","since":1784653000000,"reason":null,"exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"example-linux.worker","address":"worker","busAddress":"example-linux.worker"}]"#
         );
 
-        let mut derived = row("hetz.worker", State::Available, None, false, None, 0);
+        let mut derived = row("example-linux.worker", State::Available, None, false, None, 0);
         derived.observed = Some(harness_state::Observed {
             state: harness_state::Activity::Unknown,
             blocked_on: harness_state::BlockedOn::Unknown,
@@ -616,7 +616,7 @@ mod tests {
         });
         assert_eq!(
             to_json(&[derived], false),
-            r#"[{"identity":"hetz.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"hetz.worker","address":"worker","busAddress":"hetz.worker"}]"#
+            r#"[{"identity":"example-linux.worker","status":"available","name":null,"description":null,"retired":false,"resources":[],"desiredState":"running","desiredStateReason":null,"observedState":{"state":"unknown","blockedOn":"unknown","inputBuffer":"unknown","ask":"unknown","harness":"codex","since":null,"reason":"session-dead","exit":null},"driverDiagnostic":{"status":"absent","driver":null,"stage":null,"reason":null,"source":null,"producerVersion":null,"support":"unknown","observedAt":null,"evidenceAgeMs":null,"recovery":"publishFailureOrClearOnStageRecovery"},"context":null,"id":"example-linux.worker","address":"worker","busAddress":"example-linux.worker"}]"#
         );
     }
 
@@ -626,7 +626,7 @@ mod tests {
     /// indeterminate. Nothing here derives one axis from another.
     #[test]
     fn context_is_a_fourth_axis_that_survives_an_indeterminate_observed_state() {
-        let mut wedged = row("hetz.worker", State::Busy, None, false, None, 0);
+        let mut wedged = row("example-linux.worker", State::Busy, None, false, None, 0);
         wedged.observed = Some(harness_state::Observed {
             state: harness_state::Activity::Unknown,
             blocked_on: harness_state::BlockedOn::Unknown,
@@ -694,7 +694,7 @@ mod tests {
         );
 
         // A percent above the window rides the wire raw, and a stale reading keeps its age.
-        let mut overrun = row("hetz.pi", State::Available, None, false, None, 0);
+        let mut overrun = row("example-linux.pi", State::Available, None, false, None, 0);
         overrun.context = Some(harness_context::Observed {
             harness: harness_context::Harness::Pi,
             used_tokens: Some(23424),
@@ -727,7 +727,7 @@ mod tests {
 
     #[test]
     fn exhausted_claude_rate_limit_is_explicit_beside_active_state() {
-        let mut limited = row("hetz.worker", State::Available, None, false, None, 0);
+        let mut limited = row("example-linux.worker", State::Available, None, false, None, 0);
         limited.observed = Some(harness_state::Observed {
             state: harness_state::Activity::Active,
             blocked_on: harness_state::BlockedOn::None,
@@ -775,7 +775,7 @@ mod tests {
 
     #[test]
     fn driver_diagnostic_wire_exposes_failure_and_evidence_age_without_identity_payloads() {
-        let mut diagnosed = row("hetz.worker", State::Available, None, false, None, 0);
+        let mut diagnosed = row("example-linux.worker", State::Available, None, false, None, 0);
         diagnosed.driver_diagnostic =
             driver_diagnostic::Observed::Failure(driver_diagnostic::Failure {
                 driver: driver_diagnostic::Driver::OpenCode,
