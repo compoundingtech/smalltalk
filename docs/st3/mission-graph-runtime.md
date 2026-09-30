@@ -1302,6 +1302,9 @@ schedule "cycle" {
 }
 ```
 
+Publication requires an unpinned mission's name to exist in the publication scope or
+the stored graph, in any state; an unknown name is refused before occurrences begin.
+
 When an unpinned occurrence reaches its request time, the schedule host resolves its
 authoritative local published head. It requests work only when that head is ready.
 If there is no published head or the current head is draft or retired, the occurrence
@@ -1311,6 +1314,8 @@ which the child run uses even if another revision is published before it starts.
 Publishing a new revision does not change already-requested or active occurrences.
 Pinned schedules keep requesting their named exact revision, including when that
 revision has not yet replicated to the schedule host.
+Repeated failures of this condition keep one attention item open per schedule.
+The runtime withdraws it when a subsequent occurrence successfully starts work.
 
 The runtime gives each occurrence a deterministic mission run and a unique workspace below the declared root.
 

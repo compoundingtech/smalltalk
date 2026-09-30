@@ -8247,12 +8247,20 @@ impl<R: RuntimeControl> Reconciler<R> {
                             fields: BTreeMap::from([
                                 ("request".into(), Value::String(reached.id.clone())),
                                 ("code".into(), Value::String(failure_code.into())),
-                                ("reason".into(), Value::String(failure_reason)),
+                                ("reason".into(), Value::String(failure_reason.clone())),
                             ]),
-                            evidence: vec![reached.id],
+                            evidence: vec![reached.id.clone()],
                             expected_subject: None,
                             idempotency_key: Some(format!("schedule-work-failed:{operation}")),
                         });
+                        if failure_code == "no-ready-mission-revision" {
+                            let _ = request_schedule_head_attention(
+                                &store,
+                                &schedule_subject,
+                                &reached.id,
+                                &failure_reason,
+                            );
+                        }
                         armed
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner)
@@ -8444,6 +8452,21 @@ impl<R: RuntimeControl> Reconciler<R> {
                 expected_subject: None,
                 idempotency_key: Some(format!("schedule-work-started:{}", run.id)),
             })?;
+            let attention = schedule_head_attention_subject(&schedule.subject);
+            if self
+                .store
+                .attention_request(&attention)?
+                .is_some_and(|item| item.status == "pending")
+            {
+                self.store.withdraw_attention(
+                    &attention,
+                    &crate::model::AttentionWithdrawRequest {
+                        actor: RECONCILER_ACTOR.into(),
+                        reason: "A subsequent schedule occurrence started successfully.".into(),
+                        idempotency_key: format!("schedule-head-ready:{}", run.id),
+                    },
+                )?;
+            }
         }
         anyhow::ensure!(waiting.is_empty(), "{}", waiting.join("; "));
         Ok(())
@@ -10544,6 +10567,39 @@ fn expand_gate(
         }
         GateSpec::Deadline { .. } => {}
     }
+    Ok(())
+}
+
+fn schedule_head_attention_subject(schedule: &str) -> String {
+    let digest = hex::encode(sha2::Sha256::digest(schedule.as_bytes()));
+    format!("attention/schedule-head-{}", &digest[..32])
+}
+
+fn request_schedule_head_attention(
+    store: &Store,
+    schedule: &str,
+    occurrence: &str,
+    reason: &str,
+) -> Result<()> {
+    let attention = schedule_head_attention_subject(schedule);
+    if store
+        .attention_request(&attention)?
+        .is_some_and(|item| item.status == "pending")
+    {
+        return Ok(());
+    }
+    store.request_attention(
+        &attention,
+        &AttentionRequest {
+            reviewer: "person/operator".into(),
+            title: "A scheduled mission has no ready head".into(),
+            reason: format!("{schedule}: {reason}. Publish a ready head to resume scheduled work."),
+            severity: "warning".into(),
+            targets: vec![schedule.into()],
+            actor: RECONCILER_ACTOR.into(),
+            idempotency_key: format!("schedule-head-unready:{occurrence}"),
+        },
+    )?;
     Ok(())
 }
 
@@ -16113,18 +16169,34 @@ mission "scheduled-cycle" state="ready" {
                     "improved-cycle-across-dst",
                 );
             }
-            let expected = store.mission_spec("scheduled-cycle", None).unwrap().unwrap().revision;
+            let expected = store
+                .mission_spec("scheduled-cycle", None)
+                .unwrap()
+                .unwrap()
+                .revision;
             assert_eq!(expected == first, anchor == "2026-10-25T01:00:00Z");
-            let source = format!(r#"version 2
+            let source = format!(
+                r#"version 2
 schedule "cycle" {{
   every "1h"
   anchor "{anchor}"
   work {{ mission "scheduled-cycle"; workspace "/tmp/cycles" }}
-}}"#);
+}}"#
+            );
             let intent = parse_intent(&source, "node").unwrap();
-            let schedule = intent.subjects.values().find(|item| item.kind == "schedule").unwrap();
-            let work = crate::graph::schedule_spec(&schedule.desired, "node").unwrap().work.unwrap();
-            assert_eq!(scheduled_work_revision(&store, &work).unwrap(), Some(expected));
+            let schedule = intent
+                .subjects
+                .values()
+                .find(|item| item.kind == "schedule")
+                .unwrap();
+            let work = crate::graph::schedule_spec(&schedule.desired, "node")
+                .unwrap()
+                .work
+                .unwrap();
+            assert_eq!(
+                scheduled_work_revision(&store, &work).unwrap(),
+                Some(expected)
+            );
         }
     }
 
@@ -16138,11 +16210,13 @@ schedule "cycle" {{
             .to_rfc3339_opts(SecondsFormat::Millis, true);
         apply_source(
             &store,
-            &format!(r#"version 2
+            &format!(
+                r#"version 2
 schedule "first" {{
   at "{at}"
   work {{ mission "scheduled-cycle"; workspace "{workspace}" }}
-}}"#),
+}}"#
+            ),
             "first-unpinned",
         );
         let reconciler = Reconciler::new(
@@ -16168,7 +16242,11 @@ mission "scheduled-cycle" state="ready" {
 }"#,
             "improved-cycle",
         );
-        let second = store.mission_spec("scheduled-cycle", None).unwrap().unwrap().revision;
+        let second = store
+            .mission_spec("scheduled-cycle", None)
+            .unwrap()
+            .unwrap()
+            .revision;
         assert_ne!(first, second);
         reconciler.reconcile_once().unwrap();
         let started = store
@@ -16185,11 +16263,13 @@ mission "scheduled-cycle" state="ready" {
             .to_rfc3339_opts(SecondsFormat::Millis, true);
         apply_source(
             &store,
-            &format!(r#"version 2
+            &format!(
+                r#"version 2
 schedule "second" {{
   at "{at}"
   work {{ mission "scheduled-cycle"; workspace "{workspace}" }}
-}}"#),
+}}"#
+            ),
             "second-unpinned",
         );
         reconciler.reconcile_once().unwrap();
@@ -16220,7 +16300,10 @@ mission "scheduled-cycle" state="draft" {
 }"#,
             "draft-cycle",
         );
-        let head = store.mission_spec("scheduled-cycle", None).unwrap().unwrap();
+        let head = store
+            .mission_spec("scheduled-cycle", None)
+            .unwrap()
+            .unwrap();
         assert_ne!(head.revision, previous);
         assert_eq!(head.state, MissionState::Draft);
         let root = tempfile::tempdir().unwrap();
@@ -16228,11 +16311,14 @@ mission "scheduled-cycle" state="draft" {
             .to_rfc3339_opts(SecondsFormat::Millis, true);
         apply_source(
             &store,
-            &format!(r#"version 2
+            &format!(
+                r#"version 2
 schedule "unready" {{
   at "{at}"
   work {{ mission "scheduled-cycle"; workspace "{}" }}
-}}"#, root.path().display()),
+}}"#,
+                root.path().display()
+            ),
             "unready-schedule",
         );
         let reconciler = Reconciler::new(
@@ -16248,15 +16334,102 @@ schedule "unready" {{
             .claims_for("schedule/unready", Some("schedule.work-failed"))
             .unwrap();
         assert_eq!(failed.len(), 1);
-        assert_eq!(failed[0].body["fields"]["code"], "no-ready-mission-revision");
-        assert!(store
-            .claims_for("schedule/unready", Some("schedule.work-requested"))
-            .unwrap()
-            .is_empty());
-        assert!(store
-            .claims_for("schedule/unready", Some("schedule.work-started"))
-            .unwrap()
-            .is_empty());
+        assert_eq!(
+            failed[0].body["fields"]["code"],
+            "no-ready-mission-revision"
+        );
+        assert!(
+            store
+                .claims_for("schedule/unready", Some("schedule.work-requested"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .claims_for("schedule/unready", Some("schedule.work-started"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn unpinned_schedule_keeps_one_attention_until_an_occurrence_succeeds() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+mission "scheduled-cycle" state="draft" { goal "Not ready." }"#,
+            "draft-cycle",
+        );
+        let root = tempfile::tempdir().unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let attention = schedule_head_attention_subject("schedule/unready");
+        for occurrence in 0..4 {
+            if occurrence == 3 {
+                scheduled_mission_revision(&store);
+            }
+            let at = (Utc::now() + chrono::Duration::milliseconds(40))
+                .to_rfc3339_opts(SecondsFormat::Millis, true);
+            apply_source(
+                &store,
+                &format!(
+                    r#"version 2
+schedule "unready" {{
+  at "{at}"
+  work {{ mission "scheduled-cycle"; workspace "{}" }}
+}}"#,
+                    root.path().display()
+                ),
+                &format!("occurrence-{occurrence}"),
+            );
+            reconciler.reconcile_once().unwrap();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            reconciler.reconcile_once().unwrap();
+            assert_eq!(
+                store
+                    .claims_for(&attention, Some("attention.requested"))
+                    .unwrap()
+                    .len(),
+                1
+            );
+            if occurrence < 3 {
+                assert_eq!(
+                    store.attention_request(&attention).unwrap().unwrap().status,
+                    "pending"
+                );
+            }
+        }
+        assert_eq!(
+            store
+                .claims_for("schedule/unready", Some("schedule.work-failed"))
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            store
+                .claims_for("schedule/unready", Some("schedule.work-started"))
+                .unwrap()
+                .len(),
+            1
+        );
+        let closed = store
+            .claims_for(&attention, Some("attention.resolved"))
+            .unwrap();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].body["fields"]["outcome"], "withdrawn");
+        assert!(
+            store
+                .attention_items(None)
+                .unwrap()
+                .iter()
+                .all(|item| item.subject != attention)
+        );
     }
 
     #[tokio::test]
