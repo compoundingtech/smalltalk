@@ -47,7 +47,6 @@ pub fn run_residency_attempt(
     resume_generation: crate::residency::Generation,
     required_incarnation: String,
 ) -> Result<()> {
-
     anyhow::ensure!(
         !required_incarnation.is_empty(),
         "Claude required runtime incarnation is empty"
@@ -553,8 +552,7 @@ pub fn state_dir(catalog_root: &Path, identity: &str) -> PathBuf {
         hash.update(value);
     }
     let digest = format!("{:x}", hash.finalize());
-    crate::run::state_root()
-        .join("st2")
+    crate::run::harness_state_root()
         .join("claude")
         .join(&digest[..24])
 }
@@ -1114,24 +1112,63 @@ pub fn run_observe(
     let agent_dir =
         message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
             .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
+    let mut raw = String::new();
+    let _ = std::io::stdin().read_to_string(&mut raw);
+    let var = |name: &str| std::env::var(name).ok();
+    observe_payload(
+        catalog_root,
+        &agent_dir,
+        identity,
+        runtime_id,
+        event,
+        &raw,
+        &var,
+    )
+}
+
+/// Apply one Claude hook event whose payload the caller already read. st3 answers its seats'
+/// hooks through this, so a hook process never needs an `st2` program. `var` reads the hook's
+/// environment: the wrapper-session variables ([`SESSION_ENV`] and its siblings) and `HOME`.
+pub fn run_observe_payload(
+    catalog_root: &Path,
+    identity: &str,
+    runtime_id: Option<&str>,
+    event: &str,
+    raw: &str,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Result<()> {
+    let agent_dir =
+        message::resolve_declared_dir(catalog_root, identity, &crate::run::detect_host())?
+            .with_context(|| format!("Claude driver agent '{identity}' is not declared"))?;
+    observe_payload(
+        catalog_root,
+        &agent_dir,
+        identity,
+        runtime_id,
+        event,
+        raw,
+        var,
+    )
+}
+
+fn observe_payload(
+    catalog_root: &Path,
+    agent_dir: &Path,
+    identity: &str,
+    runtime_id: Option<&str>,
+    event: &str,
+    raw: &str,
+    var: &dyn Fn(&str) -> Option<String>,
+) -> Result<()> {
     // Counted only once the invocation has its application target: a hook for an undeclared
     // agent errors out before any state is applied and must not inflate `hook_invocations_total`.
     crate::metrics::record_hook_invocation("claude-observe", event);
-    let mut raw = String::new();
-    let _ = std::io::stdin().read_to_string(&mut raw);
-    let payload = serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null);
-    let exported_session = std::env::var(SESSION_ENV)
-        .ok()
-        .filter(|value| !value.is_empty());
-    let exported_seq = std::env::var(SESSION_SEQ_ENV)
-        .ok()
-        .and_then(|seq| seq.parse::<u64>().ok());
-    let resume_generation_raw = std::env::var(RESUME_GENERATION_ENV)
-        .ok()
-        .filter(|value| !value.is_empty());
-    let expected_native_session = std::env::var(EXPECTED_NATIVE_SESSION_ENV)
-        .ok()
-        .filter(|value| !value.is_empty());
+    let payload = serde_json::from_str(raw).unwrap_or(serde_json::Value::Null);
+    let exported_session = var(SESSION_ENV).filter(|value| !value.is_empty());
+    let exported_seq = var(SESSION_SEQ_ENV).and_then(|seq| seq.parse::<u64>().ok());
+    let resume_generation_raw = var(RESUME_GENERATION_ENV).filter(|value| !value.is_empty());
+    let expected_native_session =
+        var(EXPECTED_NATIVE_SESSION_ENV).filter(|value| !value.is_empty());
     let mandatory_resume = resume_generation_raw.is_some() || expected_native_session.is_some();
     let resume_generation = resume_generation_raw
         .map(|value| {
@@ -1172,7 +1209,7 @@ pub fn run_observe(
                 .and_then(serde_json::Value::as_str),
         ) {
             if !native_id.is_empty() {
-                if let Err(error) = write_native_session_binding(&agent_dir, incarnation, native_id)
+                if let Err(error) = write_native_session_binding(agent_dir, incarnation, native_id)
                 {
                     tracing::warn!(
                         "st2 claude-observe: native session binding write failed: {error:#}"
@@ -1186,14 +1223,14 @@ pub fn run_observe(
         .or_else(|| wrapperless_token(&payload))
         .unwrap_or_else(|| format!("unattributed:{}", runtime_id.unwrap_or(identity)));
     let mut timeline =
-        crate::harness_timeline::Writer::new(&agent_dir, "claude", timeline_incarnation);
+        crate::harness_timeline::Writer::new(agent_dir, "claude", timeline_incarnation);
     if let Err(error) = crate::harness_timeline::observe_claude(&mut timeline, event, &payload) {
         // Timeline observability is fail-open just like state/context publication: a record fault
         // must not hold up the hook process Claude is waiting on.
         tracing::warn!("st2 claude-observe: harness-timeline write failed: {error:#}");
     }
     if event == "Stop" {
-        if let Some(home) = std::env::var_os("HOME") {
+        if let Some(home) = var("HOME") {
             if let Err(error) = crate::harness_timeline::observe_claude_stop_transcript(
                 &mut timeline,
                 &payload,
@@ -1207,7 +1244,7 @@ pub fn run_observe(
     // events that carry a compaction edge say nothing about top-level harness state and would
     // otherwise return below. Fail-open: a context record that cannot be written must never stop
     // a hook the harness is waiting on, and the numbers authorize nothing (HC-A02).
-    if let Err(error) = observe_compaction(&agent_dir, identity, event, &payload) {
+    if let Err(error) = observe_compaction(agent_dir, identity, event, &payload) {
         tracing::warn!("st2 claude-observe: harness-context compaction write failed: {error:#}");
     }
     // The credential axis is independent of both the numbers and the categorical state, and is
@@ -1215,7 +1252,7 @@ pub fn run_observe(
     // an edge that carries no top-level state change must still reach its own record.
     if let Some(edge) = provider_auth_edge(event, &payload) {
         driver_diagnostic::publish_provider_auth(
-            &agent_dir,
+            agent_dir,
             driver_diagnostic::Driver::Claude,
             edge,
         );
@@ -1224,7 +1261,7 @@ pub fn run_observe(
         return Ok(());
     };
     let mut writer = observe_writer(
-        &agent_dir,
+        agent_dir,
         identity,
         runtime_id,
         event,
