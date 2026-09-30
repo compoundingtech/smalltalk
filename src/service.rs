@@ -359,7 +359,7 @@ fn uninstall_systemd_user() -> Result<()> {
 #[cfg(not(target_os = "linux"))]
 fn unsupported() -> Result<()> {
     bail!(
-        "st2 service is Linux/systemd-user only (headless hosts like hetz). On macOS, run \
+        "st2 service is Linux/systemd-user only (headless hosts like example-linux). On macOS, run \
          `st2 up --catalog <catalog>` yourself — the Mac stays manual for TCC reasons (a launchd-owned \
          process can't inherit your GUI/keychain trust)."
     )
@@ -477,10 +477,10 @@ mod tests {
     #[test]
     fn unit_runs_st2_up_with_restart_and_memory_limit() -> Result<()> {
         let spec = ServiceSpec::new(
-            "/home/user/.cargo/bin/st2",
-            "/home/user/catalog",
+            "/home/example/.cargo/bin/st2",
+            "/home/example/catalog",
             None,
-            "/home/user/.cargo/bin:/home/user/.local/bin:/usr/bin",
+            "/home/example/.cargo/bin:/home/example/.local/bin:/usr/bin",
             None,
             None,
             DEFAULT_MEMORY_MAX_MB,
@@ -490,16 +490,16 @@ mod tests {
         let unit = render_systemd_user_unit(&spec);
 
         assert!(
-            unit.contains("ExecStart=/home/user/.cargo/bin/st2 up --catalog /home/user/catalog")
+            unit.contains("ExecStart=/home/example/.cargo/bin/st2 up --catalog /home/example/catalog")
         );
         // No --host baked when unset → st2 up auto-detects, same as a manual run.
         assert!(!unit.contains("--host"));
         assert!(unit.contains("Restart=on-failure"));
         assert!(unit.contains("RestartSec=5s"));
         assert!(unit.contains("MemoryMax=1024M"));
-        assert!(unit.contains("WorkingDirectory=/home/user/catalog"));
+        assert!(unit.contains("WorkingDirectory=/home/example/catalog"));
         assert!(
-            unit.contains("Environment=PATH=/home/user/.cargo/bin:/home/user/.local/bin:/usr/bin")
+            unit.contains("Environment=PATH=/home/example/.cargo/bin:/home/example/.local/bin:/usr/bin")
         );
         assert!(!unit.contains("Environment=PTY_ROOT="));
         assert!(unit.contains("WantedBy=default.target"));
@@ -512,7 +512,7 @@ mod tests {
         let spec = ServiceSpec::new(
             "/usr/local/bin/st2",
             "/srv/catalog",
-            Some("hetz".to_string()),
+            Some("example-linux".to_string()),
             "/usr/local/bin:/usr/bin",
             Some(PathBuf::from("/srv/legacy-pty")),
             Some(crate::residency_host::HostPolicy {
@@ -526,7 +526,7 @@ mod tests {
         let unit = render_systemd_user_unit(&spec);
 
         assert!(unit.contains(
-            "ExecStart=/usr/local/bin/st2 up --catalog /srv/catalog --host hetz \
+            "ExecStart=/usr/local/bin/st2 up --catalog /srv/catalog --host example-linux \
              --residency-idle-after 300000ms --residency-warm-capacity 2"
         ));
         assert!(unit.contains("MemoryMax=512M"));
@@ -585,8 +585,8 @@ mod tests {
 
     #[test]
     fn service_path_is_deterministic_and_deduplicates_the_executable_directory() -> Result<()> {
-        let home = Path::new("/home/operator");
-        let path = service_path_for(Path::new("/home/operator/.cargo/bin/st2"), home)?;
+        let home = Path::new("/home/example");
+        let path = service_path_for(Path::new("/home/example/.cargo/bin/st2"), home)?;
         let entries = env::split_paths(&path).collect::<Vec<_>>();
 
         assert_eq!(

@@ -7,19 +7,19 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 fn write_agent(root: &Path) -> PathBuf {
-    let dir = root.join("agents/hetz/worker");
+    let dir = root.join("agents/example-linux/worker");
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join("agent.kdl"),
         r#"agent "worker" {
-  host "hetz"
+  host "example-linux"
   command "agent"
   resource "goal" uri="resources/goal.md" reason="Mission."
   resource "journal" uri="resources/context/journal.md" reason="Agent-authored store."
 }"#,
     )
     .unwrap();
-    st2::event::publish_owner_binding_for_test(root, "hetz").unwrap();
+    st2::event::publish_owner_binding_for_test(root, "example-linux").unwrap();
     dir
 }
 
@@ -27,18 +27,18 @@ fn write_agent(root: &Path) -> PathBuf {
 /// catalog-relative path.
 #[cfg(feature = "wasm-resolver")]
 fn write_agent_with_goal_scheme(root: &Path) -> PathBuf {
-    let dir = root.join("agents/hetz/worker");
+    let dir = root.join("agents/example-linux/worker");
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join("agent.kdl"),
         r#"agent "worker" {
-  host "hetz"
+  host "example-linux"
   command "agent"
-  resource "goal" uri="dev.schickling.agent-goal://hetz/worker" reason="Mission."
+  resource "goal" uri="dev.schickling.agent-goal://example-linux/worker" reason="Mission."
 }"#,
     )
     .unwrap();
-    st2::event::publish_owner_binding_for_test(root, "hetz").unwrap();
+    st2::event::publish_owner_binding_for_test(root, "example-linux").unwrap();
     dir
 }
 
@@ -77,11 +77,11 @@ fn carrier_change_emits_one_superseded_resync_event_and_silent_stores_stay_quiet
 
     // Seed the baseline before any writes: the seeded digest emits nothing.
     let supervisor =
-        st2::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".to_owned());
+        st2::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "example-linux".to_owned());
     let specs = st2::discover_strict(catalog.path()).specs;
     assert!(
         supervisor
-            .refresh(&specs, &specs, "hetz", &[], &[])
+            .refresh(&specs, &specs, "example-linux", &[], &[])
             .is_empty()
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -107,8 +107,8 @@ fn carrier_change_emits_one_superseded_resync_event_and_silent_stores_stay_quiet
     // Public ingress cannot forge or supersede the supervisor's unread built-in event.
     let error = st2::event::emit(
         catalog.path(),
-        "hetz",
-        "hetz.worker",
+        "example-linux",
+        "example-linux.worker",
         "resync",
         "forged-resync",
         Some("goal"),
@@ -168,11 +168,11 @@ fn whole_file_declaration_replacement_by_rename_notifies_immediately() {
     let declaration = agent_dir.join("agent.kdl");
 
     let supervisor =
-        st2::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".to_owned());
+        st2::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "example-linux".to_owned());
     let specs = st2::discover_strict(catalog.path()).specs;
     assert!(
         supervisor
-            .refresh(&specs, &specs, "hetz", &[], &[])
+            .refresh(&specs, &specs, "example-linux", &[], &[])
             .is_empty()
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -202,12 +202,12 @@ fn whole_file_declaration_replacement_by_rename_notifies_immediately() {
 #[test]
 fn declaring_the_reserved_resync_stream_is_refused() {
     let catalog = tempfile::tempdir().unwrap();
-    let dir = catalog.path().join("agents/hetz/worker");
+    let dir = catalog.path().join("agents/example-linux/worker");
     fs::create_dir_all(&dir).unwrap();
     fs::write(
         dir.join("agent.kdl"),
         r#"agent "worker" {
-  host "hetz"
+  host "example-linux"
   command "agent"
   stream "resync" {}
 }"#,
@@ -265,13 +265,13 @@ fn declared_wasm_profile_resolves_a_scheme_uri_goal_binding_and_fires_on_change(
 
     let supervisor = st2::resync::ResyncSupervisor::with_profiles(
         catalog.path().to_path_buf(),
-        "hetz".to_owned(),
+        "example-linux".to_owned(),
         registry,
     );
     let specs = st2::discover_strict(catalog.path()).specs;
     assert!(
         supervisor
-            .refresh(&specs, &specs, "hetz", &[], &[])
+            .refresh(&specs, &specs, "example-linux", &[], &[])
             .is_empty()
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -299,13 +299,13 @@ fn declared_profile_class_governs_and_resolver_failures_stay_contained() {
     catalog_with_profile(silent.path(), "silent");
     let supervisor = st2::resync::ResyncSupervisor::with_profiles(
         silent.path().to_path_buf(),
-        "hetz".to_owned(),
+        "example-linux".to_owned(),
         st2::catalog::declared_profiles(silent.path()).unwrap(),
     );
     let specs = st2::discover_strict(silent.path()).specs;
     assert!(
         supervisor
-            .refresh(&specs, &specs, "hetz", &[], &[])
+            .refresh(&specs, &specs, "example-linux", &[], &[])
             .is_empty()
     );
     std::thread::sleep(Duration::from_millis(300));
@@ -331,7 +331,7 @@ fn declared_profile_class_governs_and_resolver_failures_stay_contained() {
     fs::write(broken.path().join("broken.wasm"), b"not a module").unwrap();
     let registry = st2::catalog::declared_profiles(broken.path()).unwrap();
     let spec = &st2::discover_strict(broken.path()).specs[0];
-    let set = st2::resync::watch_set_for(spec, "hetz", &registry);
+    let set = st2::resync::watch_set_for(spec, "example-linux", &registry);
     assert!(
         !set.carriers.iter().any(|c| c.label == "goal"),
         "a failing resolver must not produce a carrier"
@@ -341,7 +341,7 @@ fn declared_profile_class_governs_and_resolver_failures_stay_contained() {
         registry
             .try_resolve(
                 broken_dir.parent().unwrap(),
-                "dev.schickling.agent-goal://hetz/w"
+                "dev.schickling.agent-goal://example-linux/w"
             )
             .is_err()
     );

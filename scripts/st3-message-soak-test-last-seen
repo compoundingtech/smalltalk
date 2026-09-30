@@ -16,7 +16,7 @@ ST
 chmod +x "$root/st"
 export TEST_CALLS="$root/unexpected"
 export ST3_BIN="$root/st" ST_AGENT=agent/fixture/monitor
-export FABRIC_BIN="$root/st" ST3_SOAK_SILBER_BIN="$root/st"
+export FABRIC_BIN="$root/st" ST3_SOAK_EXAMPLE_MAC_BIN="$root/st"
 export ST3_SOAK_STATE_DIR="$root/state"
 set +e
 output=$(bash "$here/st3-message-soak" --once harbor-to-traveller 2>&1)

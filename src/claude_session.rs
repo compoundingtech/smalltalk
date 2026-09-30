@@ -1795,7 +1795,7 @@ mod tests {
             argv,
             Path::new("/opt/st3/bin/st3"),
             Path::new("/var/lib/st3"),
-            "fleet/typecase/standing/typecase",
+            "example/typecase/standing/typecase",
         )
         .unwrap();
 
@@ -1813,7 +1813,7 @@ mod tests {
                 "driver",
                 "claude-mcp",
                 "--subject",
-                "agent/fleet/typecase/standing/typecase"
+                "agent/example/typecase/standing/typecase"
             ])
         );
         assert!(
@@ -1862,7 +1862,7 @@ mod tests {
             argv,
             Path::new("/opt/st3/bin/st3"),
             Path::new("/var/lib/st3"),
-            "fleet/typecase/standing/typecase",
+            "example/typecase/standing/typecase",
         )
         .unwrap_err();
 
@@ -2200,15 +2200,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let record = harness_state_path(tmp.path());
         let observer =
-            SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker").unwrap();
+            SessionObserver::new(tmp.path(), "example-linux.worker", "claude", "example-linux.worker").unwrap();
 
         // A hook process wrote a blocked observation between wrapper ticks — carrying the
         // wrapper's exported token, exactly as the env plumbing arranges in a real seat.
         harness_state::Writer::new(
             tmp.path(),
-            "hetz.worker",
+            "example-linux.worker",
             "claude",
-            Some("hetz.worker".to_string()),
+            Some("example-linux.worker".to_string()),
         )
         .with_session(observer.session())
         .observe(observe_hook_event("PermissionRequest", &serde_json::Value::Null).unwrap())
@@ -2231,15 +2231,15 @@ mod tests {
         let presence = status::status_path(tmp.path());
         let record = harness_state_path(tmp.path());
         let observer =
-            SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker").unwrap();
+            SessionObserver::new(tmp.path(), "example-linux.worker", "claude", "example-linux.worker").unwrap();
         let stop = AtomicBool::new(false);
 
         // A turn is in flight when the provider dies by signal.
         harness_state::Writer::new(
             tmp.path(),
-            "hetz.worker",
+            "example-linux.worker",
             "claude",
-            Some("hetz.worker".to_string()),
+            Some("example-linux.worker".to_string()),
         )
         .observe(observe_hook_event("UserPromptSubmit", &serde_json::Value::Null).unwrap())
         .unwrap();
@@ -2266,7 +2266,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let presence = status::status_path(tmp.path());
         let observer =
-            SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker").unwrap();
+            SessionObserver::new(tmp.path(), "example-linux.worker", "claude", "example-linux.worker").unwrap();
         let stop = AtomicBool::new(false);
 
         run_provider(
@@ -2317,15 +2317,15 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let record = harness_state_path(tmp.path());
         let observer =
-            SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker").unwrap();
+            SessionObserver::new(tmp.path(), "example-linux.worker", "claude", "example-linux.worker").unwrap();
         observer.ended("exit 0");
 
         // The straggler hook shares the session token (env plumbing) and is suppressed.
         let mut late = harness_state::Writer::new(
             tmp.path(),
-            "hetz.worker",
+            "example-linux.worker",
             "claude",
-            Some("hetz.worker".to_string()),
+            Some("example-linux.worker".to_string()),
         )
         .with_session(observer.session());
         assert!(
@@ -2344,9 +2344,9 @@ mod tests {
         // claimed record: only a written claim supersedes.
         let mut fallback = harness_state::Writer::new(
             tmp.path(),
-            "hetz.worker",
+            "example-linux.worker",
             "claude",
-            Some("hetz.worker".to_string()),
+            Some("example-linux.worker".to_string()),
         )
         .with_session("claude-session-fresh");
         fallback.interrupt();
@@ -2364,12 +2364,12 @@ mod tests {
 
         // A claimed new session — the wrapper path — supersedes the old terminal record.
         let next =
-            SessionObserver::new(tmp.path(), "hetz.worker", "claude", "hetz.worker").unwrap();
+            SessionObserver::new(tmp.path(), "example-linux.worker", "claude", "example-linux.worker").unwrap();
         let mut fresh = harness_state::Writer::new(
             tmp.path(),
-            "hetz.worker",
+            "example-linux.worker",
             "claude",
-            Some("hetz.worker".to_string()),
+            Some("example-linux.worker".to_string()),
         )
         .with_ownership(next.session().to_string(), next.seq());
         assert!(
@@ -2397,7 +2397,7 @@ mod tests {
         let payload_b = serde_json::json!({ "session_id": "bbb" });
         let drive = |event: &str, payload: &serde_json::Value| {
             let mut writer =
-                observe_writer(tmp.path(), "hetz.worker", None, event, payload, None, None);
+                observe_writer(tmp.path(), "example-linux.worker", None, event, payload, None, None);
             writer
                 .observe_unless_ended(observe_hook_event(event, payload).unwrap())
                 .unwrap()
@@ -2501,7 +2501,7 @@ mod tests {
 
     fn agent_dir(tmp: &tempfile::TempDir) -> std::path::PathBuf {
         // One level down, so the writer has a parent to stage in outside the agent subtree.
-        let dir = tmp.path().join("agents/Silber/fabric");
+        let dir = tmp.path().join("agents/ExampleMac/fabric");
         fs::create_dir_all(&dir).unwrap();
         dir
     }
@@ -2516,7 +2516,7 @@ mod tests {
         let dir = agent_dir(&tmp);
         let payload = fixture(PRE_TURN);
 
-        let mut writer = context_writer(&dir, "Silber.fabric", &payload).unwrap();
+        let mut writer = context_writer(&dir, "ExampleMac.fabric", &payload).unwrap();
         assert!(writer.observe(statusline_reading(&payload)).unwrap());
         // A withheld percent has no bucket, so a second identical render is inside the written
         // one and, well inside the heartbeat, writes nothing. That is the write guard (HC-R09)
@@ -2538,7 +2538,7 @@ mod tests {
         let mut payload = session.clone();
         payload["trigger"] = "auto".into();
 
-        observe_compaction(&dir, "Silber.fabric", "PreCompact", &payload).unwrap();
+        observe_compaction(&dir, "ExampleMac.fabric", "PreCompact", &payload).unwrap();
         let counted = context(&dir);
         assert_eq!(counted.compactions, 1);
         assert_eq!(
@@ -2547,7 +2547,7 @@ mod tests {
         );
 
         // The completion edge holds the count and only moves `lastCompactionMs` forward.
-        observe_compaction(&dir, "Silber.fabric", "PostCompact", &payload).unwrap();
+        observe_compaction(&dir, "ExampleMac.fabric", "PostCompact", &payload).unwrap();
         let completed = context(&dir);
         assert_eq!(
             completed.compactions, 1,
@@ -2559,7 +2559,7 @@ mod tests {
         // and deliberately inert — counting it is exactly the double count HC-R12 forbids.
         let mut restart = session;
         restart["source"] = "compact".into();
-        observe_compaction(&dir, "Silber.fabric", "SessionStart", &restart).unwrap();
+        observe_compaction(&dir, "ExampleMac.fabric", "SessionStart", &restart).unwrap();
         assert_eq!(context(&dir).compactions, 1);
     }
 
@@ -2571,7 +2571,7 @@ mod tests {
 
         // No record at all: the PreCompact write never landed, so PostCompact is the first
         // evidence st2 has that a compaction happened and it counts rather than losing it.
-        observe_compaction(&dir, "Silber.fabric", "PostCompact", &payload).unwrap();
+        observe_compaction(&dir, "ExampleMac.fabric", "PostCompact", &payload).unwrap();
         let observed = context(&dir);
         assert_eq!(observed.compactions, 1);
         assert_eq!(
@@ -2588,7 +2588,7 @@ mod tests {
             "session_id": "s-1", "trigger": "auto", "agent_id": "sub-7"
         });
 
-        observe_compaction(&dir, "Silber.fabric", "PreCompact", &payload).unwrap();
+        observe_compaction(&dir, "ExampleMac.fabric", "PreCompact", &payload).unwrap();
         assert!(harness_context::read(&harness_context::harness_context_path(&dir)).is_none());
     }
 
@@ -2627,7 +2627,7 @@ mod tests {
             wrapperless_token(&payload).as_deref(),
             Some("claude-session-abc")
         );
-        context_writer(&dir, "Silber.fabric", &payload)
+        context_writer(&dir, "ExampleMac.fabric", &payload)
             .unwrap()
             .observe(statusline_reading(&payload))
             .unwrap();

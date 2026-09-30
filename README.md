@@ -72,6 +72,15 @@ disables this step. Reapplying is safe, but removing a file does **not** delete
 its previously published declaration until managed-set apply exists (#646).
 The optional `ptyPackage` replaces the bundled `pty` for both the daemon and
 seats, working around the executable-directory PATH precedence in #633.
+
+Activation atomically installs a real `st3` executable at `stateDir/bin/st3` (by default
+`~/.local/state/st3/bin/st3`) before restarting the daemon, with `st` as an alias in that directory.
+The daemon, declaration-apply service, and service PATH use this stable location so running seats
+can follow new builds without ending their harness sessions. Unchanged contents are not rewritten.
+Package references in the systemd unit or launchd plist still trigger daemon restarts on upgrades.
+Seats started from store paths before this change remain stale until restarted; see
+[seats across deploys](docs/st3/seat-deploys.md).
+
 Linux user-manager lingering and macOS `st service permissions` remain host
 setup prerequisites. Fleet/replication setup is not managed by this module.
 
@@ -114,6 +123,10 @@ log.
 
 If the state directory has a long path, set `XDG_RUNTIME_DIR` to a shorter directory or pass
 `--socket` and `--client-gateway-socket` to `st up` so both Unix socket paths fit the OS limit.
+When `st up` receives a private `--state-dir` or `--socket` without an explicit
+`--client-gateway-socket`, its paired gateway is placed beside that private socket (or
+in the private state directory when no socket is specified). An existing live listener
+at either socket path is never replaced; choose a different path instead.
 
 ## Run st on more than one machine
 
@@ -194,7 +207,7 @@ st agents start example/worker --harness claude --model claude-sonnet-5 --effort
 ```kdl
 version 2
 agent "example/worker" {
-    workspace "/home/ada/src/garden"
+    workspace "/home/example/src/garden"
     restart always
     harness claude {
         model claude-sonnet-5

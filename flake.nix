@@ -36,14 +36,19 @@
         hmModuleEval = nixpkgs.lib.evalModules {
           specialArgs = {
             inherit pkgs;
-            lib = pkgs.lib // { hm.dag.entryAfter = _: value: value; };
+            lib = pkgs.lib // {
+              hm.dag = rec {
+                entryBetween = before: after: data: { inherit before after data; };
+                entryAfter = entryBetween [ ];
+              };
+            };
           };
           modules = [
             self.homeManagerModules.default
             ({ lib, ... }: {
               options = {
-                xdg.configHome = lib.mkOption { type = lib.types.str; default = "/home/test/.config"; };
-                xdg.stateHome = lib.mkOption { type = lib.types.str; default = "/home/test/.local/state"; };
+                xdg.configHome = lib.mkOption { type = lib.types.str; default = "/home/example/.config"; };
+                xdg.stateHome = lib.mkOption { type = lib.types.str; default = "/home/example/.local/state"; };
                 xdg.configFile = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
                 home.packages = lib.mkOption { type = lib.types.listOf lib.types.package; default = [ ]; };
                 home.activation = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
@@ -704,6 +709,15 @@
         checks.hm-module-eval =
           let
             rendered = hmModuleEval.config;
+            stableBinDir = "${rendered.services.smalltalk.stateDir}/bin";
+            stableExecutable = "${stableBinDir}/st3";
+            package = toString (builtins.head rendered.home.packages);
+            activation = rendered.home.activation.smalltalkBinary;
+            daemonEnvironment = if pkgs.stdenv.hostPlatform.isLinux then
+              rendered.systemd.user.services.smalltalk.Service.Environment
+            else
+              pkgs.lib.mapAttrsToList (name: value: "${name}=${value}")
+                rendered.launchd.agents.smalltalk.config.EnvironmentVariables;
             args = if pkgs.stdenv.hostPlatform.isLinux then
               rendered.systemd.user.services.smalltalk.Service.ExecStart
             else
@@ -712,6 +726,21 @@
           assert pkgs.lib.hasInfix ''person = "person/ada"'' rendered.xdg.configFile."st3/config.toml".text;
           assert pkgs.lib.hasInfix "/tmp/smalltalk-test.sock" args;
           assert pkgs.lib.hasInfix "--pty-binary" args;
+          assert (if pkgs.stdenv.hostPlatform.isLinux then
+            pkgs.lib.hasPrefix ''"${stableExecutable}" '' args
+          else
+            builtins.head rendered.launchd.agents.smalltalk.config.ProgramArguments == stableExecutable);
+          assert builtins.match ".*/nix/store/[^ ]*/bin/st3.*" args == null;
+          assert (if pkgs.stdenv.hostPlatform.isLinux then
+            map toString rendered.systemd.user.services.smalltalk.Unit.X-Restart-Triggers == [ package ]
+          else
+            rendered.launchd.agents.smalltalk.config.EnvironmentVariables.SMALLTALK_PACKAGE == package);
+          assert builtins.any (pkgs.lib.hasPrefix "PATH=${stableBinDir}:") daemonEnvironment;
+          assert activation.after == [ "writeBoundary" ];
+          assert activation.before == [
+            (if pkgs.stdenv.hostPlatform.isLinux then "reloadSystemd" else "setupLaunchAgents")
+          ];
+          assert builtins.deepSeq activation.data true;
           assert builtins.length rendered.home.packages == 1;
           assert builtins.deepSeq (if pkgs.stdenv.hostPlatform.isLinux then
             rendered.systemd.user.services.smalltalk-apply.Service.ExecStart
