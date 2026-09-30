@@ -2787,14 +2787,14 @@ mod tests {
     }
 
     /// Plans a checkpoint over a copy of a real store and prints the dry run:
-    /// `ST3_CHECKPOINT_STORE=/var/tmp/copy.sqlite3 ST3_CHECKPOINT_ORIGIN=hetz
+    /// `ST3_CHECKPOINT_STORE=/var/tmp/copy.sqlite3 ST3_CHECKPOINT_ORIGIN=example-linux
     /// ST3_CHECKPOINT_DAY=2026-09-27 cargo test -p st3 --lib plan_a_copy_of_a_real_store --
     /// --ignored --nocapture`. The copy is changed; the store it came from is not read.
     #[test]
     #[ignore = "reads the store copy named by ST3_CHECKPOINT_STORE"]
     fn plan_a_copy_of_a_real_store() {
         let path = PathBuf::from(std::env::var("ST3_CHECKPOINT_STORE").unwrap());
-        let origin = std::env::var("ST3_CHECKPOINT_ORIGIN").unwrap_or_else(|_| "hetz".into());
+        let origin = std::env::var("ST3_CHECKPOINT_ORIGIN").unwrap_or_else(|_| "example-linux".into());
         let day = std::env::var("ST3_CHECKPOINT_DAY").unwrap();
         let started = std::time::Instant::now();
         let store = Store::open(&path, origin).unwrap();

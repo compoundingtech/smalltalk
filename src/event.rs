@@ -1244,16 +1244,16 @@ mod tests {
     use super::*;
 
     fn declare_worker(root: &Path, extra: &str) -> PathBuf {
-        let directory = root.join("agents/hetz/worker");
+        let directory = root.join("agents/example-linux/worker");
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
             directory.join("agent.kdl"),
             format!(
-                "agent \"worker\" {{\n  host \"hetz\"\n{extra}  desired-state \"running\"\n  command \"agent\"\n}}\n"
+                "agent \"worker\" {{\n  host \"example-linux\"\n{extra}  desired-state \"running\"\n  command \"agent\"\n}}\n"
             ),
         )
         .unwrap();
-        publish_owner_binding_for_test(root, "hetz").unwrap();
+        publish_owner_binding_for_test(root, "example-linux").unwrap();
         directory
     }
 
@@ -1273,10 +1273,10 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let agent = declare_worker(root.path(), "  address \"chat\"\n  stream \"gh-ci\" {}\n");
 
-        for reference in ["hetz.chat", "chat"] {
+        for reference in ["example-linux.chat", "chat"] {
             let receipt = emit(
                 root.path(),
-                "hetz",
+                "example-linux",
                 reference,
                 "gh-ci",
                 &format!("run-{reference}"),
@@ -1286,14 +1286,14 @@ mod tests {
                 false,
             )
             .expect("the declared address routes");
-            assert_eq!(receipt.recipient, "hetz.worker");
+            assert_eq!(receipt.recipient, "example-linux.worker");
         }
-        assert_eq!(stream_state(&agent, "gh-ci").recipient, "hetz.worker");
+        assert_eq!(stream_state(&agent, "gh-ci").recipient, "example-linux.worker");
 
         let refused = emit(
             root.path(),
-            "hetz",
-            "hetz.worker",
+            "example-linux",
+            "example-linux.worker",
             "gh-ci",
             "run-legacy",
             None,
@@ -1303,7 +1303,7 @@ mod tests {
         )
         .expect_err("the identity spelling is not an address once one is declared");
         assert!(
-            format!("{refused:#}").contains("no agent 'hetz.worker' found"),
+            format!("{refused:#}").contains("no agent 'example-linux.worker' found"),
             "{refused:#}"
         );
     }
@@ -1319,8 +1319,8 @@ mod tests {
 
         let receipt = emit_builtin_resync(
             root.path(),
-            "hetz",
-            "hetz.worker",
+            "example-linux",
+            "example-linux.worker",
             "resync-1",
             None,
             None,
@@ -1328,17 +1328,17 @@ mod tests {
             false,
         )
         .expect("the agent key reaches its own subject after a cutover");
-        assert_eq!(receipt.recipient, "hetz.worker");
+        assert_eq!(receipt.recipient, "example-linux.worker");
         assert_eq!(receipt.status, EventReceiptStatus::Created);
         assert_eq!(
             stream_state(&agent, crate::resync::RESYNC_STREAM).recipient,
-            "hetz.worker"
+            "example-linux.worker"
         );
         let inbox = crate::message::list_inbox(&crate::message::inbox_dir(&agent)).unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(
             inbox[0].from.as_deref(),
-            Some(format!("hetz.worker/{}", crate::resync::RESYNC_STREAM).as_str())
+            Some(format!("example-linux.worker/{}", crate::resync::RESYNC_STREAM).as_str())
         );
     }
 }

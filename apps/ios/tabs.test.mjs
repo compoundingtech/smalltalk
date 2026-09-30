@@ -17,7 +17,7 @@ assert.deepEqual(parseDevLink(`${scheme}tab/Now`), { kind: 'tab', tab: 'Home' })
 assert.deepEqual(parseDevLink(`${scheme}tab/Agents`), { kind: 'tab', tab: 'Agents' });
 assert.deepEqual(parseDevLink(`${scheme}session?id=session/abc&terminal=terminal/t`), { kind: 'session', id: 'session/abc', terminal: 'terminal/t' });
 assert.deepEqual(parseDevLink(`${scheme}session?id=session/abc`), { kind: 'session', id: 'session/abc' });
-assert.deepEqual(parseDevLink(`${scheme}agent?id=agent/fleet/stui`), { kind: 'agent', id: 'agent/fleet/stui' });
+assert.deepEqual(parseDevLink(`${scheme}agent?id=agent/example/stui`), { kind: 'agent', id: 'agent/example/stui' });
 assert.deepEqual(parseDevLink(`${scheme}mission?id=mission/x`), { kind: 'mission', id: 'mission/x' });
 assert.deepEqual(parseDevLink(`${scheme}scroll?y=800`), { kind: 'scroll', y: 800 });
 assert.deepEqual(parseDevLink(`${scheme}tree?on=0`), { kind: 'tree', on: false });

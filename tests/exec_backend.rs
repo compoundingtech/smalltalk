@@ -16,7 +16,7 @@ fn exec_target(id: &str, command: &str) -> TaskTarget {
     TaskTarget {
         kind: TaskKind::Exec,
         pty_id: id.to_string(),
-        bus_id: "hetz.demo".to_string(),
+        bus_id: "example-linux.demo".to_string(),
         name: "ding".to_string(),
         derived: false,
         launch: TaskLaunch::Shell(command.to_string()),
@@ -73,7 +73,7 @@ fn exec_spawns_terminal_free_process_tracks_liveness_kills_and_cleans_up() {
     fs::create_dir_all(&catalog).unwrap();
     let backend = ExecBackend::new(state.clone(), catalog.clone());
 
-    let id = "hetz.demo.ding";
+    let id = "example-linux.demo.ding";
     let target = exec_target(id, "sleep 30");
     backend.spawn(&target, tmp.path()).unwrap();
 
@@ -120,7 +120,7 @@ fn exec_expands_catalog_in_env_and_command() {
     let out = tmp.path().join("out.txt");
     // $CATALOG in the command (sh -c expands it via the injected CATALOG env) and an env value.
     let mut target = exec_target(
-        "hetz.demo.probe",
+        "example-linux.demo.probe",
         &format!("printf '%s|%s' \"$CATALOG\" \"$DATA\" > {}", out.display()),
     );
     target.env.insert("DATA".into(), "$CATALOG/x".into());
@@ -133,8 +133,8 @@ fn exec_expands_catalog_in_env_and_command() {
     let cat = catalog.display().to_string();
     assert_eq!(got, format!("{cat}|{cat}/x"));
 
-    backend.kill("hetz.demo.probe").ok();
-    backend.remove("hetz.demo.probe").ok();
+    backend.kill("example-linux.demo.probe").ok();
+    backend.remove("example-linux.demo.probe").ok();
 }
 
 #[test]
@@ -145,7 +145,7 @@ fn exec_launches_direct_argv_with_literal_boundaries_and_catalog_expansion() {
     fs::create_dir_all(&catalog).unwrap();
     let backend = ExecBackend::new(state, catalog.clone());
 
-    let id = "hetz.demo.direct";
+    let id = "example-linux.demo.direct";
     backend
         .spawn(
             &argv_target(
@@ -186,7 +186,7 @@ fn exec_auto_logs_stdout_and_stderr_to_catalog_logs() {
     fs::create_dir_all(&catalog).unwrap();
     let backend = ExecBackend::new(state, catalog.clone());
 
-    let id = "hetz.demo.ding";
+    let id = "example-linux.demo.ding";
     backend
         .spawn(
             &exec_target(id, "echo OUT_LINE; echo ERR_LINE 1>&2"),
@@ -214,7 +214,7 @@ fn exec_restart_reap_keeps_bounded_diagnostics_and_final_remove_cleans_them() {
     let catalog = tmp.path().join("catalog");
     fs::create_dir_all(&catalog).unwrap();
     let backend = ExecBackend::new(state.clone(), catalog.clone());
-    let id = "hetz.demo.crasher";
+    let id = "example-linux.demo.crasher";
     let current = catalog.join("logs").join(format!("{id}.log"));
     let previous = catalog.join("logs").join(format!("{id}.log.1"));
 
@@ -330,7 +330,7 @@ fn exec_kill_reaps_the_whole_process_group_not_just_the_leader() {
     fs::create_dir_all(&catalog).unwrap();
     let backend = ExecBackend::new(state.clone(), catalog.clone());
 
-    let id = "hetz.demo.forky";
+    let id = "example-linux.demo.forky";
     // dash backgrounds one sleep and foregrounds another → leader (dash) + 2 child sleeps, all in the
     // one setsid group, distinct pids. A kill-the-leader-only teardown would orphan the sleeps.
     backend

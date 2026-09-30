@@ -135,8 +135,8 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
   const feed = new Feed(client, handlers, new ForegroundGate('active'), () => 'action/test', [5]);
   await settle();
   const frames = [], issues = [];
-  const follow = feed.followConversation('agent/fleet/worker', { onEntries: frame => frames.push(frame), onIssue: issue => issues.push(issue) });
-  assert.deepEqual(sockets[0].sent.at(-1), { kind: 'subscribe', id: 'conversation', collection: 'conversation', conversation: 'agent/fleet/worker' });
+  const follow = feed.followConversation('agent/example/worker', { onEntries: frame => frames.push(frame), onIssue: issue => issues.push(issue) });
+  assert.deepEqual(sockets[0].sent.at(-1), { kind: 'subscribe', id: 'conversation', collection: 'conversation', conversation: 'agent/example/worker' });
   sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: true, items: [{ id: 'entry/1' }], has_more: true });
   sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: false, items: [{ id: 'entry/2' }] });
   assert.deepEqual(frames.map(frame => [frame.replace, frame.items.map(item => item.id), frame.hasMore]), [[true, ['entry/1'], true], [false, ['entry/2'], false]]);

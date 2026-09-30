@@ -62,7 +62,7 @@ def older_count(value: str) -> int:
 
 def main(binary: str) -> None:
     session = f"stui-qa-{uuid.uuid4().hex[:10]}"
-    actor = os.environ.get("ST3_PERSON", "person/nathan")
+    actor = os.environ.get("ST3_PERSON", "person/alex")
     subprocess.run(
         [PTY, "run", "-d", "-e", "--id", session,
          "--env", f"ST3_PERSON={actor}", "--env", "TERM=xterm-256color",

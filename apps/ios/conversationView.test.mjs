@@ -4,7 +4,7 @@ import { cleanMessageText, conversationEntries, foldDeliveryFlaps, fromHarness, 
 let sequence = 0;
 const at = minute => `2026-09-30T12:${String(minute).padStart(2, '0')}:00Z`;
 const e = (type, role, body, minute = sequence) => ({ id: `timeline-entry/${++sequence}`, sequence, revision: 1, final: true, type, role, body, timestamp: at(minute) });
-const names = new Map([['agent/fleet/stui', 'Stui'], ['person/nathan', 'you']]);
+const names = new Map([['agent/example/stui', 'Stui'], ['person/alex', 'you']]);
 const paused = 'Native conversation delivery over claude-channel paused while the st daemon was unreachable; the driver stayed online and retried every second.';
 const recovered = 'Native conversation delivery over claude-channel recovered and resumed replay from durable graph state.';
 
@@ -13,7 +13,7 @@ const timeline = [
   e('content', 'assistant', { text: '**On it.**' }, 2),
   e('tool_call', 'assistant', { call_id: 'c1', name: 'Bash', arguments: { command: 'cargo test\n--all' } }, 3),
   e('tool_result', 'tool', { call_id: 'c1', status: 'success', content: [{ type: 'text', text: 'ok 1\nok 2' }] }, 4),
-  e('message', 'user', { message_id: 'message/abc', from: 'agent/fleet/cos/standing/cos', to: 'agent/fleet/stui', title: 'Hello' }, 5),
+  e('message', 'user', { message_id: 'message/abc', from: 'agent/example/cos/standing/cos', to: 'agent/example/stui', title: 'Hello' }, 5),
   e('content', 'user', { text: 'Body text [id:message/abc]' }, 5),
   e('status', 'system', { status: 'running' }, 6),
   e('usage', 'system', { input_tokens: 1 }, 6),
@@ -33,7 +33,7 @@ assert.deepEqual(entries.map(describe), [
   'user: Please fix it',
   'assistant: **On it.**',
   'tool(ok): $ cargo test [ok 1|ok 2]',
-  'mail: fleet/cos/standing/cos → Stui · Hello · Body text',
+  'mail: example/cos/standing/cos → Stui · Hello · Body text',
   'event(quiet): message delivery paused 2 times while st restarted · recovered',
   'event(fault): error: the harness exited',
   'event(quiet): something st added later',
