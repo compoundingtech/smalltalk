@@ -517,6 +517,7 @@ async fn missions_first_page_stays_under_100ms_with_thousands_of_definitions() {
         )
         .unwrap();
     let mut connection = rusqlite::Connection::open(&db).unwrap();
+    st3::store::configure_projection_writer(&connection).unwrap();
     let transaction = connection.transaction().unwrap();
     for index in 0..3000 {
         let id = format!("large-{index:04}");

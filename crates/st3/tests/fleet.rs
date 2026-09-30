@@ -644,6 +644,7 @@ async fn members_with_the_same_envelopes_but_different_claims_report_divergence_
     b.stop();
     {
         let store = rusqlite::Connection::open(b.state_dir().join("claims.sqlite3")).unwrap();
+        st3::store::configure_projection_writer(&store).unwrap();
         let dropped = store
             .execute(
                 "DELETE FROM mission_definitions WHERE mission_id LIKE '%divergence-probe%'",

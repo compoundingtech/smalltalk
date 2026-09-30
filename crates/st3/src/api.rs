@@ -4119,7 +4119,11 @@ fn native_delivery_peer(pid: u32) -> Option<NativeDeliveryPeer> {
     native_delivery_identity(pid, &args, &env)
 }
 
-fn native_delivery_identity(pid: u32, args: &[String], env: &[String]) -> Option<NativeDeliveryPeer> {
+fn native_delivery_identity(
+    pid: u32,
+    args: &[String],
+    env: &[String],
+) -> Option<NativeDeliveryPeer> {
     let (transport, archives_inbox) = args.windows(2).find_map(|pair| {
         if pair[0] != "driver" {
             return None;
@@ -5010,6 +5014,25 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 .filter(|peer| peer.sync.as_ref().is_some_and(|sync| sync.diverged))
                 .map(|peer| peer.peer.as_str())
                 .collect::<Vec<_>>();
+            let differing_tables = replication
+                .peers
+                .iter()
+                .flat_map(|peer| {
+                    peer.differing_tables
+                        .iter()
+                        .map(|table| format!("{}/{table}", peer.peer))
+                })
+                .collect::<Vec<_>>();
+            if !differing_tables.is_empty() {
+                checks.push(DoctorCheck {
+                    name: "shared-projections".into(),
+                    status: "fail".into(),
+                    message: format!(
+                        "shared tables differ at equal inventory: {}",
+                        differing_tables.join(", ")
+                    ),
+                });
+            }
             let first_sync_failed = replication
                 .first_sync
                 .as_ref()
@@ -13114,6 +13137,46 @@ agent "good" {{ workspace {:?}; command "true" }}
         assert!(
             disk["message"].as_str().unwrap().contains("GiB free"),
             "{disk}"
+        );
+    }
+
+    #[test]
+    fn doctor_names_shared_tables_that_differ_at_equal_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.fleet_id = Some("fleet/audit".into());
+        state.configured_peers = vec!["alder".into()];
+        state.store.bind_fleet("fleet/audit").unwrap();
+        let source = Store::open_memory("alder").unwrap();
+        source.bind_fleet("fleet/audit").unwrap();
+        let original = source.export_replication_summary("fleet/audit").unwrap();
+        let mut different = original.clone();
+        different
+            .projection_digests
+            .insert("planning_sessions".into(), "different".into());
+        state
+            .store
+            .receive_replication_exchange("alder", "fleet/audit", &different)
+            .unwrap();
+        let report = doctor_report(&state).unwrap().0;
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "shared-projections")
+            .unwrap();
+        assert_eq!(check.status, "fail");
+        assert!(check.message.contains("alder/planning_sessions"));
+        state
+            .store
+            .receive_replication_exchange("alder", "fleet/audit", &original)
+            .unwrap();
+        assert!(
+            !doctor_report(&state)
+                .unwrap()
+                .0
+                .checks
+                .iter()
+                .any(|check| check.name == "shared-projections")
         );
     }
 

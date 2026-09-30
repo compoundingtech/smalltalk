@@ -1147,6 +1147,7 @@ fn answer_mismatches(
 /// reader answer. `copy` is a store file holding at least the sealed set; it is changed.
 pub fn prove_on_copy(copy: &Path, sealed: &SealedSet, plan: &DropPlan) -> Result<CheckpointProof> {
     let mut connection = Connection::open(copy)?;
+    projection_digest::register(&connection)?;
     connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = MEMORY;")?;
     let transaction = connection.transaction()?;
     // Keep only the sealed set.
@@ -1207,6 +1208,7 @@ pub fn prove_on_copy(copy: &Path, sealed: &SealedSet, plan: &DropPlan) -> Result
         .collect::<BTreeSet<_>>();
     replay_from_nothing(&transaction)?;
     let graph_digest_before = graph_digest(&transaction)?;
+    let digests_before = projection_digest::tables(&transaction)?;
     let before = reader_answers(&transaction, &subjects, sealed.cut_unix_ms)?;
     // As a trim does: tombstones first, which readers that walk ancestry pass through.
     record_checkpoint_tombstones_tx(
@@ -1221,7 +1223,15 @@ pub fn prove_on_copy(copy: &Path, sealed: &SealedSet, plan: &DropPlan) -> Result
     let after = reader_answers(&transaction, &subjects, sealed.cut_unix_ms)?;
     let mut mismatches = answer_mismatches(&before, &after);
     if graph_digest_before != graph_digest_after {
-        mismatches.insert(0, "graph".into());
+        mismatches.splice(
+            0..0,
+            projection_digest::differing(
+                &digests_before,
+                &projection_digest::tables(&transaction)?,
+            )
+            .into_iter()
+            .map(|table| format!("graph {table}")),
+        );
     }
     let proof = CheckpointProof {
         reader_digest_before: answers_digest(&before)?,

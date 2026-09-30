@@ -48,6 +48,9 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_usage_seen",
         "local_latest_slots",
         "graph_generation",
+        "projection_digest_state",
+        "projection_digest_generation",
+        "projection_digest_operation_rows",
         "replica_envelope_signatures",
         "fleet_invite_tokens",
         "replica_envelope_holds",
@@ -63,6 +66,11 @@ fn every_persistent_table_has_a_projection_scope() {
         .collect::<BTreeSet<_>>();
     let store = Store::open_memory("alder").unwrap();
     let connection = store.readers.get();
+    assert_eq!(
+        SHARED_TABLES,
+        projection_digest::TABLES,
+        "every shared table must be in production digests and shuffle coverage"
+    );
     let tables = connection
         .prepare("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
         .unwrap()
@@ -100,51 +108,71 @@ fn shared_folds_never_order_by_local_arrival() {
         "export_replication_for_heads",
         "seed_replica_envelopes_tx",
     ];
-    let source = include_str!("../store.rs")
-        .split("\n#[cfg(test)]\nmod tests {")
-        .next()
-        .unwrap();
-    let mut violations = Vec::new();
-    for (offset, _) in source.match_indices("ORDER BY") {
-        let order = source[offset + "ORDER BY".len()..]
-            .split('"')
-            .next()
-            .unwrap()
-            .split("LIMIT")
-            .next()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap();
-        if !order.contains("store_index") {
-            continue;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let mut files = vec![root.join("store.rs")];
+    let mut directories = vec![root.join("store")];
+    while let Some(directory) = directories.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                directories.push(path);
+            } else if path.extension().is_some_and(|ext| ext == "rs")
+                && !["canonical_audit.rs", "convergence.rs"]
+                    .contains(&path.file_name().unwrap().to_str().unwrap())
+            {
+                files.push(path);
+            }
         }
-        let scope = source[..offset]
-            .lines()
-            .filter_map(|line| {
-                let line = line.trim_start();
-                if line.starts_with("//") {
-                    return None;
-                }
-                if let Some((_, name)) = line.split_once("fn ") {
-                    Some(name.split(['(', '<']).next().unwrap())
-                } else if let Some(name) = line.strip_prefix("const ") {
-                    Some(name.split(':').next().unwrap())
-                } else {
-                    None
-                }
-            })
-            .next_back()
+    }
+    let mut violations = Vec::new();
+    for file in files {
+        let contents = std::fs::read_to_string(&file).unwrap();
+        let source = contents
+            .split("\n#[cfg(test)]\nmod tests {")
+            .next()
             .unwrap();
-        if !allowed.contains(&scope) {
-            violations.push(format!(
-                "store.rs:{} {scope}",
-                source[..offset]
-                    .bytes()
-                    .filter(|byte| *byte == b'\n')
-                    .count()
-                    + 1
-            ));
+        for (offset, _) in source.match_indices("ORDER BY") {
+            let order = source[offset + "ORDER BY".len()..]
+                .split('"')
+                .next()
+                .unwrap()
+                .split("LIMIT")
+                .next()
+                .unwrap()
+                .split(';')
+                .next()
+                .unwrap();
+            if !order.contains("store_index") {
+                continue;
+            }
+            let scope = source[..offset]
+                .lines()
+                .filter_map(|line| {
+                    let line = line.trim_start();
+                    if line.starts_with("//") {
+                        return None;
+                    }
+                    if let Some((_, name)) = line.split_once("fn ") {
+                        Some(name.split(['(', '<']).next().unwrap())
+                    } else if let Some(name) = line.strip_prefix("const ") {
+                        Some(name.split(':').next().unwrap())
+                    } else {
+                        None
+                    }
+                })
+                .next_back()
+                .unwrap();
+            if !allowed.contains(&scope) {
+                violations.push(format!(
+                    "{}:{} {scope}",
+                    file.strip_prefix(&root).unwrap().display(),
+                    source[..offset]
+                        .bytes()
+                        .filter(|byte| *byte == b'\n')
+                        .count()
+                        + 1
+                ));
+            }
         }
     }
     assert!(
@@ -154,7 +182,7 @@ fn shared_folds_never_order_by_local_arrival() {
     );
 }
 
-fn shared_rows(store: &Store) -> BTreeMap<String, Vec<String>> {
+pub(super) fn shared_rows(store: &Store) -> BTreeMap<String, Vec<String>> {
     let connection = store.readers.get();
     SHARED_TABLES
         .iter()
@@ -177,10 +205,17 @@ fn shared_rows(store: &Store) -> BTreeMap<String, Vec<String>> {
                     }
                 })
                 .collect::<Vec<_>>();
-            let query = format!(
-                "SELECT json_array({}) AS logical_row FROM {table} ORDER BY logical_row",
-                columns.join(",")
-            );
+            let query = if *table == "operations" {
+                format!(
+                    "SELECT * FROM ({}) ORDER BY 1",
+                    projection_digest::operation_rows()
+                )
+            } else {
+                format!(
+                    "SELECT json_array({}) AS logical_row FROM {table} ORDER BY logical_row",
+                    columns.join(",")
+                )
+            };
             let rows = connection
                 .prepare(&query)
                 .unwrap()
@@ -217,6 +252,21 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
         if table_digest(&rows) != table_digest(wanted) {
             mismatches.push(format!("{phase}: {table} digest"));
         }
+    }
+    let expected_digests = projection_digest::tables(&expected.readers.get()).unwrap();
+    let actual_digests = projection_digest::tables(&actual.readers.get()).unwrap();
+    assert_eq!(
+        expected_digests,
+        projection_digest::oracle(&expected.readers.get()).unwrap(),
+        "{phase}: expected cache"
+    );
+    assert_eq!(
+        actual_digests,
+        projection_digest::oracle(&actual.readers.get()).unwrap(),
+        "{phase}: actual cache"
+    );
+    for table in projection_digest::differing(&expected_digests, &actual_digests) {
+        mismatches.push(format!("{phase}: production digest {table}"));
     }
     if graph_digest_of(expected) != graph_digest_of(actual) {
         mismatches.push(format!("{phase}: graph_digest"));
@@ -266,10 +316,26 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
     if expected.transport_links().unwrap() != actual.transport_links().unwrap() {
         mismatches.push(format!("{phase}: replicated transport observations"));
     }
+    let lane = |store: &Store| {
+        crate::lane::replay(
+            &lanes::lane_events_tx(&store.readers.get(), "lane/audit").unwrap(),
+            20,
+        )
+    };
+    if lane(expected) != lane(actual) {
+        mismatches.push(format!("{phase}: lane membership and marks"));
+    }
 }
 
 fn write_audit_history(source: &Store) {
-    failed_takeover_run(source, &["deploy-check"]);
+    publish_takeover(
+        source,
+        &format!(
+            "{TAKEOVER_SOURCE}\nagent \"alder.worker\" {{ workspace \"/tmp/audit\"; command \"true\" }}"
+        ),
+        "audit-desired",
+    );
+    let failed = failed_takeover_run(source, &["deploy-check"]);
     source
         .put_document("doc/audit", b"first", &None, "audit-document-first")
         .unwrap();
@@ -294,6 +360,52 @@ fn write_audit_history(source: &Store) {
     // Raw claim append is the daemon's internal writer path. Replicas still perform ordinary
     // schema admission, envelope verification and projection; no projection rows are seeded.
     let events = [
+        (
+            "lane/audit",
+            "lane.joined",
+            json!({"entry":"resource/audit/pull-request/1","reason":"Queue the first change."}),
+        ),
+        (
+            "lane/audit",
+            "lane.joined",
+            json!({"entry":"resource/audit/pull-request/2","reason":"Queue the second change."}),
+        ),
+        (
+            "lane/audit",
+            "lane.moved",
+            json!({"entry":"resource/audit/pull-request/1","placement":"bottom"}),
+        ),
+        (
+            "lane/audit",
+            "lane.marked",
+            json!({"entry":"resource/audit/pull-request/2","state":"ready","detail":"Checks passed."}),
+        ),
+        (
+            "mission-run/audit-secondary",
+            "mission-run.created",
+            json!({
+                "status":"running", "mission":"mission/takeover", "revision":failed.revision,
+                "current_generation":"run-generation/audit-secondary", "workspace":"/tmp/audit",
+                "requester":"person/avery", "inputs":{}, "mode":"run", "after":failed.subject,
+                "timeout_ms":1000, "deadline_at_unix_ms":now_ms()+1000
+            }),
+        ),
+        (
+            "revision-proposal/audit",
+            "revision-proposal.created",
+            json!({
+                "run":failed.subject,"source_generation":failed.generation,"candidate_revision":failed.revision,
+                "reason":"Check two independent reviewers.","status":"pending-approval","cutover":"restart-active",
+                "compatible_steps":[],"reviewers":["person/avery","person/river"],"preview_hash":"audit-preview"
+            }),
+        ),
+        (
+            "revision-proposal/audit",
+            "revision-proposal.approved",
+            json!({
+                "reviewer":"person/avery","all_approved":false,"preview_hash":"audit-preview"
+            }),
+        ),
         ("host/beacon", "transport.observed", json!({"status": "up"})),
         (
             "host/beacon",
@@ -406,13 +518,18 @@ fn write_audit_history(source: &Store) {
     for (subject, kind, fields) in events {
         let mut connection = source.connection.lock().unwrap();
         let transaction = connection.transaction().unwrap();
+        let mut body = json!({"fields": fields});
+        if subject == "host/beacon" && body["fields"]["status"] == "up" {
+            body["_operation"] =
+                json!({"id":"op/audit-transport", "request_digest":"audit-transport-digest"});
+        }
         append_claim_tx(
             &transaction,
             &source.origin,
             subject,
             kind,
             Some("agent/alder.worker"),
-            &json!({"fields": fields}),
+            &body,
             &[],
             None,
         )
@@ -584,5 +701,178 @@ fn equal_time_writers_choose_the_same_shared_source() {
     assert_eq!(
         serde_json::to_value(ordered.latest_actual_value("observer/audit").unwrap()).unwrap(),
         serde_json::to_value(reversed.latest_actual_value("observer/audit").unwrap()).unwrap()
+    );
+}
+
+#[test]
+fn incremental_digests_cover_each_shared_column_and_roll_back_with_rows() {
+    let store = Store::open_memory("alder").unwrap();
+    write_audit_history(&store);
+    let mut connection = store.connection.lock().unwrap();
+    // Deliberate projection corruption checks coverage independently of reducer semantics.
+    connection
+        .execute_batch("PRAGMA foreign_keys=OFF;")
+        .unwrap();
+    let baseline = projection_digest::tables(&connection).unwrap();
+    assert_eq!(baseline, projection_digest::oracle(&connection).unwrap());
+    for (table, excluded) in SHARED_TABLES {
+        let columns = connection
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap()
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert!(
+            connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row
+                    .get::<_, u64>(0))
+                .unwrap()
+                > 0,
+            "shuffle history must exercise {table}"
+        );
+        for (column, kind) in columns {
+            let before_generation = projection_digest::generation(&connection).unwrap();
+            let transaction = connection.transaction().unwrap();
+            let expression = if *table == "operations" && column == "state" {
+                "CASE state WHEN 'active' THEN 'conflict' ELSE 'active' END".to_owned()
+            } else if kind == "INTEGER" {
+                format!("COALESCE({column},0)+1")
+            } else if kind == "BLOB" {
+                format!("CAST({column}||x'00' AS BLOB)")
+            } else {
+                format!("COALESCE({column},'')||'-changed'")
+            };
+            transaction.execute(&format!("UPDATE {table} SET {column}={expression} WHERE rowid=(SELECT rowid FROM {table} LIMIT 1)"), []).unwrap();
+            let current = projection_digest::tables(&transaction).unwrap();
+            assert_eq!(
+                current,
+                projection_digest::oracle(&transaction).unwrap(),
+                "{table}.{column}"
+            );
+            if excluded.contains(&column.as_str()) {
+                assert_eq!(current, baseline, "local overlay {table}.{column}");
+                assert_eq!(
+                    projection_digest::generation(&transaction).unwrap(),
+                    before_generation
+                );
+            } else {
+                assert_ne!(
+                    current[*table], baseline[*table],
+                    "shared column {table}.{column}"
+                );
+                assert_ne!(
+                    projection_digest::root(&current),
+                    projection_digest::root(&baseline)
+                );
+            }
+            transaction.rollback().unwrap();
+            assert_eq!(projection_digest::tables(&connection).unwrap(), baseline);
+            assert_eq!(
+                projection_digest::generation(&connection).unwrap(),
+                before_generation
+            );
+        }
+    }
+    // REPLACE has a delete followed by an insert, including when the primary key is unchanged.
+    connection
+        .execute(
+            "INSERT OR REPLACE INTO message_index VALUES('message/audit',123,0)",
+            [],
+        )
+        .unwrap();
+    assert_eq!(
+        projection_digest::tables(&connection).unwrap(),
+        projection_digest::oracle(&connection).unwrap()
+    );
+    let generation = projection_digest::generation(&connection).unwrap();
+    connection
+        .execute("UPDATE message_index SET closed=closed", [])
+        .unwrap();
+    assert_eq!(
+        projection_digest::generation(&connection).unwrap(),
+        generation
+    );
+    STATEMENTS_RUN.with(|count| count.set(0));
+    let _ = projection_digest::root(&projection_digest::tables(&connection).unwrap());
+    assert_eq!(
+        STATEMENTS_RUN.with(std::cell::Cell::get),
+        1,
+        "digest reads one small cache, regardless of history size"
+    );
+}
+
+#[test]
+fn comparable_peers_name_differing_tables_and_legacy_peers_keep_their_digest() {
+    let source = Store::open_memory("alder").unwrap();
+    write_audit_history(&source);
+    let target = Store::open_memory("birch").unwrap();
+    receive_and_project(
+        &target,
+        "alder",
+        &exchange_from(&source, &ReplicationInventory::default()),
+    );
+    let mut summary = source.export_replication_summary(TEST_FLEET).unwrap();
+    let legacy = summary.graph_digest.clone();
+    let full = projection_digest::root(&summary.projection_digests);
+    assert_ne!(legacy, full);
+    let status = target
+        .replication_status(true, Some(TEST_FLEET), &["alder".into()])
+        .unwrap();
+    assert_eq!(status.graph_digest, full);
+    assert_eq!(status.projection_digests.len(), SHARED_TABLES.len() + 1);
+    // A planning mismatch remains visible even though the six-table compatibility hash agrees.
+    summary
+        .projection_digests
+        .insert("planning_sessions".into(), "different".into());
+    target
+        .receive_replication_exchange("alder", TEST_FLEET, &summary)
+        .unwrap();
+    let status = target
+        .replication_status(true, Some(TEST_FLEET), &["alder".into()])
+        .unwrap();
+    assert_eq!(status.peers[0].differing_tables, vec!["planning_sessions"]);
+    // Different inventories cannot identify projection divergence: the peer still lacks data.
+    summary.inventory.digest = "different inventory".into();
+    target
+        .receive_replication_exchange("alder", TEST_FLEET, &summary)
+        .unwrap();
+    assert!(
+        target
+            .replication_status(true, Some(TEST_FLEET), &["alder".into()])
+            .unwrap()
+            .peers[0]
+            .differing_tables
+            .is_empty()
+    );
+    // Old peers omit modern maps. Their unchanged compatibility hash remains comparable.
+    let mut old =
+        serde_json::to_value(source.export_replication_summary(TEST_FLEET).unwrap()).unwrap();
+    old.as_object_mut().unwrap().remove("projection_digests");
+    let old: ReplicationExchange = serde_json::from_value(old).unwrap();
+    assert!(old.projection_digests.is_empty());
+    assert_eq!(old.graph_digest, legacy);
+    let receipt = target
+        .receive_replication_exchange("alder", TEST_FLEET, &old)
+        .unwrap();
+    assert!(!receipt.heal);
+    let status = target
+        .replication_status(true, Some(TEST_FLEET), &["alder".into()])
+        .unwrap();
+    assert!(status.peers[0].projection_digests.is_empty());
+    assert!(status.peers[0].differing_tables.is_empty());
+    let mut answer = source
+        .heal_answer("birch", &ReplicationHealQuery::Ranges)
+        .unwrap();
+    if let ReplicationHealAnswer::Ranges {
+        projection_digests, ..
+    } = &mut answer
+    {
+        projection_digests.clear();
+    }
+    assert!(
+        matches!(target.heal_next("alder",answer).unwrap(),ReplicationHealStep::Done{report} if report.healed)
     );
 }

@@ -746,7 +746,13 @@ mod tests {
         let mut report = None;
         for _ in 0..16 {
             let mut answer = birch.heal_answer("alder", &query).unwrap();
-            if let ReplicationHealAnswer::Ranges { graph_digest, .. } = &mut answer {
+            if let ReplicationHealAnswer::Ranges {
+                graph_digest,
+                projection_digests,
+                ..
+            } = &mut answer
+            {
+                projection_digests.clear();
                 *graph_digest = "another graph".into();
             }
             match alder.heal_next("birch", answer).unwrap() {

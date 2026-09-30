@@ -19652,8 +19652,9 @@ observer "repo" {
                 idempotency_key: None,
             })
             .unwrap();
-        rusqlite::Connection::open(&database)
-            .unwrap()
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        crate::store::configure_projection_writer(&connection).unwrap();
+        connection
             .execute(
                 "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
                 rusqlite::params![(now_ms() - 3_600_001).to_string(), old.id],
@@ -19958,8 +19959,9 @@ observer "repo" {
                 .open_reconcile_fault_claim("daemon/node", "stage/example")
                 .unwrap()
                 .unwrap();
-            rusqlite::Connection::open(&database)
-                .unwrap()
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            crate::store::configure_projection_writer(&connection).unwrap();
+            connection
                 .execute(
                     "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
                     rusqlite::params![

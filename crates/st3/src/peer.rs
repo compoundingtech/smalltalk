@@ -4654,6 +4654,7 @@ mod tests {
             outbound_notify: watch::channel(0_u64).0,
         };
         let exchange = ReplicationExchange {
+            projection_digests: Default::default(),
             peer: "source".into(),
             fleet_id: fleet.into(),
             schema_digest: st3_schema::registry().digest(),
@@ -4745,6 +4746,7 @@ mod tests {
             outbound_notify: watch::channel(0_u64).0,
         };
         let exchange = ReplicationExchange {
+            projection_digests: Default::default(),
             peer: "source".into(),
             fleet_id: fleet.into(),
             schema_digest: st3_schema::registry().digest(),
@@ -5243,6 +5245,7 @@ mod tests {
         // The target loses the desired claim but keeps its envelope, before its first sync ends.
         {
             let connection = rusqlite::Connection::open(&target_path).unwrap();
+            crate::store::configure_projection_writer(&connection).unwrap();
             connection
                 .execute_batch(
                     "PRAGMA foreign_keys=OFF;

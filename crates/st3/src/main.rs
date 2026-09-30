@@ -6936,6 +6936,13 @@ fn render_replication_peers(
             peer.status,
             peer.last_error.as_deref().unwrap_or("")
         );
+        if !peer.differing_tables.is_empty() {
+            let _ = writeln!(
+                output,
+                "  shared tables differ: {}",
+                peer.differing_tables.join(", ")
+            );
+        }
         if let Some(at) = peer.last_success_at_unix_ms {
             let _ = writeln!(output, "  last seen {}", relative_time(at, now));
         } else {
@@ -6952,12 +6959,19 @@ fn render_replication_peers(
             .graph_compared_at_unix_ms
             .map(|at| relative_time(at, now))
             .unwrap_or_else(|| "never".into());
-        let digests = format!(
-            "this node {}, {} {}",
-            short_digest(local_graph_digest),
-            peer.peer,
-            short_digest(peer.graph_digest.as_deref().unwrap_or("unknown"))
-        );
+        let digests = if peer.projection_digests.is_empty() {
+            format!(
+                "legacy peer digest {}; full projection coverage unavailable",
+                short_digest(peer.graph_digest.as_deref().unwrap_or("unknown"))
+            )
+        } else {
+            format!(
+                "this node {}, {} {}",
+                short_digest(local_graph_digest),
+                peer.peer,
+                short_digest(peer.graph_digest.as_deref().unwrap_or("unknown"))
+            )
+        };
         if let Some(since) = sync.graph_differs_since_unix_ms {
             let _ = writeln!(
                 output,
@@ -7051,6 +7065,9 @@ async fn run_replication(
             );
             println!("authority-digest\t{}", status.authority_digest);
             println!("graph-digest\t{}", status.graph_digest);
+            for (table, digest) in &status.projection_digests {
+                println!("table-digest\t{table}\t{digest}");
+            }
             println!("envelopes\t{}", status.received_envelopes);
             println!(
                 "records\tvalid={} pending={} unknown={} invalid={} repaired={} checkpointed={}",
@@ -7169,16 +7186,21 @@ async fn run_replication(
                     "remote": remote.authority_digest,
                     "equal": remote.authority_digest.as_deref() == Some(status.authority_digest.as_str()),
                 },
+                "differing_tables": remote.differing_tables,
                 "graph": {
                     "local": status.graph_digest,
                     "remote": remote.graph_digest,
-                    "equal": remote.graph_digest.as_deref() == Some(status.graph_digest.as_str()),
+                    "equal": if remote.projection_digests.is_empty() { None } else { Some(remote.graph_digest.as_deref() == Some(status.graph_digest.as_str())) },
+                    "coverage": if remote.projection_digests.is_empty() { "legacy-only" } else { "all-shared-projections" },
                 },
             });
             if json_output {
                 return print_value(&value, true);
             }
             println!("peer\t{}\t{}", peer, remote.status);
+            if !remote.differing_tables.is_empty() {
+                println!("different-tables\t{}", remote.differing_tables.join(", "));
+            }
             println!(
                 "authority\t{}\t{}\t{}",
                 if remote.authority_digest.as_deref() == Some(status.authority_digest.as_str()) {
@@ -7191,7 +7213,9 @@ async fn run_replication(
             );
             println!(
                 "graph\t{}\t{}\t{}",
-                if remote.graph_digest.as_deref() == Some(status.graph_digest.as_str()) {
+                if remote.projection_digests.is_empty() {
+                    "unverified (legacy peer)"
+                } else if remote.graph_digest.as_deref() == Some(status.graph_digest.as_str()) {
                     "equal"
                 } else {
                     "different"
@@ -14136,6 +14160,8 @@ mod tests {
 
     fn peer_status(peer: &str, digest: Option<&str>) -> st3::model::ReplicationPeerStatus {
         st3::model::ReplicationPeerStatus {
+            projection_digests: Default::default(),
+            differing_tables: Vec::new(),
             peer: peer.into(),
             status: "up".into(),
             last_success_at_unix_ms: None,
@@ -15190,12 +15216,24 @@ mod tests {
     }
 
     #[test]
+    fn replication_status_names_shared_table_differences() {
+        let mut peer = peer_status("alder", None);
+        peer.projection_digests
+            .insert("planning_sessions".into(), "different".into());
+        peer.differing_tables = vec!["documents".into(), "planning_sessions".into()];
+        let rendered = render_replication_peers(&[peer], "local", 0);
+        assert!(rendered.contains("shared tables differ: documents, planning_sessions"));
+    }
+
+    #[test]
     fn replication_status_says_which_side_holds_what_and_how_long_catching_up_takes() {
         let now = 1_000_000;
         let local = "1111111111111111aaaa";
         let peer =
             |name: &str, graph: Option<&str>, sync: Option<st3::model::ReplicationPeerSync>| {
                 ReplicationPeerStatus {
+                    projection_digests: BTreeMap::from([("claim_sources".into(), "sample".into())]),
+                    differing_tables: Vec::new(),
                     peer: name.into(),
                     status: "up".into(),
                     last_success_at_unix_ms: Some(now - 2_000),

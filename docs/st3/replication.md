@@ -29,16 +29,65 @@ shared table must join the shuffle test's inventory and history fixture,
 the canonical ordering guard, and the production digest registry in the same change. A new
 shared claim-derived view must compare its answer at the same explicit time and recipients.
 
-The [canonical projections audit](canonical-projections-audit.md) records the current gaps and
-local exceptions. Its regression intentionally fails on the audited baseline: the current graph
-digest covers only selected columns of six tables. A matching legacy graph digest is therefore
-not yet proof that these invariants hold for every shared outcome.
+The [canonical projections audit](canonical-projections-audit.md) records the original gaps and
+local exceptions. Modern status reports a graph digest over the complete projection registry,
+plus one digest for every table. The original six-table hash remains a compatibility field on
+the peer protocol; it cannot prove that every shared outcome agrees.
 
 Shared reducers use `store/canonical.rs`. `canonical_sql` expands `CANONICAL_ASC(ALIAS)` and
 `CANONICAL_DESC(ALIAS)` in a query; `CANONICAL_ORDER` and its descending counterpart format the
 same order for existing claim queries. In-memory comparisons use `claim_key` or
 `key_from_record`, and claim-to-claim predicates use `after_sql`. Legacy batch position is its
 relative position within the batch. A global arrival index never chooses a shared winner.
+
+## Projection digest coverage and cost
+
+`store/projection_digest.rs::TABLES` lists the shared tables: operations, blobs, documents,
+desired, message_index, mission_revisions, mission_definitions, mission_runs,
+mission_run_deadlines, mission_run_after, run_generations, step_runs, revision_proposals,
+planning_sessions, planning_candidates and planning_previews. Every column joins the digest
+by default. Only document/message/mission-revision arrival indexes and the effective step lease
+expiry/change timestamps are excluded. Those step timestamps include member-local renewals;
+the original durable lease facts remain covered through their authenticated claim identity.
+`planning_previews.store_index` is an originating preview input and is covered.
+
+The `claim_sources` digest covers admitted claim identities and immutable acceptance times,
+including claims represented by checkpoint tombstones. Claim identities commit bodies,
+predecessors, actors and batch identity; authenticated envelope inventory commits complete wire
+payloads and ordering metadata. This covers the sources of on-demand views such as ownership,
+subscriptions, fleet membership, usage, observer/fault episodes, and attention. A timed view's
+answer must still be tested at the same explicit time and recipients. Host-local liveness,
+leases, receipts, cursors, secrets and notification bookkeeping stay outside shared digests.
+
+Operations are logical rows over the hot operation table and operation facts retained in
+checkpoint tombstones. Trimming a claim changes its storage representation, preserving its
+logical operation and claim-source digests. The shuffle test compares that logical union.
+
+SQLite triggers update per-table row counts and 512-bit modular sums of domain-separated
+SHA-512 row hashes in the row's own transaction. Insert, update, delete, replacement, savepoint
+rollback and commit therefore change rows and cached digest state together. SHA-256 commits the
+table name, column schema, count and sum; a sorted map of those table digests commits the graph.
+These are diagnostic digests; authenticated envelopes and signatures remain the replication
+integrity boundary. Work scales with changed row bytes, plus the fixed-size accumulator.
+Reading all table digests reads one small cache, independent of retained history size. Operations
+keep a local row cache to update their hot/tombstone union by operation identity. The first open
+of a registry/schema version backfills these caches; routine reads and subsequent opens never
+rescan projection histories to compute digests.
+
+`incremental_digests_cover_each_shared_column_and_roll_back_with_rows` changes every shared
+column and compares cached digests with a full-scan oracle, including local exclusions, no-op
+updates, replacement and rollback. The shuffle/restart/checkpoint regression compares every
+cached table digest with that oracle in every phase. The table classification guard requires
+the test inventory and production registry to agree, and the fixture exercises every table.
+
+`st replication status` prints `table-digest` entries and names differing tables under each
+peer. `st replication diff PEER` and `st doctor` also name them. Table differences are meaningful
+only when inventories agree and projection is current. Old peers omit `projection_digests`;
+exchanges and heals then compare their unchanged six-table compatibility hash. Old peers cannot
+verify full projection coverage. Modern peers compare complete maps. SQLite schema 14 adds the
+transactional digest machinery and rebuilds shared projections once, correcting older stored
+creation/change dates from claim facts. New writer connections must register the projection
+functions, including isolated checkpoint proof connections.
 
 ## Add any machine
 
