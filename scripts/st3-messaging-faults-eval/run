@@ -11,8 +11,10 @@ import shlex
 import shutil
 import signal
 import socket
+import secrets
 import tempfile
 import time
+import tomllib
 import uuid
 
 HERE = Path(__file__).resolve().parent
@@ -110,10 +112,25 @@ class Link:
             await server.wait_closed()
 
 
+_PORT_RESERVATIONS = {}
+
+
 def free_port():
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return listener.getsockname()[1]
+    # Keep the selected listener reserved throughout daemon startup. Allocate
+    # below Linux's ephemeral range so an outgoing proxy/client connection
+    # cannot take it during the handover to the replication worker.
+    ephemeral_start = int(Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()[0])
+    for _ in range(100):
+        port = 1024 + secrets.randbelow(ephemeral_start - 1024)
+        listener = socket.socket()
+        try:
+            listener.bind(("127.0.0.1", port))
+        except OSError:
+            listener.close()
+            continue
+        _PORT_RESERVATIONS[port] = listener
+        return port
+    raise RuntimeError("could not reserve an isolated replication port")
 
 
 class Node:
@@ -184,13 +201,35 @@ class Node:
             return None
 
     async def start(self):
+        config = tomllib.loads((self.root / "config.toml").read_text())
+        peer_host, peer_port = config["peer_listen"].rsplit(":", 1)
+        peer_port = int(peer_port)
+        # Restarts reserve their original address again before starting up.
+        if peer_port not in _PORT_RESERVATIONS:
+            listener = socket.socket()
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((peer_host, peer_port))
+            listener.listen()
+            _PORT_RESERVATIONS[peer_port] = listener
         self.daemon = await self.spawn(["up", "--config", str(self.root / "config.toml")], "daemon.log")
         async def ready():
             if self.daemon.returncode is not None:
                 raise RuntimeError("isolated daemon exited: " + (self.root / "daemon.log").read_text()[-2000:])
             return await self.api("/v1/replication/status")
         await until(ready)
+        _PORT_RESERVATIONS.pop(peer_port).close()
         self.worker = await self.spawn(["replication-worker", "--config", str(self.root / "config.toml")], "worker.log")
+        async def peer_ready():
+            if self.worker.returncode is not None:
+                raise RuntimeError("isolated replication worker exited: " + (self.root / "worker.log").read_text()[-2000:])
+            try:
+                _, writer = await asyncio.open_connection(peer_host, peer_port)
+                writer.close()
+                await writer.wait_closed()
+                return True
+            except OSError:
+                return False
+        await until(peer_ready)
 
     async def down(self):
         await stop(self.worker)
