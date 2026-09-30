@@ -23,6 +23,8 @@ tests, Clippy, the generated client check and the fleet compatibility test run s
 the run fails if any of them fails. The tests run under nextest, 8 at a time, with the tests
 that take a minute or more started first. A failed test is retried twice, 30 seconds apart, and
 one that passes on a retry is reported as flaky rather than failing the run.
+The messaging fault matrix has a higher repository priority so its long retries have the full
+25-minute CI test window.
 
 The repository's nextest configuration starts the full messaging fault matrix before shorter
 tests. Its retries need most of the 25-minute test limit, so starting it at the end can cut off

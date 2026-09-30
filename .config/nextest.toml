@@ -1,6 +1,4 @@
-# Start the full messaging fault matrix before the shorter tests. Three attempts
-# need most of CI's 25-minute test budget; starting it at the tail can cut off
-# the last attempt even when the other tests all pass.
+# Give the full fault matrix time to finish its CI retries within the test window.
 [[profile.default.overrides]]
-filter = 'package(st3) and test(messages_recover_across_transport_and_process_faults)'
+filter = 'package(st3) and test(/^messaging_faults::messages_recover_across_transport_and_process_faults$/)'
 priority = 100

@@ -341,6 +341,19 @@ st doctor
 
 The status view reports the authority digest, graph digest, record counts, projection health, and last peer results.
 
+A Fabric `peer not permitted for service` answer means the member's grants refuse that direct
+route. It shows as `refused`, with the Fabric node and service, in `st replication status`,
+`st fleet status` and `st doctor`. It is neither an absent member nor a replication error;
+`last_error` is empty and the JSON status carries `refusal_reason`. Doctor's replication check
+passes when the refusal is the only issue.
+
+The worker retries that route every 24–36 minutes, at most three attempts per hour including
+the first refusal. Local writes, inbound exchanges, Fabric online events and local network
+changes do not shorten this delay. A changed route retries immediately, and a later successful outbound
+exchange clears the refusal. Other routes to the same member remain usable. Members that do
+not grant each other the service can still converge through a common hub; the hub must grant
+and exchange with both leaves. The worker never changes Fabric grants itself.
+
 For each peer, the status view also reports when the last exchange happened and how far apart the
 two envelope sets were at that exchange:
 

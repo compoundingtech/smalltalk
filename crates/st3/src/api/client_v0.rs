@@ -1274,7 +1274,7 @@ fn mission_resources_filtered(
                                 "title": step.title,
                                 "assignee": step.assigned_to,
                                 "claimant": step.claimant,
-                                "state": step.status,
+                                "state": client_work_state(&step.status),
                                 "since": client_timestamp(step.updated_at_unix_ms),
                             })
                         })
@@ -1340,7 +1340,7 @@ fn mission_resources_filtered(
                                     "id": step.subject,
                                     "path": step.step,
                                     "title": step.title,
-                                    "state": step.status,
+                                    "state": client_work_state(&step.status),
                                     "attempt": step.attempt,
                                     "assignee": step.assigned_to,
                                     "claimant": step.claimant,
@@ -2409,7 +2409,7 @@ fn missions_tree_value_within(
             "id": full.subject, "mission": full.mission, "state": full.status,
             "steps": full.steps.iter().take(items).map(|step| json!({
                 "id": step.subject, "name": step.title.as_deref().unwrap_or(&step.step),
-                "path": step.step, "state": step.status
+                "path": step.step, "state": client_work_state(&step.status)
             })).collect::<Vec<_>>()
         }));
     }
@@ -8579,7 +8579,7 @@ mission "example/steps" state="ready" {
                     .unwrap()
                     .steps
                     .iter()
-                    .map(|step| json!([step.subject, step.status]))
+                    .map(|step| json!([step.subject, client_work_state(&step.status)]))
                     .collect::<Vec<_>>();
                 (run.clone(), steps)
             })
