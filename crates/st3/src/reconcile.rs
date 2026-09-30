@@ -8457,9 +8457,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             return Ok(());
         }
+        self.retire_legacy_held_subscription_attention(&item.subject)?;
         if spec.stopped {
             self.cancel_unstarted_subscription_requests(&item.subject)?;
-            self.resolve_released_held_attention(&item.subject, &BTreeMap::new())?;
             return Ok(());
         }
         if spec.delivery != "mission" {
@@ -8469,7 +8469,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             .store
             .pending_subscription_mission_requests(&item.subject)?;
         if requests.is_empty() {
-            self.resolve_released_held_attention(&item.subject, &BTreeMap::new())?;
             return Ok(());
         }
         let is_held = |request: &crate::model::ClaimRecord| {
@@ -8494,10 +8493,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         } else {
             BTreeSet::new()
         };
-        let mut held = BTreeMap::<String, usize>::new();
+        let mut capacity_waiting = BTreeSet::new();
         let mut waiting = Vec::new();
         for request in requests {
-            // A review waiting for capacity or a person reviews only the current head of an open
+            // A queued review runs only for the current head of an open
             // pull request.
             let pull_request = request
                 .body
@@ -8530,21 +8529,24 @@ impl<R: RuntimeControl> Reconciler<R> {
                 })?;
                 continue;
             }
+            // Older builds held excess deliveries for a person. Migrate current requests into
+            // the automatic queue, even when their mission is still waiting for capacity.
             if is_held(&request) && !released.contains(&request.id) {
-                let observation = request
-                    .body
-                    .pointer("/evidence/0")
-                    .and_then(Value::as_str)
-                    .unwrap_or(request.id.as_str())
-                    .to_owned();
-                *held.entry(observation).or_default() += 1;
-                continue;
-            }
-            let deferral = self
-                .store
-                .subscription_mission_deferral(&item.subject, &request.id)?;
-            if deferral.is_some_and(|(deadline, _)| deadline > now_ms()) {
-                continue;
+                self.store.append_claim(&ClaimInput {
+                    subject: item.subject.clone(),
+                    kind: "subscription.mission-request-released".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("request".into(), Value::String(request.id.clone())),
+                        (
+                            "reason".into(),
+                            Value::String("migrated held request to the automatic queue".into()),
+                        ),
+                    ]),
+                    evidence: vec![request.id.clone()],
+                    expected_subject: None,
+                    idempotency_key: Some(format!("subscription-request-queued:{}", request.id)),
+                })?;
             }
             let fields = request.body.get("fields").unwrap_or(&request.body);
             let field = |name: &str| fields.get(name).and_then(Value::as_str);
@@ -8586,6 +8588,18 @@ impl<R: RuntimeControl> Reconciler<R> {
                     continue;
                 }
             }
+            // A younger request must not pass an older capacity retry. Keep examining the
+            // rest of the queue so stale requests are cancelled and legacy holds are migrated.
+            if capacity_waiting.contains(mission) {
+                continue;
+            }
+            let deferral = self
+                .store
+                .subscription_mission_deferral(&item.subject, &request.id)?;
+            if deferral.is_some_and(|(deadline, _)| deadline > now_ms()) {
+                capacity_waiting.insert(mission.to_owned());
+                continue;
+            }
             let requester = field("requester")
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("daemon/{}", self.host));
@@ -8621,6 +8635,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let run = match created {
                 Ok(run) => run,
                 Err(error) if error.code == "mission-run-capacity" => {
+                    capacity_waiting.insert(mission.to_owned());
                     let attempt =
                         deferral.map_or(1_u32, |(_, attempts)| attempts.saturating_add(1));
                     let delay_ms =
@@ -8662,10 +8677,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                 idempotency_key: Some(format!("subscription-mission-started:{}", run.id)),
             })?;
         }
-        for (observation, count) in &held {
-            self.request_held_subscription_attention(&item.subject, observation, *count)?;
-        }
-        self.resolve_released_held_attention(&item.subject, &held)?;
         anyhow::ensure!(waiting.is_empty(), "{}", waiting.join("; "));
         Ok(())
     }
@@ -8719,62 +8730,19 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
-    /// Ask a person once per observation to release or cancel the requests it held.
-    fn request_held_subscription_attention(
-        &self,
-        subscription: &str,
-        observation: &str,
-        count: usize,
-    ) -> Result<()> {
-        let attention_subject = held_subscription_attention_subject(subscription, observation);
-        let digest = attention_subject
-            .strip_prefix("attention/")
-            .unwrap_or(&attention_subject);
-        if self.store.attention_request(&attention_subject)?.is_some() {
-            return Ok(());
-        }
-        self.store.request_attention(
-            &attention_subject,
-            &AttentionRequest {
-                reviewer: "person/operator".into(),
-                title: HELD_SUBSCRIPTION_TITLE.into(),
-                reason: format!(
-                    "One observation for {subscription} requested more than {} mission runs, so {count} wait for a person. List them with `st missions requests {subscription}`, then release or cancel each one.",
-                    crate::store::MAX_OBSERVATION_DELIVERIES
-                ),
-                severity: "warning".into(),
-                targets: vec![subscription.into()],
-                actor: RECONCILER_ACTOR.into(),
-                idempotency_key: format!("held-subscription-requests:{digest}"),
-            },
-        )?;
-        self.signal_changed();
-        Ok(())
-    }
-
-    /// Close each held-requests item of `subscription` once none of its observation's requests
-    /// is held: each was released, cancelled or started, or the subscription stopped.
-    fn resolve_released_held_attention(
-        &self,
-        subscription: &str,
-        held: &BTreeMap<String, usize>,
-    ) -> Result<()> {
-        let still_held = held
-            .keys()
-            .map(|observation| held_subscription_attention_subject(subscription, observation))
-            .collect::<BTreeSet<_>>();
+    /// Retire stored attention from the old burst cap. Queued requests now start automatically.
+    fn retire_legacy_held_subscription_attention(&self, subscription: &str) -> Result<()> {
         for request in self
             .store
             .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
         {
             if request.targets == [subscription]
-                && request.title == HELD_SUBSCRIPTION_TITLE
-                && !still_held.contains(&request.subject)
+                && request.title == "A subscription is holding mission requests"
             {
                 self.store.resolve_attention_automatically(
                     &request.subject,
-                    &format!("{subscription} holds no request from that observation"),
-                    &format!("held-subscription-released:{}", request.request),
+                    "subscription requests now wait in an automatic queue",
+                    &format!("held-subscription-queued:{}", request.request),
                 )?;
                 self.signal_changed();
             }
@@ -10070,7 +10038,6 @@ fn permanent_observation_error(code: &str) -> bool {
     )
 }
 
-const HELD_SUBSCRIPTION_TITLE: &str = "A subscription is holding mission requests";
 /// How often the disk stage reads free space.
 const DISK_CHECK_EVERY_MS: u128 = 30_000;
 
@@ -10084,13 +10051,6 @@ const FAULT_ATTENTION_AFTER_MS: u128 = 120_000;
 fn fault_attention_subject(fault: &str) -> String {
     let digest = hex::encode(sha2::Sha256::digest(
         format!("reconcile-fault-attention:{fault}").as_bytes(),
-    ));
-    format!("attention/{}", &digest[..32])
-}
-
-fn held_subscription_attention_subject(subscription: &str, observation: &str) -> String {
-    let digest = hex::encode(sha2::Sha256::digest(
-        format!("held-subscription-requests:{subscription}:{observation}").as_bytes(),
     ));
     format!("attention/{}", &digest[..32])
 }
@@ -21781,10 +21741,19 @@ subscription "triage" {{
         );
     }
 
+    const QUEUED_REVIEW_SOURCE: &str = r#"version 2
+mission "review" state="ready" {
+  concurrent-runs max=1
+  input "source" kind="resource"
+  completion { when "all-steps-exhausted" }
+  goal "Review one discovered item."
+  step "review" { agentless }
+}"#;
+
     #[test]
-    fn one_observation_holds_excess_deliveries_for_a_person() {
+    fn twenty_subscription_deliveries_start_in_order_without_holds() {
         let store = Arc::new(Store::open_memory("node").unwrap());
-        apply_source(&store, REDELIVERY_REVIEW_SOURCE, "review-mission");
+        apply_source(&store, QUEUED_REVIEW_SOURCE, "review-mission");
         let review = store
             .mission_spec("review", None)
             .unwrap()
@@ -21792,24 +21761,115 @@ subscription "triage" {{
             .revision;
         let subscriptions = watch_repository(&store, "acme/repo", &review, "watch");
         observe_issues(&store, "acme/repo", [1], &subscriptions);
-        observe_issues(&store, "acme/repo", 1..=8, &subscriptions);
-        let statuses = || {
+        observe_issues(&store, "acme/repo", 1..=21, &subscriptions);
+        let requests = store.subscription_requests("subscription/triage").unwrap();
+        assert_eq!(requests.len(), 20);
+        assert!(requests.iter().all(|request| request.status == "pending"));
+        assert!(
             store
-                .subscription_requests("subscription/triage")
+                .claims_for(
+                    "subscription/triage",
+                    Some("subscription.mission-requested")
+                )
                 .unwrap()
-                .into_iter()
-                .map(|request| (request.request, request.status))
+                .iter()
+                .all(|claim| claim.body["fields"].get("held").is_none())
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let desired = store.desired_subjects().unwrap();
+        for (position, request) in requests.iter().enumerate() {
+            // Expire the local retry deadline rather than sleeping through twenty backoffs.
+            if let Some((_, attempts)) = store
+                .subscription_mission_deferral("subscription/triage", &request.request)
+                .unwrap()
+            {
+                store
+                    .record_subscription_mission_deferral(
+                        "subscription/triage",
+                        &request.request,
+                        0,
+                        attempts,
+                    )
+                    .unwrap();
+            }
+            reconciler
+                .reconcile_subscription_missions(&desired)
+                .unwrap();
+            let active = store.active_mission_runs_for_mission("review").unwrap();
+            assert_eq!(active.len(), 1, "mission capacity must control the queue");
+            assert_eq!(
+                active[0].inputs["source"].subject.as_deref(),
+                Some(request.resource.as_str())
+            );
+            let statuses = store.subscription_requests("subscription/triage").unwrap();
+            assert!(
+                statuses[..=position]
+                    .iter()
+                    .all(|request| request.status == "started")
+            );
+            assert!(
+                statuses[position + 1..]
+                    .iter()
+                    .all(|request| request.status == "pending")
+            );
+            for _ in 0..5 {
+                reconciler.evaluate_mission_runs().unwrap();
+            }
+            assert!(
+                store
+                    .active_mission_runs_for_mission("review")
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let started = store
+            .claims_for("subscription/triage", Some("subscription.mission-started"))
+            .unwrap();
+        assert_eq!(
+            started
+                .iter()
+                .map(|claim| claim.body["fields"]["request"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            requests
+                .iter()
+                .map(|request| request.request.as_str())
                 .collect::<Vec<_>>()
-        };
-        let requested = statuses();
-        assert_eq!(requested.len(), 7);
-        let held = requested
-            .iter()
-            .filter(|(_, status)| status == "held")
-            .map(|(request, _)| request.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(held.len(), 7 - crate::store::MAX_OBSERVATION_DELIVERIES);
+        );
+        reconciler
+            .reconcile_subscription_missions(&desired)
+            .unwrap();
+        assert_eq!(
+            store
+                .claims_for("subscription/triage", Some("subscription.mission-started"))
+                .unwrap()
+                .len(),
+            20
+        );
+        assert!(
+            store
+                .attention_requests(Some("person/operator"), true)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
+    #[test]
+    fn a_new_delivery_cannot_pass_an_older_capacity_retry() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, QUEUED_REVIEW_SOURCE, "review-mission");
+        let review = store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        let subscriptions = watch_repository(&store, "acme/repo", &review, "watch");
+        observe_issues(&store, "acme/repo", [1], &subscriptions);
+        observe_issues(&store, "acme/repo", 1..=3, &subscriptions);
         let reconciler = Reconciler::new(
             store.clone(),
             Arc::new(FakeRuntime::default()),
@@ -21820,85 +21880,308 @@ subscription "triage" {{
         reconciler
             .reconcile_subscription_missions(&desired)
             .unwrap();
-        let runs = || {
-            store
-                .active_mission_runs_for_mission("review")
-                .unwrap()
-                .len()
-        };
-        assert_eq!(runs(), crate::store::MAX_OBSERVATION_DELIVERIES);
-        let attention = store.attention_items(Some("person/operator")).unwrap();
-        assert_eq!(
-            attention
-                .iter()
-                .filter(|item| item.title == "A subscription is holding mission requests")
-                .count(),
-            1
-        );
-
-        let decide = |request: &str, decision: &str, actor: &str, key: &str| {
-            store.decide_subscription_request(
-                request,
-                decision,
-                &crate::model::SubscriptionRequestDecision {
-                    actor: actor.into(),
-                    reason: "a person reviewed the held request".into(),
-                    idempotency_key: key.into(),
-                },
+        let older = store.subscription_requests("subscription/triage").unwrap()[1]
+            .request
+            .clone();
+        // Keep the older capacity retry in the future after its predecessor finishes.
+        store
+            .record_subscription_mission_deferral(
+                "subscription/triage",
+                &older,
+                now_ms() + 60_000,
+                1,
             )
-        };
-        let agent = decide(&held[0], "release", "agent/node.triage", "agent-release").unwrap_err();
-        assert_eq!(agent.code, "subscription-request-person-only");
-        assert_eq!(
-            decide(&held[0], "release", "person/operator", "release")
-                .unwrap()
-                .status,
-            "pending"
-        );
-        assert_eq!(
-            decide(&held[1], "cancel", "person/operator", "cancel")
-                .unwrap()
-                .status,
-            "cancelled"
-        );
-        assert_eq!(
-            decide(&held[1], "cancel", "person/operator", "cancel")
-                .unwrap()
-                .status,
-            "cancelled",
-            "an exact retry returns the recorded decision"
-        );
-        let closed = decide(&held[1], "release", "person/operator", "late-release").unwrap_err();
-        assert_eq!(closed.code, "subscription-request-not-open");
-
+            .unwrap();
+        for _ in 0..5 {
+            reconciler.evaluate_mission_runs().unwrap();
+        }
+        observe_issues(&store, "acme/repo", 1..=4, &subscriptions);
         reconciler
             .reconcile_subscription_missions(&desired)
             .unwrap();
-        assert_eq!(runs(), crate::store::MAX_OBSERVATION_DELIVERIES + 1);
-        let final_statuses = statuses();
+        assert!(
+            store
+                .active_mission_runs_for_mission("review")
+                .unwrap()
+                .is_empty(),
+            "the new request must wait behind the older retry"
+        );
+        store
+            .record_subscription_mission_deferral("subscription/triage", &older, 0, 1)
+            .unwrap();
+        reconciler
+            .reconcile_subscription_missions(&desired)
+            .unwrap();
         assert_eq!(
-            final_statuses
+            store.active_mission_runs_for_mission("review").unwrap()[0].inputs["source"]
+                .subject
+                .as_deref(),
+            Some("resource/repo/issue/3")
+        );
+    }
+
+    #[test]
+    fn legacy_held_requests_migrate_and_stale_requests_cancel_across_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.sqlite");
+        let store = Arc::new(Store::open(&path, "node").unwrap());
+        apply_source(&store, QUEUED_REVIEW_SOURCE, "review");
+        apply_source(
+            &store,
+            r#"version 2
+resource "repo" { kind "vcs.repository" }
+observer "repo" { resource "resource/repo"; provider "github.repository"; locator "acme/repo"; field "pull_requests" }
+subscription "reviews" {
+  observer "observer/repo"; on "pull_requests"
+  delivery "mission" { mission "review"; resource "source"; workspace "/tmp/st3-queue-reviews" }
+}"#,
+            "watch",
+        );
+        let desired = store.desired_subjects().unwrap();
+        let item = desired
+            .iter()
+            .find(|item| item.subject == "subscription/reviews")
+            .unwrap();
+        let subscriptions = vec![(
+            item.subject.clone(),
+            crate::graph::subscription_spec(&item.desired).unwrap(),
+        )];
+        let observer_revision = store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap();
+        let observe = |pulls, deliveries: &[(String, crate::model::SubscriptionSpec)]| {
+            store
+                .record_resource_observation(
+                    "observer/repo",
+                    &observer_revision,
+                    None,
+                    "resource/repo",
+                    None,
+                    &serde_json::json!({"repository_id": 7, "pull_requests": pulls}),
+                    now_ms() + 60_000,
+                    deliveries,
+                )
+                .unwrap()
+        };
+        observe(serde_json::json!([]), &[]);
+        let head = "a".repeat(40);
+        observe(
+            serde_json::json!([
+                {"number": 1, "head": head, "state": "open", "draft": false},
+                {"number": 2, "head": head, "state": "open", "draft": false},
+                {"number": 3, "head": head, "state": "open", "draft": false},
+                {"number": 4, "head": head, "state": "open", "draft": false},
+            ]),
+            &[],
+        );
+        let legacy = (1..=4)
+            .map(|number| {
+                let resource = format!("resource/repo/pull-request/{number}");
+                let mut discovery = store
+                    .claims_for(&resource, Some("resource.observed"))
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+                if number == 2 {
+                    // This held request predates item head_sha. Its cited listing still pins
+                    // the old head, so migration must cancel it when the new head arrives.
+                    let mut facts = discovery.body["fields"]["facts"].clone();
+                    facts.as_object_mut().unwrap().remove("head_sha");
+                    discovery = store
+                        .append_claim(&ClaimInput {
+                            subject: resource.clone(),
+                            kind: "resource.observed".into(),
+                            actor: None,
+                            fields: BTreeMap::from([
+                                ("kind".into(), Value::String("vcs.pull-request".into())),
+                                ("facts".into(), facts),
+                            ]),
+                            evidence: vec![discovery.body["evidence"][0]
+                                .as_str()
+                                .unwrap()
+                                .to_owned()],
+                            expected_subject: None,
+                            idempotency_key: Some("legacy-headless-item".into()),
+                        })
+                        .unwrap();
+                }
+                store
+                    .append_claim(&ClaimInput {
+                        subject: "subscription/reviews".into(),
+                        kind: "subscription.mission-requested".into(),
+                        actor: None,
+                        fields: BTreeMap::from([
+                            ("mission".into(), Value::String("mission/review".into())),
+                            ("resource".into(), Value::String(resource)),
+                            ("resource_input".into(), Value::String("source".into())),
+                            (
+                                "workspace".into(),
+                                Value::String(directory.path().to_string_lossy().into_owned()),
+                            ),
+                            ("discovery".into(), Value::String(discovery.id)),
+                            ("held".into(), Value::Bool(true)),
+                        ]),
+                        evidence: vec![],
+                        expected_subject: None,
+                        idempotency_key: Some(format!("legacy-request-{number}")),
+                    })
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        store
+            .request_attention(
+                "attention/legacy-held",
+                &AttentionRequest {
+                    reviewer: "person/operator".into(),
+                    title: "A subscription is holding mission requests".into(),
+                    reason: "one observation exceeded the old burst cap".into(),
+                    severity: "warning".into(),
+                    targets: vec!["subscription/reviews".into()],
+                    actor: RECONCILER_ACTOR.into(),
+                    idempotency_key: "legacy-held-attention".into(),
+                },
+            )
+            .unwrap();
+        // Occupy capacity so the migration must queue the valid hold rather than just start it.
+        let discovery = legacy[0].body["fields"]["discovery"].as_str().unwrap();
+        let occupied = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "review".into(),
+                revision: None,
+                workspace: directory.path().to_string_lossy().into_owned(),
+                requester: None,
+                mode: None,
+                inputs: BTreeMap::from([(
+                    "source".into(),
+                    format!("resource/repo/pull-request/1@{discovery}"),
+                )]),
+                idempotency_key: "occupied".into(),
+            })
+            .unwrap();
+        observe(
+            serde_json::json!([
+                {"number": 1, "head": head, "state": "open", "draft": false},
+                {"number": 2, "head": "b".repeat(40), "state": "open", "draft": false},
+                {"number": 3, "head": head, "state": "closed", "draft": false},
+                {"number": 4, "head": head, "state": "open", "draft": true},
+            ]),
+            &subscriptions,
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler
+            .reconcile_subscription_missions(&desired)
+            .unwrap();
+        let queue = store.subscription_requests("subscription/reviews").unwrap();
+        assert_eq!(
+            queue
                 .iter()
-                .filter(|(_, status)| status == "started")
-                .count(),
-            crate::store::MAX_OBSERVATION_DELIVERIES + 1
+                .map(|request| request.status.as_str())
+                .collect::<Vec<_>>(),
+            ["pending", "cancelled", "cancelled", "cancelled", "pending"]
+        );
+        let cancelled = store
+            .claims_for(
+                "subscription/reviews",
+                Some("subscription.mission-request-cancelled"),
+            )
+            .unwrap();
+        assert!(
+            cancelled[0].body["fields"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("moved from head")
         );
         assert_eq!(
-            final_statuses
+            cancelled[1].body["fields"]["reason"],
+            "pull request #3 is closed"
+        );
+        assert_eq!(
+            cancelled[2].body["fields"]["reason"],
+            "pull request #4 is a draft again"
+        );
+        let attention = store
+            .attention_request("attention/legacy-held")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            attention.status, "resolved",
+            "the queue never asks a person, even at capacity"
+        );
+        for _ in 0..5 {
+            reconciler.evaluate_mission_runs().unwrap();
+        }
+        assert_eq!(
+            store.mission_run(&occupied.id).unwrap().unwrap().status,
+            "completed"
+        );
+        drop(reconciler);
+        drop(store);
+
+        let store = Arc::new(Store::open(&path, "node").unwrap());
+        let desired = store.desired_subjects().unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for request in [&legacy[0].id, &queue[4].request] {
+            if let Some((_, attempts)) = store
+                .subscription_mission_deferral("subscription/reviews", request)
+                .unwrap()
+            {
+                store
+                    .record_subscription_mission_deferral(
+                        "subscription/reviews",
+                        request,
+                        0,
+                        attempts,
+                    )
+                    .unwrap();
+            }
+            reconciler
+                .reconcile_subscription_missions(&desired)
+                .unwrap();
+            let active = store.active_mission_runs_for_mission("review").unwrap();
+            assert_eq!(active.len(), 1);
+            for _ in 0..5 {
+                reconciler.evaluate_mission_runs().unwrap();
+            }
+        }
+        let started = store
+            .claims_for("subscription/reviews", Some("subscription.mission-started"))
+            .unwrap();
+        assert_eq!(
+            started
                 .iter()
-                .filter(|(_, status)| status == "cancelled")
-                .count(),
+                .map(|claim| claim.body["fields"]["request"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [&legacy[0].id, &queue[4].request]
+        );
+        let released = store
+            .claims_for(
+                "subscription/reviews",
+                Some("subscription.mission-request-released"),
+            )
+            .unwrap();
+        assert_eq!(released.len(), 1, "migration is durable and happens once");
+        assert!(
+            released[0].actor.is_none(),
+            "no person releases the migrated request"
+        );
+        assert_eq!(
+            store
+                .attention_requests(Some("person/operator"), true)
+                .unwrap()
+                .len(),
             1
         );
-        // Nothing is held any more, so the item closes.
-        let held_items = store
-            .attention_requests(Some("person/operator"), true)
-            .unwrap()
-            .into_iter()
-            .filter(|request| request.title == "A subscription is holding mission requests")
-            .collect::<Vec<_>>();
-        assert_eq!(held_items.len(), 1);
-        assert_eq!(held_items[0].status, "resolved");
     }
 
     const INTAKE_REVIEW_SOURCE: &str = r#"version 2
