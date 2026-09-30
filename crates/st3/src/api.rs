@@ -4425,6 +4425,10 @@ async fn guard_bound_request(
 
 pub async fn serve_tcp(address: &str, app: Router) -> anyhow::Result<()> {
     let address = address.parse::<std::net::SocketAddr>()?;
+    anyhow::ensure!(
+        crate::fleet::transport::is_permitted_route_address(&address.ip()),
+        "the peer listener must bind to a loopback or Tailscale address"
+    );
     let listener = TcpListener::bind(address).await?;
     axum::serve(listener, app).await?;
     Ok(())

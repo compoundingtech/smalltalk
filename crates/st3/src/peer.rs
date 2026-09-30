@@ -30,8 +30,8 @@ use crate::client::Client;
 use crate::config::{Config, PeerConfig};
 use crate::fleet::transport::{
     Fabric, FabricGrantRefusal, LocalTransports, Route, bindable_tailnet_addresses,
-    default_fabric_protocol, local_addresses, parse_route, resolve_tool, routes_from_endpoints,
-    tailscale_addresses,
+    default_fabric_protocol, is_tailnet_address, local_addresses, parse_route, resolve_tool,
+    routes_from_endpoints, tailscale_addresses,
 };
 use crate::fleet::{Acceptance, FleetView, MemberKey, Refusal, Sender, verify_signature};
 use crate::model::InventoryCheckpoint;
@@ -1553,17 +1553,23 @@ pub async fn run_worker(config: Config) -> Result<()> {
         ),
         None => None,
     };
-    let loopback = listener
+    let bound_address = listener
         .as_ref()
         .and_then(|listener| listener.local_addr().ok());
+    let loopback = bound_address.filter(|address| address.ip().is_loopback());
+    let tailnet = bound_address.filter(|address| is_tailnet_address(&address.ip()));
     if let Some(file) = &config.fleet {
         if let (Some(address), true) = (loopback, file.advertise_loopback) {
             endpoints.set_loopback(Some(address));
         }
+        if let Some(address) = tailnet {
+            endpoints.update(|set| set.tailscale = vec![address]);
+        }
         if let Some(tailscale) = tailscale {
             tokio::spawn(keep_tailnet_current(
                 tailscale,
-                loopback.map(|address| (address.port(), app.clone())),
+                bound_address.map(|address| (address.port(), app.clone())),
+                tailnet.map(|address| address.ip()),
                 endpoints.clone(),
                 fleet_transports,
                 notify_for_transports,
@@ -1653,12 +1659,13 @@ impl Endpoints {
 async fn keep_tailnet_current(
     tailscale: PathBuf,
     listen: Option<(u16, Router)>,
+    already_bound: Option<std::net::IpAddr>,
     endpoints: Endpoints,
     transports: Arc<std::sync::RwLock<LocalTransports>>,
     notify: watch::Sender<u64>,
     mut connectivity: watch::Receiver<u64>,
 ) {
-    let mut bound = BTreeSet::new();
+    let mut bound = already_bound.into_iter().collect::<BTreeSet<_>>();
     loop {
         let bindable = match tailscale_addresses(&tailscale).await {
             Ok(reported) => bindable_tailnet_addresses(&reported, &local_addresses()),

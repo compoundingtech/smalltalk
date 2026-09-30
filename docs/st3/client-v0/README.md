@@ -545,7 +545,8 @@ static config peers or Fabric. Every peer handshake verifies fleet authenticatio
 member signatures; the owner then rechecks person authority and the exact live incarnation.
 Unlike projected-screen reads, raw streams currently require a directly dialable owner endpoint;
 they fail with `remote-unavailable` rather than replacing the stream with synthetic screens.
-Configure `peer_listen` for a concrete tailnet IP and publish the corresponding fleet endpoint.
+The owner's replication worker advertises its Tailscale endpoint, whether discovered or set with
+a Tailscale `peer_listen`; see [Tailscale setup](../tailscale.md).
 The client-facing carrier remains a forwarder to `st3-client.sock`, never `st3.sock`.
 
 
