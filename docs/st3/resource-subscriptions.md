@@ -204,7 +204,7 @@ subscription "new-ready-pull-requests" {
     mission "review/pull-request"
     resource "pull-request"
     workspace "/work/pull-request-reviews"
-    requester "agent/fleet/repository/standing/owner"
+    requester "agent/example/repository/standing/owner"
   }
 }
 ```
@@ -282,7 +282,7 @@ subscription "green" {
       field "conclusion" "is" "success"
     }
   }
-  to "agent/fleet/cos/standing/cos"
+  to "agent/example/cos/standing/cos"
   delivery "message"
 }
 ```

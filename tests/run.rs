@@ -343,15 +343,15 @@ fn selected_missing_derived_ding_is_held_without_broadening_to_its_agent() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         COMPACT_AGENT_WITH_DING,
     );
     let runner = FakeRunner::default();
 
-    let report = up_once_selected(tmp.path(), "hetz.demo.ding", "hetz", &runner).unwrap();
+    let report = up_once_selected(tmp.path(), "example-linux.demo.ding", "example-linux", &runner).unwrap();
 
     assert_eq!(runner.list_calls.get(), 1);
-    assert_eq!(report.held, ["hetz.demo.ding"]);
+    assert_eq!(report.held, ["example-linux.demo.ding"]);
     assert!(report.launched.is_empty());
     assert!(runner.spawned.borrow().is_empty());
     assert!(runner.reaped.borrow().is_empty());
@@ -670,16 +670,16 @@ const AGENT: &str = r#"
 identity = "demo"
 type = "service"
 [pty.agent]
-id = "hetz.demo-claude"
+id = "example-linux.demo-claude"
 command = "exec claude 'boot'"
 [exec.ding]
-id = "hetz.demo.ding"
-command = "st2 ding hetz.demo"
+id = "example-linux.demo.ding"
+command = "st2 ding example-linux.demo"
 "#;
 
 const COMPACT_AGENT_WITH_DING: &str = r#"
 agent "demo" {
-  host "hetz"
+  host "example-linux"
   command "exit 24"
   ding
   restart { attempts 1; interval "60s"; delay "0s"; mode "fail" }
@@ -688,7 +688,7 @@ agent "demo" {
 
 const COMPACT_ADOPT_ONLY_AGENT_WITH_DING: &str = r#"
 agent "demo" {
-  host "hetz"
+  host "example-linux"
   command "true"
   lifecycle "adopt-only"
   ding
@@ -697,14 +697,14 @@ agent "demo" {
 
 const EXPLICIT_RUNNER_IDENTITY_AGENT: &str = r#"
 agent "demo" {
-  host "hetz"
-  pty "agent" { id "hetz.demo"; command "true" }
-  pty "shell" { id "hetz.demo.shell"; command "true" }
-  exec "sidecar" { id "hetz.demo.sidecar"; command "true" }
+  host "example-linux"
+  pty "agent" { id "example-linux.demo"; command "true" }
+  pty "shell" { id "example-linux.demo.shell"; command "true" }
+  exec "sidecar" { id "example-linux.demo.sidecar"; command "true" }
   exec "matched" {
-    id "hetz.demo.matched"
+    id "example-linux.demo.matched"
     command "true"
-    env { ST_AGENT "hetz.demo" }
+    env { ST_AGENT "example-linux.demo" }
   }
 }
 "#;
@@ -712,29 +712,29 @@ agent "demo" {
 #[test]
 fn runner_owned_identity_injects_compact_and_explicit_task_omissions_and_accepts_a_match() {
     for (source, expected_ids) in [
-        (COMPACT_AGENT_WITH_DING, vec!["hetz.demo", "hetz.demo.ding"]),
+        (COMPACT_AGENT_WITH_DING, vec!["example-linux.demo", "example-linux.demo.ding"]),
         (
             EXPLICIT_RUNNER_IDENTITY_AGENT,
             vec![
-                "hetz.demo",
-                "hetz.demo.matched",
-                "hetz.demo.shell",
-                "hetz.demo.sidecar",
+                "example-linux.demo",
+                "example-linux.demo.matched",
+                "example-linux.demo.shell",
+                "example-linux.demo.sidecar",
             ],
         ),
     ] {
         let tmp = tempfile::tempdir().unwrap();
-        write(tmp.path(), "agents/hetz/demo/agent.kdl", source);
+        write(tmp.path(), "agents/example-linux/demo/agent.kdl", source);
         let runner = FakeRunner::default();
 
-        let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+        let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert_eq!(runner.spawned.borrow().as_slice(), expected_ids);
         for target in runner.spawned_targets.borrow().iter() {
             assert_eq!(
                 target.env.get("ST_AGENT").map(String::as_str),
-                Some("hetz.demo"),
+                Some("example-linux.demo"),
                 "task {}",
                 target.pty_id
             );
@@ -747,30 +747,30 @@ fn runner_owned_identity_metadata_is_form_equivalent_and_role_scoped() {
     let compact = tempfile::tempdir().unwrap();
     write(
         compact.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         COMPACT_AGENT_WITH_DING,
     );
     let compact_runner = FakeRunner::default();
-    up_once(compact.path(), "hetz", &compact_runner).unwrap();
+    up_once(compact.path(), "example-linux", &compact_runner).unwrap();
 
     let explicit = tempfile::tempdir().unwrap();
     write(
         explicit.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         EXPLICIT_RUNNER_IDENTITY_AGENT,
     );
     let explicit_runner = FakeRunner::default();
-    up_once(explicit.path(), "hetz", &explicit_runner).unwrap();
+    up_once(explicit.path(), "example-linux", &explicit_runner).unwrap();
 
     let compact_targets = compact_runner.spawned_targets.borrow();
     let explicit_targets = explicit_runner.spawned_targets.borrow();
     let compact_agent = compact_targets
         .iter()
-        .find(|target| target.pty_id == "hetz.demo")
+        .find(|target| target.pty_id == "example-linux.demo")
         .unwrap();
     let explicit_agent = explicit_targets
         .iter()
-        .find(|target| target.pty_id == "hetz.demo")
+        .find(|target| target.pty_id == "example-linux.demo")
         .unwrap();
     assert_eq!(compact_agent.presentation, explicit_agent.presentation);
     assert_eq!(compact_agent.tags, explicit_agent.tags);
@@ -778,26 +778,26 @@ fn runner_owned_identity_metadata_is_form_equivalent_and_role_scoped() {
     let primary_tags = &compact_agent.presentation.as_ref().unwrap().tags;
     assert_eq!(
         primary_tags.get("agent.actor.path"),
-        Some(&Some("hetz.demo".to_owned()))
+        Some(&Some("example-linux.demo".to_owned()))
     );
     assert_eq!(primary_tags.get("role"), Some(&Some("agent".to_owned())));
     assert!(!primary_tags.contains_key("run.role"));
 
     let secondary = explicit_targets
         .iter()
-        .find(|target| target.pty_id == "hetz.demo.shell")
+        .find(|target| target.pty_id == "example-linux.demo.shell")
         .unwrap();
     let secondary_tags = &secondary.presentation.as_ref().unwrap().tags;
     assert_eq!(
         secondary_tags.get("agent.actor.path"),
-        Some(&Some("hetz.demo".to_owned()))
+        Some(&Some("example-linux.demo".to_owned()))
     );
     assert_eq!(secondary_tags.get("role"), Some(&None));
     assert!(!secondary_tags.contains_key("run.role"));
 
     let sidecar = explicit_targets
         .iter()
-        .find(|target| target.pty_id == "hetz.demo.sidecar")
+        .find(|target| target.pty_id == "example-linux.demo.sidecar")
         .unwrap();
     assert_eq!(sidecar.kind, TaskKind::Exec);
     assert!(sidecar.presentation.is_none());
@@ -811,10 +811,10 @@ fn runner_owned_identity_conflict_refuses_before_materialization_or_runner_acces
     fs::create_dir_all(&workspace).unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         &format!(
             r#"agent "demo" {{
-  host "hetz"
+  host "example-linux"
   workspace "{}"
   command "true"
   env {{ ST_AGENT "wrong.actor" }}
@@ -826,7 +826,7 @@ fn runner_owned_identity_conflict_refuses_before_materialization_or_runner_acces
     );
     let runner = FakeRunner::default();
 
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
     assert_eq!(runner.list_calls.get(), 0);
     assert!(runner.spawned.borrow().is_empty());
@@ -834,7 +834,7 @@ fn runner_owned_identity_conflict_refuses_before_materialization_or_runner_acces
     assert_eq!(
         report.errors,
         [
-            "agent 'hetz.demo' task 'agent' declares conflicting ST_AGENT 'wrong.actor'; expected runner-owned value 'hetz.demo'"
+            "agent 'example-linux.demo' task 'agent' declares conflicting ST_AGENT 'wrong.actor'; expected runner-owned value 'example-linux.demo'"
         ]
     );
 }
@@ -867,24 +867,24 @@ fn retired_identity_conflict_does_not_block_stale_task_cleanup() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/retired/agent.kdl",
+        "agents/example-linux/retired/agent.kdl",
         r#"agent "retired" {
-  host "hetz"
+  host "example-linux"
   retired #true
   command "true"
   env { ST_AGENT "stale.wrong" }
 }"#,
     );
     let runner = FakeRunner {
-        sessions: vec![live("hetz.retired")],
+        sessions: vec![live("example-linux.retired")],
         ..Default::default()
     };
 
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(runner.list_calls.get(), 1);
-    assert_eq!(runner.killed.borrow().as_slice(), ["hetz.retired"]);
+    assert_eq!(runner.killed.borrow().as_slice(), ["example-linux.retired"]);
     assert!(runner.spawned.borrow().is_empty());
 }
 
@@ -893,27 +893,27 @@ fn runner_owned_identity_is_rederived_for_dead_task_replay() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         COMPACT_AGENT_WITH_DING,
     );
     let first = FakeRunner::default();
-    up_once(tmp.path(), "hetz", &first).unwrap();
+    up_once(tmp.path(), "example-linux", &first).unwrap();
     let replay = FakeRunner {
-        sessions: vec![dead("hetz.demo"), dead("hetz.demo.ding")],
+        sessions: vec![dead("example-linux.demo"), dead("example-linux.demo.ding")],
         ..Default::default()
     };
 
-    let report = up_once(tmp.path(), "hetz", &replay).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &replay).unwrap();
 
     assert!(report.errors.is_empty(), "{:?}", report.errors);
     assert_eq!(
         replay.reaped.borrow().as_slice(),
-        ["hetz.demo", "hetz.demo.ding"]
+        ["example-linux.demo", "example-linux.demo.ding"]
     );
     for target in replay.spawned_targets.borrow().iter() {
         assert_eq!(
             target.env.get("ST_AGENT").map(String::as_str),
-            Some("hetz.demo"),
+            Some("example-linux.demo"),
             "task {}",
             target.pty_id
         );
@@ -937,27 +937,27 @@ fn runner_owned_identity_is_rederived_for_dead_task_replay() {
 #[test]
 fn up_once_launches_all_tasks_of_a_fresh_agent() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
+    write(tmp.path(), "agents/example-linux/demo/agent.toml", AGENT);
 
     let runner = FakeRunner::default();
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
     let mut launched = report.launched.clone();
     launched.sort();
-    assert_eq!(launched, vec!["hetz.demo-claude", "hetz.demo.ding"]);
+    assert_eq!(launched, vec!["example-linux.demo-claude", "example-linux.demo.ding"]);
     assert!(report.restarted.is_empty());
     assert!(report.gc.is_empty());
     assert!(report.errors.is_empty());
     let dirs = runner.spawn_dirs.borrow();
-    assert!(dirs.iter().all(|(_, d)| d.ends_with("agents/hetz/demo")));
+    assert!(dirs.iter().all(|(_, d)| d.ends_with("agents/example-linux/demo")));
     let targets = runner.spawned_targets.borrow();
     let authored_ding = targets
         .iter()
-        .find(|target| target.pty_id == "hetz.demo.ding")
+        .find(|target| target.pty_id == "example-linux.demo.ding")
         .unwrap();
     assert_eq!(
         &authored_ding.launch,
-        &TaskLaunch::Shell("st2 ding hetz.demo".into())
+        &TaskLaunch::Shell("st2 ding example-linux.demo".into())
     );
 }
 
@@ -966,18 +966,18 @@ fn fresh_compact_agent_launches_with_its_derived_ding() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         COMPACT_AGENT_WITH_DING,
     );
 
     let runner = FakeRunner::default();
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
-    assert_eq!(report.launched, ["hetz.demo", "hetz.demo.ding"]);
+    assert_eq!(report.launched, ["example-linux.demo", "example-linux.demo.ding"]);
     let targets = runner.spawned_targets.borrow();
     let ding = targets
         .iter()
-        .find(|target| target.pty_id == "hetz.demo.ding")
+        .find(|target| target.pty_id == "example-linux.demo.ding")
         .unwrap();
     assert_eq!(
         &ding.launch,
@@ -985,7 +985,7 @@ fn fresh_compact_agent_launches_with_its_derived_ding() {
             std::env::current_exe().unwrap().display().to_string(),
             "ding".into(),
             "--identity".into(),
-            "hetz.demo".into(),
+            "example-linux.demo".into(),
             "--root".into(),
             tmp.path().display().to_string(),
         ])
@@ -997,13 +997,13 @@ fn absent_adopt_only_compact_agent_holds_its_derived_ding() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         COMPACT_ADOPT_ONLY_AGENT_WITH_DING,
     );
 
-    let report = up_once(tmp.path(), "hetz", &FakeRunner::default()).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &FakeRunner::default()).unwrap();
 
-    assert_eq!(report.held, ["hetz.demo"]);
+    assert_eq!(report.held, ["example-linux.demo"]);
     assert!(report.launched.is_empty());
 }
 
@@ -1012,30 +1012,30 @@ fn held_adopt_only_compact_agent_stops_its_live_derived_ding() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         COMPACT_ADOPT_ONLY_AGENT_WITH_DING,
     );
     let runner = FakeRunner {
-        sessions: vec![dead("hetz.demo"), live("hetz.demo.ding")],
+        sessions: vec![dead("example-linux.demo"), live("example-linux.demo.ding")],
         ..Default::default()
     };
 
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
-    assert_eq!(report.held, ["hetz.demo"]);
-    assert_eq!(report.torn_down, ["hetz.demo.ding"]);
+    assert_eq!(report.held, ["example-linux.demo"]);
+    assert_eq!(report.torn_down, ["example-linux.demo.ding"]);
     assert!(report.launched.is_empty());
 }
 
 #[test]
 fn up_once_adopts_when_all_tasks_already_live() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
+    write(tmp.path(), "agents/example-linux/demo/agent.toml", AGENT);
     let runner = FakeRunner {
-        sessions: vec![live("hetz.demo-claude"), live("hetz.demo.ding")],
+        sessions: vec![live("example-linux.demo-claude"), live("example-linux.demo.ding")],
         ..Default::default()
     };
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
     assert!(report.launched.is_empty());
     assert_eq!(report.adopted, vec!["demo"]);
 }
@@ -1043,13 +1043,13 @@ fn up_once_adopts_when_all_tasks_already_live() {
 #[test]
 fn up_once_launches_only_the_missing_task() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
+    write(tmp.path(), "agents/example-linux/demo/agent.toml", AGENT);
     let runner = FakeRunner {
-        sessions: vec![live("hetz.demo-claude")],
+        sessions: vec![live("example-linux.demo-claude")],
         ..Default::default()
     };
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
-    assert_eq!(report.launched, vec!["hetz.demo.ding"]);
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
+    assert_eq!(report.launched, vec!["example-linux.demo.ding"]);
 }
 
 #[test]
@@ -1059,33 +1059,33 @@ fn up_once_tears_down_a_retired_agent() {
 identity = "demo"
 retired = true
 [pty.agent]
-id = "hetz.demo-claude"
+id = "example-linux.demo-claude"
 command = "exec claude 'boot'"
 [exec.ding]
-id = "hetz.demo.ding"
-command = "st2 ding hetz.demo"
+id = "example-linux.demo.ding"
+command = "st2 ding example-linux.demo"
 "#;
-    write(tmp.path(), "agents/hetz/demo/agent.toml", retired);
+    write(tmp.path(), "agents/example-linux/demo/agent.toml", retired);
     let runner = FakeRunner {
-        sessions: vec![live("hetz.demo-claude"), live("hetz.demo.ding")],
+        sessions: vec![live("example-linux.demo-claude"), live("example-linux.demo.ding")],
         ..Default::default()
     };
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
     let mut torn = report.torn_down.clone();
     torn.sort();
-    assert_eq!(torn, vec!["hetz.demo-claude", "hetz.demo.ding"]);
+    assert_eq!(torn, vec!["example-linux.demo-claude", "example-linux.demo.ding"]);
     assert!(report.launched.is_empty());
 }
 
 #[test]
 fn retired_agent_idempotently_archives_every_inbox_message() {
     let tmp = tempfile::tempdir().unwrap();
-    let agent_dir = tmp.path().join("agents/hetz/demo");
+    let agent_dir = tmp.path().join("agents/example-linux/demo");
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         r#"agent "demo" {
-  host "hetz"
+  host "example-linux"
   desired-state "retired" reason="Work complete"
   command "true"
 }"#,
@@ -1096,12 +1096,12 @@ fn retired_agent_idempotently_archives_every_inbox_message() {
     fs::create_dir_all(&inbox).unwrap();
     fs::write(inbox.join(filename), "first receipt").unwrap();
     let runner = FakeRunner {
-        sessions: vec![live("hetz.demo")],
+        sessions: vec![live("example-linux.demo")],
         inbox_expected_during_kill: Some(inbox.join(filename)),
         ..Default::default()
     };
 
-    let first = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let first = up_once(tmp.path(), "example-linux", &runner).unwrap();
     assert!(first.errors.is_empty(), "{:?}", first.errors);
     assert_eq!(
         fs::read_to_string(archive.join(filename)).unwrap(),
@@ -1111,17 +1111,17 @@ fn retired_agent_idempotently_archives_every_inbox_message() {
 
     fs::write(inbox.join(filename), "restored duplicate").unwrap();
     let failing_runner = FakeRunner {
-        sessions: vec![live("hetz.demo")],
-        fail_kill: Some("hetz.demo".into()),
+        sessions: vec![live("example-linux.demo")],
+        fail_kill: Some("example-linux.demo".into()),
         inbox_expected_during_kill: Some(inbox.join(filename)),
         ..Default::default()
     };
-    let second = up_once(tmp.path(), "hetz", &failing_runner).unwrap();
+    let second = up_once(tmp.path(), "example-linux", &failing_runner).unwrap();
     assert!(
         second
             .errors
             .iter()
-            .any(|error| error.contains("kill hetz.demo")),
+            .any(|error| error.contains("kill example-linux.demo")),
         "{:?}",
         second.errors
     );
@@ -1137,11 +1137,11 @@ fn retired_agent_idempotently_archives_every_inbox_message() {
     );
 
     let retry_runner = FakeRunner {
-        sessions: vec![live("hetz.demo")],
+        sessions: vec![live("example-linux.demo")],
         inbox_expected_during_kill: Some(inbox.join(filename)),
         ..Default::default()
     };
-    let retry = up_once(tmp.path(), "hetz", &retry_runner).unwrap();
+    let retry = up_once(tmp.path(), "example-linux", &retry_runner).unwrap();
     assert!(retry.errors.is_empty(), "{:?}", retry.errors);
     assert!(!inbox.join(filename).exists());
     assert_eq!(
@@ -1154,16 +1154,16 @@ fn retired_agent_idempotently_archives_every_inbox_message() {
 fn retired_compact_agent_stops_agent_and_derived_ding() {
     let tmp = tempfile::tempdir().unwrap();
     let retired =
-        COMPACT_AGENT_WITH_DING.replacen("  host \"hetz\"", "  host \"hetz\"\n  retired #true", 1);
-    write(tmp.path(), "agents/hetz/demo/agent.kdl", &retired);
+        COMPACT_AGENT_WITH_DING.replacen("  host \"example-linux\"", "  host \"example-linux\"\n  retired #true", 1);
+    write(tmp.path(), "agents/example-linux/demo/agent.kdl", &retired);
     let runner = FakeRunner {
-        sessions: vec![live("hetz.demo"), live("hetz.demo.ding")],
+        sessions: vec![live("example-linux.demo"), live("example-linux.demo.ding")],
         ..Default::default()
     };
 
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
-    assert_eq!(report.torn_down, ["hetz.demo", "hetz.demo.ding"]);
+    assert_eq!(report.torn_down, ["example-linux.demo", "example-linux.demo.ding"]);
     assert!(report.launched.is_empty());
 }
 
@@ -1172,55 +1172,55 @@ fn suspend_and_resume_cover_derived_ding_sibling_continuity_and_inbox_retention(
     let tmp = tempfile::tempdir().unwrap();
     let running = COMPACT_AGENT_WITH_DING;
     let suspended = running.replacen(
-        "  host \"hetz\"",
-        "  host \"hetz\"\n  desired-state \"suspended\" reason=\"Waiting for capacity\"",
+        "  host \"example-linux\"",
+        "  host \"example-linux\"\n  desired-state \"suspended\" reason=\"Waiting for capacity\"",
         1,
     );
-    write(tmp.path(), "agents/hetz/demo/agent.kdl", &suspended);
+    write(tmp.path(), "agents/example-linux/demo/agent.kdl", &suspended);
     write(
         tmp.path(),
-        "agents/hetz/sibling/agent.kdl",
-        "agent \"sibling\" { host \"hetz\"; command \"true\" }\n",
+        "agents/example-linux/sibling/agent.kdl",
+        "agent \"sibling\" { host \"example-linux\"; command \"true\" }\n",
     );
     write(
         tmp.path(),
-        "agents/hetz/demo/resources/inbox/1234567890000-proof.md",
-        "---\nfrom: hetz.sibling\n---\nretained\n",
+        "agents/example-linux/demo/resources/inbox/1234567890000-proof.md",
+        "---\nfrom: example-linux.sibling\n---\nretained\n",
     );
     let suspend_runner = FakeRunner {
         sessions: vec![
-            live("hetz.demo"),
-            live("hetz.demo.ding"),
-            live("hetz.sibling"),
+            live("example-linux.demo"),
+            live("example-linux.demo.ding"),
+            live("example-linux.sibling"),
         ],
         ..Default::default()
     };
 
-    let suspended_report = up_once(tmp.path(), "hetz", &suspend_runner).unwrap();
-    assert_eq!(suspended_report.torn_down, ["hetz.demo", "hetz.demo.ding"]);
+    let suspended_report = up_once(tmp.path(), "example-linux", &suspend_runner).unwrap();
+    assert_eq!(suspended_report.torn_down, ["example-linux.demo", "example-linux.demo.ding"]);
     assert_eq!(suspended_report.adopted, ["sibling"]);
     assert!(suspended_report.launched.is_empty());
     assert!(
         tmp.path()
-            .join("agents/hetz/demo/resources/inbox/1234567890000-proof.md")
+            .join("agents/example-linux/demo/resources/inbox/1234567890000-proof.md")
             .is_file()
     );
 
-    write(tmp.path(), "agents/hetz/demo/agent.kdl", running);
+    write(tmp.path(), "agents/example-linux/demo/agent.kdl", running);
     let resume_runner = FakeRunner {
         sessions: vec![
-            dead("hetz.demo"),
-            dead("hetz.demo.ding"),
-            live("hetz.sibling"),
+            dead("example-linux.demo"),
+            dead("example-linux.demo.ding"),
+            live("example-linux.sibling"),
         ],
         ..Default::default()
     };
-    let resumed_report = up_once(tmp.path(), "hetz", &resume_runner).unwrap();
-    assert_eq!(resumed_report.restarted, ["hetz.demo", "hetz.demo.ding"]);
+    let resumed_report = up_once(tmp.path(), "example-linux", &resume_runner).unwrap();
+    assert_eq!(resumed_report.restarted, ["example-linux.demo", "example-linux.demo.ding"]);
     assert_eq!(resumed_report.adopted, ["sibling"]);
     assert!(
         tmp.path()
-            .join("agents/hetz/demo/resources/inbox/1234567890000-proof.md")
+            .join("agents/example-linux/demo/resources/inbox/1234567890000-proof.md")
             .is_file()
     );
 }
@@ -1230,16 +1230,16 @@ fn up_once_skips_other_host_specs() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/here/agent.toml",
+        "agents/example-linux/here/agent.toml",
         "identity=\"here\"\n[pty.agent]\ncommand=\"x\"\n",
     );
     write(
         tmp.path(),
-        "agents/silber/there/agent.toml",
+        "agents/example-mac/there/agent.toml",
         "identity=\"there\"\n[pty.agent]\ncommand=\"y\"\n",
     );
     let runner = FakeRunner::default();
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
     assert_eq!(report.launched.len(), 1);
     assert_eq!(report.other_host, vec!["there"]);
 }
@@ -1247,29 +1247,29 @@ fn up_once_skips_other_host_specs() {
 #[test]
 fn up_once_collects_spawn_errors_without_aborting() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
+    write(tmp.path(), "agents/example-linux/demo/agent.toml", AGENT);
     let runner = FakeRunner {
-        fail_spawn: Some("hetz.demo-claude".into()),
+        fail_spawn: Some("example-linux.demo-claude".into()),
         ..Default::default()
     };
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
-    assert_eq!(report.launched, vec!["hetz.demo.ding"]);
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
+    assert_eq!(report.launched, vec!["example-linux.demo.ding"]);
     assert_eq!(report.errors.len(), 1);
-    assert!(report.errors[0].contains("hetz.demo-claude"));
+    assert!(report.errors[0].contains("example-linux.demo-claude"));
 }
 
 #[test]
 fn up_once_reports_a_successful_replacement_only_as_restarted() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
+    write(tmp.path(), "agents/example-linux/demo/agent.toml", AGENT);
     let runner = FakeRunner {
-        sessions: vec![dead("hetz.demo-claude"), dead("hetz.demo.ding")],
+        sessions: vec![dead("example-linux.demo-claude"), dead("example-linux.demo.ding")],
         ..Default::default()
     };
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
     let mut reaped = runner.reaped.borrow().clone();
     reaped.sort();
-    assert_eq!(reaped, vec!["hetz.demo-claude", "hetz.demo.ding"]);
+    assert_eq!(reaped, vec!["example-linux.demo-claude", "example-linux.demo.ding"]);
     assert!(
         runner.removed.borrow().is_empty(),
         "a restart must not remove final retirement state"
@@ -1277,7 +1277,7 @@ fn up_once_reports_a_successful_replacement_only_as_restarted() {
     assert!(report.launched.is_empty());
     let mut restarted = report.restarted.clone();
     restarted.sort();
-    assert_eq!(restarted, vec!["hetz.demo-claude", "hetz.demo.ding"]);
+    assert_eq!(restarted, vec!["example-linux.demo-claude", "example-linux.demo.ding"]);
     assert!(
         report.gc.is_empty(),
         "a successful restart must not be reported as final garbage collection"
@@ -1285,10 +1285,10 @@ fn up_once_reports_a_successful_replacement_only_as_restarted() {
     assert_eq!(
         runner.ops.borrow().as_slice(),
         [
-            "reap:hetz.demo-claude",
-            "spawn:hetz.demo-claude",
-            "reap:hetz.demo.ding",
-            "spawn:hetz.demo.ding",
+            "reap:example-linux.demo-claude",
+            "spawn:example-linux.demo-claude",
+            "reap:example-linux.demo.ding",
+            "spawn:example-linux.demo.ding",
         ],
         "st2 must reap each dead record before it starts the replacement"
     );
@@ -1297,42 +1297,42 @@ fn up_once_reports_a_successful_replacement_only_as_restarted() {
 #[test]
 fn up_once_does_not_restart_a_task_when_diagnostic_reap_fails() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
+    write(tmp.path(), "agents/example-linux/demo/agent.toml", AGENT);
     let runner = FakeRunner {
-        sessions: vec![dead("hetz.demo-claude"), dead("hetz.demo.ding")],
-        fail_reap: Some("hetz.demo-claude".into()),
+        sessions: vec![dead("example-linux.demo-claude"), dead("example-linux.demo.ding")],
+        fail_reap: Some("example-linux.demo-claude".into()),
         ..Default::default()
     };
 
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
     assert!(report.launched.is_empty());
-    assert_eq!(report.restarted, vec!["hetz.demo.ding"]);
+    assert_eq!(report.restarted, vec!["example-linux.demo.ding"]);
     assert!(report.gc.is_empty());
-    assert_eq!(runner.spawned.borrow().as_slice(), ["hetz.demo.ding"]);
+    assert_eq!(runner.spawned.borrow().as_slice(), ["example-linux.demo.ding"]);
     assert!(
         report
             .errors
             .iter()
-            .any(|error| error == "reap hetz.demo-claude for restart: reap broke")
+            .any(|error| error == "reap example-linux.demo-claude for restart: reap broke")
     );
 }
 
 #[test]
 fn up_once_does_not_report_failed_replacement_as_restarted() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
+    write(tmp.path(), "agents/example-linux/demo/agent.toml", AGENT);
     let runner = FakeRunner {
-        sessions: vec![dead("hetz.demo-claude"), live("hetz.demo.ding")],
-        fail_spawn: Some("hetz.demo-claude".into()),
+        sessions: vec![dead("example-linux.demo-claude"), live("example-linux.demo.ding")],
+        fail_spawn: Some("example-linux.demo-claude".into()),
         ..Default::default()
     };
 
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
     assert_eq!(
         runner.reaped.borrow().as_slice(),
-        ["hetz.demo-claude"],
+        ["example-linux.demo-claude"],
         "st2 must reap the stale record before it starts a replacement"
     );
     assert!(report.launched.is_empty());
@@ -1342,7 +1342,7 @@ fn up_once_does_not_report_failed_replacement_as_restarted() {
         report
             .errors
             .iter()
-            .any(|error| error == "spawn hetz.demo-claude: simulated spawn failure")
+            .any(|error| error == "spawn example-linux.demo-claude: simulated spawn failure")
     );
 }
 
@@ -1351,19 +1351,19 @@ fn failed_compact_agent_restart_stops_its_live_derived_ding() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         COMPACT_AGENT_WITH_DING,
     );
     let runner = FakeRunner {
-        sessions: vec![dead("hetz.demo"), live("hetz.demo.ding")],
-        fail_spawn: Some("hetz.demo".into()),
+        sessions: vec![dead("example-linux.demo"), live("example-linux.demo.ding")],
+        fail_spawn: Some("example-linux.demo".into()),
         ..Default::default()
     };
 
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
-    assert_eq!(report.torn_down, ["hetz.demo.ding"]);
-    assert_eq!(runner.killed.borrow().as_slice(), ["hetz.demo.ding"]);
+    assert_eq!(report.torn_down, ["example-linux.demo.ding"]);
+    assert_eq!(runner.killed.borrow().as_slice(), ["example-linux.demo.ding"]);
 }
 
 #[test]
@@ -1371,19 +1371,19 @@ fn failed_compact_agent_reap_stops_its_live_derived_ding() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         COMPACT_AGENT_WITH_DING,
     );
     let runner = FakeRunner {
-        sessions: vec![dead("hetz.demo"), live("hetz.demo.ding")],
-        fail_reap: Some("hetz.demo".into()),
+        sessions: vec![dead("example-linux.demo"), live("example-linux.demo.ding")],
+        fail_reap: Some("example-linux.demo".into()),
         ..Default::default()
     };
 
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
-    assert_eq!(report.torn_down, ["hetz.demo.ding"]);
-    assert_eq!(runner.killed.borrow().as_slice(), ["hetz.demo.ding"]);
+    assert_eq!(report.torn_down, ["example-linux.demo.ding"]);
+    assert_eq!(runner.killed.borrow().as_slice(), ["example-linux.demo.ding"]);
 }
 
 #[test]
@@ -1394,17 +1394,17 @@ fn up_once_finally_removes_dead_retired_tasks_without_restarting_them() {
         "type = \"service\"\nretired = true\nkeep = true",
         1,
     );
-    write(tmp.path(), "agents/hetz/demo/agent.toml", &retired);
+    write(tmp.path(), "agents/example-linux/demo/agent.toml", &retired);
     let runner = FakeRunner {
-        sessions: vec![dead("hetz.demo-claude"), dead("hetz.demo.ding")],
+        sessions: vec![dead("example-linux.demo-claude"), dead("example-linux.demo.ding")],
         ..Default::default()
     };
 
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
     let mut removed = runner.removed.borrow().clone();
     removed.sort();
-    assert_eq!(removed, vec!["hetz.demo-claude", "hetz.demo.ding"]);
+    assert_eq!(removed, vec!["example-linux.demo-claude", "example-linux.demo.ding"]);
     assert!(runner.reaped.borrow().is_empty());
     assert!(report.launched.is_empty());
     assert!(report.restarted.is_empty());
@@ -1417,24 +1417,24 @@ fn flapping_cap_parks_a_fail_mode_task_that_keeps_dying() {
     // mode=fail → parks after attempts (the default mode=delay would rate-limit instead).
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.toml",
-        "identity=\"demo\"\nsupervisor=\"cos-claude\"\n[restart]\nattempts=3\ninterval=\"60s\"\nmode=\"fail\"\n[pty.agent]\nid=\"hetz.demo-claude\"\ncommand=\"x\"\n",
+        "agents/example-linux/demo/agent.toml",
+        "identity=\"demo\"\nsupervisor=\"cos-claude\"\n[restart]\nattempts=3\ninterval=\"60s\"\nmode=\"fail\"\n[pty.agent]\nid=\"example-linux.demo-claude\"\ncommand=\"x\"\n",
     );
     let found = discover(tmp.path());
     let runner = FakeRunner {
-        sessions: vec![dead("hetz.demo-claude")],
+        sessions: vec![dead("example-linux.demo-claude")],
         ..Default::default()
     };
     let mut cap = FlappingCap::default();
 
     let mut last = UpReport::default();
     for _ in 0..5 {
-        let plan = reconcile(&found.specs, &runner.sessions, "hetz");
+        let plan = reconcile(&found.specs, &runner.sessions, "example-linux");
         last = UpReport::default();
         execute(&plan, &runner, &mut cap, &mut last);
     }
     assert_eq!(last.launched.len(), 0);
-    assert_eq!(last.flapping, vec!["hetz.demo-claude"]);
+    assert_eq!(last.flapping, vec!["example-linux.demo-claude"]);
     assert!(last.gc.is_empty(), "parked flapper keeps its corpse");
     assert_eq!(runner.spawned.borrow().len(), 3); // limit
     assert_eq!(runner.reaped.borrow().len(), 3);
@@ -1447,10 +1447,10 @@ fn flapping_cap_parks_a_fail_mode_task_that_keeps_dying() {
     // supervisor to notify — recorded once (not per pass).
     assert_eq!(last.crash_loops.len(), 1);
     let cl = &last.crash_loops[0];
-    assert_eq!(cl.pty_id, "hetz.demo-claude");
+    assert_eq!(cl.pty_id, "example-linux.demo-claude");
     assert_eq!(cl.identity, "demo");
     assert_eq!(cl.supervisor.as_deref(), Some("cos-claude"));
-    assert_eq!(cl.agent_bus_id("hetz"), "hetz.demo");
+    assert_eq!(cl.agent_bus_id("example-linux"), "example-linux.demo");
 }
 
 #[test]
@@ -1458,24 +1458,24 @@ fn parked_compact_agent_stops_its_live_derived_ding() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         COMPACT_AGENT_WITH_DING,
     );
     let found = discover(tmp.path());
     let runner = FakeRunner {
-        sessions: vec![dead("hetz.demo"), live("hetz.demo.ding")],
+        sessions: vec![dead("example-linux.demo"), live("example-linux.demo.ding")],
         ..Default::default()
     };
     let mut cap = FlappingCap::default();
 
-    let first = reconcile(&found.specs, &runner.sessions, "hetz");
+    let first = reconcile(&found.specs, &runner.sessions, "example-linux");
     execute(&first, &runner, &mut cap, &mut UpReport::default());
-    let second = reconcile(&found.specs, &runner.sessions, "hetz");
+    let second = reconcile(&found.specs, &runner.sessions, "example-linux");
     let mut report = UpReport::default();
     execute(&second, &runner, &mut cap, &mut report);
 
-    assert_eq!(report.flapping, ["hetz.demo"]);
-    assert_eq!(runner.killed.borrow().as_slice(), ["hetz.demo.ding"]);
+    assert_eq!(report.flapping, ["example-linux.demo"]);
+    assert_eq!(runner.killed.borrow().as_slice(), ["example-linux.demo.ding"]);
 }
 
 #[test]
@@ -1483,27 +1483,27 @@ fn parked_compact_agent_does_not_relaunch_its_exited_derived_ding() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         COMPACT_AGENT_WITH_DING,
     );
     let found = discover(tmp.path());
     let runner = FakeRunner {
-        sessions: vec![dead("hetz.demo"), dead("hetz.demo.ding")],
+        sessions: vec![dead("example-linux.demo"), dead("example-linux.demo.ding")],
         ..Default::default()
     };
     let mut cap = FlappingCap::default();
-    cap.record("hetz.demo", Instant::now());
+    cap.record("example-linux.demo", Instant::now());
 
-    let plan = reconcile(&found.specs, &runner.sessions, "hetz");
+    let plan = reconcile(&found.specs, &runner.sessions, "example-linux");
     let mut report = UpReport::default();
     execute(&plan, &runner, &mut cap, &mut report);
 
-    assert_eq!(report.flapping, ["hetz.demo"]);
+    assert_eq!(report.flapping, ["example-linux.demo"]);
     assert!(
         !runner
             .spawned
             .borrow()
-            .contains(&"hetz.demo.ding".to_string())
+            .contains(&"example-linux.demo.ding".to_string())
     );
 }
 
@@ -1531,63 +1531,63 @@ fn an_operator_recovers_one_parked_task_without_disturbing_a_healthy_peer() {
 
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         COMPACT_AGENT_WITH_DING,
     );
     write(
         tmp.path(),
-        "agents/hetz/peer/agent.kdl",
-        "agent \"peer\" {\n  host \"hetz\"\n  command \"serve\"\n}\n",
+        "agents/example-linux/peer/agent.kdl",
+        "agent \"peer\" {\n  host \"example-linux\"\n  command \"serve\"\n}\n",
     );
     let found = discover(tmp.path());
     let mut cap = FlappingCap::default();
 
     // Phase 1 — the flapper dies before every pass; the peer is up and stays up.
     let crashing = FakeRunner {
-        sessions: vec![dead("hetz.demo"), live("hetz.demo.ding"), live("hetz.peer")],
+        sessions: vec![dead("example-linux.demo"), live("example-linux.demo.ding"), live("example-linux.peer")],
         ..Default::default()
     };
     let mut parked_report = UpReport::default();
     for _ in 0..4 {
-        let plan = reconcile(&found.specs, &crashing.sessions, "hetz");
+        let plan = reconcile(&found.specs, &crashing.sessions, "example-linux");
         parked_report = UpReport::default();
         execute(&plan, &crashing, &mut cap, &mut parked_report);
         publish_parks(&cap, &projection, &mut parked_report);
     }
-    assert_eq!(parked_report.flapping, ["hetz.demo"]);
-    assert!(cap.is_parked("hetz.demo"));
+    assert_eq!(parked_report.flapping, ["example-linux.demo"]);
+    assert!(cap.is_parked("example-linux.demo"));
 
     // The park is legible to a separate reader — the entire point of #204.
     let observer = DirParkObserver::new(state.path().join("parked"));
-    let batch = observer.observe(&["hetz.demo".to_string(), "hetz.peer".to_string()]);
+    let batch = observer.observe(&["example-linux.demo".to_string(), "example-linux.peer".to_string()]);
     assert!(
         batch.complete,
         "a park is a known fault, not missing evidence"
     );
-    let ParkState::Parked(record) = batch.state("hetz.demo") else {
+    let ParkState::Parked(record) = batch.state("example-linux.demo") else {
         panic!("the parked task is not visible in the projection");
     };
     assert_eq!(record.reason, st2::run::PARK_REASON);
-    assert_eq!(batch.state("hetz.peer"), &ParkState::NotParked);
+    assert_eq!(batch.state("example-linux.peer"), &ParkState::NotParked);
 
     assert_eq!(
-        lifecycle_ops(&crashing, "hetz.peer"),
+        lifecycle_ops(&crashing, "example-linux.peer"),
         Vec::<String>::new(),
         "the healthy peer was restarted while its neighbour crash-looped"
     );
 
     // The operator fixes the cause and clears this one task.
-    st2::park::request_unpark(&requests, "hetz.demo").unwrap();
+    st2::park::request_unpark(&requests, "example-linux.demo").unwrap();
 
     // Phase 2 — same supervisor run, same cap. The fixed task now comes up and stays up.
     let recovered = FakeRunner {
-        sessions: vec![dead("hetz.demo"), dead("hetz.demo.ding"), live("hetz.peer")],
+        sessions: vec![dead("example-linux.demo"), dead("example-linux.demo.ding"), live("example-linux.peer")],
         ..Default::default()
     };
     let mut report = UpReport::default();
     grant_unpark_requests(&mut cap, &requests, &mut report);
-    assert_eq!(report.unparked, ["hetz.demo"]);
-    let plan = reconcile(&found.specs, &recovered.sessions, "hetz");
+    assert_eq!(report.unparked, ["example-linux.demo"]);
+    let plan = reconcile(&found.specs, &recovered.sessions, "example-linux");
     execute(&plan, &recovered, &mut cap, &mut report);
     publish_parks(&cap, &projection, &mut report);
 
@@ -1597,43 +1597,43 @@ fn an_operator_recovers_one_parked_task_without_disturbing_a_healthy_peer() {
     );
     let spawned = recovered.spawned.borrow().clone();
     assert!(
-        spawned.contains(&"hetz.demo".to_string()),
+        spawned.contains(&"example-linux.demo".to_string()),
         "the recovery did not actually relaunch the task: {spawned:?}"
     );
     // A recovery that brings the agent back but leaves its DING dead would silently stop delivering
     // that agent's messages — the derived companion is suppressed *because* the agent is parked, so
     // clearing the park has to bring it back with the agent.
     assert!(
-        spawned.contains(&"hetz.demo.ding".to_string()),
+        spawned.contains(&"example-linux.demo.ding".to_string()),
         "the derived ding stayed dead after its agent recovered: {spawned:?}"
     );
     assert_eq!(
-        lifecycle_ops(&recovered, "hetz.peer"),
+        lifecycle_ops(&recovered, "example-linux.peer"),
         Vec::<String>::new(),
         "recovering one task restarted the healthy peer, which is a host-wide restart by another name"
     );
 
     // The fault clears truthfully rather than lingering as a stale marker.
-    let batch = observer.observe(&["hetz.demo".to_string()]);
-    assert_eq!(batch.state("hetz.demo"), &ParkState::NotParked);
+    let batch = observer.observe(&["example-linux.demo".to_string()]);
+    assert_eq!(batch.state("example-linux.demo"), &ParkState::NotParked);
     assert!(batch.complete);
 
     // And it stays recovered past `interval` (60s here) rather than for one pass: uptime forgives the
     // budget, so a task that genuinely came back is not one failure away from parking again.
     let up = FakeRunner {
-        sessions: vec![live("hetz.demo"), live("hetz.demo.ding"), live("hetz.peer")],
+        sessions: vec![live("example-linux.demo"), live("example-linux.demo.ding"), live("example-linux.peer")],
         ..Default::default()
     };
     for _ in 0..5 {
-        let plan = reconcile(&found.specs, &up.sessions, "hetz");
+        let plan = reconcile(&found.specs, &up.sessions, "example-linux");
         let mut report = UpReport::default();
         execute(&plan, &up, &mut cap, &mut report);
         publish_parks(&cap, &projection, &mut report);
         assert!(report.flapping.is_empty());
     }
-    assert!(!cap.is_parked("hetz.demo"));
+    assert!(!cap.is_parked("example-linux.demo"));
     assert!(
-        lifecycle_ops(&up, "hetz.").is_empty(),
+        lifecycle_ops(&up, "example-linux.").is_empty(),
         "a settled fleet was churned: {:?}",
         up.ops.borrow()
     );
@@ -1657,7 +1657,7 @@ fn lifecycle_ops(runner: &FakeRunner, id: &str) -> Vec<String> {
 #[test]
 fn an_unpark_request_for_a_task_that_is_not_parked_says_so() {
     let requests = tempfile::tempdir().unwrap();
-    st2::park::request_unpark(requests.path(), "hetz.typo").unwrap();
+    st2::park::request_unpark(requests.path(), "example-linux.typo").unwrap();
 
     let mut cap = FlappingCap::default();
     let mut report = UpReport::default();
@@ -1666,7 +1666,7 @@ fn an_unpark_request_for_a_task_that_is_not_parked_says_so() {
     assert!(report.unparked.is_empty());
     assert_eq!(report.warnings.len(), 1);
     assert!(
-        report.warnings[0].contains("hetz.typo"),
+        report.warnings[0].contains("example-linux.typo"),
         "{:?}",
         report.warnings
     );
@@ -1680,24 +1680,24 @@ fn surface_crash_loop_notifies_the_supervisor_over_the_bus() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.toml",
-        "identity=\"demo\"\nsupervisor=\"cos-claude\"\n[pty.agent]\nid=\"hetz.demo-claude\"\ncommand=\"x\"\n",
+        "agents/example-linux/demo/agent.toml",
+        "identity=\"demo\"\nsupervisor=\"cos-claude\"\n[pty.agent]\nid=\"example-linux.demo-claude\"\ncommand=\"x\"\n",
     );
     write(
         tmp.path(),
-        "agents/hetz/cos-claude/agent.toml",
-        "identity=\"cos-claude\"\n[pty.agent]\nid=\"hetz.cos\"\ncommand=\"x\"\n",
+        "agents/example-linux/cos-claude/agent.toml",
+        "identity=\"cos-claude\"\n[pty.agent]\nid=\"example-linux.cos\"\ncommand=\"x\"\n",
     );
 
     let cl = CrashLoop {
-        pty_id: "hetz.demo-claude".to_string(),
+        pty_id: "example-linux.demo-claude".to_string(),
         identity: "demo".to_string(),
-        host: Some("hetz".to_string()),
+        host: Some("example-linux".to_string()),
         supervisor: Some("cos-claude".to_string()),
     };
-    surface_crash_loop(tmp.path(), "hetz", &cl);
+    surface_crash_loop(tmp.path(), "example-linux", &cl);
 
-    let inbox = message::inbox_dir(&tmp.path().join("agents/hetz/cos-claude"));
+    let inbox = message::inbox_dir(&tmp.path().join("agents/example-linux/cos-claude"));
     let msgs = message::list_dir(&inbox).unwrap();
     assert_eq!(
         msgs.len(),
@@ -1705,11 +1705,11 @@ fn surface_crash_loop_notifies_the_supervisor_over_the_bus() {
         "supervisor gets exactly one crash-loop message"
     );
     let m = &msgs[0];
-    assert_eq!(m.from.as_deref(), Some("st2.hetz")); // the runner is the sender
-    assert_eq!(m.subject.as_deref(), Some("crash-loop: hetz.demo parked"));
+    assert_eq!(m.from.as_deref(), Some("st2.example-linux")); // the runner is the sender
+    assert_eq!(m.subject.as_deref(), Some("crash-loop: example-linux.demo parked"));
     assert!(m.tags.contains(&"crash-loop".to_string()));
     assert!(
-        m.body.contains("hetz.demo-claude"),
+        m.body.contains("example-linux.demo-claude"),
         "body names the parked task"
     );
 }
@@ -1730,13 +1730,13 @@ fn a_structurally_unrecoverable_park_does_not_advise_unpark() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.toml",
-        "identity=\"demo\"\nsupervisor=\"cos\"\n[pty.agent]\nid=\"hetz.demo\"\ncommand=\"x\"\n",
+        "agents/example-linux/demo/agent.toml",
+        "identity=\"demo\"\nsupervisor=\"cos\"\n[pty.agent]\nid=\"example-linux.demo\"\ncommand=\"x\"\n",
     );
     write(
         tmp.path(),
-        "agents/hetz/cos/agent.toml",
-        "identity=\"cos\"\n[pty.agent]\nid=\"hetz.cos\"\ncommand=\"x\"\n",
+        "agents/example-linux/cos/agent.toml",
+        "identity=\"cos\"\n[pty.agent]\nid=\"example-linux.cos\"\ncommand=\"x\"\n",
     );
 
     // The recoverable case must be UNABLE to cross the bound under any resolved pty root, not
@@ -1745,13 +1745,13 @@ fn a_structurally_unrecoverable_park_does_not_advise_unpark() {
     // blow even this id would otherwise make the control silently structural.
     let resolved_root = st2::run::effective_pty_root(tmp.path());
     assert!(
-        st2::run::session_socket_overage(&resolved_root, "hetz.demo").is_none(),
+        st2::run::session_socket_overage(&resolved_root, "example-linux.demo").is_none(),
         "fixture precondition: the recoverable task must be bindable under the resolved pty root \
          {}, or this test cannot tell the two notices apart",
         resolved_root.display()
     );
 
-    let inbox = message::inbox_dir(&tmp.path().join("agents/hetz/cos"));
+    let inbox = message::inbox_dir(&tmp.path().join("agents/example-linux/cos"));
     let notify = |pty_id: &str| {
         let before = message::list_dir(&inbox)
             .unwrap()
@@ -1760,11 +1760,11 @@ fn a_structurally_unrecoverable_park_does_not_advise_unpark() {
             .collect::<Vec<_>>();
         surface_crash_loop(
             tmp.path(),
-            "hetz",
+            "example-linux",
             &CrashLoop {
                 pty_id: pty_id.to_string(),
                 identity: "demo".to_string(),
-                host: Some("hetz".to_string()),
+                host: Some("example-linux".to_string()),
                 supervisor: Some("cos".to_string()),
             },
         );
@@ -1778,7 +1778,7 @@ fn a_structurally_unrecoverable_park_does_not_advise_unpark() {
     };
 
     // Long enough that no resolved pty root can bring it under the limit.
-    let unbindable = format!("hetz.{}", "a".repeat(200));
+    let unbindable = format!("example-linux.{}", "a".repeat(200));
     let structural = notify(&unbindable);
     assert!(
         !structural.contains(&format!("st2 unpark {unbindable}")),
@@ -1793,9 +1793,9 @@ fn a_structurally_unrecoverable_park_does_not_advise_unpark() {
         "the notice must state the overage: {structural}"
     );
 
-    let recoverable = notify("hetz.demo");
+    let recoverable = notify("example-linux.demo");
     assert!(
-        recoverable.contains("st2 unpark hetz.demo"),
+        recoverable.contains("st2 unpark example-linux.demo"),
         "an ordinary crash-loop keeps its recovery verb: {recoverable}"
     );
 }
@@ -1807,34 +1807,34 @@ fn down_tears_down_this_hosts_live_tasks_only() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.toml",
-        "identity=\"demo\"\n[pty.agent]\nid=\"hetz.demo-claude\"\ncommand=\"x\"\n",
+        "agents/example-linux/demo/agent.toml",
+        "identity=\"demo\"\n[pty.agent]\nid=\"example-linux.demo-claude\"\ncommand=\"x\"\n",
     );
     write(
         tmp.path(),
-        "agents/hetz/dead/agent.toml",
-        "identity=\"dead\"\n[pty.agent]\nid=\"hetz.dead\"\ncommand=\"x\"\n",
+        "agents/example-linux/dead/agent.toml",
+        "identity=\"dead\"\n[pty.agent]\nid=\"example-linux.dead\"\ncommand=\"x\"\n",
     );
     write(
         tmp.path(),
-        "agents/silber/other/agent.toml",
-        "identity=\"other\"\nhost=\"silber\"\n[pty.agent]\nid=\"silber.other\"\ncommand=\"x\"\n",
+        "agents/example-mac/other/agent.toml",
+        "identity=\"other\"\nhost=\"example-mac\"\n[pty.agent]\nid=\"example-mac.other\"\ncommand=\"x\"\n",
     );
 
     // demo is live, dead is dead, other belongs to another host + is live.
     let runner = FakeRunner {
         sessions: vec![
-            live("hetz.demo-claude"),
-            dead("hetz.dead"),
-            live("silber.other"),
+            live("example-linux.demo-claude"),
+            dead("example-linux.dead"),
+            live("example-mac.other"),
         ],
         ..Default::default()
     };
-    let report = down(tmp.path(), "hetz", &runner).unwrap();
+    let report = down(tmp.path(), "example-linux", &runner).unwrap();
 
-    // Only hetz's LIVE task is killed. The dead one isn't (idempotent); the other host is skipped.
-    assert_eq!(runner.killed.borrow().as_slice(), ["hetz.demo-claude"]);
-    assert_eq!(report.torn_down, vec!["hetz.demo-claude"]);
+    // Only example-linux's LIVE task is killed. The dead one isn't (idempotent); the other host is skipped.
+    assert_eq!(runner.killed.borrow().as_slice(), ["example-linux.demo-claude"]);
+    assert_eq!(report.torn_down, vec!["example-linux.demo-claude"]);
     assert!(report.other_host.contains(&"other".to_string()));
     assert!(report.errors.is_empty());
 }
@@ -1845,17 +1845,17 @@ fn surface_crash_loop_without_supervisor_sends_nothing() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.toml",
-        "identity=\"demo\"\n[pty.agent]\nid=\"hetz.demo-claude\"\ncommand=\"x\"\n",
+        "agents/example-linux/demo/agent.toml",
+        "identity=\"demo\"\n[pty.agent]\nid=\"example-linux.demo-claude\"\ncommand=\"x\"\n",
     );
     let cl = CrashLoop {
-        pty_id: "hetz.demo-claude".to_string(),
+        pty_id: "example-linux.demo-claude".to_string(),
         identity: "demo".to_string(),
-        host: Some("hetz".to_string()),
+        host: Some("example-linux".to_string()),
         supervisor: None,
     };
     // Must not panic; there is simply nobody to notify.
-    surface_crash_loop(tmp.path(), "hetz", &cl);
+    surface_crash_loop(tmp.path(), "example-linux", &cl);
 }
 
 #[test]
@@ -1863,22 +1863,22 @@ fn up_once_surfaces_discovery_errors_and_unrunnable() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/good/agent.toml",
+        "agents/example-linux/good/agent.toml",
         "identity=\"good\"\n[pty.agent]\ncommand=\"x\"\n",
     );
     write(
         tmp.path(),
-        "agents/hetz/bad/agent.toml",
+        "agents/example-linux/bad/agent.toml",
         "identity=\"b\"\nnot valid =",
     );
     write(
         tmp.path(),
-        "agents/hetz/nr/agent.toml",
+        "agents/example-linux/nr/agent.toml",
         "identity=\"nr\"\ntype=\"service\"\n",
     );
     let runner = FakeRunner::default();
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
-    assert_eq!(report.launched, vec!["hetz.good.agent"]);
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
+    assert_eq!(report.launched, vec!["example-linux.good.agent"]);
     assert_eq!(report.unrunnable, vec!["nr"]);
     assert_eq!(report.errors.len(), 1);
     assert!(report.errors[0].contains("bad/agent.toml"));
@@ -1887,12 +1887,12 @@ fn up_once_surfaces_discovery_errors_and_unrunnable() {
 #[test]
 fn up_once_marks_a_list_failure_as_a_skipped_pass() {
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "agents/hetz/demo/agent.toml", AGENT);
+    write(tmp.path(), "agents/example-linux/demo/agent.toml", AGENT);
     let runner = FakeRunner {
         fail_list: true,
         ..Default::default()
     };
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
     assert!(report.skipped);
     assert!(report.launched.is_empty());
     assert!(runner.spawned.borrow().is_empty());
@@ -1914,7 +1914,7 @@ fn up_once_marks_a_list_failure_as_a_skipped_pass() {
 /// is also a claim that the two derived siblings stay independent.
 const COMPACT_AGENT_WITH_STREAM: &str = r#"
 agent "demo" {
-  host "hetz"
+  host "example-linux"
   supervisor "cos-claude"
   command "true"
   ding
@@ -1925,7 +1925,7 @@ agent "demo" {
 
 const COMPACT_STREAM_ONLY_AGENT: &str = r#"
 agent "sourceless" {
-  host "hetz"
+  host "example-linux"
   stream "gh-ci" { command "poll-gh-ci.sh" }
 }
 "#;
@@ -1937,21 +1937,21 @@ fn fresh_compact_agent_launches_with_its_derived_stream() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         COMPACT_AGENT_WITH_STREAM,
     );
 
     let runner = FakeRunner::default();
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
     assert_eq!(
         report.launched,
-        ["hetz.demo", "hetz.demo.ding", "hetz.demo.stream-gh-ci"]
+        ["example-linux.demo", "example-linux.demo.ding", "example-linux.demo.stream-gh-ci"]
     );
     let targets = runner.spawned_targets.borrow();
     let stream = targets
         .iter()
-        .find(|target| target.pty_id == "hetz.demo.stream-gh-ci")
+        .find(|target| target.pty_id == "example-linux.demo.stream-gh-ci")
         .unwrap();
     assert_eq!(
         stream.kind,
@@ -1963,7 +1963,7 @@ fn fresh_compact_agent_launches_with_its_derived_stream() {
     // Runner-owned task identity reaches the stream exactly as it reaches every other task.
     assert_eq!(
         stream.env.get("ST_AGENT").map(String::as_str),
-        Some("hetz.demo")
+        Some("example-linux.demo")
     );
 }
 
@@ -1972,25 +1972,25 @@ fn fresh_compact_agent_launches_with_its_derived_stream() {
 fn retired_compact_agent_stops_agent_and_derived_stream() {
     let tmp = tempfile::tempdir().unwrap();
     let retired = COMPACT_AGENT_WITH_STREAM.replacen(
-        "  host \"hetz\"",
-        "  host \"hetz\"\n  retired #true",
+        "  host \"example-linux\"",
+        "  host \"example-linux\"\n  retired #true",
         1,
     );
-    write(tmp.path(), "agents/hetz/demo/agent.kdl", &retired);
+    write(tmp.path(), "agents/example-linux/demo/agent.kdl", &retired);
     let runner = FakeRunner {
         sessions: vec![
-            live("hetz.demo"),
-            live("hetz.demo.ding"),
-            live("hetz.demo.stream-gh-ci"),
+            live("example-linux.demo"),
+            live("example-linux.demo.ding"),
+            live("example-linux.demo.stream-gh-ci"),
         ],
         ..Default::default()
     };
 
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
     assert_eq!(
         report.torn_down,
-        ["hetz.demo", "hetz.demo.ding", "hetz.demo.stream-gh-ci"]
+        ["example-linux.demo", "example-linux.demo.ding", "example-linux.demo.stream-gh-ci"]
     );
     assert!(report.launched.is_empty());
 }
@@ -2000,31 +2000,31 @@ fn retired_compact_agent_stops_agent_and_derived_stream() {
 fn suspended_compact_agent_stops_its_derived_stream_without_touching_a_sibling() {
     let tmp = tempfile::tempdir().unwrap();
     let suspended = COMPACT_AGENT_WITH_STREAM.replacen(
-        "  host \"hetz\"",
-        "  host \"hetz\"\n  desired-state \"suspended\" reason=\"Waiting for CI budget\"",
+        "  host \"example-linux\"",
+        "  host \"example-linux\"\n  desired-state \"suspended\" reason=\"Waiting for CI budget\"",
         1,
     );
-    write(tmp.path(), "agents/hetz/demo/agent.kdl", &suspended);
+    write(tmp.path(), "agents/example-linux/demo/agent.kdl", &suspended);
     write(
         tmp.path(),
-        "agents/hetz/sibling/agent.kdl",
-        "agent \"sibling\" { host \"hetz\"; command \"true\" }\n",
+        "agents/example-linux/sibling/agent.kdl",
+        "agent \"sibling\" { host \"example-linux\"; command \"true\" }\n",
     );
     let runner = FakeRunner {
         sessions: vec![
-            live("hetz.demo"),
-            live("hetz.demo.ding"),
-            live("hetz.demo.stream-gh-ci"),
-            live("hetz.sibling"),
+            live("example-linux.demo"),
+            live("example-linux.demo.ding"),
+            live("example-linux.demo.stream-gh-ci"),
+            live("example-linux.sibling"),
         ],
         ..Default::default()
     };
 
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
     assert_eq!(
         report.torn_down,
-        ["hetz.demo", "hetz.demo.ding", "hetz.demo.stream-gh-ci"]
+        ["example-linux.demo", "example-linux.demo.ding", "example-linux.demo.stream-gh-ci"]
     );
     assert_eq!(report.adopted, ["sibling"]);
     assert!(report.launched.is_empty());
@@ -2034,42 +2034,42 @@ fn suspended_compact_agent_stops_its_derived_stream_without_touching_a_sibling()
 fn suspend_and_resume_relaunch_the_agent_and_stream_together() {
     let tmp = tempfile::tempdir().unwrap();
     let suspended = COMPACT_AGENT_WITH_STREAM.replacen(
-        "  host \"hetz\"",
-        "  host \"hetz\"\n  desired-state \"suspended\" reason=\"Waiting for capacity\"",
+        "  host \"example-linux\"",
+        "  host \"example-linux\"\n  desired-state \"suspended\" reason=\"Waiting for capacity\"",
         1,
     );
-    write(tmp.path(), "agents/hetz/demo/agent.kdl", &suspended);
+    write(tmp.path(), "agents/example-linux/demo/agent.kdl", &suspended);
     let suspend_runner = FakeRunner {
         sessions: vec![
-            live("hetz.demo"),
-            live("hetz.demo.ding"),
-            live("hetz.demo.stream-gh-ci"),
+            live("example-linux.demo"),
+            live("example-linux.demo.ding"),
+            live("example-linux.demo.stream-gh-ci"),
         ],
         ..Default::default()
     };
-    let suspended_report = up_once(tmp.path(), "hetz", &suspend_runner).unwrap();
+    let suspended_report = up_once(tmp.path(), "example-linux", &suspend_runner).unwrap();
     assert_eq!(
         suspended_report.torn_down,
-        ["hetz.demo", "hetz.demo.ding", "hetz.demo.stream-gh-ci"]
+        ["example-linux.demo", "example-linux.demo.ding", "example-linux.demo.stream-gh-ci"]
     );
 
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         COMPACT_AGENT_WITH_STREAM,
     );
     let resume_runner = FakeRunner {
         sessions: vec![
-            dead("hetz.demo"),
-            dead("hetz.demo.ding"),
-            dead("hetz.demo.stream-gh-ci"),
+            dead("example-linux.demo"),
+            dead("example-linux.demo.ding"),
+            dead("example-linux.demo.stream-gh-ci"),
         ],
         ..Default::default()
     };
-    let resumed_report = up_once(tmp.path(), "hetz", &resume_runner).unwrap();
+    let resumed_report = up_once(tmp.path(), "example-linux", &resume_runner).unwrap();
     assert_eq!(
         resumed_report.restarted,
-        ["hetz.demo", "hetz.demo.ding", "hetz.demo.stream-gh-ci"]
+        ["example-linux.demo", "example-linux.demo.ding", "example-linux.demo.stream-gh-ci"]
     );
 }
 
@@ -2082,16 +2082,16 @@ fn held_adopt_only_compact_agent_stops_its_live_derived_stream() {
         "  command \"true\"\n  lifecycle \"adopt-only\"",
         1,
     );
-    write(tmp.path(), "agents/hetz/demo/agent.kdl", &held);
+    write(tmp.path(), "agents/example-linux/demo/agent.kdl", &held);
     let runner = FakeRunner {
-        sessions: vec![dead("hetz.demo"), live("hetz.demo.stream-gh-ci")],
+        sessions: vec![dead("example-linux.demo"), live("example-linux.demo.stream-gh-ci")],
         ..Default::default()
     };
 
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
-    assert_eq!(report.held, ["hetz.demo"]);
-    assert_eq!(report.torn_down, ["hetz.demo.stream-gh-ci"]);
+    assert_eq!(report.held, ["example-linux.demo"]);
+    assert_eq!(report.torn_down, ["example-linux.demo.stream-gh-ci"]);
     assert!(report.launched.is_empty());
 }
 
@@ -2109,15 +2109,15 @@ fn a_crash_looping_stream_parks_and_surfaces_without_disturbing_its_agent() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         COMPACT_AGENT_WITH_STREAM,
     );
     let found = discover(tmp.path());
     let runner = FakeRunner {
         sessions: vec![
-            live("hetz.demo"),
-            live("hetz.demo.ding"),
-            dead("hetz.demo.stream-gh-ci"),
+            live("example-linux.demo"),
+            live("example-linux.demo.ding"),
+            dead("example-linux.demo.stream-gh-ci"),
         ],
         ..Default::default()
     };
@@ -2125,12 +2125,12 @@ fn a_crash_looping_stream_parks_and_surfaces_without_disturbing_its_agent() {
 
     let mut last = UpReport::default();
     for _ in 0..4 {
-        let plan = reconcile(&found.specs, &runner.sessions, "hetz");
+        let plan = reconcile(&found.specs, &runner.sessions, "example-linux");
         last = UpReport::default();
         execute(&plan, &runner, &mut cap, &mut last);
     }
 
-    assert_eq!(last.flapping, ["hetz.demo.stream-gh-ci"]);
+    assert_eq!(last.flapping, ["example-linux.demo.stream-gh-ci"]);
     assert!(last.launched.is_empty());
     assert!(
         last.gc.is_empty(),
@@ -2148,7 +2148,7 @@ fn a_crash_looping_stream_parks_and_surfaces_without_disturbing_its_agent() {
     //
     // `patch:` is deliberately excluded: presentation patching is the pass's ordinary cosmetic
     // batch for every live task and carries no lifecycle meaning. Measured, not assumed — the
-    // agent DOES appear in the raw op log, as `patch:hetz.demo` and nothing else.
+    // agent DOES appear in the raw op log, as `patch:example-linux.demo` and nothing else.
     let ops = runner.ops.borrow();
     let lifecycle_ops = ops
         .iter()
@@ -2158,8 +2158,8 @@ fn a_crash_looping_stream_parks_and_surfaces_without_disturbing_its_agent() {
     assert_eq!(
         lifecycle_ops,
         [
-            "reap:hetz.demo.stream-gh-ci",
-            "spawn:hetz.demo.stream-gh-ci"
+            "reap:example-linux.demo.stream-gh-ci",
+            "spawn:example-linux.demo.stream-gh-ci"
         ],
         "only the stream may be touched while it crash-loops"
     );
@@ -2172,23 +2172,23 @@ fn a_crash_looping_stream_parks_and_surfaces_without_disturbing_its_agent() {
     // supervisor to notify, so `surface_crash_loop` can deliver it over the bus unchanged.
     assert_eq!(last.crash_loops.len(), 1);
     let cl = &last.crash_loops[0];
-    assert_eq!(cl.pty_id, "hetz.demo.stream-gh-ci");
+    assert_eq!(cl.pty_id, "example-linux.demo.stream-gh-ci");
     assert_eq!(cl.identity, "demo");
     assert_eq!(cl.supervisor.as_deref(), Some("cos-claude"));
-    assert_eq!(cl.agent_bus_id("hetz"), "hetz.demo");
+    assert_eq!(cl.agent_bus_id("example-linux"), "example-linux.demo");
 
     write(
         tmp.path(),
-        "agents/hetz/cos-claude/agent.kdl",
-        "agent \"cos-claude\" { host \"hetz\"; command \"true\" }\n",
+        "agents/example-linux/cos-claude/agent.kdl",
+        "agent \"cos-claude\" { host \"example-linux\"; command \"true\" }\n",
     );
-    surface_crash_loop(tmp.path(), "hetz", cl);
-    let inbox = message::inbox_dir(&tmp.path().join("agents/hetz/cos-claude"));
+    surface_crash_loop(tmp.path(), "example-linux", cl);
+    let inbox = message::inbox_dir(&tmp.path().join("agents/example-linux/cos-claude"));
     let msgs = message::list_dir(&inbox).unwrap();
     assert_eq!(msgs.len(), 1);
     assert!(msgs[0].tags.contains(&"crash-loop".to_string()));
     assert!(
-        msgs[0].body.contains("hetz.demo.stream-gh-ci"),
+        msgs[0].body.contains("example-linux.demo.stream-gh-ci"),
         "the supervisor is told WHICH task parked, not just which agent"
     );
 }
@@ -2199,28 +2199,28 @@ fn parked_compact_agent_stops_its_live_derived_stream() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         COMPACT_AGENT_WITH_STREAM,
     );
     let found = discover(tmp.path());
     let runner = FakeRunner {
-        sessions: vec![dead("hetz.demo"), live("hetz.demo.stream-gh-ci")],
+        sessions: vec![dead("example-linux.demo"), live("example-linux.demo.stream-gh-ci")],
         ..Default::default()
     };
     let mut cap = FlappingCap::default();
 
-    let first = reconcile(&found.specs, &runner.sessions, "hetz");
+    let first = reconcile(&found.specs, &runner.sessions, "example-linux");
     execute(&first, &runner, &mut cap, &mut UpReport::default());
-    let second = reconcile(&found.specs, &runner.sessions, "hetz");
+    let second = reconcile(&found.specs, &runner.sessions, "example-linux");
     let mut report = UpReport::default();
     execute(&second, &runner, &mut cap, &mut report);
 
-    assert_eq!(report.flapping, ["hetz.demo"]);
+    assert_eq!(report.flapping, ["example-linux.demo"]);
     assert!(
         runner
             .killed
             .borrow()
-            .contains(&"hetz.demo.stream-gh-ci".to_string())
+            .contains(&"example-linux.demo.stream-gh-ci".to_string())
     );
 }
 
@@ -2231,15 +2231,15 @@ fn selected_missing_derived_stream_is_held_without_broadening_to_its_agent() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
+        "agents/example-linux/demo/agent.kdl",
         COMPACT_AGENT_WITH_STREAM,
     );
     let runner = FakeRunner::default();
 
-    let report = up_once_selected(tmp.path(), "hetz.demo.stream-gh-ci", "hetz", &runner).unwrap();
+    let report = up_once_selected(tmp.path(), "example-linux.demo.stream-gh-ci", "example-linux", &runner).unwrap();
 
     assert_eq!(runner.list_calls.get(), 1);
-    assert_eq!(report.held, ["hetz.demo.stream-gh-ci"]);
+    assert_eq!(report.held, ["example-linux.demo.stream-gh-ci"]);
     assert!(report.launched.is_empty());
     assert!(
         runner.spawned.borrow().is_empty(),
@@ -2255,12 +2255,12 @@ fn a_launched_stream_alone_is_rejected_before_reconciliation() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/sourceless/agent.kdl",
+        "agents/example-linux/sourceless/agent.kdl",
         COMPACT_STREAM_ONLY_AGENT,
     );
     let runner = FakeRunner::default();
 
-    let report = up_once(tmp.path(), "hetz", &runner).unwrap();
+    let report = up_once(tmp.path(), "example-linux", &runner).unwrap();
 
     assert!(report.unrunnable.is_empty());
     assert!(
@@ -2281,8 +2281,8 @@ fn a_stream_does_not_claim_a_delivery_transport() {
     let tmp = tempfile::tempdir().unwrap();
     write(
         tmp.path(),
-        "agents/hetz/demo/agent.kdl",
-        "agent \"demo\" { host \"hetz\"; command \"true\"; stream \"gh-ci\" { command \"poll.sh\" } }\n",
+        "agents/example-linux/demo/agent.kdl",
+        "agent \"demo\" { host \"example-linux\"; command \"true\"; stream \"gh-ci\" { command \"poll.sh\" } }\n",
     );
     let found = discover(tmp.path());
     let spec = &found.specs[0];
@@ -2302,13 +2302,13 @@ fn a_stream_does_not_claim_a_delivery_transport() {
 #[test]
 fn an_unknown_derived_task_still_refuses_the_pass() {
     let tmp = tempfile::tempdir().unwrap();
-    let mut spec = task_spec("demo", Some("hetz"), "hetz.demo.mystery");
+    let mut spec = task_spec("demo", Some("example-linux"), "example-linux.demo.mystery");
     spec.tasks[0].derived = true;
     spec.tasks[0].name = "mystery".to_string();
     let context = TaskCompileContext::current(tmp.path().to_path_buf()).unwrap();
     let mut specs = vec![spec];
 
-    let error = compile_generated_tasks(&mut specs, "hetz", &context).unwrap_err();
+    let error = compile_generated_tasks(&mut specs, "example-linux", &context).unwrap_err();
 
     assert!(
         format!("{error:#}").contains("unsupported derived task: mystery"),

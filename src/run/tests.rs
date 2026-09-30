@@ -37,11 +37,11 @@ fn session_socket_overage_is_derived_from_the_resolved_root() {
     assert_eq!(path, short_root.join(format!("{over}.sock")));
 
     // A deeper root shrinks every identity's budget on that host: the same id that fitted
-    // above is now 26 bytes over.
-    let deep_root = Path::new("/home/user/.local/state/st2/default/catalog/pty");
+    // above is now 29 bytes over.
+    let deep_root = Path::new("/home/example/.local/state/st2/default/catalog/pty");
     assert_eq!(
         session_socket_overage(deep_root, &fits).map(|(_, over)| over),
-        Some(26)
+        Some(29)
     );
 }
 
@@ -113,7 +113,7 @@ fn target(id: &str, cmd: &str) -> TaskTarget {
     TaskTarget {
         kind: TaskKind::Pty,
         pty_id: id.to_string(),
-        bus_id: "hetz.demo".to_string(),
+        bus_id: "example-linux.demo".to_string(),
         name: "agent".to_string(),
         derived: false,
         launch: TaskLaunch::Shell(cmd.to_string()),
@@ -767,12 +767,12 @@ impl Runner for SpawnCountingRunner {
 #[test]
 fn on_demand_agents_do_not_launch_without_host_policy() {
     let catalog = tempfile::tempdir().unwrap();
-    let agent_dir = catalog.path().join("agents/hetz/worker");
+    let agent_dir = catalog.path().join("agents/example-linux/worker");
     std::fs::create_dir_all(&agent_dir).unwrap();
     std::fs::write(
         agent_dir.join("agent.kdl"),
         r#"agent "worker" {
-  host "hetz"
+  host "example-linux"
   residency-policy "on-demand"
   session-driver "omp"
   argv "omp" "--prompt" "continue"
@@ -782,12 +782,12 @@ fn on_demand_agents_do_not_launch_without_host_policy() {
     .unwrap();
     let runner = SpawnCountingRunner::default();
 
-    let report = up_once(catalog.path(), "hetz", &runner).unwrap();
+    let report = up_once(catalog.path(), "example-linux", &runner).unwrap();
 
     assert!(runner.spawned.borrow().is_empty());
     assert!(report.errors.iter().any(|error| {
         error.contains("on-demand agents require host --residency-idle-after")
-            && error.contains("hetz.worker")
+            && error.contains("example-linux.worker")
     }));
 }
 
@@ -813,7 +813,7 @@ fn execute_closes_each_pass_so_a_recovered_task_regains_its_fail_budget() {
         ReconcilePlan {
             launch: vec![Launch {
                 spec,
-                tasks: vec![target("hetz.demo.agent", "x")],
+                tasks: vec![target("example-linux.demo.agent", "x")],
                 live_derived: Vec::new(),
             }],
             ..ReconcilePlan::default()
@@ -830,7 +830,7 @@ fn execute_closes_each_pass_so_a_recovered_task_regains_its_fail_budget() {
     // empty launch set — is what forgives the budget.
     execute(
         &ReconcilePlan {
-            live: vec!["hetz.demo.agent".to_string()],
+            live: vec!["example-linux.demo.agent".to_string()],
             ..ReconcilePlan::default()
         },
         &runner,
@@ -852,7 +852,7 @@ fn execute_closes_each_pass_so_a_recovered_task_regains_its_fail_budget() {
     );
     assert_eq!(
         last.flapping,
-        vec!["hetz.demo.agent".to_string()],
+        vec!["example-linux.demo.agent".to_string()],
         "and it still parks in the end"
     );
 }
@@ -933,7 +933,7 @@ fn a_pass_that_omits_a_task_does_not_credit_it_with_uptime() {
         ReconcilePlan {
             launch: vec![Launch {
                 spec,
-                tasks: vec![target("hetz.demo.agent", "x")],
+                tasks: vec![target("example-linux.demo.agent", "x")],
                 live_derived: Vec::new(),
             }],
             ..ReconcilePlan::default()
@@ -967,7 +967,7 @@ fn a_pass_that_omits_a_task_does_not_credit_it_with_uptime() {
     );
     assert_eq!(
         last.flapping,
-        vec!["hetz.demo.agent".to_string()],
+        vec!["example-linux.demo.agent".to_string()],
         "and the task must still park"
     );
 }
@@ -979,7 +979,7 @@ fn spec_fixture() -> AgentSpec {
         identity: "demo".into(),
         name: None,
         description: None,
-        host: Some("hetz".into()),
+        host: Some("example-linux".into()),
         role: None,
         job_type: JobType::Service,
         workspace: None,
@@ -1007,18 +1007,18 @@ fn driver_labels_include_typed_and_argv_omp_but_remain_bounded() {
         tasks: Vec::new(),
         live_derived: Vec::new(),
     };
-    let mut omp_argv = target("hetz.demo.agent", "unused");
+    let mut omp_argv = target("example-linux.demo.agent", "unused");
     omp_argv.launch = TaskLaunch::Argv(vec!["st2".into(), "driver".into(), "omp-session".into()]);
-    let mut exec = target("hetz.demo.agent", "codex");
+    let mut exec = target("example-linux.demo.agent", "codex");
     exec.kind = TaskKind::Exec;
     let targets = [
-        target("hetz.demo.agent", "codex"),
-        target("hetz.demo.agent", "claude"),
-        target("hetz.demo.agent", "opencode"),
-        target("hetz.demo.agent", "pi"),
+        target("example-linux.demo.agent", "codex"),
+        target("example-linux.demo.agent", "claude"),
+        target("example-linux.demo.agent", "opencode"),
+        target("example-linux.demo.agent", "pi"),
         omp_argv,
         exec,
-        target("hetz.demo.agent", "unrecognized"),
+        target("example-linux.demo.agent", "unrecognized"),
     ];
     let labels = targets
         .iter()
@@ -1042,7 +1042,7 @@ fn driver_labels_include_typed_and_argv_omp_but_remain_bounded() {
         live_derived: Vec::new(),
     };
     assert_eq!(
-        driver_label(&typed_launch, &target("hetz.demo.agent", "claude")),
+        driver_label(&typed_launch, &target("example-linux.demo.agent", "claude")),
         "omp",
         "typed driver identity must take precedence over argv heuristics"
     );
@@ -1076,23 +1076,23 @@ fn resync_watch_eligibility_requires_a_proven_live_agent_seat() {
         spec("restarted", Some("custom-seat")),
     ];
     let sessions = vec![
-        sess("hetz.dead-adopted.agent", false),
+        sess("example-linux.dead-adopted.agent", false),
         // A live canonical seat remains eligible even when a missing companion means the
         // whole spec was not adopted and the companion later fails to launch.
-        sess("hetz.observed-live.agent", true),
+        sess("example-linux.observed-live.agent", true),
     ];
     let report = UpReport {
         adopted: vec!["dead-adopted".into()],
         launched: vec![
-            "hetz.launched.agent".into(),
+            "example-linux.launched.agent".into(),
             // A successfully launched companion is not evidence of a live agent seat.
-            "hetz.desired.ding".into(),
+            "example-linux.desired.ding".into(),
         ],
         restarted: vec!["custom-seat".into()],
         ..UpReport::default()
     };
 
-    let eligible = live_resync_specs(&specs, "hetz", &sessions, &report)
+    let eligible = live_resync_specs(&specs, "example-linux", &sessions, &report)
         .into_iter()
         .map(|spec| spec.identity)
         .collect::<Vec<_>>();
@@ -1142,11 +1142,11 @@ fn subscription_eligibility_excludes_non_running_agents_even_with_a_live_seat() 
     ];
     // Every seat is observed alive, so only desired state can distinguish them.
     let sessions = vec![
-        sess("hetz.running.agent", true),
-        sess("hetz.retired.agent", true),
-        sess("hetz.suspended.agent", true),
+        sess("example-linux.running.agent", true),
+        sess("example-linux.retired.agent", true),
+        sess("example-linux.suspended.agent", true),
     ];
-    let eligible = live_resync_specs(&specs, "hetz", &sessions, &UpReport::default())
+    let eligible = live_resync_specs(&specs, "example-linux", &sessions, &UpReport::default())
         .into_iter()
         .map(|spec| spec.identity)
         .collect::<Vec<_>>();
@@ -1230,14 +1230,14 @@ impl Runner for SteadyChainRunner {
 }
 
 fn write_resync_agent(catalog: &Path, identity: &str) -> (PathBuf, PathBuf) {
-    let agent_dir = catalog.join("agents/hetz").join(identity);
+    let agent_dir = catalog.join("agents/example-linux").join(identity);
     let resources = agent_dir.join("resources");
     std::fs::create_dir_all(&resources).unwrap();
     std::fs::write(
         agent_dir.join("agent.kdl"),
         format!(
             r#"agent "{identity}" {{
-  host "hetz"
+  host "example-linux"
   command "agent"
   resource "goal" uri="resources/goal.md" reason="Mission."
 }}"#
@@ -1289,7 +1289,7 @@ fn write_notify_chain_agent_with_state(
     later_task: bool,
     desired_state: Option<&str>,
 ) -> (PathBuf, PathBuf) {
-    let agent_dir = catalog.join("agents/hetz").join(identity);
+    let agent_dir = catalog.join("agents/example-linux").join(identity);
     let resources = agent_dir.join("resources");
     std::fs::create_dir_all(&resources).unwrap();
     let supervisor = supervisor
@@ -1307,9 +1307,9 @@ fn write_notify_chain_agent_with_state(
         agent_dir.join("agent.kdl"),
         format!(
             r#"agent "{identity}" {{
-  host "hetz"
+  host "example-linux"
 {supervisor}{desired_state}  command "agent"
-{later_task}  resource "goal" uri="dev.schickling.agent-goal://hetz/{identity}" reason="Layer."
+{later_task}  resource "goal" uri="dev.schickling.agent-goal://example-linux/{identity}" reason="Layer."
 }}
 "#
         ),
@@ -1406,14 +1406,14 @@ fn up_loop_keeps_complete_notify_chain_sets_during_steady_reconcile() {
     write_notify_chain_profile(catalog.path());
     let (root_dir, root_goal) = write_notify_chain_agent(catalog.path(), "root", None, false);
     let (lead_dir, lead_goal) =
-        write_notify_chain_agent(catalog.path(), "lead", Some("hetz.root"), false);
+        write_notify_chain_agent(catalog.path(), "lead", Some("example-linux.root"), false);
     let (worker_dir, _worker_goal) =
-        write_notify_chain_agent(catalog.path(), "worker", Some("hetz.lead"), false);
+        write_notify_chain_agent(catalog.path(), "worker", Some("example-linux.lead"), false);
     let specs = crate::discover_strict(catalog.path()).specs;
     let task_id = |spec: &AgentSpec, task: &Task| {
         task.id
             .clone()
-            .unwrap_or_else(|| format!("{}.{}", spec.bus_id("hetz"), task.name))
+            .unwrap_or_else(|| format!("{}.{}", spec.bus_id("example-linux"), task.name))
     };
     let mut sessions = Vec::new();
     for spec in &specs {
@@ -1425,7 +1425,7 @@ fn up_loop_keeps_complete_notify_chain_sets_during_steady_reconcile() {
     let (release_tx, release_rx) = mpsc::channel();
     let runner = SteadyChainRunner {
         sessions: std::sync::Mutex::new(sessions),
-        block_id: "hetz.worker.later".to_owned(),
+        block_id: "example-linux.worker.later".to_owned(),
         entered: entered_tx,
         release: std::sync::Mutex::new(release_rx),
     };
@@ -1440,25 +1440,25 @@ fn up_loop_keeps_complete_notify_chain_sets_during_steady_reconcile() {
 
             std::fs::write(&root_goal, "steady baseline transition\n").unwrap();
             let root_initial = wait_for_resync_event_for_key(&root_dir, "goal");
-            let lead_initial = wait_for_resync_event_for_key(&lead_dir, "goal@hetz.root");
-            let worker_initial = wait_for_resync_event_for_key(&worker_dir, "goal@hetz.root");
+            let lead_initial = wait_for_resync_event_for_key(&lead_dir, "goal@example-linux.root");
+            let worker_initial = wait_for_resync_event_for_key(&worker_dir, "goal@example-linux.root");
 
-            write_notify_chain_agent(&observer_catalog, "worker", Some("hetz.lead"), true);
+            write_notify_chain_agent(&observer_catalog, "worker", Some("example-linux.lead"), true);
             let entered = entered_rx.recv_timeout(Duration::from_secs(5)).is_ok();
             let root_after_reconcile = root_initial.as_deref().and_then(|prior| {
                 std::fs::write(&root_goal, "transition during steady reconcile\n").unwrap();
                 wait_for_resync_event_key_change(&root_dir, "goal", prior)
             });
             let lead_after_reconcile = lead_initial.as_deref().and_then(|prior| {
-                wait_for_resync_event_key_change(&lead_dir, "goal@hetz.root", prior)
+                wait_for_resync_event_key_change(&lead_dir, "goal@example-linux.root", prior)
             });
             let worker_after_reconcile = worker_initial.as_deref().and_then(|prior| {
-                wait_for_resync_event_key_change(&worker_dir, "goal@hetz.root", prior)
+                wait_for_resync_event_key_change(&worker_dir, "goal@example-linux.root", prior)
             });
 
             std::fs::write(&lead_goal, "lead transition during steady reconcile\n").unwrap();
             let lead_own = wait_for_resync_event_for_key(&lead_dir, "goal");
-            let worker_from_lead = wait_for_resync_event_for_key(&worker_dir, "goal@hetz.lead");
+            let worker_from_lead = wait_for_resync_event_for_key(&worker_dir, "goal@example-linux.lead");
 
             let _ = release_tx.send(());
             observer_stop.store(true, Ordering::SeqCst);
@@ -1476,7 +1476,7 @@ fn up_loop_keeps_complete_notify_chain_sets_during_steady_reconcile() {
         });
         up_loop_until(
             catalog.path(),
-            "hetz",
+            "example-linux",
             &runner,
             Duration::from_millis(25),
             &stop,
@@ -1521,12 +1521,12 @@ fn assert_up_loop_full_refresh_keeps_a_retired_middle_as_live_child_topology() {
         let (middle_dir, _middle_goal) = write_notify_chain_agent_with_state(
             catalog.path(),
             "middle",
-            Some("hetz.root"),
+            Some("example-linux.root"),
             false,
             Some(retirement),
         );
         let (child_dir, _child_goal) =
-            write_notify_chain_agent(catalog.path(), "child", Some("hetz.middle"), false);
+            write_notify_chain_agent(catalog.path(), "child", Some("example-linux.middle"), false);
         let specs = crate::discover_strict(catalog.path()).specs;
         let sessions = specs
             .iter()
@@ -1536,7 +1536,7 @@ fn assert_up_loop_full_refresh_keeps_a_retired_middle_as_live_child_topology() {
                     let id = task
                         .id
                         .clone()
-                        .unwrap_or_else(|| format!("{}.{}", spec.bus_id("hetz"), task.name));
+                        .unwrap_or_else(|| format!("{}.{}", spec.bus_id("example-linux"), task.name));
                     sess(&id, true)
                 })
             })
@@ -1562,14 +1562,14 @@ fn assert_up_loop_full_refresh_keeps_a_retired_middle_as_live_child_topology() {
                 std::thread::sleep(Duration::from_millis(300));
                 std::fs::write(&root_goal, "root transition after full refresh\n").unwrap();
                 let root_event = wait_for_resync_event_for_key(&root_dir, "goal");
-                let child_event = wait_for_resync_event_for_key(&child_dir, "goal@hetz.root");
-                let middle_event = current_resync_event_for_key(&middle_dir, "goal@hetz.root");
+                let child_event = wait_for_resync_event_for_key(&child_dir, "goal@example-linux.root");
+                let middle_event = current_resync_event_for_key(&middle_dir, "goal@example-linux.root");
                 observer_stop.store(true, Ordering::SeqCst);
                 (root_event, child_event, middle_event)
             });
             up_loop_until(
                 catalog.path(),
-                "hetz",
+                "example-linux",
                 &runner,
                 Duration::from_millis(25),
                 &stop,
@@ -1614,7 +1614,7 @@ fn assert_up_loop_full_refresh_keeps_a_retired_middle_as_live_child_topology() {
 fn compile_invalid_seat_does_not_block_existing_live_resync_watch() {
     let catalog = tempfile::tempdir().unwrap();
     let (live_dir, live_goal) = write_resync_agent(catalog.path(), "live");
-    let broken_dir = catalog.path().join("agents/hetz/broken");
+    let broken_dir = catalog.path().join("agents/example-linux/broken");
     let broken_resources = broken_dir.join("resources");
     std::fs::create_dir_all(&broken_resources).unwrap();
     std::fs::create_dir_all(catalog.path().join("broken-workspace")).unwrap();
@@ -1622,7 +1622,7 @@ fn compile_invalid_seat_does_not_block_existing_live_resync_watch() {
     std::fs::write(
         &broken_declaration,
         r#"agent "broken" {
-  host "hetz"
+  host "example-linux"
   deliver "mcp"
   workspace "$CATALOG/broken-workspace"
   exec "agent" { command "true" }
@@ -1632,25 +1632,25 @@ fn compile_invalid_seat_does_not_block_existing_live_resync_watch() {
     .unwrap();
     let broken_goal = broken_resources.join("goal.md");
     std::fs::write(&broken_goal, "before\n").unwrap();
-    crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+    crate::event::publish_owner_binding_for_test(catalog.path(), "example-linux").unwrap();
 
     let runner = SpawnCountingRunner {
         sessions: RefCell::new(vec![
-            sess("hetz.live", true),
-            sess("hetz.broken.agent", true),
+            sess("example-linux.live", true),
+            sess("example-linux.broken.agent", true),
         ]),
         ..SpawnCountingRunner::default()
     };
     let task_context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
     let resync =
-        crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "example-linux".into());
     let mut cap = FlappingCap::default();
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     let mut presentation_cursor = PresentationPatchCursor::default();
 
     let first = reconcile_pass(
         catalog.path(),
-        "hetz",
+        "example-linux",
         &task_context,
         &runner,
         &mut cap,
@@ -1687,7 +1687,7 @@ fn compile_invalid_seat_does_not_block_existing_live_resync_watch() {
     std::fs::write(
         &broken_declaration,
         r#"agent "broken" {
-  host "hetz"
+  host "example-linux"
   deliver "mcp"
   workspace "$CATALOG/broken-workspace"
   pty "agent" { command "true" }
@@ -1697,7 +1697,7 @@ fn compile_invalid_seat_does_not_block_existing_live_resync_watch() {
     .unwrap();
     let corrected = reconcile_pass(
         catalog.path(),
-        "hetz",
+        "example-linux",
         &task_context,
         &runner,
         &mut cap,
@@ -1740,7 +1740,7 @@ fn materialization_failure_retains_only_the_observed_live_resync_watch() {
             agent_dir.join("agent.kdl"),
             format!(
                 r#"agent "{identity}" {{
-  host "hetz"
+  host "example-linux"
   workspace "{}"
   command "agent"
   resource "goal" uri="resources/goal.md" reason="Mission."
@@ -1756,22 +1756,22 @@ fn materialization_failure_retains_only_the_observed_live_resync_watch() {
     };
     let (live_dir, live_goal) = write_broken_agent("live");
     let (dormant_dir, dormant_goal) = write_broken_agent("dormant");
-    crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+    crate::event::publish_owner_binding_for_test(catalog.path(), "example-linux").unwrap();
 
     let runner = SpawnCountingRunner {
-        sessions: RefCell::new(vec![sess("hetz.live", true)]),
+        sessions: RefCell::new(vec![sess("example-linux.live", true)]),
         ..SpawnCountingRunner::default()
     };
     let task_context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
     let resync =
-        crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "example-linux".into());
     let mut cap = FlappingCap::default();
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     let mut presentation_cursor = PresentationPatchCursor::default();
 
     let failed = reconcile_pass(
         catalog.path(),
-        "hetz",
+        "example-linux",
         &task_context,
         &runner,
         &mut cap,
@@ -1810,7 +1810,7 @@ fn materialization_failure_retains_only_the_observed_live_resync_watch() {
     std::fs::write(catalog.path().join("_templates/live.md"), "rendered\n").unwrap();
     let recovered = reconcile_pass(
         catalog.path(),
-        "hetz",
+        "example-linux",
         &task_context,
         &runner,
         &mut cap,
@@ -1851,15 +1851,15 @@ fn execute_resync_plan(
         &mut report,
         &mut |spec| {
             install_count += 1;
-            assert!(resync.install_live(spec, specs, "hetz").is_empty());
+            assert!(resync.install_live(spec, specs, "example-linux").is_empty());
         },
     );
     assert!(
         resync
             .refresh(
                 specs,
-                &live_resync_specs(specs, "hetz", &[], &report),
-                "hetz",
+                &live_resync_specs(specs, "example-linux", &[], &report),
+                "example-linux",
                 &[],
                 &[],
             )
@@ -1875,19 +1875,19 @@ fn notify_chain_launch_boundary_installs_ancestors_before_a_later_task_finishes(
     let catalog = tempfile::tempdir().unwrap();
     write_notify_chain_profile(catalog.path());
     let (_root_dir, root_goal) = write_notify_chain_agent(catalog.path(), "root", None, false);
-    write_notify_chain_agent(catalog.path(), "lead", Some("hetz.root"), false);
+    write_notify_chain_agent(catalog.path(), "lead", Some("example-linux.root"), false);
     let (worker_dir, _worker_goal) =
-        write_notify_chain_agent(catalog.path(), "worker", Some("hetz.lead"), false);
-    crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+        write_notify_chain_agent(catalog.path(), "worker", Some("example-linux.lead"), false);
+    crate::event::publish_owner_binding_for_test(catalog.path(), "example-linux").unwrap();
     let specs = crate::discover_strict(catalog.path()).specs;
     let worker = specs.iter().find(|spec| spec.identity == "worker").unwrap();
-    let mut later = target("hetz.worker.later", "later");
+    let mut later = target("example-linux.worker.later", "later");
     later.name = "later".into();
     later.derived = true;
     let plan = ReconcilePlan {
         launch: vec![Launch {
             spec: worker,
-            tasks: vec![target("hetz.worker.agent", "agent"), later],
+            tasks: vec![target("example-linux.worker.agent", "agent"), later],
             live_derived: Vec::new(),
         }],
         ..ReconcilePlan::default()
@@ -1897,13 +1897,13 @@ fn notify_chain_launch_boundary_installs_ancestors_before_a_later_task_finishes(
     let runner = BlockingLaunchRunner {
         sessions: RefCell::new(Vec::new()),
         fail_id: None,
-        block_id: "hetz.worker.later".to_owned(),
+        block_id: "example-linux.worker.later".to_owned(),
         entered: entered_tx,
         release: RefCell::new(release_rx),
     };
     let resync = crate::resync::ResyncSupervisor::with_profiles(
         catalog.path().to_path_buf(),
-        "hetz".into(),
+        "example-linux".into(),
         crate::catalog::declared_profiles(catalog.path()).unwrap(),
     );
 
@@ -1911,16 +1911,16 @@ fn notify_chain_launch_boundary_installs_ancestors_before_a_later_task_finishes(
         let observer = scope.spawn(move || {
             entered_rx.recv().unwrap();
             std::fs::write(&root_goal, "changed while later task launches\n").unwrap();
-            let event = wait_for_resync_event_for_key(&worker_dir, "goal@hetz.root");
+            let event = wait_for_resync_event_for_key(&worker_dir, "goal@example-linux.root");
             release_tx.send(()).unwrap();
             event
         });
         let report = execute_resync_plan(&plan, &runner, &specs, &resync);
-        assert_eq!(report.launched, ["hetz.worker.agent", "hetz.worker.later"]);
+        assert_eq!(report.launched, ["example-linux.worker.agent", "example-linux.worker.later"]);
         observer.join().unwrap()
     })
     .expect("the fresh worker must receive its ancestor transition before full refresh");
-    assert!(event.contains("key: goal@hetz.root"), "{event}");
+    assert!(event.contains("key: goal@example-linux.root"), "{event}");
 }
 
 #[test]
@@ -1928,7 +1928,7 @@ fn resync_launch_boundary_seeds_first_seat_before_later_seat_finishes() {
     let catalog = tempfile::tempdir().unwrap();
     let (first_dir, first_goal) = write_resync_agent(catalog.path(), "first");
     write_resync_agent(catalog.path(), "second");
-    crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+    crate::event::publish_owner_binding_for_test(catalog.path(), "example-linux").unwrap();
     let specs = crate::discover_strict(catalog.path()).specs;
     let first = specs.iter().find(|spec| spec.identity == "first").unwrap();
     let second = specs.iter().find(|spec| spec.identity == "second").unwrap();
@@ -1936,12 +1936,12 @@ fn resync_launch_boundary_seeds_first_seat_before_later_seat_finishes() {
         launch: vec![
             Launch {
                 spec: first,
-                tasks: vec![target("hetz.first.agent", "agent")],
+                tasks: vec![target("example-linux.first.agent", "agent")],
                 live_derived: Vec::new(),
             },
             Launch {
                 spec: second,
-                tasks: vec![target("hetz.second.agent", "agent")],
+                tasks: vec![target("example-linux.second.agent", "agent")],
                 live_derived: Vec::new(),
             },
         ],
@@ -1952,12 +1952,12 @@ fn resync_launch_boundary_seeds_first_seat_before_later_seat_finishes() {
     let runner = BlockingLaunchRunner {
         sessions: RefCell::new(Vec::new()),
         fail_id: None,
-        block_id: "hetz.second.agent".to_owned(),
+        block_id: "example-linux.second.agent".to_owned(),
         entered: entered_tx,
         release: RefCell::new(release_rx),
     };
     let resync =
-        crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "example-linux".into());
 
     std::thread::scope(|scope| {
         scope.spawn(move || {
@@ -1967,7 +1967,7 @@ fn resync_launch_boundary_seeds_first_seat_before_later_seat_finishes() {
             release_tx.send(()).unwrap();
         });
         let report = execute_resync_plan(&plan, &runner, &specs, &resync);
-        assert_eq!(report.launched, ["hetz.first.agent", "hetz.second.agent"]);
+        assert_eq!(report.launched, ["example-linux.first.agent", "example-linux.second.agent"]);
     });
 
     let event = wait_for_resync_event(&first_dir)
@@ -1980,7 +1980,7 @@ fn resync_launch_boundary_excludes_failed_canonical_seat() {
     let catalog = tempfile::tempdir().unwrap();
     let (first_dir, first_goal) = write_resync_agent(catalog.path(), "first");
     write_resync_agent(catalog.path(), "second");
-    crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+    crate::event::publish_owner_binding_for_test(catalog.path(), "example-linux").unwrap();
     let specs = crate::discover_strict(catalog.path()).specs;
     let first = specs.iter().find(|spec| spec.identity == "first").unwrap();
     let second = specs.iter().find(|spec| spec.identity == "second").unwrap();
@@ -1988,12 +1988,12 @@ fn resync_launch_boundary_excludes_failed_canonical_seat() {
         launch: vec![
             Launch {
                 spec: first,
-                tasks: vec![target("hetz.first.agent", "agent")],
+                tasks: vec![target("example-linux.first.agent", "agent")],
                 live_derived: Vec::new(),
             },
             Launch {
                 spec: second,
-                tasks: vec![target("hetz.second.agent", "agent")],
+                tasks: vec![target("example-linux.second.agent", "agent")],
                 live_derived: Vec::new(),
             },
         ],
@@ -2003,13 +2003,13 @@ fn resync_launch_boundary_excludes_failed_canonical_seat() {
     let (release_tx, release_rx) = mpsc::channel();
     let runner = BlockingLaunchRunner {
         sessions: RefCell::new(Vec::new()),
-        fail_id: Some("hetz.first.agent".to_owned()),
-        block_id: "hetz.second.agent".to_owned(),
+        fail_id: Some("example-linux.first.agent".to_owned()),
+        block_id: "example-linux.second.agent".to_owned(),
         entered: entered_tx,
         release: RefCell::new(release_rx),
     };
     let resync =
-        crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "example-linux".into());
 
     std::thread::scope(|scope| {
         scope.spawn(move || {
@@ -2019,9 +2019,9 @@ fn resync_launch_boundary_excludes_failed_canonical_seat() {
             release_tx.send(()).unwrap();
         });
         let report = execute_resync_plan(&plan, &runner, &specs, &resync);
-        assert_eq!(report.launched, ["hetz.second.agent"]);
+        assert_eq!(report.launched, ["example-linux.second.agent"]);
         assert!(report.errors.iter().any(|error| {
-            error.contains("hetz.first.agent") && error.contains("simulated launch failure")
+            error.contains("example-linux.first.agent") && error.contains("simulated launch failure")
         }));
     });
 
@@ -2036,26 +2036,26 @@ fn resync_launch_boundary_excludes_failed_canonical_seat() {
 fn dead_resync_seat_is_deactivated_before_its_relaunch_blocks() {
     let catalog = tempfile::tempdir().unwrap();
     let (agent_dir, goal) = write_resync_agent(catalog.path(), "worker");
-    crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+    crate::event::publish_owner_binding_for_test(catalog.path(), "example-linux").unwrap();
     let (entered_tx, entered_rx) = mpsc::sync_channel(0);
     let (release_tx, release_rx) = mpsc::channel();
     let runner = BlockingLaunchRunner {
-        sessions: RefCell::new(vec![sess("hetz.worker", true)]),
+        sessions: RefCell::new(vec![sess("example-linux.worker", true)]),
         fail_id: None,
-        block_id: "hetz.worker".to_owned(),
+        block_id: "example-linux.worker".to_owned(),
         entered: entered_tx,
         release: RefCell::new(release_rx),
     };
     let task_context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
     let resync =
-        crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "example-linux".into());
     let mut cap = FlappingCap::default();
     let mut debounce = LivenessDebounce::new(Duration::ZERO);
     let mut presentation_cursor = PresentationPatchCursor::default();
 
     let seeded = reconcile_pass(
         catalog.path(),
-        "hetz",
+        "example-linux",
         &task_context,
         &runner,
         &mut cap,
@@ -2065,7 +2065,7 @@ fn dead_resync_seat_is_deactivated_before_its_relaunch_blocks() {
         None,
     );
     assert!(seeded.adopted.iter().any(|identity| identity == "worker"));
-    *runner.sessions.borrow_mut() = vec![sess("hetz.worker", false)];
+    *runner.sessions.borrow_mut() = vec![sess("example-linux.worker", false)];
     let blocked_goal = goal.clone();
 
     let relaunched = std::thread::scope(|scope| {
@@ -2077,7 +2077,7 @@ fn dead_resync_seat_is_deactivated_before_its_relaunch_blocks() {
         });
         reconcile_pass(
             catalog.path(),
-            "hetz",
+            "example-linux",
             &task_context,
             &runner,
             &mut cap,
@@ -2087,7 +2087,7 @@ fn dead_resync_seat_is_deactivated_before_its_relaunch_blocks() {
             None,
         )
     });
-    assert_eq!(relaunched.restarted, ["hetz.worker"]);
+    assert_eq!(relaunched.restarted, ["example-linux.worker"]);
     std::thread::sleep(Duration::from_millis(750));
     assert!(
         current_resync_event(&agent_dir).is_none(),
@@ -2116,21 +2116,21 @@ fn reconcile_pass_completes_while_a_resync_publication_is_blocked() {
 
     let catalog = tempfile::tempdir().unwrap();
     let (agent_dir, goal) = write_resync_agent(catalog.path(), "worker");
-    crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+    crate::event::publish_owner_binding_for_test(catalog.path(), "example-linux").unwrap();
     let runner = SpawnCountingRunner {
-        sessions: RefCell::new(vec![sess("hetz.worker", true)]),
+        sessions: RefCell::new(vec![sess("example-linux.worker", true)]),
         ..Default::default()
     };
     let task_context = TaskCompileContext::current(catalog.path().to_path_buf()).unwrap();
     let resync =
-        crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "example-linux".into());
     let mut cap = FlappingCap::default();
     let mut debounce = LivenessDebounce::new(DEBOUNCE_GRACE);
     let mut presentation_cursor = PresentationPatchCursor::default();
 
     let seeded = reconcile_pass(
         catalog.path(),
-        "hetz",
+        "example-linux",
         &task_context,
         &runner,
         &mut cap,
@@ -2187,7 +2187,7 @@ fn reconcile_pass_completes_while_a_resync_publication_is_blocked() {
         });
         let pass = reconcile_pass(
             catalog.path(),
-            "hetz",
+            "example-linux",
             &task_context,
             &runner,
             &mut cap,
@@ -2214,16 +2214,16 @@ fn reconcile_pass_completes_while_a_resync_publication_is_blocked() {
 fn resync_launch_boundary_preserves_baseline_across_derived_companion() {
     let catalog = tempfile::tempdir().unwrap();
     let (agent_dir, goal) = write_resync_agent(catalog.path(), "worker");
-    crate::event::publish_owner_binding_for_test(catalog.path(), "hetz").unwrap();
+    crate::event::publish_owner_binding_for_test(catalog.path(), "example-linux").unwrap();
     let specs = crate::discover_strict(catalog.path()).specs;
     let spec = &specs[0];
-    let mut derived = target("hetz.worker.ding", "ding");
+    let mut derived = target("example-linux.worker.ding", "ding");
     derived.name = "ding".into();
     derived.derived = true;
     let plan = ReconcilePlan {
         launch: vec![Launch {
             spec,
-            tasks: vec![target("hetz.worker.agent", "agent"), derived],
+            tasks: vec![target("example-linux.worker.agent", "agent"), derived],
             live_derived: Vec::new(),
         }],
         ..ReconcilePlan::default()
@@ -2233,12 +2233,12 @@ fn resync_launch_boundary_preserves_baseline_across_derived_companion() {
     let runner = BlockingLaunchRunner {
         sessions: RefCell::new(Vec::new()),
         fail_id: None,
-        block_id: "hetz.worker.ding".to_owned(),
+        block_id: "example-linux.worker.ding".to_owned(),
         entered: entered_tx,
         release: RefCell::new(release_rx),
     };
     let resync =
-        crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "hetz".into());
+        crate::resync::ResyncSupervisor::spawn(catalog.path().to_path_buf(), "example-linux".into());
     let installs = AtomicUsize::new(0);
     let mut report = UpReport::default();
 
@@ -2257,7 +2257,7 @@ fn resync_launch_boundary_preserves_baseline_across_derived_companion() {
             &mut report,
             &mut |spec| {
                 installs.fetch_add(1, AtomicOrdering::SeqCst);
-                assert!(resync.install_live(spec, &specs, "hetz").is_empty());
+                assert!(resync.install_live(spec, &specs, "example-linux").is_empty());
             },
         );
     });
@@ -2265,8 +2265,8 @@ fn resync_launch_boundary_preserves_baseline_across_derived_companion() {
         resync
             .refresh(
                 &specs,
-                &live_resync_specs(&specs, "hetz", &[], &report),
-                "hetz",
+                &live_resync_specs(&specs, "example-linux", &[], &report),
+                "example-linux",
                 &[],
                 &[],
             )
@@ -2287,26 +2287,26 @@ fn resync_launch_boundary_preserves_baseline_across_derived_companion() {
 fn debounce_absorbs_a_gc_flicker_but_reaps_a_stable_death() {
     let t0 = Instant::now();
     let mut db = LivenessDebounce::new(Duration::from_secs(10));
-    db.observe(&[sess("hetz.demo.agent", true)], t0);
+    db.observe(&[sess("example-linux.demo.agent", true)], t0);
 
     // Flicker: reads not-alive 1s later but was alive within the grace → deferred (left running).
     let mut plan = ReconcilePlan::default();
-    plan.gc.push("hetz.demo.agent".into());
+    plan.gc.push("example-linux.demo.agent".into());
     let deferred = db.defer_flickers(&mut plan, t0 + Duration::from_secs(1));
     assert!(
         plan.gc.is_empty(),
         "a recently-alive flicker must NOT be GC'd"
     );
-    assert_eq!(deferred, vec!["hetz.demo.agent".to_string()]);
+    assert_eq!(deferred, vec!["example-linux.demo.agent".to_string()]);
 
     // CENTRAL anti-over-correction check: a STABLE death past the grace IS still reaped — the
     // debounce must never MASK a real death.
     let mut plan = ReconcilePlan::default();
-    plan.gc.push("hetz.demo.agent".into());
+    plan.gc.push("example-linux.demo.agent".into());
     let deferred = db.defer_flickers(&mut plan, t0 + Duration::from_secs(11));
     assert_eq!(
         plan.gc,
-        vec!["hetz.demo.agent".to_string()],
+        vec!["example-linux.demo.agent".to_string()],
         "a stable death must still be reaped"
     );
     assert!(deferred.is_empty());
@@ -2361,9 +2361,9 @@ fn debounce_never_defers_a_never_seen_task() {
     let db = LivenessDebounce::new(Duration::from_secs(10));
     // A genuinely-new target (never observed alive) is handled immediately, not deferred.
     let mut plan = ReconcilePlan::default();
-    plan.gc.push("hetz.brandnew.agent".into());
+    plan.gc.push("example-linux.brandnew.agent".into());
     let deferred = db.defer_flickers(&mut plan, t0);
-    assert_eq!(plan.gc, vec!["hetz.brandnew.agent".to_string()]);
+    assert_eq!(plan.gc, vec!["example-linux.brandnew.agent".to_string()]);
     assert!(deferred.is_empty());
 }
 
@@ -2371,7 +2371,7 @@ fn debounce_never_defers_a_never_seen_task() {
 fn debounce_defers_a_flickering_launch_target_too() {
     let t0 = Instant::now();
     let mut db = LivenessDebounce::new(Duration::from_secs(10));
-    db.observe(&[sess("hetz.demo.agent", true)], t0);
+    db.observe(&[sess("example-linux.demo.agent", true)], t0);
 
     // The same recently-alive id showing up as a launch target (Absent/Dead) is also deferred —
     // no noisy "already in use" re-launch of a live session.
@@ -2379,7 +2379,7 @@ fn debounce_defers_a_flickering_launch_target_too() {
     let mut plan = ReconcilePlan::default();
     plan.launch.push(Launch {
         spec: &spec,
-        tasks: vec![target("hetz.demo.agent", "x")],
+        tasks: vec![target("example-linux.demo.agent", "x")],
         live_derived: Vec::new(),
     });
     let deferred = db.defer_flickers(&mut plan, t0 + Duration::from_secs(2));
@@ -2387,7 +2387,7 @@ fn debounce_defers_a_flickering_launch_target_too() {
         plan.launch.is_empty(),
         "a recently-alive flicker must NOT be re-launched"
     );
-    assert_eq!(deferred, vec!["hetz.demo.agent".to_string()]);
+    assert_eq!(deferred, vec!["example-linux.demo.agent".to_string()]);
 }
 
 #[test]
@@ -2505,10 +2505,10 @@ fn hook_verification_failure_suppresses_only_new_codex_agents() {
 fn build_run_command_wraps_command_in_sh_c() {
     let cli = PtyCli::default();
     let t = target(
-        "hetz.demo.agent",
+        "example-linux.demo.agent",
         "exec claude --permission-mode bypassPermissions 'boot'",
     );
-    let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+    let cmd = cli.build_run_command(&t, Path::new("/cat/example-linux/demo"));
 
     assert_eq!(cmd.get_program(), OsStr::new("pty"));
     let args: Vec<String> = cmd
@@ -2519,9 +2519,9 @@ fn build_run_command_wraps_command_in_sh_c() {
     assert_eq!(&args[0..2], &["run", "-d"]);
     assert!(args.contains(&"--force".to_string()));
     let id_pos = args.iter().position(|a| a == "--id").unwrap();
-    assert_eq!(args[id_pos + 1], "hetz.demo.agent");
+    assert_eq!(args[id_pos + 1], "example-linux.demo.agent");
     let name_pos = args.iter().position(|a| a == "--name").unwrap();
-    assert_eq!(args[name_pos + 1], "hetz.demo");
+    assert_eq!(args[name_pos + 1], "example-linux.demo");
     let sep = args.iter().position(|a| a == "--").unwrap();
     assert_eq!(
         &args[sep + 1..],
@@ -2605,23 +2605,23 @@ fn build_run_command_projects_primary_name_and_owned_tags_at_spawn() {
     unsafe { std::env::set_var(key, "expanded") }
 
     let cli = PtyCli::default();
-    let mut t = target("hetz.demo", "codex");
-    t.bus_id = "hetz.demo".to_owned();
+    let mut t = target("example-linux.demo", "codex");
+    t.bus_id = "example-linux.demo".to_owned();
     t.tags
         .insert("unrelated".to_owned(), "preserved".to_owned());
     t.presentation = Some(PtyPresentation {
-        pty_id: "hetz.demo".to_owned(),
+        pty_id: "example-linux.demo".to_owned(),
         display_name: Some(Some("Build owner".to_owned())),
         tags: BTreeMap::from([
             ("agent.presentation.schema".to_owned(), Some("1".to_owned())),
-            ("agent.actor.path".to_owned(), Some("hetz.demo".to_owned())),
+            ("agent.actor.path".to_owned(), Some("example-linux.demo".to_owned())),
             (
                 "agent.presentation.description".to_owned(),
                 Some(format!("${key}")),
             ),
         ]),
     });
-    let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+    let cmd = cli.build_run_command(&t, Path::new("/cat/example-linux/demo"));
     let args = cmd
         .get_args()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -2636,7 +2636,7 @@ fn build_run_command_projects_primary_name_and_owned_tags_at_spawn() {
         .collect::<BTreeSet<_>>();
     assert!(tags.contains("unrelated=preserved"));
     assert!(tags.contains("agent.presentation.schema=1"));
-    assert!(tags.contains("agent.actor.path=hetz.demo"));
+    assert!(tags.contains("agent.actor.path=example-linux.demo"));
     assert!(tags.contains("agent.presentation.description=$ST2_TEST_PRESENTATION_LITERAL_71c"));
 }
 
@@ -3088,7 +3088,7 @@ fn expired_cleanup_deadline_hands_reaping_off_without_blocking() {
 #[test]
 fn build_run_command_passes_direct_argv_without_a_shell() {
     let cli = PtyCli::new(PathBuf::from("/my/catalog"));
-    let mut t = target("hetz.demo.agent", "unused");
+    let mut t = target("example-linux.demo.agent", "unused");
     t.launch = TaskLaunch::Argv(vec![
         "axe".into(),
         "agent".into(),
@@ -3098,7 +3098,7 @@ fn build_run_command_passes_direct_argv_without_a_shell() {
         "--resume".into(),
         "$CATALOG/session id".into(),
     ]);
-    let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+    let cmd = cli.build_run_command(&t, Path::new("/cat/example-linux/demo"));
     let args = cmd
         .get_args()
         .map(|arg| arg.to_string_lossy().into_owned())
@@ -3150,14 +3150,14 @@ fn build_run_command_expands_direct_argv_with_the_managed_agent_environment() {
 #[test]
 fn build_run_command_persists_the_complete_managed_environment_before_the_command() {
     let cli = PtyCli::new(PathBuf::from("/my/catalog"));
-    let mut t = target("hetz.demo.agent", "exec codex 'boot'");
+    let mut t = target("example-linux.demo.agent", "exec codex 'boot'");
     t.env.insert("CUSTOM".into(), "task-value".into());
-    t.env.insert("ST_AGENT".into(), "hetz.demo".into());
+    t.env.insert("ST_AGENT".into(), "example-linux.demo".into());
     t.env.insert("ST_ROOT".into(), "$CATALOG/custom-bus".into());
     t.env.insert("TERM".into(), "screen-256color".into());
     t.env
         .insert("PTY_ROOT".into(), "/declared/root/must-not-win".into());
-    let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+    let cmd = cli.build_run_command(&t, Path::new("/cat/example-linux/demo"));
 
     let args: Vec<String> = cmd
         .get_args()
@@ -3217,7 +3217,7 @@ fn build_run_command_persists_the_complete_managed_environment_before_the_comman
     );
     assert_eq!(
         persisted.get("ST_AGENT").map(String::as_str),
-        Some("hetz.demo")
+        Some("example-linux.demo")
     );
     assert_eq!(
         persisted.get("CUSTOM").map(String::as_str),
@@ -3229,14 +3229,14 @@ fn build_run_command_persists_the_complete_managed_environment_before_the_comman
 #[test]
 fn build_run_command_omits_an_alias_equal_to_the_lifecycle_id() {
     let cli = PtyCli::default();
-    let mut t = target("hetz.demo", "exec codex 'boot'");
+    let mut t = target("example-linux.demo", "exec codex 'boot'");
     t.bus_id = t.pty_id.clone();
     t.presentation = Some(PtyPresentation {
         pty_id: t.pty_id.clone(),
         display_name: Some(Some(t.pty_id.clone())),
         tags: BTreeMap::new(),
     });
-    let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+    let cmd = cli.build_run_command(&t, Path::new("/cat/example-linux/demo"));
     let args: Vec<String> = cmd
         .get_args()
         .map(|a| a.to_string_lossy().into_owned())
@@ -3246,7 +3246,7 @@ fn build_run_command_omits_an_alias_equal_to_the_lifecycle_id() {
         args.iter()
             .position(|arg| arg == "--id")
             .map(|position| args[position + 1].as_str()),
-        Some("hetz.demo")
+        Some("example-linux.demo")
     );
     assert!(
         !args.iter().any(|arg| arg == "--name"),
@@ -3261,17 +3261,17 @@ fn build_run_command_omits_an_alias_equal_to_the_lifecycle_id() {
 #[test]
 fn build_run_command_defaults_cwd_to_spec_dir_and_passes_tags_and_env() {
     let cli = PtyCli::default();
-    let mut t = target("hetz.demo.agent", "exec claude 'boot'");
+    let mut t = target("example-linux.demo.agent", "exec claude 'boot'");
     t.tags.insert("role".into(), "agent".into());
-    t.env.insert("ST_AGENT".into(), "hetz.demo-claude".into());
-    let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+    t.env.insert("ST_AGENT".into(), "example-linux.demo-claude".into());
+    let cmd = cli.build_run_command(&t, Path::new("/cat/example-linux/demo"));
 
     let args: Vec<String> = cmd
         .get_args()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     let cwd_pos = args.iter().position(|a| a == "--cwd").unwrap();
-    assert_eq!(args[cwd_pos + 1], "/cat/hetz/demo"); // no cwd, no workspace → spec dir
+    assert_eq!(args[cwd_pos + 1], "/cat/example-linux/demo"); // no cwd, no workspace → spec dir
     let tag_pos = args.iter().position(|a| a == "--tag").unwrap();
     assert_eq!(args[tag_pos + 1], "role=agent");
 
@@ -3287,7 +3287,7 @@ fn build_run_command_defaults_cwd_to_spec_dir_and_passes_tags_and_env() {
         .collect();
     assert_eq!(
         envs.get("ST_AGENT"),
-        Some(&Some("hetz.demo-claude".to_string()))
+        Some(&Some("example-linux.demo-claude".to_string()))
     );
     assert_eq!(
         envs.get("TERM"),
@@ -3305,8 +3305,8 @@ fn build_run_command_defaults_cwd_to_spec_dir_and_passes_tags_and_env() {
 #[test]
 fn managed_agent_scrubs_ambient_no_color_unless_explicitly_declared() {
     let cli = PtyCli::default();
-    let agent = target("hetz.demo.agent", "exec claude 'boot'");
-    let command = cli.build_run_command(&agent, Path::new("/cat/hetz/demo"));
+    let agent = target("example-linux.demo.agent", "exec claude 'boot'");
+    let command = cli.build_run_command(&agent, Path::new("/cat/example-linux/demo"));
     assert_eq!(
         command
             .get_envs()
@@ -3325,9 +3325,9 @@ fn managed_agent_scrubs_ambient_no_color_unless_explicitly_declared() {
         "the removal must be persisted for PTY restart"
     );
 
-    let mut explicit = target("hetz.explicit.agent", "exec claude 'boot'");
+    let mut explicit = target("example-linux.explicit.agent", "exec claude 'boot'");
     explicit.env.insert("NO_COLOR".into(), "1".into());
-    let command = cli.build_run_command(&explicit, Path::new("/cat/hetz/explicit"));
+    let command = cli.build_run_command(&explicit, Path::new("/cat/example-linux/explicit"));
     assert_eq!(
         command
             .get_envs()
@@ -3351,9 +3351,9 @@ fn managed_agent_scrubs_ambient_no_color_unless_explicitly_declared() {
 #[test]
 fn non_agent_task_does_not_claim_no_color_policy() {
     let cli = PtyCli::default();
-    let mut task = target("hetz.demo.sidecar", "exec sleep 1");
+    let mut task = target("example-linux.demo.sidecar", "exec sleep 1");
     task.name = "sidecar".into();
-    let command = cli.build_run_command(&task, Path::new("/cat/hetz/demo"));
+    let command = cli.build_run_command(&task, Path::new("/cat/example-linux/demo"));
 
     assert!(
         command
@@ -3395,9 +3395,9 @@ fn isolation_wrapper_preserves_environment_removals() {
 #[test]
 fn build_run_command_allows_a_task_to_override_the_default_term() {
     let cli = PtyCli::default();
-    let mut t = target("hetz.demo.agent", "exec codex 'boot'");
+    let mut t = target("example-linux.demo.agent", "exec codex 'boot'");
     t.env.insert("TERM".into(), "screen-256color".into());
-    let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+    let cmd = cli.build_run_command(&t, Path::new("/cat/example-linux/demo"));
     let term = cmd
         .get_envs()
         .find(|(key, _)| *key == OsStr::new("TERM"))
@@ -3409,9 +3409,9 @@ fn build_run_command_allows_a_task_to_override_the_default_term() {
 #[test]
 fn build_run_command_defaults_cwd_to_workspace_when_task_cwd_absent() {
     let cli = PtyCli::default();
-    let mut t = target("hetz.demo.agent", "exec claude 'boot'");
+    let mut t = target("example-linux.demo.agent", "exec claude 'boot'");
     t.workspace = Some("/repos/demo".into()); // no task cwd → workspace (spec.md §2)
-    let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+    let cmd = cli.build_run_command(&t, Path::new("/cat/example-linux/demo"));
     let args: Vec<String> = cmd
         .get_args()
         .map(|a| a.to_string_lossy().into_owned())
@@ -3423,9 +3423,9 @@ fn build_run_command_defaults_cwd_to_workspace_when_task_cwd_absent() {
 #[test]
 fn build_run_command_expands_catalog_var_and_sets_it_in_env() {
     let cli = PtyCli::new(PathBuf::from("/my/catalog"));
-    let mut t = target("hetz.demo.agent", "run");
+    let mut t = target("example-linux.demo.agent", "run");
     t.env.insert("DATA".into(), "$CATALOG/evals/x".into());
-    let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+    let cmd = cli.build_run_command(&t, Path::new("/cat/example-linux/demo"));
     let envs: BTreeMap<String, Option<String>> = cmd
         .get_envs()
         .map(|(k, v)| {
@@ -3449,11 +3449,11 @@ fn build_run_command_expands_vars_in_env_cwd_and_tags_but_not_command() {
     unsafe { std::env::set_var(key, "/net/xyz") }
 
     let cli = PtyCli::default();
-    let mut t = target("hetz.demo.agent", "exec claude $ST2_TEST_EXPAND_NET_9f3/go");
+    let mut t = target("example-linux.demo.agent", "exec claude $ST2_TEST_EXPAND_NET_9f3/go");
     t.cwd = Some(format!("${key}/work"));
     t.tags.insert("net".into(), format!("${key}"));
     t.env.insert("ST_ROOT".into(), format!("${key}/custom-bus"));
-    let cmd = cli.build_run_command(&t, Path::new("/cat/hetz/demo"));
+    let cmd = cli.build_run_command(&t, Path::new("/cat/example-linux/demo"));
 
     let args: Vec<String> = cmd
         .get_args()
@@ -3496,27 +3496,27 @@ fn resolve_cwd_honors_relative_absolute_workspace_and_default() {
     // relative cwd → joined onto the spec dir
     t.cwd = Some("sub".into());
     assert_eq!(
-        cli.resolve_cwd(&t, Path::new("/cat/hetz/demo")),
-        Path::new("/cat/hetz/demo/sub")
+        cli.resolve_cwd(&t, Path::new("/cat/example-linux/demo")),
+        Path::new("/cat/example-linux/demo/sub")
     );
     // absolute cwd → replaces
     t.cwd = Some("/repos/fabric".into());
     assert_eq!(
-        cli.resolve_cwd(&t, Path::new("/cat/hetz/demo")),
+        cli.resolve_cwd(&t, Path::new("/cat/example-linux/demo")),
         Path::new("/repos/fabric")
     );
     // no cwd but a workspace → workspace
     t.cwd = None;
     t.workspace = Some("/repos/ws".into());
     assert_eq!(
-        cli.resolve_cwd(&t, Path::new("/cat/hetz/demo")),
+        cli.resolve_cwd(&t, Path::new("/cat/example-linux/demo")),
         Path::new("/repos/ws")
     );
     // neither → spec dir
     t.workspace = None;
     assert_eq!(
-        cli.resolve_cwd(&t, Path::new("/cat/hetz/demo")),
-        Path::new("/cat/hetz/demo")
+        cli.resolve_cwd(&t, Path::new("/cat/example-linux/demo")),
+        Path::new("/cat/example-linux/demo")
     );
 }
 
