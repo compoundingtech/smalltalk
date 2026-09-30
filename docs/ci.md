@@ -1,8 +1,7 @@
 # CI operations
 
-The fleet CI definitions and trusted scripts live in
-[`myobie/st3-network/missions`](https://github.com/myobie/st3-network/tree/main/missions)
-as `smalltalk-ci-*.kdl` and `smalltalk-ci*.sh`. The standing `st` mission observes
+The fleet's CI mission declarations and trusted runner scripts are kept with that fleet's private
+machine configuration, outside this repository, as `smalltalk-ci-*.kdl` and `smalltalk-ci*.sh`. The standing `st` mission observes
 same-repository pull request heads and pushes to `main`. Each run checks the exact observed
 commit. A pull request run merges that commit with the latest `main` in a temporary checkout
 before running `cargo test --workspace --locked` and

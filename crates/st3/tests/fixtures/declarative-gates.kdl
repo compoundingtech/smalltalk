@@ -1,6 +1,6 @@
 version 2
 
-// A dream version of missions/app-web-one-space-gets-instant-new-items.kdl in myobie/st3-network.
+// A dream version of missions/app-web-one-space-gets-instant-new-items.kdl in a private fleet configuration.
 //
 // Real in st3 when this fixture was authored: the step `message {}` upsert, the named `loop` with
 // `until`, and the github.pull-request observer with its `checks` field.
