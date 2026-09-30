@@ -17491,13 +17491,15 @@ fn expected_operations(
         .collect())
 }
 
-/// The version of the rules that derive `operations` and the planning tables from claims. Every
-/// write and projection keeps both current, so a start rebuilds them only when this changes, or
-/// for a store no build with this rule has opened. Rebuilding them read every claim and held a
-/// start for seconds before the API could answer.
+/// The version of the rules that derive `operations` from claims. Every write and projection
+/// keeps it current, so a start rebuilds it only when this changes, or for a store no build with
+/// this rule has opened. Rebuilding it read every claim and held a start for seconds before the
+/// API could answer. The planning tables are small and rebuilt on every start, since a planning
+/// claim written through the generic claim path is projected only by a rebuild.
 const DERIVED_TABLES_VERSION: &str = "1";
 
 fn rebuild_derived_tables_once_tx(transaction: &Transaction<'_>) -> Result<()> {
+    rebuild_planning_tx(transaction)?;
     let built: Option<String> = transaction
         .query_row(
             "SELECT value FROM meta WHERE key='derived_tables_version'",
@@ -17509,7 +17511,6 @@ fn rebuild_derived_tables_once_tx(transaction: &Transaction<'_>) -> Result<()> {
         return Ok(());
     }
     rebuild_operations_tx(transaction)?;
-    rebuild_planning_tx(transaction)?;
     transaction.execute(
         "INSERT INTO meta(key, value) VALUES ('derived_tables_version', ?1)
          ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -17535,7 +17536,8 @@ fn rebuild_planning_tx(transaction: &Transaction<'_>) -> Result<()> {
     transaction.execute("DELETE FROM planning_sessions", [])?;
     let mut statement = transaction.prepare(
         "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-         FROM claims WHERE kind LIKE 'planning-session.%' ORDER BY store_index",
+         FROM claims WHERE kind >= 'planning-session.' AND kind < 'planning-session/'
+         ORDER BY store_index",
     )?;
     let claims = statement
         .query_map([], claim_from_row)?
