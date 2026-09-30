@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -161,6 +160,17 @@ WHERE kind='schedule.work-started';
 CREATE INDEX IF NOT EXISTS claims_operation_index
 ON claims(json_extract(body, '$._operation.id'))
 WHERE json_extract(body, '$._operation.id') IS NOT NULL;
+-- The newest message to a recipient, found by one seek instead of a scan of every message.
+CREATE INDEX IF NOT EXISTS claims_message_to_order_index
+ON claims(json_extract(body, '$.fields.to'), store_index)
+WHERE kind='message.sent';
+-- Claims that can place a runtime subject in a current view: a declaration, or a live status.
+-- The predicate is CURRENT_VIEW_CLAIM, which queries repeat so the planner uses this index.
+CREATE INDEX IF NOT EXISTS claims_current_view_index
+ON claims(subject, store_index)
+WHERE kind='intent.desired'
+   OR json_extract(body, '$.fields.status') NOT IN ('stopped', 'absent', 'exited')
+   OR json_extract(body, '$.status') NOT IN ('stopped', 'absent', 'exited');
 
 CREATE TABLE IF NOT EXISTS operations (
     id TEXT PRIMARY KEY,
@@ -168,6 +178,7 @@ CREATE TABLE IF NOT EXISTS operations (
     canonical_claim_id TEXT NOT NULL REFERENCES claims(id),
     state TEXT NOT NULL CHECK(state IN ('active','conflict'))
 );
+CREATE INDEX IF NOT EXISTS operations_conflict_index ON operations(id) WHERE state='conflict';
 
 CREATE TABLE IF NOT EXISTS blobs (
     hash TEXT PRIMARY KEY,
@@ -601,7 +612,15 @@ PRAGMA user_version = 13;
 const WRITE_CLOCK: &str =
     "CREATE TEMP TABLE IF NOT EXISTS write_clock(offset_ms INTEGER NOT NULL, at_ms INTEGER);";
 
-const READ_CONNECTIONS: usize = 4;
+/// Read connections a store keeps open between reads; more open while more reads run at once.
+/// Each caches up to 8 MiB of pages.
+const IDLE_READ_CONNECTIONS: usize = 32;
+/// How many threads one large status projection splits across.
+const STATUS_WORKERS: usize = 4;
+/// Prepared statements each connection keeps. The default of 16 is fewer than the cached
+/// statements one status reduction alone runs, so they evicted each other and were planned anew
+/// for every subject.
+const STATEMENT_CACHE_CAPACITY: usize = 128;
 
 /// Claims in canonical order: accepted time, then writer, batch sequence and position in the
 /// batch. Every node that holds the same claims orders them the same way, as the full replay does.
@@ -615,6 +634,279 @@ const CANONICAL_ORDER_DESC: &str = "length(claims.accepted_at_unix_ms) DESC,
 const CLAIM_COLUMNS: &str = "claims.id, claims.store_index, claims.batch_id, claims.subject,
      claims.kind, claims.origin, claims.actor, claims.body, claims.predecessors,
      claims.accepted_at_unix_ms";
+
+/// The predicate of `claims_current_view_index`, word for word, so SQLite can use the index.
+const CURRENT_VIEW_CLAIM: &str = "(kind='intent.desired'
+   OR json_extract(body, '$.fields.status') NOT IN ('stopped', 'absent', 'exited')
+   OR json_extract(body, '$.status') NOT IN ('stopped', 'absent', 'exited'))";
+
+/// Whether `subject` names a runtime, whose stopped or undeclared state puts it in history.
+fn runtime_subject(subject: &str) -> bool {
+    subject.starts_with("agent/")
+        || subject.starts_with("exec/")
+        || subject.starts_with("pty/")
+        || subject.starts_with("gate-operation/")
+}
+
+/// Status reductions kept per subject between snapshots. `through` is the newest snapshot whose
+/// arrivals were applied: a subject that gained a claim, acted in one, or whose owning run or
+/// generation gained one since an answer was read loses it. `conflicts` counts conflicting
+/// operations, which change a subject's status without a claim of its own.
+#[derive(Default)]
+struct SubjectCache {
+    through: u64,
+    conflicts: u64,
+    views: HashMap<String, ViewEntry>,
+    statuses: HashMap<String, StatusEntry>,
+}
+
+/// One subject's reduction, read at snapshot `read_at`, so it holds from there on.
+struct StatusEntry {
+    read_at: u64,
+    owners: Vec<String>,
+    status: SubjectStatus,
+    action: Option<PlannedAction>,
+}
+
+/// One runtime's answer. It depends on the runtime's own claims and, for a declared runtime,
+/// on its owning run's and generation's, so it holds at every snapshot from the newest of
+/// those claims, `head`, while none of `owners` or the runtime itself gains another.
+struct ViewEntry {
+    head: u64,
+    history: bool,
+    /// Whether the answer used a declaration, and so the snapshot's owner state.
+    declared: bool,
+    owners: Vec<String>,
+}
+
+fn subject_head_at(connection: &Connection, subject: &str, store_index: u64) -> Result<u64> {
+    connection
+        .prepare_cached(
+            "SELECT COALESCE(MAX(store_index), 0) FROM claims WHERE subject=?1 AND store_index<=?2",
+        )?
+        .query_row(params![subject, store_index], |row| row.get::<_, u64>(0))
+        .map_err(Into::into)
+}
+
+/// Whether a current view at `store_index` leaves out runtime `subject`: exactly when its
+/// reduction there would place it in history. `owners` says whether a declared runtime's owning
+/// run and generation may decide it; the snapshot reduction reads them from their claims.
+fn runtime_view_entry(
+    connection: &Connection,
+    subject: &str,
+    store_index: u64,
+    owners: bool,
+) -> Result<ViewEntry> {
+    let head = subject_head_at(connection, subject, store_index)?;
+    let entry = |history| ViewEntry {
+        head,
+        history,
+        declared: false,
+        owners: Vec::new(),
+    };
+    // A folded status can be live only when some claim carries a live status, and a declaration
+    // is one of these claims, so a runtime with none of them is stopped or undeclared: history.
+    let candidate = connection
+        .prepare_cached(&format!(
+            "SELECT EXISTS(SELECT 1 FROM claims INDEXED BY claims_current_view_index
+                           WHERE subject=?1 AND store_index<=?2 AND {CURRENT_VIEW_CLAIM})"
+        ))?
+        .query_row(params![subject, store_index], |row| row.get::<_, bool>(0))?;
+    if !candidate {
+        return Ok(entry(true));
+    }
+    let status = |connection: &Connection| -> Result<Option<String>> {
+        Ok(latest_actual_at(connection, subject, Some(store_index))?
+            .as_ref()
+            .and_then(|value| value.get("fields").unwrap_or(value).get("status"))
+            .and_then(Value::as_str)
+            .map(str::to_owned))
+    };
+    let stopped = |status: Option<&str>| matches!(status, Some("stopped" | "absent" | "exited"));
+    let desired = desired_row_at(connection, subject, Some(store_index))?;
+    let Some(desired) = desired else {
+        // Undeclared: current only while its status is live.
+        let status = status(connection)?;
+        return Ok(entry(status.is_none() || stopped(status.as_deref())));
+    };
+    if !owners {
+        return Ok(ViewEntry {
+            declared: true,
+            ..entry(false)
+        });
+    }
+    let annotation = operational_annotation(
+        connection,
+        subject,
+        Some(&desired.kind),
+        true,
+        desired.owner_run.as_deref(),
+        desired.owner_generation.as_deref(),
+        None,
+        Some(store_index),
+    )?;
+    // A stop declaration leaves a stopped runtime in history; no other declaration reads status.
+    let history = annotation.layer != "current"
+        || (desired.kind == "stop" && stopped(status(connection)?.as_deref()));
+    let owners = desired
+        .owner_run
+        .iter()
+        .chain(desired.owner_generation.iter())
+        .cloned()
+        .collect::<Vec<_>>();
+    let mut head = head;
+    for owner in &owners {
+        head = head.max(subject_head_at(connection, owner, store_index)?);
+    }
+    Ok(ViewEntry {
+        head,
+        history,
+        declared: true,
+        owners,
+    })
+}
+
+/// One subject's status at `at_index`, and the action it asks of its host when it is current and
+/// differs from what is declared. With `owner_filter`, a subject another run owns is skipped.
+fn subject_status_at(
+    connection: &Connection,
+    subject: &str,
+    at_index: Option<u64>,
+    owner_filter: Option<&str>,
+) -> Result<Option<(SubjectStatus, Option<PlannedAction>)>> {
+    #[cfg(test)]
+    SUBJECT_REDUCTIONS.with(|reductions| reductions.set(reductions.get() + 1));
+    let desired = desired_row_at(connection, subject, at_index)?;
+    let member = desired
+        .as_ref()
+        .and_then(|row| row.member.as_deref())
+        .and_then(|value| serde_json::from_str::<crate::model::MemberSpec>(value).ok());
+    let actual = latest_actual_at(connection, subject, at_index)?;
+    let (actual_claim, actual_origin, actual_origin_conflict) = selected_actual_source_at(
+        connection,
+        subject,
+        at_index,
+        member.as_ref().map(|member| member.host.as_str()),
+    )?;
+    let harness = current_harness_at(connection, subject, at_index)?;
+    let claims = claim_ids_at(connection, subject, at_index)?;
+    let conflicts = desired_conflicts_at(
+        connection,
+        subject,
+        desired.as_ref().map(|row| row.claim_id.as_str()),
+        at_index,
+    )?;
+    let kind = desired.as_ref().map(|row| row.kind.clone());
+    let owner_run = desired.as_ref().and_then(|row| row.owner_run.clone());
+    let owner_generation = desired
+        .as_ref()
+        .and_then(|row| row.owner_generation.clone());
+    if owner_filter.is_some_and(|run| owner_run.as_deref() != Some(run)) {
+        return Ok(None);
+    }
+    let status = actual
+        .as_ref()
+        .and_then(|value| value.get("status"))
+        .and_then(Value::as_str);
+    let unknown_claim = has_unknown_claim_at(connection, subject, at_index)?;
+    let reachability = if unknown_claim.is_some() || actual_origin_conflict {
+        "indeterminate".to_owned()
+    } else {
+        actual
+            .as_ref()
+            .and_then(|value| value.get("reachability"))
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| {
+                if actual.is_some() {
+                    "reachable"
+                } else if desired.is_some() {
+                    "indeterminate"
+                } else {
+                    // Nothing declares or observes this subject, so nothing says it
+                    // can be reached.
+                    "unknown"
+                }
+            })
+            .to_owned()
+    };
+    let gap = match (kind.as_deref(), member.as_ref(), status) {
+        (Some("stop"), _, Some("stopped" | "absent" | "exited")) => None,
+        (Some("stop"), _, _) => Some("the desired state is stopped".to_owned()),
+        (_, Some(_), Some("running" | "ready" | "working" | "idle")) => None,
+        (_, Some(member), Some("exited")) if member.restart == crate::model::RestartType::Never => {
+            None
+        }
+        (_, Some(_), Some(value)) => Some(format!("the member is {value}")),
+        (_, Some(_), None) => Some("the desired member has no actual state".to_owned()),
+        _ => None,
+    };
+    let projection = operational_annotation(
+        connection,
+        subject,
+        kind.as_deref(),
+        desired.is_some(),
+        owner_run.as_deref(),
+        owner_generation.as_deref(),
+        actual.as_ref(),
+        at_index,
+    )?;
+    let action = (projection.layer == "current")
+        .then_some(gap.as_ref())
+        .flatten()
+        .map(|reason| PlannedAction {
+            subject: subject.to_owned(),
+            action: if matches!(kind.as_deref(), Some("stop")) {
+                "stop"
+            } else {
+                "reconcile"
+            }
+            .into(),
+            reason: reason.clone(),
+        });
+    let reason = actual_origin_conflict
+        .then(|| "concurrent runtime observations have indeterminate authority".to_owned())
+        .or_else(|| {
+            unknown_claim
+                .map(|kind| format!("claim kind `{kind}` is not registered"))
+                .or_else(|| {
+                    actual
+                        .as_ref()
+                        .and_then(|value| value.get("reason"))
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+        });
+    let desired_value = desired
+        .as_ref()
+        .map(|row| serde_json::from_str(&row.body))
+        .transpose()?;
+    let under = desired_value
+        .as_ref()
+        .map(crate::graph::agent_under)
+        .unwrap_or_default();
+    Ok(Some((
+        SubjectStatus {
+            subject: subject.to_owned(),
+            kind,
+            desired_token: desired.as_ref().map(|row| row.claim_id.clone()),
+            desired_revision: desired.as_ref().map(|row| row.revision.clone()),
+            desired: desired_value,
+            actual,
+            actual_claim,
+            actual_origin,
+            harness,
+            conflicts,
+            claims,
+            owner_run,
+            gap,
+            reachability,
+            reason,
+            under,
+            projection,
+        },
+        action,
+    )))
+}
 
 fn claims_for_subject_query(kind: bool) -> String {
     let kind = if kind { " AND claims.kind=?2" } else { "" };
@@ -689,68 +981,21 @@ impl Drop for WriterGuard<'_> {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ReadClass {
-    Background,
-    Interactive,
-    Operational,
-    Critical,
-}
-
-thread_local! {
-    static READ_CLASS: Cell<ReadClass> = const { Cell::new(ReadClass::Background) };
-}
-
-pub(crate) fn read_class() -> ReadClass {
-    READ_CLASS.with(Cell::get)
-}
-
-pub(crate) fn with_read_class<T>(class: ReadClass, read: impl FnOnce() -> T) -> T {
-    READ_CLASS.with(|flag| {
-        struct Restore<'a>(&'a Cell<ReadClass>, ReadClass);
-        impl Drop for Restore<'_> {
-            fn drop(&mut self) {
-                self.0.set(self.1);
-            }
-        }
-        let _restore = Restore(flag, flag.replace(class));
-        read()
-    })
-}
-
-pub(crate) fn with_interactive_reads<T>(read: impl FnOnce() -> T) -> T {
-    with_read_class(ReadClass::Interactive, read)
-}
-
-struct ReadLane {
-    connections: Mutex<Vec<Connection>>,
-    available: Condvar,
-    /// How many connections `Store::read_snapshot` holds. At least one always stays unpinned,
-    /// so a pinned read that fans out to worker threads can never wait on itself.
-    pinned: Mutex<usize>,
-    unpinned: Condvar,
-}
-
-impl ReadLane {
-    fn new(connections: Vec<Connection>) -> Self {
-        Self {
-            connections: Mutex::new(connections),
-            available: Condvar::new(),
-            pinned: Mutex::new(0),
-            unpinned: Condvar::new(),
-        }
-    }
-}
-
+/// Read connections. A read takes an idle connection, or opens another when every one is busy,
+/// so a read never waits for another read to finish: the pool holds as many connections as reads
+/// ever ran at once, keeps up to `IDLE_READ_CONNECTIONS` of them between reads, and closes them
+/// with the store. Reads see the last committed state and, in WAL mode, never wait for the writer.
 struct ReadPool {
-    background: ReadLane,
-    interactive: ReadLane,
-    operational: ReadLane,
-    critical: ReadLane,
+    idle: Mutex<Vec<Connection>>,
+    /// Wakes a read waiting for an idle connection, which happens only when the operating system
+    /// refuses another one, for example past the open file limit.
+    returned: Condvar,
+    path: PathBuf,
+    shared_memory: bool,
 }
 
 struct ReadGuard<'a> {
-    lane: &'a ReadLane,
+    pool: &'a ReadPool,
     connection: Option<Connection>,
     /// The connection `Store::read_snapshot` pinned for this thread, shared by every read in it.
     pinned: Option<Rc<Connection>>,
@@ -764,22 +1009,13 @@ thread_local! {
 
 /// Ends a pinned read on every exit path, panics included.
 struct PinnedRead<'a> {
-    lane: &'a ReadLane,
+    pool: &'a ReadPool,
     connection: Option<Rc<Connection>>,
 }
 
 impl Drop for PinnedRead<'_> {
     fn drop(&mut self) {
         PINNED_READER.with(|slot| slot.borrow_mut().take());
-        {
-            let mut pinned = self
-                .lane
-                .pinned
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            *pinned -= 1;
-            self.lane.unpinned.notify_one();
-        }
         let Some(connection) = self.connection.take() else {
             return;
         };
@@ -787,39 +1023,23 @@ impl Drop for PinnedRead<'_> {
         // Every guard lent from the pin is gone by now; if one escaped, the pool loses that
         // connection rather than sharing it.
         if let Ok(connection) = Rc::try_unwrap(connection) {
-            let mut connections = self
-                .lane
-                .connections
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            connections.push(connection);
-            self.lane.available.notify_one();
+            self.pool.release(connection);
         }
     }
 }
 
 impl ReadPool {
-    fn new(
-        background: Vec<Connection>,
-        interactive: Vec<Connection>,
-        operational: Vec<Connection>,
-        critical: Vec<Connection>,
-    ) -> Self {
-        Self {
-            background: ReadLane::new(background),
-            interactive: ReadLane::new(interactive),
-            operational: ReadLane::new(operational),
-            critical: ReadLane::new(critical),
-        }
-    }
-
-    fn lane(&self) -> &ReadLane {
-        match read_class() {
-            ReadClass::Background => &self.background,
-            ReadClass::Interactive => &self.interactive,
-            ReadClass::Operational => &self.operational,
-            ReadClass::Critical => &self.critical,
-        }
+    fn new(path: &Path, shared_memory: bool) -> Result<Self> {
+        let pool = Self {
+            idle: Mutex::new(Vec::new()),
+            returned: Condvar::new(),
+            path: path.to_path_buf(),
+            shared_memory,
+        };
+        // Open one now, so a store that cannot be read fails to open.
+        let connection = open_read_connection(&pool.path, pool.shared_memory)?;
+        pool.release(connection);
+        Ok(pool)
     }
 
     fn key(&self) -> usize {
@@ -835,30 +1055,55 @@ impl ReadPool {
         });
         if pinned.is_some() {
             return ReadGuard {
-                lane: self.lane(),
+                pool: self,
                 connection: None,
                 pinned,
             };
         }
-        let lane = self.lane();
         let waiting = crate::profile::enabled().then(std::time::Instant::now);
-        let mut connections = lane
-            .connections
+        let idle = self
+            .idle
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        while connections.is_empty() {
-            connections = lane
-                .available
-                .wait(connections)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        let connection = match idle {
+            Some(connection) => connection,
+            None => match open_read_connection(&self.path, self.shared_memory) {
+                Ok(connection) => {
+                    crate::profile::note("read connection opened");
+                    connection
+                }
+                Err(error) => {
+                    eprintln!("st3: open another read connection: {error:#}; waiting for one");
+                    let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+                    loop {
+                        if let Some(connection) = idle.pop() {
+                            break connection;
+                        }
+                        idle = self
+                            .returned
+                            .wait(idle)
+                            .unwrap_or_else(PoisonError::into_inner);
+                    }
+                }
+            },
+        };
         if let Some(waiting) = waiting {
             crate::profile::read_waited(waiting.elapsed());
         }
         ReadGuard {
-            lane,
-            connection: connections.pop(),
+            pool: self,
+            connection: Some(connection),
             pinned: None,
+        }
+    }
+
+    /// Keep `connection` for the next read, or close it when enough are idle already.
+    fn release(&self, connection: Connection) {
+        let mut idle = self.idle.lock().unwrap_or_else(PoisonError::into_inner);
+        if idle.len() < IDLE_READ_CONNECTIONS {
+            idle.push(connection);
+            self.returned.notify_one();
         }
     }
 }
@@ -877,16 +1122,9 @@ impl Deref for ReadGuard<'_> {
 impl Drop for ReadGuard<'_> {
     fn drop(&mut self) {
         // A pinned connection goes back when its snapshot ends, not here.
-        let Some(connection) = self.connection.take() else {
-            return;
-        };
-        let mut connections = self
-            .lane
-            .connections
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        connections.push(connection);
-        self.lane.available.notify_one();
+        if let Some(connection) = self.connection.take() {
+            self.pool.release(connection);
+        }
     }
 }
 
@@ -911,17 +1149,26 @@ pub struct MissionRunStateMoment {
     pub outcome: Option<MissionRunOutcomeView>,
 }
 
+/// A kept agent status: the snapshot it answers, the agent projection index it was reduced at,
+/// whether it includes history, and the status.
+type AgentStatusEntry = (u64, u64, bool, Arc<StatusResponse>);
+
 pub struct Store {
     connection: WriterConnection,
     readers: ReadPool,
     committed_index: Arc<AtomicU64>,
     actual_cache: Mutex<HashMap<String, (u64, Option<Value>)>>,
+    /// Per-subject status reductions and current-view answers, until their claims change.
+    subject_cache: Mutex<SubjectCache>,
     message_cache: Mutex<HashMap<String, MessageCacheEntry>>,
-    agent_status_cache: Mutex<VecDeque<(u64, u64, Arc<StatusResponse>)>>,
+    agent_status_cache: Mutex<VecDeque<AgentStatusEntry>>,
     agent_resources_cache: Mutex<VecDeque<(u64, u64, bool, Arc<Vec<Value>>)>>,
     seeded_batch_rowid: AtomicI64,
     replica_generation: AtomicU64,
     replication_snapshot: Mutex<Option<Arc<ReplicationSnapshot>>>,
+    /// Held while one thread builds the next replication snapshot, so concurrent callers reuse
+    /// it instead of building their own.
+    replication_snapshot_build: Mutex<()>,
     replication_sync: Mutex<BTreeMap<String, PeerSyncProgress>>,
     replication_timers: ReplicationTimers,
     /// Admitted replicated claims wait for a projection a catching-up node deferred.
@@ -993,13 +1240,12 @@ struct MessageCacheEntry {
 
 #[cfg(test)]
 impl Store {
+    /// Hold more read connections than the pool keeps idle, as a burst of long reads does.
     pub(crate) fn hold_read_connections_for_test(&self, hold: impl FnOnce()) {
-        let _guards: Vec<_> = (0..READ_CONNECTIONS).map(|_| self.readers.get()).collect();
+        let _guards: Vec<_> = (0..IDLE_READ_CONNECTIONS + 4)
+            .map(|_| self.readers.get())
+            .collect();
         hold();
-    }
-
-    pub(crate) fn hold_interactive_read_connections_for_test(&self, hold: impl FnOnce()) {
-        with_interactive_reads(|| self.hold_read_connections_for_test(hold));
     }
 
     pub(crate) fn hold_writer_for_test(&self, hold: impl FnOnce()) {
@@ -1941,26 +2187,23 @@ fn authoring_pull_request_runs_tx(
     Ok(runs)
 }
 
-fn open_read_connections(path: &Path, shared_memory: bool) -> Result<Vec<Connection>> {
+fn open_read_connection(path: &Path, shared_memory: bool) -> Result<Connection> {
     let flags = if shared_memory {
         OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_URI
     } else {
         OpenFlags::SQLITE_OPEN_READ_ONLY
     };
-    (0..READ_CONNECTIONS)
-        .map(|_| {
-            let mut connection = Connection::open_with_flags(path, flags)
-                .with_context(|| format!("open st read connection {}", path.display()))?;
-            connection.profile(Some(record_sqlite_time));
-            connection.execute_batch(
-                "PRAGMA busy_timeout = 5000;
-                 PRAGMA foreign_keys = ON;
-                 PRAGMA cache_size = -8192;
-                 PRAGMA query_only = ON;",
-            )?;
-            Ok(connection)
-        })
-        .collect()
+    let mut connection = Connection::open_with_flags(path, flags)
+        .with_context(|| format!("open st read connection {}", path.display()))?;
+    connection.profile(Some(record_sqlite_time));
+    connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
+    connection.execute_batch(
+        "PRAGMA busy_timeout = 5000;
+         PRAGMA foreign_keys = ON;
+         PRAGMA cache_size = -8192;
+         PRAGMA query_only = ON;",
+    )?;
+    Ok(connection)
 }
 
 fn claims_page_query(subject: bool, descending: bool) -> String {
@@ -1982,6 +2225,7 @@ impl Store {
         let mut connection = Connection::open(path)
             .with_context(|| format!("open st database {}", path.display()))?;
         connection.profile(Some(record_sqlite_time));
+        connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         // Keep the hot graph and replication index pages in SQLite's bounded
         // page cache. The default (~2 MiB per connection) churns against the
         // large durable claim store during otherwise quiet replication.
@@ -2000,23 +2244,20 @@ impl Store {
         }
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
-        let readers = ReadPool::new(
-            open_read_connections(path, false)?,
-            open_read_connections(path, false)?,
-            open_read_connections(path, false)?,
-            open_read_connections(path, false)?,
-        );
+        let readers = ReadPool::new(path, false)?;
         Ok(Self {
             connection: WriterConnection::new(connection, committed_index.clone()),
             readers,
             committed_index,
             actual_cache: Mutex::new(HashMap::new()),
+            subject_cache: Mutex::default(),
             message_cache: Mutex::new(HashMap::new()),
             agent_status_cache: Mutex::new(VecDeque::new()),
             agent_resources_cache: Mutex::new(VecDeque::new()),
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
+            replication_snapshot_build: Mutex::new(()),
             replication_sync: Mutex::new(BTreeMap::new()),
             replication_timers: ReplicationTimers::default(),
             replication_projection_deferred: AtomicBool::new(false),
@@ -2044,6 +2285,7 @@ impl Store {
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
         connection.profile(Some(record_sqlite_time));
+        connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
@@ -2058,23 +2300,20 @@ impl Store {
         }
         let seeded_batch_rowid = max_batch_rowid(&connection)?;
         let committed_index = Arc::new(AtomicU64::new(current_index(&connection)?));
-        let readers = ReadPool::new(
-            open_read_connections(&uri, true)?,
-            open_read_connections(&uri, true)?,
-            open_read_connections(&uri, true)?,
-            open_read_connections(&uri, true)?,
-        );
+        let readers = ReadPool::new(&uri, true)?;
         Ok(Self {
             connection: WriterConnection::new(connection, committed_index.clone()),
             readers,
             committed_index,
             actual_cache: Mutex::new(HashMap::new()),
+            subject_cache: Mutex::default(),
             message_cache: Mutex::new(HashMap::new()),
             agent_status_cache: Mutex::new(VecDeque::new()),
             agent_resources_cache: Mutex::new(VecDeque::new()),
             seeded_batch_rowid: AtomicI64::new(seeded_batch_rowid),
             replica_generation: AtomicU64::new(0),
             replication_snapshot: Mutex::new(None),
+            replication_snapshot_build: Mutex::new(()),
             replication_sync: Mutex::new(BTreeMap::new()),
             replication_timers: ReplicationTimers::default(),
             replication_projection_deferred: AtomicBool::new(false),
@@ -2106,26 +2345,11 @@ impl Store {
             let index = current_index(&self.readers.get())?;
             return read(index);
         }
-        let lane = self.readers.lane();
-        {
-            let waiting = crate::profile::enabled().then(std::time::Instant::now);
-            let mut pinned = lane.pinned.lock().unwrap_or_else(PoisonError::into_inner);
-            while *pinned + 1 >= READ_CONNECTIONS {
-                pinned = lane
-                    .unpinned
-                    .wait(pinned)
-                    .unwrap_or_else(PoisonError::into_inner);
-            }
-            *pinned += 1;
-            if let Some(waiting) = waiting {
-                crate::profile::read_waited(waiting.elapsed());
-            }
-        }
         let mut guard = self.readers.get();
         // Declared first so it drops last: on every exit it ends the transaction, releases the
         // pin, and returns the connection to the pool.
         let pinned = PinnedRead {
-            lane,
+            pool: &self.readers,
             connection: Some(Rc::new(
                 guard
                     .connection
@@ -8642,25 +8866,25 @@ impl Store {
         // Agent listings are expensive on large graphs. Hold this lock while building the
         // snapshot so concurrent callers share one reduction, then serve clones at the same
         // store index. A later index always rebuilds, preserving snapshot semantics.
-        if prefix == "agent/" && include_history {
+        if prefix == "agent/" {
             let current = self.index()?;
             let index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
             let mut cache = self
                 .agent_status_cache
                 .lock()
                 .expect("agent status cache poisoned");
-            if let Some((_, _, status)) = cache
-                .iter()
-                .find(|(cached_index, _, _)| *cached_index == index)
-            {
+            if let Some((_, _, _, status)) = cache.iter().find(|(cached_index, _, history, _)| {
+                *cached_index == index && *history == include_history
+            }) {
                 let mut result = (**status).clone();
                 result.store_index = index;
                 return Ok(result);
             }
             let projection_index = self.agent_status_index(index)?;
-            if let Some((cached_index, _, status)) = cache
-                .iter_mut()
-                .find(|(_, cached_projection, _)| *cached_projection == projection_index)
+            if let Some((cached_index, _, _, status)) =
+                cache.iter_mut().find(|(_, cached_projection, history, _)| {
+                    *cached_projection == projection_index && *history == include_history
+                })
             {
                 *cached_index = index;
                 let mut result = (**status).clone();
@@ -8669,7 +8893,12 @@ impl Store {
             }
             let status =
                 self.status_for_subject_prefix_uncached(prefix, Some(index), include_history)?;
-            cache.push_back((index, projection_index, Arc::new(status.clone())));
+            cache.push_back((
+                index,
+                projection_index,
+                include_history,
+                Arc::new(status.clone()),
+            ));
             if cache.len() > 8 {
                 cache.pop_front();
             }
@@ -8722,12 +8951,182 @@ impl Store {
         self.status_for_subject_names_at(subjects, store_index, include_history)
     }
 
+    /// Of `subjects`, those a current view can show at `store_index`. A runtime that nothing
+    /// declares is current only while its folded status is live; the rest is history, and its
+    /// reduction reads every claim it has. Each runtime's answer is kept until a claim about it
+    /// arrives, so a view costs what it shows and what changed, not every runtime the store has
+    /// ever held.
+    /// Apply the claims that arrived through `store_index` to the subject cache, and say whether
+    /// answers read at `store_index` may be kept: only those at the newest applied snapshot are
+    /// known to hold afterwards.
+    fn advance_subject_cache(&self, connection: &Connection, store_index: u64) -> Result<bool> {
+        let mut cache = self
+            .subject_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if store_index > cache.through {
+            let conflicts = connection
+                .prepare_cached("SELECT COUNT(*) FROM operations WHERE state='conflict'")?
+                .query_row([], |row| row.get::<_, u64>(0))?;
+            if conflicts != cache.conflicts {
+                cache.views.clear();
+                cache.statuses.clear();
+                cache.conflicts = conflicts;
+            } else if !cache.views.is_empty() || !cache.statuses.is_empty() {
+                // The subjects and actors of the claims that arrived.
+                let mut statement = connection.prepare_cached(
+                    "SELECT subject, actor FROM claims WHERE store_index>?1 AND store_index<=?2",
+                )?;
+                let mut changed = HashSet::new();
+                for row in statement.query_map(params![cache.through, store_index], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                })? {
+                    let (subject, actor) = row?;
+                    changed.insert(subject);
+                    changed.extend(actor);
+                }
+                drop(statement);
+                let stale = |subject: &String, owners: &[String]| {
+                    changed.contains(subject) || owners.iter().any(|owner| changed.contains(owner))
+                };
+                cache
+                    .views
+                    .retain(|subject, entry| !stale(subject, &entry.owners));
+                cache
+                    .statuses
+                    .retain(|subject, entry| !stale(subject, &entry.owners));
+            }
+            cache.through = store_index;
+        }
+        Ok(store_index == cache.through)
+    }
+
+    /// `subject`'s status at `store_index`, reduced again only when a claim it depends on
+    /// arrived since it was last reduced. `newest` says whether to keep a new reduction.
+    fn cached_subject_status(
+        &self,
+        connection: &Connection,
+        subject: &str,
+        store_index: u64,
+        newest: bool,
+    ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
+        {
+            let cache = self
+                .subject_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(entry) = cache
+                .statuses
+                .get(subject)
+                .filter(|entry| entry.read_at <= store_index && store_index <= cache.through)
+            {
+                return Ok((entry.status.clone(), entry.action.clone()));
+            }
+        }
+        let (status, action) = subject_status_at(connection, subject, Some(store_index), None)?
+            .expect("a reduction without an owner filter always has a status");
+        if newest {
+            let mut cache = self
+                .subject_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            // Keep it only if no later snapshot was applied meanwhile.
+            if cache.through == store_index {
+                let owners = status
+                    .owner_run
+                    .iter()
+                    .chain(status.projection.owner_generation.iter())
+                    .cloned()
+                    .collect();
+                cache.statuses.insert(
+                    subject.to_owned(),
+                    StatusEntry {
+                        read_at: store_index,
+                        owners,
+                        status: status.clone(),
+                        action: action.clone(),
+                    },
+                );
+            }
+        }
+        Ok((status, action))
+    }
+
+    /// Of `subjects`, those a current view can show at `store_index`. A runtime that nothing
+    /// declares is current only while its folded status is live, and one whose owning run or
+    /// generation ended is history; the rest of history's reduction reads every claim it has.
+    /// Each runtime's answer is kept until a claim it depends on arrives, so a view costs what
+    /// it shows and what changed, not every runtime the store has ever held. `owners` says
+    /// whether the reduction reads owners at the snapshot, as the answers here do.
+    fn current_view_candidates(
+        &self,
+        connection: &Connection,
+        subjects: BTreeSet<String>,
+        store_index: u64,
+        owners: bool,
+    ) -> Result<BTreeSet<String>> {
+        let newest = self.advance_subject_cache(connection, store_index)?;
+        let mut candidates = BTreeSet::new();
+        for subject in subjects {
+            if !runtime_subject(&subject) {
+                candidates.insert(subject);
+                continue;
+            }
+            // Without the owner checks, only an answer that used no declaration applies.
+            let known = self
+                .subject_cache
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .views
+                .get(&subject)
+                .filter(|entry| entry.head <= store_index && (owners || !entry.declared))
+                .map(|entry| entry.history);
+            let history = match known {
+                Some(history) => history,
+                None => {
+                    let entry = runtime_view_entry(connection, &subject, store_index, owners)?;
+                    let history = entry.history;
+                    if newest && owners {
+                        let mut cache = self
+                            .subject_cache
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner);
+                        if cache.through == store_index {
+                            cache.views.insert(subject.clone(), entry);
+                        }
+                    }
+                    history
+                }
+            };
+            if !history {
+                candidates.insert(subject);
+            }
+        }
+        Ok(candidates)
+    }
+
+    /// Forget every kept reduction, after claims were deleted, repaired or replayed into the
+    /// graph without arriving anew.
+    pub(crate) fn forget_current_views(&self) {
+        let mut cache = self
+            .subject_cache
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        cache.views.clear();
+        cache.statuses.clear();
+    }
+
     fn status_for_subject_names_at(
         &self,
         subjects: BTreeSet<String>,
         store_index: u64,
         include_history: bool,
     ) -> Result<StatusResponse> {
+        let subjects = if include_history {
+            subjects
+        } else {
+            self.current_view_candidates(&self.readers.get(), subjects, store_index, true)?
+        };
         if subjects.len() <= 64 {
             return self.status_at_view_for_names(
                 None,
@@ -8737,11 +9136,10 @@ impl Store {
                 Some(subjects),
             );
         }
-        // The read pool has four connections. Divide a large bounded projection across them;
-        // each worker holds one snapshot connection for its slice, then merge in subject order.
+        // Divide a large bounded projection across a few threads, each reading its slice on its
+        // own connection at the same store index, then merge in subject order.
         let subjects = subjects.into_iter().collect::<Vec<_>>();
-        let chunk_size = subjects.len().div_ceil(READ_CONNECTIONS);
-        let read_class = read_class();
+        let chunk_size = subjects.len().div_ceil(STATUS_WORKERS);
         let profile = crate::profile::current();
         let parts = std::thread::scope(|scope| {
             subjects
@@ -8751,15 +9149,13 @@ impl Store {
                     let profile = profile.clone();
                     scope.spawn(move || {
                         let _entered = crate::profile::enter(profile.as_ref());
-                        with_read_class(read_class, || {
-                            self.status_at_view_for_names(
-                                None,
-                                None,
-                                Some(store_index),
-                                include_history,
-                                Some(names),
-                            )
-                        })
+                        self.status_at_view_for_names(
+                            None,
+                            None,
+                            Some(store_index),
+                            include_history,
+                            Some(names),
+                        )
                     })
                 })
                 .collect::<Vec<_>>()
@@ -8817,142 +9213,42 @@ impl Store {
             )?;
             let rows = statement.query_map([store_index], |row| row.get::<_, String>(0))?;
             subject_names.extend(rows.collect::<Result<Vec<_>, _>>()?);
+            drop(statement);
+            if !include_history {
+                // Without a snapshot the reduction reads owners from the run tables, so only
+                // what a runtime's own claims decide leaves it out.
+                subject_names = self.current_view_candidates(
+                    &connection,
+                    subject_names,
+                    store_index,
+                    at_index.is_some(),
+                )?;
+            }
         }
+        // A snapshot reduction is kept per subject until a claim it depends on arrives.
+        let newest = match at_index {
+            Some(_) if selected_owner_run.is_none() => {
+                Some(self.advance_subject_cache(&connection, store_index)?)
+            }
+            _ => None,
+        };
         let mut subjects = Vec::new();
         let mut pending_actions = Vec::new();
         for subject in subject_names {
-            let desired = desired_row_at(&connection, &subject, at_index)?;
-            let member = desired
-                .as_ref()
-                .and_then(|row| row.member.as_deref())
-                .and_then(|value| serde_json::from_str::<crate::model::MemberSpec>(value).ok());
-            let actual = latest_actual_at(&connection, &subject, at_index)?;
-            let (actual_claim, actual_origin, actual_origin_conflict) = selected_actual_source_at(
-                &connection,
-                &subject,
-                at_index,
-                member.as_ref().map(|member| member.host.as_str()),
-            )?;
-            let harness = current_harness_at(&connection, &subject, at_index)?;
-            let claims = claim_ids_at(&connection, &subject, at_index)?;
-            let conflicts = desired_conflicts_at(
-                &connection,
-                &subject,
-                desired.as_ref().map(|row| row.claim_id.as_str()),
-                at_index,
-            )?;
-            let kind = desired.as_ref().map(|row| row.kind.clone());
-            let owner_run = desired.as_ref().and_then(|row| row.owner_run.clone());
-            let owner_generation = desired
-                .as_ref()
-                .and_then(|row| row.owner_generation.clone());
-            if selected_owner_run.is_some_and(|run| owner_run.as_deref() != Some(run)) {
-                continue;
-            }
-            let status = actual
-                .as_ref()
-                .and_then(|value| value.get("status"))
-                .and_then(Value::as_str);
-            let unknown_claim = has_unknown_claim_at(&connection, &subject, at_index)?;
-            let reachability = if unknown_claim.is_some() || actual_origin_conflict {
-                "indeterminate".to_owned()
-            } else {
-                actual
-                    .as_ref()
-                    .and_then(|value| value.get("reachability"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_else(|| {
-                        if actual.is_some() {
-                            "reachable"
-                        } else if desired.is_some() {
-                            "indeterminate"
-                        } else {
-                            // Nothing declares or observes this subject, so nothing says it
-                            // can be reached.
-                            "unknown"
-                        }
-                    })
-                    .to_owned()
-            };
-            let gap = match (kind.as_deref(), member.as_ref(), status) {
-                (Some("stop"), _, Some("stopped" | "absent" | "exited")) => None,
-                (Some("stop"), _, _) => Some("the desired state is stopped".to_owned()),
-                (_, Some(_), Some("running" | "ready" | "working" | "idle")) => None,
-                (_, Some(member), Some("exited"))
-                    if member.restart == crate::model::RestartType::Never =>
-                {
-                    None
+            let reduced = match newest {
+                Some(newest) => {
+                    Some(self.cached_subject_status(&connection, &subject, store_index, newest)?)
                 }
-                (_, Some(_), Some(value)) => Some(format!("the member is {value}")),
-                (_, Some(_), None) => Some("the desired member has no actual state".to_owned()),
-                _ => None,
+                None => subject_status_at(&connection, &subject, at_index, selected_owner_run)?,
             };
-            let projection = operational_annotation(
-                &connection,
-                &subject,
-                kind.as_deref(),
-                desired.is_some(),
-                owner_run.as_deref(),
-                owner_generation.as_deref(),
-                actual.as_ref(),
-                at_index,
-            )?;
-            let operational = projection.layer == "current";
-            if selected.is_none() && !include_history && !operational {
+            let Some((status, action)) = reduced else {
+                continue;
+            };
+            if selected.is_none() && !include_history && status.projection.layer != "current" {
                 continue;
             }
-            if operational && let Some(reason) = &gap {
-                pending_actions.push(PlannedAction {
-                    subject: subject.clone(),
-                    action: if matches!(kind.as_deref(), Some("stop")) {
-                        "stop"
-                    } else {
-                        "reconcile"
-                    }
-                    .into(),
-                    reason: reason.clone(),
-                });
-            }
-            let reason = actual_origin_conflict
-                .then(|| "concurrent runtime observations have indeterminate authority".to_owned())
-                .or_else(|| {
-                    unknown_claim
-                        .map(|kind| format!("claim kind `{kind}` is not registered"))
-                        .or_else(|| {
-                            actual
-                                .as_ref()
-                                .and_then(|value| value.get("reason"))
-                                .and_then(Value::as_str)
-                                .map(str::to_owned)
-                        })
-                });
-            let desired_value = desired
-                .as_ref()
-                .map(|row| serde_json::from_str(&row.body))
-                .transpose()?;
-            let under = desired_value
-                .as_ref()
-                .map(crate::graph::agent_under)
-                .unwrap_or_default();
-            subjects.push(SubjectStatus {
-                subject,
-                kind,
-                desired_token: desired.as_ref().map(|row| row.claim_id.clone()),
-                desired_revision: desired.as_ref().map(|row| row.revision.clone()),
-                desired: desired_value,
-                actual,
-                actual_claim,
-                actual_origin,
-                harness,
-                conflicts,
-                claims,
-                owner_run,
-                gap,
-                reachability,
-                reason,
-                under,
-                projection,
-            });
+            pending_actions.extend(action);
+            subjects.push(status);
         }
         Ok(StatusResponse {
             store_index,
@@ -12417,28 +12713,20 @@ impl Store {
         Ok(self.replication_snapshot()?.inventory.public())
     }
 
+    /// The replication snapshot with every local batch sealed into a signed envelope first. The
+    /// exchange paths use it; they must offer peers everything this node wrote.
     fn replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
-        let store_index = self.index()?;
-        let replica_generation = self.replica_generation.load(Ordering::Acquire);
-        // The store index never moves back, so deleting the newest claim leaves it unchanged,
-        // and a projection or a replay writes no claims at all. The graph generation moves with
-        // every change to a digested table.
-        let current_graph_generation = graph_generation(&self.readers.get())?;
-        if let Some(snapshot) = self
-            .replication_snapshot
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .as_ref()
-            .filter(|snapshot| {
-                snapshot.store_index == store_index
-                    && snapshot.replica_generation == replica_generation
-                    && snapshot.graph_generation == current_graph_generation
-            })
-            .cloned()
-        {
-            return Ok(snapshot);
-        }
+        self.seal_local_batches()?;
+        self.sealed_replication_snapshot()
+    }
 
+    /// Seal this node's batches that have no envelope yet, and sign them. Only this takes the
+    /// writer, and only when there are such batches.
+    fn seal_local_batches(&self) -> Result<()> {
+        if max_batch_rowid(&self.readers.get())? <= self.seeded_batch_rowid.load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
         let mut connection = self.connection.write();
         let _timing = time_stage(&self.replication_timers.snapshot);
         let seeded_through = self.seeded_batch_rowid.load(Ordering::Acquire);
@@ -12452,6 +12740,57 @@ impl Store {
             self.seeded_batch_rowid
                 .store(latest_batch, Ordering::Release);
         }
+        Ok(())
+    }
+
+    /// The replication snapshot of the envelopes already sealed, built on a read connection. A
+    /// read such as `st replication status` uses it and never waits for the writer; a batch
+    /// written since the last exchange shows once the next exchange seals it.
+    fn sealed_replication_snapshot(&self) -> Result<Arc<ReplicationSnapshot>> {
+        let current = |store: &Self| -> Result<Option<Arc<ReplicationSnapshot>>> {
+            let store_index = store.index()?;
+            let replica_generation = store.replica_generation.load(Ordering::Acquire);
+            // The store index never moves back, so deleting the newest claim leaves it
+            // unchanged, and a projection or a replay writes no claims at all. The graph
+            // generation moves with every change to a digested table, and sealing a batch adds
+            // an envelope row.
+            let reader = store.readers.get();
+            let current_graph_generation = graph_generation(&reader)?;
+            let envelope_rowid = max_envelope_rowid(&reader)?;
+            Ok(store
+                .replication_snapshot
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .filter(|snapshot| {
+                    snapshot.store_index == store_index
+                        && snapshot.replica_generation == replica_generation
+                        && snapshot.graph_generation == current_graph_generation
+                        && snapshot.max_envelope_rowid == envelope_rowid
+                })
+                .cloned())
+        };
+        if let Some(snapshot) = current(self)? {
+            return Ok(snapshot);
+        }
+        let _building = self
+            .replication_snapshot_build
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if let Some(snapshot) = current(self)? {
+            return Ok(snapshot);
+        }
+        let _timing = time_stage(&self.replication_timers.snapshot);
+        self.read_snapshot(|_| {
+            let connection = self.readers.get();
+            self.build_replication_snapshot(&connection)
+        })
+    }
+
+    fn build_replication_snapshot(
+        &self,
+        connection: &Connection,
+    ) -> Result<Arc<ReplicationSnapshot>> {
         let previous = self
             .replication_snapshot
             .lock()
@@ -12459,7 +12798,7 @@ impl Store {
             .take();
         // Harness observations, timelines, usage and lease renewals change none of the digested
         // tables, so their writes leave the generation, and the graph digest, unchanged.
-        let graph_generation = graph_generation(&connection)?;
+        let graph_generation = graph_generation(connection)?;
         let reusable_graph_digest = previous
             .as_ref()
             .filter(|previous| previous.graph_generation == graph_generation)
@@ -12550,10 +12889,10 @@ impl Store {
                         .unwrap_or(buckets.len());
                     (inventory, max_rowid, buckets, digest_prefixes, resume_from)
                 } else {
-                    full(&connection)?
+                    full(connection)?
                 }
             } else {
-                full(&connection)?
+                full(connection)?
             };
         inventory.resume_digest(&buckets, &mut digest_prefixes, resume_from);
         // Envelope hashes already commit the complete payload (and chain metadata). The
@@ -12562,10 +12901,10 @@ impl Store {
         let authority_digest = inventory.digest.clone();
         let graph_digest = match reusable_graph_digest {
             Some(digest) => digest,
-            None => graph_digest(&connection)?,
+            None => graph_digest(connection)?,
         };
         let snapshot = Arc::new(ReplicationSnapshot {
-            store_index: current_index(&connection)?,
+            store_index: current_index(connection)?,
             replica_generation: self.replica_generation.load(Ordering::Acquire),
             max_envelope_rowid,
             envelope_rows: envelope_count,
@@ -13197,6 +13536,8 @@ impl Store {
             params![current_index_tx(&transaction)?, now_ms().to_string()],
         )?;
         transaction.commit()?;
+        drop(connection);
+        self.forget_current_views();
         Ok(())
     }
 
@@ -13208,7 +13549,7 @@ impl Store {
         self.last_replication_projection_unix_ms
             .store(now_ms() as u64, Ordering::Release);
         let transaction = connection.transaction()?;
-        let result = (|| -> Result<(), St3Error> {
+        let result = (|| -> Result<bool, St3Error> {
             // An incremental projection that fails is rolled back and replaced by a full replay,
             // which quarantines the claim it cannot project instead of failing the graph.
             transaction
@@ -13243,10 +13584,10 @@ impl Store {
                 crate::profile::note("projection: incremental");
             }
             reapply_local_work_lease_renewals_tx(&transaction)?;
-            Ok(())
+            Ok(!projected)
         })();
         match result {
-            Ok(()) => {
+            Ok(replayed) => {
                 transaction.execute(
                     "INSERT INTO projection_health(aggregate, status, last_good_store_index, updated_at_unix_ms)
                      VALUES ('graph', 'healthy', ?1, ?2)
@@ -13255,6 +13596,10 @@ impl Store {
                     params![current_index_tx(&transaction)?, now_ms().to_string()],
                 )?;
                 transaction.commit()?;
+                drop(connection);
+                if replayed {
+                    self.forget_current_views();
+                }
                 Ok(true)
             }
             Err(error) => {
@@ -13381,6 +13726,10 @@ impl Store {
             }
         }
         transaction.commit()?;
+        drop(connection);
+        if changed != 0 {
+            self.forget_current_views();
+        }
         Ok(changed)
     }
 
@@ -13728,7 +14077,19 @@ impl Store {
         fleet_id: Option<&str>,
         configured_peers: &[String],
     ) -> Result<ReplicationStatus> {
-        let snapshot = self.replication_snapshot()?;
+        self.seal_local_batches()?;
+        self.replication_status_sealed(configured, fleet_id, configured_peers)
+    }
+
+    /// Replication status from what is committed and sealed, without taking the writer: the
+    /// status a person reads. A batch written since the last exchange counts once it is sealed.
+    pub fn replication_status_sealed(
+        &self,
+        configured: bool,
+        fleet_id: Option<&str>,
+        configured_peers: &[String],
+    ) -> Result<ReplicationStatus> {
+        let snapshot = self.sealed_replication_snapshot()?;
         let connection = self.readers.get();
         let count = |state: &str| -> Result<u64> {
             Ok(connection.query_row(
@@ -15714,7 +16075,7 @@ fn desired_row_at(
     let Some(at_index) = at_index else {
         return current_desired_row(connection, subject);
     };
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT id, body, predecessors FROM claims
          WHERE subject=?1 AND kind='intent.desired' AND store_index<=?2
            AND NOT EXISTS (
@@ -17350,20 +17711,29 @@ fn has_unknown_claim_at(
         }
     }
     let through = at_index.unwrap_or(i64::MAX as u64);
-    let conflict = connection
-        .query_row(
-            "SELECT operations.id FROM claims JOIN operations
-             ON operations.id=json_extract(claims.body, '$._operation.id')
-             WHERE claims.subject=?1 AND claims.store_index<=?2 AND operations.state='conflict'
-             ORDER BY operations.id LIMIT 1",
-            params![subject, through],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
+    // Operations almost never conflict. Look for one of this subject's only when some does,
+    // since the lookup reads every claim of the subject.
+    let any_conflict = connection
+        .prepare_cached("SELECT EXISTS(SELECT 1 FROM operations WHERE state='conflict')")?
+        .query_row([], |row| row.get::<_, bool>(0))?;
+    let conflict = if any_conflict {
+        connection
+            .query_row(
+                "SELECT operations.id FROM claims JOIN operations
+                 ON operations.id=json_extract(claims.body, '$._operation.id')
+                 WHERE claims.subject=?1 AND claims.store_index<=?2 AND operations.state='conflict'
+                 ORDER BY operations.id LIMIT 1",
+                params![subject, through],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+    } else {
+        None
+    };
     if let Some(operation) = conflict {
         return Ok(Some(format!("idempotency-conflict:{operation}")));
     }
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT DISTINCT kind FROM claims WHERE subject=?1 AND store_index<=?2 ORDER BY kind",
     )?;
     let kinds = statement
@@ -17753,7 +18123,7 @@ fn selected_actual_source_at(
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     // Canonical order, not arrival order, so every node holding these claims selects the same
     // source.
-    let mut statement = connection.prepare(&format!(
+    let mut statement = connection.prepare_cached(&format!(
         "SELECT claims.id, claims.kind, claims.origin, claims.predecessors,
                 CASE WHEN claims.kind='runtime.observed' THEN claims.body END
          FROM claims JOIN batches ON batches.id=claims.batch_id
@@ -18116,7 +18486,7 @@ fn claim_ids_at(
     at_index: Option<u64>,
 ) -> Result<Vec<String>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT id FROM claims WHERE subject=?1 AND store_index<=?2 ORDER BY store_index",
     )?;
     let rows = statement.query_map(params![subject, at_index], |row| row.get(0))?;
@@ -18130,7 +18500,7 @@ fn desired_conflicts_at(
     at_index: Option<u64>,
 ) -> Result<Vec<String>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT id, predecessors FROM claims
          WHERE subject=?1 AND kind='intent.desired' AND store_index<=?2
            AND NOT EXISTS (
@@ -18208,7 +18578,7 @@ fn intent_leaves_at(
     at_index: Option<u64>,
 ) -> Result<Vec<String>> {
     let through = at_index.unwrap_or(i64::MAX as u64);
-    let mut statement = connection.prepare(
+    let mut statement = connection.prepare_cached(
         "SELECT id, predecessors FROM claims
          WHERE subject=?1 AND kind='intent.desired' AND store_index<=?2
            AND NOT EXISTS (
@@ -20303,10 +20673,7 @@ fn operational_annotation(
         .and_then(|value| value.get("incarnation_id"))
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let runtime_subject = subject.starts_with("agent/")
-        || subject.starts_with("exec/")
-        || subject.starts_with("pty/")
-        || subject.starts_with("gate-operation/");
+    let runtime_subject = runtime_subject(subject);
     let stopped = matches!(status, Some("stopped" | "absent" | "exited"));
     let mut historical = Vec::new();
     if runtime_subject && stopped && (!has_desired || desired_kind == Some("stop")) {
@@ -20813,6 +21180,16 @@ impl Store {
     pub fn fleet_view(&self) -> Result<crate::fleet::FleetView> {
         Ok(crate::fleet::FleetView::from_membership(
             &self.fleet_membership()?,
+        ))
+    }
+
+    /// The fleet as its sealed envelopes show it, without taking the writer, for reads. A local
+    /// membership claim shows once the next exchange seals its batch.
+    pub fn fleet_view_sealed(&self) -> Result<crate::fleet::FleetView> {
+        self.sealed_replication_snapshot()?;
+        let connection = self.readers.get();
+        Ok(crate::fleet::FleetView::from_membership(
+            &fleet_membership_tx(&connection)?,
         ))
     }
 
@@ -22934,6 +23311,7 @@ thread_local! {
     static INVENTORY_IDENTITIES_HASHED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static GRAPH_DIGESTS_COMPUTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static FULL_REPLAYS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SUBJECT_REDUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The projected tables the graph digest commits: digest label, table, digested columns in
@@ -29480,14 +29858,60 @@ mod tests {
     }
 
     #[test]
+    fn a_read_opens_another_connection_rather_than_wait_for_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(&directory.path().join("state.sqlite3"), "node").unwrap());
+        let (ready, readied) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let holder = {
+            let store = store.clone();
+            std::thread::spawn(move || {
+                store.hold_read_connections_for_test(|| {
+                    ready.send(()).unwrap();
+                    released.recv().unwrap();
+                });
+            })
+        };
+        readied.recv().unwrap();
+        // Every connection the pool kept is busy, and more besides. A read and a pinned read
+        // that fans out to worker threads still answer at once.
+        let (done, finished) = std::sync::mpsc::channel();
+        for _ in 0..8 {
+            let (store, done) = (store.clone(), done.clone());
+            std::thread::spawn(move || {
+                let result = store.read_snapshot(|_| {
+                    std::thread::scope(|scope| {
+                        scope
+                            .spawn(|| store.claims_for("resource/busy", None))
+                            .join()
+                            .unwrap()
+                    })
+                });
+                done.send(result.is_ok()).unwrap();
+            });
+        }
+        for _ in 0..8 {
+            assert!(
+                finished
+                    .recv_timeout(std::time::Duration::from_secs(5))
+                    .expect("a read waited for a busy connection")
+            );
+        }
+        release.send(()).unwrap();
+        holder.join().unwrap();
+        // The pool keeps only so many between reads; the rest closed.
+        assert!(store.readers.idle.lock().unwrap().len() <= IDLE_READ_CONNECTIONS);
+    }
+
+    #[test]
     fn pinned_reads_that_fan_out_never_wait_on_each_other() {
         let directory = tempfile::tempdir().unwrap();
         let store = Arc::new(Store::open(&directory.path().join("state.sqlite3"), "node").unwrap());
         // Every pinned read holds its connection while a worker thread, like the agent status
         // reduction's, needs another one from the pool.
         let (done, finished) = std::sync::mpsc::channel();
-        let barrier = Arc::new(std::sync::Barrier::new(READ_CONNECTIONS));
-        for _ in 0..READ_CONNECTIONS {
+        let barrier = Arc::new(std::sync::Barrier::new(STATUS_WORKERS));
+        for _ in 0..STATUS_WORKERS {
             let (store, done, barrier) = (store.clone(), done.clone(), barrier.clone());
             std::thread::spawn(move || {
                 barrier.wait();
@@ -29507,7 +29931,7 @@ mod tests {
                 done.send(result.is_ok()).unwrap();
             });
         }
-        for _ in 0..READ_CONNECTIONS {
+        for _ in 0..STATUS_WORKERS {
             assert!(
                 finished
                     .recv_timeout(std::time::Duration::from_secs(10))
@@ -31539,6 +31963,221 @@ observer "ordered/file" {
             .unwrap();
         assert_eq!(gate.projection.layer, "history");
         assert_eq!(gate.projection.reasons, ["stopped"]);
+    }
+
+    fn observe_runtime(store: &Store, subject: &str, status: &str, incarnation: &str) {
+        store
+            .append_claim(&ClaimInput {
+                subject: subject.into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("status".into(), Value::String(status.into())),
+                    (
+                        "runtime_id".into(),
+                        Value::String(subject.replace('/', ".")),
+                    ),
+                    ("incarnation_id".into(), Value::String(incarnation.into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+    }
+
+    fn current_runtimes(store: &Store) -> (Vec<String>, usize) {
+        SUBJECT_REDUCTIONS.with(|reductions| reductions.set(0));
+        let view = store
+            .status_for_claim_kind_at("runtime.observed", None, false)
+            .unwrap();
+        (
+            view.subjects
+                .into_iter()
+                .map(|status| status.subject)
+                .collect(),
+            SUBJECT_REDUCTIONS.with(std::cell::Cell::get),
+        )
+    }
+
+    #[test]
+    fn current_runtime_views_reduce_what_they_show_not_every_runtime_ever_held() {
+        let store = Store::open_memory("node").unwrap();
+        observe_runtime(&store, "agent/bench/live", "running", "live-1");
+        let retire = |from: usize, to: usize| {
+            for number in from..to {
+                let subject = format!("agent/bench/old-{number:03}");
+                observe_runtime(&store, &subject, "running", "old");
+                observe_runtime(&store, &subject, "stopped", "old");
+            }
+        };
+        retire(0, 40);
+        let live = vec!["agent/bench/live".to_owned()];
+        assert_eq!(current_runtimes(&store), (live.clone(), 1));
+        // Nothing changed, so nothing is reduced again.
+        assert_eq!(current_runtimes(&store), (live.clone(), 0));
+        // Three times the history leaves the work where it was.
+        retire(40, 120);
+        assert_eq!(current_runtimes(&store), (live.clone(), 0));
+        // A claim about the live runtime reduces it again, and only it.
+        observe_runtime(&store, "agent/bench/live", "running", "live-2");
+        assert_eq!(current_runtimes(&store), (live.clone(), 1));
+        // The view is the current layer of the full reduction.
+        let full = store
+            .status_for_claim_kind_at("runtime.observed", None, true)
+            .unwrap();
+        assert_eq!(full.subjects.len(), 121);
+        let current_layer = full
+            .subjects
+            .into_iter()
+            .filter(|status| status.projection.layer == "current")
+            .map(|status| status.subject)
+            .collect::<Vec<_>>();
+        assert_eq!(current_layer, live);
+    }
+
+    #[test]
+    fn kept_statuses_match_a_fresh_reduction_as_claims_arrive() {
+        let store = Store::open_memory("node").unwrap();
+        let mut seed = 0x5eed_u64;
+        let mut next = || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            (seed >> 33) as usize
+        };
+        let statuses = ["running", "stopped", "starting", "exited", "idle"];
+        let states = ["idle", "working", "ready"];
+        for step in 0..240 {
+            let seat = next() % 10;
+            let subject = format!("agent/bench/seat-{seat}");
+            let incarnation = format!("seat-{seat}-{}", next() % 2);
+            if next() % 2 == 0 {
+                observe_runtime(
+                    &store,
+                    &subject,
+                    statuses[next() % statuses.len()],
+                    &incarnation,
+                );
+            } else {
+                store
+                    .append_claim(&ClaimInput {
+                        subject: subject.clone(),
+                        kind: "harness.observed".into(),
+                        actor: Some(subject.clone()),
+                        fields: BTreeMap::from([
+                            (
+                                "state".into(),
+                                Value::String(states[next() % states.len()].into()),
+                            ),
+                            ("incarnation_id".into(), Value::String(incarnation)),
+                            ("driver".into(), Value::String("claude".into())),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: None,
+                    })
+                    .unwrap();
+            }
+            if step % 6 != 5 {
+                continue;
+            }
+            for history in [false, true] {
+                let view = |store: &Store| {
+                    serde_json::to_value(
+                        store
+                            .status_for_claim_kind_at("runtime.observed", None, history)
+                            .unwrap(),
+                    )
+                    .unwrap()
+                };
+                let kept = view(&store);
+                store.forget_current_views();
+                assert_eq!(kept, view(&store), "step {step}, history {history}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_kept_status_follows_work_its_agent_does_on_other_subjects() {
+        let store = Store::open_memory("node").unwrap();
+        let agent = "agent/bench/worker";
+        observe_runtime(&store, agent, "running", "worker-1");
+        store
+            .append_claim(&ClaimInput {
+                subject: agent.into(),
+                kind: "harness.observed".into(),
+                actor: Some(agent.into()),
+                fields: BTreeMap::from([
+                    ("state".into(), Value::String("idle".into())),
+                    ("incarnation_id".into(), Value::String("worker-1".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        let harness_state = |store: &Store| {
+            store
+                .status_for_claim_kind_at("runtime.observed", None, false)
+                .unwrap()
+                .subjects
+                .into_iter()
+                .find(|status| status.subject == agent)
+                .and_then(|status| status.harness)
+                .map(|harness| harness.state)
+        };
+        assert_eq!(harness_state(&store).as_deref(), Some("idle"));
+        // Work the agent reports on a step, a claim about another subject, makes it working.
+        {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            append_claim_tx(
+                &transaction,
+                &store.origin,
+                "step-run/bench/work",
+                "work.progress",
+                Some(agent),
+                &json!({"fields": {
+                    "attempt": 1,
+                    "status": "working",
+                    "worker_reported": true,
+                    "claimant": agent,
+                    "claim_incarnation": "worker-1",
+                    "claim_expires_at_unix_ms": now_ms().saturating_add(60_000),
+                    "readiness_epoch": 1,
+                }}),
+                &[],
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        }
+        assert_eq!(harness_state(&store).as_deref(), Some("working"));
+    }
+
+    #[test]
+    fn the_newest_message_to_a_recipient_is_found_by_index() {
+        let store = Store::open_memory("node").unwrap();
+        let connection = store.readers.get();
+        let plan = connection
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT accepted_at_unix_ms FROM claims
+                 WHERE kind='message.sent' AND json_extract(body, '$.fields.to')=?1
+                   AND store_index<=?2 ORDER BY store_index DESC LIMIT 1",
+            )
+            .unwrap()
+            .query_map(params!["agent/bench/reader", 10], |row| {
+                row.get::<_, String>(3)
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("claims_message_to_order_index")),
+            "{plan:?}"
+        );
     }
 
     #[test]
