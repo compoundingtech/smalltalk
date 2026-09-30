@@ -437,6 +437,8 @@ async fn bench(name: &str, source: &Path, settings: &Settings) -> Run {
         native_session_home: Some(root.join("home")),
         planner_default: st3::model::PlannerSpec::default(),
     };
+    // As the daemon does when it starts.
+    st3::api::start_operation_report(&state);
     let server_socket = socket.clone();
     let server =
         tokio::spawn(

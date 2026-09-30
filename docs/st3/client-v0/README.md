@@ -170,7 +170,9 @@ represented by an event tombstone; an ID is never reused.
 `operations` is the client-safe operational view: daemon health, host reachability, transport
 health, resource observers, and diagnostics. Some diagnostics compare the whole projection with
 the claim log, so pages serve the daemon's last diagnostic report and a read of a report older
-than 30 seconds starts a new one in the background; the first read after a start waits for one.
+than 30 seconds starts a new one in the background. The daemon makes its first report in the
+background as it starts; until that report is made, the collection lists one `running` operation,
+`operation/diagnostic-report`, that says so.
 `history` is a typed audit projection. It does not expose raw claims, replication envelopes, or
 repair internals.
 

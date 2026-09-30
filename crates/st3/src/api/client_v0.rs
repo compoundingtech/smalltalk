@@ -1446,6 +1446,21 @@ fn runtime_resources(
         Some(snapshot.store_index),
         history,
     )?;
+    // Each runtime's declaration and observation time, in one statement apiece for the list.
+    let desired_tokens = state.store.selected_desired_tokens(
+        &status
+            .subjects
+            .iter()
+            .map(|selected| selected.subject.as_str())
+            .collect::<Vec<_>>(),
+    )?;
+    let claim_times = state.store.claim_acceptance_times(
+        &status
+            .subjects
+            .iter()
+            .filter_map(|selected| selected.actual_claim.as_deref())
+            .collect::<Vec<_>>(),
+    )?;
     let mut values = Vec::new();
     for selected in status.subjects {
         let Some(actual) = selected.actual.as_ref() else {
@@ -1485,11 +1500,10 @@ fn runtime_resources(
         }
         let local = authoritative && observed == "running" && actual_origin == state.store.origin();
         let incarnation_id = fields.get("incarnation_id").and_then(Value::as_str);
-        let desired_revision = state.store.selected_desired_token(&owner_id)?;
-        let updated_at = state
-            .store
-            .claim_by_id(actual_claim)?
-            .map(|claim| client_timestamp(claim.accepted_at_unix_ms))
+        let desired_revision = desired_tokens.get(&owner_id).cloned();
+        let updated_at = claim_times
+            .get(actual_claim)
+            .map(|accepted_at| client_timestamp(*accepted_at))
             .unwrap_or_else(|| snapshot.created_at.clone());
         let reasons = selected.reason.into_iter().collect::<Vec<_>>();
         values.push(json!({
@@ -1801,19 +1815,13 @@ fn machine_resources(
         }
     }
 
-    // Machines need only the claimant, subject, and update time. Building full
-    // client work resources also reduces usage history and mission annotations
-    // for every step, which makes this small host list expensive during the
+    // Machines need only the claimant, subject, and update time of the steps a claimant holds.
+    // Building full client work resources also reduces usage history, wake history and mission
+    // annotations for every step, which makes this small host list expensive during the
     // startup burst when many seats connect at once.
-    let work = if history {
-        state
-            .store
-            .client_work_history_at_snapshot(None, client_snapshot_time(snapshot))?
-    } else {
-        state
-            .store
-            .client_work_at_snapshot(None, false, client_snapshot_time(snapshot))?
-    };
+    let work = state
+        .store
+        .client_work_claims_at_snapshot(history, client_snapshot_time(snapshot))?;
     let mut host_work = BTreeMap::<String, BTreeSet<String>>::new();
     for item in work {
         let Some(claimant) = item.claimant.as_deref() else {
@@ -2067,7 +2075,8 @@ const OPERATION_REPORT_REFRESH: Duration = Duration::from_secs(30);
 
 struct OperationReport {
     store: std::sync::Weak<crate::store::Store>,
-    checks: Arc<Vec<crate::model::DoctorCheck>>,
+    /// `None` while the first report since the daemon started is being made.
+    checks: Option<Arc<Vec<crate::model::DoctorCheck>>>,
     at: Instant,
     refreshing: bool,
 }
@@ -2077,20 +2086,58 @@ struct OperationReport {
 /// store, so page reads serve the last report and a new one is made off the request path.
 static OPERATION_REPORTS: OnceLock<Mutex<BTreeMap<usize, OperationReport>>> = OnceLock::new();
 
-fn operation_checks(state: &AppState) -> Result<Arc<Vec<crate::model::DoctorCheck>>, ApiError> {
+fn operation_reports() -> std::sync::MutexGuard<'static, BTreeMap<usize, OperationReport>> {
+    OPERATION_REPORTS
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Start the daemon's first diagnostic report off the request path, so no read waits for it. The
+/// daemon calls this as its API starts to listen; until the report is made, the operations
+/// collection says that it is being made.
+pub(super) fn start_operation_report(state: &AppState) {
     let key = Arc::as_ptr(&state.store) as usize;
-    let reports = OPERATION_REPORTS.get_or_init(Default::default);
+    let mut reports = operation_reports();
+    if reports.get(&key).is_some_and(|report| {
+        report
+            .store
+            .upgrade()
+            .is_some_and(|store| Arc::ptr_eq(&store, &state.store))
+    }) {
+        return;
+    }
+    reports.insert(
+        key,
+        OperationReport {
+            store: Arc::downgrade(&state.store),
+            checks: None,
+            at: Instant::now(),
+            refreshing: true,
+        },
+    );
+    let state = state.clone();
+    std::thread::spawn(move || refresh_operation_report(&state, key));
+}
+
+/// The last diagnostic report, or `None` while the first one since the daemon started is being
+/// made.
+fn operation_checks(
+    state: &AppState,
+) -> Result<Option<Arc<Vec<crate::model::DoctorCheck>>>, ApiError> {
+    let key = Arc::as_ptr(&state.store) as usize;
     {
-        let mut reports = reports
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut reports = operation_reports();
         if let Some(report) = reports.get_mut(&key).filter(|report| {
             report
                 .store
                 .upgrade()
                 .is_some_and(|store| Arc::ptr_eq(&store, &state.store))
         }) {
-            if report.at.elapsed() >= OPERATION_REPORT_REFRESH && !report.refreshing {
+            if report.checks.is_some()
+                && report.at.elapsed() >= OPERATION_REPORT_REFRESH
+                && !report.refreshing
+            {
                 report.refreshing = true;
                 let state = state.clone();
                 std::thread::spawn(move || refresh_operation_report(&state, key));
@@ -2098,42 +2145,56 @@ fn operation_checks(state: &AppState) -> Result<Arc<Vec<crate::model::DoctorChec
             return Ok(report.checks.clone());
         }
     }
-    // The first read after a start has no report yet and makes one.
+    // A server that did not start a report, such as a test's, makes the first one on its first
+    // read.
     let checks = Arc::new(doctor_report(state)?.0.checks);
-    reports
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .insert(
-            key,
-            OperationReport {
-                store: Arc::downgrade(&state.store),
-                checks: checks.clone(),
-                at: Instant::now(),
-                refreshing: false,
-            },
-        );
-    Ok(checks)
+    operation_reports().insert(
+        key,
+        OperationReport {
+            store: Arc::downgrade(&state.store),
+            checks: Some(checks.clone()),
+            at: Instant::now(),
+            refreshing: false,
+        },
+    );
+    Ok(Some(checks))
 }
 
 fn refresh_operation_report(state: &AppState, key: usize) {
     let checks = doctor_report(state)
         .ok()
         .map(|report| Arc::new(report.0.checks));
-    let reports = OPERATION_REPORTS.get_or_init(Default::default);
-    let mut reports = reports
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    if let Some(report) = reports.get_mut(&key) {
-        report.refreshing = false;
-        if let Some(checks) = checks {
-            report.checks = checks;
+    let mut reports = operation_reports();
+    let Some(report) = reports.get_mut(&key) else {
+        return;
+    };
+    report.refreshing = false;
+    match checks {
+        Some(checks) => {
+            report.checks = Some(checks);
             report.at = Instant::now();
         }
+        // The first report failed: the next read makes one and answers with its error.
+        None if report.checks.is_none() => drop(reports.remove(&key)),
+        None => {}
     }
 }
 
 fn operation_resources(state: &AppState, at: &str) -> Result<Vec<Value>, ApiError> {
-    let checks = operation_checks(state)?;
+    let Some(checks) = operation_checks(state)? else {
+        return Ok(vec![json!({
+            "id": "operation/diagnostic-report",
+            "kind": "operation",
+            "revision": "diagnostic-report:running",
+            "updated_at": at,
+            "component": "daemon",
+            "severity": "info",
+            "state": "running",
+            "summary": "the daemon is making its first diagnostic report since it started",
+            "targets": [],
+            "operational": { "layer": "current", "actionable": false, "reasons": ["diagnostic"] }
+        })]);
+    };
     let mut values = checks
         .iter()
         .map(|check| {
@@ -2523,10 +2584,13 @@ pub(super) async fn operations(
     Extension(snapshot): Extension<ClientSnapshot>,
     Extension(session): Extension<ClientSession>,
     Query(query): Query<ClientListQuery>,
-) -> Result<Json<ClientResourcePage>, ApiError> {
+) -> Result<ClientPageResponse, ApiError> {
     require_scope(&session, "read.projections")?;
-    let items = operation_resources(&state, &snapshot.created_at)?;
-    client_page(&state, &snapshot, "operations", items, &query).map(Json)
+    client_snapshot_page(&state, snapshot, "operations", &query, |state, snapshot| {
+        operation_resources(state, &snapshot.created_at)
+            .map_err(|error| anyhow::anyhow!(error.message))
+    })
+    .await
 }
 
 pub(super) async fn now(
@@ -7542,6 +7606,132 @@ subscription "watch/source" {
         );
     }
 
+    /// The runtime, terminal and machine lists read what they show in a fixed number of
+    /// statements, however many runtimes there are.
+    #[test]
+    fn runtime_and_machine_lists_cost_a_fixed_number_of_statements() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let observe = |number: usize| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: format!("agent/listed/runtime-{number}"),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String("running".into())),
+                        (
+                            "runtime_id".into(),
+                            Value::String(format!("listed-{number}")),
+                        ),
+                        (
+                            "incarnation_id".into(),
+                            Value::String(format!("listed-{number}:1")),
+                        ),
+                        ("terminal".into(), Value::Bool(true)),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        let statements = |count: usize| {
+            let snapshot = new_client_snapshot(&state);
+            // The first read reduces each runtime once; count a read at the same snapshot.
+            machine_resources(&state, false, &snapshot, &session).unwrap();
+            crate::store::STATEMENTS_RUN.with(|run| run.set(0));
+            let runtimes = runtime_resources(&state, false, &snapshot, &session).unwrap();
+            let runtime_statements = crate::store::STATEMENTS_RUN.with(|run| run.replace(0));
+            assert_eq!(runtimes.len(), count);
+            for runtime in &runtimes {
+                let observed = state
+                    .store
+                    .claim_by_id(runtime["revision"].as_str().unwrap())
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    runtime["updated_at"],
+                    client_timestamp(observed.accepted_at_unix_ms)
+                );
+            }
+            crate::store::STATEMENTS_RUN.with(|run| run.set(0));
+            let machines = machine_resources(&state, false, &snapshot, &session).unwrap();
+            assert_eq!(machines[0]["runtime_ids"].as_array().unwrap().len(), count);
+            let machine_statements = crate::store::STATEMENTS_RUN.with(std::cell::Cell::get);
+            (runtime_statements, machine_statements)
+        };
+        for number in 0..3 {
+            observe(number);
+        }
+        let few = statements(3);
+        for number in 3..40 {
+            observe(number);
+        }
+        assert_eq!(statements(40), few);
+    }
+
+    /// The operations collection answers while the first diagnostic report since a start is
+    /// being made, saying so, and lists the report once it is made.
+    #[test]
+    fn operations_answer_while_the_first_report_is_made() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let key = Arc::as_ptr(&state.store) as usize;
+        // As `start_operation_report` leaves it until its thread has made the report.
+        operation_reports().insert(
+            key,
+            OperationReport {
+                store: Arc::downgrade(&state.store),
+                checks: None,
+                at: Instant::now(),
+                refreshing: true,
+            },
+        );
+        crate::store::STATEMENTS_RUN.with(|run| run.set(0));
+        let pending = operation_resources(&state, "2026-09-30T00:00:00Z").unwrap();
+        assert_eq!(crate::store::STATEMENTS_RUN.with(std::cell::Cell::get), 0);
+        assert_eq!(pending.len(), 1, "{pending:?}");
+        assert_eq!(pending[0]["kind"], "operation");
+        assert_eq!(pending[0]["component"], "daemon");
+        assert_eq!(pending[0]["severity"], "info");
+        assert_eq!(pending[0]["state"], "running");
+        assert_eq!(pending[0]["updated_at"], "2026-09-30T00:00:00Z");
+        refresh_operation_report(&state, key);
+        let report = operation_resources(&state, "2026-09-30T00:00:00Z").unwrap();
+        assert!(
+            report.iter().all(|item| item["state"] != "running"),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .iter()
+                .any(|item| item["revision"] == "claim-store:pass"),
+            "{report:?}"
+        );
+
+        // A started report is made on its own thread, and a second start keeps it.
+        let other = tempfile::tempdir().unwrap();
+        let started = test_state(other.path());
+        start_operation_report(&started);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        while operation_checks(&started).unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the started report was never made"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let made = operation_checks(&started).unwrap().unwrap();
+        start_operation_report(&started);
+        assert!(Arc::ptr_eq(
+            &made,
+            &operation_checks(&started).unwrap().unwrap()
+        ));
+    }
+
     #[test]
     fn attention_events_name_the_attention_they_change() {
         let root = tempfile::tempdir().unwrap();
@@ -8076,8 +8266,8 @@ mission "example/looped" state="ready" {
     fn operations_serve_the_last_diagnostic_report() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "operations-node");
-        let first = operation_checks(&state).unwrap();
-        let second = operation_checks(&state).unwrap();
+        let first = operation_checks(&state).unwrap().unwrap();
+        let second = operation_checks(&state).unwrap().unwrap();
         assert!(Arc::ptr_eq(&first, &second));
         assert!(
             first
@@ -8085,7 +8275,10 @@ mission "example/looped" state="ready" {
                 .any(|check| check.name == "operation-projection")
         );
         let other = test_state_named(&root.path().join("other"), "operations-other");
-        assert!(!Arc::ptr_eq(&first, &operation_checks(&other).unwrap()));
+        assert!(!Arc::ptr_eq(
+            &first,
+            &operation_checks(&other).unwrap().unwrap()
+        ));
     }
 
     /// A fleet larger than the tree lists shows the first items and says what it left out, rather
