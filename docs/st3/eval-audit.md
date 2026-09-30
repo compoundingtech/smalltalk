@@ -24,6 +24,7 @@ This table records the purpose and the prompt boundary for every st eval.
 | `loop-until-green` | Keep. It proves the supported sequential-until loop reaches a gate and terminates. |
 | `mission-document-lift` | Keep. It proves immutable mission documents. |
 | `mission-inputs` | Keep. It proves text and resource inputs. |
+| `messaging-faults` | Keep. Two isolated nodes exercise real replication, native omp driver/channel and the binary's embedded extension across eight faults. A token-free provider API stand-in records every native handoff and read acknowledgement; it never polls a mailbox or starts a model. The fixed observation tail rejects duplicates and unexpected provider starts, and checks delivery-report accuracy separately from message receipt. Real model response time and other harness integrations remain outside this eval. |
 | `mixed-worker-pool` | Keep. It proves assigned, pooled, and agentless work. |
 | `network-isolation` | Keep. It proves isolated stores and explicit replication. |
 | `network-smoke` | Keep. It proves a basic network graph. |
