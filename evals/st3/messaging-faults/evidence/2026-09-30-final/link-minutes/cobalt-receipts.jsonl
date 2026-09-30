@@ -1,0 +1,12 @@
+{"at_unix_ms":1790755820461,"pid":1505285,"event":"started"}
+{"at_unix_ms":1790755820542,"pid":1505285,"event":"ready"}
+{"at_unix_ms":1790755821547,"pid":1505285,"event":"wire-frame","subject":"message/bb1616e69e0cd3a4"}
+{"at_unix_ms":1790755821548,"pid":1505285,"event":"received","subject":"message/bb1616e69e0cd3a4","content":"<smalltalk-message id=\"bb1616e69e0cd3a4\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/bb1616e69e0cd3a4\">\nreceipt-token:warmup\n</smalltalk-message>"}
+{"at_unix_ms":1790755821558,"pid":1505285,"event":"delivered","subject":"message/bb1616e69e0cd3a4","accepted_at_unix_ms":1790755821555}
+{"at_unix_ms":1790755821561,"pid":1505285,"event":"read","subject":"message/bb1616e69e0cd3a4","accepted_at_unix_ms":1790755821560}
+{"at_unix_ms":1790755821565,"pid":1505285,"event":"closed","subject":"message/bb1616e69e0cd3a4","accepted_at_unix_ms":1790755821562}
+{"at_unix_ms":1790755943545,"pid":1505285,"event":"wire-frame","subject":"message/48445fc4f47c6297"}
+{"at_unix_ms":1790755943545,"pid":1505285,"event":"received","subject":"message/48445fc4f47c6297","content":"<smalltalk-message id=\"48445fc4f47c6297\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: link-minutes\" sha256=\"6f412fb3b2788b6dd15abc27ab0ddac1c2f54adbe55f481917269696c481bb14\" graph=\"message/48445fc4f47c6297\">\nreceipt-token:link-minutes\n</smalltalk-message>"}
+{"at_unix_ms":1790755943547,"pid":1505285,"event":"delivered","subject":"message/48445fc4f47c6297","accepted_at_unix_ms":1790755943546}
+{"at_unix_ms":1790755943548,"pid":1505285,"event":"read","subject":"message/48445fc4f47c6297","accepted_at_unix_ms":1790755943547}
+{"at_unix_ms":1790755943549,"pid":1505285,"event":"closed","subject":"message/48445fc4f47c6297","accepted_at_unix_ms":1790755943548}

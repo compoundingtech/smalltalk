@@ -1,0 +1,12 @@
+{"at_unix_ms":1790755720924,"pid":1478512,"event":"started"}
+{"at_unix_ms":1790755720989,"pid":1478512,"event":"ready"}
+{"at_unix_ms":1790755721991,"pid":1478512,"event":"wire-frame","subject":"message/12a6142729a74545"}
+{"at_unix_ms":1790755721992,"pid":1478512,"event":"received","subject":"message/12a6142729a74545","content":"<smalltalk-message id=\"12a6142729a74545\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/12a6142729a74545\">\nreceipt-token:warmup\n</smalltalk-message>"}
+{"at_unix_ms":1790755722000,"pid":1478512,"event":"delivered","subject":"message/12a6142729a74545","accepted_at_unix_ms":1790755721997}
+{"at_unix_ms":1790755722001,"pid":1478512,"event":"read","subject":"message/12a6142729a74545","accepted_at_unix_ms":1790755722001}
+{"at_unix_ms":1790755722002,"pid":1478512,"event":"closed","subject":"message/12a6142729a74545","accepted_at_unix_ms":1790755722002}
+{"at_unix_ms":1790755725997,"pid":1478512,"event":"wire-frame","subject":"message/6a4927a472965e12"}
+{"at_unix_ms":1790755725997,"pid":1478512,"event":"received","subject":"message/6a4927a472965e12","content":"<smalltalk-message id=\"6a4927a472965e12\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: daemon-restart\" sha256=\"4e4a84137e58a9c6c78e378d93e682c3f4b8f381f36350bf3835333b540cc465\" graph=\"message/6a4927a472965e12\">\nreceipt-token:daemon-restart\n</smalltalk-message>"}
+{"at_unix_ms":1790755726001,"pid":1478512,"event":"delivered","subject":"message/6a4927a472965e12","accepted_at_unix_ms":1790755726000}
+{"at_unix_ms":1790755726005,"pid":1478512,"event":"read","subject":"message/6a4927a472965e12","accepted_at_unix_ms":1790755726003}
+{"at_unix_ms":1790755726008,"pid":1478512,"event":"closed","subject":"message/6a4927a472965e12","accepted_at_unix_ms":1790755726006}
