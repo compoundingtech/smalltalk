@@ -146,12 +146,17 @@ pub(crate) fn run_for_with_environment(
                 std::env::var_os(key).is_some()
             }));
         }
-        let set = hooks::verify_required_set().with_context(|| {
-            format!(
-                "{label} driver '{runtime_id}' needs this binary's verified hook set for {}; run `st2 hooks install`",
-                kind.extension
-            )
-        })?;
+        // An exported set that holds this binary's exact extension (st3 publishes its own) wins;
+        // otherwise the extension comes from st2's verified hook root.
+        let set = match hooks::exported_set_holding(kind.extension) {
+            Some(set) => set,
+            None => hooks::verify_required_set().with_context(|| {
+                format!(
+                    "{label} driver '{runtime_id}' needs this binary's verified hook set for {}; the st daemon publishes it when it starts (`st2 hooks install` on an st2 host)",
+                    kind.extension
+                )
+            })?,
+        };
         // Pi otherwise derives one project directory beneath the global credential profile. Two
         // supervised seats that start together can then race creation of that directory and one
         // provider accepts a turn without ever creating its transcript. A seat-owned directory is

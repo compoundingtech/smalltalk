@@ -478,9 +478,10 @@ impl Reconciler<NativeRuntime> {
                     "PTY_ROOT".into(),
                     selected_pty_root.to_string_lossy().into_owned(),
                 ),
+                // st3's own hook set, which `st up` publishes beneath this state directory.
                 (
                     "ST_HOOKS".into(),
-                    st2::hooks::versioned_hooks_dir()?
+                    crate::hooks::set_dir(&crate::hooks::root(state_dir))
                         .to_string_lossy()
                         .into_owned(),
                 ),
@@ -11001,7 +11002,7 @@ enum UsedMissionOutcome {
 /// the daemon, and in between Linux names this process's image `PATH (deleted)`. Launching that
 /// name fails every start in the window and can hold a seat in a crash loop, so use the
 /// replacement installed at the original path.
-fn launch_executable() -> Result<PathBuf> {
+pub(crate) fn launch_executable() -> Result<PathBuf> {
     let current = std::env::current_exe()?;
     Ok(replaced_executable(&current).unwrap_or(current))
 }

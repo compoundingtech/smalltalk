@@ -7,10 +7,14 @@ pub(crate) mod checkout;
 pub mod client;
 pub mod config;
 pub(crate) mod disk;
+/// Answers the hooks an st3 seat's harness runs: `st driver-hook NAME`.
+pub mod driver_hook;
 pub mod environment;
 pub(crate) mod external_sessions;
 pub mod fleet;
 pub mod graph;
+/// The lifecycle hook set st3 publishes beneath its own state directory.
+pub mod hooks;
 pub mod lane;
 pub mod mission;
 pub mod model;

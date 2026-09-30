@@ -1121,6 +1121,24 @@ pub(crate) fn state_root() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/tmp"))
 }
 
+static HARNESS_STATE_ROOT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Keep this process's harness-session state (Claude resume bindings, OpenCode delivery ledgers,
+/// omp and Codex session state) beneath `root` instead of `$XDG_STATE_HOME/st2`. st3 calls this in
+/// its drivers and hooks, so a seat it launches never writes st2's state directory. The first
+/// call wins.
+pub fn use_harness_state_root(root: PathBuf) {
+    let _ = HARNESS_STATE_ROOT.set(root);
+}
+
+/// Where harness-session state lives: the root a host program chose, else `$XDG_STATE_HOME/st2`.
+pub(crate) fn harness_state_root() -> PathBuf {
+    HARNESS_STATE_ROOT
+        .get()
+        .cloned()
+        .unwrap_or_else(|| state_root().join("st2"))
+}
+
 /// The machine-local runner-state dir for a host's exec tasks: `$XDG_STATE_HOME/st2/<host>/exec`
 /// (falling back to `~/.local/state`). Not synced — pids are host-local.
 pub fn exec_state_dir(host: &str) -> PathBuf {
