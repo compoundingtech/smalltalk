@@ -37,16 +37,21 @@ class FakeApi:
         self.posts = []
         self.records = []
         self.fail_send = False
+        self.advanced = False
 
     async def get(self, path):
         if path.startswith("/v1/claims"):
             return {"claims": self.records}
+        if path.startswith("/v1/messages/read/") and self.advanced:
+            return {"status": "closed", "to": "agent/probe/amber"}
         raise AssertionError(path)
 
     async def post(self, path, body):
         self.posts.append((path, body))
         if path == "/v1/messages" and self.fail_send:
             raise TimeoutError("send committed; client lost its response")
+        if self.advanced and path.endswith("/claims") and body["lifecycle"] != "closed":
+            raise RuntimeError("invalid-message-transition: message already advanced")
         return {"subject": "attention/probe"}
 
 
@@ -111,6 +116,18 @@ class ProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.monitor.state["routes"][self.target], before)
         await self.monitor.acknowledge("message/native")
         self.assertEqual([body["lifecycle"] for _, body in self.monitor.api.posts], ["delivered", "read", "closed"])
+        self.assertFalse(self.monitor.state["receipts"])
+
+    async def test_replayed_ack_accepts_forward_read_but_never_infers_read_from_closed(self):
+        self.monitor.state["receipts"]["message/native"] = {"consumed_at_unix_ms": 10}
+        self.monitor.persist()
+        self.monitor.api.advanced = True
+        with self.assertRaises(RuntimeError):
+            await self.monitor.acknowledge("message/native")
+        self.assertIn("message/native", self.monitor.state["receipts"])
+        self.monitor.api.records = [{"kind": "message.read", "actor": self.monitor.actor,
+                                     "accepted_at_unix_ms": 20}]
+        await self.monitor.acknowledge("message/native")
         self.assertFalse(self.monitor.state["receipts"])
 
 

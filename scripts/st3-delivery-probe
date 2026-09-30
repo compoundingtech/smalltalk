@@ -113,10 +113,25 @@ class Probe:
         # The durable native receipt exists before either the channel's delivered
         # acknowledgement or the graph read. Restarts replay these idempotently.
         for lifecycle in ("delivered", "read", "closed"):
-            await self.api.post(f"/v1/messages/{subject[8:]}/claims", {
-                "lifecycle": lifecycle, "actor": self.actor,
-                "idempotency_key": f"delivery-probe:{subject}:{lifecycle}",
-            })
+            try:
+                await self.api.post(f"/v1/messages/{subject[8:]}/claims", {
+                    "lifecycle": lifecycle, "actor": self.actor,
+                    "idempotency_key": f"delivery-probe:{subject}:{lifecycle}",
+                })
+            except Exception:
+                # A native-channel ack can win the delivery race. The API may
+                # return its existing claim without retaining our retry key.
+                # After a crash, never try to regress a message that advanced;
+                # prove the forward state instead. Closed alone is not a read.
+                message = await self.api.get("/v1/messages/read/" + subject)
+                rank = {"sent": 0, "staged": 1, "delivered": 2, "read": 3, "closed": 4}
+                actual = rank.get(message["status"], -1)
+                if message["to"] != self.actor or actual < rank[lifecycle]:
+                    raise
+                if actual >= rank["read"]:
+                    claims = await self.claims(subject)
+                    if not any(claim["kind"] == "message.read" and claim.get("actor") == self.actor for claim in claims):
+                        raise
         self.state["receipts"].pop(subject, None)
         self.persist()
         self.event("read", message=subject)

@@ -17,6 +17,8 @@ mission that installed the probe does not close an unresolved delivery alert.
 Sender state, received envelopes awaiting acknowledgement, and send idempotency
 keys are written and synced before the corresponding network mutations. The seat
 restarts through st, and the consumer reconnects a lost native channel itself.
+Receipt replay accepts a message that already advanced only after verifying its
+graph state; a closed message without the recipient's read claim cannot pass.
 The state directory must remain stable across upgrades. A process lock prevents
 two consumers from sharing one directory.
 
@@ -95,7 +97,8 @@ matrix exercises the actual omp extension without model calls.
 
 `scripts/st3-delivery-probe-test --binary /path/to/st3` tests a lost send response,
 stable idempotency across retry, crash replay of pending receipts, a delivered
-claim without a read, incorrect read actors, attention deduplication and recovery.
+claim without a read, a replay after a competing native acknowledgement, a closed
+message without a read, incorrect read actors, attention deduplication and recovery.
 Its isolated two-node test uses the real native channels and replication, stops
 only its own test recipient, observes an overdue attention item and a doctor
 warning, then restores that recipient and verifies exactly one read claim.
