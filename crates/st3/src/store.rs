@@ -8685,6 +8685,9 @@ impl Store {
         name: Option<&str>,
         idempotency_key: &str,
     ) -> Result<ApplyResponse, St3Error> {
+        if name == Some("") {
+            return Err(St3Error::new("invalid-agent-name", "a seat label must be a non-empty string"));
+        }
         let (mut desired, heads, writer) = {
             let connection = self.readers.get();
             let transaction = connection.unchecked_transaction().map_err(internal)?;
@@ -8695,11 +8698,22 @@ impl Store {
                      FROM desired LEFT JOIN claims ON claims.id=desired.claim_id
                      WHERE desired.subject=?1 AND desired.kind='agent'",
                     [subject],
-                    |row| Ok((desired_from_row(row)?, row.get::<_, Option<String>>(7)?)),
+                    |row| Ok((
+                        desired_from_row(row)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(3)?,
+                    )),
                 )
                 .optional()
                 .map_err(internal)?
                 .ok_or_else(|| St3Error::new("missing-agent", format!("no agent `{subject}`")))?;
+            // Republishing a member this build cannot read would erase it for every peer.
+            if desired.2.is_some() && desired.0.member.is_none() {
+                return Err(St3Error::new(
+                    "unreadable-agent-member",
+                    format!("agent `{subject}` has a launch this build cannot read"),
+                ));
+            }
             let heads = intent_leaves_tx(&transaction, subject).map_err(internal)?;
             (desired.0, heads, desired.1)
         };
@@ -10149,6 +10163,14 @@ impl Store {
     pub fn selected_desired_token(&self, subject: &str) -> Result<Option<String>> {
         let connection = self.readers.get();
         current_desired_row(&connection, subject).map(|row| row.map(|row| row.claim_id))
+    }
+
+    /// The selected desired revision of `subject`, then each predecessor that differs from it
+    /// only in presentation. The last entry is the revision that still defines the launch, so
+    /// launch records, restart budgets, and crash-loop parking follow a rename.
+    pub fn launch_lineage(&self, subject: &str) -> Result<Vec<String>> {
+        let connection = self.readers.get();
+        launch_lineage_tx(&connection, subject)
     }
 
     /// `selected_desired_token` of each of `subjects` that has a declaration, in one statement.
@@ -13318,7 +13340,10 @@ fn reset_declared_runtime_tx(
         "runtime.restart-window-reset",
         None,
         &json!({"fields": {
-            "desired_token": desired.claim_id,
+            "desired_token": launch_lineage_tx(transaction, runtime)
+                .map_err(internal)?
+                .pop()
+                .unwrap_or(desired.claim_id),
             "incarnation_id": incarnation,
             "reason": operation.reason,
         }}),
@@ -15056,6 +15081,43 @@ fn claim_by_id_tx(connection: &Connection, id: &str) -> Result<Option<ClaimRecor
         )
         .optional()
         .map_err(Into::into)
+}
+
+fn launch_lineage_tx(connection: &Connection, subject: &str) -> Result<Vec<String>> {
+    let Some(row) = current_desired_row(connection, subject)? else {
+        return Ok(Vec::new());
+    };
+    let mut lineage = vec![row.claim_id.clone()];
+    let mut current = row.claim_id;
+    while let Some(claim) = claim_by_id_tx(connection, &current)? {
+        let [predecessor] = claim.predecessors.as_slice() else {
+            break;
+        };
+        let Some(previous) = claim_by_id_tx(connection, predecessor)? else {
+            break;
+        };
+        if previous.kind != "intent.desired"
+            || previous.subject != subject
+            || lineage.contains(&previous.id)
+            || !presentation_only_change(&previous.body, &claim.body)
+        {
+            break;
+        }
+        current.clone_from(&previous.id);
+        lineage.push(previous.id);
+    }
+    Ok(lineage)
+}
+
+/// Two agent declarations that differ only in their human label share one launch.
+fn presentation_only_change(previous: &Value, next: &Value) -> bool {
+    let parse = |body: &Value| {
+        let mut desired = serde_json::from_value::<DesiredSubject>(body.clone()).ok()?;
+        (desired.kind == "agent").then_some(())?;
+        desired.set_display_name(None).ok()?;
+        Some(desired)
+    };
+    matches!((parse(previous), parse(next)), (Some(previous), Some(next)) if previous == next)
 }
 
 /// The version of the rules that derive `operations` from claims. Every write and projection
@@ -24823,6 +24885,35 @@ agent "test/worker" { workspace "."; command "true"; name "Initial" }
         let cleared = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap().0;
         assert_eq!(crate::model::effective_agent_name("agent/test/worker", Some(&cleared.desired)), "test/worker");
         assert_eq!(cleared.member.unwrap().display_name, None);
+    }
+
+    #[test]
+    fn seat_rename_refuses_an_unreadable_member_and_an_empty_label() {
+        let store = Store::open_memory("node").unwrap();
+        let intent = parse_intent(r#"version 2
+agent "test/worker" { command "true"; name "Initial" }
+"#, "node").unwrap();
+        let preview = store.mission(&intent, IntentInput {
+            kdl: String::new(), source_name: None,
+        }).unwrap();
+        store.apply(&intent, &preview.subject_tokens, "initial").unwrap();
+        let before = store.selected_desired_token("agent/test/worker").unwrap();
+        assert_eq!(
+            store.rename_agent("agent/test/worker", Some(""), "empty").unwrap_err().code,
+            "invalid-agent-name"
+        );
+        // A launch published by a newer peer stays until a build that can read it takes it up.
+        store.replace_desired_member_for_test("agent/test/worker", r#"{"future":true}"#);
+        assert_eq!(
+            store.rename_agent("agent/test/worker", Some("Renamed"), "unreadable").unwrap_err().code,
+            "unreadable-agent-member"
+        );
+        assert_eq!(store.selected_desired_token("agent/test/worker").unwrap(), before);
+        let connection = store.readers.get();
+        let member: String = connection
+            .query_row("SELECT member FROM desired WHERE subject='agent/test/worker'", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(member, r#"{"future":true}"#);
     }
 
     #[test]

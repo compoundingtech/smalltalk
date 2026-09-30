@@ -2390,7 +2390,11 @@ struct AgentHoldArgs {
 #[derive(Args)]
 struct AgentRenameArgs {
     subject: String,
-    #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+    #[arg(
+        required_unless_present = "clear",
+        conflicts_with = "clear",
+        value_parser = clap::builder::NonEmptyStringValueParser::new()
+    )]
     label: Option<String>,
     /// Restore the subject-derived presentation label.
     #[arg(long)]
@@ -18472,6 +18476,22 @@ mod tests {
                 command: AgentsCommand::Stop(_)
             }
         ));
+    }
+
+    #[test]
+    fn agent_rename_needs_a_nonempty_label_or_clear() {
+        let rename = |label: &[&str]| {
+            Cli::try_parse_from(
+                ["st3", "agents", "rename", "agent/worker"]
+                    .into_iter()
+                    .chain(label.iter().copied())
+                    .chain(["--as", "person/alex"]),
+            )
+        };
+        assert!(rename(&["Garden"]).is_ok());
+        assert!(rename(&["--clear"]).is_ok());
+        assert!(rename(&[""]).is_err());
+        assert!(rename(&[]).is_err());
     }
 
     fn agent_new_args(arguments: &[&str]) -> AgentNewArgs {

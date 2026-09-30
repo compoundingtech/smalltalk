@@ -2704,33 +2704,20 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
+    /// The desired revision whose launch configuration is current. Launch records, restart
+    /// budgets, and crash-loop parking key on it, so a label-only revision inherits them.
+    fn launch_token(&self, subject: &str) -> Result<String> {
+        Ok(self.store.launch_lineage(subject)?.pop().unwrap_or_default())
+    }
+
     fn member_was_launched_for_selected_desired(&self, subject: &str) -> Result<bool> {
-        let Some(desired_token) = self.store.selected_desired_token(subject)? else {
-            return Ok(false);
-        };
-        let launches = self.store.observations_for(subject, "runtime.action.succeeded")?;
-        let Some(token) = launches.iter().rev().find_map(|claim| {
-            claim.body.pointer("/fields/desired_token").and_then(Value::as_str)
-        }) else {
-            return Ok(false);
-        };
-        if token == desired_token {
-            return Ok(true);
-        }
-        let Some((mut current, _)) = self.store.desired_subject_with_writer(subject)? else {
-            return Ok(false);
-        };
-        if current.kind != "agent" {
-            return Ok(false);
-        }
-        current.set_display_name(None)?;
-        if let Some(previous) = self.store.claim_by_id(token)?
-            && let Ok(mut previous) = serde_json::from_value::<DesiredSubject>(previous.body)
-        {
-            previous.set_display_name(None)?;
-            return Ok(previous == current);
-        }
-        Ok(false)
+        let lineage = self.store.launch_lineage(subject)?;
+        Ok(self
+            .store
+            .observations_for(subject, "runtime.action.succeeded")?
+            .iter()
+            .filter_map(|claim| claim.body.pointer("/fields/desired_token").and_then(Value::as_str))
+            .any(|token| lineage.iter().any(|candidate| candidate == token)))
     }
 
     #[cfg(test)]
@@ -3200,10 +3187,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         }
         if member.driver.as_deref() == Some("codex") {
-            let token = self
-                .store
-                .selected_desired_token(&subject.subject)?
-                .unwrap_or_default();
+            let token = self.launch_token(&subject.subject)?;
             if self.codex_crash_loop_raised(&subject.subject, &token)? {
                 self.raise_codex_crash_loop(
                     &subject.subject,
@@ -3327,10 +3311,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         )?;
         if let Err(error) = self.runtime.start(&launch_member) {
             let reason = error.to_string();
-            let desired_token = self
-                .store
-                .selected_desired_token(&subject.subject)?
-                .unwrap_or_default();
+            let desired_token = self.launch_token(&subject.subject)?;
             let prior_failures = self.start_failures(&subject.subject, &desired_token)?;
             self.store.append_claim(&ClaimInput {
                 subject: subject.subject.clone(),
@@ -3357,10 +3338,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             )?;
             return Err(error).context("start member runtime");
         }
-        let desired_token = self
-            .store
-            .selected_desired_token(&subject.subject)?
-            .unwrap_or_default();
+        let desired_token = self.launch_token(&subject.subject)?;
         self.store.append_claim(&ClaimInput {
             subject: subject.subject.clone(),
             kind: "runtime.action.succeeded".into(),
@@ -3412,10 +3390,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         }
         if member.driver.as_deref() == Some("codex") {
-            let token = self
-                .store
-                .selected_desired_token(&subject.subject)?
-                .unwrap_or_default();
+            let token = self.launch_token(&subject.subject)?;
             if self.codex_crash_loop_raised(&subject.subject, &token)? {
                 self.raise_codex_crash_loop(
                     &subject.subject,
@@ -3452,10 +3427,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             }
             RestartDecision::Fail { reason } => {
                 if member.driver.as_deref() == Some("codex") {
-                    let token = self
-                        .store
-                        .selected_desired_token(&subject.subject)?
-                        .unwrap_or_default();
+                    let token = self.launch_token(&subject.subject)?;
                     let diagnostic = self
                         .store
                         .claims_for(&subject.subject, Some("harness.diagnostic"))?
@@ -3530,10 +3502,7 @@ impl<R: RuntimeControl> Reconciler<R> {
 
     /// Keep a failed durable launch from turning each graph write into another PTY spawn.
     fn defer_or_park_failed_start(&self, subject: &DesiredSubject) -> Result<bool> {
-        let token = self
-            .store
-            .selected_desired_token(&subject.subject)?
-            .unwrap_or_default();
+        let token = self.launch_token(&subject.subject)?;
         if self.runtime_crash_loop_raised(&subject.subject, &token)? {
             return Ok(true);
         }
@@ -3588,10 +3557,7 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     fn park_unready_crash_loop(&self, subject: &DesiredSubject) -> Result<bool> {
-        let token = self
-            .store
-            .selected_desired_token(&subject.subject)?
-            .unwrap_or_default();
+        let token = self.launch_token(&subject.subject)?;
         if self.runtime_crash_loop_raised(&subject.subject, &token)? {
             return Ok(true);
         }
@@ -3746,10 +3712,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             member.restart_intensity.clone()
         };
         let now = now_ms();
-        let desired_token = self
-            .store
-            .selected_desired_token(&subject.subject)?
-            .unwrap_or_default();
+        let desired_token = self.launch_token(&subject.subject)?;
         let mut launches = self
             .store
             .observations_for(&subject.subject, "runtime.action.succeeded")?
@@ -15604,6 +15567,10 @@ agent "worker" {
             .selected_desired_token("agent/node.worker")
             .unwrap()
             .unwrap();
+        // A label-only revision keeps the exhausted budget; only a reset or launch change restarts.
+        store.rename_agent("agent/node.worker", Some("Renamed"), "rename-exhausted").unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.starts.lock().unwrap().len(), 1);
         store
             .append_claim(&ClaimInput {
                 subject: "agent/node.worker".into(),
@@ -15715,6 +15682,9 @@ agent "worker" {
                 .iter()
                 .any(|attention| { attention.targets.contains(&"agent/node.worker".to_owned()) })
         );
+        store.rename_agent("agent/node.worker", Some("Renamed"), "rename-parked").unwrap();
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.starts.lock().unwrap().len(), 3, "a rename must not unpark the seat");
     }
 
     #[test]

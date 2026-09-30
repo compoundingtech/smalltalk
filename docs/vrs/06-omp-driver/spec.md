@@ -129,8 +129,13 @@ contains the canonical KDL name child and the normalized member's `display_name`
 these two representations identical and preserves the original declaring authority.
 `st3 agents rename <subject> <label>` and `st3 agents rename <subject> --clear` publish only
 this presentation field through the durable desired-state log, without restarting the harness.
-Rename requires declaration authority over the seat. Clearing restores the subject without the
-`agent/` prefix, which the Agent API uses as the effective label.
+Rename requires declaration authority over the seat and a non-empty label, and refuses a seat
+whose stored launch this build cannot read, since republishing it would erase that launch.
+Clearing restores the subject without the `agent/` prefix, which the Agent API uses as the
+effective label. A revision that differs from its predecessor only in the label keeps that
+predecessor's launch revision: launch records, restart budgets, restart-window resets, and
+crash-loop holds all key on the launch revision, so a rename never restarts a finished,
+exhausted, or parked seat.
 
 ## Rust channel process
 
