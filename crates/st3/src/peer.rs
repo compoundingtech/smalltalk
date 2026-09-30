@@ -6154,6 +6154,7 @@ mod retry_tests {
         let task = tokio::spawn(keep_tailnet_current(
             program,
             None,
+            None,
             Endpoints::default(),
             Arc::default(),
             watch::channel(0).0,
