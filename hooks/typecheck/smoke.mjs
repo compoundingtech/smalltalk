@@ -36,12 +36,12 @@ const readFrames = () =>
     .filter((line) => line.trim())
     .map((line) => JSON.parse(line));
 
-process.env.ST3_PI_CHANNEL_BIN = recorder;
-process.env.ST3_PI_CHANNEL_CATALOG = "/tmp/st2-smoke-catalog";
-process.env.ST3_PI_CHANNEL_IDENTITY = "smoke.worker";
-process.env.ST3_PI_CHANNEL_RUNTIME_ID = "smoke.worker";
-process.env.ST3_PI_CHANNEL_SESSION = "smoke-session";
-process.env.ST3_PI_CHANNEL_SEQ = "1";
+process.env.ST2_PI_CHANNEL_BIN = recorder;
+process.env.ST2_PI_CHANNEL_CATALOG = "/tmp/st2-smoke-catalog";
+process.env.ST2_PI_CHANNEL_IDENTITY = "smoke.worker";
+process.env.ST2_PI_CHANNEL_RUNTIME_ID = "smoke.worker";
+process.env.ST2_PI_CHANNEL_SESSION = "smoke-session";
+process.env.ST2_PI_CHANNEL_SEQ = "1";
 
 const mod = await import("./smoke-out/pi-channel.mjs");
 assert.strictEqual(typeof mod.default, "function", "extension exports its entry point");

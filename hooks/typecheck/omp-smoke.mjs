@@ -15,15 +15,13 @@ const framesPath = path.join(dir, "frames.jsonl");
 const outboxPath = path.join(dir, "outbox.jsonl");
 const pidPath = path.join(dir, "channel-pids");
 const delayedHelloPath = path.join(dir, "delay-hello");
-const labelPath = path.join(dir, "label");
-fs.writeFileSync(labelPath, "Initial seat");
 const recorder = path.join(dir, "recorder");
 fs.writeFileSync(
   recorder,
   `#!${process.execPath}
 import fs from "node:fs";
 fs.appendFileSync(${JSON.stringify(pidPath)}, process.pid + "\\n");
-const hello = () => process.stdout.write(JSON.stringify({ type: "hello", protocol: 1, name: fs.existsSync(${JSON.stringify(labelPath)}) ? fs.readFileSync(${JSON.stringify(labelPath)}, "utf8") : undefined, sessionContext: fs.existsSync(${JSON.stringify(delayedHelloPath)}) ? "late seat context" : "" }) + "\\n");
+const hello = () => process.stdout.write(JSON.stringify({ type: "hello", protocol: 1, sessionContext: fs.existsSync(${JSON.stringify(delayedHelloPath)}) ? "late seat context" : "" }) + "\\n");
 if (fs.existsSync(${JSON.stringify(delayedHelloPath)})) setTimeout(hello, 6000);
 else hello();
 process.stdin.setEncoding("utf8");
@@ -51,12 +49,12 @@ const readFrames = () =>
     .filter((line) => line.trim())
     .map((line) => JSON.parse(line));
 
-process.env.ST3_OMP_CHANNEL_BIN = recorder;
-process.env.ST3_OMP_CHANNEL_CATALOG = "/tmp/st2-smoke-catalog";
-process.env.ST3_OMP_CHANNEL_IDENTITY = "smoke.worker";
-process.env.ST3_OMP_CHANNEL_RUNTIME_ID = "smoke.worker";
-process.env.ST3_OMP_CHANNEL_SESSION = "smoke-session";
-process.env.ST3_OMP_CHANNEL_SEQ = "1";
+process.env.ST2_OMP_CHANNEL_BIN = recorder;
+process.env.ST2_OMP_CHANNEL_CATALOG = "/tmp/st2-smoke-catalog";
+process.env.ST2_OMP_CHANNEL_IDENTITY = "smoke.worker";
+process.env.ST2_OMP_CHANNEL_RUNTIME_ID = "smoke.worker";
+process.env.ST2_OMP_CHANNEL_SESSION = "smoke-session";
+process.env.ST2_OMP_CHANNEL_SEQ = "1";
 
 const mod = await import("./smoke-out/omp-channel.mjs");
 assert.strictEqual(typeof mod.default, "function", "extension exports its entry point");
@@ -65,9 +63,7 @@ const handlers = new Map();
 // Every message the extension hands to omp, with the options it chose.
 const handedOver = [];
 const sessionMessages = [];
-const titles = [];
 const pi = {
-  setSessionName: (name) => titles.push(name),
   on: (name, handler) => handlers.set(name, handler),
   sendUserMessage: (content, options) => {
     handedOver.push(options === undefined ? { content } : { content, options });
@@ -154,29 +150,6 @@ for (const ctx of [bareCtx, fullCtx, throwingCtx]) {
   await handlers.get("session_before_compact")({}, ctx);
   await handlers.get("session_shutdown")({}, ctx);
 }
-
-// The label snapshot, live updates, and native-session rebind all have the same writer.
-process.env.AGENT_PERSONA_SHORT = "gen";
-await handlers.get("session_start")({}, fullCtx);
-assert.strictEqual(titles.at(-1), "Initial seat[gen]");
-fs.writeFileSync(labelPath, "Renamed seat");
-fs.appendFileSync(outboxPath, JSON.stringify({ type: "label", name: "Renamed seat" }) + "\n");
-await new Promise((resolve) => setTimeout(resolve, 100));
-assert.strictEqual(titles.at(-1), "Renamed seat[gen]");
-fs.rmSync(outboxPath, { force: true });
-await handlers.get("session_switch")({}, {
-  ...bareCtx, sessionManager: { getSessionId: () => "new-native-session" },
-});
-assert.strictEqual(titles.at(-1), "Renamed seat[gen]", "new/resumed sessions restore current authority");
-delete process.env.AGENT_PERSONA_SHORT;
-fs.rmSync(outboxPath, { force: true });
-await handlers.get("session_switch")({}, bareCtx);
-assert.strictEqual(titles.at(-1), "Renamed seat", "no persona means no suffix");
-fs.rmSync(labelPath);
-titles.push("Old producer local title");
-await handlers.get("session_switch")({}, bareCtx);
-assert.strictEqual(titles.at(-1), "Old producer local title", "an old hello leaves the title writer unchanged");
-fs.writeFileSync(labelPath, "Renamed seat");
 
 // Structured ask observation is correlated by toolCallId. An unrelated result must emit nothing
 // (and therefore leave the durable blocked frame intact); only the matching result clears it.

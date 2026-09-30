@@ -24,22 +24,22 @@ use crate::pi_family_session::{self, HarnessKind};
 const EXTENSION: &str = "omp-channel.ts";
 
 /// The exact st2 executable the omp extension must spawn for its channel.
-pub const CHANNEL_BIN: &str = "ST3_OMP_CHANNEL_BIN";
+pub const CHANNEL_BIN: &str = "ST2_OMP_CHANNEL_BIN";
 /// The catalog root that executable must be pointed at.
-pub const CHANNEL_CATALOG: &str = "ST3_OMP_CHANNEL_CATALOG";
+pub const CHANNEL_CATALOG: &str = "ST2_OMP_CHANNEL_CATALOG";
 /// The host-qualified bus identity the channel binds.
-pub const CHANNEL_IDENTITY: &str = "ST3_OMP_CHANNEL_IDENTITY";
+pub const CHANNEL_IDENTITY: &str = "ST2_OMP_CHANNEL_IDENTITY";
 /// The wrapper's runtime/task ID — the pty session whose liveness vouches for observed state.
-pub const CHANNEL_RUNTIME_ID: &str = "ST3_OMP_CHANNEL_RUNTIME_ID";
+pub const CHANNEL_RUNTIME_ID: &str = "ST2_OMP_CHANNEL_RUNTIME_ID";
 /// The session incarnation token the wrapper mints. The channel adopts it so the wrapper's
 /// terminal record owns — and thereby fences — the live records the channel writes.
-pub const CHANNEL_SESSION: &str = "ST3_OMP_CHANNEL_SESSION";
+pub const CHANNEL_SESSION: &str = "ST2_OMP_CHANNEL_SESSION";
 /// The ownership sequence the wrapper claimed at startup.
-pub const CHANNEL_SEQ: &str = "ST3_OMP_CHANNEL_SEQ";
+pub const CHANNEL_SEQ: &str = "ST2_OMP_CHANNEL_SEQ";
 /// The exact native session that a cold residency launch must resume.
-pub const CHANNEL_EXPECTED_NATIVE_SESSION: &str = "ST3_OMP_CHANNEL_EXPECTED_NATIVE_SESSION";
+pub const CHANNEL_EXPECTED_NATIVE_SESSION: &str = "ST2_OMP_CHANNEL_EXPECTED_NATIVE_SESSION";
 /// The cold residency generation whose exact native session the channel must prove.
-pub const CHANNEL_RESUME_GENERATION: &str = "ST3_OMP_CHANNEL_RESUME_GENERATION";
+pub const CHANNEL_RESUME_GENERATION: &str = "ST2_OMP_CHANNEL_RESUME_GENERATION";
 
 const BINDING_SCHEMA: &str = "st2.omp-session-binding.v1";
 const CHECKPOINT_SCHEMA: &str = "st2.omp-residency-checkpoint.v1";
@@ -782,8 +782,8 @@ mod tests {
         let fake = FakeExecutable::new(&format!(
             "#!/bin/sh\n\
              if [ \"$1\" = \"--version\" ]; then printf 'omp v18.1.7\\n'; exit 0; fi\n\
-             printf '%s|%s\\n' \"${{ST3_OMP_CHANNEL_EXPECTED_NATIVE_SESSION-unset}}\" \
-             \"${{ST3_OMP_CHANNEL_RESUME_GENERATION-unset}}\" > '{}'\n",
+             printf '%s|%s\\n' \"${{ST2_OMP_CHANNEL_EXPECTED_NATIVE_SESSION-unset}}\" \
+             \"${{ST2_OMP_CHANNEL_RESUME_GENERATION-unset}}\" > '{}'\n",
             marker.display()
         ));
         let hooks = temp.path().join("hooks");

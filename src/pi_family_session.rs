@@ -644,6 +644,14 @@ mod tests {
         let pi = names(&PI_KIND);
         let omp = names(&OMP_KIND);
         assert!(
+            pi.iter().all(|name| name.starts_with("ST2_PI_CHANNEL_")),
+            "{pi:?}"
+        );
+        assert!(
+            omp.iter().all(|name| name.starts_with("ST2_OMP_CHANNEL_")),
+            "{omp:?}"
+        );
+        assert!(
             pi.iter().all(|name| !omp.contains(name)),
             "the two harnesses must share no channel variable name"
         );

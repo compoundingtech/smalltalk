@@ -3355,7 +3355,6 @@ dependencies = [
  "kdl",
  "libc",
  "notify",
- "parking_lot",
  "portable-pty",
  "predicates",
  "proptest",

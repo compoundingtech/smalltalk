@@ -7705,15 +7705,17 @@ async fn rename_agent(
     };
     if !request.actor.starts_with("person/") {
         let actor = normalized_agent_actor(&request.actor).ok_or_else(|| {
-            ApiError::bad(St3Error::new("invalid-rename-actor", "rename needs a person or agent actor"))
+            ApiError::bad(St3Error::new(
+                "invalid-rename-actor",
+                "rename needs a person or agent actor",
+            ))
         })?;
         require_agent_seat_authority(&state, &actor, "declare", &subject)?;
     }
-    let response = state.store.rename_agent(
-        &subject,
-        request.name.as_deref(),
-        &request.idempotency_key,
-    ).map_err(ApiError::bad)?;
+    let response = state
+        .store
+        .rename_agent(&subject, request.name.as_deref(), &request.idempotency_key)
+        .map_err(ApiError::bad)?;
     signal_changed(&state);
     Ok(Json(response))
 }
@@ -16988,28 +16990,70 @@ agent "test/target" { workspace "."; command "true"; name "Initial seat" }
 "#;
         let request = apply_request(&state, source, "person/test", "rename-fixture");
         let _ = apply(State(state.clone()), Json(request)).await.unwrap();
-        let original = state.store.desired_subject_with_writer("agent/test/target").unwrap().unwrap();
-        let initial = client_agent_resources(&state.store, false, "before", state.store.index().unwrap()).unwrap();
-        assert_eq!(initial.iter().find(|agent| agent["id"] == "agent/test/target").unwrap()["name"], "Initial seat");
+        let original = state
+            .store
+            .desired_subject_with_writer("agent/test/target")
+            .unwrap()
+            .unwrap();
+        let initial =
+            client_agent_resources(&state.store, false, "before", state.store.index().unwrap())
+                .unwrap();
+        assert_eq!(
+            initial
+                .iter()
+                .find(|agent| agent["id"] == "agent/test/target")
+                .unwrap()["name"],
+            "Initial seat"
+        );
         let app = router(state.clone());
-        let (status, _) = json_request(app.clone(), "/v1/agents/rename", json!({
-            "subject": "test/target", "name": "Denied", "actor": "agent/test/target",
-            "idempotency_key": "denied",
-        })).await;
+        let (status, _) = json_request(
+            app.clone(),
+            "/v1/agents/rename",
+            json!({
+                "subject": "test/target", "name": "Denied", "actor": "agent/test/target",
+                "idempotency_key": "denied",
+            }),
+        )
+        .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
-        assert_eq!(state.store.desired_subject_with_writer("agent/test/target").unwrap().unwrap(), original);
+        assert_eq!(
+            state
+                .store
+                .desired_subject_with_writer("agent/test/target")
+                .unwrap()
+                .unwrap(),
+            original
+        );
         for (name, key) in [(Some("Renamed seat"), "rename"), (None, "clear")] {
-            let (status, body) = json_request(app.clone(), "/v1/agents/rename", json!({
-                "subject": "test/target", "name": name, "actor": "agent/test/renamer",
-                "idempotency_key": key,
-            })).await;
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/agents/rename",
+                json!({
+                    "subject": "test/target", "name": name, "actor": "agent/test/renamer",
+                    "idempotency_key": key,
+                }),
+            )
+            .await;
             assert_eq!(status, StatusCode::OK, "{body}");
-            let (mut desired, writer) = state.store.desired_subject_with_writer("agent/test/target").unwrap().unwrap();
-            let agents = client_agent_resources(&state.store, false, "after", state.store.index().unwrap()).unwrap();
-            assert_eq!(agents.iter().find(|agent| agent["id"] == "agent/test/target").unwrap()["name"],
-                name.unwrap_or("test/target"));
+            let (mut desired, writer) = state
+                .store
+                .desired_subject_with_writer("agent/test/target")
+                .unwrap()
+                .unwrap();
+            let agents =
+                client_agent_resources(&state.store, false, "after", state.store.index().unwrap())
+                    .unwrap();
+            assert_eq!(
+                agents
+                    .iter()
+                    .find(|agent| agent["id"] == "agent/test/target")
+                    .unwrap()["name"],
+                name.unwrap_or("test/target")
+            );
             assert_eq!(writer, original.1);
-            desired.set_display_name(original.0.member.as_ref().unwrap().display_name.as_deref()).unwrap();
+            desired
+                .set_display_name(original.0.member.as_ref().unwrap().display_name.as_deref())
+                .unwrap();
             assert_eq!(desired, original.0);
         }
     }

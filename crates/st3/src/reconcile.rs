@@ -112,7 +112,6 @@ pub trait RuntimeControl: Send + Sync + 'static {
     fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>>;
     fn observe_exec(&self, runtime_id: &str) -> Result<Option<RuntimeObservation>>;
     fn start(&self, member: &MemberSpec) -> Result<()>;
-    fn set_display_name(&self, runtime_id: &str, name: &str) -> Result<()>;
     fn stop(
         &self,
         runtime_id: &str,
@@ -204,10 +203,6 @@ fn local_process_is_alive(_pid: u32) -> bool {
 }
 
 impl RuntimeControl for NativeRuntime {
-    fn set_display_name(&self, runtime_id: &str, name: &str) -> Result<()> {
-        self.pty()?.set_display_name(runtime_id, name)
-    }
-
     fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
         let observations = self.pty()?.snapshot()?;
         // A PTY server started before st moved servers out of their harness's scope moves here.
@@ -1443,14 +1438,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                 };
                 match observed {
                     Some(observation) if observation.status == "running" => {
-                        if subject.kind == "agent" && member.terminal {
-                            self.runtime.set_display_name(
-                                &member.runtime_id,
-                                crate::model::effective_agent_name(
-                                    &subject.subject, Some(&subject.desired),
-                                ),
-                            )?;
-                        }
                         self.record_member(subject, &observation, true)?;
                         self.reconcile_claude_auth_screen(subject, member, &observation)?;
                         self.reconcile_claude_trust_screen(
@@ -2735,9 +2722,14 @@ impl<R: RuntimeControl> Reconciler<R> {
         let Some(desired_token) = self.store.selected_desired_token(subject)? else {
             return Ok(false);
         };
-        let launches = self.store.observations_for(subject, "runtime.action.succeeded")?;
+        let launches = self
+            .store
+            .observations_for(subject, "runtime.action.succeeded")?;
         if launches.iter().rev().any(|claim| {
-            claim.body.pointer("/fields/desired_token").and_then(Value::as_str)
+            claim
+                .body
+                .pointer("/fields/desired_token")
+                .and_then(Value::as_str)
                 == Some(desired_token.as_str())
         }) {
             return Ok(true);
@@ -2750,7 +2742,11 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         current.set_display_name(None)?;
         for claim in launches.into_iter().rev() {
-            let Some(token) = claim.body.pointer("/fields/desired_token").and_then(Value::as_str) else {
+            let Some(token) = claim
+                .body
+                .pointer("/fields/desired_token")
+                .and_then(Value::as_str)
+            else {
                 continue;
             };
             if let Some(previous) = self.store.claim_by_id(token)?
@@ -3295,9 +3291,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             launch_member
                 .environment
                 .insert("ST_AGENT".into(), subject.subject.clone());
-            if member.driver.as_deref() == Some("omp") {
-                launch_member.environment.insert("ST3_OMP_CHANNEL_LABELS".into(), "1".into());
-            }
         } else if let Some(owner) = member.tags.get("st3.agent") {
             launch_member
                 .environment
@@ -11352,14 +11345,9 @@ exec "orchid" {{ command "orchid-tool"; workspace "{}"; }}"#,
         screen: Mutex<String>,
         screens: Mutex<HashMap<String, String>>,
         keys: Mutex<Vec<String>>,
-        names: parking_lot::Mutex<HashMap<String, String>>,
     }
 
     impl RuntimeControl for FakeRuntime {
-        fn set_display_name(&self, runtime_id: &str, name: &str) -> Result<()> {
-            self.names.lock().insert(runtime_id.to_owned(), name.to_owned());
-            Ok(())
-        }
         fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
             if *self.snapshot_error.lock().unwrap() {
                 anyhow::bail!("the PTY snapshot is unavailable")
@@ -15177,42 +15165,93 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
     }
 
     #[test]
-    fn seat_rename_projects_labels_without_relaunching_and_survives_reopen() {
+    fn seat_rename_preserves_runtime_identity_and_survives_reopen() {
         let root = tempfile::tempdir().unwrap();
         let database = root.path().join("state.sqlite3");
         let store = Arc::new(Store::open(&database, "node").unwrap());
-        apply_source(&store, r#"version 2
+        apply_source(
+            &store,
+            r#"version 2
 agent "test/worker" {
     workspace "/tmp"
     command "true"
     name "Initial seat"
     restart "never"
 }
-"#, "seat");
+"#,
+            "seat",
+        );
         let runtime = Arc::new(FakeRuntime::default());
-        let reconciler = Reconciler::new(store.clone(), runtime.clone(), "node".into(),
-            Arc::new(Notify::new()));
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
         reconciler.reconcile_once().unwrap();
-        let original = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap();
+        let original = store
+            .desired_subject_with_writer("agent/test/worker")
+            .unwrap()
+            .unwrap();
         let runtime_id = original.0.member.as_ref().unwrap().runtime_id.clone();
         runtime.ptys.lock().unwrap().push(RuntimeObservation {
-            runtime_id: runtime_id.clone(), terminal: true, status: "running".into(),
-            exit_code: None, incarnation_id: Some("unchanged-incarnation".into()),
+            runtime_id: runtime_id.clone(),
+            terminal: true,
+            status: "running".into(),
+            exit_code: None,
+            incarnation_id: Some("unchanged-incarnation".into()),
         });
-        store.rename_agent("agent/test/worker", Some("Renamed seat"), "rename").unwrap();
+        store
+            .rename_agent("agent/test/worker", Some("Renamed seat"), "rename")
+            .unwrap();
         reconciler.reconcile_once().unwrap();
-        assert_eq!(runtime.names.lock().get(&runtime_id).unwrap(), "Renamed seat");
-        let mut renamed = store.desired_subject_with_writer("agent/test/worker").unwrap().unwrap();
-        assert_eq!(renamed.1, original.1, "presentation must not change declaring authority");
-        assert_eq!(renamed.0.member.as_ref().unwrap().display_name.as_deref(), Some("Renamed seat"));
-        renamed.0.set_display_name(original.0.member.as_ref().unwrap().display_name.as_deref()).unwrap();
-        assert_eq!(renamed.0, original.0, "rename changes no other desired field or identity");
+        let mut renamed = store
+            .desired_subject_with_writer("agent/test/worker")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            renamed.1, original.1,
+            "presentation must not change declaring authority"
+        );
+        assert_eq!(
+            renamed.0.member.as_ref().unwrap().display_name.as_deref(),
+            Some("Renamed seat")
+        );
+        renamed
+            .0
+            .set_display_name(original.0.member.as_ref().unwrap().display_name.as_deref())
+            .unwrap();
+        assert_eq!(
+            renamed.0, original.0,
+            "rename changes no other desired field or identity"
+        );
         let reopened = Store::open(&database, "node").unwrap();
-        assert_eq!(reopened.desired_subject_with_writer("agent/test/worker").unwrap().unwrap()
-            .0.member.unwrap().display_name.as_deref(), Some("Renamed seat"));
-        store.rename_agent("agent/test/worker", None, "clear").unwrap();
+        assert_eq!(
+            reopened
+                .desired_subject_with_writer("agent/test/worker")
+                .unwrap()
+                .unwrap()
+                .0
+                .member
+                .unwrap()
+                .display_name
+                .as_deref(),
+            Some("Renamed seat")
+        );
+        store
+            .rename_agent("agent/test/worker", None, "clear")
+            .unwrap();
         reconciler.reconcile_once().unwrap();
-        assert_eq!(runtime.names.lock().get(&runtime_id).unwrap(), "test/worker");
+        let cleared = store
+            .desired_subject_with_writer("agent/test/worker")
+            .unwrap()
+            .unwrap()
+            .0;
+        assert_eq!(cleared.member.as_ref().unwrap().display_name, None);
+        assert_eq!(
+            crate::model::effective_agent_name(&cleared.subject, Some(&cleared.desired)),
+            "test/worker"
+        );
         runtime.ptys.lock().unwrap()[0].status = "exited".into();
         runtime.ptys.lock().unwrap()[0].exit_code = Some(0);
         reconciler.reconcile_once().unwrap();

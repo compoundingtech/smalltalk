@@ -144,13 +144,23 @@ pub struct MemberSpec {
 
 /// Presentation is independent of the durable seat identity.
 pub fn effective_agent_name<'a>(subject: &'a str, desired: Option<&'a Value>) -> &'a str {
-    desired.and_then(|desired| {
-        desired.get("display_name").and_then(Value::as_str).or_else(|| {
-            desired.get("children")?.as_array()?.iter()
-                .find(|child| child.get("name").and_then(Value::as_str) == Some("name"))?
-                .get("arguments")?.as_array()?.first()?.as_str()
+    desired
+        .and_then(|desired| {
+            desired
+                .get("display_name")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    desired
+                        .get("children")?
+                        .as_array()?
+                        .iter()
+                        .find(|child| child.get("name").and_then(Value::as_str) == Some("name"))?
+                        .get("arguments")?
+                        .as_array()?
+                        .first()?
+                        .as_str()
+                })
         })
-    })
         .unwrap_or_else(|| subject.strip_prefix("agent/").unwrap_or(subject))
 }
 
@@ -172,10 +182,16 @@ pub struct DesiredSubject {
 impl DesiredSubject {
     /// Keep the authored KDL name and its normalized member projection identical.
     pub fn set_display_name(&mut self, name: Option<&str>) -> Result<(), St3Error> {
-        let children = self.desired.get_mut("children").and_then(Value::as_array_mut)
-            .ok_or_else(|| St3Error::new("invalid-agent-declaration", "agent has no canonical body"))?;
+        let children = self
+            .desired
+            .get_mut("children")
+            .and_then(Value::as_array_mut)
+            .ok_or_else(|| {
+                St3Error::new("invalid-agent-declaration", "agent has no canonical body")
+            })?;
         if let Some(name) = name {
-            if let Some(child) = children.iter_mut()
+            if let Some(child) = children
+                .iter_mut()
                 .find(|child| child.get("name").and_then(Value::as_str) == Some("name"))
             {
                 child["arguments"] = serde_json::json!([name]);

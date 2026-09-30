@@ -61,9 +61,6 @@ const PASSES_PER_SECOND: usize = 4;
 struct NoRuntime;
 
 impl RuntimeControl for NoRuntime {
-    fn set_display_name(&self, _runtime_id: &str, _name: &str) -> Result<()> {
-        Ok(())
-    }
     fn snapshot_ptys(&self) -> Result<Vec<RuntimeObservation>> {
         Ok(Vec::new())
     }

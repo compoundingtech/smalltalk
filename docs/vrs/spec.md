@@ -1607,8 +1607,8 @@ inbox --> st2 driver pi-channel --NDJSON--> pi-channel.ts --> pi.sendUserMessage
 `st2 driver pi-session` owns the launch. It resolves `pi-channel.ts` from this
 binary's verified immutable hook set and splices `-e <path>` in immediately
 after the provider program, so a declaration never carries a machine-local
-path. It exports `ST3_PI_CHANNEL_BIN`, `ST3_PI_CHANNEL_CATALOG`, and
-`ST3_PI_CHANNEL_IDENTITY`; the extension spawns exactly that binary rather than
+path. It exports `ST2_PI_CHANNEL_BIN`, `ST2_PI_CHANNEL_CATALOG`, and
+`ST2_PI_CHANNEL_IDENTITY`; the extension spawns exactly that binary rather than
 resolving `st2` from `PATH`, which is what keeps a replaced control plane and
 its live agents from disagreeing under R11. The wrapper also owns the
 five-minute presence heartbeat for as long as its provider lives, on the same
@@ -1647,7 +1647,7 @@ steer and queue is tracked in #277.
 A managed pi seat runs with `PI_OFFLINE=1` and `PI_SKIP_VERSION_CHECK=1` unless
 its declaration already sets them: a supervised agent must not self-update or
 make its boot latency depend on the network. The extension unexports
-`ST3_PI_CHANNEL_*` once it has read it, because pi places its environment in
+`ST2_PI_CHANNEL_*` once it has read it, because pi places its environment in
 front of every tool child, and eval seats scrub `PI_*` for the same reason they
 scrub `CLAUDE_*` and `CODEX_*`.
 

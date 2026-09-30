@@ -233,18 +233,19 @@ A running seat keeps its current process when you apply a changed declaration; l
 take effect the next time it starts. To use those now, stop the seat and apply again. `st agents stop
 agent/example/worker --as person/ada` stops a seat until you apply its file again.
 
-Human labels are live presentation, not launch configuration:
+Human labels are durable presentation, not launch configuration:
 
 ```sh
 st agents rename agent/example/worker "Garden maintenance" --as person/ada
 st agents rename agent/example/worker --clear --as person/ada
 ```
 
-Rename publishes only `desired.display_name`, the same durable field as KDL `name`. It does not
-restart the seat or change its identity. The Agent API, running PTY display name, and managed OMP
-header share this effective label; clearing it restores `example/worker`. OMP adds the launcher's
-persona suffix and restores the current label after `/new` or native-session resume. OMP's native
-`/rename` changes only its local title, not the seat's authoritative label.
+Rename updates KDL `name` and its normalized `desired.display_name` projection through the
+durable desired-state log. It does not restart the seat or change its identity. The Agent API
+reads this effective label from the daemon; clearing it restores `example/worker`. Rename uses
+the same declaration-authority boundary as applying the seat declaration. Live OMP headers and
+PTY titles will consume daemon seat updates through the channel work in #821, not label
+environment variables or new file-channel frames.
 
 [`examples/st3/seats`](examples/st3/seats) has a seat file for each harness.
 

@@ -54,7 +54,6 @@ walkdir = "2"
 tokio = { version = "1", features = ["test-util"] }
 agent-spec = { path = "../agent-spec" }
 assert_cmd = "2"
-parking_lot = "0.12"
 portable-pty = "0.9"
 predicates = "3"
 proptest = "1"

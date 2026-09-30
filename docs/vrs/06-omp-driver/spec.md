@@ -7,37 +7,37 @@ measured surface in
 
 ## Status
 
-The typed `harness "omp"` declaration expands to the `st3 driver omp` wrapper. The
-wrapper enforces the admitted 18.x minor gate and injects the immutable `omp-channel.ts`
-asset, type-checked and smoke-driven under `checks.pi-extension-types`. Driver decisions
-are recorded in
+Implemented in this change set: the `omp` driver block and expansion, the
+`omp-session` wrapper with the hard 18.x gate, the `omp-channel.ts` asset (type-checked and
+smoke-driven under `checks.pi-extension-types`), and the shared channel loop's blocked-frame
+parsing. The driver-level decisions are recorded in
 [decision 0007](../.decisions/0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate.md).
 Open questions are tracked in [open-questions.md](./open-questions.md).
 
 ## Overview
 
 ```text
-agent declaration             expansion (pure)              runtime
-─────────────────             ────────────────              ────────────────────────
-agent "seat" {                graph.rs                      st3 driver omp
-  name "Human label"          agent member ──────────────►   --subject agent/seat
-  harness "omp" {                                            -- omp … -e <set>/omp-channel.ts
-    model "…"                                                       │
-    effort "high"                                            omp (native TUI)
-  }                                                                 │ extension spawns
-}                                                           st3 driver omp-channel
-                                                            --identity seat
-                                                            ▲ LF-delimited JSON stdio
-                                                           omp-channel.ts
+agent spec                    expansion (pure)              runtime
+──────────────                ──────────────────            ─────────────────────────────
+driver omp {                 ┌──────────────┐   task argv: st2 driver omp-session
+  model    "…"               │ expand_omp    │             --identity … --runtime-id …
+  thinking "high"     ─────► │  in driver.rs │──────────►  -- <omp --model … -e <set>/omp-channel.ts>
+  prompt   "…"               └──────────────┘                        │
+}                                                          wrapper: presence lease,
+                                                           terminal harness-state record
+                                                                   │ spawns
+                                                           st2 driver omp-channel --identity …
+                                                            ▲ newline-JSON frames over stdio
+                                                           omp-channel.ts (in-process extension)
 ```
 
-## Harness declaration
+## Driver block
 
-An st3 seat declares `harness "omp" { model "…"; effort "high"; args "…" }`.
-The graph's typed harness parser expands `model` to `--model`, and `effort` to OMP's
-`--thinking` (off|minimal|low|medium|high|xhigh|max|auto); extra arguments are preserved.
-There is no startup prompt: the seat takes no turn until a person types or a channel
-message arrives.
+`OmpDriver { model: Option<String>, thinking: Option<String>, prompt: String }`, KDL
+kebab-case, mirroring `PiDriver`. omp has no effort flag; its analog is `--thinking`
+(off|minimal|low|medium|high|xhigh|max|auto), so the field is named for what omp exposes.
+Expansion prepends `--model` and `--thinking` when set; extra args ride the existing driver
+args escape.
 
 ## Wrapper (`src/omp_session.rs`)
 
@@ -68,7 +68,7 @@ Shape of `pi_session.rs`:
   resolved from this binary's immutable asset, never a catalog-pinned path).
 - Applies offline defaults (`PI_OFFLINE=1`, `PI_SKIP_VERSION_CHECK=1`) unless the operator's
   declaration already set them; suppression of the update banner itself is DQ-OMP-5.
-- Exports the channel env (`ST3_OMP_CHANNEL_{BIN,CATALOG,IDENTITY,RUNTIME_ID,SESSION,SEQ}`).
+- Exports the channel env (`ST2_OMP_CHANNEL_{BIN,CATALOG,IDENTITY,RUNTIME_ID,SESSION,SEQ}`).
   A residency wake also exports `EXPECTED_NATIVE_SESSION` and `RESUME_GENERATION`; ordinary
   launches explicitly remove both fence variables from the inherited provider environment.
   Fresh names ensure that an omp seat never adopts a stray pi channel env.
@@ -78,7 +78,7 @@ Shape of `pi_session.rs`:
 ## Channel (`hooks/omp-channel.ts`)
 
 Forked from `pi-channel.ts`; same frame protocol discipline (LF-delimited JSON, hello /
-message / label / delivered / failed / state / context frames, protocol 1). Differences:
+message / delivered / failed / state / context frames, PROTOCOL constant). Differences:
 
 - **Idle and terminal edges:** `agent_start` emits active. On a terminal `agent_end`, poll
   `ctx.isIdle()` every ~100 ms with a bounded window and emit idle at the first true sample.
@@ -93,7 +93,7 @@ message / label / delivered / failed / state / context frames, protocol 1). Diff
   `errorMessage` and its own classification bitfield, forwarded raw; otherwise the frame carries
   no error and is the positive proof the provider accepted the credential. This frame REPLACES
   the terminal error's own state frame: the credential edge and the categorical state are one
-  observation on two axes, and correlating them across two frames would be a race st3 cannot
+  observation on two axes, and correlating them across two frames would be a race st2 cannot
   win. `errorStatus` is deliberately not on the wire — three of the four measured 403s are not
   credential rejections, and omp already prefixes the status to the prose.
 - **Structured ask axis:** an `ask` `tool_call` with a valid question emits active with
@@ -105,60 +105,47 @@ message / label / delivered / failed / state / context frames, protocol 1). Diff
   activity proved by `isIdle()`. Approval frames do not overwrite a tracked structured ask.
 - **Pre-compaction edge:** `session_before_compact` emits `{type:"pre_compact"}`. The extension
   carries no durable path and writes no context itself.
-- **Session lifecycle and native binding:** both `session_start` and `session_switch` require
-  `ctx.sessionManager.getSessionId()`, reopen the channel, and send that native OMP session ID
+- **Session lifecycle and native binding:** `session_start` requires
+  `ctx.sessionManager.getSessionId()`, opens the channel, and sends that native OMP session ID
   before accepting Rust's hello. After the hello passes the protocol gate, the extension returns
-  a matching ready frame. The extension's generation and expected-ID fence applies to the first
-  restored session of a cold launch; an explicit later in-process session switch becomes the
-  current binding instead of inheriting the old fence. Replacement sessions close their named
-  predecessor in `open()`. Upstream defines
+  a matching ready frame. Only this two-way exchange makes the binding ready. The mandatory
+  generation and expected-ID fence applies to the first restored session of a cold launch; an
+  explicit later in-process session switch becomes the current binding instead of inheriting the
+  old fence. Replacement sessions close their named predecessor in `open()`. Upstream defines
   `session_shutdown` without a `reason` field and fires it on process exit, so every such event
   closes the current channel.
 - **Restored context:** seeding uses
-  `sendMessage({customType:"st3-session-start", …}, {deliverAs:"nextTurn"})`.
-
-## Seat labels
-
-`desired.display_name` (KDL `name`) is the authority for the human label. Its stored declaration
-contains the canonical KDL name child and the normalized member's `display_name`; rename keeps
-these two representations identical and preserves the original declaring authority.
-`st3 agents rename <subject> <label>` and `st3 agents rename <subject> --clear` publish only
-this presentation field through the durable desired-state log, without restarting the harness.
-Clearing restores the subject without the `agent/` prefix. The Agent API (and Fractal)
-and the running PTY's atomic `displayName` metadata projection use this same effective label.
-`ST_AGENT`, `ST3_SUBJECT`, `PTY_SESSION`, and seat/runtime identities remain unchanged.
-
-The cold protocol-1 hello includes `name` with the effective label. The running channel
-polls desired state and emits `{"type":"label","name":"…"}` when it changes, including
-after a binary re-exec; the last sent label survives re-exec in `PiChannelResume`.
-An old resume record without the label receives a label snapshot on the first tick, not
-a second context-bearing hello. Both additions are observational: old hooks ignore them.
-The OMP hook sets the native session title to the received label followed by
-`[${AGENT_PERSONA_SHORT}]` when the launcher supplies a nonempty short code.
-Rebinding on native-session start/switch restores the authoritative title after `/new`
-or resume. A native `/rename` is only a temporary local title until the next authority
-update or rebind, not a mutation of smalltalk desired state.
-Managed OMP members export `ST3_OMP_CHANNEL_LABELS=1`, allowing launch-provided status
-extensions to relinquish title writes to the channel. Older/direct launch paths retain
-their own title writer when that capability is absent.
+  `sendMessage({customType:"st2-session-start", …}, {deliverAs:"nextTurn"})`.
 
 ## Rust channel process
 
-`st3 driver omp-channel` runs the pi-family loop in `crates/st3/src/main.rs`.
-It waits for the seat's running incarnation, sends a protocol-1 hello with the effective
-label and restored session context, and records categorical harness state and native handoff
-receipts through the st3 API. The extension's provider-idle proof gates message delivery. Failed
-handoffs remain queued with backoff, and authoritative receipts settle them. The channel
-keeps reports across daemon outages and carries its state and partial input frame across
-binary re-exec without replaying restored context.
+`st2 driver omp-channel` reuses the pi channel's loop (`pi_channel.rs`) parameterized by the
+`ChannelKind` for `"omp"`; the state frame parser accepts the blocked fields. Before publishing
+hello, the OMP endpoint stores a separate not-ready candidate and validates its wrapper
+incarnation, residency generation, and required native ID. The checkpoint binding remains
+authoritative and retryable if the channel exits before the exchange completes. Only a matching
+ready frame promotes the candidate to the authoritative binding. Residency readiness therefore
+proves the new wrapper incarnation, exact native session, exact generation, and completed
+two-way channel handshake; a binding from before the checkpoint remains starting rather than
+becoming a false positive.
 
-The st3 loop consumes `state`, `delivered`, and `failed` extension frames. `active` projects
-to `working`, and `idle` projects to `idle`; optional blocked-on-human details are not projected
-by this loop. The hook also emits `session`, `ready`, `context`, `turn`, and `pre_compact`
-observations, but this st3 channel does not consume those frames. In particular, this loop
-does not publish a durable native-session binding, a pre-compaction context stub, or a typed
-provider-auth diagnostic. Those behaviors of the legacy `src/pi_channel.rs` loop must not be
-read as st3 guarantees. Labels are independent of those observational frames.
+On `pre_compact`, Rust resolves `<agent>/resources/context/now.md` through the canonical context
+API. The blank predicate and atomic replacement execute under the same lock used by every
+`now.md` writer, so an authored write cannot land between them. Only `NotFound` or successfully
+decoded whitespace-only content permits the recovery stub; nonblank content is preserved, and
+every other read failure leaves the entry untouched and publishes a deterministic actionable
+error state. The ding side gains no omp adapter (OMP-T03): delivery is channel-only, failing
+closed when absent.
+
+The `{type:"turn"}` frame lands on two independent records. Categorically, a provider error is
+`active` — nothing is running, but a record saying `idle` would read as a healthy yield — with
+reason `providerAuth` for the credential class and omp's own bounded prose for every other one; an
+ordinary end asserts nothing, because the sampled idle poll still owns that edge. On the
+native-driver diagnostic it publishes `providerAuth`/`providerAuthRejected`/`turnResult` under
+driver word `omp`, or clears that stage. Each edge uses a fresh publisher, so the on-disk record is
+what carries a rejection across a channel restart. `ChannelKind` is what keeps this out of the pi
+channel: pi's extension has no classification field to forward, so `diagnostic_driver` is `None`
+there and the same loop publishes no credential verdict for it.
 
 ## Admission evidence required for a new minor
 

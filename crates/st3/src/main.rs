@@ -7882,18 +7882,22 @@ async fn run_agents(
 ) -> Result<()> {
     match command {
         AgentsCommand::Rename(args) => {
-            let actor = args.actor.as_deref().or(configured_person).context(
-                "st3 agents rename needs --as ACTOR or a configured person",
-            )?;
-            let response: Value = cli_client(endpoint).post(
-                "/v1/agents/rename",
-                &json!({
-                    "subject": normalize_agent_subject(&args.subject),
-                    "name": args.label,
-                    "actor": actor,
-                    "idempotency_key": uuid::Uuid::now_v7().to_string(),
-                }),
-            ).await?;
+            let actor = args
+                .actor
+                .as_deref()
+                .or(configured_person)
+                .context("st3 agents rename needs --as ACTOR or a configured person")?;
+            let response: Value = cli_client(endpoint)
+                .post(
+                    "/v1/agents/rename",
+                    &json!({
+                        "subject": normalize_agent_subject(&args.subject),
+                        "name": args.label,
+                        "actor": actor,
+                        "idempotency_key": uuid::Uuid::now_v7().to_string(),
+                    }),
+                )
+                .await?;
             print_value(&response, json_output)
         }
         AgentsCommand::Queue(args) => {
@@ -12435,14 +12439,6 @@ fn pi_family_session_context(identity: &str, context: &str) -> String {
     )
 }
 
-async fn current_agent_name(client: &Client, subject: &str) -> Result<String> {
-    let status: StatusResponse = client.get(&format!(
-        "/v1/status?subject={}", urlencoding::encode(subject),
-    )).await?;
-    let desired = status.subjects.first().and_then(|subject| subject.desired.as_ref());
-    Ok(st3::model::effective_agent_name(subject, desired).to_owned())
-}
-
 async fn run_pi_channel(
     client: &Client,
     subject: &str,
@@ -12472,9 +12468,6 @@ async fn run_pi_channel(
         }
         None => {
             let incarnation = wait_for_agent_incarnation(client, subject).await?;
-            let name = retry_while_daemon_unreachable(subject, || {
-                current_agent_name(client, subject)
-            }).await?;
             let context_name = format!("doc/context/{identity}/now");
             let context = retry_while_daemon_unreachable(subject, || {
                 latest_document_text(client, &context_name)
@@ -12490,7 +12483,6 @@ async fn run_pi_channel(
                             "type": "hello",
                             "protocol": 1,
                             "identity": identity,
-                            "name": name,
                             "sessionContext": session_context,
                         }))?
                     )
@@ -12500,12 +12492,8 @@ async fn run_pi_channel(
             stdout.flush().await?;
             PiChannelResume {
                 incarnation,
-                label: Some(name),
-                session: std::env::var(if driver == "omp" {
-                    st2::omp_session::CHANNEL_SESSION
-                } else {
-                    st2::pi_session::CHANNEL_SESSION
-                }).unwrap_or_else(|_| "unknown".into()),
+                session: std::env::var("ST2_PI_CHANNEL_SESSION")
+                    .unwrap_or_else(|_| "unknown".into()),
                 ..PiChannelResume::default()
             }
         }
@@ -12562,17 +12550,6 @@ async fn run_pi_channel(
                 }
             }
             _ = interval.tick() => {
-                match current_agent_name(client, subject).await {
-                    Ok(name) if state.label.as_deref() != Some(name.as_str()) => {
-                        stdout.write_all(format!("{}\n", json!({
-                            "type": "label", "name": name,
-                        })).as_bytes()).await?;
-                        stdout.flush().await?;
-                        state.label = Some(name);
-                    }
-                    Ok(_) => {}
-                    Err(error) => warn_pi_channel(subject, &error, &mut last_warning),
-                }
                 if let Err(error) = state
                     .pending
                     .publish(client, subject, driver, &incarnation, &session)
@@ -12756,8 +12733,6 @@ async fn run_pi_channel(
 struct PiChannelResume {
     incarnation: String,
     session: String,
-    #[serde(default)]
-    label: Option<String>,
     delivered: BTreeSet<String>,
     failed_handoffs: BTreeMap<String, u32>,
     #[serde(default)]
@@ -14613,7 +14588,6 @@ mod tests {
         let mut state = PiChannelResume {
             incarnation: "1:one".into(),
             session: "session".into(),
-            label: Some("Current seat".into()),
             ..PiChannelResume::default()
         };
         state
@@ -14629,7 +14603,6 @@ mod tests {
         // The next image reads everything back, including the partial frame.
         let mut resumed: PiChannelResume =
             serde_json::from_slice(&serde_json::to_vec(&state).unwrap()).unwrap();
-        assert_eq!(resumed.label.as_deref(), Some("Current seat"));
         resumed
             .lines
             .push(b"ered\",\"meta\":{\"messageId\":\"message/one\"}}\n");

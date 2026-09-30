@@ -1,13 +1,13 @@
-// st3 native message delivery for the omp harness.
+// st2 native message delivery for the omp harness.
 //
 // Forked from pi-channel.ts: omp is pi-family and loads the same extension shape, but the two
 // diverge where it matters (measured 2026-08-25, omp v18.0.3 — see
 // docs/vrs/06-omp-driver/.experiments/). omp has no `agent_settled` event, so terminal
 // `agent_end` uses a bounded `ctx.isIdle()` poll; structured `ask` tool events and approval events
 // carry the blocked-on-human axis pi cannot express; and a failed turn carries omp's own typed
-// error classification, which this asset forwards raw because st3 — not the asset — decides what
+// error classification, which this asset forwards raw because st2 — not the asset — decides what
 // a rejected provider credential is. Like the pi asset this file holds no delivery
-// policy: st3 decides which message is delivered, how, and what a starting session is told. The
+// policy: st2 decides which message is delivered, how, and what a starting session is told. The
 // one omp-specific choice here is timing: a message that arrives during a running turn is handed
 // to omp at the tool-batch boundary where omp would inject it anyway (see `HOLD_MAX_MS`). It
 // fails open in both directions — an unmanaged omp session loads this extension and does nothing;
@@ -21,16 +21,16 @@ import type {
 
 const PROTOCOL = 1;
 
-const BIN = "ST3_OMP_CHANNEL_BIN";
-const CATALOG = "ST3_OMP_CHANNEL_CATALOG";
-const IDENTITY = "ST3_OMP_CHANNEL_IDENTITY";
-const RUNTIME_ID = "ST3_OMP_CHANNEL_RUNTIME_ID";
-const SESSION = "ST3_OMP_CHANNEL_SESSION";
-const SEQ = "ST3_OMP_CHANNEL_SEQ";
-const EXPECTED_NATIVE_SESSION = "ST3_OMP_CHANNEL_EXPECTED_NATIVE_SESSION";
-const RESUME_GENERATION = "ST3_OMP_CHANNEL_RESUME_GENERATION";
+const BIN = "ST2_OMP_CHANNEL_BIN";
+const CATALOG = "ST2_OMP_CHANNEL_CATALOG";
+const IDENTITY = "ST2_OMP_CHANNEL_IDENTITY";
+const RUNTIME_ID = "ST2_OMP_CHANNEL_RUNTIME_ID";
+const SESSION = "ST2_OMP_CHANNEL_SESSION";
+const SEQ = "ST2_OMP_CHANNEL_SEQ";
+const EXPECTED_NATIVE_SESSION = "ST2_OMP_CHANNEL_EXPECTED_NATIVE_SESSION";
+const RESUME_GENERATION = "ST2_OMP_CHANNEL_RESUME_GENERATION";
 
-// omp starts the session even if st3 is slow to answer. Restored context is worth a short wait
+// omp starts the session even if st2 is slow to answer. Restored context is worth a short wait
 // and never worth a hung agent.
 const HELLO_TIMEOUT_MS = 5000;
 
@@ -49,7 +49,6 @@ const HOLD_MAX_MS = 10_000;
 type Frame = {
   type?: string;
   protocol?: number;
-  name?: string;
   sessionContext?: string;
   content?: string;
   deliverAs?: "steer" | "followUp";
@@ -92,7 +91,7 @@ type Stash = {
    * The last assistant message's `usage.cost.total`.
    *
    * Cost rides only the message-bearing events, but a context frame may be emitted from an event
-   * that carries none (`agent_end`, `session_start`). st3's record replaces a reading's fields
+   * that carries none (`agent_end`, `session_start`). st2's record replaces a reading's fields
    * WHOLESALE — deliberately, so a withheld number is never fabricated from a previous one — so a
    * frame omitting the cost would erase the published one on the very next turn boundary.
    */
@@ -115,7 +114,7 @@ type Stash = {
 
 /**
  * Withhold rather than coerce (HC-R03). A non-finite or absent value is not a reading, and
- * substituting zero, the previous number, or a division st3 could have done itself is exactly the
+ * substituting zero, the previous number, or a division st2 could have done itself is exactly the
  * fabrication HC-R03 forbids.
  */
 const finiteOrNull = (value: unknown): number | null =>
@@ -143,7 +142,7 @@ type AgentEndFrame = {
  * omp's own words for the provider error that ended a turn.
  *
  * `errorId` is omp's error-classification BITFIELD, assigned onto the assistant message at the
- * provider-stream boundary beside `errorStatus` and `errorMessage`. It travels raw: st3 owns the
+ * provider-stream boundary beside `errorStatus` and `errorMessage`. It travels raw: st2 owns the
  * verdict, exactly as it owns delivery policy, so this asset never decides what an auth failure
  * is. `errorStatus` is deliberately not carried — the status code classifies nothing (three of
  * the four measured 403s are not credential rejections) and omp already prefixes it to the prose.
@@ -204,11 +203,11 @@ void pinnedTelemetrySurface;
 /**
  * Read the channel configuration once and unexport it.
  *
- * Channel identity and ownership values are stashed and unexported: a leaked runtime id or session
- * token would hand a nested harness child this seat's registry key and record ownership.
- * The values cannot live in module scope because a second instantiation would find them already deleted and
+ * Every ST2_OMP_CHANNEL_* value is stashed and unexported: a leaked runtime id or session token
+ * would hand a nested harness child this seat's registry key and record ownership. The values
+ * cannot live in module scope because a second instantiation would find them already deleted and
  * silently run as an unmanaged session; the stash outlives re-instantiation, the environment does
- * not. ST3_OMP_CHANNEL_LABELS remains available to the status extension's single-writer guard.
+ * not.
  */
 const stash = (): Stash => {
   const globals = globalThis as { __st2OmpChannel?: Stash };
@@ -285,7 +284,7 @@ export default function (pi: ExtensionAPI) {
       // Refuse rather than degrade. Without a positive idle proof this extension cannot choose
       // between an idle send and a steer, and guessing would deliver into a running turn.
       ctx.ui?.notify?.(
-        "st3: this omp build exposes no ctx.isIdle(); refusing to open the st3 channel",
+        "st2: this omp build exposes no ctx.isIdle(); refusing to open the st2 channel",
         "error",
       );
       return Promise.resolve("");
@@ -293,7 +292,7 @@ export default function (pi: ExtensionAPI) {
     const nativeSessionId = ctx.sessionManager.getSessionId();
     if (typeof nativeSessionId !== "string" || nativeSessionId.trim() === "") {
       ctx.ui?.notify?.(
-        "st3: omp reported no native session id; refusing to open the st3 channel",
+        "st2: omp reported no native session id; refusing to open the st2 channel",
         "error",
       );
       return Promise.resolve("");
@@ -379,14 +378,10 @@ export default function (pi: ExtensionAPI) {
           if (frame.protocol !== PROTOCOL) {
             closeChild(child);
             ctx.ui?.notify?.(
-              `st3: omp channel protocol ${frame.protocol} is not understood by this extension (expected ${PROTOCOL}); reinstall st3's hook set`,
+              `st2: omp channel protocol ${frame.protocol} is not understood by this extension (expected ${PROTOCOL}); reinstall st2's hook set`,
             );
             settle("");
             return;
-          }
-          if (typeof frame.name === "string") {
-            const persona = process.env.AGENT_PERSONA_SHORT;
-            pi.setSessionName(frame.name + (persona ? `[${persona}]` : ""));
           }
           state.reconnectAttempt = 0;
           send({ type: "ready", sessionId: nativeSessionId });
@@ -406,17 +401,12 @@ export default function (pi: ExtensionAPI) {
             // identity into the next turn instead of silently dropping the late hello.
             try {
               pi.sendMessage(
-                { customType: "st3-session-start", content: context, display: true },
+                { customType: "st2-session-start", content: context, display: true },
                 { deliverAs: "nextTurn" },
               );
             } catch { /* session shutdown may have begun */ }
           }
           settle(context);
-          return;
-        }
-        if (frame.type === "label" && typeof frame.name === "string") {
-          const persona = process.env.AGENT_PERSONA_SHORT;
-          pi.setSessionName(frame.name + (persona ? `[${persona}]` : ""));
           return;
         }
         if (frame.type !== "message" || typeof frame.content !== "string") return;
@@ -459,7 +449,7 @@ export default function (pi: ExtensionAPI) {
     state.reconnectTimer.unref?.();
   };
 
-  // Frames are observational — st3 decides what becomes of them — and a closed channel drops
+  // Frames are observational — st2 decides what becomes of them — and a closed channel drops
   // them silently.
   const sendFrame = (frame: Record<string, unknown>) => {
     const child = state.child;
@@ -649,7 +639,7 @@ export default function (pi: ExtensionAPI) {
   // The call is present and working on 18.0.3 as well as 18.0.9 (35 occurrences in each binary);
   // the older capture's "ctx exposes {ui} only" was a probe artifact, not a version fact.
   //
-  // As on pi, this asset holds no cadence policy — st3's write guard quantizes to 1% of the
+  // As on pi, this asset holds no cadence policy — st2's write guard quantizes to 1% of the
   // window — and every pull is guarded, because an observability call must never take a turn down.
   const modelId = (ctx: ExtensionContext): string | null => {
     try {
@@ -691,7 +681,7 @@ export default function (pi: ExtensionAPI) {
   /**
    * The harness-durable compaction count (HC-R12) — omp's own session store, through the same
    * `getEntries()` path as pi's, measured going 0 → 1 across the event. `null` when the store
-   * cannot be read, which makes st3 count the edge itself: a weaker, incarnation-scoped answer
+   * cannot be read, which makes st2 count the edge itself: a weaker, incarnation-scoped answer
    * and never a wrong one.
    */
   const durableCompactions = (ctx: ExtensionContext): number | null => {
@@ -756,7 +746,7 @@ export default function (pi: ExtensionAPI) {
     }
     // The typed turn result, on every turn that ACTUALLY ended and in both directions. It is one
     // frame rather than two because the credential edge and the categorical state are the same
-    // observation seen from two axes, and correlating them across frames would be a race st3
+    // observation seen from two axes, and correlating them across frames would be a race st2
     // cannot win. An ordinary end carries no error and asserts no state: the sampled idle below
     // still owns that edge.
     const error = terminalProviderError(end);
@@ -783,7 +773,7 @@ export default function (pi: ExtensionAPI) {
     });
   }
   // omp's `session_compact` carries NO `reason` and no `willRetry` — pi 0.84.2 has both — so the
-  // trigger is withheld here and st3 records `unknown`. omp does name its auto-compaction "idle"
+  // trigger is withheld here and st2 records `unknown`. omp does name its auto-compaction "idle"
   // and "threshold" internally, but those words are not projected onto the event, and inventing
   // one would be a claim no capture supports. Unlike pi, omp's `getContextUsage()` still answers
   // inside this handler (8,100 measured, not null), so the frame carries a real post-compaction
@@ -899,8 +889,9 @@ export default function (pi: ExtensionAPI) {
     sendFrame({ type: "pre_compact" });
   });
 
-  const bindSession = async (_event: unknown, ctx: ExtensionContext) => {
-    // New and resumed native sessions both need the current authority snapshot.
+  pi.on("session_start", async (_event, ctx) => {
+    // Awaited before the session's first turn, which is what makes restored context reach the boot
+    // prompt rather than the turn after it.
     const restored = await open(ctx);
     const opened = state.child;
     if (opened) {
@@ -911,13 +902,11 @@ export default function (pi: ExtensionAPI) {
     if (restored.trim()) {
       // A custom message participates in LLM context without triggering a turn of its own.
       pi.sendMessage(
-        { customType: "st3-session-start", content: restored, display: true },
+        { customType: "st2-session-start", content: restored, display: true },
         { deliverAs: "nextTurn" },
       );
     }
-  };
-  pi.on("session_start", bindSession);
-  onWidened("session_switch", bindSession);
+  });
   // Upstream's `session_shutdown` payload has no reason: source defines it as process exit only.
   // Replacement is a separate session-switch lifecycle and remains handled by `open()` closing
   // the named predecessor.

@@ -61,10 +61,8 @@ session instead of ending it, and writes no terminal record. The next image adop
 The driver also carries its published timeline, its ready flag, and its delivery episode number, so
 the new image republishes nothing. The Claude channel carries the MCP handshake, the inbox files it
 already handed to Claude, and any partial request line. The pi-family channel carries its delivered
-and failed messages, its unsent reports, last effective seat label, and any partial frame; it skips
-the hello because the extension already has its session context. A changed label (or an older
-resume record without one) is projected as a separate label frame on the next observation tick.
-Both channels read stdin on a thread that polls with a
+and failed messages, its unsent reports, and any partial frame; it skips the hello, because the
+extension already has its session context. Both channels read stdin on a thread that polls with a
 short timeout and is joined before the exec, so no byte they took from the pipe is lost.
 
 A driver's control loop now ends only when its provider ends. A failed publish is logged and retried,

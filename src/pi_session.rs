@@ -25,19 +25,19 @@ const EXTENSION: &str = "pi-channel.ts";
 pub const MEASURED_CONTEXT_VERSION: &str = "0.84.2";
 
 /// The exact st2 executable the pi extension must spawn for its channel.
-pub const CHANNEL_BIN: &str = "ST3_PI_CHANNEL_BIN";
+pub const CHANNEL_BIN: &str = "ST2_PI_CHANNEL_BIN";
 /// The catalog root that executable must be pointed at.
-pub const CHANNEL_CATALOG: &str = "ST3_PI_CHANNEL_CATALOG";
+pub const CHANNEL_CATALOG: &str = "ST2_PI_CHANNEL_CATALOG";
 /// The host-qualified bus identity the channel binds.
-pub const CHANNEL_IDENTITY: &str = "ST3_PI_CHANNEL_IDENTITY";
+pub const CHANNEL_IDENTITY: &str = "ST2_PI_CHANNEL_IDENTITY";
 /// The wrapper's runtime/task ID — the pty session whose liveness vouches for observed state.
-pub const CHANNEL_RUNTIME_ID: &str = "ST3_PI_CHANNEL_RUNTIME_ID";
+pub const CHANNEL_RUNTIME_ID: &str = "ST2_PI_CHANNEL_RUNTIME_ID";
 /// The session incarnation token the wrapper mints. The channel adopts it so the wrapper's
 /// terminal record owns — and thereby fences — the live records the channel writes.
-pub const CHANNEL_SESSION: &str = "ST3_PI_CHANNEL_SESSION";
+pub const CHANNEL_SESSION: &str = "ST2_PI_CHANNEL_SESSION";
 /// The ownership sequence the wrapper claimed at startup — exported beside the token so the
 /// channel's writes act under the same directional claim.
-pub const CHANNEL_SEQ: &str = "ST3_PI_CHANNEL_SEQ";
+pub const CHANNEL_SEQ: &str = "ST2_PI_CHANNEL_SEQ";
 
 /// pi's half of the pi-family launch fork. No `verify_version`: pi gates its build in
 /// `flake.nix`'s extension check rather than at launch.
