@@ -399,7 +399,12 @@ agent "fault-probe" {{
                 return len([row for row in receipts(target) if row.get("subject") == subject
                             and row["event"] == "handoff-refused"]) >= 3
             await until(refused, 30)
-            await asyncio.sleep(5)  # also cross the sender's ten-second read threshold
+            async def old_enough():
+                view = await source.api("/v1/messages/delivery/" + subject)
+                return (view or {}).get("delivery", {}).get("age_ms", 0) >= 11000
+            # Measure from the sender's actual accepted timestamp, not from retry
+            # counts: scheduling can put the third failure before five seconds.
+            await until(old_enough, 20)
             blocked_agent = await agent(target)
             blocked_doctor = await target.api("/v1/doctor")
             blocked_sender = await source.api("/v1/messages/delivery/" + subject)
