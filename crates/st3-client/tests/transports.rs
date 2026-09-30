@@ -712,6 +712,99 @@ async fn detach_terminal(client: &Client, attachment: &TerminalAttachment, suffi
 }
 
 #[tokio::test]
+async fn applied_subject_definitions_roundtrip_and_report_typed_absence() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let server_socket = socket.clone();
+    let state = state(root.path(), "client-definition");
+    let source = r#"version 2
+agent "fleet/definition" {
+  description "Quotes \" and backslashes \\ and Unicode λ.\nSecond line."
+  command "true"
+  env { API_TOKEN "fixture-secret" }
+}
+mission "example/definition" state="ready" {
+  goal "Inspect the applied graph, not an authored file."
+  step "inspect" { agentless }
+}
+"#;
+    let intent = st3::graph::parse_intent(source, "client-definition").unwrap();
+    state.store.apply_internal(&intent, "definition-fixture").unwrap();
+    // An observed runtime alone has no desired declaration to reconstruct.
+    publish_terminal(&state, "terminal-demo-runtime:i1");
+    let app = st3::api::router(state.clone());
+    let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
+    wait_for_socket(&socket).await;
+    let client = Client::unix(&socket);
+
+    {
+        let subject = "agent/fleet/definition";
+        // Environment values are hidden unless explicitly requested.
+        let response = client.subject_definition(subject, false).await.unwrap();
+        let definition = response.value;
+        assert_eq!(definition.subject, subject);
+        let mut redacted = intent.subjects[subject].desired.clone();
+        st3::graph::redact_agent_env_values(&mut redacted);
+        assert_eq!(serde_json::to_value(&definition.desired).unwrap(), redacted);
+        let reparsed = st3::graph::parse_intent(&definition.kdl, "client-definition").unwrap();
+        assert_eq!(reparsed.subjects[subject].desired, redacted, "{}", definition.kdl);
+        assert!(!serde_json::to_string(&definition).unwrap().contains("fixture-secret"));
+        let status = state.store.status(Some(subject)).unwrap();
+        let status = status.subjects.iter().find(|item| item.subject == subject).unwrap();
+        assert_eq!(Some(&definition.desired_revision), status.desired_revision.as_ref());
+        assert_eq!(Some(&definition.desired_token), status.desired_token.as_ref());
+        assert_eq!(definition.conflicts, status.conflicts);
+        assert_eq!(response.snapshot.store_index, state.store.index().unwrap());
+
+        // Explicit values need declaration scope, which a projection-only reader lacks.
+        assert!(matches!(
+            client.subject_definition(subject, true).await,
+            Err(ClientError::Api(ErrorCode::Forbidden, _, _))
+        ));
+        let person = Client::unix_as(&socket, "person/test");
+        let definition = person.subject_definition(subject, true).await.unwrap().value;
+        let ast = serde_json::to_value(&definition.desired).unwrap();
+        assert_eq!(ast, intent.subjects[subject].desired);
+        assert!(definition.kdl.contains("fixture-secret"), "{}", definition.kdl);
+
+        let rendered = st3::graph::parse_intent(&definition.kdl, "client-definition").unwrap();
+        let preview = state.store.mission(&rendered, st3::model::IntentInput {
+            kdl: definition.kdl,
+            source_name: None,
+        }).unwrap();
+        assert_eq!(preview.normalized["declarations"], serde_json::json!([ast]));
+        assert!(preview.changes.is_empty(), "{:?}", preview.changes);
+    }
+
+    for subject in ["agent/unknown", "agent/terminal-demo"] {
+        assert!(matches!(
+            client.subject_definition(subject, false).await,
+            Err(ClientError::Api(ErrorCode::NotFound, _, _))
+        ));
+    }
+    // A published mission is a compiled revision with no desired declaration AST to render.
+    for subject in ["mission/example/definition", "runtime/not-a-definition"] {
+        assert!(matches!(
+            client.subject_definition(subject, false).await,
+            Err(ClientError::Api(ErrorCode::ValidationFailed, _, _))
+        ));
+    }
+
+    // Descriptions are capped at 1,000 bytes; a command is not, so it can outgrow a response.
+    let oversized = format!(
+        "version 2\nagent \"fleet/large-definition\" {{ command \"true {}\" }}",
+        "x".repeat(1_100_000),
+    );
+    let oversized = st3::graph::parse_intent(&oversized, "client-definition").unwrap();
+    state.store.apply_internal(&oversized, "large-definition-fixture").unwrap();
+    assert!(matches!(
+        client.subject_definition("agent/fleet/large-definition", false).await,
+        Err(ClientError::Api(ErrorCode::ValidationFailed, _, _))
+    ));
+    server.abort();
+}
+
+#[tokio::test]
 async fn generated_client_conforms_over_the_real_unix_transport() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");

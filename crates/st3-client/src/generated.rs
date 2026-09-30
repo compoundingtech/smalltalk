@@ -294,6 +294,30 @@ pub struct DocumentContent {
     pub reference: String,
     pub bytes: Vec<u8>,
 }
+
+/// A normalized KDL node. Empty optional collections are omitted just as in the stored AST.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct CanonicalNode {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arguments: Vec<Value>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub properties: BTreeMap<String, Value>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<CanonicalNode>,
+}
+
+/// Applied desired state, not the original declaration file or a proposed mission revision.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct SubjectDefinition {
+    pub kind: String,
+    pub subject: String,
+    pub desired: CanonicalNode,
+    pub kdl: String,
+    pub desired_revision: String,
+    pub desired_token: String,
+    pub conflicts: Vec<String>,
+}
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct AgentDeclaration {
     pub id: String,
