@@ -388,11 +388,44 @@ impl Mission {
 
 // ---------------------------------------------------------------- fleet, trees
 
+/// How this machine knows another fleet member is there.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Reach {
+    /// The machine stui is talking to.
+    Here,
+    /// It replicates with this machine directly.
+    Direct,
+    /// No direct link, but its agents were heard from recently through other members.
+    Indirect,
+    /// Not heard from recently.
+    Offline,
+    /// st cannot tell: its reports about the machine disagree.
+    Unknown,
+}
+
+impl Reach {
+    pub fn online(self) -> bool {
+        matches!(self, Reach::Here | Reach::Direct | Reach::Indirect)
+    }
+    pub fn word(self) -> &'static str {
+        match self {
+            Reach::Here => "this machine",
+            Reach::Direct => "connected",
+            Reach::Indirect => "online, through another machine",
+            Reach::Offline => "offline",
+            Reach::Unknown => "st cannot tell",
+        }
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Machine {
     pub name: String,
-    pub online: bool,
+    pub reach: Reach,
+    /// Operating system and architecture, when st reports them; empty otherwise.
     pub platform: String,
+    /// When anything was last heard from it: "4s ago", or "never".
     pub seen: String,
     pub load: Option<String>,
     pub links: Vec<(String, bool, String)>,

@@ -822,43 +822,68 @@ fn is_system_mission(id: &str) -> bool {
 
 // ------------------------------------------------------------------- machines
 
+/// A member heard from within this long is online, even without a direct link.
+const HEARD_RECENTLY: chrono::Duration = chrono::Duration::minutes(5);
+
 fn machines(model: &Model) -> Vec<Machine> {
     let gateway = gateway(model).unwrap_or_default();
     model
         .machines()
-        .map(|machine| Machine {
-            name: machine.name.clone(),
-            online: matches!(
-                machine.state.as_str(),
-                "online" | "reachable" | "local" | "active"
-            ),
-            platform: machine.state.clone(),
-            seen: machine
+        .map(|machine| {
+            // A member this machine does not replicate with directly is still heard through
+            // the others: its agents' activity arrives with everything else.
+            let heard = machine
                 .transports
                 .iter()
                 .filter_map(|transport| transport.last_success_at.as_deref())
-                .max()
-                .map(age)
-                .unwrap_or_else(|| "not seen yet".into()),
-            load: Some(format!(
-                "{} running runtimes",
-                machine.occupancy.running_runtimes
-            )),
-            links: machine
-                .transports
-                .iter()
-                .map(|transport| {
-                    (
-                        transport.protocol.clone(),
-                        matches!(
+                .chain(
+                    model
+                        .agents()
+                        .filter(|agent| agent.host_id.as_deref() == Some(machine.host_id.as_str()))
+                        .filter_map(|agent| agent.last_activity_at.as_deref()),
+                )
+                .filter_map(|at| chrono::DateTime::parse_from_rfc3339(at).ok())
+                .max();
+            let recent = heard.is_some_and(|at| chrono::Utc::now() - at.to_utc() < HEARD_RECENTLY);
+            let reach = match machine.state.as_str() {
+                _ if machine.host_id == gateway => Reach::Here,
+                "local" => Reach::Here,
+                "reachable" => Reach::Direct,
+                _ if recent => Reach::Indirect,
+                "indeterminate" => Reach::Unknown,
+                _ => Reach::Offline,
+            };
+            Machine {
+                name: machine.name.clone(),
+                reach,
+                platform: String::new(),
+                seen: heard
+                    .map(|at| crate::age_label(&at.to_rfc3339(), &now()))
+                    .unwrap_or_else(|| "never".into()),
+                load: Some(match machine.occupancy.running_runtimes {
+                    1 => "1 running runtime".to_owned(),
+                    count => format!("{count} running runtimes"),
+                }),
+                links: machine
+                    .transports
+                    .iter()
+                    // This machine's own socket is not a link to anywhere.
+                    .filter(|transport| transport.status != "local")
+                    .map(|transport| {
+                        let up = matches!(
                             transport.status.as_str(),
                             "ok" | "up" | "connected" | "reachable" | "healthy"
-                        ),
-                        transport.status.clone(),
-                    )
-                })
-                .collect(),
-            you_are_here: machine.host_id == gateway,
+                        );
+                        let detail = match (up, transport.last_success_at.as_deref()) {
+                            (true, _) => "up".to_owned(),
+                            (false, Some(at)) => format!("down · last worked {}", age(at)),
+                            (false, None) => "no direct link".to_owned(),
+                        };
+                        (transport.protocol.clone(), up, detail)
+                    })
+                    .collect(),
+                you_are_here: machine.host_id == gateway,
+            }
         })
         .collect()
 }
@@ -2117,6 +2142,116 @@ mod tests {
                 && outcome.ends_with(" ago: the change merged after its gate was fixed"),
             "{outcome}"
         );
+    }
+
+    #[test]
+    fn machines_say_how_they_are_reached_and_never_call_a_heard_member_offline() {
+        let now = chrono::Utc::now();
+        let ago = |minutes: i64| (now - chrono::Duration::minutes(minutes)).to_rfc3339();
+        let machine = |name: &str, state: &str, transport: Value| {
+            json!({
+                "id": format!("machine/{name}"), "kind": "machine", "revision": "r",
+                "updated_at": "2026-09-29T09:00:00Z", "host_id": format!("host/{name}"),
+                "name": name, "state": state, "capacity": {"state": "unknown", "reason": "no capacity observation"},
+                "occupancy": {"running_runtimes": 1}, "transports": [transport],
+            })
+        };
+        let mut model = Model::default();
+        model.machines = window(vec![
+            machine(
+                "harbor",
+                "local",
+                json!({"protocol": "unix", "status": "local", "last_success_at": null}),
+            ),
+            machine(
+                "quay",
+                "reachable",
+                json!({"protocol": "replication", "status": "up", "last_success_at": ago(0)}),
+            ),
+            // No direct link from here, but its agent spoke a minute ago through another member.
+            machine(
+                "wren",
+                "last-seen",
+                json!({"protocol": "replication", "status": "last-seen", "last_success_at": null}),
+            ),
+            machine(
+                "gull",
+                "last-seen",
+                json!({"protocol": "replication", "status": "last-seen", "last_success_at": ago(90)}),
+            ),
+        ]);
+        model.agents = window(vec![json!({
+            "id": "agent/fleet/wren/probe", "kind": "agent", "revision": "r",
+            "updated_at": "2026-09-29T09:00:00Z", "name": "fleet/wren/probe", "state": "running",
+            "reachability": "remote", "harness_state": "idle", "next_work_id": null, "next_work": null,
+            "host_id": "host/wren", "last_activity_at": ago(1), "runtime_ids": [],
+            "current_work_ids": [], "upcoming_work_ids": [], "queued_work_count": 0,
+            "current_work": [], "upcoming_work": [], "under": [],
+        })]);
+        let world = world(&model, "person/avery", &Extras::default());
+        let Load::Ready(machines) = &world.machines else {
+            panic!("machines load")
+        };
+        let reach = machines
+            .iter()
+            .map(|machine| (machine.name.as_str(), machine.reach, machine.seen.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(reach[0], ("harbor", Reach::Here, "never"));
+        assert_eq!(reach[1].1, Reach::Direct);
+        assert_eq!(reach[2].1, Reach::Indirect, "wren's agent was heard 1m ago");
+        assert_eq!((reach[3].1, reach[3].2), (Reach::Offline, "1h ago"));
+        assert!(
+            machines[0].links.is_empty(),
+            "the local socket is not a link"
+        );
+        assert_eq!(machines[2].links[0].2, "no direct link");
+        for machine in machines {
+            assert!(machine.platform.is_empty(), "st reports no platform");
+            assert!(!machine.seen.contains("not seen"));
+        }
+    }
+
+    #[test]
+    fn a_mission_nobody_started_says_so_and_a_moving_step_drops_its_old_reason() {
+        let mut model = Model::default();
+        model.missions = window(vec![
+            json!({
+                "id": "mission/fleet/harbor/someday", "kind": "mission", "revision": "r",
+                "updated_at": "2026-09-29T09:58:00Z", "title": "fleet/harbor/someday",
+                "state": "ready", "mission_revision": "r", "runs": [], "run_details": [],
+            }),
+            json!({
+                "id": "mission/fleet/harbor/gate", "kind": "mission", "revision": "r",
+                "updated_at": "2026-09-29T09:58:00Z", "title": "fleet/harbor/gate",
+                "state": "running", "mission_revision": "r", "runs": ["mission-run/gate-1"],
+                "run_details": [{
+                    "id": "mission-run/gate-1", "requester": "person/avery", "status": "running",
+                    "phase": "normal", "progress": {"done": 0, "total": 1}, "current_steps": [],
+                    "must_act": "person", "state_since": "2026-09-29T09:58:00Z",
+                    "steps": [{
+                        "id": "step-run/gate-1/answer", "path": "answer", "state": "working",
+                        "attempt": 1, "assignee": null, "claimant": null, "agentless": true,
+                        "since": "2026-09-29T09:58:00Z",
+                        "blocked_reason": "the eligible agentless execution started",
+                        "goals": [], "constraints": [], "blockers": [],
+                    }],
+                }],
+            }),
+        ]);
+        let world = world(&model, "person/avery", &Extras::default());
+        let Load::Ready(missions) = &world.missions else {
+            panic!("missions load")
+        };
+        let someday = missions
+            .iter()
+            .find(|mission| mission.title.contains("Someday"))
+            .unwrap();
+        assert_eq!(someday.word, Word::NotStarted);
+        let gate = missions
+            .iter()
+            .find(|mission| mission.title.contains("Gate"))
+            .unwrap();
+        assert_eq!(gate.steps[0].note, None);
     }
 
     #[test]

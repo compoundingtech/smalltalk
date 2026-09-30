@@ -863,7 +863,7 @@ fn machines() -> Vec<Machine> {
     vec![
         Machine {
             name: s("lark"),
-            online: true,
+            reach: Reach::Here,
             platform: s("macOS · arm64"),
             seen: s("now"),
             load: Some(s("2 agents")),
@@ -875,7 +875,7 @@ fn machines() -> Vec<Machine> {
         },
         Machine {
             name: s("harbor"),
-            online: true,
+            reach: Reach::Direct,
             platform: s("linux · x86_64"),
             seen: s("4s ago"),
             load: Some(s("6 agents · 41% cpu")),
@@ -887,7 +887,7 @@ fn machines() -> Vec<Machine> {
         },
         Machine {
             name: s("wren"),
-            online: false,
+            reach: Reach::Offline,
             platform: s("linux · arm64"),
             seen: s("2d ago"),
             load: None,

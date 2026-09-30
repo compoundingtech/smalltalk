@@ -588,7 +588,10 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 card.section("agents", Some(preview.agents.len()), inner);
                 for agent in &preview.agents {
                     card.line(Line::from(vec![
-                        span(format!("  {:<18}", agent.name), theme::text()),
+                        span(
+                            format!("  {:<18} ", text::truncate(&agent.name, 18)),
+                            theme::text(),
+                        ),
                         span(
                             format!("{:<8}", agent.harness.name()),
                             theme::fg(harness_color(agent.harness)),
@@ -1316,7 +1319,7 @@ pub fn mission_detail(
     for id in &mission.agents {
         if let Some(agent) = world.agents.items().iter().find(|agent| &agent.id == id) {
             let (glyph, color) = agent_glyph(agent.state, spinner);
-            let label = format!("{glyph} {:<18}", agent.name);
+            let label = format!("{glyph} {:<18} ", text::truncate(&agent.name, 18));
             agents.targets.push(super::doc::Target {
                 line: agents.lines.len(),
                 column: 0,
@@ -1527,11 +1530,7 @@ pub fn fleet_list(world: &World) -> Listing {
     let mut items = Vec::new();
     let mut ids = Vec::new();
     for machine in world.machines.items() {
-        let (glyph, color) = if machine.online {
-            ("●", theme::GREEN)
-        } else {
-            ("○", theme::RED)
-        };
+        let (glyph, color) = reach_style(machine.reach);
         let agents = world
             .agents
             .items()
@@ -1552,11 +1551,11 @@ pub fn fleet_list(world: &World) -> Listing {
                     theme::fg(theme::ACCENT),
                 ),
             ],
-            right: vec![span(format!("{agents} agents"), theme::dim())],
-            second: vec![span(
-                format!("   {} · seen {}", machine.platform, machine.seen),
+            right: vec![span(
+                format!("{agents} agent{}", if agents == 1 { "" } else { "s" }),
                 theme::dim(),
             )],
+            second: vec![span(format!("   {}", machine_line(machine)), theme::dim())],
         });
         ids.push(machine.name.clone());
     }
@@ -1564,8 +1563,35 @@ pub fn fleet_list(world: &World) -> Listing {
         items,
         ids,
         state: state_of(&world.machines, "Loading machines…", "No machines yet."),
-        legend: legend(&[("●", theme::GREEN, "online"), ("○", theme::RED, "offline")]),
+        legend: legend(&[
+            ("●", theme::GREEN, "connected"),
+            ("◐", theme::SAPPHIRE, "through another"),
+            ("○", theme::RED, "offline"),
+        ]),
     }
+}
+
+fn reach_style(reach: Reach) -> (&'static str, Color) {
+    match reach {
+        Reach::Here | Reach::Direct => ("●", theme::GREEN),
+        Reach::Indirect => ("◐", theme::SAPPHIRE),
+        Reach::Offline => ("○", theme::RED),
+        Reach::Unknown => ("◌", theme::OVERLAY1),
+    }
+}
+
+/// How a machine is reached and when it was last heard from, in words.
+fn machine_line(machine: &Machine) -> String {
+    let mut parts = vec![machine.reach.word().to_owned()];
+    if !machine.platform.is_empty() {
+        parts.push(machine.platform.clone());
+    }
+    match (machine.reach, machine.seen.as_str()) {
+        (Reach::Here, _) => {}
+        (_, "never") => parts.push("never heard from".into()),
+        (_, seen) => parts.push(format!("heard {seen}")),
+    }
+    parts.join(" · ")
 }
 
 pub fn fleet_detail(world: &World, id: Option<&str>, width: usize, spinner: &'static str) -> Doc {
@@ -1580,18 +1606,11 @@ pub fn fleet_detail(world: &World, id: Option<&str>, width: usize, spinner: &'st
         doc.line(Line::from(span("Select a machine.", theme::dim())));
         return doc;
     };
-    let (glyph, color) = if machine.online {
-        ("●", theme::GREEN)
-    } else {
-        ("○", theme::RED)
-    };
+    let (glyph, color) = reach_style(machine.reach);
     doc.line(Line::from(vec![
         span(format!(" {glyph} "), theme::strong(color)),
         span(machine.name.clone(), theme::bold()),
-        span(
-            format!("  {} · seen {}", machine.platform, machine.seen),
-            theme::dim(),
-        ),
+        span(format!("  {}", machine_line(machine)), theme::dim()),
     ]));
     if let Some(load) = &machine.load {
         doc.line(Line::from(span(format!("   {load}"), theme::soft())));
@@ -1610,7 +1629,11 @@ pub fn fleet_detail(world: &World, id: Option<&str>, width: usize, spinner: &'st
     }
     if links.lines.is_empty() {
         links.line(Line::from(span(
-            "Unknown while this machine is offline.",
+            if machine.you_are_here {
+                "This is the machine stui is talking to."
+            } else {
+                "st reports no link to this machine."
+            },
             theme::dim(),
         )));
     }
@@ -1621,7 +1644,7 @@ pub fn fleet_detail(world: &World, id: Option<&str>, width: usize, spinner: &'st
         .filter(|agent| agent.host == machine.name)
     {
         let (glyph, color) = agent_glyph(agent.state, spinner);
-        let label = format!("{glyph} {:<20}", agent.name);
+        let label = format!("{glyph} {:<20} ", text::truncate(&agent.name, 20));
         agents.targets.push(super::doc::Target {
             line: agents.lines.len(),
             column: 0,
@@ -1753,7 +1776,7 @@ pub fn worktree_detail(
     for id in &tree.agents {
         if let Some(agent) = world.agents.items().iter().find(|agent| &agent.id == id) {
             let (glyph, color) = agent_glyph(agent.state, spinner);
-            let label = format!("{glyph} {:<20}", agent.name);
+            let label = format!("{glyph} {:<20} ", text::truncate(&agent.name, 20));
             agents.targets.push(super::doc::Target {
                 line: agents.lines.len(),
                 column: 0,
