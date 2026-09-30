@@ -718,7 +718,7 @@ async fn applied_subject_definitions_roundtrip_and_report_typed_absence() {
     let server_socket = socket.clone();
     let state = state(root.path(), "client-definition");
     let source = r#"version 2
-agent "fleet/definition" {
+agent "example/definition" {
   description "Quotes \" and backslashes \\ and Unicode λ.\nSecond line."
   command "true"
 }
@@ -737,7 +737,7 @@ mission "example/definition" state="ready" {
     let client = Client::unix(&socket);
 
     {
-        let subject = "agent/fleet/definition";
+        let subject = "agent/example/definition";
         let response = client.subject_definition(subject).await.unwrap();
         let definition = response.value;
         assert_eq!(definition.subject, subject);
@@ -775,13 +775,13 @@ mission "example/definition" state="ready" {
 
     // Descriptions are capped at 1,000 bytes; a command is not, so it can outgrow a response.
     let oversized = format!(
-        "version 2\nagent \"fleet/large-definition\" {{ command \"true {}\" }}",
+        "version 2\nagent \"example/large-definition\" {{ command \"true {}\" }}",
         "x".repeat(1_100_000),
     );
     let oversized = st3::graph::parse_intent(&oversized, "client-definition").unwrap();
     state.store.apply_internal(&oversized, "large-definition-fixture").unwrap();
     assert!(matches!(
-        client.subject_definition("agent/fleet/large-definition").await,
+        client.subject_definition("agent/example/large-definition").await,
         Err(ClientError::Api(ErrorCode::ValidationFailed, _, _))
     ));
     server.abort();

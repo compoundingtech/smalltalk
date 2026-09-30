@@ -175,7 +175,7 @@ represented by an event tombstone; an ID is never reused.
 
 ### Applied subject definitions
 
-`GET /v1/client/subject-definition?subject=agent%2Ffleet%2Fworker` reads exactly one agent's
+`GET /v1/client/subject-definition?subject=agent%2Fexample%2Fworker` reads exactly one agent's
 applied desired declaration, including mission-owned and ad-hoc seats. It requires
 `read.projections`; the Rust method is
 `Client::subject_definition(subject)`, returning `Envelope<SubjectDefinition>` over either
