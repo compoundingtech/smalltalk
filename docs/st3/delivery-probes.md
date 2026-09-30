@@ -109,3 +109,9 @@ A member shown as last seen pauses its route: the probe queues no new sends, wit
 route attention, and retains any pending message. After a new replication exchange,
 it resumes that same message with a fresh measurement window. Doctor waits for absent
 members before judging missing heartbeats or overdue routes.
+
+A direct route refused by a member's Fabric grants does not count as a delivery failure.
+While another peer is exchanging, the probe continues sending real messages to the refused
+member through the fleet, and doctor checks the actual recipient reads and heartbeats.
+An indirect delivery that exceeds the deadline still warns. If no replication peer is up,
+the probe pauses and retains the pending message until a path returns.
