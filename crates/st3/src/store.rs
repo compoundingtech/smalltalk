@@ -711,6 +711,16 @@ const CLAIM_COLUMNS: &str = "claims.id, claims.store_index, claims.batch_id, cla
      claims.kind, claims.origin, claims.actor, claims.body, claims.predecessors,
      claims.accepted_at_unix_ms";
 
+/// The claims that say what a subject actually is: none of its declarations, harness reports,
+/// readiness deadlines or reconcile faults. A seat's harness reports grow with every turn it
+/// takes, to tens of thousands, so `harness.*` is written as the two `kind` ranges around it and
+/// the query names `claims_subject_kind_index`: SQLite then seeks past a subject's harness
+/// reports instead of reading each one. Unlike `NOT LIKE`, the ranges are case-sensitive, as
+/// `str::starts_with` is.
+const ACTUAL_STATE_CLAIM: &str = "(claims.kind<'harness.' OR claims.kind>='harness/')
+     AND claims.kind NOT IN ('intent.desired', 'runtime.readiness-deadline-reached',
+                             'reconcile.fault')";
+
 /// The predicate of `claims_current_view_index`, word for word, so SQLite can use the index.
 const CURRENT_VIEW_CLAIM: &str = "(kind='intent.desired'
    OR json_extract(body, '$.fields.status') NOT IN ('stopped', 'absent', 'exited')
@@ -19080,12 +19090,14 @@ fn selected_actual_source_at(
 ) -> Result<(Option<String>, Option<String>, bool)> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     // Canonical order, not arrival order, so every node holding these claims selects the same
-    // source.
+    // source. Only claims about the subject's actual state can be selected or conflict, so the
+    // read leaves out its harness reports.
     let mut statement = connection.prepare_cached(&format!(
-        "SELECT claims.id, claims.kind, claims.origin, claims.predecessors,
+        "SELECT claims.id, claims.kind, claims.origin,
                 CASE WHEN claims.kind='runtime.observed' THEN claims.body END
-         FROM claims JOIN batches ON batches.id=claims.batch_id
-         WHERE claims.subject=?1 AND claims.store_index<=?2
+         FROM claims INDEXED BY claims_subject_kind_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND {ACTUAL_STATE_CLAIM} AND claims.store_index<=?2
          ORDER BY {CANONICAL_ORDER}"
     ))?;
     let rows = statement
@@ -19094,8 +19106,7 @@ fn selected_actual_source_at(
                 row.get::<_, String>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
-                serde_json::from_str::<Vec<String>>(&row.get::<_, String>(3)?).unwrap_or_default(),
-                row.get::<_, Option<String>>(4)?
+                row.get::<_, Option<String>>(3)?
                     .and_then(|body| serde_json::from_str::<Value>(&body).ok())
                     .unwrap_or(Value::Null),
             ))
@@ -19104,21 +19115,50 @@ fn selected_actual_source_at(
     let selected = rows
         .iter()
         .rev()
-        .find(|(_, kind, _, _, _)| kind == "runtime.observed")
-        .or_else(|| {
-            rows.iter().rev().find(|(_, kind, _, _, _)| {
-                kind != "intent.desired"
-                    && !kind.starts_with("harness.")
-                    && kind != "runtime.readiness-deadline-reached"
-                    && kind != "reconcile.fault"
-            })
-        });
-    let Some((selected_id, _, selected_origin, _, selected_body)) = selected else {
+        .find(|(_, kind, _, _)| kind == "runtime.observed")
+        .or_else(|| rows.last());
+    let Some((selected_id, _, selected_origin, selected_body)) = selected else {
         return Ok((None, None, false));
     };
+    let rivals = rows
+        .iter()
+        .filter(|(id, kind, origin, body)| {
+            kind == "runtime.observed"
+                && id != selected_id
+                && origin != selected_origin
+                && !nonowner_terminal_observation(
+                    desired_host,
+                    selected_origin,
+                    selected_body,
+                    origin,
+                    body,
+                )
+        })
+        .map(|(id, _, _, _)| id.as_str())
+        .collect::<Vec<_>>();
+    // Another host's observation conflicts unless the selected claim descends from it. Only then
+    // does the walk need the subject's whole causal history, harness reports included.
+    let runtime_conflict = !rivals.is_empty()
+        && !subject_descends_from_all(connection, subject, at_index, selected_id, &rivals)?;
+    Ok((
+        Some(selected_id.clone()),
+        Some(selected_origin.clone()),
+        runtime_conflict,
+    ))
+}
+
+/// Whether claim `descendant` of `subject` descends from every claim of `ancestors`, walking the
+/// predecessors of the subject's claims at or before store index `at_index`.
+fn subject_descends_from_all(
+    connection: &Connection,
+    subject: &str,
+    at_index: u64,
+    descendant: &str,
+    ancestors: &[&str],
+) -> Result<bool> {
     // A checkpoint may have dropped claims on the path from the selected claim to an older
     // observation. Their tombstones keep the links, so the walk passes through them.
-    let dropped = connection
+    let mut predecessors = connection
         .prepare_cached("SELECT id, predecessors FROM checkpoint_claims WHERE subject=?1")?
         .query_map([subject], |row| {
             Ok((
@@ -19126,17 +19166,23 @@ fn selected_actual_source_at(
                 serde_json::from_str::<Vec<String>>(&row.get::<_, String>(1)?).unwrap_or_default(),
             ))
         })?
-        .collect::<Result<Vec<_>, _>>()?;
-    let mut predecessors = dropped
-        .iter()
-        .map(|(id, predecessors)| (id.as_str(), predecessors.as_slice()))
-        .collect::<BTreeMap<_, _>>();
+        .collect::<Result<BTreeMap<_, _>, _>>()?;
     predecessors.extend(
-        rows.iter()
-            .map(|(id, _, _, predecessors, _)| (id.as_str(), predecessors.as_slice())),
+        connection
+            .prepare_cached(
+                "SELECT id, predecessors FROM claims WHERE subject=?1 AND store_index<=?2",
+            )?
+            .query_map(params![subject, at_index], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    serde_json::from_str::<Vec<String>>(&row.get::<_, String>(1)?)
+                        .unwrap_or_default(),
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?,
     );
     let descends_from = |ancestor: &str| {
-        let mut pending = vec![selected_id.as_str()];
+        let mut pending = vec![descendant];
         let mut visited = BTreeSet::new();
         while let Some(current) = pending.pop() {
             if current == ancestor {
@@ -19151,24 +19197,7 @@ fn selected_actual_source_at(
         }
         false
     };
-    let runtime_conflict = rows.iter().any(|(id, kind, origin, _, body)| {
-        kind == "runtime.observed"
-            && id != selected_id
-            && origin != selected_origin
-            && !nonowner_terminal_observation(
-                desired_host,
-                selected_origin,
-                selected_body,
-                origin,
-                body,
-            )
-            && !descends_from(id)
-    });
-    Ok((
-        Some(selected_id.clone()),
-        Some(selected_origin.clone()),
-        runtime_conflict,
-    ))
+    Ok(ancestors.iter().all(|ancestor| descends_from(ancestor)))
 }
 
 fn nonowner_terminal_observation(
@@ -19202,14 +19231,14 @@ fn latest_actual_at(
 ) -> Result<Option<Value>> {
     let at_index = at_index.unwrap_or(i64::MAX as u64);
     // Folded in canonical order, so two nodes holding the same claims agree however they
-    // received them.
+    // received them. `NOT LIKE` also leaves out harness kinds in any letter case, as it always
+    // has; the ranges let SQLite seek past the subject's harness reports.
     let mut statement = connection.prepare_cached(&format!(
-        "SELECT claims.kind, claims.body FROM claims JOIN batches ON batches.id=claims.batch_id
-         WHERE claims.subject=?1
-           AND claims.kind!='intent.desired'
+        "SELECT claims.kind, claims.body
+         FROM claims INDEXED BY claims_subject_kind_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND {ACTUAL_STATE_CLAIM}
            AND claims.kind NOT LIKE 'harness.%'
-           AND claims.kind!='runtime.readiness-deadline-reached'
-           AND claims.kind!='reconcile.fault'
            AND claims.store_index<=?2
          ORDER BY {CANONICAL_ORDER}"
     ))?;
@@ -34478,6 +34507,98 @@ version 2
         assert_eq!(
             status.subjects[0].reason.as_deref(),
             Some("concurrent runtime observations have indeterminate authority")
+        );
+    }
+
+    /// A subject's harness reports neither change which observation its status selects nor hide
+    /// the causal path between two hosts' observations, although the reads that select skip them.
+    #[test]
+    fn harness_reports_neither_select_nor_hide_a_runtime_observation() {
+        let subject = "agent/run/worker";
+        let append = |store: &Store, kind: &str, fields: &[(&str, &str)]| {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: kind.into(),
+                    actor: Some(subject.into()),
+                    fields: fields
+                        .iter()
+                        .map(|(name, value)| ((*name).into(), Value::String((*value).into())))
+                        .collect(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        let report = |store: &Store, count: usize| {
+            for _ in 0..count {
+                append(store, "harness.observed", &[("state", "working")]);
+            }
+        };
+        let observe = |store: &Store, incarnation: &str| {
+            append(
+                store,
+                "runtime.observed",
+                &[("status", "running"), ("incarnation_id", incarnation)],
+            )
+        };
+
+        // The left host observes the runtime after it has taken in the right host's
+        // observation, with harness reports between the two: no conflict.
+        let left = Store::open_memory("left").unwrap();
+        let right = Store::open_memory("right").unwrap();
+        observe(&right, "right-one");
+        report(&right, 3);
+        left.import_replication("right", &right.export_replication(0).unwrap())
+            .unwrap();
+        report(&left, 3);
+        let selected = observe(&left, "left-two");
+        report(&left, 3);
+        let status = left.status(Some(subject)).unwrap();
+        assert_eq!(status.subjects[0].reachability, "reachable");
+        assert_eq!(
+            status.subjects[0].actual_claim.as_deref(),
+            Some(selected.id.as_str())
+        );
+        assert_eq!(
+            status.subjects[0].actual.as_ref().unwrap()["incarnation_id"],
+            "left-two"
+        );
+
+        // Two hosts observe it without seeing each other, harness reports on both sides.
+        let other = Store::open_memory("other").unwrap();
+        observe(&other, "other-one");
+        report(&other, 3);
+        left.import_replication("other", &other.export_replication(0).unwrap())
+            .unwrap();
+        let status = left.status(Some(subject)).unwrap();
+        assert_eq!(status.subjects[0].reachability, "indeterminate");
+
+        // The selecting reads seek past the harness reports instead of reading them.
+        let connection = left.readers.get();
+        let plan = connection
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT claims.id FROM claims
+                 INDEXED BY claims_subject_kind_index
+                 JOIN batches ON batches.id=claims.batch_id
+                 WHERE claims.subject=?1 AND {ACTUAL_STATE_CLAIM} AND claims.store_index<=?2
+                 ORDER BY {CANONICAL_ORDER}"
+            ))
+            .unwrap()
+            .query_map(params![subject, i64::MAX], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("claims_subject_kind_index (subject=? AND kind<?)")),
+            "{plan:?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|step| step.contains("claims_subject_kind_index (subject=? AND kind>?)")),
+            "{plan:?}"
         );
     }
 
