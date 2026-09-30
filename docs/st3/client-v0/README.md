@@ -150,6 +150,12 @@ the stable `id` ascending. No locale-sensitive ordering is permitted.
 | Sessions | `/sessions`, `/sessions/{id}` | updated time descending, ID |
 | Session timeline | `/sessions/{id}/timeline` | sequence ascending |
 
+Work resources, mission steps (including `current_steps`), and agent work labels use the same
+`WorkState` vocabulary: `waiting`, `ready`, `claimed`, `blocked`, `verifying`, `completed`,
+`failed`, and `cancelled`. The API translates internal `pending` to `waiting` and `working` to
+`claimed` in every projection. Clients treat held or verifying work as active even when its
+successors are waiting.
+
 A page carries an optional `sync` notice while its host is catching up with a fleet peer. Its
 projections can then show early history as current, such as an attention request that a
 not-yet-received envelope resolves. The notice lists each peer that holds more envelopes than one

@@ -37493,6 +37493,110 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         }
     }
 
+    #[test]
+    fn planning_state_and_attention_agree_when_claims_arrive_in_different_orders() {
+        let source = Store::open_memory("source").unwrap();
+        let kdl = "version 2\nmission \"release\" state=\"ready\" { goal \"Ship a release\" }\n";
+        let intent = crate::graph::parse_test_intent(kdl, "source").unwrap();
+        let mission = source
+            .mission(
+                &intent,
+                IntentInput {
+                    kdl: kdl.into(),
+                    source_name: None,
+                },
+            )
+            .unwrap();
+        let doc = source
+            .put_document(
+                "doc/planning/release/request",
+                b"Ship a release",
+                &None,
+                "request",
+            )
+            .unwrap();
+        let reference = format!("{}@{}", doc.name, doc.hash);
+        let subject = "planning-session/planning/release/one";
+        let events = [
+            (
+                "started",
+                json!({"mission": "mission/release", "request": reference, "workspace": "/work/release", "requester": "person/avery", "planner": "agent/source.planner"}),
+            ),
+            (
+                "candidate-submitted",
+                json!({"candidate_revision": 1, "markdown": reference, "kdl": reference, "mission_revision": "revision-one"}),
+            ),
+            (
+                "previewed",
+                json!({"candidate_revision": 1, "preview_hash": "preview-one", "store_index": mission.store_index, "graph": "release", "diff": "new", "mission": mission}),
+            ),
+            (
+                "approved",
+                json!({"mission_revision": "revision-one", "requester": "person/avery"}),
+            ),
+        ];
+        for (kind, fields) in events {
+            // Distinct accepted times also prove this is independent of the receiver's indexes.
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            source
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: format!("planning-session.{kind}"),
+                    actor: Some("person/avery".into()),
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("planning-{kind}")),
+                })
+                .unwrap();
+            if kind == "previewed" {
+                source.replay_replication_graph().unwrap();
+                let attention = source.attention_items(Some("person/avery")).unwrap();
+                assert_eq!(attention.len(), 1);
+                assert_eq!(attention[0].kind, "launch-approval");
+            }
+        }
+        let envelopes = exchange_from(&source, &ReplicationInventory::default()).envelopes;
+        let in_order = Store::open_memory("in-order").unwrap();
+        receive_and_project(
+            &in_order,
+            "source",
+            &exchange_of("source", envelopes.clone()),
+        );
+        let reversed = Store::open_memory("reversed").unwrap();
+        for envelope in envelopes.iter().rev() {
+            receive_and_project(
+                &reversed,
+                "source",
+                &exchange_of("source", vec![envelope.clone()]),
+            );
+        }
+        assert_eq!(graph_digest_of(&in_order), graph_digest_of(&reversed));
+        for store in [&in_order, &reversed] {
+            let launch = store.planning_session(subject).unwrap().unwrap();
+            assert_eq!(launch.status, "approved");
+            assert_eq!(launch.published_revision.as_deref(), Some("revision-one"));
+            assert!(
+                store
+                    .attention_items(Some("person/avery"))
+                    .unwrap()
+                    .is_empty()
+            );
+            // Startup replay must retain the same result, too.
+            store.replay_replication_graph().unwrap();
+            assert_eq!(
+                store.planning_session(subject).unwrap().unwrap().status,
+                "approved"
+            );
+            assert!(
+                store
+                    .attention_items(Some("person/avery"))
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
     /// Status, the harness view and the latest claim of a kind fold in canonical order. Two nodes
     /// that hold the same claims therefore agree even when the claims reached them in different
     /// orders, which a checkpoint relies on when it drops claims that a later one replaced.

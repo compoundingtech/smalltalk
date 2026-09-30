@@ -1,4 +1,4 @@
-import type { Agent, Attention, Device, Mission, MissionStep } from '../../clients/typescript/st3-client';
+import type { Agent, Attention, Device, Mission, MissionStep, WorkState } from '../../clients/typescript/st3-client';
 
 // The daemon annotates every resource with its operational layer. It is not part of the
 // generated resource types, so read it at the UI boundary.
@@ -82,10 +82,23 @@ export function missionSteps(mission: Pick<Mission, 'run_details'>): MissionStep
 
 export const missionGroups = ['Blocked', 'Waiting', 'Running', 'Drafts', 'Archive'] as const;
 export type MissionGroup = typeof missionGroups[number];
+// All contract states have a presentation; held and verifying steps take precedence
+// over dependent steps that are still waiting. Keep aliases for cached older projections.
+const stepGroups: Record<WorkState, MissionGroup | null> = {
+  waiting: 'Waiting', ready: 'Running', claimed: 'Running', blocked: 'Blocked',
+  verifying: 'Running', completed: null, failed: 'Blocked', cancelled: null,
+};
+function stepGroup(state: string): MissionGroup | null {
+  if (state === 'working' || state === 'running') return 'Running';
+  if (state === 'pending') return 'Waiting';
+  return stepGroups[state as WorkState] ?? null;
+}
 export function missionGroup(mission: Pick<Mission, 'run_details' | 'state'>): MissionGroup {
-  const states = missionSteps(mission).map(step => step.state);
-  if (states.includes('blocked')) return 'Blocked';
-  if (states.includes('waiting')) return 'Waiting';
+  if (['completed', 'failed', 'cancelled', 'retired'].includes(mission.state)) return 'Archive';
+  const groups = missionSteps(mission).map(step => stepGroup(step.state));
+  if (groups.includes('Blocked')) return 'Blocked';
+  if (groups.includes('Running')) return 'Running';
+  if (groups.includes('Waiting')) return 'Waiting';
   if (mission.state === 'running' || mission.state === 'standing') return 'Running';
   if (mission.state === 'ready' || mission.state === 'draft') return 'Drafts';
   return 'Archive';
@@ -94,7 +107,7 @@ export function missionGroup(mission: Pick<Mission, 'run_details' | 'state'>): M
 export function missionDetail(mission: Pick<Mission, 'run_details' | 'runs' | 'visualization'>): string {
   const planned = mission.visualization?.nodes.filter(node => node.kind === 'step').length;
   const steps = missionSteps(mission);
-  const current = steps.find(step => step.state === 'blocked') ?? steps.find(step => step.state === 'claimed' || step.state === 'ready') ?? steps[0];
+  const current = steps.find(step => step.state === 'blocked') ?? steps.find(step => stepGroup(step.state) === 'Running') ?? steps[0];
   // Someone set the latest run's outcome after it finished: say what, who, and why.
   const runs = mission.run_details ?? [];
   const outcome = runs[runs.length - 1]?.outcome;
