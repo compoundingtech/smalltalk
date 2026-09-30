@@ -125,6 +125,11 @@ impl Node {
             .env("XDG_RUNTIME_DIR", self.root.join("run"))
             .env("ST3_WORKER_INTERVAL_MS", "300")
             .env("ST3_DAEMON_WAIT", "0");
+        // The Nix check account has no passwd login shell. Preserve the shell supplied by
+        // preCheck so the daemon can capture its login environment after env_clear().
+        if let Some(shell) = std::env::var_os("SHELL") {
+            command.env("SHELL", shell);
+        }
         for (key, value) in &self.env {
             command.env(key, value);
         }
