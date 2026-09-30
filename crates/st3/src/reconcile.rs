@@ -15740,6 +15740,11 @@ agent "worker" {
     #[test]
     fn restart_delay_starts_at_the_exit_observation() {
         let store = Arc::new(Store::open_memory("node").unwrap());
+        // Keep the first launch older than the restart delay, independent of
+        // how quickly this machine executes the reconcile.
+        store
+            .set_write_clock_at(now_ms().saturating_sub(60_000))
+            .unwrap();
         let source = r#"
             version 2
 
@@ -15758,14 +15763,17 @@ agent "worker" {
         apply_source(&store, source, "restart-delay-from-exit");
         let runtime = Arc::new(FakeRuntime::default());
         let reconciler = Reconciler::new(
-            store,
+            store.clone(),
             runtime.clone(),
             "node".into(),
             Arc::new(Notify::new()),
         );
 
         reconciler.reconcile_once().unwrap();
-        std::thread::sleep(Duration::from_millis(25));
+        // Place the exit in the future so a slow reconcile cannot consume the
+        // 20ms delay before it reaches the restart decision.
+        let exit_at = now_ms() + 60_000;
+        store.set_write_clock_at(exit_at).unwrap();
         runtime.ptys.lock().unwrap().push(RuntimeObservation {
             runtime_id: "node.worker".into(),
             terminal: true,
@@ -15776,9 +15784,23 @@ agent "worker" {
         reconciler.reconcile_once().unwrap();
         assert_eq!(runtime.starts.lock().unwrap().len(), 1);
 
-        std::thread::sleep(Duration::from_millis(25));
-        reconciler.reconcile_once().unwrap();
-        assert_eq!(runtime.starts.lock().unwrap().len(), 2);
+        let observed = store
+            .latest_claim("agent/node.worker", Some("runtime.observed"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(observed.accepted_at_unix_ms, exit_at);
+        let decision = store
+            .latest_claim("agent/node.worker", Some("runtime.reconcile-decision"))
+            .unwrap()
+            .unwrap();
+        let restart_at = (exit_at + 20).to_string();
+        assert_eq!(
+            decision
+                .body
+                .pointer("/fields/restart_at_unix_ms")
+                .and_then(Value::as_str),
+            Some(restart_at.as_str())
+        );
     }
 
     #[test]
