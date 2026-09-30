@@ -80,13 +80,14 @@ pub struct OmpResidencyCheckpoint {
 /// 18.0 was measured twice: at 18.0.3 on 2026-08-25 and again at 18.0.9 on 2026-08-28.
 /// 18.1 was measured at 18.1.2 on 2026-09-02.
 /// 18.3 was measured at 18.3.0 on 2026-09-24.
+/// 18.4 was measured at 18.4.2 on 2026-09-29.
 ///
 /// Admission is per minor, per decision 0007-omp-is-a-fifth-native-driver-with-its-own-channel-and-a-hard-version-gate ("hard version gate on the minor, 18.x initially")
 /// and OMP-R05 ("a later minor stays rejected"). Any patch inside an admitted minor launches
 /// without new evidence: omp releases near-daily, so gating patches blocked the fleet on changes
 /// the capture already covered — 18.0.10 shipped within hours of 18.0.9 being admitted. A new
 /// MINOR still costs the five OMP-R05 probes.
-const SUPPORTED_OMP_MINORS: [(u32, u32); 3] = [(18, 0), (18, 1), (18, 3)];
+const SUPPORTED_OMP_MINORS: [(u32, u32); 4] = [(18, 0), (18, 1), (18, 3), (18, 4)];
 
 /// The omp builds the harness-context producer's arithmetic was measured against (HC-R13, HC-T03).
 ///
@@ -560,7 +561,7 @@ mod tests {
     /// `.experiments/` capture that justifies it.
     #[test]
     fn admitted_minors_are_exactly_the_measured_set() {
-        assert_eq!(SUPPORTED_OMP_MINORS, [(18, 0), (18, 1), (18, 3)]);
+        assert_eq!(SUPPORTED_OMP_MINORS, [(18, 0), (18, 1), (18, 3), (18, 4)]);
     }
 
     /// Every exact build that admitted a minor must still launch. Keeping the literals here makes
@@ -568,7 +569,7 @@ mod tests {
     /// admitted series.
     #[test]
     fn version_gate_admits_every_admission_capture() {
-        for version in ["18.0.3", "18.0.9", "18.1.2", "18.3.0"] {
+        for version in ["18.0.3", "18.0.9", "18.1.2", "18.3.0", "18.4.2"] {
             let fake = FakeExecutable::new(&format!(
                 "#!/bin/sh\nprintf 'omp v{version}\\n{version}\\n'\n"
             ));
