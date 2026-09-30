@@ -126,6 +126,10 @@ st attention ls         # decisions and requests waiting for you
 st conversations ls person/ada
 ```
 
+`st --help` and `st help` open with the main uses, then group commands for everyday use, agent
+seats, and running a machine or fleet. `st help --all` also lists plumbing commands.
+Use `st help agents new` to open a command's full help.
+
 Lists show current state. Add `--all` for history. Every command has `--help`, and the global
 `--json` flag prints the stable client format that the apps read. Run `stui` for the same views
 in a terminal app.
@@ -142,7 +146,7 @@ st agents new site --host builder --harness claude --model claude-opus-5-5 --att
 It writes the same declaration a person writes by hand, with the harness defaults of the fleet's
 Claude and Codex seats, and applies it as the `person` in your st config (or `--as`). Without
 `--workspace`, the agent gets a new directory below that host's home, `~/st/agents/site`, which the
-host creates. The command prints the agent's subject, here `agent/builder.site`. `--print-kdl` shows
+host creates. Its next-step commands name the agent's subject, here `agent/builder.site`. `--print-kdl` shows
 the declaration without applying it, and `--description` says what the agent is for.
 
 Ctrl+\\ detaches and leaves the agent running. `st terminals attach agent/builder.site` attaches
@@ -150,6 +154,12 @@ again later, from any machine in the fleet. A terminal on another host is attach
 Fabric when that host runs `st terminals expose-fabric` and grants your machine the protocol it
 prints; no st daemon carries the bytes. Otherwise it goes through the client gateway as your
 person, the same path the apps use.
+
+After creating a seat, st explains whether it is ready or still starting and prints the exact
+commands to attach, send it a message, inspect it, and stop it. These commands are also printed
+when startup times out or the agent needs your input. Attaching stays opt-in with `--attach`.
+Mission starts, launches, device pairing, and fleet creation or joining also finish with their
+next steps. JSON output keeps its existing shape.
 
 ## Declare a seat
 
