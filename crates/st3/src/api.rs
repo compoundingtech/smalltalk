@@ -4085,7 +4085,8 @@ async fn serve_unix_with_ancestor(
 /// Atomically replace only the discovery link, never the listener itself. On macOS (and when
 /// XDG_RUNTIME_DIR is absent) the default listener already lives at this state path.
 fn publish_state_socket(socket: &Path, state_socket: &Path) -> anyhow::Result<()> {
-    if socket == state_socket || fs::canonicalize(state_socket).ok() == fs::canonicalize(socket).ok()
+    if socket == state_socket
+        || fs::canonicalize(state_socket).ok() == fs::canonicalize(socket).ok()
     {
         return Ok(());
     }

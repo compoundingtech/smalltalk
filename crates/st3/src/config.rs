@@ -337,7 +337,8 @@ impl Config {
     /// Resolve the daemon's published endpoint when this client lacks its runtime directory.
     /// Following the link itself would exceed the Unix socket address limit for long state paths.
     pub fn client_socket(&self) -> PathBuf {
-        if env::var_os("XDG_RUNTIME_DIR").is_none() && self.socket == state_socket(&self.state_dir) {
+        if env::var_os("XDG_RUNTIME_DIR").is_none() && self.socket == state_socket(&self.state_dir)
+        {
             return fs::read_link(&self.socket)
                 .ok()
                 .filter(|target| target.is_absolute())
