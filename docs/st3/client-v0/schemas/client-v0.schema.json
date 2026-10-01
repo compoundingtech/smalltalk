@@ -1466,7 +1466,7 @@
             }
           }
         },
-        { "properties": { "type": { "enum": ["terminal.attach", "terminal.detach"] }, "fence": { "allOf": [{ "$ref": "#/$defs/Fence" }, { "required": ["runtime_incarnation", "terminal_sequence"] }] }, "parameters": { "$ref": "#/$defs/TargetParameters" } } },
+        { "properties": { "type": { "enum": ["terminal.attach", "terminal.detach"] }, "fence": { "allOf": [{ "$ref": "#/$defs/Fence" }, { "required": ["runtime_incarnation"] }] }, "parameters": { "$ref": "#/$defs/TargetParameters" } } },
         { "properties": { "type": { "const": "pairing.revoke" }, "parameters": { "$ref": "#/$defs/TargetParameters" } } }
       ]
     },
