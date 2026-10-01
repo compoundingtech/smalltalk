@@ -7,12 +7,13 @@
 //! The passes write to the copy and render into the workspaces it names, so run it on a copy
 //! made for it, in a sandbox whose only writable directories are the copy's and a private `/tmp`:
 //!
-//! `ST3_PERF_RUNTIMES` names a JSON list of the member's running runtimes (`runtime_id`,
-//! `incarnation_id`, `terminal`), taken from its `/v1/client/runtimes`.
+//! `ST3_PERF_NODE` is the member's node name. `ST3_PERF_RUNTIMES` names a JSON list of the member's
+//! running runtimes (`runtime_id`, `incarnation_id`, `terminal`), taken from its
+//! `/v1/client/runtimes`.
 //!
 //! ```sh
 //! bwrap --ro-bind / / --dev /dev --proc /proc --tmpfs /tmp --bind COPY_DIR COPY_DIR \
-//!   --unshare-pid --unshare-net --die-with-parent env ST3_PERF_STORE=COPY_DIR/claims.sqlite3 \
+//!   --unshare-pid --unshare-net --die-with-parent env ST3_PERF_STORE=COPY_DIR/claims.sqlite3 ST3_PERF_NODE=NODE \
 //!   INTEGRATION_TEST_BINARY reconcile_pass_perf:: --ignored --nocapture
 //! ```
 
@@ -105,7 +106,7 @@ fn quiet_reconcile_passes_on_a_store_copy() {
     // totals.json there.
     st3::profile::init_from_env();
     let path = PathBuf::from(std::env::var("ST3_PERF_STORE").expect("set ST3_PERF_STORE"));
-    let node = std::env::var("ST3_PERF_NODE").unwrap_or_else(|_| "hetz".into());
+    let node = std::env::var("ST3_PERF_NODE").expect("set ST3_PERF_NODE to the member's node name");
     let store = Arc::new(st3::store::Store::open(&path, node.clone()).unwrap());
     // The member's running runtimes, as `/v1/client/runtimes` lists them, so passes see the same
     // incarnations its seats report harness state for.

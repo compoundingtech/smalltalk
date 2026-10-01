@@ -499,6 +499,9 @@ CREATE INDEX IF NOT EXISTS step_runs_assignee_index ON step_runs(assignee, statu
 -- The steps a lease holds, a handful of all the steps a fleet has ever run.
 CREATE INDEX IF NOT EXISTS step_runs_lease_index ON step_runs(lease_owner)
 WHERE lease_owner IS NOT NULL;
+-- The few steps offered to several seats, so a seat's steps are found without reading every step.
+CREATE INDEX IF NOT EXISTS step_runs_available_index ON step_runs(run_id)
+WHERE available_to!='[]';
 -- The steps that have not finished, a few of every step a fleet has run.
 CREATE INDEX IF NOT EXISTS step_runs_open_index ON step_runs(created_at_unix_ms, step_path)
 WHERE status NOT IN ('completed','failed','cancelled');
@@ -6502,7 +6505,12 @@ impl Store {
     ) -> Result<Vec<StepRunView>> {
         let actor = actor.map(|value| normalize_actor(value, "agent"));
         let connection = self.readers.get();
-        let mut statement = connection.prepare(&work_at_snapshot_query(open_only))?;
+        let query = if actor.is_some() {
+            seat_work_at_snapshot_query(open_only)
+        } else {
+            work_at_snapshot_query(open_only)
+        };
+        let mut statement = connection.prepare_cached(&query)?;
         let rows = statement.query_map(
             params![actor.as_deref(), include_terminal, include_agentless],
             step_run_from_row,
@@ -29233,6 +29241,34 @@ fn work_at_snapshot_query(open_only: bool) -> String {
     )
 }
 
+/// [`work_at_snapshot_query`] for one named actor `?1`. The reconciler reads each running seat's
+/// steps on every pass; the actor's steps are found through the assignee and lease indexes, and
+/// the few steps offered to several seats through their own index, instead of scanning every
+/// step the store ever ran.
+fn seat_work_at_snapshot_query(open_only: bool) -> String {
+    let open = if open_only {
+        "AND status NOT IN ('completed','failed','cancelled')"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+         FROM step_runs
+         WHERE rowid IN (
+                 SELECT rowid FROM step_runs WHERE assignee=?1
+                 UNION SELECT rowid FROM step_runs WHERE lease_owner=?1
+                 UNION SELECT rowid FROM step_runs WHERE available_to!='[]'
+                   AND EXISTS (SELECT 1 FROM json_each(step_runs.available_to) WHERE value=?1)
+               )
+           AND (agentless=0 OR (?3 AND ?1 IS NULL))
+           AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
+           AND (?2 OR status NOT IN ('pending','completed','failed','cancelled'))
+           {open}
+         ORDER BY created_at_unix_ms, step_path"
+    )
+}
+
 /// Read seat-queue inputs for one seat or the whole roster. A live run is queued
 /// while its current generation has a step for the seat, and it keeps the join
 /// time of its first such step in any generation. Runs that are no longer
@@ -40360,6 +40396,16 @@ version 2
             open_steps.contains("step_runs_open_index"),
             "a seat queue must read the open steps, not every step:\n{open_steps}"
         );
+        for open_only in [false, true] {
+            let seat_steps = plan(&seat_work_at_snapshot_query(open_only));
+            assert!(
+                seat_steps.contains("step_runs_assignee_index (assignee=?)")
+                    && seat_steps.contains("step_runs_lease_index (lease_owner=?)")
+                    && seat_steps.contains("step_runs_available_index")
+                    && !seat_steps.contains("SCAN step_runs\n"),
+                "a seat's steps must be found by seat, not by reading every step:\n{seat_steps}"
+            );
+        }
         let joins = plan(&seat_queue_joins_query());
         assert!(
             joins.contains("SCAN mission_runs USING INDEX mission_runs_open_index")
