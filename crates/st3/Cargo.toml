@@ -27,9 +27,13 @@ hyper = { version = "1", features = ["client", "http1", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 kdl = "6"
 libc = "0.2"
+# Exactly pty-terminal's pin: libghostty's C API is not stable between Ghostty commits.
+libghostty-vt = "=0.2.1"
+libghostty-vt-sys = { version = "=0.2.1", features = ["pkg-config"] }
 notify = "8"
 pty-client = { git = "https://github.com/compoundingtech/pty-rust", rev = "06c303f708a49a8110a5eb640194deab0561fa3a" }
 pty-core = { git = "https://github.com/compoundingtech/pty-rust", rev = "06c303f708a49a8110a5eb640194deab0561fa3a" }
+pty-terminal = { git = "https://github.com/compoundingtech/pty-rust", rev = "06c303f708a49a8110a5eb640194deab0561fa3a" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 ring = "0.17"
 rusqlite = { version = "0.32", features = ["bundled", "trace", "functions"] }
@@ -49,7 +53,6 @@ toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt", "registry", "std"] }
 tower = { version = "0.5", features = ["util"] }
-alacritty_terminal = { version = "0.26", default-features = false }
 tar = "0.4"
 urlencoding = "2"
 uuid = { version = "1", features = ["v7"] }
