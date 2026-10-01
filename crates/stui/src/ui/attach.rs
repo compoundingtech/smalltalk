@@ -112,6 +112,99 @@ pub fn from_clipboard() -> Result<Attachment, String> {
     describe(&path).ok_or_else(|| "the clipboard image could not be read".into())
 }
 
+/// Whether the terminal stui draws in is kitty, which can hand over the person's clipboard
+/// through the terminal itself (OSC 5522), wherever stui runs.
+pub fn terminal_clipboard() -> bool {
+    std::env::var("TERM").is_ok_and(|term| term.contains("kitty"))
+        || std::env::var_os("KITTY_WINDOW_ID").is_some()
+}
+
+/// The image on the person's clipboard, asked of their terminal (kitty's OSC 5522): it works
+/// over SSH or fabric because the request and the image travel through the terminal. kitty
+/// asks the person before it hands the clipboard over.
+pub fn from_terminal() -> Result<Attachment, String> {
+    use base64::Engine as _;
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::AsRawFd as _;
+    let mut tty = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .map_err(|error| format!("no terminal to ask ({error})"))?;
+    let base64 = base64::engine::general_purpose::STANDARD;
+    write!(
+        tty,
+        "\x1b]5522;type=read;{}\x1b\\",
+        base64.encode("image/png")
+    )
+    .and_then(|()| tty.flush())
+    .map_err(|error| error.to_string())?;
+    // The person may be asked first, so the first answer may take a while; after it, the
+    // data flows at once.
+    let mut received = Vec::new();
+    let mut chunk = [0_u8; 65536];
+    let mut wait = 30_000;
+    loop {
+        let mut poll = libc::pollfd {
+            fd: tty.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd for an open descriptor, for the given time.
+        let ready = unsafe { libc::poll(&mut poll, 1, wait) };
+        if ready <= 0 {
+            return Err(
+                "the terminal did not answer (is it kitty, with clipboard reading allowed?)".into(),
+            );
+        }
+        let read = tty.read(&mut chunk).map_err(|error| error.to_string())?;
+        if read == 0 {
+            return Err("the terminal closed".into());
+        }
+        received.extend_from_slice(&chunk[..read]);
+        wait = 5_000;
+        let text = String::from_utf8_lossy(&received);
+        if text.contains("status=DONE") {
+            break;
+        }
+        for status in ["EPERM", "ENOSYS", "EBUSY"] {
+            if text.contains(&format!("status={status}")) {
+                return Err(match status {
+                    "EPERM" => "the terminal did not allow reading the clipboard".into(),
+                    "ENOSYS" => "the clipboard holds no image".into(),
+                    _ => "the clipboard is busy; try again".into(),
+                });
+            }
+        }
+    }
+    let encoded = osc_payload(&String::from_utf8_lossy(&received));
+    let bytes = base64
+        .decode(encoded.as_bytes())
+        .map_err(|_| "the terminal sent an image stui could not read".to_owned())?;
+    if !is_png(&bytes) {
+        return Err("the clipboard holds no image".into());
+    }
+    let dir = dir().ok_or("no place to keep the image (set HOME)")?;
+    std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
+    let path = dir.join(format!("{}.png", uuid::Uuid::now_v7()));
+    std::fs::write(&path, bytes).map_err(|error| error.to_string())?;
+    describe(&path).ok_or_else(|| "the image is too large to attach".into())
+}
+
+/// Every OSC 5522 DATA packet's payload, in order: one base64 stream.
+fn osc_payload(text: &str) -> String {
+    let mut encoded = String::new();
+    for packet in text.split("\x1b]5522;").skip(1) {
+        let packet = packet.split(['\x1b', '\x07']).next().unwrap_or_default();
+        if let Some((meta, payload)) = packet.split_once(';')
+            && meta.contains("status=DATA")
+        {
+            encoded.push_str(payload);
+        }
+    }
+    encoded
+}
+
 fn describe(path: &Path) -> Option<Attachment> {
     let bytes = std::fs::metadata(path).ok()?.len();
     if bytes == 0 || bytes > MAX_BYTES {
@@ -153,6 +246,12 @@ pub fn mention(attachments: &[Attachment]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kittys_clipboard_answer_is_its_data_packets_joined() {
+        let answer = "\x1b]5522;type=read:status=OK\x1b\\\x1b]5522;type=read:status=DATA:mime=aW1hZ2UvcG5n;iVBO\x1b\\\x1b]5522;type=read:status=DATA:mime=aW1hZ2UvcG5n;Rw0K\x1b\\\x1b]5522;type=read:status=DONE\x1b\\";
+        assert_eq!(osc_payload(answer), "iVBORw0K");
+    }
 
     #[test]
     fn a_pasted_image_path_attaches_and_other_text_does_not() {

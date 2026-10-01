@@ -582,7 +582,14 @@ impl Ui {
     /// Attach the image on this machine's clipboard to the message being written.
     fn attach_clipboard(&mut self) {
         let Some(key) = self.draft_key() else { return };
-        match attach::from_clipboard() {
+        // kitty hands over the person's own clipboard through the terminal, wherever stui
+        // runs; elsewhere this machine's clipboard is the person's.
+        let attached = if attach::terminal_clipboard() {
+            attach::from_terminal().or_else(|error| attach::from_clipboard().map_err(|_| error))
+        } else {
+            attach::from_clipboard()
+        };
+        match attached {
             Ok(attachment) => {
                 self.flash(format!("Attached {}", attachment.label()));
                 self.attachments.entry(key).or_default().push(attachment);

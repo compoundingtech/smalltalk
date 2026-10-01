@@ -2608,6 +2608,12 @@ pub fn new_agent_form(form: &AgentForm, hosts: &[String], width: usize) -> Doc {
                 body.lines(text::wrap(&runs, w.saturating_sub(4), &[], &[], None));
             }
         }
+        // What it should do gets room to write in from the start (Nathan, 2026-10-01).
+        if index == 0 {
+            while body.lines.len() < 4 {
+                body.blank();
+            }
+        }
         field(&mut inner, index, label, body);
     }
     let host = match form.host {
