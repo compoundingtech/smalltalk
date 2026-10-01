@@ -1,0 +1,59 @@
+import assert from 'node:assert/strict';
+import { agentName, agentRows, agentSections, agentState, agentTreeLines, filterAgentRows, UNMANAGED_GROUP } from './agentsView.ts';
+
+const now = Date.parse('2026-09-30T12:00:00Z');
+const agent = (id, extra = {}) => ({ id: `agent/${id}`, name: id, kind: 'agent', updated_at: '2026-09-30T11:00:00Z', state: 'running', harness_state: 'idle', driver: 'claude', runtime_ids: [], reachability: 'local', ...extra });
+
+// Names read the way stui reads them, including an omp seat under its parent.
+assert.equal(agentName({ id: 'agent/example/cos/standing/cos', name: 'example/cos/standing/cos' }), 'COS');
+assert.equal(agentName({ id: 'agent/example/pty-rust/omp', name: 'example/pty-rust/omp' }), 'PTY Rust · OMP');
+assert.equal(agentName({ id: 'agent/example/smalltalk-ci', name: 'example/smalltalk-ci' }), 'Smalltalk Ci');
+
+// States follow stui: a fault or a stale delivery is broken whatever the harness says.
+assert.equal(agentState({ state: 'running', harness_state: 'working' }), 'working');
+assert.equal(agentState({ state: 'running', harness_state: 'idle' }), 'idle');
+assert.equal(agentState({ state: 'running', harness_state: 'working', fault: 'boom' }), 'fault');
+assert.equal(agentState({ state: 'running', delivery: { state: 'stale' } }), 'fault');
+assert.equal(agentState({ state: 'waiting', harness_state: 'blocked' }), 'needs-you');
+assert.equal(agentState({ state: 'waiting', harness_state: 'starting' }), 'starting');
+assert.equal(agentState({ state: 'stopped' }), 'stopped');
+assert.equal(agentState({ state: 'failed' }), 'fault');
+
+// Grouped and sorted like stui: waiting on you, broken, working, idle, stopped, and sessions st
+// found but did not start last, never first.
+const agents = [
+  agent('example/zeta'),
+  agent('example/alpha'),
+  agent('example/busy', { harness_state: 'working', driver: 'codex' }),
+  agent('example/asks', { state: 'waiting', harness_state: 'blocked' }),
+  agent('example/off', { state: 'stopped' }),
+  agent('example/bad', { fault: 'crashed' }),
+];
+const sessions = [
+  { id: 'session/found', kind: 'session', state: 'running', managed: false, driver: 'codex', workspace: '/home/example/src/app', updated_at: '2026-09-30T11:59:18Z' },
+  { id: 'session/managed', kind: 'session', state: 'running', owner_id: 'agent/example/alpha', updated_at: '2026-09-30T11:00:00Z' },
+  { id: 'session/old', kind: 'session', state: 'completed', managed: false, driver: 'codex', updated_at: '2026-09-30T11:00:00Z' },
+];
+const rows = agentRows(agents, sessions, 'example-linux', now);
+assert.deepEqual(rows.map(row => row.name), ['Asks', 'Bad', 'Busy', 'Alpha', 'Zeta', 'Off', 'codex in app']);
+assert.deepEqual(agentSections(rows).map(section => [section.title, section.count]), [['waiting on you', 1], ['broken', 1], ['working', 1], ['idle', 2], ['stopped', 1], [UNMANAGED_GROUP, 1]]);
+assert.equal(agentSections(rows)[0].person, true);
+const found = rows.at(-1);
+assert.deepEqual([found.target, found.harness, found.activity, found.host, found.unmanaged], ['session/found', 'codex', '42s', 'example-linux', true]);
+assert.deepEqual([rows[3].path, rows[3].harness, rows[3].activity, rows[3].target], ['example/alpha', 'claude', '1h', 'agent/example/alpha']);
+
+// The tree puts each agent under the folders of its path, opening each folder once.
+const tree = agentTreeLines(agentRows([agent('example/cos/standing/cos'), agent('example/stui'), agent('example/cos/other')], [], 'example-linux', now));
+assert.deepEqual(tree.map(line => line.kind === 'folder' ? `${'  '.repeat(line.depth)}${line.name}/` : `${'  '.repeat(line.depth)}${line.row.name}`), [
+  'example/',
+  '  cos/',
+  '    Other',
+  '    standing/',
+  '      COS',
+  '  Stui',
+]);
+
+// The search field keeps rows matching every word, in name, path, harness, or host.
+assert.deepEqual(filterAgentRows(rows, 'CODEX').map(row => row.name), ['Busy', 'codex in app']);
+assert.deepEqual(filterAgentRows(rows, 'example ZE').map(row => row.name), ['Zeta']);
+assert.equal(filterAgentRows(rows, '  ').length, rows.length);

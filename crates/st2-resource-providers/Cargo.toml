@@ -21,7 +21,7 @@ wasmtime = { version = "=48.0.1", default-features = false, features = ["compone
 tokio = { version = "1", features = ["macros", "rt", "sync", "time"] }
 
 [dev-dependencies]
-st2-resource-protocol = { path = "../st2-resource-protocol" }
+st2-resource-protocol = { package = "st-resource-protocol", path = "../st-resource-protocol" }
 tempfile = "3"
 
 [[test]]

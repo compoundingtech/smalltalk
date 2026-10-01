@@ -104,6 +104,36 @@ pub fn resolve_tool(override_path: Option<&Path>, name: &str) -> Option<PathBuf>
     })
 }
 
+#[derive(Debug)]
+struct CommandFailure(String);
+
+impl std::fmt::Display for CommandFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for CommandFailure {}
+
+/// Fabric answered the dial but this member has not granted the requested service.
+#[derive(Debug)]
+pub struct FabricGrantRefusal {
+    pub node: String,
+    pub protocol: String,
+}
+
+impl std::fmt::Display for FabricGrantRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refused by that member's Fabric grants (node {}, service {}); retrying in about 30 minutes; replication can continue through other members",
+            self.node, self.protocol
+        )
+    }
+}
+
+impl std::error::Error for FabricGrantRefusal {}
+
 async fn run(program: &Path, arguments: &[&str]) -> Result<String> {
     let output = tokio::time::timeout(
         COMMAND_TIMEOUT,
@@ -116,13 +146,16 @@ async fn run(program: &Path, arguments: &[&str]) -> Result<String> {
     .await
     .with_context(|| format!("{} {} timed out", program.display(), arguments.join(" ")))?
     .with_context(|| format!("run {}", program.display()))?;
-    anyhow::ensure!(
-        output.status.success(),
-        "{} {} failed: {}",
-        program.display(),
-        arguments.join(" "),
-        String::from_utf8_lossy(&output.stderr).trim()
-    );
+    if !output.status.success() {
+        return Err(anyhow::Error::new(CommandFailure(
+            String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        ))
+        .context(format!(
+            "{} {} failed",
+            program.display(),
+            arguments.join(" ")
+        )));
+    }
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
@@ -160,6 +193,28 @@ impl Fabric {
         Self { program }
     }
 
+    /// Local endpoint state, queried without contacting any peer. Address changes or a
+    /// restarted Fabric endpoint wake replication independently of failed-peer timers.
+    pub async fn addresses(&self) -> Result<BTreeSet<String>> {
+        let value: Value = serde_json::from_str(&run(&self.program, &["addr"]).await?)?;
+        let addresses = value["addrs"]
+            .as_array()
+            .context("fabric addr needs addrs")?;
+        Ok(addresses.iter().map(Value::to_string).collect())
+    }
+
+    /// Fabric owns reconnecting this passive local event stream. Older builds lack the
+    /// command; the worker then retains its address/suspend watcher and retry timers.
+    pub fn peer_events(&self) -> Result<tokio::process::Child> {
+        Ok(tokio::process::Command::new(&self.program)
+            .args(["peer-events", "--watch"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?)
+    }
+
     /// This machine's Fabric NodeID.
     pub async fn id(&self) -> Result<String> {
         let id = run(&self.program, &["id"]).await?.trim().to_owned();
@@ -167,15 +222,12 @@ impl Fabric {
         Ok(id)
     }
 
-    /// Expose a loopback TCP listener to trusted peers under `protocol`, without persisting
-    /// the exposure in Fabric's configuration. Repeating it is harmless.
+    /// Persist a loopback listener exposure so Fabric restores it after a restart.
+    /// Repeating it is harmless; fleet leave and uninstall remove it explicitly.
     pub async fn expose(&self, protocol: &str, address: &str) -> Result<()> {
-        run(
-            &self.program,
-            &["expose", protocol, "--tcp", address, "--ephemeral"],
-        )
-        .await
-        .map(|_| ())
+        run(&self.program, &["expose", protocol, "--tcp", address])
+            .await
+            .map(|_| ())
     }
 
     pub async fn unexpose(&self, protocol: &str) -> Result<()> {
@@ -218,7 +270,21 @@ impl Fabric {
             &self.program,
             &["dial", node, protocol, "--tcp", "127.0.0.1:0"],
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            if error
+                .downcast_ref::<CommandFailure>()
+                .is_some_and(|failure| failure.0.contains("peer not permitted for service"))
+            {
+                FabricGrantRefusal {
+                    node: node.into(),
+                    protocol: protocol.into(),
+                }
+                .into()
+            } else {
+                error
+            }
+        })?;
         let address: SocketAddr = printed
             .trim()
             .parse()
@@ -238,6 +304,38 @@ pub enum Route {
     Http(String),
     /// A Fabric peer and protocol; the worker dials a local tunnel for it.
     Fabric { node: String, protocol: String },
+}
+
+/// A lasting peer route. HTTP stays on loopback or the encrypted tailnet; Fabric names
+/// the remote peer/protocol, never an ephemeral local tunnel address.
+pub fn parse_route(route: &str) -> Option<Route> {
+    if let Some(rest) = route.strip_prefix("fabric://") {
+        let (node, protocol) = rest.split_once('/')?;
+        if node.is_empty()
+            || protocol.is_empty()
+            || rest
+                .chars()
+                .any(|character| character.is_whitespace() || matches!(character, '?' | '#' | '@'))
+        {
+            return None;
+        }
+        return Some(Route::Fabric {
+            node: node.into(),
+            protocol: protocol.into(),
+        });
+    }
+    let url = reqwest::Url::parse(route).ok()?;
+    let host = url.host_str()?.trim_matches(['[', ']']);
+    (url.scheme() == "http"
+        && url.username().is_empty()
+        && url.password().is_none()
+        && url.query().is_none()
+        && url.fragment().is_none()
+        && (host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<IpAddr>()
+                .is_ok_and(|address| is_permitted_route_address(&address))))
+    .then(|| Route::Http(route.trim_end_matches('/').into()))
 }
 
 /// What this machine can use to dial.
@@ -403,11 +501,34 @@ mod tests {
         assert_eq!(
             calls,
             "id\ndial node-b st3/fleet/x --tcp 127.0.0.1:0\n\
-             expose st3/fleet/x --tcp 127.0.0.1:31313 --ephemeral\nunexpose st3/fleet/x\n"
+             expose st3/fleet/x --tcp 127.0.0.1:31313\nunexpose st3/fleet/x\n"
         );
 
         let remote = Fabric::new(shim(root.path(), "echo 192.168.1.4:45678"));
         assert!(remote.dial("node-b", "p").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn fabric_grant_refusals_are_distinct_from_unavailable_peers() {
+        let root = tempfile::tempdir().unwrap();
+        let refused = Fabric::new(shim(
+            root.path(),
+            "echo 'peer not permitted for service st3-peer-v1' >&2; exit 1",
+        ));
+        let error = refused
+            .dial("invented-leaf", "st3-peer-v1")
+            .await
+            .unwrap_err();
+        assert!(error.is::<FabricGrantRefusal>(), "{error:#}");
+        assert!(error.to_string().contains("that member's Fabric grants"));
+        let away = Fabric::new(shim(root.path(), "echo 'peer offline' >&2; exit 1"));
+        assert!(
+            !away
+                .dial("invented-leaf", "st3-peer-v1")
+                .await
+                .unwrap_err()
+                .is::<FabricGrantRefusal>()
+        );
     }
 
     #[tokio::test]

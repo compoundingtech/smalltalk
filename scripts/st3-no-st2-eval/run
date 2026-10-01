@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""A Claude seat on a machine with no st2: no `st2` on PATH and no st2 state directory.
+
+One isolated daemon (private HOME, XDG dirs, PATH and sockets) runs one Claude seat whose
+`claude` is ./claude, a stand-in that drives the real hook, status-line and channel contracts.
+The eval checks, from outside the seat, that st3 alone:
+- publishes harness.observed working and idle from the seat's hooks;
+- binds Claude's native session, so the client API timeline shows the native transcript;
+- records the status line (harness.usage carries the stand-in's model and context);
+- delivers a message through the channel and sees it read;
+- reports claude-hooks pass in `st doctor`;
+- launches nothing whose argv or environment names an `st2` program or an `/st2/` path, and
+  creates no st2 state directory.
+"""
+import argparse
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import subprocess
+import tempfile
+import time
+import urllib.parse
+
+HERE = Path(__file__).resolve().parent
+SUBJECT = "agent/eval/no-st2"
+
+
+def st2_surface(text):
+    """Whether text runs an `st2` program or names st2's state (mirrors st3::hooks)."""
+    tokens = re.split(r"[\s\"'();|&`=:]+", text)
+    return any(token == "st2" or token.endswith("/st2") for token in tokens) or "/st2/" in text
+
+
+class Node:
+    def __init__(self, root, binary):
+        self.root = root
+        self.binary = binary
+        for sub in ("bin", "home", "run", "ws", "state"):
+            (root / sub).mkdir(parents=True, exist_ok=True)
+        pty = shutil.which("pty")
+        if not pty:
+            raise SystemExit("pty must be on PATH")
+        (root / "bin/pty").symlink_to(pty)
+        stub = root / "bin/claude"
+        shutil.copy2(HERE / "claude", stub)
+        stub.chmod(0o755)
+        self.path = f"{root / 'bin'}:/usr/bin:/bin"
+        found = shutil.which("st2", path=self.path)
+        if found:
+            raise SystemExit(f"the isolated PATH must not hold st2, but {found} is on it")
+        self.endpoint = root / "run/st.sock"
+        self.env = {"PATH": self.path, "HOME": str(root / "home"), "SHELL": "/bin/bash",
+                    "USER": os.environ.get("USER", "eval"), "LOGNAME": os.environ.get("USER", "eval"),
+                    "LANG": "C.UTF-8", "XDG_STATE_HOME": str(root / "home/.local/state"),
+                    "XDG_CONFIG_HOME": str(root / "home/.config"),
+                    "XDG_DATA_HOME": str(root / "home/.local/share"),
+                    "XDG_RUNTIME_DIR": str(root / "run"), "ST3_ENDPOINT": str(self.endpoint),
+                    "ST3_DAEMON_WAIT": "0"}
+        # The daemon rebuilds PATH from a login shell; pin it to the isolated one.
+        profile = f"export PATH='{self.path}'\n"
+        for name in (".profile", ".bash_profile", ".bashrc", ".zprofile", ".zshenv"):
+            (root / "home" / name).write_text(profile)
+        (root / "config.toml").write_text(f'''node = "nost2"
+person = "person/eval"
+state_dir = "{root / 'state'}"
+pty_root = "{root / 'pty'}"
+socket = "{self.endpoint}"
+client_gateway_socket = "{root / 'run/client.sock'}"
+''')
+        self.log = (root / "daemon.log").open("ab")
+        self.daemon = None
+
+    def start(self):
+        self.daemon = subprocess.Popen([str(self.binary), "up", "--config", str(self.root / "config.toml")],
+                                       env=self.env, cwd=self.root / "ws", stdin=subprocess.DEVNULL,
+                                       stdout=self.log, stderr=self.log, start_new_session=True)
+        until(lambda: self.api("/v1/health"), 60, "the isolated daemon did not answer",
+              lambda: self.daemon.poll() is None or fail("daemon exited: " + self.tail("daemon.log")))
+
+    def tail(self, name):
+        path = self.root / name
+        return path.read_text(errors="replace")[-3000:] if path.exists() else ""
+
+    def cli(self, *args, check=True):
+        result = subprocess.run([str(self.binary), "--endpoint", str(self.endpoint), *args], env=self.env,
+                                capture_output=True, text=True, timeout=60)
+        if check and result.returncode:
+            raise RuntimeError(f"st {' '.join(args)}: {result.stderr.strip()}")
+        return result.stdout
+
+    def api(self, path):
+        result = subprocess.run(["curl", "-sf", "--max-time", "10", "--unix-socket", str(self.endpoint),
+                                 "http://localhost" + path], capture_output=True, text=True)
+        if result.returncode:
+            return None
+        try:
+            payload = json.loads(result.stdout)
+        except ValueError:
+            return None
+        return payload.get("value", payload) if isinstance(payload, dict) else payload
+
+    def stop(self):
+        if self.daemon and self.daemon.poll() is None:
+            os.killpg(self.daemon.pid, signal.SIGTERM)
+            try:
+                self.daemon.wait(15)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.daemon.pid, signal.SIGKILL)
+        env = {**self.env, "PTY_ROOT": str(self.root / "pty")}
+        listed = subprocess.run(["pty", "list", "--json"], env=env, capture_output=True, text=True)
+        try:
+            for row in json.loads(listed.stdout or "[]"):
+                subprocess.run(["pty", "kill", row["name"]], env=env, capture_output=True)
+        except (ValueError, KeyError):
+            pass
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            for pid, _, _ in self.seat_processes():
+                try:
+                    os.kill(pid, sig)
+                except ProcessLookupError:
+                    pass
+            time.sleep(0.3)
+
+    def seat_processes(self):
+        """Every process this daemon launched for the seat, by its exact private endpoint."""
+        rows = []
+        for proc in Path("/proc").glob("[0-9]*"):
+            try:
+                environ = (proc / "environ").read_bytes().split(b"\0")
+                if f"ST3_ENDPOINT={self.endpoint}".encode() not in environ:
+                    continue
+                if f"ST_AGENT={SUBJECT}".encode() not in environ:
+                    continue
+                argv = (proc / "cmdline").read_bytes().replace(b"\0", b" ").decode()
+                rows.append((int(proc.name), argv, [value.decode(errors="replace") for value in environ]))
+            except (OSError, UnicodeError):
+                pass
+        return rows
+
+
+class Failure(Exception):
+    pass
+
+
+def fail(message):
+    raise Failure(message)
+
+
+def until(predicate, timeout, message, alive=lambda: True):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        alive()
+        value = predicate()
+        if value:
+            return value
+        time.sleep(0.25)
+    fail(message)
+
+
+def receipts(node):
+    path = node.root / "ws/receipts.jsonl"
+    return [json.loads(line) for line in path.read_text().splitlines() if line] if path.exists() else []
+
+
+def claims(node, kind):
+    text = node.cli("trace", "show", SUBJECT, "--json", "--limit", "500", check=False)
+    rows = []
+    for line in text.splitlines():
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("kind") == kind:
+            rows.append(row)
+    return rows
+
+
+def fields(claim):
+    body = claim.get("body", claim)
+    return body.get("fields", body)
+
+
+def run(args, root, evidence):
+    node = Node(root, args.binary)
+    checks = {}
+    try:
+        node.start()
+        seats = root / "seats.kdl"
+        seats.write_text(f'''version 2
+agent "no-st2" {{
+  identity "eval/no-st2"
+  workspace "{root / 'ws'}"
+  restart "always"
+  harness "claude" {{}}
+}}
+''')
+        node.cli("agents", "apply", str(seats), "--as", "person/eval")
+
+        def turned():
+            states = {fields(claim).get("state") for claim in claims(node, "harness.observed")}
+            return {"working", "idle"} <= states and states
+        checks["observed_states"] = sorted(until(turned, args.ready_seconds,
+                                                 "harness.observed never showed working and idle"))
+
+        hooks = [row for row in receipts(node) if row["event"] == "hook"]
+        checks["hook_runs"] = len(hooks)
+        failed = [row for row in hooks if row["exit"] != 0]
+        if failed:
+            fail(f"hooks failed: {failed}")
+        session_start = [row for row in hooks if row["hook_event"] == "SessionStart"]
+        if not session_start:
+            fail("SessionStart never ran")
+
+        def timeline():
+            page = node.api("/v1/client/sessions/" + urllib.parse.quote(SUBJECT, safe="/") + "/timeline")
+            return page if page and "no-st2 transcript probe" in json.dumps(page) else None
+        page = until(timeline, 60, "the client API timeline never showed the native transcript")
+        (evidence / "timeline.json").write_text(json.dumps(page, indent=2))
+        checks["timeline_items"] = len(page.get("items", []))
+
+        def status_recorded():
+            usage = claims(node, "harness.usage")
+            return [fields(claim) for claim in usage if fields(claim).get("model") == "claude-stub-model"]
+        checks["usage"] = until(status_recorded, 60, "the status line was never recorded")[-1]
+        lines = [row for row in receipts(node) if row["event"] == "statusline"]
+        if not lines or any(row.get("exit") != 0 or "missing" in row.get("stdout", "") for row in lines):
+            fail(f"the status line failed: {lines[-3:]}")
+
+        sent = json.loads(node.cli("conversations", "send", SUBJECT, "--from", "person/eval",
+                                   "--subject", "no-st2 probe", "--body", "reply-token:no-st2", "--json"))
+        message = sent["subject"]
+        checks["message"] = message
+
+        def read():
+            view = node.api("/v1/messages/read/" + message)
+            return view if (view or {}).get("status") in ("read", "closed") else None
+        checks["message_status"] = until(read, 90, f"{message} was never read")["status"]
+        channel = [row for row in receipts(node) if row["event"] == "channel"]
+        if not any(message in row["content"] for row in channel):
+            fail("the message never reached the channel")
+
+        doctor = node.api("/v1/doctor") or {}
+        hook_check = next((row for row in doctor.get("checks", []) if row.get("name") == "claude-hooks"), None)
+        checks["doctor"] = hook_check
+        if not hook_check or hook_check["status"] != "pass" or "1 running sessions are bound" not in hook_check["message"]:
+            fail(f"doctor claude-hooks: {hook_check}")
+
+        processes = node.seat_processes()
+        checks["seat_processes"] = len(processes)
+        if not any(" driver-hook " in argv or "claude-mcp" in argv for _, argv, _ in processes) and not processes:
+            fail("no seat process was found")
+        for pid, argv, environ in processes:
+            legacy = [value.split("=", 1)[0] for value in environ if value.startswith("ST2_")]
+            if legacy:
+                fail(f"fresh seat process {pid} exports legacy environment names: {legacy}")
+            for text in [argv, *environ]:
+                if st2_surface(text):
+                    fail(f"seat process {pid} ({argv[:120]}) reaches st2: {text[:300]}")
+        hook_set = [value for _, _, environ in processes for value in environ if value.startswith("ST_HOOKS=")]
+        checks["st_hooks"] = sorted(set(hook_set))
+        if not hook_set or not all(value.startswith(f"ST_HOOKS={root / 'state/hooks/sets/sha256-'}")
+                                   for value in hook_set):
+            fail(f"ST_HOOKS is not st3's set: {hook_set}")
+        checks["record_schemas"] = {}
+        for name in ("harness-state", "harness-context", "harness-timeline"):
+            paths = list((root / "state").rglob(name))
+            if not paths:
+                fail(f"the fresh seat wrote no {name} record")
+            for path in paths:
+                schema = json.loads(path.read_text())["schema"]
+                if schema != f"st.{name}.v1":
+                    fail(f"fresh {name} record has legacy or unsupported schema {schema!r}")
+                checks["record_schemas"][name] = schema
+        leftovers = [str(path) for path in root.rglob("st2") if path.is_dir()]
+        if leftovers:
+            fail(f"st2 state directories were created: {leftovers}")
+        return {"verdict": "pass", "checks": checks}
+    except Failure as error:
+        return {"verdict": "fail", "failure": str(error), "checks": checks}
+    finally:
+        if node.daemon and node.daemon.poll() is None:
+            (evidence / "trace.jsonl").write_text(
+                node.cli("trace", "show", SUBJECT, "--json", "--limit", "500", check=False))
+            terminal = subprocess.run(["pty", "peek", "--plain", "--full", "eval.no-st2"],
+                                      env={**node.env, "PTY_ROOT": str(root / "pty")},
+                                      capture_output=True, text=True)
+            (evidence / "terminal.txt").write_text(terminal.stdout + terminal.stderr)
+        node.stop()
+        for name in ("daemon.log", "ws/receipts.jsonl"):
+            path = root / name
+            if path.exists():
+                (evidence / Path(name).name).write_text(path.read_text(errors="replace"))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("binary", type=Path)
+    parser.add_argument("evidence", type=Path)
+    parser.add_argument("--ready-seconds", type=float, default=120)
+    args = parser.parse_args()
+    args.binary = args.binary.resolve()
+    args.evidence.mkdir(parents=True, exist_ok=True)
+    # Short, private paths: Unix socket paths are limited to about 100 bytes.
+    root = Path(tempfile.mkdtemp(prefix="nst2-", dir="/tmp"))
+    try:
+        result = run(args, root, args.evidence)
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+    (args.evidence / "result.json").write_text(json.dumps(result, indent=2, default=str) + "\n")
+    print(json.dumps(result, indent=2, default=str))
+    return 0 if result["verdict"] == "pass" else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -7,15 +7,20 @@ pub(crate) mod checkout;
 pub mod client;
 pub mod config;
 pub(crate) mod disk;
+/// Answers the hooks an st3 seat's harness runs: `st driver-hook NAME`.
+pub mod driver_hook;
 pub mod environment;
 pub(crate) mod external_sessions;
 pub mod fleet;
 pub mod graph;
+/// The lifecycle hook set st3 publishes beneath its own state directory.
+pub mod hooks;
 pub mod lane;
 pub mod mission;
 pub mod model;
 pub mod otlp;
 pub mod peer;
+pub mod performance;
 /// Opt-in accounting of where the daemon's time goes, turned on by `ST3_PROFILE_DIR`.
 pub mod profile;
 pub mod projection;
@@ -35,6 +40,7 @@ pub mod service;
 /// The st agent skill bundled in this binary and installed for each harness.
 pub mod skill;
 pub mod store;
+pub mod telemetry;
 /// Attaches a local terminal to another fleet host's PTY session over Fabric, without st daemons.
 pub mod terminal_fabric;
 

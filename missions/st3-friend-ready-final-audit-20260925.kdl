@@ -7,7 +7,7 @@ mission "fleet/st3/friend-ready-final-audit-20260925" state="ready" {
   constraint "Do not edit or discard soak evidence, lower thresholds, expose the privileged socket, or require a physical iPhone."
 
   step "audit-and-handoff" timeout="8h" {
-    assigned-to "agent/fleet/st3/standing/st3"
+    assigned-to "agent/example/st3/standing/st3"
     goal "Inspect both retained soak logs and service health, exact message receipts, strict doctors, signed replication, daemon PIDs, app/TUI evidence, rollback binaries, and final source/test record."
     goal "If a gate fails, diagnose and remediate it, retain the failure evidence, and restart the complete affected window. Do not announce a friend-ready release on a short diagnostic."
     goal "If every requirement passes, update the friend-trial handoff with exact evidence and state the bounded trial decision."

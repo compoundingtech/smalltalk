@@ -53,9 +53,12 @@ const COLLECTION_MAX_SUBSCRIPTIONS: usize = 8;
 /// commit kept a daemon busy for as long as a client stayed connected. Commits in between are
 /// read together; a new subscription is still read at once.
 const COLLECTION_REREAD_INTERVAL: Duration = Duration::from_millis(1_500);
+// Observer grace periods and checkpoint waits can enter attention without a new claim.
+const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
+    if collection == "glasses" { return !kind.starts_with("glass."); }
     matches!(kind, "daemon.diagnostic" | "transport.observed")
         || (kind == "harness.usage" && collection != "agents")
 }
@@ -94,7 +97,7 @@ async fn collection_items(
 ) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
     if !matches!(
         request.collection.as_str(),
-        "missions" | "attention" | "agents" | "work"
+        "missions" | "attention" | "agents" | "work" | "glasses"
     ) {
         return Err(validation("unknown collection subscription"));
     }
@@ -105,7 +108,12 @@ async fn collection_items(
     if !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&limit) {
         return Err(validation("collection limit must be 1 through 200"));
     }
-    let person = if request.collection == "attention" {
+    let person = if request.collection == "glasses" {
+        if request.person.is_some() || request.actor.is_some() {
+            return Err(validation("glasses select the session person"));
+        }
+        Some(glass_person(session, false)?)
+    } else if request.collection == "attention" {
         person_filter(session, request.person.as_deref())?
     } else {
         None
@@ -123,10 +131,14 @@ async fn collection_items(
                 "missions" => {
                     let mut ids =
                         store.mission_collection_ids(false, 0, limit.saturating_add(1))?;
-                    let has_more = ids.len() > limit;
+                    let mut has_more = ids.len() > limit;
                     ids.truncate(limit);
-                    let items = mission_resources_filtered(&store, index, false, None, Some(&ids))?;
+                    let mut items = mission_list_cards(&store, &ids)?;
+                    has_more |= bound_mission_cards(&mut items)?;
                     return Ok((snapshot, items, has_more));
+                }
+                "glasses" => {
+                    store.glasses(person.as_deref().expect("authenticated glass owner"), index)?
                 }
                 "attention" => client_attention_resources(&store, person.as_deref(), false)?,
                 "agents" => client_agent_resources(&store, false, &at, index)?,
@@ -307,7 +319,9 @@ fn conversation_owner_host(
     .map(|origin| client_host_id(&origin));
     if let Some(owner) = &remote {
         if !session.authority_actor.starts_with("person/") {
-            return Err(forbidden("a remote conversation requires a concrete person"));
+            return Err(forbidden(
+                "a remote conversation requires a concrete person",
+            ));
         }
         if state
             .client_relay
@@ -411,20 +425,18 @@ async fn follow_conversation(
     outbox: tokio::sync::mpsc::UnboundedSender<(String, Value)>,
 ) {
     let remote = remote.as_deref();
-    let failed = |error: ApiError| {
-        json!({"kind":"error", "id":id, "collection":"conversation", "code":error.code, "message":error.message})
-    };
+    let failed = |error: ApiError| json!({"kind":"error", "id":id, "collection":"conversation", "code":error.code, "message":error.message});
     loop {
         // The cursor first, so nothing that lands while the page is read is lost.
-        let start =
-            match conversation_changes_value(&state, &session, &session_id, remote, None, 0).await
-            {
-                Ok(start) => start,
-                Err(error) => {
-                    let _ = outbox.send((id.clone(), failed(error)));
-                    return;
-                }
-            };
+        let start = match conversation_changes_value(&state, &session, &session_id, remote, None, 0)
+            .await
+        {
+            Ok(start) => start,
+            Err(error) => {
+                let _ = outbox.send((id.clone(), failed(error)));
+                return;
+            }
+        };
         let page = match conversation_page(&state, &session, &session_id, remote).await {
             Ok(page) => page,
             Err(error) => {
@@ -435,7 +447,9 @@ async fn follow_conversation(
         let mut frame = json!({"kind":"conversation", "id":id, "collection":"conversation", "session_id":session_id, "replace":true, "items":page["items"], "has_more":page["page"]["has_more"]});
         // A page of long tool output can outgrow one frame: keep its newest entries.
         while frame_bytes(&frame) > CLIENT_MAX_RESPONSE_BYTES {
-            let Some(items) = frame["items"].as_array_mut().filter(|items| items.len() > 1)
+            let Some(items) = frame["items"]
+                .as_array_mut()
+                .filter(|items| items.len() > 1)
             else {
                 break;
             };
@@ -521,6 +535,8 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
     let (conversation_outbox, mut conversation_frames) =
         tokio::sync::mpsc::unbounded_channel::<(String, Value)>();
     // The commits already weighed for a reread, whether one is due, and when the last ran.
+    let mut attention_clock = tokio::time::interval(ATTENTION_CLOCK_INTERVAL);
+    attention_clock.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut weighed = state.store.index().unwrap_or_default();
     let mut reread_due = false;
     let mut last_reread = tokio::time::Instant::now() - COLLECTION_REREAD_INTERVAL;
@@ -605,7 +621,8 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
                 let index = state.store.index().unwrap_or(weighed);
                 if index > weighed {
                     let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims).unwrap_or_default();
-                    reread_due |= claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
+                    let glasses_changed = subscriptions.values().any(|s| s.request.collection == "glasses") && state.store.glasses_changed(weighed, index).unwrap_or(true);
+                    reread_due |= glasses_changed || claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
                         claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
                     });
                     weighed = index;
@@ -615,6 +632,9 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
             }
             () = tokio::time::sleep_until(last_reread + COLLECTION_REREAD_INTERVAL), if !command_waiting && reread_due => {
                 refresh.extend(subscriptions.keys().cloned());
+            }
+            _ = attention_clock.tick(), if !command_waiting && subscriptions.values().any(|s| s.request.collection == "attention") => {
+                refresh.extend(subscriptions.iter().filter(|(_, s)| s.request.collection == "attention").map(|(id, _)| id.clone()));
             }
             Some((id, frame)) = conversation_frames.recv(), if !command_waiting => {
                 // A follower stopped by unsubscribe may still have had a frame on the way.
@@ -671,6 +691,47 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
 }
 
 #[derive(Deserialize)]
+pub(super) struct AgentDeclarationQuery {
+    revision: Option<String>,
+    #[serde(default)]
+    show_env_values: bool,
+}
+
+/// Both redacted and explicit environment-value reads require declaration scope.
+pub(super) async fn agent_declaration(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+    Query(query): Query<AgentDeclarationQuery>,
+) -> Result<Json<Value>, ApiError> {
+    require_scope(&session, "read.declarations")?;
+    let subject = format!("agent/{}", id.trim_start_matches("agent/"));
+    let lookup_subject = subject.clone();
+    let store = state.store.clone();
+    let revision = query.revision;
+    let (declaration, revisions) = blocking_store(move || {
+        let declaration = store.agent_declaration(&lookup_subject, revision.as_deref())?;
+        let revisions = store.agent_declaration_revisions(&lookup_subject)?;
+        Ok((declaration, revisions))
+    })
+    .await?;
+    let Some((revision, mut tree)) = declaration else {
+        return Err(ApiError::not_found("managed agent declaration not found"));
+    };
+    if !query.show_env_values {
+        crate::graph::redact_agent_env_values(&mut tree);
+    }
+    let kdl = crate::graph::render_agent_desired_kdl(&tree).map_err(ApiError::bad)?;
+    Ok(Json(json!({
+        "id": subject,
+        "revision": revision,
+        "tree": tree,
+        "kdl": kdl,
+        "revisions": revisions,
+    })))
+}
+
+#[derive(Deserialize)]
 pub(super) struct ClientDocumentQuery {
     name: String,
 }
@@ -704,6 +765,9 @@ pub(super) async fn document_get(
 
 const ALL_SCOPES: &[&str] = &[
     "read.projections",
+    "read.declarations",
+    "read.glasses",
+    "control.glasses",
     "terminal.read",
     "terminal.control",
     "control.attention",
@@ -716,6 +780,8 @@ const ALL_SCOPES: &[&str] = &[
 ];
 const LIMITED_PAIRING_SCOPES: &[&str] = &[
     "read.projections",
+    "read.glasses",
+    "control.glasses",
     "terminal.read",
     "control.attention",
     "control.launches",
@@ -739,6 +805,9 @@ const ACTIONS: &[&str] = &[
     "mission.cancel-revision",
     "mission.cancel",
     "session.import",
+    "work.ask",
+    "work.done",
+    "work.cancel-ask",
     "work.claim",
     "work.renew",
     "work.progress",
@@ -765,7 +834,6 @@ const ACTIONS: &[&str] = &[
     "pairing.revoke",
 ];
 const AVAILABLE_ACTIONS: &[&str] = &[
-    "attention.resolve",
     "review.approve",
     "review.reject",
     "review.request-changes",
@@ -782,6 +850,9 @@ const AVAILABLE_ACTIONS: &[&str] = &[
     "mission.cancel-revision",
     "mission.cancel",
     "session.import",
+    "work.ask",
+    "work.done",
+    "work.cancel-ask",
     "work.claim",
     "work.renew",
     "work.progress",
@@ -820,10 +891,11 @@ pub(super) struct ClientSession {
 impl ClientSession {
     fn local(person: Option<&str>) -> Result<Self, ApiError> {
         if person.is_some_and(|person| {
-            !person.starts_with("person/") || person.matches('/').count() != 1
+            !(person.starts_with("person/") && person.matches('/').count() == 1
+                || person.starts_with("agent/"))
         }) {
             return Err(forbidden(
-                "the trusted Unix client must identify one concrete person",
+                "the trusted Unix client must identify one concrete person or agent",
             ));
         }
         let Some(person) = person else {
@@ -841,7 +913,14 @@ impl ClientSession {
             actor: person.into(),
             authority_actor: person.into(),
             transport: "unix",
-            scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
+            scopes: if person.starts_with("agent/") {
+                ["read.projections", "control.work", "control.missions"]
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect()
+            } else {
+                ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect()
+            },
         })
     }
 
@@ -860,7 +939,9 @@ impl ClientSession {
 }
 
 fn session_claim_actor(session: &ClientSession) -> String {
-    if session.authority_actor.starts_with("person/") {
+    if session.authority_actor.starts_with("person/")
+        || session.authority_actor.starts_with("agent/")
+    {
         session.authority_actor.clone()
     } else {
         "requester".into()
@@ -878,11 +959,16 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
+    capabilities.push(json!({"id":"glasses", "version":0, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
     capabilities.extend(ACTIONS.iter().map(|action| {
         let scope = action_scope(action).expect("registered client action has a scope");
         let state = if !AVAILABLE_ACTIONS.contains(action) {
             "unavailable"
-        } else if session.allows(scope) {
+        } else if session.allows(scope)
+            && !(session.authority_actor.starts_with("agent/")
+                && scope == "control.missions"
+                && *action != "mission.cancel")
+        {
             "granted"
         } else {
             "ungranted"
@@ -1018,7 +1104,13 @@ pub(super) fn authenticate(
         scopes,
     };
     if request.method() == axum::http::Method::GET {
-        let scope = if request.uri().path().starts_with("/v1/client/terminals/") {
+        let scope = if request
+            .uri()
+            .path()
+            .starts_with("/v1/client/agent-declarations/")
+        {
+            "read.declarations"
+        } else if request.uri().path().starts_with("/v1/client/terminals/") {
             "terminal.read"
         } else {
             "read.projections"
@@ -1104,6 +1196,102 @@ pub(super) fn mission_resources(
     selected_id: Option<&str>,
 ) -> anyhow::Result<Vec<Value>> {
     mission_resources_filtered(store, snapshot_index, history, selected_id, None)
+}
+
+/// Collection cards keep only three run headers, regardless of a mission's history size.
+/// Full run and step detail stays on the detail endpoint.
+fn mission_list_cards(store: &Store, ids: &[String]) -> anyhow::Result<Vec<Value>> {
+    let attention = store.human_attention_runs()?;
+    let definitions = store
+        .mission_definitions_for_ids(ids)?
+        .into_iter()
+        .map(|d| (d.mission.subject.clone(), d))
+        .collect::<BTreeMap<_, _>>();
+    ids.iter().map(|id| {
+        let overview = store.mission_overview(id, 3)?;
+        let newest = overview["newest"].as_array().expect("overview previews");
+        let latest = newest.first();
+        let definition = definitions.get(id);
+        let state = if overview["counts"]["running"].as_u64().unwrap_or(0)>0 {"running"}
+            else if overview["counts"]["standing"].as_u64().unwrap_or(0)>0 {"standing"}
+            else if definition.is_some_and(|d| d.mission.state==crate::model::MissionState::Retired) {"retired"}
+            else if let Some(run)=latest {run["status"].as_str().unwrap_or("ready")}
+            else {match definition.map(|d| &d.mission.state) {
+                Some(crate::model::MissionState::Draft)=>"draft",
+                Some(crate::model::MissionState::Retired)=>"retired", _=>"ready"}};
+        let updated = latest.and_then(|r| r["updated_at_unix_ms"].as_u64()).map(u128::from)
+            .or_else(|| definition.map(|d| d.updated_at_unix_ms)).unwrap_or(0);
+        let revision = latest.and_then(|r| r["revision"].as_str())
+            .or_else(|| definition.map(|d| d.mission.revision.as_str())).unwrap_or("unknown");
+        let active = overview["counts"].as_object().unwrap().iter()
+            .filter(|(state,_)| !matches!(state.as_str(),"completed"|"failed"|"cancelled"))
+            .map(|(_,count)| count.as_u64().unwrap_or(0)).sum::<u64>();
+        let details = newest.iter().rev().map(|run| {
+            let run_id=run["id"].as_str().expect("run header id");
+            let (total,done,steps)=store.mission_step_preview(run_id)?;
+            let terminal=matches!(run["status"].as_str(),Some("completed"|"failed"|"cancelled"));
+            let must_act=if terminal {"nobody"} else if attention.contains(run_id) {"you"}
+                else if steps.iter().any(|s| matches!(s.status.as_str(),"ready"|"claimed"|"working")
+                    && (s.assigned_to.is_some() || s.claimant.is_some() || !s.available_to.is_empty())) {"agent"}
+                else if steps.iter().any(|s| s.status=="blocked") {"blocked"} else {"system"};
+            let shown=steps.iter().map(|step| json!({
+                "id":step.subject,"path":step.step,"title":step.title,"state":client_work_state(&step.status),
+                "attempt":step.attempt,"assignee":step.assigned_to,"claimant":step.claimant,
+                "agentless":step.agentless,"since":client_timestamp(step.updated_at_unix_ms),
+                "blocked_reason":step.blocked_reason,"blockers":step.blockers,
+                "goals":step.goals,"constraints":step.constraints
+            })).collect::<Vec<_>>();
+            let current=shown.iter().filter(|s| matches!(s["state"].as_str(),Some("ready"|"claimed"|"verifying"|"blocked")))
+                .map(|s| json!({"id":s["id"],"title":s["title"],"assignee":s["assignee"],"claimant":s["claimant"],"state":s["state"],"since":s["since"]})).collect::<Vec<_>>();
+            Ok::<Value,anyhow::Error>(json!({
+                "id":run["id"],"generation_id":run["generation_id"],"requester":run["requester"],
+                "status":run["status"],"phase":run["phase"],"progress":{"done":done,"total":total},
+                "current_steps":current,"must_act":must_act,
+                "state_since":client_timestamp(run["updated_at_unix_ms"].as_u64().unwrap_or(0) as u128),
+                "steps":shown
+            }))
+        }).collect::<anyhow::Result<Vec<_>>>()?;
+        let must_act=["you","agent","blocked","system"].into_iter()
+            .find(|kind| details.iter().any(|run| run["must_act"]==*kind)).unwrap_or(if active>0 {"system"} else {"nobody"});
+        let generations=newest.iter().map(|r| (r["id"].as_str().unwrap().to_owned(),r["generation_id"].clone()))
+            .collect::<serde_json::Map<_,_>>();
+        let historical = matches!(state,"completed"|"failed"|"cancelled"|"retired");
+        Ok(json!({"id":id,"kind":"mission","revision":revision,"updated_at":client_timestamp(updated),
+            "title":id.trim_start_matches("mission/"),"state":state,"mission_revision":revision,
+            "runs":newest.iter().rev().map(|r| r["id"].clone()).collect::<Vec<_>>(),
+            "run_details":details,"active_runs":active,"total_runs":overview["total_runs"],
+            "run_counts":overview["counts"],"runs_truncated":overview["total_runs"].as_u64().unwrap_or(0)>newest.len() as u64,
+            "run_generations":generations,"must_act":must_act,
+            "operational":{"layer":if historical {"history"} else {"current"},"actionable":!historical,"reasons":[]}}))
+    }).collect()
+}
+
+fn bound_mission_cards(items: &mut Vec<Value>) -> anyhow::Result<bool> {
+    // Reserve room for the envelope, continuation cursor and fleet sync notice.
+    let budget = CLIENT_MAX_RESPONSE_BYTES.saturating_sub(128_000);
+    let mut used = 0;
+    let mut keep = 0;
+    for item in items.iter_mut() {
+        let mut bytes = serde_json::to_vec(item)?.len() + 1;
+        if keep == 0 && bytes > budget {
+            item["runs"] = json!([]);
+            item["run_details"] = json!([]);
+            item["runs_truncated"] = json!(true);
+            bytes = serde_json::to_vec(item)?.len() + 1;
+        }
+        if used + bytes > budget {
+            break;
+        }
+        used += bytes;
+        keep += 1;
+    }
+    let truncated = keep < items.len();
+    items.truncate(keep);
+    anyhow::ensure!(
+        !truncated || keep > 0,
+        "a mission identifier exceeds the response budget"
+    );
+    Ok(truncated)
 }
 
 fn mission_resources_filtered(
@@ -1274,7 +1462,7 @@ fn mission_resources_filtered(
                                 "title": step.title,
                                 "assignee": step.assigned_to,
                                 "claimant": step.claimant,
-                                "state": step.status,
+                                "state": client_work_state(&step.status),
                                 "since": client_timestamp(step.updated_at_unix_ms),
                             })
                         })
@@ -1340,7 +1528,7 @@ fn mission_resources_filtered(
                                     "id": step.subject,
                                     "path": step.step,
                                     "title": step.title,
-                                    "state": step.status,
+                                    "state": client_work_state(&step.status),
                                     "attempt": step.attempt,
                                     "assignee": step.assigned_to,
                                     "claimant": step.claimant,
@@ -1850,12 +2038,6 @@ fn machine_resources(
     // Fleet members count as configured hosts; ended members are history. A config peer that
     // ended as a member is history too, even while its [[peers]] entry remains.
     let fleet = state.store.fleet_view_for_client()?;
-    let dial_out_hosts = fleet
-        .members
-        .iter()
-        .filter(|member| member.state == "current" && member.mode == "dial-out")
-        .map(|member| client_host_id(&member.name))
-        .collect::<BTreeSet<_>>();
     let ended_hosts = fleet
         .members
         .iter()
@@ -1910,20 +2092,20 @@ fn machine_resources(
             operational_layer,
             operational_actionable,
             operational_reasons,
-        ) = if host_id != local_host && dial_out_hosts.contains(&host_id) {
-            // A dial-out member is never dialed, so it is never reachable or unreachable from
-            // here: show when it last exchanged with this node instead.
+        ) = if host_id != local_host && configured_hosts.contains(&host_id) {
             let last_success_at = state.store.replication_peer_last_success(&name)?;
+            let recent =
+                last_success_at.is_some_and(|at| client_now_ms().saturating_sub(at) < 90_000);
             (
-                "dial-out",
+                if recent { "reachable" } else { "last-seen" },
                 vec![json!({
                     "protocol": "replication",
-                    "status": "unknown",
+                    "status": if recent { "up" } else { "last-seen" },
                     "last_success_at": last_success_at.map(client_timestamp),
                 })],
                 "current".to_owned(),
-                false,
-                vec!["dial-out-member".to_owned()],
+                recent,
+                vec!["replication-transport".to_owned()],
             )
         } else if host_id == local_host {
             (
@@ -2288,9 +2470,10 @@ pub(super) async fn missions(
                 client_snapshot_at(&reader, index)
             };
             let mut ids = store.mission_collection_ids(history, offset, limit.saturating_add(1))?;
-            let has_more = ids.len() > limit;
+            let mut has_more = ids.len() > limit;
             ids.truncate(limit);
-            let items = mission_resources_filtered(&store, index, history, None, Some(&ids))?;
+            let mut items = mission_list_cards(&store, &ids)?;
+            has_more |= bound_mission_cards(&mut items)?;
             Ok(Some((snapshot, items, has_more)))
         })
     })
@@ -2415,7 +2598,7 @@ fn missions_tree_value_within(
             "id": full.subject, "mission": full.mission, "state": full.status,
             "steps": full.steps.iter().take(items).map(|step| json!({
                 "id": step.subject, "name": step.title.as_deref().unwrap_or(&step.step),
-                "path": step.step, "state": step.status
+                "path": step.step, "state": client_work_state(&step.status)
             })).collect::<Vec<_>>()
         }));
     }
@@ -2988,10 +3171,8 @@ fn native_timeline_page(
     snapshot: &ClientSnapshot,
     session_id: &str,
     query: &ClientListQuery,
-    external: &crate::external_sessions::ExternalSession,
+    mut items: Vec<Value>,
 ) -> Result<Json<Value>, ApiError> {
-    let mut items =
-        crate::external_sessions::normalized_timeline(external).map_err(ApiError::internal)?;
     if let Some((owner, incarnation, _)) =
         super::managed_session_owner_at(&state.store, snapshot.store_index, session_id)
             .map_err(ApiError::internal)?
@@ -3040,13 +3221,96 @@ fn native_timeline_page(
     })))
 }
 
-fn managed_codex_transcript(
+/// What st3 established about a managed seat's native transcript.
+struct ManagedTranscript {
+    /// The harness the seat's latest observation names.
+    driver: String,
+    /// The `harness.observed` claim the verdict rests on. A notice about a missing transcript is
+    /// placed beside it in the timeline, so it moves forward when the observation changes.
+    anchor: ClaimRecord,
+    /// The seat's exact native session, or why st3 could not bind one.
+    transcript: Result<crate::external_sessions::ExternalSession, String>,
+}
+
+/// Bind a managed seat to its exact native transcript, when its harness keeps one st3 reads.
+///
+/// `None` means the seat runs no such harness (or has not reported one), and its timeline is
+/// built from claims alone as before. Otherwise the result either carries the exact session or
+/// says why none could be bound, so the timeline can say so rather than silently showing only
+/// status entries. The binding is never widened to a guess: a transcript that cannot be tied to
+/// this seat's current incarnation is not shown.
+fn managed_transcript(
     state: &AppState,
     owner: &str,
     incarnation: &str,
-) -> Result<Option<crate::external_sessions::ExternalSession>, ApiError> {
-    let Some(home) = state.native_session_home.as_deref() else {
+) -> Result<Option<ManagedTranscript>, ApiError> {
+    let Some(anchor) = state
+        .store
+        .latest_claim(owner, Some("harness.observed"))
+        .map_err(ApiError::internal)?
+    else {
         return Ok(None);
+    };
+    let fields = anchor.body.get("fields").unwrap_or(&anchor.body);
+    let driver = fields["driver"].as_str().unwrap_or_default().to_owned();
+    if !matches!(driver.as_str(), "codex" | "claude" | "omp") {
+        return Ok(None);
+    }
+    let transcript = if fields["incarnation_id"] != incarnation {
+        Err("the harness has not reported on the seat's current incarnation yet".to_owned())
+    } else {
+        let evidence = fields["evidence_incarnation"].as_str();
+        match driver.as_str() {
+            "codex" => managed_codex_transcript(state, owner, evidence),
+            "claude" => managed_claude_transcript(state, owner, evidence),
+            _ => managed_omp_transcript(state, owner, incarnation),
+        }
+    };
+    Ok(Some(ManagedTranscript {
+        driver,
+        anchor,
+        transcript,
+    }))
+}
+
+/// The timeline entry that says a managed seat's native transcript is not shown, and why.
+fn transcript_notice(session_id: &str, managed: &ManagedTranscript, reason: &str) -> Value {
+    let anchor = &managed.anchor;
+    let fields = anchor.body.get("fields").unwrap_or(&anchor.body);
+    let digest = hex::encode(Sha256::digest(
+        format!("{}:transcript-not-bound", anchor.id).as_bytes(),
+    ));
+    json!({
+        "id": format!("timeline-entry/{}/{}", session_id.trim_start_matches("session/"), &digest[..24]),
+        // Slot 2 of the observation's four sequence slots is otherwise unused.
+        "sequence": anchor.store_index.saturating_mul(4).saturating_add(2),
+        "revision": 1,
+        "timestamp": client_timestamp(
+            fields
+                .get("observed_at_unix_ms")
+                .and_then(Value::as_u64)
+                .map(u128::from)
+                .unwrap_or(anchor.accepted_at_unix_ms),
+        ),
+        "role": "system",
+        "type": "error",
+        "final": true,
+        "body": {
+            "code": "transcript-not-bound",
+            "message": format!("transcript not bound: {reason}"),
+            "retryable": true,
+            "details": { "driver": managed.driver, "claim_id": anchor.id }
+        }
+    })
+}
+
+fn managed_codex_transcript(
+    state: &AppState,
+    owner: &str,
+    evidence: Option<&str>,
+) -> Result<crate::external_sessions::ExternalSession, String> {
+    let Some(home) = state.native_session_home.as_deref() else {
+        return Err("this daemon has no home directory to read native sessions from".into());
     };
     // The wrapper owns this path; never resolve a path from client input. A reused
     // driver directory is only authoritative when its runtime and a durable
@@ -3056,61 +3320,62 @@ fn managed_codex_transcript(
         .join("drivers")
         .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
         .join("state");
-    let Ok(runtime) = std::fs::read(directory.join("runtime.json")) else {
-        return Ok(None);
-    };
-    let Ok(binding) = std::fs::read(directory.join("binding.json")) else {
-        return Ok(None);
-    };
+    let runtime = std::fs::read(directory.join("runtime.json"))
+        .map_err(|_| "the Codex driver has not written its runtime record".to_owned())?;
+    let binding = std::fs::read(directory.join("binding.json"))
+        .map_err(|_| "the Codex driver has not bound a thread yet".to_owned())?;
     let (Ok(runtime), Ok(binding)) = (
         serde_json::from_slice::<Value>(&runtime),
         serde_json::from_slice::<Value>(&binding),
     ) else {
-        return Ok(None);
+        return Err("the Codex driver's runtime or binding record is unreadable".into());
     };
     let identity = owner.strip_prefix("agent/").unwrap_or(owner);
     let Some(provider_incarnation) = runtime["incarnation"].as_str() else {
-        return Ok(None);
+        return Err("the Codex runtime record names no incarnation".into());
     };
     let Some(native_id) = binding["threadId"].as_str() else {
-        return Ok(None);
+        return Err("the Codex binding names no thread".into());
     };
     if runtime["agent"] != identity
         || binding["agent"] != identity
         || binding["runtimeIncarnation"] != provider_incarnation
     {
-        return Ok(None);
+        return Err("the Codex binding belongs to a different runtime".into());
     }
-    let observed = state
-        .store
-        .latest_claim(owner, Some("harness.observed"))
-        .map_err(ApiError::internal)?
-        .is_some_and(|claim| {
-            let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            fields["driver"] == "codex"
-                && fields["incarnation_id"] == incarnation
-                && fields["evidence_incarnation"] == provider_incarnation
-        });
-    if !observed {
-        return Ok(None);
+    if evidence != Some(provider_incarnation) {
+        return Err("the Codex binding is from a different provider incarnation".into());
     }
-    Ok(crate::external_sessions::discover(Some(home), true)
-        .map_err(ApiError::internal)?
-        .sessions
-        .into_iter()
-        .find(|session| {
-            session.driver == crate::external_sessions::ExternalDriver::Codex
-                && session.native_id == native_id
-        }))
+    // Codex names the rollout after its thread, so look it up directly first; a rollout whose
+    // name does not follow that convention is still found by the thread ID inside it.
+    let bound = match crate::external_sessions::find_bound_transcript(
+        home,
+        crate::external_sessions::ExternalDriver::Codex,
+        native_id,
+    ) {
+        Ok(Some(session)) => Some(session),
+        _ => crate::external_sessions::discover(Some(home), true)
+            .map_err(|error| format!("listing Codex sessions failed: {error:#}"))?
+            .sessions
+            .into_iter()
+            .find(|session| {
+                session.driver == crate::external_sessions::ExternalDriver::Codex
+                    && session.native_id == native_id
+            }),
+    };
+    bound.ok_or_else(|| format!("Codex thread {native_id} has no rollout file yet"))
 }
 
 fn managed_claude_transcript(
     state: &AppState,
     owner: &str,
-    incarnation: &str,
-) -> Result<Option<crate::external_sessions::ExternalSession>, ApiError> {
+    evidence: Option<&str>,
+) -> Result<crate::external_sessions::ExternalSession, String> {
     let Some(home) = state.native_session_home.as_deref() else {
-        return Ok(None);
+        return Err("this daemon has no home directory to read native sessions from".into());
+    };
+    let Some(evidence) = evidence else {
+        return Err("the Claude driver has not reported which process owns the seat".into());
     };
     let identity = owner.strip_prefix("agent/").unwrap_or(owner);
     let directory = state
@@ -3119,70 +3384,59 @@ fn managed_claude_transcript(
         .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
         .join("catalog")
         .join("agents")
-        .join(st2::run::detect_host())
+        .join(st_drivers::run::detect_host())
         .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16]);
-    // Only the current wrapper's SessionStart hook may bind a Claude transcript.
-    // A previous provider's session-id file can survive a restart, so neither
-    // its presence nor the newest transcript in a workspace is sufficient.
-    let Ok(binding) = std::fs::read(directory.join("claude-native-session")) else {
-        return Ok(None);
-    };
-    let Ok(binding) = serde_json::from_slice::<Value>(&binding) else {
-        return Ok(None);
-    };
-    let (Some(provider_incarnation), Some(native_id)) = (
-        binding["incarnation"].as_str(),
-        binding["native_session_id"].as_str(),
-    ) else {
-        return Ok(None);
-    };
-    let observed = state
-        .store
-        .latest_claim(owner, Some("harness.observed"))
-        .map_err(ApiError::internal)?
-        .is_some_and(|claim| {
-            let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            fields["driver"] == "claude"
-                && fields["incarnation_id"] == incarnation
-                && fields["evidence_incarnation"] == provider_incarnation
+    // The current wrapper's SessionStart hook binds the Claude session it started. A previous
+    // provider's binding can survive a restart, so it counts only when it names the same
+    // provider incarnation as the seat's current observation; neither its presence nor the
+    // newest transcript in a workspace is sufficient.
+    let hook_binding = std::fs::read(directory.join("claude-native-session"))
+        .ok()
+        .and_then(|binding| serde_json::from_slice::<Value>(&binding).ok())
+        .and_then(|binding| {
+            (binding["incarnation"].as_str() == Some(evidence))
+                .then(|| binding["native_session_id"].as_str().map(str::to_owned))
+                .flatten()
         });
-    if !observed {
-        return Ok(None);
-    }
-    crate::external_sessions::find_bound_transcript(
+    let native_id = match hook_binding {
+        Some(native_id) => native_id,
+        // Without the hook, prove the session from the live processes instead; see
+        // `claude_session_of_managed_driver` for why that cannot pick another session.
+        None => crate::external_sessions::claude_session_of_managed_driver(home, owner, evidence)
+            .map_err(|reason| {
+            format!("the SessionStart hook did not bind this incarnation, and {reason}")
+        })?,
+    };
+    match crate::external_sessions::find_bound_transcript(
         home,
         crate::external_sessions::ExternalDriver::Claude,
-        native_id,
-    )
-    .map_err(ApiError::internal)
+        &native_id,
+    ) {
+        Ok(Some(session)) => Ok(session),
+        Ok(None) => Err(format!(
+            "Claude session {native_id} has no transcript file yet"
+        )),
+        Err(error) => Err(format!(
+            "finding Claude session {native_id} failed: {error:#}"
+        )),
+    }
 }
 
 fn managed_omp_transcript(
     state: &AppState,
     owner: &str,
     incarnation: &str,
-) -> Result<Option<crate::external_sessions::ExternalSession>, ApiError> {
-    let Some((_, started_at)) = incarnation.split_once(':') else {
-        return Ok(None);
-    };
-    let Ok(started_at) = chrono::DateTime::parse_from_rfc3339(started_at) else {
-        return Ok(None);
-    };
-    let observed = state
-        .store
-        .latest_claim(owner, Some("harness.observed"))
-        .map_err(ApiError::internal)?
-        .is_some_and(|claim| {
-            let fields = claim.body.get("fields").unwrap_or(&claim.body);
-            fields["driver"] == "omp" && fields["incarnation_id"] == incarnation
-        });
-    if !observed {
-        return Ok(None);
-    }
+) -> Result<crate::external_sessions::ExternalSession, String> {
+    let started_at = incarnation
+        .split_once(':')
+        .and_then(|(_, started_at)| chrono::DateTime::parse_from_rfc3339(started_at).ok())
+        .ok_or_else(|| {
+            format!("the OMP incarnation `{incarnation}` does not carry its start time")
+        })?;
     if let Some(claim) = state
         .store
         .latest_claim(owner, Some("harness.session-file"))
-        .map_err(ApiError::internal)?
+        .map_err(|error| format!("reading the OMP session record failed: {error:#}"))?
     {
         let fields = claim.body.get("fields").unwrap_or(&claim.body);
         if fields["harness"] == "omp"
@@ -3191,11 +3445,16 @@ fn managed_omp_transcript(
             && let (Some(path), Some(native_id)) =
                 (fields["path"].as_str(), fields["session_id"].as_str())
         {
-            return crate::external_sessions::find_imported_omp_transcript(
+            return match crate::external_sessions::find_imported_omp_transcript(
                 Path::new(path),
                 native_id,
-            )
-            .map_err(ApiError::internal);
+            ) {
+                Ok(Some(session)) => Ok(session),
+                Ok(None) => Err(format!("the imported OMP session {native_id} is not readable")),
+                Err(error) => Err(format!(
+                    "reading the imported OMP session {native_id} failed: {error:#}"
+                )),
+            };
         }
     }
     let identity = owner.strip_prefix("agent/").unwrap_or(owner);
@@ -3205,14 +3464,42 @@ fn managed_omp_transcript(
         .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
         .join("catalog")
         .join("agents")
-        .join(st2::run::detect_host())
+        .join(st_drivers::run::detect_host())
         .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16])
         .join("provider-sessions");
-    crate::external_sessions::find_managed_omp_transcript(
+    match crate::external_sessions::find_managed_omp_transcript(
         &directory,
         (started_at.timestamp_millis().max(0) as u128).saturating_sub(2_000),
-    )
-    .map_err(ApiError::internal)
+    ) {
+        Ok(Some(session)) => Ok(session),
+        Ok(None) => Err("OMP has not saved a session for this incarnation yet".into()),
+        Err(error) => Err(format!(
+            "reading the OMP session directory failed: {error:#}"
+        )),
+    }
+}
+
+fn external_conversation_items(
+    conversation: Option<crate::external_sessions::ExternalConversation>,
+    session_id: &str,
+) -> Result<Vec<Value>, ApiError> {
+    match conversation {
+        Some(crate::external_sessions::ExternalConversation::Readable(external)) => {
+            crate::external_sessions::normalized_timeline(&external).map_err(ApiError::internal)
+        }
+        Some(crate::external_sessions::ExternalConversation::Unavailable(process)) => Err(ApiError {
+            status: StatusCode::UNPROCESSABLE_ENTITY,
+            code: "unsupported-capability".into(),
+            message: "This agent was not started by st, and st could not identify its saved session. Its conversation is not available.".into(),
+            details: Box::new(serde_json::Map::from_iter([
+                ("session_id".into(), json!(process.id)),
+                ("reason".into(), json!("native-session-unidentified")),
+            ])),
+        }),
+        None => Err(ApiError::not_found(format!(
+            "session `{session_id}` does not exist"
+        ))),
+    }
 }
 
 pub(super) fn timeline_value(
@@ -3243,26 +3530,35 @@ pub(super) fn timeline_value(
     let managed = super::managed_session_owner_at(&state.store, snapshot.store_index, &session_id)
         .map_err(ApiError::internal)?;
     let Some((owner, incarnation, _)) = managed else {
-        let external =
-            crate::external_sessions::find(state.native_session_home.as_deref(), &session_id)
-                .map_err(ApiError::internal)?
-                .ok_or_else(|| {
-                    ApiError::not_found(format!("session `{session_id}` does not exist"))
-                })?;
-        return native_timeline_page(state, snapshot, &session_id, query, &external);
+        let conversation = crate::external_sessions::find_conversation(
+            state.native_session_home.as_deref(),
+            &session_id,
+        )
+        .map_err(ApiError::internal)?;
+        let items = external_conversation_items(conversation, &session_id)?;
+        return native_timeline_page(state, snapshot, &session_id, query, items);
     };
     let owner = owner.as_str();
     let incarnation = incarnation.as_deref();
-    if let Some(incarnation) = incarnation {
-        let external = match managed_codex_transcript(state, owner, incarnation)? {
-            Some(external) => Some(external),
-            None => match managed_claude_transcript(state, owner, incarnation)? {
-                Some(external) => Some(external),
-                None => managed_omp_transcript(state, owner, incarnation)?,
-            },
-        };
-        if let Some(external) = external {
-            return native_timeline_page(state, snapshot, &session_id, query, &external);
+    // When the seat's harness keeps a transcript st3 cannot bind or read, the claim timeline
+    // below is shown with one entry that says why, never silently in its place.
+    let mut transcript_notice_entry = None;
+    if let Some(incarnation) = incarnation
+        && let Some(managed) = managed_transcript(state, owner, incarnation)?
+    {
+        let read = managed
+            .transcript
+            .as_ref()
+            .map_err(String::clone)
+            .and_then(|external| {
+                crate::external_sessions::normalized_timeline(external)
+                    .map_err(|error| format!("the transcript could not be read: {error:#}"))
+            });
+        match read {
+            Ok(items) => return native_timeline_page(state, snapshot, &session_id, query, items),
+            Err(reason) => {
+                transcript_notice_entry = Some(transcript_notice(&session_id, &managed, &reason));
+            }
         }
     }
     let desired = state.store.desired_subjects().map_err(ApiError::internal)?;
@@ -3567,6 +3863,7 @@ pub(super) fn timeline_value(
             }));
         }
     }
+    items.extend(transcript_notice_entry);
     items.sort_by_key(|item| item["sequence"].as_u64().unwrap_or(u64::MAX));
     // A conversation opens at its newest bounded window. The cursor walks toward older
     // windows, while each individual page remains chronological for straightforward rendering.
@@ -3904,13 +4201,8 @@ impl ConversationMark {
             .unwrap_or_default();
         // Resolve the transcript once: finding it walks the harness's session directories.
         let transcript = match (&owner, &incarnation) {
-            (Some(owner), Some(incarnation)) => match managed_codex_transcript(state, owner, incarnation)? {
-                Some(external) => Some(external),
-                None => match managed_claude_transcript(state, owner, incarnation)? {
-                    Some(external) => Some(external),
-                    None => managed_omp_transcript(state, owner, incarnation)?,
-                },
-            },
+            (Some(owner), Some(incarnation)) => managed_transcript(state, owner, incarnation)?
+                .and_then(|managed| managed.transcript.ok()),
             _ => crate::external_sessions::find(state.native_session_home.as_deref(), session_id)
                 .map_err(ApiError::internal)?,
         }
@@ -3931,7 +4223,14 @@ impl ConversationMark {
         if index > self.store_index {
             let claims = state
                 .store
-                .claims_page(None, None, self.store_index, index.checked_add(1), false, 10_000)
+                .claims_page(
+                    None,
+                    None,
+                    self.store_index,
+                    index.checked_add(1),
+                    false,
+                    10_000,
+                )
                 .map_err(ApiError::internal)?
                 .claims;
             // A burst too large to scan is treated as a change.
@@ -5871,6 +6170,9 @@ pub(super) struct ActionRequest {
 }
 
 fn action_scope(action: &str) -> Option<&'static str> {
+    if action == "work.done" {
+        return Some("control.attention");
+    }
     Some(match action.split_once('.')?.0 {
         "attention" => "control.attention",
         "review" => "control.attention",
@@ -6201,7 +6503,13 @@ fn validate_fence(
         ));
     }
     for (subject, revision) in &fence.subject_revisions {
-        let current = if let Some(id) = subject.strip_prefix("launch/") {
+        let current = if subject.starts_with("attention/") {
+            client_attention_resources(&state.store, None, false)
+                .map_err(ApiError::internal)?
+                .into_iter()
+                .find(|item| item["id"] == *subject)
+                .and_then(|item| item["revision"].as_str().map(str::to_owned))
+        } else if let Some(id) = subject.strip_prefix("launch/") {
             state
                 .store
                 .planning_session(id)
@@ -6259,38 +6567,71 @@ async fn dispatch_action(
             .0;
             Ok(vec![result.subject])
         }
-        "attention.resolve" => {
-            // Any person can close any item; the store records who closed it.
-            let target = parameter_string(p, "attention_id")?;
-            let known = state
-                .store
-                .attention_request(&target)
-                .map_err(ApiError::internal)?
-                .is_some()
-                || (target.starts_with("attention/subscription-failure-")
-                    && state
-                        .store
-                        .attention_items(None)
-                        .map_err(ApiError::internal)?
-                        .iter()
-                        .any(|item| item.subject == target));
-            if !known {
-                return Err(ApiError::not_found(format!(
-                    "attention `{target}` does not exist"
-                )));
+        "attention.resolve" => Err(ApiError::bad(St3Error::new(
+            "attention-migrated",
+            "attention is a view; complete or remedy its source",
+        ))),
+        "work.ask" => {
+            if let Some(step) = p.get("step_id").and_then(Value::as_str) {
+                validate_work_fence(state, step, &request.fence)?;
             }
-            let result = resolve_attention(
-                State(state.clone()),
-                AxumPath(target),
-                Json(AttentionResolveRequest {
-                    outcome: parameter_string(p, "outcome")?,
-                    reason: p.get("reason").and_then(Value::as_str).map(str::to_owned),
+            let result = state
+                .store
+                .ask_person(&PersonAskRequest {
+                    legacy_request: None,
+                    person: parameter_string(p, "person_id")?,
+                    title: parameter_string(p, "title")?,
+                    reason: parameter_string(p, "reason")?,
                     actor: authority_actor.clone(),
+                    step: p
+                        .get("step_id")
+                        .map(|_| parameter_string(p, "step_id"))
+                        .transpose()?,
+                    new_run: p
+                        .get("new_run")
+                        .map(|_| parameter_string(p, "new_run"))
+                        .transpose()?,
+                    incarnation: request.fence.runtime_incarnation.clone(),
                     idempotency_key: request.idempotency_key.clone(),
-                }),
-            )
-            .await?
-            .0;
+                })
+                .map_err(ApiError::bad)?;
+            signal_changed(state);
+            Ok(vec![result.subject])
+        }
+        action @ ("work.done" | "work.cancel-ask") => {
+            let target = parameter_string(p, "target_id")?;
+            let result = state
+                .store
+                .finish_person_step(
+                    &PersonStepResponse {
+                        subject: target,
+                        actor: authority_actor.clone(),
+                        summary: parameter_string(p, "summary")?,
+                        evidence: p
+                            .get("evidence")
+                            .map(|value| {
+                                serde_json::from_value::<Vec<String>>(value.clone()).map_err(|_| {
+                                    ApiError::bad(St3Error::new(
+                                        "validation-failed",
+                                        "evidence must be an array of strings",
+                                    ))
+                                })
+                            })
+                            .transpose()?
+                            .unwrap_or_default(),
+                        episode: Some(parameter_string(p, "episode")?),
+                        idempotency_key: request.idempotency_key.clone(),
+                    },
+                    action == "work.cancel-ask",
+                )
+                .map_err(|error| {
+                    if error.code == "forbidden" {
+                        forbidden(error.message)
+                    } else {
+                        ApiError::bad(error)
+                    }
+                })?;
+            signal_changed(state);
             Ok(vec![result.subject])
         }
         "message.send" => {
@@ -6604,6 +6945,7 @@ async fn dispatch_action(
             if request.fence.mission_generation.as_deref() != Some(current.generation.as_str()) {
                 return Err(stale("the mission generation fence is stale"));
             }
+            require_agent_mission_authority(state, authority_actor, "cancel", &current.mission)?;
             let reason = p
                 .get("reason")
                 .and_then(Value::as_str)
@@ -6947,6 +7289,12 @@ pub(super) async fn action(
             "client actions cannot select an actor, credential, or fleet secret",
         ));
     }
+    if request.action_type == "attention.resolve" {
+        return Err(ApiError::bad(St3Error::new(
+            "attention-migrated",
+            "attention is a view; complete or remedy its source",
+        )));
+    }
     let scope = action_scope(&request.action_type)
         .ok_or_else(|| validation("the action type is unknown"))?;
     require_scope(&session, scope)?;
@@ -6954,7 +7302,14 @@ pub(super) async fn action(
         request.action_type.as_str(),
         "terminal.attach" | "terminal.detach"
     );
-    if !read_only_terminal_lifecycle && !session.authority_actor.starts_with("person/") {
+    if !read_only_terminal_lifecycle
+        && !session.authority_actor.starts_with("person/")
+        && !(session.transport == "unix"
+            && session.authority_actor.starts_with("agent/")
+            && ((request.action_type.starts_with("work.")
+                && request.action_type != "work.done")
+                || request.action_type == "mission.cancel"))
+    {
         return Err(forbidden(
             "client mutations require explicit concrete person authority",
         ));
@@ -7200,8 +7555,117 @@ mod tests {
     use std::os::unix::fs::MetadataExt as _;
     use std::sync::Barrier;
 
+    #[test]
+    fn listed_unresolved_process_opens_into_explanatory_no_conversation_state() {
+        use crate::external_sessions::{
+            ExternalDiscovery, ExternalDriver, ExternalProcess, UnresolvedProcess,
+        };
+
+        let unresolved = UnresolvedProcess {
+            id: "session/external-process-test".into(),
+            revision: "test".into(),
+            driver: ExternalDriver::Omp,
+            process: ExternalProcess {
+                pid: 123,
+                parent_pid: 1,
+                started_at_unix_ms: 0,
+                fingerprint: "123:0:test".into(),
+                cwd: None,
+                command: "omp --resume native-session".into(),
+                exact_session: false,
+            },
+        };
+        let resource =
+            super::super::unresolved_session_resource(unresolved.clone(), "2026-09-30T00:00:00Z");
+        let id = resource["id"].as_str().unwrap();
+        let discovery = ExternalDiscovery {
+            sessions: Vec::new(),
+            unresolved_processes: vec![unresolved],
+        };
+        let error = external_conversation_items(discovery.into_conversation(id), id).unwrap_err();
+        assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error.code, "unsupported-capability");
+        assert_eq!(error.details["session_id"], id);
+        assert_eq!(error.details["reason"], "native-session-unidentified");
+        assert!(error.message.contains("not started by st"));
+        assert!(
+            error
+                .message
+                .contains("could not identify its saved session")
+        );
+        assert!(!error.message.contains("does not exist"));
+    }
+
     fn test_state(root: &Path) -> AppState {
         test_state_named(root, "terminal-test")
+    }
+
+    #[tokio::test]
+    async fn fleet_operational_commands_are_bounded_and_report_slow_queries() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        state.store.seed_operational_fleet();
+        // The old card's complete run array would exceed the negotiated one-megabyte limit.
+        let app = super::super::router(state.clone());
+        let read = |uri: String| {
+            let app = app.clone();
+            async move {
+                let response = app
+                    .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = to_bytes(response.into_body(), CLIENT_MAX_RESPONSE_BYTES)
+                    .await
+                    .unwrap();
+                let value: Value = serde_json::from_slice(&bytes).unwrap_or_else(|error| {
+                    panic!("{status}: {error}: {}", String::from_utf8_lossy(&bytes))
+                });
+                assert_eq!(status, StatusCode::OK, "{value}");
+                value
+            }
+        };
+        let missions = read("/v1/client/missions?history=true&limit=50".into()).await;
+        let item = &missions["value"]["items"][0];
+        assert_eq!(item["total_runs"], 2401);
+        assert_eq!(item["active_runs"], 601);
+        assert_eq!(item["runs"].as_array().unwrap().len(), 3);
+        assert_eq!(item["runs_truncated"], true);
+        let mut large = vec![item.clone(); 200];
+        for card in &mut large {
+            for run in card["run_details"].as_array_mut().unwrap() {
+                run["requester"] = json!(format!("person/{}", "x".repeat(1990)));
+            }
+        }
+        assert!(bound_mission_cards(&mut large).unwrap());
+        assert!(!large.is_empty() && large.len() < 200);
+        assert!(serde_json::to_vec(&large).unwrap().len() < CLIENT_MAX_RESPONSE_BYTES - 120_000);
+        let overview = read("/v1/mission-overview?mission=mission%2Fexample%2Ffleet".into()).await;
+        assert_eq!(overview["value"]["total_runs"], 2401);
+        for collection in ["missions", "work"] {
+            let page = read(format!(
+                "/v1/outcome-history?collection={collection}&since=0&status=failed&limit=50"
+            ))
+            .await;
+            assert_eq!(page["value"]["items"].as_array().unwrap().len(), 50);
+            assert_eq!(page["value"]["has_more"], true);
+        }
+        // The SQL hook sees a real fleet-scale query, without file profiling or diagnostic claims.
+        let index = state.store.index().unwrap();
+        let _ = state
+            .store
+            .claims_page(None, None, 0, None, false, 500)
+            .unwrap();
+        let report = read("/v1/performance".into()).await;
+        assert_eq!(report["value"]["window_seconds"], 300);
+        assert!(!report["value"]["queries"].as_array().unwrap().is_empty());
+        assert!(!report["value"]["requests"].as_array().unwrap().is_empty());
+        assert_eq!(
+            state.store.index().unwrap(),
+            index,
+            "operational samples never write graph claims"
+        );
+        assert!(!report.to_string().contains("person/operator"));
     }
 
     fn test_state_named(root: &Path, node: &str) -> AppState {
@@ -7218,6 +7682,99 @@ mod tests {
             client_relay: None,
             native_session_home: None,
             planner_default: crate::model::PlannerSpec::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_declarations_require_sensitive_scope_and_select_exact_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let state = test_state(root.path());
+        let publish = |source: &str| {
+            let intent = crate::graph::parse_intent(source, "terminal-test").unwrap();
+            let planned = state
+                .store
+                .mission(
+                    &intent,
+                    IntentInput {
+                        kdl: source.into(),
+                        source_name: None,
+                    },
+                )
+                .unwrap();
+            assert!(planned.blockers.is_empty(), "{:?}", planned.blockers);
+            state
+                .store
+                .apply(&intent, &planned.subject_tokens, source)
+                .unwrap();
+        };
+        publish(
+            "version 2\nagent \"dotfiles/steward\" { workspace \"/tmp\"; command \"true\"; env { TOKEN \"old-secret\" } }",
+        );
+        let original = state
+            .store
+            .agent_declaration_revisions("agent/dotfiles/steward")
+            .unwrap()[0]
+            .clone();
+        publish(
+            "version 2\nagent \"dotfiles/steward\" { workspace \"/tmp\"; command \"true\"; env { TOKEN \"new-secret\" } }",
+        );
+        let read = |revision, show_env_values| {
+            agent_declaration(
+                State(state.clone()),
+                Extension(ClientSession::local(Some("person/test")).unwrap()),
+                AxumPath("dotfiles/steward".into()),
+                Query(AgentDeclarationQuery {
+                    revision,
+                    show_env_values,
+                }),
+            )
+        };
+        for (revision, secret) in [(None, "new-secret"), (Some(original.clone()), "old-secret")] {
+            let redacted = read(revision.clone(), false).await.unwrap().0;
+            let kdl = redacted["kdl"].as_str().unwrap();
+            let parsed = crate::graph::parse_intent(kdl, "terminal-test").unwrap();
+            assert_eq!(
+                parsed.subjects["agent/dotfiles/steward"].desired,
+                redacted["tree"]
+            );
+            let env = redacted["tree"]["children"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|node| node["name"] == "env")
+                .unwrap();
+            assert_eq!(env["children"][0]["name"], "TOKEN");
+            assert_eq!(env["children"][0]["arguments"][0], "<redacted>");
+            assert!(!redacted.to_string().contains(secret));
+            let visible = read(revision, true).await.unwrap().0;
+            assert!(
+                visible["kdl"].as_str().unwrap().contains(secret),
+                "{visible}"
+            );
+            assert!(visible["tree"].to_string().contains(secret), "{visible}");
+            assert_eq!(visible["revision"], redacted["revision"]);
+            assert_eq!(visible["revisions"].as_array().unwrap().len(), 2);
+            if secret == "old-secret" {
+                assert_eq!(visible["revision"], original);
+            }
+        }
+        assert!(read(Some("not-a-revision".into()), false).await.is_err());
+        for revision in [None, Some(original)] {
+            for show_env_values in [false, true] {
+                assert!(
+                    agent_declaration(
+                        State(state.clone()),
+                        Extension(ClientSession::local(None).unwrap()),
+                        AxumPath("dotfiles/steward".into()),
+                        Query(AgentDeclarationQuery {
+                            revision: revision.clone(),
+                            show_env_values,
+                        }),
+                    )
+                    .await
+                    .is_err()
+                );
+            }
         }
     }
 
@@ -7262,7 +7819,7 @@ mission "watch-work" state="ready" {
                 mission: "watch-work".into(),
                 revision: None,
                 workspace: root.path().display().to_string(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "client-watch-run".into(),
@@ -7377,7 +7934,7 @@ subscription "watch/source" {
                 idempotency_key: None,
             })
             .unwrap();
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let snapshot = new_client_snapshot(&state);
         let desired = state.store.selected_desired_token(&owner).unwrap().unwrap();
         let request = ActionRequest {
@@ -7444,7 +8001,7 @@ subscription "watch/source" {
                 mission: "reset-work".into(),
                 revision: None,
                 workspace: root.path().display().to_string(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "reset-run".into(),
@@ -7486,7 +8043,7 @@ subscription "watch/source" {
             })
             .unwrap();
         let snapshot = new_client_snapshot(&state);
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let request = ActionRequest {
             api_version: CLIENT_API_VERSION.into(),
             id: "action/reset-worker".into(),
@@ -7540,7 +8097,7 @@ subscription "watch/source" {
                 mission: "retry-work".into(),
                 revision: None,
                 workspace: root.path().display().to_string(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "client-retry-run".into(),
@@ -7553,7 +8110,7 @@ subscription "watch/source" {
             .unwrap();
         let current = state.store.step_run(&step.subject).unwrap().unwrap();
         let snapshot = new_client_snapshot(&state);
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let mut request = ActionRequest {
             api_version: CLIENT_API_VERSION.into(),
             id: "action/retry-check".into(),
@@ -7619,7 +8176,7 @@ subscription "watch/source" {
             .unwrap();
         assert!(peer_success > 1_000);
 
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let machines =
             machine_resources(&state, false, &new_client_snapshot(&state), &session).unwrap();
         let edge = machines
@@ -7639,7 +8196,7 @@ subscription "watch/source" {
     fn runtime_and_machine_lists_cost_a_fixed_number_of_statements() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state(root.path());
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let observe = |number: usize| {
             state
                 .store
@@ -7769,12 +8326,12 @@ subscription "watch/source" {
             .request_attention(
                 "attention/sync-demo",
                 &crate::model::AttentionRequest {
-                    reviewer: "person/nathan".into(),
+                    reviewer: "person/alex".into(),
                     title: "Review the invented plan".into(),
                     reason: "A replicated change must refresh Now.".into(),
                     severity: "warning".into(),
                     targets: Vec::new(),
-                    actor: "agent/fleet/example/builder".into(),
+                    actor: "agent/example/example/builder".into(),
                     idempotency_key: "attention-event".into(),
                 },
             )
@@ -7917,15 +8474,15 @@ subscription "watch/source" {
             .record_transport_observation("laptop", "down", Some("asleep"), None)
             .unwrap();
 
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let machines =
             machine_resources(&state, false, &new_client_snapshot(&state), &session).unwrap();
         let laptop = machines
             .iter()
             .find(|machine| machine["host_id"] == "host/laptop")
             .expect("the dial-out member is a current machine");
-        assert_eq!(laptop["state"], "dial-out");
-        assert_eq!(laptop["transports"][0]["status"], "unknown");
+        assert_eq!(laptop["state"], "last-seen");
+        assert_eq!(laptop["transports"][0]["status"], "last-seen");
         assert!(
             machines
                 .iter()
@@ -7944,13 +8501,10 @@ subscription "watch/source" {
             .append_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "custom.client.pairing-begun".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
                     ("pairing_id".into(), Value::String("pairing/named".into())),
-                    (
-                        "device_name".into(),
-                        Value::String("Nathan's iPhone".into()),
-                    ),
+                    ("device_name".into(), Value::String("Alex's iPhone".into())),
                 ]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -7962,13 +8516,13 @@ subscription "watch/source" {
             .append_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "custom.client.pairing-completed".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
                     ("device_id".into(), Value::String("device/named".into())),
-                    ("person_id".into(), Value::String("person/nathan".into())),
+                    ("person_id".into(), Value::String("person/alex".into())),
                     (
                         "session_actor".into(),
-                        Value::String("person/nathan/session/named".into()),
+                        Value::String("person/alex/session/named".into()),
                     ),
                     (
                         "expires_at_unix_ms".into(),
@@ -7981,8 +8535,8 @@ subscription "watch/source" {
             })
             .unwrap();
         let resources =
-            device_resources(&state, &new_client_snapshot(&state), "person/nathan").unwrap();
-        assert_eq!(resources[0]["name"], "Nathan's iPhone");
+            device_resources(&state, &new_client_snapshot(&state), "person/alex").unwrap();
+        assert_eq!(resources[0]["name"], "Alex's iPhone");
     }
 
     #[test]
@@ -7996,7 +8550,7 @@ subscription "watch/source" {
             .append_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "custom.client.pairing-completed".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
                     (
                         "credential_hash".into(),
@@ -8006,7 +8560,7 @@ subscription "watch/source" {
                         "session_actor".into(),
                         Value::String("client/test-session".into()),
                     ),
-                    ("person_id".into(), Value::String("person/nathan".into())),
+                    ("person_id".into(), Value::String("person/alex".into())),
                     ("scopes".into(), json!(["read.projections"])),
                     (
                         "expires_at_unix_ms".into(),
@@ -8034,7 +8588,7 @@ subscription "watch/source" {
             .append_claim(&ClaimInput {
                 subject: subject.into(),
                 kind: "custom.client.pairing-revoked".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::new(),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -8522,7 +9076,7 @@ mission "example/steps" state="ready" {
                     .unwrap()
                     .steps
                     .iter()
-                    .map(|step| json!([step.subject, step.status]))
+                    .map(|step| json!([step.subject, client_work_state(&step.status)]))
                     .collect::<Vec<_>>();
                 (run.clone(), steps)
             })
@@ -8790,7 +9344,7 @@ mission "example/zero-run" state="ready" {
                 store_index: 9,
                 kind: "message.sent".into(),
                 subject: "message/safe-id".into(),
-                body: json!({"fields": {"content": "PRIVATE-MESSAGE", "from": "person/nathan", "to": "agent/worker", "session_id": "session/current"}}),
+                body: json!({"fields": {"content": "PRIVATE-MESSAGE", "from": "person/alex", "to": "agent/worker", "session_id": "session/current"}}),
             },
         ] {
             let projected = safe_event_projection(&state, &record);
@@ -8858,9 +9412,9 @@ mission "example/zero-run" state="ready" {
             .append_claim(&ClaimInput {
                 subject: "message/original-time".into(),
                 kind: "message.sent".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
-                    ("from".into(), Value::String("person/nathan".into())),
+                    ("from".into(), Value::String("person/alex".into())),
                     ("to".into(), Value::String("agent/worker".into())),
                     ("content".into(), Value::String("safe".into())),
                     ("status".into(), Value::String("sent".into())),
@@ -8887,9 +9441,9 @@ mission "example/zero-run" state="ready" {
                 .append_claim(&ClaimInput {
                     subject: format!("message/{id}"),
                     kind: "message.sent".into(),
-                    actor: Some("person/nathan".into()),
+                    actor: Some("person/alex".into()),
                     fields: BTreeMap::from([
-                        ("from".into(), Value::String("person/nathan".into())),
+                        ("from".into(), Value::String("person/alex".into())),
                         ("to".into(), Value::String("agent/worker".into())),
                         ("content".into(), Value::String("secret".into())),
                         ("status".into(), Value::String("sent".into())),
@@ -8965,9 +9519,9 @@ mission "example/zero-run" state="ready" {
                     .append_claim(&ClaimInput {
                         subject: format!("message/{id}"),
                         kind: "message.sent".into(),
-                        actor: Some("person/nathan".into()),
+                        actor: Some("person/alex".into()),
                         fields: BTreeMap::from([
-                            ("from".into(), Value::String("person/nathan".into())),
+                            ("from".into(), Value::String("person/alex".into())),
                             ("to".into(), Value::String("agent/worker".into())),
                             ("content".into(), Value::String(id.into())),
                             ("status".into(), Value::String("sent".into())),
@@ -9008,9 +9562,9 @@ mission "example/zero-run" state="ready" {
                 .append_claim(&ClaimInput {
                     subject: format!("message/{id}"),
                     kind: "message.sent".into(),
-                    actor: Some("person/nathan".into()),
+                    actor: Some("person/alex".into()),
                     fields: BTreeMap::from([
-                        ("from".into(), Value::String("person/nathan".into())),
+                        ("from".into(), Value::String("person/alex".into())),
                         ("to".into(), Value::String(owner.into())),
                         ("content".into(), Value::String(id.into())),
                         ("status".into(), Value::String("sent".into())),
@@ -9184,9 +9738,9 @@ mission "example/zero-run" state="ready" {
             .append_claim(&ClaimInput {
                 subject: "message/wake".into(),
                 kind: "message.sent".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
-                    ("from".into(), Value::String("person/nathan".into())),
+                    ("from".into(), Value::String("person/alex".into())),
                     ("to".into(), Value::String("agent/worker".into())),
                     ("content".into(), Value::String("wake".into())),
                     ("status".into(), Value::String("sent".into())),
@@ -9421,7 +9975,7 @@ mission "example/zero-run" state="ready" {
         let session_id = owned_sessions[0]["id"].as_str().unwrap().to_owned();
         assert_eq!(agent["current_session_id"], session_id);
 
-        let client_session = ClientSession::local(Some("person/nathan")).unwrap();
+        let client_session = ClientSession::local(Some("person/alex")).unwrap();
         let action = |key: &str, parameters: Value| ActionRequest {
             api_version: CLIENT_API_VERSION.into(),
             id: format!("action/{key}"),
@@ -9696,7 +10250,7 @@ mission "example/zero-run" state="ready" {
                 .unwrap();
         }
         let snapshot = new_client_snapshot(&state);
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let session_id = super::managed_session_id(owner, incarnation);
         let timeline = timeline_value(
             &state,
@@ -9717,9 +10271,9 @@ mission "example/zero-run" state="ready" {
             .append_claim(&ClaimInput {
                 subject: "message/managed-native".into(),
                 kind: "message.sent".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
-                    ("from".into(), json!("person/nathan")),
+                    ("from".into(), json!("person/alex")),
                     ("to".into(), json!(owner)),
                     ("session_id".into(), json!(session_id)),
                     ("content".into(), json!("Native message")),
@@ -9753,11 +10307,27 @@ mission "example/zero-run" state="ready" {
             .unwrap(),
         )
         .unwrap();
-        assert!(
-            managed_codex_transcript(&state, owner, incarnation)
-                .unwrap()
-                .is_none()
+        let stale = managed_transcript(&state, owner, incarnation)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            stale.transcript.unwrap_err(),
+            "the Codex binding belongs to a different runtime"
         );
+        let unbound = timeline_value(
+            &state,
+            &new_client_snapshot(&state),
+            &session,
+            &session_id,
+            &ClientListQuery::default(),
+        )
+        .unwrap()
+        .0;
+        assert!(unbound["items"].as_array().unwrap().iter().any(|item| {
+            item["type"] == "error"
+                && item["body"]["code"] == "transcript-not-bound"
+                && item["body"]["details"]["driver"] == "codex"
+        }));
     }
 
     #[test]
@@ -9782,7 +10352,7 @@ mission "example/zero-run" state="ready" {
             .join("drivers")
             .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
             .join("catalog/agents")
-            .join(st2::run::detect_host())
+            .join(st_drivers::run::detect_host())
             .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16]);
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(
@@ -9813,8 +10383,10 @@ mission "example/zero-run" state="ready" {
                 idempotency_key: None,
             })
             .unwrap();
-        let exact = super::managed_claude_transcript(&state, owner, incarnation)
+        let exact = super::managed_transcript(&state, owner, incarnation)
             .unwrap()
+            .unwrap()
+            .transcript
             .unwrap();
         let timeline = crate::external_sessions::normalized_timeline(&exact).unwrap();
         assert!(
@@ -9823,9 +10395,11 @@ mission "example/zero-run" state="ready" {
                 .any(|entry| entry["body"]["text"] == "Current Claude answer")
         );
         assert!(
-            super::managed_claude_transcript(&state, owner, "native-pty:old")
+            super::managed_transcript(&state, owner, "native-pty:old")
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .transcript
+                .is_err()
         );
         std::fs::write(
             directory.join("claude-native-session"),
@@ -9835,18 +10409,140 @@ mission "example/zero-run" state="ready" {
             .unwrap(),
         )
         .unwrap();
-        assert!(
-            super::managed_claude_transcript(&state, owner, incarnation)
-                .unwrap()
-                .is_none()
+        // A stale hook binding is not used, and the process fallback refuses evidence that
+        // does not name a driver process.
+        let stale = super::managed_transcript(&state, owner, incarnation)
+            .unwrap()
+            .unwrap()
+            .transcript
+            .unwrap_err();
+        assert!(stale.contains("does not name a driver process"), "{stale}");
+    }
+
+    #[test]
+    fn managed_claude_without_a_hook_binding_is_proved_from_its_driver_or_says_why_not() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let native_id = "22222222-2222-4222-8222-222222222222";
+        let transcript = home.join(format!(".claude/projects/-test/{native_id}.jsonl"));
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            format!("{}\n", json!({"type":"assistant","sessionId":native_id,"timestamp":"2026-09-30T12:00:00Z","message":{"role":"assistant","content":[{"type":"text","text":"Recovered without the hook"}]}})),
+        )
+        .unwrap();
+        let mut state = test_state_named(root.path(), "managed-claude-fallback-test");
+        state.native_session_home = Some(home.clone());
+        let owner = "agent/managed-claude-fallback";
+        let incarnation = "native-pty:current";
+        let append = |kind: &str, fields: BTreeMap<String, Value>| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: owner.into(),
+                    kind: kind.into(),
+                    actor: Some(owner.into()),
+                    fields,
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+        };
+        let observe = |evidence: &str| {
+            append(
+                "harness.observed",
+                BTreeMap::from([
+                    ("state".into(), json!("working")),
+                    ("driver".into(), json!("claude")),
+                    ("incarnation_id".into(), json!(incarnation)),
+                    ("evidence_incarnation".into(), json!(evidence)),
+                ]),
+            );
+        };
+        append(
+            "runtime.observed",
+            BTreeMap::from([
+                ("status".into(), json!("running")),
+                ("runtime_id".into(), json!("managed-claude-pty")),
+                ("incarnation_id".into(), json!(incarnation)),
+                ("terminal".into(), json!(true)),
+            ]),
         );
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let session_id = super::managed_session_id(owner, incarnation);
+        let timeline = || {
+            timeline_value(
+                &state,
+                &new_client_snapshot(&state),
+                &session,
+                &session_id,
+                &ClientListQuery::default(),
+            )
+            .unwrap()
+            .0["items"]
+                .as_array()
+                .unwrap()
+                .clone()
+        };
+
+        // The hook never bound a session and the evidence names a driver that is gone: the
+        // claim timeline says so instead of silently standing in for the conversation.
+        observe("4194303-1000-0");
+        let unbound = timeline();
+        let notice = unbound
+            .iter()
+            .find(|item| item["body"]["code"] == "transcript-not-bound")
+            .expect("the timeline should say why the transcript is missing");
+        assert_eq!(notice["type"], "error");
+        assert_eq!(notice["role"], "system");
+        assert_eq!(notice["body"]["details"]["driver"], "claude");
+        assert!(
+            notice["body"]["message"]
+                .as_str()
+                .unwrap()
+                .starts_with("transcript not bound: the SessionStart hook did not bind"),
+            "{notice:#}"
+        );
+        assert!(
+            !unbound
+                .iter()
+                .any(|item| item["body"]["text"] == "Recovered without the hook")
+        );
+
+        // The live driver named by the evidence proves its Claude child's session.
+        #[cfg(target_os = "linux")]
+        {
+            let fake = crate::external_sessions::test_support::FakeClaudeDriver::start(owner);
+            fake.record_session(&home, native_id, None);
+            observe(&fake.token());
+            let bound = timeline();
+            assert!(
+                bound
+                    .iter()
+                    .any(|item| item["body"]["text"] == "Recovered without the hook"),
+                "{bound:#?}"
+            );
+            assert!(
+                !bound
+                    .iter()
+                    .any(|item| item["body"]["code"] == "transcript-not-bound")
+            );
+            // A different seat's evidence naming this driver binds nothing.
+            let other = crate::external_sessions::claude_session_of_managed_driver(
+                &home,
+                "agent/someone-else",
+                &fake.token(),
+            );
+            assert!(other.is_err());
+        }
     }
 
     #[test]
     fn managed_omp_session_reads_the_current_saved_conversation() {
         let root = tempfile::tempdir().unwrap();
         let state = test_state_named(root.path(), "managed-omp-test");
-        let owner = "agent/fleet/pty-rust/omp";
+        let owner = "agent/example/pty-rust/omp";
         let identity = owner.strip_prefix("agent/").unwrap();
         let incarnation = "123:2026-09-25T15:11:54.870Z";
         let directory = state
@@ -9854,7 +10550,7 @@ mission "example/zero-run" state="ready" {
             .join("drivers")
             .join(&hex::encode(Sha256::digest(owner.as_bytes()))[..24])
             .join("catalog/agents")
-            .join(st2::run::detect_host())
+            .join(st_drivers::run::detect_host())
             .join(&hex::encode(Sha256::digest(identity.as_bytes()))[..16])
             .join("provider-sessions");
         std::fs::create_dir_all(&directory).unwrap();
@@ -9894,8 +10590,10 @@ mission "example/zero-run" state="ready" {
                 idempotency_key: None,
             })
             .unwrap();
-        let exact = super::managed_omp_transcript(&state, owner, incarnation)
+        let exact = super::managed_transcript(&state, owner, incarnation)
             .unwrap()
+            .unwrap()
+            .transcript
             .unwrap();
         assert_eq!(exact.native_id, "current");
         let timeline = crate::external_sessions::normalized_timeline(&exact).unwrap();
@@ -9912,9 +10610,11 @@ mission "example/zero-run" state="ready" {
                     && entry["body"]["text"] == "{\"presence\":null}")
         );
         assert!(
-            super::managed_omp_transcript(&state, owner, "123:2026-09-25T14:00:00Z")
+            super::managed_transcript(&state, owner, "123:2026-09-25T14:00:00Z")
                 .unwrap()
-                .is_none()
+                .unwrap()
+                .transcript
+                .is_err()
         );
     }
 
@@ -9956,9 +10656,9 @@ mission "example/zero-run" state="ready" {
             .append_claim(&ClaimInput {
                 subject: "message/timeline-user".into(),
                 kind: "message.sent".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
-                    ("from".into(), Value::String("person/nathan".into())),
+                    ("from".into(), Value::String("person/alex".into())),
                     ("to".into(), Value::String(subject.into())),
                     ("content".into(), Value::String("do the work".into())),
                     ("status".into(), Value::String("sent".into())),
@@ -10501,7 +11201,7 @@ mission "example/zero-run" state="ready" {
                 idempotency_key: None,
             })
             .unwrap();
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let request = ActionRequest {
             api_version: CLIENT_API_VERSION.into(),
             id: "action/terminal-attach-crash".into(),
@@ -10668,7 +11368,7 @@ mission "example/zero-run" state="ready" {
             },
             parameters: json!({ "target_id": "terminal/agent/concurrent-terminal-owner" }),
         };
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let count = 8;
         let barrier = Arc::new(Barrier::new(count));
         let threads = (0..count)
@@ -10758,7 +11458,7 @@ mission "example/zero-run" state="ready" {
             .store
             .append_claim(&runtime("running", "same-runtime-id:i1", "owner-running"))
             .unwrap();
-        let session = ClientSession::local(Some("person/nathan")).unwrap();
+        let session = ClientSession::local(Some("person/alex")).unwrap();
         let projected = runtime_resources(&owner, true, &new_client_snapshot(&owner), &session)
             .unwrap()
             .into_iter()
@@ -10839,8 +11539,8 @@ mission "example/zero-run" state="ready" {
         })
         .unwrap();
         let paired = ClientSession {
-            actor: "person/nathan/session/device-one".into(),
-            authority_actor: "person/nathan".into(),
+            actor: "person/alex/session/device-one".into(),
+            authority_actor: "person/alex".into(),
             transport: "paired",
             scopes: ["terminal.read".into()].into_iter().collect(),
         };
@@ -10853,7 +11553,7 @@ mission "example/zero-run" state="ready" {
         let remote_capability = remote["stream_capability"].as_str().unwrap();
         assert_ne!(remote_capability, capability);
         let another_device = ClientSession {
-            actor: "person/nathan/session/device-two".into(),
+            actor: "person/alex/session/device-two".into(),
             ..paired.clone()
         };
         assert_eq!(
@@ -10936,4 +11636,164 @@ mission "example/zero-run" state="ready" {
         assert_eq!(indeterminate["terminal_access"]["read"], "unavailable");
         assert_eq!(indeterminate["operational"]["actionable"], false);
     }
+}
+
+fn glass_person(session: &ClientSession, write: bool) -> Result<String, ApiError> {
+    require_scope(
+        session,
+        if write {
+            "control.glasses"
+        } else {
+            "read.glasses"
+        },
+    )?;
+    let person = &session.authority_actor;
+    if !person.starts_with("person/") || person.matches('/').count() != 1 {
+        return Err(forbidden("glasses require the session's concrete person"));
+    }
+    Ok(person.clone())
+}
+
+fn glass_subject(person: &str, id: &str) -> Result<String, ApiError> {
+    if !st3_schema::glasses::valid_uuid(id) {
+        return Err(validation("a glass ID must be a canonical lowercase UUID"));
+    }
+    Ok(format!("glass/{person}/{id}"))
+}
+
+pub(super) async fn glasses_list(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    let person = glass_person(&session, false)?;
+    if query.person.is_some() || query.actor.is_some() || query.history {
+        return Err(validation(
+            "glasses always select the session person and current state",
+        ));
+    }
+    let store = state.store.clone();
+    let through = snapshot.store_index;
+    let items = blocking_store(move || store.glasses(&person, through)).await?;
+    Ok(Json(client_page(
+        &state, &snapshot, "glasses", items, &query,
+    )?))
+}
+
+pub(super) async fn glass_get(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let person = glass_person(&session, false)?;
+    let subject = glass_subject(&person, &id)?;
+    let store = state.store.clone();
+    let through = snapshot.store_index;
+    blocking_store(move || store.glasses(&person, through))
+        .await?
+        .into_iter()
+        .find(|glass| glass["id"].as_str() == Some(&subject))
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::not_found("the glass is absent, retired, or outside the current quota")
+        })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GlassPut {
+    body: Value,
+    #[serde(deserialize_with = "glass_base_revision")]
+    base_revision: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GlassDelete {
+    #[serde(deserialize_with = "glass_base_revision")]
+    base_revision: Option<String>,
+}
+fn glass_base_revision<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(d)
+}
+
+async fn glass_write(
+    state: AppState,
+    session: ClientSession,
+    id: String,
+    headers: HeaderMap,
+    body: Option<Value>,
+    base_revision: Option<String>,
+) -> Result<Json<Value>, ApiError> {
+    let person = glass_person(&session, true)?;
+    let subject = glass_subject(&person, &id)?;
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|h| h.to_str().ok())
+        .filter(|key| !key.is_empty() && key.len() <= 200)
+        .ok_or_else(|| validation("glass writes require a bounded Idempotency-Key header"))?;
+    let idempotency_key = format!("glass:{}:{key}", session.actor);
+    let mut fields = BTreeMap::from([("base_revision".into(), json!(base_revision))]);
+    let kind = if let Some(body) = body {
+        st3_schema::glasses::validate_body(&body).map_err(|e| validation(e.message))?;
+        fields.insert("body".into(), body);
+        "glass.upserted"
+    } else {
+        "glass.deleted"
+    };
+    let store = state.store.clone();
+    let claim = blocking_store(move || {
+        Ok(store.append_claim(&ClaimInput {
+            subject,
+            kind: kind.into(),
+            actor: Some(person),
+            fields,
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: Some(idempotency_key),
+        }))
+    })
+    .await?
+    .map_err(|error| {
+        let is_idempotency = matches!(error.code, "idempotency-mismatch" | "idempotency-conflict");
+        let mut error = ApiError::bad(error);
+        if is_idempotency { error.code = "idempotency-conflict".into(); error.status = StatusCode::CONFLICT; }
+        error
+    })?;
+    signal_changed(&state);
+    Ok(Json(
+        json!({"id":claim.subject, "kind":"glass", "revision":claim.id,
+        "body":claim.body["fields"]["body"], "deleted":claim.kind == "glass.deleted",
+        "base_revision":claim.body["fields"]["base_revision"],
+        "replaced_revision":claim.body["fields"]["replaced_revision"],
+        "updated_at":client_timestamp(claim.accepted_at_unix_ms)}),
+    ))
+}
+
+pub(super) async fn glass_put(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(request): Json<GlassPut>,
+) -> Result<Json<Value>, ApiError> {
+    glass_write(
+        state,
+        session,
+        id,
+        headers,
+        Some(request.body),
+        request.base_revision,
+    )
+    .await
+}
+pub(super) async fn glass_delete(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(request): Json<GlassDelete>,
+) -> Result<Json<Value>, ApiError> {
+    glass_write(state, session, id, headers, None, request.base_revision).await
 }

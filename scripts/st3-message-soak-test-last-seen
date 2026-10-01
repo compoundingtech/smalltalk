@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+root=$(mktemp -d)
+trap 'rm -r "$root"' EXIT
+here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
+cat > "$root/st" <<'ST'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+if [[ $* == 'replication status --json' ]]; then
+  printf '%s\n' '{"peers":[{"peer":"traveller","status":"last-seen","last_success_at_unix_ms":1000}]}'
+  exit 0
+fi
+printf '%s\n' "$*" >> "$TEST_CALLS"
+exit 55
+ST
+chmod +x "$root/st"
+export TEST_CALLS="$root/unexpected"
+export ST3_BIN="$root/st" ST_AGENT=agent/fixture/monitor
+export FABRIC_BIN="$root/st" ST3_SOAK_EXAMPLE_MAC_BIN="$root/st"
+export ST3_SOAK_STATE_DIR="$root/state"
+set +e
+output=$(bash "$here/st3-message-soak" --once harbor-to-traveller 2>&1)
+result=$?
+set -e
+[[ $result == 3 && $output == *'reason=member-last-seen'* ]]
+[[ ! -e $TEST_CALLS ]]
+[[ $output != *FAILED* && $output != *attention* ]]
+printf '%s\n' 'last-seen members pause probes without a send or attention request'

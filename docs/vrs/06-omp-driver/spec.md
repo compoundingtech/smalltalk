@@ -169,6 +169,7 @@ Captures, per measured release:
 - 18.0.9 — [`2026-08-28-omp-18-0-9-admission.md`](./.experiments/2026-08-28-omp-18-0-9-admission.md).
 - 18.1.2 — [`2026-09-02-omp-18-1-2-admission.md`](./.experiments/2026-09-02-omp-18-1-2-admission.md).
 - 18.3.0 — [`2026-09-24-omp-18-3-0-admission.md`](./.experiments/2026-09-24-omp-18-3-0-admission.md).
+- 18.4.2 — [`2026-09-29-omp-18-4-2-admission.md`](./.experiments/2026-09-29-omp-18-4-2-admission.md).
 
 The `18.2` minor is not admitted: no release in that minor has been measured.
 

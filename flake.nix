@@ -1,5 +1,5 @@
 {
-  description = "st2 - harness-agnostic runner: reconcile a catalog+inbox folder of agent specs, keep their ptys running, deliver messages by moving files";
+  description = "Small Talk claims-graph runtime and terminal UI, with a separate legacy st2 runner";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -36,14 +36,19 @@
         hmModuleEval = nixpkgs.lib.evalModules {
           specialArgs = {
             inherit pkgs;
-            lib = pkgs.lib // { hm.dag.entryAfter = _: value: value; };
+            lib = pkgs.lib // {
+              hm.dag = rec {
+                entryBetween = before: after: data: { inherit before after data; };
+                entryAfter = entryBetween [ ];
+              };
+            };
           };
           modules = [
             self.homeManagerModules.default
             ({ lib, ... }: {
               options = {
-                xdg.configHome = lib.mkOption { type = lib.types.str; default = "/home/test/.config"; };
-                xdg.stateHome = lib.mkOption { type = lib.types.str; default = "/home/test/.local/state"; };
+                xdg.configHome = lib.mkOption { type = lib.types.str; default = "/home/example/.config"; };
+                xdg.stateHome = lib.mkOption { type = lib.types.str; default = "/home/example/.local/state"; };
                 xdg.configFile = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
                 home.packages = lib.mkOption { type = lib.types.listOf lib.types.package; default = [ ]; };
                 home.activation = lib.mkOption { type = lib.types.attrsOf lib.types.anything; default = { }; };
@@ -78,7 +83,7 @@
         # pure input, so baking it lets a hermetic build know its own identity
         # without an impure `.git` read. Same env var + JSON shape as the rest of
         # the fleet (TS `@overeng/utils/node/cli-version`; the otel-scrape Rust
-        # reader) — `src/version.rs` reads it via `option_env!("CLI_BUILD_STAMP")`.
+        # reader) — `crates/st-drivers/src/version.rs` reads it via `option_env!("CLI_BUILD_STAMP")`.
         # `self.shortRev`/`lastModified` are absent only for a dirty tree, where
         # `dirtyShortRev` and the working-tree mtime stand in and `dirty` is true.
         sourceRev = self.shortRev or self.dirtyShortRev or "unknown";
@@ -211,7 +216,7 @@
           # over the LocalStamp `build.rs` bakes from git (which is empty here
           # anyway — a flake source carries no `.git`). Reaches rustc as a plain
           # env var, captured at compile time by `option_env!` (see
-          # src/version.rs). A derivation env var change rebuilds the crate.
+          # crates/st-drivers/src/version.rs). A derivation env var change rebuilds the crate.
           CLI_BUILD_STAMP = buildStamp;
           ST2_EXECUTOR_BUILD_IDENTITY = buildStamp;
           AGENT_SPEC_REVISION = agentSpecRevision;
@@ -314,7 +319,7 @@
           };
         };
 
-        st3 = pkgs.rustPlatform.buildRustPackage {
+        st3Check = pkgs.rustPlatform.buildRustPackage {
           pname = "st3";
           inherit version;
           src = self;
@@ -395,12 +400,16 @@
             installShellCompletion --cmd st --bash st.bash --zsh _st --fish st.fish
           '';
           meta = {
-            description = "Small Talk claims-graph runtime, terminal UI, and st2 KDL migration tool";
-            homepage = "https://github.com/compoundingtech/st2";
+            description = "Small Talk claims-graph runtime, terminal UI, and KDL migration tool";
+            homepage = "https://github.com/compoundingtech/smalltalk";
             license = pkgs.lib.licenses.mit;
             mainProgram = "st3";
           };
         };
+
+        # Installing the current tools must not depend on running the full runtime suite.
+        # Keep that suite as checks.st3; st/ci also runs it in the native test environment.
+        st3 = st3Check.overrideAttrs (_: { doCheck = false; });
 
         st3Help = pkgs.runCommand "st3-help-${version}" { } ''
           test "$(readlink ${st3}/bin/st)" = st3
@@ -417,31 +426,45 @@
           touch $out
         '';
 
-        # Both products from one source: st2, st3, and the st3 package's own `st` symlink.
-        smallTalk = pkgs.symlinkJoin {
-          name = "small-talk-${version}";
-          paths = [
-            st2
-            st3
-          ];
-        };
+        # Current package aliases must select st3 without pulling in the st2 package.
+        # Every install path leaves `st` resolving to the installed st3.
+        installLayout =
+          assert self.packages.${system}.default.drvPath == st3.drvPath;
+          assert self.packages.${system}.st.drvPath == st3.drvPath;
+          assert self.packages.${system}.small-talk.drvPath == st3.drvPath;
+          pkgs.runCommand "st3-install-layout-${version}" { } ''
+            export HOME=$(mktemp -d)
+            test "$(readlink ${st3}/bin/st)" = st3
+            printf '%s\n' pty st st3 st3-migrate stui > expected-package-bin
+            ls ${st3}/bin | sort > actual-package-bin
+            cmp expected-package-bin actual-package-bin
 
-        # Every install path leaves `st` resolving to the installed st3, never a separate build.
-        installLayout = pkgs.runCommand "small-talk-install-layout-${version}" { } ''
+            mkdir built
+            ln -s ${st3}/bin/st3 ${st3}/bin/st3-migrate ${st3}/bin/stui built/
+            bash ${self}/scripts/install --from built --bin-dir "$PWD/bin"
+            printf '%s\n' st st3 st3-migrate stui > expected-source-bin
+            ls bin | sort > actual-source-bin
+            cmp expected-source-bin actual-source-bin
+            test "$(readlink bin/st)" = st3
+            bin/st --help > st.help
+            bin/st3 --help > st3.help
+            cmp st.help st3.help
+            bin/st3-migrate --help > /dev/null
+            bin/stui --help > /dev/null
+
+            bash ${self}/scripts/install-test
+            touch $out
+          '';
+
+        st2InstallLayout = pkgs.runCommand "st2-install-layout-${version}" { } ''
           export HOME=$(mktemp -d)
-          test "$(readlink -f ${smallTalk}/bin/st)" = "$(readlink -f ${smallTalk}/bin/st3)"
-          test -x ${smallTalk}/bin/st2
-
-          mkdir built
-          ln -s ${st2}/bin/st2 ${st3}/bin/st3 ${st3}/bin/st3-migrate ${st3}/bin/stui built/
-          bash ${self}/scripts/install --from built --bin-dir "$PWD/bin"
-          test "$(readlink bin/st)" = st3
-          bin/st --help > st.help
-          bin/st3 --help > st3.help
-          cmp st.help st3.help
-          bin/st2 --help > /dev/null
-
-          bash ${self}/scripts/install-test
+          ls ${st2}/bin > actual-bin
+          printf '%s\n' st2 > expected-bin
+          cmp expected-bin actual-bin
+          ${st2}/bin/st2 --help > /dev/null
+          test -s ${st2}/share/bash-completion/completions/st2.bash
+          test -s ${st2}/share/zsh/site-functions/_st2
+          test -s ${st2}/share/fish/vendor_completions.d/st2.fish
           touch $out
         '';
 
@@ -674,9 +697,10 @@
       in
       {
         packages.st2 = st2;
+        packages.st = st3;
         packages.st3 = st3;
         packages.st3-migrate = st3;
-        packages.small-talk = smallTalk;
+        packages.small-talk = st3;
         packages.st2-wasm-resolver = st2WasmResolver;
         packages.st2-provider-runtime = st2ProviderRuntime;
         # All four components come out of one build; the install paths are unchanged.
@@ -684,7 +708,7 @@
         packages.st2-github-pr-component = st2ProviderComponents;
         packages.st2-pty-stats-component = st2ProviderComponents;
         packages.st2-vista-component = st2ProviderComponents;
-        packages.default = st2;
+        packages.default = st3;
 
         # `nix flake check` is the whole CI: it builds the package — which runs
         # the hermetic portion of the in-tree `cargo test` suite via doCheck —
@@ -696,14 +720,24 @@
         # commits on every rebase. The devShell ships rustfmt + clippy for whoever
         # wants them.
         checks.st2 = st2;
-        checks.st3 = st3;
+        checks.st3 = st3Check;
         checks.st3-help = st3Help;
         checks.install-layout = installLayout;
+        checks.st2-install-layout = st2InstallLayout;
         checks.release-integration = st2ReleaseIntegration;
         checks.debug-assertions = st2DebugAssertions;
         checks.hm-module-eval =
           let
             rendered = hmModuleEval.config;
+            stableBinDir = "${rendered.services.smalltalk.stateDir}/bin";
+            stableExecutable = "${stableBinDir}/st3";
+            package = toString (builtins.head rendered.home.packages);
+            activation = rendered.home.activation.smalltalkBinary;
+            daemonEnvironment = if pkgs.stdenv.hostPlatform.isLinux then
+              rendered.systemd.user.services.smalltalk.Service.Environment
+            else
+              pkgs.lib.mapAttrsToList (name: value: "${name}=${value}")
+                rendered.launchd.agents.smalltalk.config.EnvironmentVariables;
             args = if pkgs.stdenv.hostPlatform.isLinux then
               rendered.systemd.user.services.smalltalk.Service.ExecStart
             else
@@ -712,6 +746,21 @@
           assert pkgs.lib.hasInfix ''person = "person/ada"'' rendered.xdg.configFile."st3/config.toml".text;
           assert pkgs.lib.hasInfix "/tmp/smalltalk-test.sock" args;
           assert pkgs.lib.hasInfix "--pty-binary" args;
+          assert (if pkgs.stdenv.hostPlatform.isLinux then
+            pkgs.lib.hasPrefix ''"${stableExecutable}" '' args
+          else
+            builtins.head rendered.launchd.agents.smalltalk.config.ProgramArguments == stableExecutable);
+          assert builtins.match ".*/nix/store/[^ ]*/bin/st3.*" args == null;
+          assert (if pkgs.stdenv.hostPlatform.isLinux then
+            map toString rendered.systemd.user.services.smalltalk.Unit.X-Restart-Triggers == [ package ]
+          else
+            rendered.launchd.agents.smalltalk.config.EnvironmentVariables.SMALLTALK_PACKAGE == package);
+          assert builtins.any (pkgs.lib.hasPrefix "PATH=${stableBinDir}:") daemonEnvironment;
+          assert activation.after == [ "writeBoundary" ];
+          assert activation.before == [
+            (if pkgs.stdenv.hostPlatform.isLinux then "reloadSystemd" else "setupLaunchAgents")
+          ];
+          assert builtins.deepSeq activation.data true;
           assert builtins.length rendered.home.packages == 1;
           assert builtins.deepSeq (if pkgs.stdenv.hostPlatform.isLinux then
             rendered.systemd.user.services.smalltalk-apply.Service.ExecStart
@@ -776,14 +825,14 @@
               hash = "sha256-ATysqeRVcLEeqPuz+LnjJ0NpNrNiiAZAtZ+f4qz93sk=";
             };
           in
-          pkgs.runCommand "st2-pi-extension-types-${version}" {
+          pkgs.runCommand "st-pi-extension-types-${version}" {
             nativeBuildInputs = [
               pkgs.gnutar
               pkgs.nodejs
               pkgs.typescript
             ];
           } ''
-            cp -R ${self}/hooks hooks
+            cp -R ${self}/crates/st-drivers/hooks hooks
             chmod -R u+w hooks
 
             modules=hooks/typecheck/node_modules
@@ -808,7 +857,7 @@
             # every telemetry pull throws — because a bare context takes the fail-open branch and
             # never executes the harness-context producer's body at all, which is the same blind
             # spot in a new place. The channel is a recorder rather than `true`, so the smoke reads
-            # the frames back and asserts the wire `src/pi_channel.rs` decodes: with a pipe nobody
+            # the frames back and asserts the wire `crates/st-drivers/src/pi_channel.rs` decodes: with a pipe nobody
             # reads, a producer that silently emits nothing is indistinguishable from a working
             # one, and that failure looks exactly like the pre-producer state where every
             # declaration's context reads null. Nothing else couples the two halves of that wire —
@@ -821,6 +870,7 @@
               --format=esm --platform=node --target=es2022 \
               --outfile=hooks/typecheck/smoke-out/omp-channel.mjs
             ${pkgs.nodejs}/bin/node hooks/typecheck/omp-smoke.mjs
+            ${pkgs.nodejs}/bin/node hooks/typecheck/environment-smoke.mjs
             touch $out
           '';
 

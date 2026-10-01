@@ -12,7 +12,11 @@ if (process.argv.includes('--version')) {
 const directory = process.cwd();
 // Exercise an actual historical channel with today's daemon/driver/extension,
 // avoiding unrelated historical daemon startup and prompt contracts.
-if (process.env.FAULT_OLD_CHANNEL_BIN) process.env.ST2_OMP_CHANNEL_BIN = process.env.FAULT_OLD_CHANNEL_BIN;
+if (process.env.FAULT_OLD_CHANNEL_BIN) {
+  // The provider may load either generation's immutable extension during compatibility tests.
+  process.env.ST_OMP_CHANNEL_BIN = process.env.FAULT_OLD_CHANNEL_BIN;
+  process.env.ST2_OMP_CHANNEL_BIN = process.env.FAULT_OLD_CHANNEL_BIN;
+}
 const actor = process.env.ST_AGENT;
 const endpoint = process.env.ST3_ENDPOINT;
 const events = new Map();

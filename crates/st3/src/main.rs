@@ -8,7 +8,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context as _, Result};
 use base64::Engine as _;
-use clap::{Args, CommandFactory as _, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory as _, FromArgMatches as _, Parser, Subcommand, ValueEnum};
 use kdl::{KdlDocument, KdlEntry, KdlNode};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
@@ -26,13 +26,14 @@ use st3::model::{
     MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
     MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest, MissionRunView,
     MissionSpec, MissionState, OperationalRepairApplyRequest, OperationalRepairPlan,
-    OperationalRepairResult, PlannerSpec, PlanningApprovalRequest, PlanningCandidateSubmitRequest,
-    PlanningProposalRequest, PlanningSessionView, ReplicaRecordView, ReplicationPeerStatus,
-    ReplicationRepairRequest, ReplicationStatus, ReviewRequest, RevisionApprovalRequest,
-    RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
-    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionScreen,
-    SessionSignalRequest, StatusResponse, StepRunView, SubscriptionRequestDecision,
-    SubscriptionRequestView, WorkRequest, WorkRetryRequest, WorkWakeRequest,
+    OperationalRepairResult, PersonAskRequest, PersonStepResponse, PlannerSpec,
+    PlanningApprovalRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
+    PlanningSessionView, ReplicaRecordView, ReplicationPeerStatus, ReplicationRepairRequest,
+    ReplicationStatus, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
+    RevisionProposalView, RevisionSubmissionView, RunGenerationView, SessionControlResponse,
+    SessionInputMode, SessionInputRequest, SessionScreen, SessionSignalRequest, StatusResponse,
+    StepRunView, SubscriptionRequestDecision, SubscriptionRequestView, WorkRequest,
+    WorkRetryRequest, WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -49,6 +50,7 @@ use st3_client::{
 };
 use tokio::sync::{Notify, watch};
 
+mod cli_help;
 mod presentation;
 
 use presentation::{
@@ -286,7 +288,7 @@ enum FleetInvitesCommand {
 
 #[derive(Args, Clone)]
 struct FleetMemberArgs {
-    /// Accept no connections and dial listening members: for a laptop that is often away.
+    /// Accept no inbound connections; replication and presence otherwise behave normally.
     #[arg(long)]
     dial_out: bool,
     /// The replication port. The default is 31313 or the next free port.
@@ -372,7 +374,7 @@ struct FleetJoinArgs {
     /// This machine's name in the fleet.
     #[arg(long)]
     name: Option<String>,
-    /// A loopback URL that reaches the sponsor, instead of the code's endpoints.
+    /// A loopback/tailnet http:// or fabric:// route to the sponsor.
     #[arg(long)]
     via: Option<String>,
     /// Do not stop, install, or start services; print the foreground commands instead.
@@ -511,14 +513,11 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 "Created fleet {} with {} as its first member.",
                 founded.fleet_id, founded.node
             );
-            if !args.no_service && services_installed() {
+            let services = !args.no_service && services_installed();
+            if services {
                 st3::service::install(Config::load_with_fleet(None)?)?;
-                println!("The st3 services now run as a fleet member. Next: st fleet invite NAME");
-            } else {
-                println!(
-                    "Restart st3 up and start st3 replication-worker, then: st fleet invite NAME"
-                );
             }
+            print!("{}", cli_help::fleet_created_next_steps(services));
             Ok(())
         }
         FleetCommand::Invite(args) => {
@@ -695,11 +694,12 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                     if joined.resumed { " (resumed)" } else { "" }
                 );
             }
+            let mut sync_state = None;
             if use_services {
                 st3::service::install(Config::load_with_fleet(None)?)?;
-                println!(
-                    "The st3 services now run as a fleet member; st fleet status shows the sync."
-                );
+                if !json_output {
+                    println!("The st services now run as a fleet member.");
+                }
                 if !args.no_wait {
                     match wait_for_first_sync(&client, Duration::from_secs(30 * 60), !json_output)
                         .await?
@@ -710,7 +710,16 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                             "{}",
                             render_first_sync(&first, now_ms())
                         ),
-                        Some(first) => report_first_sync(&first, false)?,
+                        Some(first) => {
+                            sync_state = Some(first.state.clone());
+                            if first.state != "verified" {
+                                print!(
+                                    "{}",
+                                    cli_help::fleet_next_steps(use_services, sync_state.as_deref())
+                                );
+                            }
+                            report_first_sync(&first, false)?;
+                        }
                         None if json_output => {}
                         None => println!(
                             "This machine is a member and still syncing; st fleet wait waits for \
@@ -722,6 +731,12 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                 println!(
                     "Start st3 up and st3 replication-worker to begin syncing; st fleet wait \
                      waits for the first sync to end and checks it."
+                );
+            }
+            if !json_output {
+                print!(
+                    "{}",
+                    cli_help::fleet_next_steps(use_services, sync_state.as_deref())
                 );
             }
             Ok(())
@@ -844,8 +859,9 @@ async fn run_fleet(endpoint: &Endpoint, command: FleetCommand, json_output: bool
                     "PEER  {}  {}{}",
                     peer.peer,
                     peer.status,
-                    peer.last_error
+                    peer.refusal_reason
                         .as_deref()
+                        .or(peer.last_error.as_deref())
                         .map(|error| format!("  {error}"))
                         .unwrap_or_default()
                 );
@@ -1256,6 +1272,9 @@ struct FleetMigrateArgs {
     code_file: Option<PathBuf>,
     #[arg(long)]
     fabric_inbox: bool,
+    /// A loopback/tailnet http:// or fabric:// route to the sponsor.
+    #[arg(long, conflicts_with_all = ["anchor", "finish", "unfinish"])]
+    via: Option<String>,
     /// Make this machine the anchor: the first machine of the fleet to migrate.
     #[arg(long, conflicts_with_all = ["code", "code_file", "fabric_inbox", "finish", "unfinish"])]
     anchor: bool,
@@ -1391,7 +1410,7 @@ async fn run_fleet_migrate(client: &Client, config: &Config, args: FleetMigrateA
             configured_node: config.node.clone(),
             code: code.trim().to_owned(),
             name: Some(config.node.clone()),
-            via: None,
+            via: args.via.clone(),
             settings,
             legacy_secret_file: Some(secret_file),
             fabric_protocol: args.fabric_protocol.clone(),
@@ -1504,7 +1523,7 @@ enum MissionViewCommand {
     /// List current missions; use --all for historical terminal missions.
     Ls {
         /// Follow current collection changes.
-        #[arg(long, conflicts_with_all = ["all", "cursor"])]
+        #[arg(long, conflicts_with_all = ["all", "cursor", "since", "until", "status"])]
         watch: bool,
         #[arg(long)]
         all: bool,
@@ -1512,6 +1531,15 @@ enum MissionViewCommand {
         cursor: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Terminal transitions since a duration such as 6h, or an RFC3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// End of the time window (RFC3339 timestamp or duration ago).
+        #[arg(long)]
+        until: Option<String>,
+        /// Terminal state: failed, cancelled, timed-out, or completed. Includes reasons.
+        #[arg(long, value_parser = ["failed", "cancelled", "timed-out", "completed"])]
+        status: Option<String>,
     },
     /// Explain one mission run, its goals, state, work, and usage.
     Show(MissionShowArgs),
@@ -1530,14 +1558,14 @@ enum MissionViewCommand {
         /// Exact seat subject or its identity without the `agent/` prefix.
         agent: String,
     },
-    /// List the open mission requests that one subscription recorded.
+    /// Show one subscription's automatic mission request queue.
     Requests {
         subscription: String,
         /// Include started, cancelled, and failed requests.
         #[arg(long)]
         all: bool,
     },
-    /// Start one mission request that an observation held for a person.
+    /// Release a legacy held request; new requests are queued automatically.
     Release(SubscriptionRequestArgs),
     /// Close one pending or held mission request without starting it.
     CancelRequest(SubscriptionRequestArgs),
@@ -1596,8 +1624,8 @@ struct MissionCancelArgs {
     /// Why the run is no longer wanted.
     #[arg(long)]
     reason: String,
-    /// Concrete human authority carried over the trusted local Unix boundary.
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    /// Person or authorized agent carried over the trusted local Unix boundary.
+    #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
 }
 
@@ -2041,9 +2069,20 @@ struct DevicesArgs {
 #[derive(Subcommand)]
 enum SubjectCommand {
     /// Show one typed subject card.
-    Show(InspectArgs),
+    Show(SubjectShowArgs),
     /// Show bounded immutable history for one subject.
     History(TraceArgs),
+}
+
+#[derive(Args)]
+struct SubjectShowArgs {
+    subject: String,
+    /// Print the current managed agent declaration as canonical KDL v2.
+    #[arg(long)]
+    kdl: bool,
+    /// Include literal environment values in the KDL output.
+    #[arg(long, requires = "kdl")]
+    show_env_values: bool,
 }
 
 #[derive(Subcommand)]
@@ -2058,6 +2097,9 @@ enum TraceCommand {
 struct DoctorArgs {
     #[arg(long)]
     strict: bool,
+    /// Show only the slowest requests and queries over the last five minutes.
+    #[arg(long)]
+    performance: bool,
 }
 
 #[derive(Subcommand)]
@@ -2497,7 +2539,7 @@ struct AgentNewArgs {
     /// What the agent is for.
     #[arg(long)]
     description: Option<String>,
-    /// Attach this terminal to the agent once its harness is ready. Detach with Ctrl+\.
+    /// Attach this terminal to the agent once it is ready. Detach with Ctrl+\.
     #[arg(long, conflicts_with = "print_kdl")]
     attach: bool,
     /// Print the declaration without applying it.
@@ -2603,35 +2645,11 @@ enum AttentionCommand {
         #[arg(long = "as", value_parser = parse_person_subject)]
         actor: Option<String>,
     },
-    /// Request attention after an explicit fault.
-    ///
-    /// A request names what closes it. The item stays in `st now` until a person resolves it or
-    /// you withdraw it with `st attention withdraw` once the condition clears. It also leaves
-    /// `now` on its own:
-    ///
-    /// - when the step you have claimed ends, if the request names no target that can end, no
-    ///   --until and no --person-closes; the step ends when it completes, fails, is cancelled,
-    ///   starts another attempt or leaves its run's current generation, and --step names
-    ///   another step;
-    /// - once every target meets its --until condition;
-    /// - at once, when a `step-run/` or `run-generation/` target is no longer current, or a
-    ///   pull request target is merged or closed;
-    /// - otherwise, once every other target has ended after the request: a `mission/` retired or
-    ///   cancelled, a `mission-run/` terminal, an `attention/` item resolved or its gate no
-    ///   longer pending, an `agent/` stopped or ready on a later incarnation, an `observer/`
-    ///   stopped or observing again, a `subscription/` stopped, a `loop-run/` running again or
-    ///   its run revised or cancelled, or a `message/` closed.
-    ///
-    /// Other `resource/` targets and `doc/` targets are context and never end an item. A target
-    /// of any other kind, or one that had already ended when you made the request, keeps it open.
-    ///
-    /// st refuses a request that nothing could close. Pass --person-closes when only a person
-    /// can say it is done.
-    #[command(verbatim_doc_comment)]
+    /// Legacy mutation: returns attention-migrated. Use work ask or remedy the source.
     Request(AttentionRequestArgs),
-    /// Resolve or dismiss any attention request, as any person.
+    /// Legacy mutation: returns attention-migrated. Complete a person step with work done.
     Resolve(AttentionResolveArgs),
-    /// Withdraw an obsolete attention request as its original requester.
+    /// Legacy mutation: returns attention-migrated. Cancel your ask with work cancel-ask.
     Withdraw(AttentionWithdrawArgs),
     /// Approve one person-owned gate or launch review.
     Approve(ReviewArgs),
@@ -2693,10 +2711,16 @@ struct AttentionWithdrawArgs {
 
 #[derive(Subcommand)]
 enum WorkCommand {
+    /// Ask a person through a runtime step owned by live work.
+    Ask(WorkAskArgs),
+    /// Complete a person-assigned step with a response.
+    Done(WorkDoneArgs),
+    /// Cancel your own ask and resume its live origin.
+    CancelAsk(WorkDoneArgs),
     /// List current actionable work; use --as to filter one agent or --all for history.
     Ls {
         /// Follow current collection changes.
-        #[arg(long, conflicts_with_all = ["all", "cursor"])]
+        #[arg(long, conflicts_with_all = ["all", "cursor", "since", "until", "status"])]
         watch: bool,
         #[arg(long = "as")]
         actor: Option<String>,
@@ -2707,6 +2731,15 @@ enum WorkCommand {
         cursor: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Terminal transitions since a duration such as 6h, or an RFC3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// End of the time window (RFC3339 timestamp or duration ago).
+        #[arg(long)]
+        until: Option<String>,
+        /// Terminal state: failed, cancelled, timed-out, or completed. Includes reasons.
+        #[arg(long, value_parser = ["failed", "cancelled", "timed-out", "completed"])]
+        status: Option<String>,
     },
     /// Explain one work item, its owner, readiness, lease, and evidence.
     Show { subject: String },
@@ -2735,6 +2768,41 @@ enum WorkCommand {
         #[command(subcommand)]
         command: WorkRevisionCommand,
     },
+}
+
+#[derive(Args)]
+struct WorkAskArgs {
+    #[arg(long = "for")]
+    person: String,
+    #[arg(long)]
+    title: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(long, conflicts_with = "new_run")]
+    step: Option<String>,
+    #[arg(long, conflicts_with = "step")]
+    new_run: Option<String>,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+    #[arg(long, env = "ST3_INCARNATION")]
+    incarnation: Option<String>,
+    #[arg(long)]
+    idempotency_key: String,
+}
+
+#[derive(Args)]
+struct WorkDoneArgs {
+    subject: String,
+    #[arg(long = "as")]
+    actor: String,
+    #[arg(long, alias = "reason")]
+    summary: String,
+    #[arg(long)]
+    evidence: Vec<String>,
+    #[arg(long)]
+    episode: Option<String>,
+    #[arg(long)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -3018,24 +3086,76 @@ fn main() -> ExitCode {
     }
     // A seat process asks a replacement binary which resume formats it reads before executing it.
     if std::env::args_os().nth(1).as_deref()
-        == Some(std::ffi::OsStr::new(st2::reexec::PROBE_SUBCOMMAND))
+        == Some(std::ffi::OsStr::new(st_drivers::reexec::PROBE_SUBCOMMAND))
     {
-        println!("{}", st2::reexec::probe_answer());
+        println!("{}", st_drivers::reexec::probe_answer());
         return ExitCode::SUCCESS;
     }
+    // A seat's harness runs its hooks through this binary. They are hidden from help, need no
+    // daemon or config to start, and the status line runs every few seconds, so they skip the
+    // CLI parser and the async runtime.
+    if std::env::args_os().nth(1).as_deref()
+        == Some(std::ffi::OsStr::new(st3::driver_hook::SUBCOMMAND))
+    {
+        return run_driver_hook();
+    }
     // SAFETY: no other thread exists yet; the async runtime starts after this returns.
-    unsafe { st2::reexec::take_resume_environment() };
-    if st2::reexec::resume_path(st2::reexec::DRIVER_RESUME_ENV).is_some() {
+    unsafe { st_drivers::reexec::take_resume_environment() };
+    if st_drivers::reexec::resume_path(st_drivers::reexec::DRIVER_RESUME_ENV).is_some() {
         // The predecessor blocked the stop signals across its exec. Install the handlers before
         // unblocking them, so a stop that arrived in between ends the session the ordinary way.
-        st2::provider_session::install_stop_handlers();
-        st2::reexec::unblock_stop_signals();
+        st_drivers::provider_session::install_stop_handlers();
+        st_drivers::reexec::unblock_stop_signals();
     }
-    let cli = Cli::parse();
+    let arguments = std::env::args_os().collect::<Vec<_>>();
+    if cli_help::all_help_requested(&arguments) {
+        print!("{}", cli_help::root_help(true));
+        return ExitCode::SUCCESS;
+    }
+    let matches = Cli::command()
+        .override_help(cli_help::root_help(false))
+        .get_matches_from(arguments);
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
     if let Command::Up(args) = &cli.command {
         record_daemon_commands(args);
     }
     run_cli(cli)
+}
+
+/// `st driver-hook NAME [ARGS]`: answer one harness hook with the payload on stdin.
+fn run_driver_hook() -> ExitCode {
+    let arguments = std::env::args().skip(2).collect::<Vec<_>>();
+    let Some((name, rest)) = arguments.split_first() else {
+        eprintln!(
+            "usage: st {} NAME [ARGS]; NAME is one of {}",
+            st3::driver_hook::SUBCOMMAND,
+            st3::driver_hook::HOOKS.join(", ")
+        );
+        return ExitCode::from(2);
+    };
+    let env = st3::driver_hook::ProcessEnv;
+    let run = || st3::driver_hook::run(
+        name,
+        rest,
+        &env,
+        // Unlocked: the status-line tee reads stdin itself, and a held lock would deadlock it.
+        &mut std::io::stdin(),
+        &mut |diagnostic| {
+            if let Err(error) = st3::driver_hook::post_diagnostic(&env, &diagnostic) {
+                eprintln!(
+                    "st: could not record the {} diagnostic: {error:#}",
+                    diagnostic.code
+                );
+            }
+        },
+    );
+    let code = if name == "claude-observe" {
+        st3::telemetry::hook(&env, run)
+    } else {
+        st3::telemetry::local_only();
+        run()
+    };
+    ExitCode::from(code)
 }
 
 /// The daemon finds `git` and `gh` through its recorder like every member does. `run_up` installs
@@ -3061,6 +3181,9 @@ fn record_daemon_commands(args: &UpArgs) {
 
 #[tokio::main]
 async fn run_cli(cli: Cli) -> ExitCode {
+    if matches!(&cli.command, Command::Driver(_)) {
+        st3::telemetry::local_only();
+    }
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -3152,7 +3275,7 @@ async fn run(cli: Cli) -> Result<()> {
         .or_else(|| std::env::var("ST3_ENDPOINT").ok())
         .as_deref()
         .map(Endpoint::parse)
-        .unwrap_or_else(|| Endpoint::Unix(config.socket.clone()));
+        .unwrap_or_else(|| Endpoint::Unix(config.client_socket()));
     let _ = DAEMON_WAIT.set(Duration::from_secs(cli.daemon_wait));
     let client = cli_client(&endpoint);
     // Drivers outlive daemon restarts and handle an outage in their own loops; doctor reports one.
@@ -3332,7 +3455,7 @@ fn guard_mutating_cli_actor(
     if let Some(actor) = actor {
         if actor.starts_with("person/") || actor == "requester" {
             anyhow::bail!(
-                "this harness is `{own}` (ST_AGENT) and cannot act as `{actor}` on a mutating command; request a person through `st attention request --as \"$ST_AGENT\"`"
+                "this harness is `{own}` (ST_AGENT) and cannot act as `{actor}` on a mutating command; request a person through `st work ask --as \"$ST_AGENT\"`"
             );
         }
         if let Some(message) = foreign_agent_actor(actor, Some(own), mission_run) {
@@ -3365,16 +3488,16 @@ fn run_skill(args: SkillArgs) -> Result<()> {
 fn run_claude_channel(command: ClaudeChannelCommand) -> Result<()> {
     match command {
         ClaudeChannelCommand::Install { no_policy } => {
-            st2::claude_channel::install_st3(no_policy).map(|_| ())
+            st_drivers::claude_channel::install_st3(no_policy).map(|_| ())
         }
-        ClaudeChannelCommand::Status => st2::claude_channel::status_st3(),
+        ClaudeChannelCommand::Status => st_drivers::claude_channel::status_st3(),
         ClaudeChannelCommand::Uninstall { keep_policy } => {
-            st2::claude_channel::uninstall_st3(keep_policy)
+            st_drivers::claude_channel::uninstall_st3(keep_policy)
         }
         ClaudeChannelCommand::InstallPolicy => {
-            st2::claude_channel::install_st3_policy().map(|_| ())
+            st_drivers::claude_channel::install_st3_policy().map(|_| ())
         }
-        ClaudeChannelCommand::UninstallPolicy => st2::claude_channel::uninstall_st3_policy(),
+        ClaudeChannelCommand::UninstallPolicy => st_drivers::claude_channel::uninstall_st3_policy(),
     }
 }
 
@@ -3440,7 +3563,63 @@ fn raise_open_file_limit() {
     }
 }
 
+fn select_private_gateway(config: &mut Config, private_state: bool, private_socket: bool) {
+    if !(private_state || private_socket) {
+        return;
+    }
+    let defaults = Config::default();
+    if config.state_dir == defaults.state_dir && config.socket == defaults.socket {
+        return;
+    }
+    let parent = if private_socket {
+        config
+            .socket
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+    } else {
+        Some(config.state_dir.as_path())
+    };
+    config.client_gateway_socket = parent
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("st3-client.sock");
+}
+
+#[cfg(test)]
+mod private_gateway_tests {
+    use super::*;
+
+    #[test]
+    fn private_state_and_socket_derive_a_private_gateway() {
+        let mut config = Config::default();
+        let default_gateway = config.client_gateway_socket.clone();
+        config.state_dir = "/tmp/private-state".into();
+        select_private_gateway(&mut config, true, false);
+        assert_eq!(
+            config.client_gateway_socket,
+            PathBuf::from("/tmp/private-state/st3-client.sock")
+        );
+        config.socket = "/tmp/private-socket/api.sock".into();
+        select_private_gateway(&mut config, true, true);
+        assert_eq!(
+            config.client_gateway_socket,
+            PathBuf::from("/tmp/private-socket/st3-client.sock")
+        );
+        assert_ne!(config.client_gateway_socket, default_gateway);
+    }
+
+    #[test]
+    fn default_daemon_keeps_its_default_gateway() {
+        let mut config = Config::default();
+        let gateway = config.client_gateway_socket.clone();
+        select_private_gateway(&mut config, false, false);
+        assert_eq!(config.client_gateway_socket, gateway);
+    }
+}
+
 async fn run_up(args: UpArgs) -> Result<()> {
+    let private_state = args.state_dir.is_some();
+    let private_socket = args.socket.is_some();
+    let explicit_gateway = args.client_gateway_socket.is_some();
     let mut config = Config::load_unvalidated(args.config.as_deref())?;
     if let Some(node) = args.node {
         config.node = node;
@@ -3456,6 +3635,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
     }
     if let Some(socket) = args.client_gateway_socket {
         config.client_gateway_socket = socket;
+    }
+    if !explicit_gateway {
+        select_private_gateway(&mut config, private_state, private_socket);
     }
     if let Some(peer_listen) = args.peer_listen {
         config.peer_listen = Some(peer_listen);
@@ -3473,10 +3655,10 @@ async fn run_up(args: UpArgs) -> Result<()> {
     config.validate()?;
     validate_unix_socket_path(&config.socket, "--socket")?;
     validate_unix_socket_path(&config.client_gateway_socket, "--client-gateway-socket")?;
-    st2::hooks::ensure_installed().context(
+    fs::create_dir_all(&config.state_dir)?;
+    st3::hooks::ensure_installed(&st3::hooks::root(&config.state_dir)).context(
         "publishing this st binary's required lifecycle hook set before starting the daemon",
     )?;
-    fs::create_dir_all(&config.state_dir)?;
     st3::profile::init_from_env();
     raise_open_file_limit();
     let store = Arc::new(st3::profile::task("startup open-store", || {
@@ -3641,13 +3823,14 @@ async fn run_up(args: UpArgs) -> Result<()> {
         config.client_gateway_socket.display()
     );
     let local_socket = config.socket.clone();
+    let state_socket = config.state_dir.join("run/st3.sock");
     let client_gateway_socket = config.client_gateway_socket.clone();
     // The first diagnostic report reads the whole claim log; no read waits for it.
     st3::api::start_operation_report(&state);
     // Nor does the first session list wait to read every native transcript's header.
     st3::api::start_native_session_discovery(&state);
     tokio::try_join!(
-        st3::api::serve_unix_bound(&local_socket, router(state.clone())),
+        st3::api::serve_unix_bound(&local_socket, &state_socket, router(state.clone())),
         serve_unix(&client_gateway_socket, fabric_router(state)),
     )?;
     Ok(())
@@ -3723,6 +3906,7 @@ async fn run_launch(
         );
     }
     let nonce = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+    let starting = matches!(&command, LaunchCommand::Start(_));
     let response = match command {
         LaunchCommand::Ls { .. } => unreachable!(),
         LaunchCommand::Start(args) => {
@@ -3923,7 +4107,11 @@ async fn run_launch(
                     },
                 )
                 .await?;
-            return print_value(&response, json_output);
+            print_value(&response, json_output)?;
+            if !json_output {
+                print!("{}", cli_help::mission_next_steps(&response.mission_run));
+            }
+            return Ok(());
         }
         LaunchCommand::Run(args) => {
             let workspace = fs::canonicalize(&args.workspace)
@@ -3939,7 +4127,11 @@ async fn run_launch(
                     },
                 )
                 .await?;
-            return print_value(&response, json_output);
+            print_value(&response, json_output)?;
+            if !json_output {
+                print!("{}", cli_help::mission_next_steps(&response));
+            }
+            return Ok(());
         }
         LaunchCommand::Question(args) => {
             let response: Value = client
@@ -4057,6 +4249,9 @@ async fn run_launch(
             println!("Blocker: {blocker}");
         }
     }
+    if starting {
+        print!("{}", cli_help::launch_next_steps(&response));
+    }
     Ok(())
 }
 
@@ -4081,11 +4276,34 @@ async fn run_mission_view(
             all,
             cursor,
             limit,
+            since,
+            until,
+            status,
         } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
                 "the mission limit must be 1 through 200"
             );
+            if since.is_some()
+                || until.is_some()
+                || status.is_some()
+                || cursor
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with("outcomes:"))
+            {
+                return list_outcomes(
+                    client,
+                    "missions",
+                    since,
+                    until,
+                    status,
+                    None,
+                    cursor,
+                    limit,
+                    json_output,
+                )
+                .await;
+            }
             if watch {
                 return run_collection_watch(
                     endpoint,
@@ -4111,28 +4329,36 @@ async fn run_mission_view(
             )
         }
         MissionViewCommand::Show(args) => {
-            let selected = args.mission_or_run;
-            let run = if selected.starts_with("mission-run/") {
-                client
-                    .get::<MissionRunView>(&format!(
-                        "/v1/mission-runs/{}",
-                        urlencoding::encode(&selected)
-                    ))
-                    .await?
-            } else {
-                let runs: Vec<MissionRunView> = client
+            let mut selected = args.mission_or_run;
+            if !selected.starts_with("mission-run/") {
+                let overview: Value = client
                     .get(&format!(
-                        "/v1/mission-runs?mission={}",
+                        "/v1/mission-overview?mission={}",
                         urlencoding::encode(&selected)
                     ))
                     .await?;
-                anyhow::ensure!(
-                    runs.len() == 1,
-                    "mission `{selected}` has {} active runs; use an exact mission run subject",
-                    runs.len()
-                );
-                runs.into_iter().next().expect("one active run was checked")
-            };
+                if overview["total_runs"].as_u64() != Some(1) {
+                    anyhow::ensure!(
+                        !args.follow,
+                        "--follow needs an exact mission run subject; choose a run from the summary"
+                    );
+                    if json_output {
+                        return print_value(&overview, true);
+                    }
+                    print!("{}", render_mission_overview(&overview));
+                    return Ok(());
+                }
+                selected = overview["newest"][0]["id"]
+                    .as_str()
+                    .context("missing run in mission summary")?
+                    .to_owned();
+            }
+            let run = client
+                .get::<MissionRunView>(&format!(
+                    "/v1/mission-runs/{}",
+                    urlencoding::encode(&selected)
+                ))
+                .await?;
             if args.follow {
                 return follow_mission_run(client, run, 0, json_output).await;
             }
@@ -4406,9 +4632,12 @@ async fn start_mission_run(
                 true,
             )
         } else {
-            println!("{}", started.subject);
+            print!("{}", cli_help::mission_next_steps(&started));
             Ok(())
         };
+    }
+    if !json_output {
+        print!("{}", cli_help::mission_next_steps(&started));
     }
     follow_mission_run(client, started, response.store_index, json_output).await
 }
@@ -5607,11 +5836,15 @@ async fn run_devices(
                 .pairing_begin(&PairingBegin {
                     api_version: CLIENT_V0_API_VERSION.into(),
                     device_name,
-                    person_id: person,
+                    person_id: person.clone(),
                     full_control: full_control.then_some(true),
                 })
                 .await?;
-            print_client_value(&response, json_output)
+            print_client_value(&response, json_output)?;
+            if !json_output {
+                print!("{}", cli_help::pairing_next_steps(&person));
+            }
+            Ok(())
         }
         DevicesCommand::Revoke { device, reason } => {
             let capabilities = client.capabilities().await?;
@@ -5844,7 +6077,12 @@ fn attention_target_line(target: &st3_client::AttentionTargetState, now_unix_ms:
 /// Active and finished runs apart, so a mission with one live run and five old ones does not
 /// read as six runs. A daemon that does not report active runs gets the plain total.
 fn render_mission_runs(mission: &st3_client::Mission) -> String {
-    let total = mission.runs.len();
+    let total = mission
+        .extra
+        .get("total_runs")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(mission.runs.len());
     let plural = |count: usize| if count == 1 { "" } else { "s" };
     let Some(active) = mission.active_runs.map(|active| active.min(total)) else {
         return format!("{total} run{}", plural(total));
@@ -5926,7 +6164,9 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
                 if let Some(usage) = &item.usage {
                     let _ = writeln!(output, "  usage {}", render_usage(usage));
                 }
-                if let Some(run) = item.runs.last() {
+                if item.extra.get("runs_truncated").and_then(Value::as_bool) == Some(true) {
+                    let _ = writeln!(output, "  inspect: st missions show {}", item.header.id);
+                } else if let Some(run) = item.runs.last() {
                     let _ = writeln!(output, "  inspect: st missions show {run}");
                 }
             }
@@ -6479,7 +6719,36 @@ async fn follow_conversation(
 
 async fn run_subject(client: &Client, command: SubjectCommand, json_output: bool) -> Result<()> {
     match command {
-        SubjectCommand::Show(args) => run_inspect(client, args, json_output).await,
+        SubjectCommand::Show(args) => {
+            if args.kdl {
+                anyhow::ensure!(
+                    args.subject.starts_with("agent/"),
+                    "--kdl is supported for managed agents only"
+                );
+                let status = status_for(client, &args.subject).await?;
+                let mut desired = status
+                    .subjects
+                    .iter()
+                    .find(|subject| subject.subject == args.subject)
+                    .and_then(|subject| subject.desired.as_ref())
+                    .cloned()
+                    .context("No managed declaration")?;
+                if !args.show_env_values {
+                    st3::graph::redact_agent_env_values(&mut desired);
+                }
+                print!("{}", st3::graph::render_agent_desired_kdl(&desired)?);
+                Ok(())
+            } else {
+                run_inspect(
+                    client,
+                    InspectArgs {
+                        subject: args.subject,
+                    },
+                    json_output,
+                )
+                .await
+            }
+        }
         SubjectCommand::History(args) => run_trace(client, args, json_output).await,
     }
 }
@@ -6626,7 +6895,201 @@ fn parse_timeout(value: &str) -> Result<Duration> {
     anyhow::bail!("a timeout must use ms, s, m, h, or zero")
 }
 
+fn outcome_time(value: &str, now: u128) -> Result<u128> {
+    if let Ok(at) = chrono::DateTime::parse_from_rfc3339(value) {
+        return u128::try_from(at.timestamp_millis())
+            .context("the time must be after the Unix epoch");
+    }
+    let ago = parse_timeout(value).context("use a duration such as 6h or an RFC3339 timestamp")?;
+    Ok(now.saturating_sub(ago.as_millis()))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OutcomeCursor {
+    collection: String,
+    since: u128,
+    until: u128,
+    status: Option<String>,
+    actor: Option<String>,
+    before: u64,
+    limit: usize,
+}
+
+async fn list_outcomes(
+    client: &Client,
+    collection: &str,
+    since: Option<String>,
+    until: Option<String>,
+    status: Option<String>,
+    actor: Option<String>,
+    cursor: Option<String>,
+    limit: usize,
+    json_output: bool,
+) -> Result<()> {
+    let now = current_unix_ms()?;
+    let mut filter = if let Some(cursor) = cursor {
+        let encoded = cursor
+            .strip_prefix("outcomes:")
+            .context("use the outcome cursor printed by this command")?;
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)?;
+        let saved: OutcomeCursor = serde_json::from_slice(&decoded)?;
+        anyhow::ensure!(
+            saved.collection == collection
+                && saved.limit == limit
+                && saved.actor == actor
+                && status
+                    .as_deref()
+                    .is_none_or(|s| saved.status.as_deref() == Some(s)),
+            "the outcome cursor does not match the collection or filters"
+        );
+        anyhow::ensure!(
+            since.is_none() && until.is_none(),
+            "the cursor already fixes the time window; omit --since and --until"
+        );
+        saved
+    } else {
+        OutcomeCursor {
+            collection: collection.into(),
+            since: since
+                .as_deref()
+                .map(|v| outcome_time(v, now))
+                .transpose()?
+                .unwrap_or(0),
+            until: until
+                .as_deref()
+                .map(|v| outcome_time(v, now))
+                .transpose()?
+                .unwrap_or(now),
+            status,
+            actor,
+            before: i64::MAX as u64,
+            limit,
+        }
+    };
+    anyhow::ensure!(
+        filter.since <= filter.until,
+        "--since must be before --until"
+    );
+    let mut path = format!(
+        "/v1/outcome-history?collection={collection}&since={}&until={}&before={}&limit={limit}",
+        filter.since, filter.until, filter.before
+    );
+    if let Some(status) = &filter.status {
+        path.push_str(&format!("&status={}", urlencoding::encode(status)));
+    }
+    if let Some(actor) = &filter.actor {
+        path.push_str(&format!("&actor={}", urlencoding::encode(actor)));
+    }
+    let mut page: Value = client.get(&path).await?;
+    if let Some(before) = page["next_before"].as_u64() {
+        filter.before = before;
+        let next = format!(
+            "outcomes:{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&filter)?)
+        );
+        page["next_cursor"] = json!(next);
+    }
+    if json_output {
+        return print_value(&page, true);
+    }
+    let items = page["items"].as_array().context("invalid outcome page")?;
+    println!("{} OUTCOMES  {}", collection.to_uppercase(), items.len());
+    for item in items {
+        println!(
+            "{}  {}  {}",
+            item["subject"].as_str().unwrap_or("?"),
+            item["status"].as_str().unwrap_or("?"),
+            relative_time(item["at_unix_ms"].as_u64().unwrap_or(0) as u128, now)
+        );
+        if let Some(reason) = item["reason"].as_str() {
+            println!("  reason: {reason}");
+        }
+        if let Some(mission) = item["mission"].as_str() {
+            println!("  mission: {mission}");
+        }
+    }
+    if let Some(cursor) = page["next_cursor"].as_str() {
+        let actor = filter
+            .actor
+            .as_deref()
+            .map(|a| format!(" --as {a}"))
+            .unwrap_or_default();
+        println!("Next: st {collection} ls{actor} --limit {limit} --cursor '{cursor}'");
+    }
+    Ok(())
+}
+
+fn render_mission_overview(view: &Value) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!(
+        "MISSION  {}\nRUNS     {} total\n",
+        view["mission"].as_str().unwrap_or("?"),
+        view["total_runs"]
+    );
+    if let Some(counts) = view["counts"].as_object() {
+        for (state, count) in counts {
+            let _ = writeln!(out, "  {state}: {count}");
+        }
+    }
+    for (key, title) in [("newest", "NEWEST"), ("failed", "FAILED")] {
+        let _ = writeln!(out, "{title} (up to {} runs)", view["preview_limit"]);
+        if let Some(runs) = view[key].as_array() {
+            for run in runs {
+                let _ = writeln!(
+                    out,
+                    "  {}  {}",
+                    run["id"].as_str().unwrap_or("?"),
+                    run["status"].as_str().unwrap_or("?")
+                );
+                if let Some(reason) = run["reason"].as_str() {
+                    let _ = writeln!(out, "    reason: {reason}");
+                }
+            }
+        }
+    }
+    out
+}
+
+fn render_performance(view: &Value) -> String {
+    use std::fmt::Write as _;
+    if view.is_null() {
+        return String::new();
+    }
+    let mut out = format!(
+        "PERFORMANCE  last {} seconds · sorted by total wall time\n",
+        view["window_seconds"]
+    );
+    for (key, title) in [("requests", "REQUESTS AND TASKS"), ("queries", "QUERIES")] {
+        let _ = writeln!(out, "{title}  count · total ms · max ms · CPU ms · kind");
+        if let Some(rows) = view[key].as_array() {
+            for row in rows {
+                let _ = writeln!(
+                    out,
+                    "  {}  {:.1}  {:.1}  {:.1}  {}",
+                    row["count"],
+                    row["total_ms"].as_f64().unwrap_or(0.0),
+                    row["max_ms"].as_f64().unwrap_or(0.0),
+                    row["cpu_ms"].as_f64().unwrap_or(0.0),
+                    row["kind"].as_str().unwrap_or("?")
+                );
+            }
+        }
+    }
+    if let Some(note) = view["query_time_note"].as_str() {
+        let _ = writeln!(out, "{note}");
+    }
+    out
+}
+
 async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Result<()> {
+    if args.performance {
+        let report: Value = client.get("/v1/performance").await?;
+        if json_output {
+            return print_value(&report, true);
+        }
+        print!("{}", render_performance(&report));
+        return Ok(());
+    }
     let report: DoctorReport = client.get("/v1/doctor").await?;
     if json_output {
         print_value(&report, true)?;
@@ -6634,6 +7097,7 @@ async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Res
         for check in &report.checks {
             println!("{}\t{}\t{}", check.status, check.name, check.message);
         }
+        print!("{}", render_performance(&report.performance));
     }
     anyhow::ensure!(report.status != "fail", "st doctor found a failed check");
     anyhow::ensure!(
@@ -6890,10 +7354,20 @@ fn render_replication_peers(
             "peer\t{}\t{}\t{}",
             peer.peer,
             peer.status,
-            peer.last_error.as_deref().unwrap_or("")
+            peer.refusal_reason
+                .as_deref()
+                .or(peer.last_error.as_deref())
+                .unwrap_or("")
         );
+        if !peer.differing_tables.is_empty() {
+            let _ = writeln!(
+                output,
+                "  shared tables differ: {}",
+                peer.differing_tables.join(", ")
+            );
+        }
         if let Some(at) = peer.last_success_at_unix_ms {
-            let _ = writeln!(output, "  last exchange {}", relative_time(at, now));
+            let _ = writeln!(output, "  last seen {}", relative_time(at, now));
         } else {
             let _ = writeln!(output, "  no exchange yet");
         }
@@ -6908,12 +7382,19 @@ fn render_replication_peers(
             .graph_compared_at_unix_ms
             .map(|at| relative_time(at, now))
             .unwrap_or_else(|| "never".into());
-        let digests = format!(
-            "this node {}, {} {}",
-            short_digest(local_graph_digest),
-            peer.peer,
-            short_digest(peer.graph_digest.as_deref().unwrap_or("unknown"))
-        );
+        let digests = if peer.projection_digests.is_empty() {
+            format!(
+                "legacy peer digest {}; full projection coverage unavailable",
+                short_digest(peer.graph_digest.as_deref().unwrap_or("unknown"))
+            )
+        } else {
+            format!(
+                "this node {}, {} {}",
+                short_digest(local_graph_digest),
+                peer.peer,
+                short_digest(peer.graph_digest.as_deref().unwrap_or("unknown"))
+            )
+        };
         if let Some(since) = sync.graph_differs_since_unix_ms {
             let _ = writeln!(
                 output,
@@ -7007,6 +7488,9 @@ async fn run_replication(
             );
             println!("authority-digest\t{}", status.authority_digest);
             println!("graph-digest\t{}", status.graph_digest);
+            for (table, digest) in &status.projection_digests {
+                println!("table-digest\t{table}\t{digest}");
+            }
             println!("envelopes\t{}", status.received_envelopes);
             println!(
                 "records\tvalid={} pending={} unknown={} invalid={} repaired={} checkpointed={}",
@@ -7125,16 +7609,21 @@ async fn run_replication(
                     "remote": remote.authority_digest,
                     "equal": remote.authority_digest.as_deref() == Some(status.authority_digest.as_str()),
                 },
+                "differing_tables": remote.differing_tables,
                 "graph": {
                     "local": status.graph_digest,
                     "remote": remote.graph_digest,
-                    "equal": remote.graph_digest.as_deref() == Some(status.graph_digest.as_str()),
+                    "equal": if remote.projection_digests.is_empty() { None } else { Some(remote.graph_digest.as_deref() == Some(status.graph_digest.as_str())) },
+                    "coverage": if remote.projection_digests.is_empty() { "legacy-only" } else { "all-shared-projections" },
                 },
             });
             if json_output {
                 return print_value(&value, true);
             }
             println!("peer\t{}\t{}", peer, remote.status);
+            if !remote.differing_tables.is_empty() {
+                println!("different-tables\t{}", remote.differing_tables.join(", "));
+            }
             println!(
                 "authority\t{}\t{}\t{}",
                 if remote.authority_digest.as_deref() == Some(status.authority_digest.as_str()) {
@@ -7147,7 +7636,9 @@ async fn run_replication(
             );
             println!(
                 "graph\t{}\t{}\t{}",
-                if remote.graph_digest.as_deref() == Some(status.graph_digest.as_str()) {
+                if remote.projection_digests.is_empty() {
+                    "unverified (legacy peer)"
+                } else if remote.graph_digest.as_deref() == Some(status.graph_digest.as_str()) {
                     "equal"
                 } else {
                     "different"
@@ -7803,10 +8294,33 @@ async fn run_agents(
                 &cli_client(endpoint),
                 kdl,
                 format!("st agents start {}", args.identity),
-                args.actor,
+                args.actor.clone(),
             )
             .await?;
-            print_value(&response, json_output)
+            print_value(&response, json_output)?;
+            if !json_output
+                && let Some(subject) = response
+                    .subject_tokens
+                    .keys()
+                    .find(|subject| subject.starts_with("agent/"))
+            {
+                let agent = generated_client(endpoint, None)?
+                    .agents_get(subject)
+                    .await?;
+                if let ClientResource::Agent(agent) = agent.value {
+                    let state = cli_help::agent_state(
+                        &agent.state,
+                        agent.harness_state.as_deref(),
+                        agent.fault.as_deref(),
+                        &agent.reachability,
+                    );
+                    print!(
+                        "{}",
+                        cli_help::agent_next_steps(subject, &args.actor, &state)
+                    );
+                }
+            }
+            Ok(())
         }
         AgentsCommand::Stop(args) => {
             let subject = normalize_member_subject(&args.subject, "agent");
@@ -7873,10 +8387,9 @@ fn agent_start_document(args: &AgentStartArgs) -> Result<String> {
     Ok(publication_document(agent))
 }
 
-/// The Claude settings the fleet's Claude seats run with: st's channel plugin on and the older
-/// st2 channel plugin off.
-const CLAUDE_SEAT_SETTINGS: &str =
-    r#"{"enabledPlugins":{"st2-channel@st2":false,"st3-channel@st2":true}}"#;
+/// The Claude settings the fleet's Claude seats run with: st's own channel plugin on, and the
+/// plugins st2's marketplace shipped off.
+const CLAUDE_SEAT_SETTINGS: &str = r#"{"enabledPlugins":{"st2-channel@st2":false,"st3-channel@st2":false,"st3-channel@st3":true}}"#;
 
 /// The declaration `st agents new` publishes: what a person writes by hand for a fleet seat.
 /// Claude and Codex seats get the harness defaults the fleet's existing seats run with.
@@ -8023,19 +8536,47 @@ async fn run_agent_new(
     }
     publish_text(&client, kdl, source_name, actor.clone()).await?;
     if !json_output {
-        eprintln!("Declared {subject} in {workspace}; waiting for its harness.");
+        eprintln!("Created {subject} in {workspace}; waiting for the agent to start.");
     }
-    let agent = match tokio::time::timeout(
+    let mut latest = None;
+    let waiting = tokio::time::timeout(
         timeout,
-        wait_for_agent_harness(&client, &gateway, &subject, args.attach),
-    )
-    .await
-    {
-        Ok(agent) => agent?,
-        Err(_) => anyhow::bail!(
-            "`{subject}` was declared, but its harness was not ready after {}; see `st agents show {subject}`",
-            args.timeout
+        wait_for_agent_harness(
+            &client,
+            &gateway,
+            &subject,
+            args.attach,
+            json_output,
+            &mut latest,
         ),
+    )
+    .await;
+    let agent = match waiting {
+        Ok(Ok(agent)) => agent,
+        other => {
+            if !json_output {
+                let state = latest.as_ref().map_or_else(
+                    || cli_help::agent_state("starting", None, None, "unknown"),
+                    |agent: &st3_client::Agent| {
+                        cli_help::agent_state(
+                            &agent.state,
+                            agent.harness_state.as_deref(),
+                            agent.fault.as_deref(),
+                            &agent.reachability,
+                        )
+                    },
+                );
+                println!("{}", cli_help::agent_next_steps(&subject, &actor, &state));
+            }
+            return match other {
+                Ok(Err(error)) => Err(error),
+                Err(_) => anyhow::bail!(
+                    "`{subject}` was created, but was not ready after {}; see `st agents show {subject}`",
+                    args.timeout
+                ),
+                Ok(Ok(_)) => unreachable!(),
+            };
+        }
     };
     if json_output {
         print_value(
@@ -8049,7 +8590,13 @@ async fn run_agent_new(
             true,
         )?;
     } else {
-        println!("{subject}");
+        let state = cli_help::agent_state(
+            &agent.state,
+            agent.harness_state.as_deref(),
+            agent.fault.as_deref(),
+            &agent.reachability,
+        );
+        println!("{}", cli_help::agent_next_steps(&subject, &actor, &state));
     }
     if args.attach {
         // The daemon has just answered for the new agent, so there is no registry fallback to name.
@@ -8130,6 +8677,8 @@ async fn wait_for_agent_harness(
     gateway: &GeneratedClient,
     subject: &str,
     attach: bool,
+    json_output: bool,
+    latest: &mut Option<st3_client::Agent>,
 ) -> Result<st3_client::Agent> {
     let health: Value = client.get("/v1/health").await?;
     let mut cursor = health["store_index"]
@@ -8146,12 +8695,13 @@ async fn wait_for_agent_harness(
             Err(error) => return Err(error.into()),
         };
         if let Some(agent) = agent {
-            let harness = agent.harness_state.as_deref().unwrap_or("unobserved");
+            *latest = Some(agent.clone());
+            let harness = agent.harness_state.as_deref().unwrap_or("not ready");
             match agent.state.as_str() {
                 "running" => return Ok(agent),
                 "waiting" if attach && agent.reachability == "reachable" => return Ok(agent),
                 "waiting" if agent.reachability == "reachable" => anyhow::bail!(
-                    "`{subject}` started, but its harness is {harness} and waits on a person; attach with `st terminals attach {subject}`"
+                    "`{subject}` started and is waiting for your input; attach with `st terminals attach {subject}`"
                 ),
                 "failed" => anyhow::bail!(
                     "`{subject}` failed to start: {}",
@@ -8159,8 +8709,13 @@ async fn wait_for_agent_harness(
                 ),
                 _ => {}
             }
-            let progress = format!("{} · harness {harness}", agent.state);
-            if progress != reported {
+            let progress = cli_help::agent_state(
+                &agent.state,
+                agent.harness_state.as_deref(),
+                agent.fault.as_deref(),
+                &agent.reachability,
+            );
+            if !json_output && progress != reported {
                 eprintln!("{subject}: {progress}");
                 reported = progress;
             }
@@ -9057,6 +9612,7 @@ fn render_mission_authority(authority: &st3_client::AgentMissionAuthority) -> St
         ("publish", &authority.publish),
         ("start", &authority.start),
         ("revise", &authority.revise),
+        ("cancel", &authority.cancel),
     ] {
         for pattern in rules {
             match patterns.iter_mut().find(|(known, _)| known == pattern) {
@@ -9631,12 +10187,60 @@ async fn run_work(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        WorkCommand::Ask(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let result: StepRunView = client
+                .post(
+                    "/v1/work/ask",
+                    &PersonAskRequest {
+                        legacy_request: None,
+                        person: args.person,
+                        title: args.title,
+                        reason: args.reason,
+                        actor: args.actor,
+                        step: args.step,
+                        new_run: args.new_run,
+                        incarnation: args.incarnation,
+                        idempotency_key: args.idempotency_key,
+                    },
+                )
+                .await?;
+            print_value(&result, json_output)
+        }
+        command @ (WorkCommand::Done(_) | WorkCommand::CancelAsk(_)) => {
+            let (args, path) = match command {
+                WorkCommand::Done(args) => (args, "/v1/work/done"),
+                WorkCommand::CancelAsk(args) => (args, "/v1/work/cancel-ask"),
+                _ => unreachable!(),
+            };
+            reject_foreign_agent_actor(&args.actor)?;
+            let result: StepRunView = client
+                .post(
+                    path,
+                    &PersonStepResponse {
+                        subject: args.subject,
+                        actor: args.actor,
+                        summary: args.summary,
+                        evidence: args.evidence,
+                        episode: args.episode,
+                        idempotency_key: args.idempotency_key.unwrap_or_else(|| {
+                            format!("person-response:{}", uuid::Uuid::now_v7().simple())
+                        }),
+                    },
+                )
+                .await?;
+            print_value(&result, json_output)
+        }
+
         WorkCommand::Ls {
             watch,
             actor,
             all,
             cursor,
             limit,
+            since,
+            until,
+            status,
         } => {
             if let Some(actor) = actor.as_deref() {
                 reject_foreign_agent_actor(actor)?;
@@ -9645,6 +10249,26 @@ async fn run_work(
                 limit > 0 && limit <= 200,
                 "the work limit must be 1 through 200"
             );
+            if since.is_some()
+                || until.is_some()
+                || status.is_some()
+                || cursor
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with("outcomes:"))
+            {
+                return list_outcomes(
+                    client,
+                    "work",
+                    since,
+                    until,
+                    status,
+                    actor,
+                    cursor,
+                    limit,
+                    json_output,
+                )
+                .await;
+            }
             if watch {
                 return run_collection_watch(
                     endpoint,
@@ -10962,7 +11586,7 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
             .as_deref()
             .context("the Claude channel has no subject")?;
         let (catalog, _agent_dir, identity, _runtime_id) = prepare_native_driver(subject)?;
-        return st2::claude_mcp::run_st3(&catalog, &identity);
+        return st_drivers::claude_mcp::run_st3(&catalog, &identity);
     }
     if matches!(args.driver.as_str(), "pi-channel" | "omp-channel") {
         let identity = args
@@ -11001,7 +11625,12 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
                 ),
             );
         }
-        if let Some(state) = st2::reexec::resume_path(st2::reexec::DRIVER_RESUME_ENV) {
+        // Harness-session state (OpenCode delivery ledgers, Claude resume bindings) stays beneath
+        // st3's driver directory, never st2's; the seat's hooks choose the same root.
+        if let Some(drivers) = std::env::var_os("ST3_DRIVER_STATE_DIR") {
+            st_drivers::run::use_harness_state_root(PathBuf::from(drivers).join("sessions"));
+        }
+        if let Some(state) = st_drivers::reexec::resume_path(st_drivers::reexec::DRIVER_RESUME_ENV) {
             return resume_native_driver(client, subject, &args.driver, argv, &state).await;
         }
         if args.driver == "codex" {
@@ -11083,7 +11712,7 @@ async fn run_st2_native_driver(
         )
     })
     .await?;
-    let harness_state_path = st2::harness_state::harness_state_path(&paths.agent_dir);
+    let harness_state_path = st_drivers::harness_state::harness_state_path(&paths.agent_dir);
     let loop_state = NativeLoopState {
         predecessor_harness_record: fs::read(&harness_state_path).ok(),
         ..NativeLoopState::default()
@@ -11132,7 +11761,7 @@ impl NativePaths {
 
 enum ProviderStart {
     Launch(Vec<String>),
-    Adopt(st2::provider_session::DetachedSession),
+    Adopt(st_drivers::provider_session::DetachedSession),
 }
 
 fn spawn_st2_provider(
@@ -11140,28 +11769,28 @@ fn spawn_st2_provider(
     paths: &NativePaths,
     start: ProviderStart,
 ) -> tokio::task::JoinHandle<Result<()>> {
-    use st2::provider_session::DetachedSession;
+    use st_drivers::provider_session::DetachedSession;
     let paths = paths.clone();
     let driver = driver.to_owned();
     tokio::task::spawn_blocking(move || match start {
         ProviderStart::Launch(argv) => match driver.as_str() {
-            "claude" => st2::claude_session::run_controlled_paths(
+            "claude" => st_drivers::claude_session::run_controlled_paths(
                 &paths.catalog,
                 &paths.agent_dir,
                 paths.identity,
                 paths.runtime_id,
                 argv,
             ),
-            "pi" => st2::pi_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv),
-            "omp" => st2::omp_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv),
+            "pi" => st_drivers::pi_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv),
+            "omp" => st_drivers::omp_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv),
             "opencode" => {
-                st2::opencode_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv)
+                st_drivers::opencode_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv)
             }
             _ => unreachable!("the native driver was checked"),
         },
         ProviderStart::Adopt(session) => match (driver.as_str(), session) {
             ("claude", DetachedSession::Provider { pid, session, seq }) => {
-                st2::claude_session::adopt_controlled_paths(
+                st_drivers::claude_session::adopt_controlled_paths(
                     &paths.agent_dir,
                     &paths.identity,
                     &paths.runtime_id,
@@ -11170,7 +11799,7 @@ fn spawn_st2_provider(
                     seq,
                 )
             }
-            ("pi", DetachedSession::Provider { pid, session, seq }) => st2::pi_session::adopt(
+            ("pi", DetachedSession::Provider { pid, session, seq }) => st_drivers::pi_session::adopt(
                 &paths.catalog,
                 paths.identity,
                 paths.runtime_id,
@@ -11178,7 +11807,7 @@ fn spawn_st2_provider(
                 session,
                 seq,
             ),
-            ("omp", DetachedSession::Provider { pid, session, seq }) => st2::omp_session::adopt(
+            ("omp", DetachedSession::Provider { pid, session, seq }) => st_drivers::omp_session::adopt(
                 &paths.catalog,
                 paths.identity,
                 paths.runtime_id,
@@ -11197,7 +11826,7 @@ fn spawn_st2_provider(
                     version_ok,
                     producer_version,
                 },
-            ) => st2::opencode_session::adopt(
+            ) => st_drivers::opencode_session::adopt(
                 &paths.catalog,
                 paths.identity,
                 paths.runtime_id,
@@ -11236,7 +11865,7 @@ struct DriverResume {
     driver: String,
     subject: String,
     incarnation: String,
-    session: st2::provider_session::DetachedSession,
+    session: st_drivers::provider_session::DetachedSession,
     loop_state: NativeLoopState,
 }
 
@@ -11248,7 +11877,7 @@ async fn resume_native_driver(
     argv: Vec<String>,
     state_path: &Path,
 ) -> Result<()> {
-    let mut resume: DriverResume = st2::reexec::read_state(state_path)?;
+    let mut resume: DriverResume = st_drivers::reexec::read_state(state_path)?;
     anyhow::ensure!(
         resume.subject == subject && resume.driver == driver,
         "the resume state belongs to the {} driver of `{}`, not the {driver} driver of `{subject}`",
@@ -11260,7 +11889,7 @@ async fn resume_native_driver(
         subject,
         &format!(
             "the {driver} driver resumed in {} after its st binary was replaced; the provider kept running",
-            st2::reexec::installed_binary()
+            st_drivers::reexec::installed_binary()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "a replacement binary".into())
         ),
@@ -11293,14 +11922,14 @@ async fn resume_native_driver(
 /// Follows the installed st binary for a native driver. Once a replacement is ready, the driver
 /// asks its provider task to detach and re-executes with the session it released.
 struct DriverReplacement {
-    watch: Option<st2::reexec::ReplacementWatch>,
+    watch: Option<st_drivers::reexec::ReplacementWatch>,
     pending: Option<PathBuf>,
 }
 
 impl DriverReplacement {
     fn new() -> Self {
         Self {
-            watch: st2::reexec::ReplacementWatch::for_current_process(),
+            watch: st_drivers::reexec::ReplacementWatch::for_current_process(),
             pending: None,
         }
     }
@@ -11318,14 +11947,14 @@ impl DriverReplacement {
             return false;
         };
         self.pending = Some(binary);
-        st2::provider_session::DETACH.store(true, std::sync::atomic::Ordering::SeqCst);
+        st_drivers::provider_session::DETACH.store(true, std::sync::atomic::Ordering::SeqCst);
         true
     }
 
     /// Re-execute with a released session. Returns only when that failed; the caller then adopts
     /// the session again in this image and retries the replacement later.
     fn exec(&mut self, subject: &str, state_root: &Path, resume: &DriverResume) -> anyhow::Error {
-        st2::provider_session::DETACH.store(false, std::sync::atomic::Ordering::SeqCst);
+        st_drivers::provider_session::DETACH.store(false, std::sync::atomic::Ordering::SeqCst);
         let Some(binary) = self.pending.take() else {
             return anyhow::anyhow!("no replacement binary was pending");
         };
@@ -11337,14 +11966,14 @@ impl DriverReplacement {
                 resume.driver
             ),
         );
-        let error = match st2::reexec::write_state(state_root, "driver-resume", resume) {
+        let error = match st_drivers::reexec::write_state(state_root, "driver-resume", resume) {
             Ok(path) => {
-                let error = st2::reexec::exec_unless_stopped(
+                let error = st_drivers::reexec::exec_unless_stopped(
                     &binary,
-                    st2::reexec::DRIVER_RESUME_ENV,
+                    st_drivers::reexec::DRIVER_RESUME_ENV,
                     &path,
                     &resume.session.inherited_descriptors(),
-                    &st2::provider_session::stop_requested,
+                    &st_drivers::provider_session::stop_requested,
                 );
                 let _ = fs::remove_file(&path);
                 anyhow::Error::new(error).context(format!("executing {}", binary.display()))
@@ -11365,11 +11994,11 @@ impl DriverReplacement {
 }
 
 /// The detached session a provider task returned, if it returned one.
-fn detached_session(outcome: &Result<()>) -> Option<st2::provider_session::DetachedSession> {
+fn detached_session(outcome: &Result<()>) -> Option<st_drivers::provider_session::DetachedSession> {
     outcome
         .as_ref()
         .err()?
-        .downcast_ref::<st2::provider_session::Detached>()
+        .downcast_ref::<st_drivers::provider_session::Detached>()
         .map(|detached| detached.session.clone())
 }
 
@@ -11379,10 +12008,10 @@ fn native_delivery_report(transport: &str, agent_dir: Option<&Path>) -> String {
     let mut report = json!({
         "transport": transport,
         "pid": std::process::id(),
-        "image": st2::reexec::running_identity().map(|identity| identity.token()),
+        "image": st_drivers::reexec::running_identity().map(|identity| identity.token()),
     });
     if let Some(agent_dir) = agent_dir {
-        let channel = st2::claude_mcp::read_presence(agent_dir);
+        let channel = st_drivers::claude_mcp::read_presence(agent_dir);
         let now = current_unix_ms().unwrap_or_default() as u64;
         report["channel"] = match channel {
             Some(presence) => json!({
@@ -11411,9 +12040,9 @@ async fn drive_st2_native(
         identity,
         runtime_id,
     } = paths.clone();
-    let harness_state_path = st2::harness_state::harness_state_path(&agent_dir);
-    let inbox = st2::message::inbox_dir(&agent_dir);
-    let archive = st2::message::archive_dir(&agent_dir);
+    let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
+    let inbox = st_drivers::message::inbox_dir(&agent_dir);
+    let archive = st_drivers::message::archive_dir(&agent_dir);
     // Mailbox projection reads the durable message history. A one-second poll
     // bounds delivery latency without repeatedly walking it four times a
     // second for every native harness during idle periods.
@@ -11428,6 +12057,7 @@ async fn drive_st2_native(
     let mut last_capacity_fingerprint = None;
     let mut delivery = NativeDeliverySupervisor::resumed(loop_state.delivery_episode);
     let mut replacement = DriverReplacement::new();
+    let mut binding_watch = ClaudeBindingWatch::default();
     loop {
         tokio::select! {
             result = &mut task => {
@@ -11482,11 +12112,42 @@ async fn drive_st2_native(
                     current_record.as_deref(),
                 );
                 let provider_incarnation = if loop_state.harness_record_started {
-                    st2::harness_state::read(&harness_state_path, None)
+                    st_drivers::harness_state::read(&harness_state_path, None)
                         .and_then(|observed| observed.evidence_incarnation)
                 } else {
                     None
                 };
+                if driver == "claude"
+                    && let Some(reason) = binding_watch.overdue(
+                        &agent_dir,
+                        provider_incarnation.as_deref(),
+                        Instant::now(),
+                    )
+                {
+                    let session = provider_incarnation.clone().unwrap_or_default();
+                    let posted: Result<ClaimRecord> = client.post("/v1/claims", &ClaimInput {
+                        subject: subject.into(),
+                        kind: "harness.diagnostic".into(),
+                        actor: Some(subject.into()),
+                        fields: BTreeMap::from([
+                            ("severity".into(), Value::String("error".into())),
+                            ("status".into(), Value::String("failed".into())),
+                            ("code".into(), Value::String(st3::driver_hook::UNBOUND_CODE.into())),
+                            ("reason".into(), Value::String(reason)),
+                            ("incarnation_id".into(), Value::String(incarnation.clone())),
+                        ]),
+                        evidence: Vec::new(),
+                        expected_subject: None,
+                        idempotency_key: Some(format!(
+                            "{}:{subject}:{session}",
+                            st3::driver_hook::UNBOUND_CODE
+                        )),
+                    }).await;
+                    if let Err(error) = posted {
+                        binding_watch.retry();
+                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    }
+                }
                 // Delivery runs first and on its own: a failing observation publish must never
                 // hold back a message.
                 if driver == "claude" {
@@ -11526,21 +12187,21 @@ async fn drive_st2_native(
                 let tick: Result<()> = async {
                     if native_file_may_override_channel(driver)
                         && loop_state.harness_record_started
-                        && let Some(observed) = st2::harness_state::read(&harness_state_path, None)
+                        && let Some(observed) = st_drivers::harness_state::read(&harness_state_path, None)
                     {
                         // A session claim is a startup fence, not an observation. Preserve the
                         // explicit `starting` state until a hook or the initialized ST3 channel
                         // supplies positive evidence; publishing the derived `claimed`
                         // indeterminacy would erase the more precise lifecycle state.
                         let claim_placeholder =
-                            observed.state == st2::harness_state::Activity::Unknown
+                            observed.state == st_drivers::harness_state::Activity::Unknown
                                 && observed.reason.as_deref() == Some("claimed");
                         if !claim_placeholder {
                             if !loop_state.ready
                                 && !matches!(
                                     observed.state,
-                                    st2::harness_state::Activity::Unknown
-                                        | st2::harness_state::Activity::Ended
+                                    st_drivers::harness_state::Activity::Unknown
+                                        | st_drivers::harness_state::Activity::Ended
                                 )
                             {
                                 let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
@@ -11673,6 +12334,61 @@ fn harness_record_belongs_to_current_session(
     already_started || current.is_some_and(|bytes| Some(bytes) != predecessor)
 }
 
+/// How long a Claude wrapper session may run before a missing native-session binding is a fault.
+/// SessionStart fires as Claude starts, so a minute covers a slow start.
+const CLAUDE_BINDING_GRACE: Duration = Duration::from_secs(60);
+
+/// Watches that the current Claude wrapper session gets its native-session binding. The seat's
+/// SessionStart hook writes it; when the hook cannot run at all (its st3 binary is missing, or the
+/// seat's settings name no hooks), only the driver can notice.
+#[derive(Default)]
+struct ClaudeBindingWatch {
+    session: Option<String>,
+    since: Option<Instant>,
+    settled: bool,
+}
+
+impl ClaudeBindingWatch {
+    /// The reason to record once `session` has run past the grace period with no binding. It is
+    /// returned once per wrapper session.
+    fn overdue(&mut self, agent_dir: &Path, session: Option<&str>, now: Instant) -> Option<String> {
+        let session = session?;
+        if self.session.as_deref() != Some(session) {
+            self.session = Some(session.to_owned());
+            self.since = Some(now);
+            self.settled = false;
+        }
+        if self.settled {
+            return None;
+        }
+        if st3::hooks::claude_binding(agent_dir, session).is_some() {
+            self.settled = true;
+            return None;
+        }
+        if now.duration_since(self.since?) < CLAUDE_BINDING_GRACE {
+            return None;
+        }
+        self.settled = true;
+        let variable = |name: &str| {
+            std::env::var(name)
+                .ok()
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "unset".into())
+        };
+        Some(format!(
+            "Claude has run for {} s and its SessionStart hook bound no native session, so st cannot find this seat's transcript. The hooks run \"$ST_HOOKS/claude-observe.sh\" (ST_HOOKS={}), which runs ST3_BIN={}.",
+            CLAUDE_BINDING_GRACE.as_secs(),
+            variable("ST_HOOKS"),
+            variable("ST3_BIN"),
+        ))
+    }
+
+    /// Report again on the next tick, after a report the daemon did not take.
+    fn retry(&mut self) {
+        self.settled = false;
+    }
+}
+
 fn native_file_may_override_channel(driver: &str) -> bool {
     !matches!(driver, "pi" | "omp")
 }
@@ -11700,7 +12416,7 @@ fn prepare_native_driver_in(
         "catalog { pty-root \"/tmp/st3-native\" }\n",
     )?;
     let identity = subject.strip_prefix("agent/").unwrap_or(subject).to_owned();
-    let host = st2::run::detect_host();
+    let host = st_drivers::run::detect_host();
     let leaf = &hex::encode(Sha256::digest(identity.as_bytes()))[..16];
     let agent_dir = catalog.join("agents").join(&host).join(leaf);
     fs::create_dir_all(&agent_dir)?;
@@ -11713,13 +12429,13 @@ fn prepare_native_driver_in(
     Ok((catalog, agent_dir, identity.clone(), identity))
 }
 
-fn harness_activity_state(activity: st2::harness_state::Activity) -> &'static str {
+fn harness_activity_state(activity: st_drivers::harness_state::Activity) -> &'static str {
     match activity {
-        st2::harness_state::Activity::Ready => "ready",
-        st2::harness_state::Activity::Idle => "idle",
-        st2::harness_state::Activity::Active | st2::harness_state::Activity::Child => "working",
-        st2::harness_state::Activity::Ended => "ended",
-        st2::harness_state::Activity::Unknown => "indeterminate",
+        st_drivers::harness_state::Activity::Ready => "ready",
+        st_drivers::harness_state::Activity::Idle => "idle",
+        st_drivers::harness_state::Activity::Active | st_drivers::harness_state::Activity::Child => "working",
+        st_drivers::harness_state::Activity::Ended => "ended",
+        st_drivers::harness_state::Activity::Unknown => "indeterminate",
     }
 }
 
@@ -11729,7 +12445,7 @@ async fn publish_harness_activity(
     driver: &str,
     transport: &str,
     incarnation: Option<&str>,
-    observed: &st2::harness_state::Observed,
+    observed: &st_drivers::harness_state::Observed,
     last_fingerprint: &mut Option<String>,
 ) -> Result<()> {
     let status = harness_activity_state(observed.state);
@@ -11833,7 +12549,7 @@ async fn publish_harness_usage(
     last_fingerprint: &mut Option<String>,
 ) -> Result<()> {
     let Some(observed) =
-        st2::harness_context::read(&st2::harness_context::harness_context_path(agent_dir))
+        st_drivers::harness_context::read(&st_drivers::harness_context::harness_context_path(agent_dir))
     else {
         return Ok(());
     };
@@ -11991,7 +12707,7 @@ async fn publish_harness_timeline(
     published: &mut BTreeSet<String>,
 ) -> Result<()> {
     let Some(record) =
-        st2::harness_timeline::read(&st2::harness_timeline::timeline_path(agent_dir))
+        st_drivers::harness_timeline::read(&st_drivers::harness_timeline::timeline_path(agent_dir))
     else {
         return Ok(());
     };
@@ -12039,7 +12755,7 @@ async fn publish_harness_timeline(
 }
 
 fn timeline_record_is_current(
-    record: &st2::harness_timeline::Record,
+    record: &st_drivers::harness_timeline::Record,
     driver: &str,
     provider_incarnation: Option<&str>,
 ) -> bool {
@@ -12047,7 +12763,7 @@ fn timeline_record_is_current(
 }
 
 fn timeline_claim_fields(
-    operation: st2::harness_timeline::Operation,
+    operation: st_drivers::harness_timeline::Operation,
     runtime_incarnation: &str,
 ) -> BTreeMap<String, Value> {
     let mut fields = BTreeMap::from([
@@ -12127,13 +12843,13 @@ fn pi_family_message_frame(message: &st3::model::MessageView, body: &str, identi
     json!({
         "type": "message",
         "deliverAs": "steer",
-        "content": st2::ding::st3_notification_text(
+        "content": st_drivers::ding::st3_notification_text(
             &message.subject,
             &message.from,
             &message.to,
             message.title.as_deref(),
             body,
-            &st2::ding::st3_body_sha256(body),
+            &st_drivers::ding::st3_body_sha256(body),
         ),
         "meta": {
             "from": message.from,
@@ -12166,10 +12882,10 @@ async fn run_pi_channel(
     use tokio::io::AsyncWriteExt as _;
 
     let identity = subject.strip_prefix("agent/").unwrap_or(subject);
-    let resumed = match st2::reexec::resume_path(st2::reexec::CHANNEL_RESUME_ENV) {
+    let resumed = match st_drivers::reexec::resume_path(st_drivers::reexec::CHANNEL_RESUME_ENV) {
         Some(path) => {
-            let state = st2::reexec::read_state::<PiChannelResume>(&path);
-            st2::reexec::unblock_stop_signals();
+            let state = st_drivers::reexec::read_state::<PiChannelResume>(&path);
+            st_drivers::reexec::unblock_stop_signals();
             Some(state.context("resuming the pi-family channel after a binary replacement")?)
         }
         None => None,
@@ -12210,8 +12926,12 @@ async fn run_pi_channel(
             stdout.flush().await?;
             PiChannelResume {
                 incarnation,
-                session: std::env::var("ST2_PI_CHANNEL_SESSION")
-                    .unwrap_or_else(|_| "unknown".into()),
+                session: st_drivers::contracts::env(if driver == "omp" {
+                    st_drivers::omp_session::CHANNEL_SESSION
+                } else {
+                    st_drivers::pi_session::CHANNEL_SESSION
+                })
+                .unwrap_or_else(|| "unknown".into()),
                 ..PiChannelResume::default()
             }
         }
@@ -12220,11 +12940,11 @@ async fn run_pi_channel(
     let session = state.session.clone();
     let transport = format!("{driver}-channel");
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
-    let spawn_reader = |sender: tokio::sync::mpsc::UnboundedSender<st2::reexec::StdinChunk>| {
-        st2::reexec::StdinReader::spawn(move |chunk| sender.send(chunk).is_ok())
+    let spawn_reader = |sender: tokio::sync::mpsc::UnboundedSender<st_drivers::reexec::StdinChunk>| {
+        st_drivers::reexec::StdinReader::spawn(move |chunk| sender.send(chunk).is_ok())
     };
     let mut reader = Some(spawn_reader(input_tx.clone()));
-    let mut watch = st2::reexec::ReplacementWatch::for_current_process();
+    let mut watch = st_drivers::reexec::ReplacementWatch::for_current_process();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_warning = None;
@@ -12236,14 +12956,14 @@ async fn run_pi_channel(
             chunk = input_rx.recv() => {
                 let mut publish = false;
                 match chunk {
-                    Some(st2::reexec::StdinChunk::Bytes(bytes)) => {
+                    Some(st_drivers::reexec::StdinChunk::Bytes(bytes)) => {
                         state.lines.push(&bytes);
                         while let Some(line) = state.lines.next_line() {
                             publish |= state.accept_frame(&line);
                         }
                     }
                     // The extension ends the pipe when its session ends.
-                    Some(st2::reexec::StdinChunk::Eof) | None => {
+                    Some(st_drivers::reexec::StdinChunk::Eof) | None => {
                         if let Some(line) = state.lines.finish()
                             && state.accept_frame(&line)
                         {
@@ -12254,7 +12974,7 @@ async fn run_pi_channel(
                         }
                         return Ok(());
                     }
-                    Some(st2::reexec::StdinChunk::Failed(error)) => {
+                    Some(st_drivers::reexec::StdinChunk::Failed(error)) => {
                         return Err(error).context("reading the pi-family channel input");
                     }
                 }
@@ -12384,9 +13104,9 @@ async fn run_pi_channel(
                     let mut publish = false;
                     while let Ok(chunk) = input_rx.try_recv() {
                         match chunk {
-                            st2::reexec::StdinChunk::Bytes(bytes) => state.lines.push(&bytes),
-                            st2::reexec::StdinChunk::Eof => return Ok(()),
-                            st2::reexec::StdinChunk::Failed(error) => {
+                            st_drivers::reexec::StdinChunk::Bytes(bytes) => state.lines.push(&bytes),
+                            st_drivers::reexec::StdinChunk::Eof => return Ok(()),
+                            st_drivers::reexec::StdinChunk::Failed(error) => {
                                 return Err(error).context("reading the pi-family channel input");
                             }
                         }
@@ -12409,11 +13129,11 @@ async fn run_pi_channel(
                             binary.display()
                         ),
                     );
-                    let failure = match st2::reexec::write_state(state_root, "channel-resume", &state) {
+                    let failure = match st_drivers::reexec::write_state(state_root, "channel-resume", &state) {
                         Ok(path) => {
-                            let error = st2::reexec::exec(
+                            let error = st_drivers::reexec::exec(
                                 &binary,
-                                st2::reexec::CHANNEL_RESUME_ENV,
+                                st_drivers::reexec::CHANNEL_RESUME_ENV,
                                 &path,
                                 &[],
                             );
@@ -12461,7 +13181,7 @@ struct PiChannelResume {
     // Reports the daemon has not accepted yet. A restart must not end the channel or lose the
     // harness's latest state, so each waits here and is sent again on the next tick.
     pending: PiFamilyReports,
-    lines: st2::reexec::LineBuffer,
+    lines: st_drivers::reexec::LineBuffer,
 }
 
 impl PiChannelResume {
@@ -12705,7 +13425,7 @@ fn spawn_codex_provider(
     let state_dir = state_dir.to_path_buf();
     let argv = argv.to_vec();
     tokio::task::spawn_blocking(move || match start {
-        ProviderStart::Launch(_) => st2::codex_app_server::run_controlled_paths(
+        ProviderStart::Launch(_) => st_drivers::codex_app_server::run_controlled_paths(
             &paths.catalog,
             &state_dir,
             &paths.agent_dir,
@@ -12713,14 +13433,14 @@ fn spawn_codex_provider(
             paths.runtime_id,
             argv,
         ),
-        ProviderStart::Adopt(st2::provider_session::DetachedSession::Codex {
+        ProviderStart::Adopt(st_drivers::provider_session::DetachedSession::Codex {
             tui_pid,
             server_pid,
             watchdog_pid,
             owner_write_fd,
             socket_path,
             safe_fallback,
-        }) => st2::codex_app_server::adopt_controlled_paths(
+        }) => st_drivers::codex_app_server::adopt_controlled_paths(
             &paths.catalog,
             &state_dir,
             &paths.agent_dir,
@@ -12758,8 +13478,8 @@ async fn drive_codex_native(
     let root = paths.state_root();
     let state_dir = root.join("state");
     let prior_binding = std::fs::read(state_dir.join("binding.json")).ok();
-    let inbox = st2::message::inbox_dir(&agent_dir);
-    let archive = st2::message::archive_dir(&agent_dir);
+    let inbox = st_drivers::message::inbox_dir(&agent_dir);
+    let archive = st_drivers::message::archive_dir(&agent_dir);
     let mut task = spawn_codex_provider(&paths, &state_dir, &argv, start);
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -12850,8 +13570,8 @@ async fn drive_codex_native(
                         }).await?;
                         loop_state.ready = true;
                     }
-                    if let Some(observed) = st2::harness_state::read(
-                        &st2::harness_state::harness_state_path(&agent_dir),
+                    if let Some(observed) = st_drivers::harness_state::read(
+                        &st_drivers::harness_state::harness_state_path(&agent_dir),
                         None,
                     ) {
                         publish_harness_activity(
@@ -13558,7 +14278,7 @@ async fn forward_projected_messages_reporting(
             state_dir,
             identity,
             runtime_id,
-        } => st2::codex_app_server::consumed_delivery_filenames(state_dir, identity, runtime_id),
+        } => st_drivers::codex_app_server::consumed_delivery_filenames(state_dir, identity, runtime_id),
         NativeDeliveryReceipts::ClaudeChannel {
             agent_dir,
             incarnation,
@@ -13567,7 +14287,7 @@ async fn forward_projected_messages_reporting(
             catalog_root,
             identity,
             runtime_id,
-        } => st2::opencode_session::consumed_delivery_filenames(catalog_root, identity, runtime_id),
+        } => st_drivers::opencode_session::consumed_delivery_filenames(catalog_root, identity, runtime_id),
     }?;
     let mut cursor = None;
     let mut failures = Vec::new();
@@ -13615,13 +14335,13 @@ async fn forward_projected_messages_reporting(
                     };
                     let mut tags = message.tags.clone();
                     tags.push(format!("{TAG_PREFIX}{}", message.subject));
-                    tags.push(format!("{}{}", st2::ding::ST3_TO_TAG, message.to));
+                    tags.push(format!("{}{}", st_drivers::ding::ST3_TO_TAG, message.to));
                     tags.push(format!(
                         "{}{}",
-                        st2::ding::ST3_SHA256_TAG,
-                        st2::ding::st3_body_sha256(&content)
+                        st_drivers::ding::ST3_SHA256_TAG,
+                        st_drivers::ding::st3_body_sha256(&content)
                     ));
-                    let filename = st2::message::send_to_inbox(
+                    let filename = st_drivers::message::send_to_inbox(
                         inbox,
                         &message.from,
                         message.title.as_deref(),
@@ -13671,7 +14391,7 @@ async fn forward_projected_messages_reporting(
     // A message can close between polls. The active page intentionally excludes
     // history, so inspect only projected files still in the native inbox before
     // deciding whether to archive them. A failed lookup keeps the file in place.
-    for file in st2::message::list_dir(inbox)? {
+    for file in st_drivers::message::list_dir(inbox)? {
         for reference in file
             .tags
             .iter()
@@ -13718,7 +14438,7 @@ fn claude_channel_consumed_delivery_filenames(
 ) -> Result<BTreeSet<String>> {
     const PREFIX: &str = "[st3-delivery:";
     let Some(record) =
-        st2::harness_timeline::read(&st2::harness_timeline::timeline_path(agent_dir))
+        st_drivers::harness_timeline::read(&st_drivers::harness_timeline::timeline_path(agent_dir))
     else {
         return Ok(BTreeSet::new());
     };
@@ -13732,7 +14452,7 @@ fn claude_channel_consumed_delivery_filenames(
         .filter_map(|operation| operation.body.get("text").and_then(Value::as_str))
         .flat_map(|text| text.split(PREFIX).skip(1))
         .filter_map(|tail| tail.split_once(']').map(|(filename, _)| filename))
-        .filter(|filename| st2::message::is_message_filename(filename))
+        .filter(|filename| st_drivers::message::is_message_filename(filename))
         .map(str::to_owned)
         .collect())
 }
@@ -13760,14 +14480,14 @@ fn sync_consumed_projected_messages(
     consumed_by_recipient: &BTreeSet<String>,
 ) -> Result<()> {
     const TAG_PREFIX: &str = "st3-message:";
-    for message in st2::message::list_dir(inbox)? {
+    for message in st_drivers::message::list_dir(inbox)? {
         let is_consumed = message
             .tags
             .iter()
             .filter_map(|tag| tag.strip_prefix(TAG_PREFIX))
             .any(|subject| consumed_by_recipient.contains(subject));
         if is_consumed {
-            st2::message::archive_msg(inbox, archive, &message.filename)?;
+            st_drivers::message::archive_msg(inbox, archive, &message.filename)?;
         }
     }
     Ok(())
@@ -13782,9 +14502,9 @@ fn projected_message_subjects(inbox: &Path, archive: &Path) -> Result<BTreeSet<S
 
 fn projected_message_files(inbox: &Path, archive: &Path) -> Result<BTreeMap<String, String>> {
     const TAG_PREFIX: &str = "st3-message:";
-    Ok(st2::message::list_dir(inbox)?
+    Ok(st_drivers::message::list_dir(inbox)?
         .into_iter()
-        .chain(st2::message::list_dir(archive)?)
+        .chain(st_drivers::message::list_dir(archive)?)
         .flat_map(|message| {
             message.tags.into_iter().filter_map(move |tag| {
                 tag.strip_prefix(TAG_PREFIX)
@@ -14023,14 +14743,43 @@ fn unique_pairs(values: Vec<(String, String)>, kind: &str) -> Result<BTreeMap<St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_claude_session_without_a_binding_is_reported_once_after_the_grace() {
+        let dir = tempfile::tempdir().unwrap();
+        let start = Instant::now();
+        let mut watch = ClaudeBindingWatch::default();
+        assert_eq!(watch.overdue(dir.path(), None, start), None);
+        assert_eq!(watch.overdue(dir.path(), Some("wrapper-1"), start), None);
+        let late = start + CLAUDE_BINDING_GRACE;
+        let reason = watch.overdue(dir.path(), Some("wrapper-1"), late).unwrap();
+        assert!(reason.contains("bound no native session"), "{reason}");
+        assert_eq!(watch.overdue(dir.path(), Some("wrapper-1"), late), None);
+        watch.retry();
+        assert!(watch.overdue(dir.path(), Some("wrapper-1"), late).is_some());
+        // A new wrapper session gets its own grace, and a bound one is never reported.
+        assert_eq!(watch.overdue(dir.path(), Some("wrapper-2"), late), None);
+        fs::write(
+            dir.path().join(st3::hooks::CLAUDE_BINDING_FILE),
+            r#"{"incarnation":"wrapper-2","native_session_id":"native-2"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            watch.overdue(dir.path(), Some("wrapper-2"), late + CLAUDE_BINDING_GRACE),
+            None
+        );
+    }
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     fn peer_status(peer: &str, digest: Option<&str>) -> st3::model::ReplicationPeerStatus {
         st3::model::ReplicationPeerStatus {
+            projection_digests: Default::default(),
+            differing_tables: Vec::new(),
             peer: peer.into(),
             status: "up".into(),
             last_success_at_unix_ms: None,
             last_error: None,
+            refusal_reason: None,
             schema_digest: None,
             authority_digest: digest.map(str::to_owned),
             graph_digest: None,
@@ -14146,7 +14895,7 @@ mod tests {
                 "<smalltalk-message id=\"0123456789abcdef\" from=\"agent/run-1/wake.claude\" \
                  to=\"agent/run-1/wake.omp-2\" subject=\"Cross-harness consensus: idle\" \
                  sha256=\"{}\" graph=\"message/0123456789abcdef\">\nFACT QUARTZ\n</smalltalk-message>",
-                st2::ding::st3_body_sha256("FACT QUARTZ")
+                st_drivers::ding::st3_body_sha256("FACT QUARTZ")
             )
         );
         assert_eq!(omp["meta"]["messageId"], "message/0123456789abcdef");
@@ -14333,7 +15082,7 @@ mod tests {
             driver: "claude".into(),
             subject: "agent/example/worker".into(),
             incarnation: "1:one".into(),
-            session: st2::provider_session::DetachedSession::Provider {
+            session: st_drivers::provider_session::DetachedSession::Provider {
                 pid: 42,
                 session: "token".into(),
                 seq: 3,
@@ -14394,7 +15143,7 @@ mod tests {
     fn agent_card_shows_mission_authority_and_its_source() {
         let card = |authority: serde_json::Value| {
             let agent: st3_client::Agent = serde_json::from_value(serde_json::json!({
-                "kind": "agent", "id": "agent/fleet/website/standing/website", "revision": "one",
+                "kind": "agent", "id": "agent/example/website/standing/website", "revision": "one",
                 "updated_at": "2026-09-29T12:00:00Z", "name": "Website",
                 "state": "running", "reachability": "local", "runtime_ids": [],
                 "mission_authority": authority
@@ -14413,10 +15162,10 @@ mod tests {
         assert!(
             card(serde_json::json!({
                 "source": "declared",
-                "publish": ["fleet/website/docs/*"], "start": ["fleet/website/docs/*", "fleet/website/deploy"]
+                "publish": ["fleet/website/docs/*"], "start": ["fleet/website/docs/*", "fleet/website/deploy"], "cancel": ["fleet/website/deploy"]
             }))
             .contains(
-                "AUTHORITY    publish, start mission/fleet/website/docs/*; start mission/fleet/website/deploy (declared)"
+                "AUTHORITY    publish, start mission/fleet/website/docs/*; start, cancel mission/fleet/website/deploy (declared)"
             )
         );
         assert!(
@@ -14513,7 +15262,7 @@ mod tests {
     #[test]
     fn agent_queue_view_lists_the_claim_then_runs_in_order_and_moves() {
         let queue: st3_client::AgentQueue = serde_json::from_value(serde_json::json!({
-            "kind": "agent-queue", "agent_id": "agent/fleet/worker",
+            "kind": "agent-queue", "agent_id": "agent/example/worker",
             "current_work_ids": ["step-run/held/build"],
             "next_work_id": "step-run/second/review",
             "runs": [
@@ -14548,7 +15297,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             render_agent_queue(&queue),
-            "AGENT QUEUE  agent/fleet/worker\n\
+            "AGENT QUEUE  agent/example/worker\n\
              CURRENT      step-run/held/build\n\
              NEXT WORK    step-run/second/review\n\
              RUNS         3\n  \
@@ -15081,16 +15830,40 @@ mod tests {
     }
 
     #[test]
+    fn replication_status_names_shared_table_differences() {
+        let mut peer = peer_status("alder", None);
+        peer.projection_digests
+            .insert("planning_sessions".into(), "different".into());
+        peer.differing_tables = vec!["documents".into(), "planning_sessions".into()];
+        let rendered = render_replication_peers(&[peer], "local", 0);
+        assert!(rendered.contains("shared tables differ: documents, planning_sessions"));
+    }
+
+    #[test]
+    fn replication_status_renders_the_fabric_grant_reason() {
+        let mut peer = peer_status("cobalt", None);
+        peer.status = "refused".into();
+        peer.refusal_reason =
+            Some("refused by that member's Fabric grants (service st3-peer-v1)".into());
+        let output = render_replication_peers(&[peer], "local", 2000);
+        assert!(output.contains("peer\tcobalt\trefused\trefused by that member's Fabric grants"));
+        assert!(!output.contains("down"));
+    }
+
+    #[test]
     fn replication_status_says_which_side_holds_what_and_how_long_catching_up_takes() {
         let now = 1_000_000;
         let local = "1111111111111111aaaa";
         let peer =
             |name: &str, graph: Option<&str>, sync: Option<st3::model::ReplicationPeerSync>| {
                 ReplicationPeerStatus {
+                    projection_digests: BTreeMap::from([("claim_sources".into(), "sample".into())]),
+                    differing_tables: Vec::new(),
                     peer: name.into(),
                     status: "up".into(),
                     last_success_at_unix_ms: Some(now - 2_000),
                     last_error: None,
+                    refusal_reason: None,
                     schema_digest: None,
                     authority_digest: None,
                     graph_digest: graph.map(str::to_owned),
@@ -15109,7 +15882,7 @@ mod tests {
         let output = render_replication_peers(
             &[
                 peer(
-                    "Silber",
+                    "ExampleMac",
                     Some("3333333333333333"),
                     Some(st3::model::ReplicationPeerSync {
                         peer_only_envelopes: 124_384,
@@ -15147,32 +15920,32 @@ mod tests {
             output,
             "sync\tdiverged: Laptop holds the same envelopes but projects a different graph, \
              since 3m ago\n\
-             sync\tcatching up: Silber has 124,384 envelopes this node lacks, \
+             sync\tcatching up: ExampleMac has 124,384 envelopes this node lacks, \
              caught up in about 15m\n\
-             peer\tSilber\tup\t\n\
-             \x20 last exchange 2s ago\n\
-             \x20 Silber has 124,384 envelopes this node lacks\n\
-             \x20 this node has 3 envelopes Silber lacks\n\
+             peer\tExampleMac\tup\t\n\
+             \x20 last seen 2s ago\n\
+             \x20 ExampleMac has 124,384 envelopes this node lacks\n\
+             \x20 this node has 3 envelopes ExampleMac lacks\n\
              \x20 receiving 142.5 envelopes/s, caught up in about 15m (measured 2s ago)\n\
              peer\tQuiet\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 in sync: the same envelopes and the same graph (measured now)\n\
              peer\tMoved\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 same envelopes (measured now), but the graphs differ (this node \
              111111111111, Moved 444444444444); the next exchange compares them\n\
              peer\tSettling\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 graphs differ: the same envelopes project different graphs since 10s ago \
              (compared now; this node 111111111111, Settling 555555555555)\n\
              \x20 diverged if this lasts a minute; a peer still projecting settles by itself\n\
              peer\tLaptop\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 diverged: the same envelopes project different graphs since 3m ago \
              (compared 1s ago; this node 111111111111, Laptop 222222222222)\n\
              \x20 exchanges cannot fix this; the nodes heal by comparing the claims each projects, and views on one node are wrong until then\n\
              peer\tFresh\tup\t\n\
-             \x20 last exchange 2s ago\n\
+             \x20 last seen 2s ago\n\
              \x20 difference not measured yet\n"
         );
     }
@@ -15183,7 +15956,7 @@ mod tests {
         page.sync = Some(st3_client::SyncNotice {
             state: "catching-up".into(),
             peers: vec![st3_client::SyncPeer {
-                host_id: "host/Silber".into(),
+                host_id: "host/ExampleMac".into(),
                 peer_only_envelopes: 1,
                 local_only_envelopes: 0,
                 last_exchange_at: Some("1970-01-01T00:16:38Z".into()),
@@ -15191,10 +15964,10 @@ mod tests {
                 diverged_since: None,
             }],
         });
-        let output = render_now_page(&page, "st3 now --as person/nathan");
+        let output = render_now_page(&page, "st3 now --as person/alex");
         assert!(
             output.starts_with(
-                "SYNCING  Silber has 1 envelope this host lacks · estimating time to catch up · \
+                "SYNCING  ExampleMac has 1 envelope this host lacks · estimating time to catch up · \
                  last exchange "
             ),
             "{output}"
@@ -15205,7 +15978,7 @@ mod tests {
         );
         assert_eq!(
             render_sync_notice(page.sync.as_ref().unwrap(), 1_000_000),
-            "SYNCING  Silber has 1 envelope this host lacks · estimating time to catch up · \
+            "SYNCING  ExampleMac has 1 envelope this host lacks · estimating time to catch up · \
              last exchange 2s ago\n  Until then, items below can be out of date. \
              Progress: st3 replication status\n\n"
         );
@@ -15221,7 +15994,7 @@ mod tests {
         sync.peers[0].diverged_since = Some("1970-01-01T00:13:40Z".into());
         assert_eq!(
             render_sync_notice(page.sync.as_ref().unwrap(), 1_000_000),
-            "DIVERGED  Silber projects a different graph from the same envelopes · since 3m ago\n\
+            "DIVERGED  ExampleMac projects a different graph from the same envelopes · since 3m ago\n\
              \x20 Exchanges cannot fix this, so items below can be wrong. \
              Details: st3 replication status\n\n"
         );
@@ -15306,7 +16079,7 @@ mod tests {
         });
         let rendered = render_product_page("NOW", &page, "st now");
         assert!(
-            rendered.contains("  requester retired: only person/nathan can close it\n"),
+            rendered.contains("  requester retired: only person/alex can close it\n"),
             "{rendered}"
         );
     }
@@ -15334,7 +16107,7 @@ mod tests {
             concat!(
                 "NOW  3\n",
                 "attention/release-review  attention  high  open  Review release\n",
-                "  action: st attention show launch/release --as person/nathan\n",
+                "  action: st attention show launch/release --as person/alex\n",
                 "work/release/1/build  work  claimed  build  attempt 1\n",
                 "  assigned: agent/release\n",
                 "  action: st work show work/release/1/build\n",
@@ -15348,7 +16121,7 @@ mod tests {
     fn now_page_without_work_does_not_claim_zero_working() {
         let attention_only = render_now_page(
             &fixture_product_page(&["attention"], false),
-            "st now --as person/nathan",
+            "st now --as person/alex",
         );
         assert!(
             attention_only.starts_with("NEEDS YOU  1\n"),
@@ -15363,7 +16136,7 @@ mod tests {
 
         let with_work = render_now_page(
             &fixture_product_page(&["attention", "work"], false),
-            "st now --as person/nathan --owner-run mission-run/release/1",
+            "st now --as person/alex --owner-run mission-run/release/1",
         );
         assert!(with_work.contains("\nWORKING  1\n"), "{with_work}");
         assert!(!with_work.contains("UNHEALTHY"), "{with_work}");
@@ -15425,20 +16198,20 @@ mod tests {
     #[test]
     fn an_empty_mailbox_prints_a_heading_and_no_current_items() {
         assert_eq!(
-            render_mailbox("person/nathan", None, false, &[]),
-            "MESSAGES  0\nFILTERS  mailbox=person/nathan\nNo current items.\n"
+            render_mailbox("person/alex", None, false, &[]),
+            "MESSAGES  0\nFILTERS  mailbox=person/alex\nNo current items.\n"
         );
         assert_eq!(
             render_mailbox(
                 "agent/worker",
-                Some("person/nathan"),
+                Some("person/alex"),
                 true,
-                &["message/one\tread\tperson/nathan\tHello".into()]
+                &["message/one\tread\tperson/alex\tHello".into()]
             ),
             concat!(
                 "MESSAGES  1\n",
-                "FILTERS  mailbox=agent/worker · from=person/nathan · archived=included\n",
-                "message/one\tread\tperson/nathan\tHello\n",
+                "FILTERS  mailbox=agent/worker · from=person/alex · archived=included\n",
+                "message/one\tread\tperson/alex\tHello\n",
             )
         );
     }
@@ -15505,7 +16278,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_request_help_says_which_targets_end_an_item() {
+    fn legacy_attention_help_directs_callers_to_person_work() {
         let mut command = Cli::command();
         let help = command
             .find_subcommand_mut("attention")
@@ -15514,20 +16287,8 @@ mod tests {
             .unwrap()
             .render_long_help()
             .to_string();
-        for expected in [
-            "st attention withdraw",
-            "`step-run/` or `run-generation/` target is no longer current",
-            "a `mission/` retired or\n  cancelled",
-            "pull request target is merged or closed",
-            "a `loop-run/` running again",
-            "Other `resource/` targets and `doc/` targets are context",
-            "had already ended when you made the request, keeps it open",
-            "when the step you have claimed ends",
-            "st refuses a request that nothing could close",
-            "--person-closes",
-        ] {
-            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
-        }
+        assert!(help.contains("attention-migrated"), "{help}");
+        assert!(help.contains("work ask"), "{help}");
     }
 
     #[test]
@@ -15553,11 +16314,11 @@ mod tests {
         );
         assert_eq!(
             contract["purposes"]["attention"]["human_example"],
-            "st attention ls --as person/nathan"
+            "st attention ls --as person/alex"
         );
         assert_eq!(
             contract["purposes"]["attention"]["json_example"],
-            "st attention ls --as person/nathan --json"
+            "st attention ls --as person/alex --json"
         );
     }
 
@@ -15584,12 +16345,12 @@ mod tests {
             render_product_page(
                 "DEVICES",
                 &fixture_product_page(&["device"], false),
-                "st devices --as person/nathan"
+                "st devices --as person/alex"
             ),
             concat!(
                 "DEVICES  1\n",
-                "device/ios-release  active  person/nathan/session/ios-release  scopes 4\n",
-                "  action: st devices --as person/nathan revoke device/ios-release\n",
+                "device/ios-release  active  person/alex/session/ios-release  scopes 4\n",
+                "  action: st devices --as person/alex revoke device/ios-release\n",
             )
         );
     }
@@ -15630,7 +16391,7 @@ mod tests {
             "st3",
             "terminals",
             "attach",
-            "agent/fleet/app-web/standing/app-web",
+            "agent/example/app-web/standing/app-web",
         ])
         .unwrap();
         let Command::Terminals {
@@ -15639,7 +16400,7 @@ mod tests {
         else {
             panic!("the PTY attach command did not parse");
         };
-        assert_eq!(args.subject, "agent/fleet/app-web/standing/app-web");
+        assert_eq!(args.subject, "agent/example/app-web/standing/app-web");
         assert!(!args.force);
     }
 
@@ -15662,9 +16423,9 @@ mod tests {
             "--json",
             "terminals",
             "screen",
-            "terminal/agent/fleet/app-web/standing/app-web",
+            "terminal/agent/example/app-web/standing/app-web",
             "--as",
-            "person/nathan",
+            "person/alex",
         ])
         .unwrap();
         assert!(cli.json);
@@ -15676,9 +16437,9 @@ mod tests {
         };
         assert_eq!(
             args.subject,
-            "terminal/agent/fleet/app-web/standing/app-web"
+            "terminal/agent/example/app-web/standing/app-web"
         );
-        assert_eq!(args.person.as_deref(), Some("person/nathan"));
+        assert_eq!(args.person.as_deref(), Some("person/alex"));
     }
 
     #[test]
@@ -15699,7 +16460,7 @@ mod tests {
             "st3",
             "terminals",
             "attach-info",
-            "terminal/agent/fleet/app-web/standing/app-web",
+            "terminal/agent/example/app-web/standing/app-web",
         ])
         .unwrap();
         assert!(matches!(
@@ -15713,7 +16474,7 @@ mod tests {
             "st3",
             "terminals",
             "stream",
-            "terminal/agent/fleet/app-web/standing/app-web",
+            "terminal/agent/example/app-web/standing/app-web",
             "--capability",
             "test-capability",
             "--incarnation",
@@ -15735,7 +16496,7 @@ mod tests {
             "st3",
             "terminals",
             "input-client",
-            "terminal/agent/fleet/app-web/standing/app-web",
+            "terminal/agent/example/app-web/standing/app-web",
             "hello",
             "--key",
         ])
@@ -15807,7 +16568,7 @@ mod tests {
             "st3",
             "terminals",
             "attach",
-            "agent/fleet/app-web/standing/app-web",
+            "agent/example/app-web/standing/app-web",
             "--force",
         ])
         .unwrap();
@@ -15965,7 +16726,7 @@ mod tests {
             "publish",
             "missions/typecase.kdl",
             "--as",
-            "agent/fleet/cos/standing/cos",
+            "agent/example/cos/standing/cos",
         ])
         .unwrap();
         let Command::Missions {
@@ -15975,7 +16736,7 @@ mod tests {
             panic!("the mission publish command did not parse");
         };
         assert_eq!(args.file, PathBuf::from("missions/typecase.kdl"));
-        assert_eq!(args.actor, "agent/fleet/cos/standing/cos");
+        assert_eq!(args.actor, "agent/example/cos/standing/cos");
         assert!(
             Cli::try_parse_from([
                 "st3",
@@ -15991,6 +16752,34 @@ mod tests {
 
     #[test]
     fn mission_cancel_requires_an_exact_actor_and_reason() {
+        for actor in ["agent/example/operator", "person/alex"] {
+            assert!(
+                Cli::try_parse_from([
+                    "st3",
+                    "missions",
+                    "cancel",
+                    "mission-run/example/one",
+                    "--reason",
+                    "superseded",
+                    "--as",
+                    actor
+                ])
+                .is_ok()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "missions",
+                "cancel",
+                "mission-run/example/one",
+                "--reason",
+                "superseded",
+                "--as",
+                "operator"
+            ])
+            .is_err()
+        );
         let cli = Cli::try_parse_from([
             "st3",
             "missions",
@@ -15999,7 +16788,7 @@ mod tests {
             "--reason",
             "the run was superseded",
             "--as",
-            "person/nathan",
+            "person/alex",
         ])
         .unwrap();
         let Command::Missions {
@@ -16010,7 +16799,7 @@ mod tests {
         };
         assert_eq!(args.mission_run, "mission-run/release/demo");
         assert_eq!(args.reason, "the run was superseded");
-        assert_eq!(args.actor, "person/nathan");
+        assert_eq!(args.actor, "person/alex");
     }
 
     #[test]
@@ -16118,7 +16907,7 @@ mod tests {
     #[test]
     fn an_ended_harness_uses_the_registered_state() {
         assert_eq!(
-            harness_activity_state(st2::harness_state::Activity::Ended),
+            harness_activity_state(st_drivers::harness_state::Activity::Ended),
             "ended"
         );
         st3_schema::registry()
@@ -16159,12 +16948,12 @@ mod tests {
     #[test]
     fn claude_delivery_requires_the_exact_incarnations_prompt_submit_receipt() {
         let root = tempfile::tempdir().unwrap();
-        let mut writer = st2::harness_timeline::Writer::new(root.path(), "claude", "inc-2");
+        let mut writer = st_drivers::harness_timeline::Writer::new(root.path(), "claude", "inc-2");
         writer
             .append(
                 "prompt-1",
-                st2::harness_timeline::Role::User,
-                st2::harness_timeline::EntryType::Content,
+                st_drivers::harness_timeline::Role::User,
+                st_drivers::harness_timeline::EntryType::Content,
                 serde_json::json!({
                     "text": "[st3-delivery:1784649988123-abc23z.md]\nhello"
                 }),
@@ -16199,12 +16988,12 @@ mod tests {
     fn claude_receipts_use_provider_session_not_runtime_incarnation() {
         let root = tempfile::tempdir().unwrap();
         let mut writer =
-            st2::harness_timeline::Writer::new(root.path(), "claude", "provider-current");
+            st_drivers::harness_timeline::Writer::new(root.path(), "claude", "provider-current");
         writer
             .append(
                 "prompt-1",
-                st2::harness_timeline::Role::User,
-                st2::harness_timeline::EntryType::Content,
+                st_drivers::harness_timeline::Role::User,
+                st_drivers::harness_timeline::EntryType::Content,
                 serde_json::json!({"text": "[st3-delivery:1784649988123-abc23z.md] hello"}),
                 true,
             )
@@ -16504,13 +17293,13 @@ mod tests {
             "st3",
             "agents",
             "start",
-            "fleet/cos/standing/cos",
+            "example/cos/standing/cos",
             "--harness",
             "claude",
             "--model",
             "opus",
             "--as",
-            "person/nathan",
+            "person/alex",
             "--print-kdl",
         ])
         .unwrap();
@@ -16522,9 +17311,9 @@ mod tests {
         };
         let kdl = agent_start_document(&args).unwrap();
         let intent = st3::parse_intent(&kdl, "node").unwrap();
-        assert!(intent.subjects.contains_key("agent/fleet/cos/standing/cos"));
+        assert!(intent.subjects.contains_key("agent/example/cos/standing/cos"));
         assert!(
-            intent.subjects["agent/fleet/cos/standing/cos"]
+            intent.subjects["agent/example/cos/standing/cos"]
                 .owner_run
                 .is_none()
         );
@@ -16533,9 +17322,9 @@ mod tests {
             "st3",
             "agents",
             "stop",
-            "fleet/cos/standing/cos",
+            "example/cos/standing/cos",
             "--as",
-            "person/nathan",
+            "person/alex",
             "--print-kdl",
         ])
         .unwrap();
@@ -16578,14 +17367,14 @@ mod tests {
             "--attach",
         ]);
         assert!(args.attach && args.actor.is_none() && args.workspace.is_none());
-        let kdl = agent_new_document(&args, "/home/avery/st/agents/site", true);
-        assert!(kdl.contains(r#"workspace "/home/avery/st/agents/site" create=#true"#));
+        let kdl = agent_new_document(&args, "/home/example/st/agents/site", true);
+        assert!(kdl.contains(r#"workspace "/home/example/st/agents/site" create=#true"#));
         let intent = st3::parse_intent(&kdl, "laptop").unwrap();
         let seat = &intent.subjects["agent/builder.site"];
         assert!(seat.owner_run.is_none());
         let member = seat.member.as_ref().unwrap();
         assert_eq!(member.host, "builder");
-        assert_eq!(member.workspace, "/home/avery/st/agents/site");
+        assert_eq!(member.workspace, "/home/example/st/agents/site");
         assert!(member.workspace_create);
         assert_eq!(member.driver.as_deref(), Some("claude"));
         assert_eq!(member.restart, st3::model::RestartType::Always);
@@ -16622,7 +17411,7 @@ mod tests {
     #[test]
     fn a_new_codex_agent_is_the_fleet_codex_seat() {
         let args = agent_new_args(&[
-            "fleet/example/codex",
+            "example/codex",
             "--harness",
             "codex",
             "--model",
@@ -16640,7 +17429,7 @@ mod tests {
         assert!(!kdl.contains("create="));
         assert!(!kdl.contains("host "));
         let intent = st3::parse_intent(&kdl, "laptop").unwrap();
-        let member = intent.subjects["agent/fleet/example/codex"]
+        let member = intent.subjects["agent/example/codex"]
             .member
             .as_ref()
             .unwrap();
@@ -16742,9 +17531,9 @@ mod tests {
         }
 
         for argv in [
-            vec!["st3", "attention", "ls", "--as", "nathan"],
-            vec!["st3", "devices", "--as", "nathan"],
-            vec!["st3", "import", "run", "session/demo", "--as", "nathan"],
+            vec!["st3", "attention", "ls", "--as", "alex"],
+            vec!["st3", "devices", "--as", "alex"],
+            vec!["st3", "import", "run", "session/demo", "--as", "alex"],
         ] {
             assert!(
                 Cli::try_parse_from(&argv).is_err(),
@@ -16756,7 +17545,7 @@ mod tests {
     #[test]
     fn full_control_device_pairing_is_an_explicit_cli_choice() {
         let limited =
-            Cli::try_parse_from(["st3", "devices", "--as", "person/nathan", "pair", "iPhone"])
+            Cli::try_parse_from(["st3", "devices", "--as", "person/alex", "pair", "iPhone"])
                 .unwrap();
         let Command::Devices(DevicesArgs {
             command: Some(DevicesCommand::Pair { full_control, .. }),
@@ -16771,7 +17560,7 @@ mod tests {
             "st3",
             "devices",
             "--as",
-            "person/nathan",
+            "person/alex",
             "pair",
             "--full-control",
             "iPhone",
@@ -16934,14 +17723,14 @@ mission "review" state="ready" {
     #[test]
     fn review_commands_parse_a_filter_and_an_owner_target() {
         let list =
-            Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/nathan"]).unwrap();
+            Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/alex"]).unwrap();
         let Command::Attention {
             command: AttentionCommand::Ls { actor, .. },
         } = list.command
         else {
             panic!("the review list command did not parse");
         };
-        assert_eq!(actor.as_deref(), Some("person/nathan"));
+        assert_eq!(actor.as_deref(), Some("person/alex"));
 
         let approve = Cli::try_parse_from([
             "st3",
@@ -16949,7 +17738,7 @@ mission "review" state="ready" {
             "approve",
             "mission-run/release/one",
             "--as",
-            "person/nathan",
+            "person/alex",
         ])
         .unwrap();
         let Command::Attention {
@@ -16964,21 +17753,21 @@ mission "review" state="ready" {
     #[test]
     fn attention_commands_parse_list_request_and_resolution() {
         let list =
-            Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/nathan"]).unwrap();
+            Cli::try_parse_from(["st3", "attention", "ls", "--as", "person/alex"]).unwrap();
         let Command::Attention {
             command: AttentionCommand::Ls { actor, .. },
         } = list.command
         else {
             panic!("the attention list command did not parse");
         };
-        assert_eq!(actor.as_deref(), Some("person/nathan"));
+        assert_eq!(actor.as_deref(), Some("person/alex"));
 
         let request = Cli::try_parse_from([
             "st3",
             "attention",
             "request",
             "--for",
-            "person/nathan",
+            "person/alex",
             "--title",
             "Fabric needs review",
             "--reason",
@@ -17006,7 +17795,7 @@ mission "review" state="ready" {
             "attention",
             "request",
             "--for",
-            "person/nathan",
+            "person/alex",
             "--title",
             "Publish this revision",
             "--reason",
@@ -17035,7 +17824,7 @@ mission "review" state="ready" {
             "--outcome",
             "dismissed",
             "--as",
-            "person/nathan",
+            "person/alex",
         ])
         .unwrap();
         let Command::Attention {
@@ -17064,14 +17853,14 @@ mission "review" state="ready" {
         assert_eq!(identity, "node.worker");
         assert_eq!(runtime_id, "node.worker");
         let (long_catalog, _, _, _) =
-            prepare_native_driver_in("agent/fleet/app-web/standing/app-web", root.path()).unwrap();
-        let report = st2::validate::validate_for_host(&long_catalog, &st2::run::detect_host());
+            prepare_native_driver_in("agent/example/app-web/standing/app-web", root.path()).unwrap();
+        let report = st_drivers::validate::validate_for_host(&long_catalog, &st_drivers::run::detect_host());
         assert!(report.issues.is_empty(), "{report:?}");
     }
 
     #[test]
     fn native_timeline_fences_provider_session_but_claims_runtime_session() {
-        let record = st2::harness_timeline::Record {
+        let record = st_drivers::harness_timeline::Record {
             schema: "st2.harness-timeline.v1".into(),
             driver: "claude".into(),
             incarnation_id: "provider-current".into(),
@@ -17094,7 +17883,7 @@ mission "review" state="ready" {
             Some("provider-current")
         ));
         let fields = timeline_claim_fields(
-            st2::harness_timeline::Operation {
+            st_drivers::harness_timeline::Operation {
                 operation: "append".into(),
                 entry_id: "timeline-entry/test".into(),
                 sequence: 1,
@@ -17120,7 +17909,7 @@ mission "review" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let inbox = root.path().join("inbox");
         let archive = root.path().join("archive");
-        st2::message::send_to_inbox(
+        st_drivers::message::send_to_inbox(
             &inbox,
             "requester",
             Some("Start"),
@@ -17153,7 +17942,7 @@ mission "review" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let inbox = root.path().join("inbox");
         let archive = root.path().join("archive");
-        let filename = st2::message::send_to_inbox(
+        let filename = st_drivers::message::send_to_inbox(
             &inbox,
             "requester",
             Some("Start"),
@@ -17174,7 +17963,7 @@ mission "review" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let inbox = root.path().join("inbox");
         let archive = root.path().join("archive");
-        let old = st2::message::send_to_inbox(
+        let old = st_drivers::message::send_to_inbox(
             &inbox,
             "requester",
             Some("Already read"),
@@ -17183,7 +17972,7 @@ mission "review" state="ready" {
             "The recipient read this through the graph.",
         )
         .unwrap();
-        let next = st2::message::send_to_inbox(
+        let next = st_drivers::message::send_to_inbox(
             &inbox,
             "requester",
             Some("Still staged"),
@@ -17200,7 +17989,7 @@ mission "review" state="ready" {
         assert!(!inbox.join(&old).exists());
         assert!(archive.join(old).is_file());
         assert!(inbox.join(next).is_file());
-        assert_eq!(st2::message::list_dir(&archive).unwrap().len(), 1);
+        assert_eq!(st_drivers::message::list_dir(&archive).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -17236,7 +18025,7 @@ mission "review" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let inbox = root.path().join("inbox");
         let archive = root.path().join("archive");
-        let filename = st2::message::send_to_inbox(
+        let filename = st_drivers::message::send_to_inbox(
             &inbox,
             "agent/sender",
             Some("done"),
@@ -17307,18 +18096,18 @@ mission "review" state="ready" {
         .unwrap();
         server.abort();
 
-        let projected = st2::message::list_inbox(&inbox).unwrap();
+        let projected = st_drivers::message::list_inbox(&inbox).unwrap();
         assert_eq!(projected.len(), 1);
         // The inbox file appends a newline, so the hash must come from the graph content.
         assert_eq!(projected[0].body, "FACT <b>QUARTZ</b>\n");
         let catalog = tempfile::tempdir().unwrap();
         assert_eq!(
-            st2::ding::poke_text(catalog.path(), "h", "run-1/wake.right", &projected[0]),
+            st_drivers::ding::poke_text(catalog.path(), "h", "run-1/wake.right", &projected[0]),
             format!(
                 "<smalltalk-message id=\"fact\" from=\"agent/run-1/wake.left\" \
                  to=\"agent/run-1/wake.right\" subject=\"Fact\" sha256=\"{}\" \
                  graph=\"message/fact\">\nFACT &lt;b&gt;QUARTZ&lt;/b&gt;\n</smalltalk-message>",
-                st2::ding::st3_body_sha256("FACT <b>QUARTZ</b>")
+                st_drivers::ding::st3_body_sha256("FACT <b>QUARTZ</b>")
             )
         );
     }
@@ -17434,7 +18223,7 @@ mission "review" state="ready" {
                 .collect::<Vec<_>>(),
             ["message/missing"]
         );
-        let projected = st2::message::list_inbox(&inbox).unwrap();
+        let projected = st_drivers::message::list_inbox(&inbox).unwrap();
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].body, "the next message\n");
     }

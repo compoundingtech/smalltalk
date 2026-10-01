@@ -1,8 +1,7 @@
 # CI operations
 
-The fleet CI definitions and trusted scripts live in
-[`myobie/st3-network/missions`](https://github.com/myobie/st3-network/tree/main/missions)
-as `smalltalk-ci-*.kdl` and `smalltalk-ci*.sh`. The standing `st` mission observes
+The fleet's CI mission declarations and trusted runner scripts are kept with that fleet's private
+machine configuration, outside this repository, as `smalltalk-ci-*.kdl` and `smalltalk-ci*.sh`. The standing `st` mission observes
 same-repository pull request heads and pushes to `main`. Each run checks the exact observed
 commit. A pull request run merges that commit with the latest `main` in a temporary checkout
 before running `cargo test --workspace --locked` and
@@ -15,11 +14,17 @@ read within ten seconds of recovery. The historical channel build is pinned sepa
 `.github/messaging-compat-baseline.json` and cached by Nix. See
 [the eval contract](../evals/st3/messaging-faults/README.md).
 
+The workspace tests and the public GitHub Actions job run `scripts/check-public-repo`. It
+rejects real host names, personal home paths, unlisted person IDs, internal fleet agent IDs,
+and references to private fleet configuration repositories.
+
 On Linux, the workspace test build runs first and alone, without debug information. Then the
 tests, Clippy, the generated client check and the fleet compatibility test run side by side, and
 the run fails if any of them fails. The tests run under nextest, 8 at a time, with the tests
 that take a minute or more started first. A failed test is retried twice, 30 seconds apart, and
 one that passes on a retry is reported as flaky rather than failing the run.
+The messaging fault matrix has a higher repository priority so its long retries have the full
+25-minute CI test window.
 
 st2's catalog, supervisor and end-to-end tests cover st2 code that st3 does not use: the
 `agent_author`, `catalog*`, `eval_run`, `resync` and `resource_profile_supervisor` modules and
@@ -32,10 +37,10 @@ support and the shared crates. A run that skips them says "st2 catalog and super
 needed" in its `st/ci` description. `main` runs them once a day: the first `main` run after a day
 without a passing one.
 
-`st/ci` is the Linux result from hetz and is the pull request merge check.
-`st/ci-macos` runs on Silber for `main` commits. To request a macOS run on a
+`st/ci` is the Linux result from the CI machine and is the pull request merge check.
+`st/ci-macos` runs on the macOS CI machine for `main` commits. To request a macOS run on a
 pull request, add the `macos-ci` label; the run starts after Linux succeeds.
-Linux runs use two host-local Cargo target lanes, while Silber reuses one target
+Linux runs use two host-local Cargo target lanes, while macOS reuses one target
 directory. Each run isolates `HOME` and XDG directories. Forked pull requests
 are excluded before any code from them runs on these machines. GitHub Actions handles tags
 and forks.
@@ -69,13 +74,13 @@ update the branch with `main` (`gh pr update-branch NUMBER`, or merge `main` you
 - A fork's code never runs on these machines. So the rule does not block forks, `st/ci` posts
   one success on a fork's head that says it does not run for forks. GitHub Actions is what checks
   the fork.
-- `st/ci` runs as the `agent/fleet/smalltalk-ci` seat. If it stops, no pull request can merge
-  until CI runs again; change the `main` ruleset only for that.
+- If the standing CI seat stops, no pull request can merge until CI runs again; change the
+  `main` ruleset only for that.
 
 ## Merge train
 
 The merge train is a [lane](st3/lanes.md) named `smalltalk`, owned by the
-`fleet/smalltalk/train` mission (`smalltalk-train.kdl` and `smalltalk-train.sh` in the same
+merge-train mission (`smalltalk-train.kdl` and `smalltalk-train.sh` in the same
 missions directory). When a pull request is ready to merge, join it:
 
 ```sh
@@ -107,7 +112,7 @@ testing its car only sends that car to the back.
 
 ## Inspect a failure
 
-The commit status description includes the mission run ID. On hetz:
+The commit status description includes the mission run ID. On example-linux:
 
 ```sh
 st missions show mission-run/RUN-ID
@@ -117,7 +122,7 @@ st trace show mission-run/RUN-ID
 The Linux checkout, summary and test logs are under
 `~/.local/state/st3/smalltalk-ci/runs/RUN-ID/`. Each step writes `logs/STEP.log` and
 `logs/STEP.time`; the steps are `components`, `hooks`, `build`, `test`, `clippy`, `codegen` and
-`fleet-compat`. On Silber, the corresponding files are in the `macos/`
+`fleet-compat`. On macOS, the corresponding files are in the `macos/`
 subdirectory. A failed command's stderr is in its log. The summary records whether st2's
 catalog and supervisor tests ran and why (`st2_rest=`), the failed steps (`failed=`), each step's
 seconds (`stages=`), the elapsed time and the final result. Use the run's source claim and

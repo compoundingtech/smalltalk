@@ -4,10 +4,12 @@
 //! open conversation, and, while a terminal is open, that terminal. st joins each row and each
 //! conversation, so stui never joins lists itself or reads item by item. When the socket drops,
 //! the feed opens a new one, subscribes again, and attaches the open terminal again. Nothing
-//! here runs on a timer while connected: frames arrive only when something changed.
+//! here polls projections while connected: frames arrive only when something changed. Remote
+//! devices also make a bounded liveness read so an idle network blackhole becomes offline.
 
 use st3_client::{
-    Client, ClientError, CollectionEvent, CollectionStream, ErrorCode, Fence, Resource, Snapshot,
+    CapabilityState, Client, ClientError, CollectionEvent, CollectionStream, ErrorCode, Fence,
+    Resource, Snapshot,
     TargetParameters, TerminalScreen, TimelineEntry,
 };
 use std::collections::BTreeMap;
@@ -38,6 +40,8 @@ pub enum Window {
     Attention,
     Missions,
     Agents,
+    /// The person's glasses, followed only by `stui --glasses` when st grants them.
+    Glasses,
 }
 
 impl Window {
@@ -48,16 +52,33 @@ impl Window {
             Self::Attention => "attention",
             Self::Missions => "missions",
             Self::Agents => "agents",
+            Self::Glasses => "glasses",
         }
     }
 
     fn from_id(id: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|window| window.id() == id)
+        Self::ALL
+            .into_iter()
+            .chain([Self::Glasses])
+            .find(|window| window.id() == id)
+    }
+
+    /// How many items to follow: every glass a person may keep, a page of anything else.
+    fn limit(self) -> usize {
+        match self {
+            Self::Glasses => GLASSES,
+            _ => WINDOW,
+        }
     }
 }
 
+/// The most glasses st keeps live for one person.
+const GLASSES: usize = 100;
+
 #[derive(Debug)]
 pub enum Update {
+    /// Use this member for actions too. A live window must arrive before actions are enabled.
+    Connected(Client),
     /// st cannot be reached; the feed keeps trying and every window keeps its last items.
     Offline(String),
     /// A window's current items, in st's display order.
@@ -105,6 +126,8 @@ pub enum TerminalUpdate {
 
 #[derive(Debug)]
 pub enum Command {
+    /// Retry a connection now; never a queued mutation.
+    Reconnect,
     /// Follow this agent's terminal, found among its runtimes, in place of any other.
     Follow {
         runtime_ids: Vec<String>,
@@ -138,27 +161,56 @@ struct Following {
 }
 
 /// Keep stui's windows and terminal current until the receiving side goes away.
+#[cfg(test)]
 pub async fn run(
     client: Client,
     updates: mpsc::Sender<Update>,
+    commands: channel::UnboundedReceiver<Command>,
+) {
+    run_members(vec![client], false, false, updates, commands).await;
+}
+
+pub async fn run_members(
+    clients: Vec<Client>,
+    remote: bool,
+    glasses: bool,
+    updates: mpsc::Sender<Update>,
     mut commands: channel::UnboundedReceiver<Command>,
 ) {
+    if clients.is_empty() {
+        return;
+    }
     let mut failures = 0_usize;
+    let mut member = 0;
     let mut following: Option<Following> = None;
     let mut conversing: Option<Conversing> = None;
     loop {
-        let stream = match client.collection_stream().await {
-            Ok(stream) => Some(stream),
-            Err(error) => {
-                if updates.send(Update::Offline(error.to_string())).is_err() {
-                    return;
+        // Try every paired member before waiting. Never forward a grant to another origin.
+        let mut selected = None;
+        let mut reason = "No member is reachable".to_owned();
+        for offset in 0..clients.len() {
+            let index = (member + offset) % clients.len();
+            match tokio::time::timeout(Duration::from_secs(5), clients[index].collection_stream())
+                .await
+            {
+                Ok(Ok(stream)) => {
+                    selected = Some((index, stream));
+                    break;
                 }
-                None
+                Ok(Err(error)) => reason = error.to_string(),
+                Err(_) => reason = "Member connection timed out".into(),
             }
-        };
-        if let Some(mut stream) = stream {
+        }
+        if let Some((index, mut stream)) = selected {
+            member = index;
+            let client = &clients[index];
+            if updates.send(Update::Connected(client.clone())).is_err() {
+                return;
+            }
             match connected(
-                &client,
+                client,
+                remote,
+                glasses,
                 &mut stream,
                 &updates,
                 &mut commands,
@@ -182,19 +234,28 @@ pub async fn run(
                     if let Some(current) = conversing.as_mut() {
                         current.retry_at = None;
                     }
+                    if clients.len() > 1 {
+                        member = (member + 1) % clients.len();
+                    }
                 }
             }
+        } else if updates.send(Update::Offline(reason)).is_err() {
+            return;
         }
         // Wait before trying again, still honouring an unfollow meanwhile.
         let delay = RETRY_DELAYS[failures.min(RETRY_DELAYS.len() - 1)];
-        failures += 1;
-        let wake = tokio::time::sleep(delay);
+        // Device gateways have no peer-online channel. Keep their retry ceiling short,
+        // with jitter so clients returning together do not all reconnect at once.
+        let jitter = Duration::from_millis((uuid::Uuid::now_v7().as_u128() % 500) as u64);
+        failures = failures.saturating_add(1);
+        let wake = tokio::time::sleep(delay + jitter);
         tokio::pin!(wake);
         loop {
             tokio::select! {
                 () = &mut wake => break,
                 command = commands.recv() => match command {
                     None => return,
+                    Some(Command::Reconnect) => { failures = 0; break; }
                     Some(Command::Unfollow) => following = None,
                     Some(Command::Converse { target }) => {
                         conversing = Some(Conversing { target, retry_at: None, failures: 0 });
@@ -202,7 +263,7 @@ pub async fn run(
                     Some(Command::Unconverse) => conversing = None,
                     Some(Command::Follow { runtime_ids }) => {
                         following = None;
-                        match resolve(&client, &runtime_ids).await {
+                        match resolve(&clients[member], &runtime_ids).await {
                             Ok((runtime_id, terminal_id)) => following = Some(Following {
                                 runtime_id, terminal_id, incarnation: None, attachment_id: None, retry_at: None, failures: 0,
                             }),
@@ -227,6 +288,8 @@ enum Ended {
 /// Serve one open socket until it drops.
 async fn connected(
     client: &Client,
+    remote: bool,
+    glasses: bool,
     stream: &mut CollectionStream,
     updates: &mpsc::Sender<Update>,
     commands: &mut channel::UnboundedReceiver<Command>,
@@ -234,9 +297,20 @@ async fn connected(
     conversing: &mut Option<Conversing>,
     failures: &mut usize,
 ) -> Ended {
-    for window in Window::ALL {
+    // A blackholed network can leave a WebSocket open indefinitely. A bounded read
+    // detects that case even when the graph is idle; it never resends a mutation.
+    let mut probe = tokio::time::interval(Duration::from_secs(15));
+    probe.tick().await;
+    // Glasses are followed only where st grants them; elsewhere stui keeps them on the device.
+    let granted = glasses
+        && client.capabilities().await.is_ok_and(|capabilities| {
+            capabilities.value.capabilities.iter().any(|capability| {
+                capability.id == "glasses" && capability.state == CapabilityState::Granted
+            })
+        });
+    for window in Window::ALL.into_iter().chain(granted.then_some(Window::Glasses)) {
         if let Err(error) = stream
-            .subscribe(window.id(), window.id(), WINDOW, None, None)
+            .subscribe(window.id(), window.id(), window.limit(), None, None)
             .await
         {
             return Ended::Dropped(error.to_string());
@@ -256,12 +330,20 @@ async fn connected(
         let retry_at = following.as_ref().and_then(|current| current.retry_at);
         let converse_at = conversing.as_ref().and_then(|current| current.retry_at);
         tokio::select! {
+            _ = probe.tick(), if remote => {
+                match tokio::time::timeout(Duration::from_secs(5), client.capabilities()).await {
+                    Ok(Ok(_)) => *failures = 0,
+                    Ok(Err(error)) => return Ended::Dropped(error.to_string()),
+                    Err(_) => return Ended::Dropped("Member stopped answering".into()),
+                }
+            }
             event = stream.next_event() => {
                 let event = match event {
                     Ok(Some(event)) => event,
                     Ok(None) => return Ended::Dropped("st closed the connection".into()),
                     Err(error) => return Ended::Dropped(error.to_string()),
                 };
+                *failures = 0;
                 match event {
                     CollectionEvent::Snapshot { id, snapshot, items, order, has_more } => {
                         let Some(window) = Window::from_id(&id) else { continue };
@@ -286,7 +368,7 @@ async fn connected(
                     }
                     CollectionEvent::Resync { id } => {
                         if let Some(window) = Window::from_id(&id)
-                            && let Err(error) = stream.subscribe(window.id(), window.id(), WINDOW, None, None).await
+                            && let Err(error) = stream.subscribe(window.id(), window.id(), window.limit(), None, None).await
                         {
                             return Ended::Dropped(error.to_string());
                         }
@@ -331,6 +413,7 @@ async fn connected(
                 }
             }
             command = commands.recv() => match command {
+                Some(Command::Reconnect) => {}
                 None => {
                     stop_following(client, stream, following).await;
                     return Ended::Closed;

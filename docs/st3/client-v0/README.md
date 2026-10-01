@@ -70,7 +70,7 @@ HTTPS route after every rollout, then make an authenticated paired-client read.
 This provides tailnet-only HTTPS and WebSocket transport at the host's Tailscale name while the
 gateway continues to enforce the same paired credential, scopes, terminal subprotocol, and
 single-use attachment capability. Begin pairing over the trusted local socket with, for example,
-`st devices --as person/nathan pair "Nathan iPhone"`; complete pairing from the remote device over
+`st devices --as person/alex pair "Alex iPhone"`; complete pairing from the remote device over
 the served gateway. To remove the carrier without changing graph credentials or daemon state:
 
 ```sh
@@ -150,9 +150,15 @@ the stable `id` ascending. No locale-sensitive ordering is permitted.
 | Sessions | `/sessions`, `/sessions/{id}` | updated time descending, ID |
 | Session timeline | `/sessions/{id}/timeline` | sequence ascending |
 
+Work resources, mission steps (including `current_steps`), and agent work labels use the same
+`WorkState` vocabulary: `waiting-person`, `waiting`, `ready`, `claimed`, `blocked`, `verifying`, `completed`,
+`failed`, and `cancelled`. The API translates internal `pending` to `waiting` and `working` to
+`claimed` in every projection. Clients treat held or verifying work as active even when its
+successors are waiting.
+
 A page carries an optional `sync` notice while its host is catching up with a fleet peer. Its
-projections can then show early history as current, such as an attention request that a
-not-yet-received envelope resolves. The notice lists each peer that holds more envelopes than one
+projections can then show early history as current, such as a person step that a
+not-yet-received envelope completes. The notice lists each peer that holds more envelopes than one
 replication exchange carries, with `peer_only_envelopes` (held by the peer, missing here),
 `local_only_envelopes`, `last_exchange_at`, and `estimated_catch_up_seconds` (null until a rate is
 measured). Clients show the notice above the page. The page omits it once the host has caught up.
@@ -176,16 +182,43 @@ background as it starts; until that report is made, the collection lists one `ru
 `history` is a typed audit projection. It does not expose raw claims, replication envelopes, or
 repair internals.
 
+Attention is a read-only snapshot of current sources. Its identity is the source, recipient, and
+waiting episode. `source_kind`, `episode`, `source_id`, `priority`, `requested_at`, and
+`action_parameters` describe the source and its current remedy. Completed, cancelled, removed,
+retired, or replaced sources disappear before cleanup; a failed run can retain its own fault.
+Pending held subscription requests are not attention sources. Historical `attention.*` claims
+remain audit data. Both raw legacy mutation routes and `attention.resolve` return
+`attention-migrated`; capabilities mark that action unsupported.
+
+An agent asks through `work.ask` (`person_id`, `title`, `reason`, and exactly one of `step_id` or
+`new_run`). Claimed work requires its current generation, definition, attempt, readiness, and
+incarnation fences. The ask creates a ready person-assigned runtime step and pauses its origin
+in `waiting-person`, with no lease, timeout, or retry consumption. A named small run requires a
+live requester declaration or owning run and rejects ambiguous claimed work. Repeating the same
+ask key returns the same step. Retirement and generation replacement invalidate the ask.
+
+`work.done` takes `target_id`, `episode`, nonempty `summary`, and optional string `evidence`.
+Only the assigned person or a session explicitly delegated by that person completes it. The
+requester may instead use `work.cancel-ask`. Completion resumes a live origin in the same attempt
+with a new readiness epoch; the response and evidence stay on the source. CLI equivalents are
+`st work ask --for PERSON --title TEXT --reason TEXT --step STEP --as AGENT --idempotency-key KEY`
+(or `--new-run NAME`) and `st work done STEP --as PERSON --summary TEXT`.
+
+Clients must evict removed source cards and replace their window from fresh snapshots on
+reconnect. The iOS cache version is 4 and stui's is 3; older cached cards are discarded. Offline
+cards are marked stale and cannot submit actions. A future notification consumer should compare
+fixed-recipient snapshots at an explicit `as_of` and deduplicate transitions by source, person,
+and episode, notifying only when an episode first appears. There is no push delivery service.
+
 Every attention resource carries its concrete `person_id`, original `source_id`, semantic
 `attention_kind`, optional mission/run/step context, and currently meaningful typed actions. A
 client can therefore render a mixed inbox, navigate to the source, and act without recovering
 identity or graph context from prose.
 
 A `fault` also carries `target_states`: for each target with a lifecycle (a mission, run,
-generation, step, attention item, or agent), its current `state` and, when known, the `since`
-time it entered that state. Resource and document targets have none. A person can recognize a
-request whose targets have all moved on, such as `mission/fleet/typecase: cancelled 4h ago`,
-without opening each target.
+generation, step, or agent), its current `state` and, when known, the `since`
+time it entered that state. Resource and document targets have none. The card describes the
+current failure and offers source inspection; recovery, cancellation, or retirement removes it.
 
 Each agent resource includes `current_work_ids` and an ordered `upcoming_work_ids` preview across
 mission runs. `next_work_id` is the first ready item, even while another step occupies the agent's
@@ -194,11 +227,14 @@ at most five items each. Ready work follows the agent's seat queue: mission runs
 then step creation time and subject ID inside one run. These fields describe the queue and do not
 imply that an active claim is making progress.
 
-`mission_authority` lists the missions the agent may publish, start, and revise, as exact mission
+`mission_authority` lists the missions the agent may publish, start, revise, and cancel, as exact mission
 IDs or terminal `/*` namespaces. Its `source` is `declared` when the declaration carries
 `mission-authority`, `default` for a person-declared top-level seat `fleet/PROJECT/...` (which
 holds `fleet/PROJECT/*`), and `none` otherwise. It is `null` for an agent with no current
-declaration.
+declaration. Cancellation requires an explicit `cancel` rule and is excluded from the default.
+Trusted local agent sessions may invoke `mission.cancel` with the current generation fence;
+the daemon checks the mission path against their current declaration. Other mission actions
+on client-v0 retain their person requirement.
 
 `GET /v1/client/agent-queues/{agent_id}` returns one `AgentQueue` value for a seat: its
 `current_work_ids`, its `next_work_id`, each queued mission run in order with `position`, `state`
@@ -246,6 +282,14 @@ Incremental timeline events use `append`, `replace`, or `finalize`. `replace` ta
 entry and increments its revision; it cannot change the entry's ID, sequence, role, or type.
 `finalize` makes the entry immutable. Tool results must refer to a preceding tool call. Timeline
 pages and updates are bounded by the negotiated byte and item limits.
+
+External process sessions remain listed even when st cannot identify a native transcript.
+Opening their timeline returns a non-retryable `unsupported-capability` error with
+`details.reason: native-session-unidentified` and `details.session_id`, explaining that the
+agent was not started by st and its saved session could not be identified. Clients show this
+as the no-conversation state, rather than treating the listed session as missing. The same
+verdict applies to the conversation stream. OMP `__omp_worker_*` internal modes are helpers,
+not external harness sessions, and are excluded from discovery.
 
 ## Launches, variants, decisions, and approvals
 
@@ -300,12 +344,12 @@ The v0 action discriminators are:
 
 | Family | Actions | Required fences |
 |---|---|---|
-| Attention | `attention.resolve`, `review.approve`, `review.reject`, `review.request-changes` | attention or review revision |
+| Attention | `work.done`, `review.approve`, `review.reject`, `review.request-changes` | source episode or review revision |
 | Messages | `message.send`, `message.read`, `message.close` | reply/message revision when present |
 | Launches | `launch.create`, `launch.revise`, `launch.preview`, `launch.approve`, `launch.cancel` | launch revision; target generation and preview token where applicable |
 | Missions | `mission.start`, `mission.revise`, `mission.approve-revision`, `mission.cancel-revision`, `mission.cancel` | mission revision and current generation where applicable |
 | Sessions | `session.import` | exact native-session revision; an exact running-process fingerprint is revalidated server-side |
-| Work | `work.claim`, `work.renew`, `work.progress`, `work.complete`, `work.fail`, `work.release`, `work.retry`, `work.publish-mission` | generation, definition, attempt, readiness epoch, and claimant incarnation after claim |
+| Work | `work.ask`, `work.cancel-ask`, `work.claim`, `work.renew`, `work.progress`, `work.complete`, `work.fail`, `work.release`, `work.retry`, `work.publish-mission` | generation, definition, attempt, readiness epoch, and claimant incarnation after claim |
 | Seat queues | `agent.queue-move` | snapshot; the run and any anchor run must be queued for the seat |
 | Lanes | `lane.join`, `lane.leave`, `lane.move`, `lane.mark`, `lane.approve` | snapshot; the lane must be open and a named entry or anchor must be in it |
 | Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation; stop, restart, and reset also require `runtime_desired_revision` from the runtime resource |
@@ -363,10 +407,25 @@ Pairing codes expire after five minutes and reveal no fleet secret. The remote d
 request its own actor or scopes. By default the trusted local begin grants projection reads,
 terminal reads, attention control, and launch control. For an intentionally trusted device that
 needs Chat sends, mission/work actions, runtime control, and terminal input, the initiating person
-must use `st devices --as person/nathan pair --full-control "Nathan iPhone"` on the trusted local
+must use `st devices --as person/alex pair --full-control "Alex iPhone"` on the trusted local
 socket. The selected concrete scopes are sealed into that pairing; existing limited devices are
 not silently upgraded and must be re-paired, then revoked when no longer needed. Revocation takes
 effect for every subsequent request, including a new bounded terminal WebSocket exchange.
+
+Agent declarations are a separate, sensitive read: `GET /v1/client/agent-declarations/{id}`
+returns the currently applied desired tree, its canonical KDL v2 text, exact revision ID, and
+the immutable revision IDs newest-first. `?revision=ID` selects only that exact agent claim,
+including superseded declarations; an unknown revision or unmanaged session returns 404.
+Environment variable names are preserved, but their values are `"<redacted>"` by default
+in both the desired tree and KDL. Explicitly request `?show_env_values=true` (combined with
+`&revision=ID` for a past revision) to include literal environment values. Both current and
+historical bodies, redacted or not, require `read.declarations`; `read.projections` alone
+does not authorize this endpoint. Default limited pairing never grants `read.declarations`.
+Full-control pairing does, so grant it only to a trusted device whose holder may explicitly
+inspect declaration secrets; revoke or re-pair existing devices to change their sealed scopes.
+Likewise, `st subject show agent/NAME --kdl` redacts environment values; add
+`--show-env-values` to include them. KDL is a normalized representation of the applied
+desired state, not a recovery of authored whitespace or comments.
 
 Read-only scope permits snapshots, details, timelines, and event feeds. `terminal.control` adds
 terminal input and resize; other control scopes are action-family-specific. A capabilities response
@@ -500,3 +559,66 @@ manifest. [`fixtures/manifest.json`](fixtures/manifest.json) maps every golden f
 schema definition. The Rust tests validate fixture coverage, IDs, ordering, fences, timeline links,
 and deterministic preview tokens. Ignored baseline tests exercise the missing implementation and
 are intentionally red until the corresponding server work lands.
+
+## Private glasses
+
+A glass is one person's named workspace. Its stable subject is `glass/person/NAME/UUID`;
+clients generate a lowercase UUID (stui uses UUIDv7). Renaming changes `body.name`, never the
+ID. Names are free text and need not be unique. The client handles name lookup.
+
+`GET /v1/client/glasses` returns the ordinary paged resource list, ordered by ID, and
+`GET /v1/client/glasses/{uuid}` returns one resource. The authenticated session determines
+its person; these routes accept no owner selector. Anonymous sessions and agents have no glass
+access. Paired devices need `read.glasses` for reads and `control.glasses` for writes. New
+limited pairings include both grants. Existing devices with explicit grants need a new pairing
+if they lack them. Discover the granted `glasses` capability (version 0) before migrating local
+storage; it is granted when the session has both read and write access.
+
+`PUT /v1/client/glasses/{uuid}` accepts `{body, base_revision}`. A new ID requires a null
+base revision. Existing IDs accept stale or null bases: writes replace the whole body, using
+canonical claim order to choose the winner. `DELETE` on that route accepts `{base_revision}`
+and records a tombstone. Both mutations require an `Idempotency-Key` header (1–200 bytes).
+Reusing a key with identical input returns the same accepted revision; different input fails.
+The device/session identity isolates keys. A deleted ID is permanently retired, including
+when an offline device sends an edit after the deletion.
+
+A resource contains `id`, `kind: "glass"`, `revision`, `updated_at`, `body`, `deleted`,
+`base_revision`, and `replaced_revision`. Mutation responses identify the revision accepted by
+this member; a subsequently received concurrent revision may win. `base_revision` records the
+client's basis; `replaced_revision` records the head this member observed under its writer
+transaction. Both are null on a first creation. A deletion response has a null body and
+`deleted: true`; lists and detail reads show only current live glasses.
+
+The structure is `{name, tabs:[{title?, layout}]}`. A layout is `{pane: "opaque key"}` or
+`{split: "right" | "below", children: [layout, layout]}`. Pane keys convey no authority. No
+focus, scroll, selection, ratios, or last-used glass is stored. Empty `tabs: []` is valid:
+clients supply their implicit Home locally. Names and pane keys must be nonempty; splits have
+exactly two children, and no unknown structure fields are accepted.
+The daemon advertises limits: 65,536 bytes of compact UTF-8 JSON per body, 32 layout levels,
+1,024 layout nodes across all tabs, and 100 live glasses per person. The response ceiling is
+8 MiB, allowing a complete 100-glass subscription window at these bounds.
+
+Local creation is refused when the member already sees 100 live glasses. Concurrent creates
+on separate members are all retained as immutable claims. After synchronization, the earliest
+100 created, undeleted IDs in canonical claim order occupy the live slots; the remaining
+bodies are retained outside the live view. Deleting a live glass opens a slot for the next
+retained ID. Editing or renaming does not change creation priority. Detail reads outside the
+live quota return `not-found`; a client that saves on a disconnected member may later see its
+ID disappear from the live view after synchronization. This rule converges independently of
+arrival order and never discards the saved structure.
+
+Subscribe to `collection: "glasses"` on `st3.client.collections.v0`, with `limit: 100`, to
+follow the person's current glass set. The existing `snapshot` / `changes` frames carry full
+resource upserts and removed IDs, including deletions and quota changes. A reconnect starts
+with an authoritative snapshot. The server applies ownership and read grants to each
+subscription read. Glass bodies are excluded from generic claim lists, claim detail, status,
+events, and history used by agents. Dedicated operations and replicated admission both check
+the claim's person owner. Typed `glass.upserted` and `glass.deleted` claims are durable;
+reads derive their answers from canonical order, and checkpoint proofs compare the same view.
+
+Generated clients expose Rust `list_glasses`, `get_glass`, `put_glass`, `delete_glass`, and
+`CollectionStream::subscribe_glasses`; TypeScript `listGlasses`, `getGlass`, `putGlass`,
+`deleteGlass`, and `CollectionStream.subscribeGlasses`; and Swift `listGlasses`, `getGlass`,
+`putGlass`, `deleteGlass`, and `glassesStream`. Each supplies typed bodies and recursive layouts.
+Mutation methods take an explicit idempotency key so a retry uses the original key and input.
+Member daemons replicate the claims; paired clients read them through a member gateway.

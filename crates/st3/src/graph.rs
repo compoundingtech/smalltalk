@@ -145,6 +145,14 @@ pub(crate) fn runtime_proof_variables(
     variables
 }
 
+/// Authority kinds carried by one agent declaration.
+pub type AgentAuthorityGrants = (
+    crate::model::MissionAuthority,
+    crate::model::QueueAuthority,
+    crate::model::SeatAuthority,
+    crate::model::AgentAuthority,
+);
+
 /// The authority granted to agents declared inside a mission, in its own declarations, its
 /// steps' declarations, or any nested mission, keyed by the agent subject of a proof run. Only a
 /// person grants authority, so an agent may not publish or revise a mission whose grants exceed
@@ -152,28 +160,11 @@ pub(crate) fn runtime_proof_variables(
 pub fn mission_declared_authority_grants(
     mission: &crate::model::MissionSpec,
     default_host: &str,
-) -> Result<
-    BTreeMap<
-        String,
-        (
-            crate::model::MissionAuthority,
-            crate::model::QueueAuthority,
-            crate::model::SeatAuthority,
-        ),
-    >,
-    St3Error,
-> {
+) -> Result<BTreeMap<String, AgentAuthorityGrants>, St3Error> {
     fn visit(
         mission: &crate::model::MissionSpec,
         default_host: &str,
-        grants: &mut BTreeMap<
-            String,
-            (
-                crate::model::MissionAuthority,
-                crate::model::QueueAuthority,
-                crate::model::SeatAuthority,
-            ),
-        >,
+        grants: &mut BTreeMap<String, AgentAuthorityGrants>,
     ) -> Result<(), St3Error> {
         let variables = runtime_proof_variables(mission);
         let sources = mission.declarations_kdl.iter().chain(
@@ -193,6 +184,7 @@ pub fn mission_declared_authority_grants(
                             agent_mission_authority(&desired.desired),
                             agent_queue_authority(&desired.desired),
                             agent_seat_authority(&desired.desired),
+                            agent_declaration_authority(&desired.desired),
                         ),
                     );
                 }
@@ -272,7 +264,7 @@ fn parse_intent_with_owner(
     let mut document: KdlDocument = source
         .parse::<KdlDocument>()
         .map_err(|error| St3Error::new("invalid-kdl", error.to_string()))?;
-    st2::kdl_version::ensure_st3_version(&document)
+    st_drivers::kdl_version::ensure_st3_version(&document)
         .map_err(|error| St3Error::new("unsupported-kdl-version", error.to_string()))?;
     let mut deprecated_syntax = BTreeSet::new();
     canonicalize_terminal_declarations(&mut document, &mut deprecated_syntax);
@@ -2128,14 +2120,14 @@ fn driver_member(
         // native channel. `dev-channels #true` is retained only so declarations written before
         // the channel became intrinsic continue to parse; opting out would create an agent that
         // cannot receive graph messages, so false is rejected below.
-        provider.extend(["--channels".into(), st2::claude_channel::ST3_CHANNEL.into()]);
+        provider.extend(["--channels".into(), st_drivers::claude_channel::ST3_CHANNEL.into()]);
         // The channel wakes the real TUI, while Claude's own lifecycle hooks externalize the
         // resulting turn. Supplying the canonical registration as an additional native settings
         // source keeps arbitrary user workspaces untouched and gives every typed st seat the
-        // same UserPromptSubmit/Stop state edges as a materialized st2 seat.
+        // same UserPromptSubmit/Stop state edges.
         provider.extend([
             "--settings".into(),
-            st2::hooks::claude_st3_settings_registration().to_string(),
+            crate::hooks::claude_settings_registration().to_string(),
         ]);
     }
     if let Some(model) = model {
@@ -2393,6 +2385,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "mission-authority",
         "queue-authority",
         "seat-authority",
+        "agent-authority",
         "pty",
         "exec",
     ];
@@ -2428,6 +2421,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "mission-authority",
         "queue-authority",
         "seat-authority",
+        "agent-authority",
     ] {
         unique_child(document, child)?;
     }
@@ -2438,7 +2432,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
             authority,
             AuthorityBlock {
                 name: "mission-authority",
-                verbs: &["publish", "start", "revise"],
+                verbs: &["publish", "start", "revise", "cancel"],
                 empty: "empty-mission-authority",
                 duplicate: "duplicate-mission-authority",
                 pattern: validate_mission_authority_pattern,
@@ -2468,6 +2462,19 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
                 empty: "empty-seat-authority",
                 duplicate: "duplicate-seat-authority",
                 pattern: validate_queue_authority_pattern,
+            },
+            owner,
+        )?;
+    }
+    if let Some(authority) = unique_child(document, "agent-authority")? {
+        validate_authority_block(
+            authority,
+            AuthorityBlock {
+                name: "agent-authority",
+                verbs: &["apply"],
+                empty: "empty-agent-authority",
+                duplicate: "duplicate-agent-authority",
+                pattern: validate_agent_authority_pattern,
             },
             owner,
         )?;
@@ -2609,6 +2616,13 @@ fn validate_queue_authority_pattern(pattern: &str) -> Result<(), St3Error> {
     validate_name(seat, false).map_err(|_| invalid())
 }
 
+fn validate_agent_authority_pattern(pattern: &str) -> Result<(), St3Error> {
+    validate_queue_authority_pattern(pattern).map_err(|_| St3Error::new(
+        "invalid-agent-authority-pattern",
+        "agent authority needs an exact agent identity or a terminal `/*` namespace, without `agent/`",
+    ))
+}
+
 /// Whether `mission-authority "none"` withholds all mission authority, including the default
 /// of a top-level project seat. Any other value is refused; a block of rules is not a value.
 fn declares_no_mission_authority(authority: &KdlNode) -> Result<bool, St3Error> {
@@ -2673,7 +2687,7 @@ fn validate_authority_block(
 }
 
 /// The `VERB "PATTERN"` rules of one authority block in a desired agent declaration.
-fn authority_rules<'a>(desired: &'a Value, block: &str) -> Vec<(&'a str, &'a str)> {
+pub(crate) fn authority_rules<'a>(desired: &'a Value, block: &str) -> Vec<(&'a str, &'a str)> {
     let Some(children) = desired.get("children").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -2702,7 +2716,12 @@ fn authority_rules<'a>(desired: &'a Value, block: &str) -> Vec<(&'a str, &'a str
 
 /// Whether a desired agent declaration grants authority.
 pub fn declares_authority(desired: &Value) -> bool {
-    ["mission-authority", "queue-authority", "seat-authority"]
+    [
+        "mission-authority",
+        "queue-authority",
+        "seat-authority",
+        "agent-authority",
+    ]
         .iter()
         .any(|block| !authority_rules(desired, block).is_empty())
 }
@@ -2714,6 +2733,7 @@ pub fn agent_mission_authority(desired: &Value) -> crate::model::MissionAuthorit
             "publish" => authority.publish.push(pattern.to_owned()),
             "start" => authority.start.push(pattern.to_owned()),
             "revise" => authority.revise.push(pattern.to_owned()),
+            "cancel" => authority.cancel.push(pattern.to_owned()),
             _ => {}
         }
     }
@@ -2768,6 +2788,7 @@ pub fn effective_agent_mission_authority(
                     publish: namespace.clone(),
                     start: namespace.clone(),
                     revise: namespace,
+                    cancel: Vec::new(),
                 },
             }
         }
@@ -2795,6 +2816,16 @@ pub fn agent_seat_authority(desired: &Value) -> crate::model::SeatAuthority {
         }
     }
     authority
+}
+
+pub fn agent_declaration_authority(desired: &Value) -> crate::model::AgentAuthority {
+    crate::model::AgentAuthority {
+        apply: authority_rules(desired, "agent-authority")
+            .into_iter()
+            .filter(|(verb, _)| *verb == "apply")
+            .map(|(_, pattern)| pattern.to_owned())
+            .collect(),
+    }
 }
 
 fn validate_task_body(
@@ -3419,6 +3450,7 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
             "at",
             "every",
             "anchor",
+            "calendar",
             "catch-up",
             "max-catch-up",
             "work",
@@ -3431,6 +3463,7 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
         "at",
         "every",
         "anchor",
+        "calendar",
         "catch-up",
         "max-catch-up",
         "work",
@@ -3439,17 +3472,20 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
     }
     let at = child_string(body, "at")?;
     let every = child_string(body, "every")?;
-    if at.is_some() == every.is_some() {
+    let calendar = unique_child(body, "calendar")?;
+    if usize::from(at.is_some()) + usize::from(every.is_some()) + usize::from(calendar.is_some())
+        != 1
+    {
         return Err(St3Error::new(
             "invalid-schedule-time",
-            "a schedule needs exactly one of `at` and `every`",
+            "a schedule needs exactly one of `at`, `every`, and `calendar`",
         ));
     }
     let anchor = child_string(body, "anchor")?;
-    if at.is_some() && anchor.is_some() || every.is_some() && anchor.is_none() {
+    if anchor.is_some() != every.is_some() {
         return Err(St3Error::new(
             "invalid-schedule-anchor",
-            "an interval schedule needs an anchor and a one-time schedule cannot have one",
+            "only an interval schedule has an anchor, and it requires one",
         ));
     }
     if let Some(at) = at.as_deref().or(anchor.as_deref()) {
@@ -3457,6 +3493,26 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
     }
     if let Some(every) = every {
         parse_duration(&every, true)?;
+    }
+    if let Some(calendar) = calendar {
+        ensure_bare(calendar)?;
+        let calendar_body = calendar.children().ok_or_else(|| {
+            St3Error::new(
+                "invalid-schedule-calendar",
+                "a calendar needs `at` and `timezone`",
+            )
+        })?;
+        reject_unknown_children(calendar_body, &["at", "timezone"], "calendar", "calendar")?;
+        unique_child(calendar_body, "at")?;
+        unique_child(calendar_body, "timezone")?;
+        parse_calendar_time(&required_child_string(calendar_body, "at", "calendar")?)?;
+        let timezone = required_child_string(calendar_body, "timezone", "calendar")?;
+        timezone.parse::<chrono_tz::Tz>().map_err(|_| {
+            St3Error::new(
+                "invalid-schedule-timezone",
+                format!("unknown IANA timezone `{timezone}`"),
+            )
+        })?;
     }
     let catch_up = child_string(body, "catch-up")?;
     let max = child_integer(body, "max-catch-up")?;
@@ -3509,7 +3565,13 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
     unique_child(work_body, "mission")?;
     unique_child(work_body, "workspace")?;
     let reference = required_child_string(work_body, "mission", "schedule work")?;
-    validate_exact_mission_reference(&reference)?;
+    if reference.contains('@') {
+        validate_exact_mission_reference(&reference)?;
+    } else {
+        crate::mission::validate_mission_id(
+            reference.strip_prefix("mission/").unwrap_or(&reference),
+        )?;
+    }
     let workspace = required_child_string(work_body, "workspace", "schedule work")?;
     if workspace.trim().is_empty() {
         return Err(St3Error::new(
@@ -3691,6 +3753,60 @@ fn parse_utc_time(value: &str) -> Result<i64, St3Error> {
         .map_err(|error| St3Error::new("invalid-utc-time", error.to_string()))
 }
 
+fn parse_calendar_time(value: &str) -> Result<(Option<u8>, u16), St3Error> {
+    let (weekday, clock) = value
+        .split_once(' ')
+        .map_or((None, value), |(day, clock)| (Some(day), clock));
+    let weekday = match weekday {
+        None => None,
+        Some("Mon") => Some(1),
+        Some("Tue") => Some(2),
+        Some("Wed") => Some(3),
+        Some("Thu") => Some(4),
+        Some("Fri") => Some(5),
+        Some("Sat") => Some(6),
+        Some("Sun") => Some(7),
+        Some(_) => {
+            return Err(St3Error::new(
+                "invalid-schedule-calendar",
+                "calendar `at` must be HH:MM or Mon HH:MM (Mon–Sun)",
+            ));
+        }
+    };
+    let (hours, minutes) = clock.split_once(':').ok_or_else(|| {
+        St3Error::new(
+            "invalid-schedule-calendar",
+            "calendar `at` must be HH:MM or Mon HH:MM (Mon–Sun)",
+        )
+    })?;
+    if hours.len() != 2
+        || minutes.len() != 2
+        || !hours
+            .bytes()
+            .chain(minutes.bytes())
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return Err(St3Error::new(
+            "invalid-schedule-calendar",
+            "calendar `at` must use 24-hour HH:MM",
+        ));
+    }
+    let hour: u16 = hours
+        .parse()
+        .map_err(|_| St3Error::new("invalid-schedule-calendar", "invalid hour"))?;
+    let minute: u16 = minutes
+        .parse()
+        .map_err(|_| St3Error::new("invalid-schedule-calendar", "invalid minute"))?;
+    if hour >= 24 || minute >= 60 {
+        return Err(St3Error::new(
+            "invalid-schedule-calendar",
+            "calendar `at` must be a valid local time",
+        ));
+    }
+    Ok((weekday, hour * 60 + minute))
+}
+
+
 pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> {
     let children = value.get("children")?.as_array()?;
     if children.len() == 1 && children[0].get("name").and_then(Value::as_str) == Some("stop") {
@@ -3700,6 +3816,7 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
             at_unix_ms: None,
             every_ms: None,
             anchor_unix_ms: None,
+            calendar: None,
             catch_up: "latest".into(),
             max_catch_up: None,
             work: None,
@@ -3719,6 +3836,18 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
     let anchor_unix_ms = canonical_child_value(value, "anchor")
         .and_then(Value::as_str)
         .and_then(|value| parse_utc_time(value).ok());
+    let calendar = children
+        .iter()
+        .find(|child| child.get("name").and_then(Value::as_str) == Some("calendar"))
+        .and_then(|node| {
+            let (weekday, at_minute) =
+                parse_calendar_time(canonical_child_value(node, "at")?.as_str()?).ok()?;
+            Some(crate::model::CalendarSchedule {
+                weekday,
+                at_minute,
+                timezone: canonical_child_value(node, "timezone")?.as_str()?.to_owned(),
+            })
+        });
     let catch_up = canonical_child_value(value, "catch-up")
         .and_then(Value::as_str)
         .unwrap_or("latest")
@@ -3731,7 +3860,10 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
         .find(|child| child.get("name").and_then(Value::as_str) == Some("work"))?;
     let reference = canonical_child_value(work_node, "mission")?.as_str()?;
     let reference = reference.strip_prefix("mission/").unwrap_or(reference);
-    let (mission, revision) = reference.rsplit_once('@')?;
+    let (mission, revision) = match reference.rsplit_once('@') {
+        Some((mission, revision)) => (mission, Some(revision.to_owned())),
+        None => (reference, None),
+    };
     let mut inputs = BTreeMap::new();
     for input in work_node
         .get("children")?
@@ -3751,11 +3883,12 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
         at_unix_ms,
         every_ms,
         anchor_unix_ms,
+        calendar,
         catch_up,
         max_catch_up,
         work: Some(crate::model::ScheduledWork {
             mission: mission.to_owned(),
-            revision: revision.to_owned(),
+            revision,
             workspace: canonical_child_value(work_node, "workspace")?
                 .as_str()?
                 .to_owned(),
@@ -4141,6 +4274,105 @@ fn insert_subject(context: &mut ParseContext, subject: DesiredSubject) -> Result
         ));
     }
     Ok(())
+}
+
+/// Render a normalized desired tree rather than the original authored source.
+pub fn render_agent_desired_kdl(desired: &Value) -> Result<String, St3Error> {
+    if desired.get("name").and_then(Value::as_str) != Some("agent") {
+        return Err(St3Error::new(
+            "invalid-declaration",
+            "expected an agent root",
+        ));
+    }
+    let mut document = KdlDocument::new();
+    let mut version = KdlNode::new("version");
+    version.entries_mut().push(kdl::KdlEntry::new(2_i128));
+    document.nodes_mut().push(version);
+    document.nodes_mut().push(render_desired_node(desired)?);
+    document.autoformat();
+    Ok(document.to_string())
+}
+
+/// Preserve environment names while hiding values in a declaration read.
+pub fn redact_agent_env_values(tree: &mut Value) {
+    let is_env = tree.get("name").and_then(Value::as_str) == Some("env");
+    if let Some(children) = tree.get_mut("children").and_then(Value::as_array_mut) {
+        for child in children {
+            if is_env {
+                if let Some(arguments) = child.get_mut("arguments").and_then(Value::as_array_mut) {
+                    for value in arguments {
+                        *value = Value::String("<redacted>".into());
+                    }
+                }
+                if let Some(properties) = child.get_mut("properties").and_then(Value::as_object_mut)
+                {
+                    for value in properties.values_mut() {
+                        *value = Value::String("<redacted>".into());
+                    }
+                }
+            } else {
+                redact_agent_env_values(child);
+            }
+        }
+    }
+}
+
+fn render_desired_node(tree: &Value) -> Result<KdlNode, St3Error> {
+    let invalid = || St3Error::new("invalid-declaration", "malformed desired KDL node tree");
+    let object = tree.as_object().ok_or_else(invalid)?;
+    let name = object
+        .get("name")
+        .and_then(Value::as_str)
+        .ok_or_else(invalid)?;
+    let mut node = KdlNode::new(name);
+    if let Some(arguments) = object.get("arguments") {
+        for value in arguments.as_array().ok_or_else(invalid)? {
+            node.entries_mut()
+                .push(kdl::KdlEntry::new(render_desired_value(value)?));
+        }
+    }
+    if let Some(properties) = object.get("properties") {
+        for (name, value) in properties.as_object().ok_or_else(invalid)? {
+            node.entries_mut().push(kdl::KdlEntry::new_prop(
+                name.as_str(),
+                render_desired_value(value)?,
+            ));
+        }
+    }
+    if let Some(children) = object.get("children") {
+        let mut document = KdlDocument::new();
+        for child in children.as_array().ok_or_else(invalid)? {
+            document.nodes_mut().push(render_desired_node(child)?);
+        }
+        if !document.nodes().is_empty() {
+            node.set_children(document);
+        }
+    }
+    Ok(node)
+}
+
+fn render_desired_value(value: &Value) -> Result<KdlValue, St3Error> {
+    match value {
+        Value::Null => Ok(KdlValue::Null),
+        Value::Bool(value) => Ok(KdlValue::Bool(*value)),
+        Value::String(value) => Ok(KdlValue::String(value.clone())),
+        Value::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                Ok(KdlValue::Integer(integer.into()))
+            } else if let Some(float) = value.as_f64() {
+                Ok(KdlValue::Float(float))
+            } else {
+                Err(St3Error::new(
+                    "invalid-declaration",
+                    "desired KDL number is outside the supported range",
+                ))
+            }
+        }
+        _ => Err(St3Error::new(
+            "invalid-declaration",
+            "desired KDL entries must be scalar",
+        )),
+    }
 }
 
 fn canonical_node(node: &KdlNode) -> Result<Value, St3Error> {
@@ -4620,6 +4852,37 @@ mod tests {
     use super::*;
 
     #[test]
+    fn normalized_agent_tree_round_trips_through_canonical_kdl() {
+        for source in [
+            r#"version 2
+agent "dotfiles/steward" {
+    host "dev3"
+    workspace "/srv/work"
+    env { TOKEN "private"; MODE "ready" }
+    harness "omp" {
+        model "openai-codex/gpt-6-sol"
+        args "--foo" "--bar"
+    }
+}"#,
+            "version 2\nagent \"fleet/cos/standing/cos\" { command \"true\" }",
+        ] {
+            let parsed = parse_intent(source, "node").unwrap();
+            let (subject, desired) = parsed
+                .subjects
+                .iter()
+                .find(|(_, desired)| desired.kind == "agent")
+                .unwrap();
+            let rendered = render_agent_desired_kdl(&desired.desired).unwrap();
+            let reparsed = parse_intent(&rendered, "node").unwrap();
+            assert_eq!(reparsed.subjects[subject].desired, desired.desired);
+            assert_eq!(
+                render_agent_desired_kdl(&reparsed.subjects[subject].desired).unwrap(),
+                rendered
+            );
+        }
+    }
+
+    #[test]
     fn an_agent_checkout_needs_a_workspace_and_git_ref_names() {
         let mission = |workspace: &str, checkout: &str| {
             format!(
@@ -4728,15 +4991,15 @@ mod tests {
     #[test]
     fn accepts_a_durable_agent_seat_but_rejects_unowned_tasks() {
         let intent = parse_intent(
-            "version 2\nagent \"fleet/cos/standing/cos\" { command \"true\" }",
+            "version 2\nagent \"example/cos/standing/cos\" { command \"true\" }",
             "host",
         )
         .expect("a durable seat is valid desired state");
-        let seat = &intent.subjects["agent/fleet/cos/standing/cos"];
+        let seat = &intent.subjects["agent/example/cos/standing/cos"];
         assert!(seat.owner_run.is_none());
         assert_eq!(
             seat.member.as_ref().unwrap().runtime_id,
-            "fleet.cos.standing.cos"
+            "example.cos.standing.cos"
         );
 
         let error = parse_intent("version 2\npty \"worker\" { command \"true\" }", "host")
@@ -5049,6 +5312,36 @@ message "external" {
     }
 
     #[test]
+    fn no_harness_launch_reaches_st2() {
+        for harness in ["claude", "codex", "pi", "omp", "opencode"] {
+            let intent = parse_test_intent(
+                &format!(
+                    "version 2\n\n  agent \"worker\" {{\n    workspace \"/work\"\n    harness \"{harness}\" {{}}\n  }}\n"
+                ),
+                "node",
+            )
+            .expect("new KDL parses");
+            let member = intent.subjects["agent/node.worker"]
+                .member
+                .as_ref()
+                .unwrap();
+            let crate::model::LaunchSpec::Argv(argv) = &member.launch else {
+                panic!("the native driver needs argv");
+            };
+            for text in argv
+                .iter()
+                .chain(member.environment.keys())
+                .chain(member.environment.values())
+            {
+                assert!(
+                    !crate::hooks::mentions_st2_surface(text),
+                    "the {harness} launch reaches st2: {text}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn claude_always_uses_the_native_interactive_channel() {
         let intent = parse_test_intent(
             r#"
@@ -5074,7 +5367,7 @@ version 2
         assert!(argv.iter().any(|arg| arg == "claude"));
         assert!(
             argv.windows(2)
-                .any(|pair| pair == ["--channels", st2::claude_channel::ST3_CHANNEL])
+                .any(|pair| pair == ["--channels", st_drivers::claude_channel::ST3_CHANNEL])
         );
         let settings = argv
             .windows(2)
@@ -5083,7 +5376,7 @@ version 2
             .expect("typed Claude seats carry lifecycle hook settings");
         assert_eq!(
             serde_json::from_str::<Value>(settings).unwrap(),
-            st2::hooks::claude_st3_settings_registration()
+            crate::hooks::claude_settings_registration()
         );
         assert!(
             !argv
@@ -5462,6 +5755,35 @@ observer "github" {
         let error = parse_test_intent(&source.replace("5m", "0s"), "node").unwrap_err();
         assert_eq!(error.code, "invalid-duration");
     }
+    #[test]
+    fn daily_calendar_is_exclusive_and_requires_valid_local_time_and_zone() {
+        let source = r#"version 2
+schedule "daily" {
+    calendar { at "08:00"; timezone "Europe/Berlin" }
+    catch-up "latest"
+    work { mission "work@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; workspace "/tmp/work" }
+}"#;
+        let intent = parse_test_intent(source, "node").unwrap();
+        let spec = schedule_spec(&intent.subjects["schedule/daily"].desired, "node").unwrap();
+        assert_eq!(spec.calendar.as_ref().unwrap().at_minute, 480);
+        assert_eq!(spec.calendar.as_ref().unwrap().weekday, None);
+        assert_eq!(spec.calendar.as_ref().unwrap().timezone, "Europe/Berlin");
+        assert!(spec.at_unix_ms.is_none());
+        assert!(spec.every_ms.is_none());
+        let weekly = parse_test_intent(&source.replace("08:00", "Mon 09:00"), "node").unwrap();
+        let weekly = schedule_spec(&weekly.subjects["schedule/daily"].desired, "node").unwrap();
+        assert_eq!(weekly.calendar.as_ref().unwrap().weekday, Some(1));
+        assert_eq!(weekly.calendar.as_ref().unwrap().at_minute, 540);
+        for (changed, code) in [
+            (source.replace("08:00", "24:00"), "invalid-schedule-calendar"),
+            (source.replace("Europe/Berlin", "Europe/NotAZone"), "invalid-schedule-timezone"),
+            (source.replace("08:00", "Funday 08:00"), "invalid-schedule-calendar"),
+            (source.replace("calendar {", "every \"1d\"; anchor \"2026-01-01T00:00:00Z\"; calendar {"), "invalid-schedule-time"),
+        ] {
+            assert_eq!(parse_test_intent(&changed, "node").unwrap_err().code, code);
+        }
+    }
+
 
     #[test]
     fn strict_grammar_rejects_unknown_children_and_properties() {
@@ -5593,7 +5915,7 @@ subscription "reviews" {{
       mission "review@{revision}"
       resource "pull-request"
       workspace "/work/reviews"
-      requester "agent/fleet/repository/standing/owner"
+      requester "agent/example/repository/standing/owner"
     }}
 }}"#
         );
@@ -5610,7 +5932,7 @@ subscription "reviews" {{
         assert_eq!(spec.resource_input.as_deref(), Some("pull-request"));
         assert_eq!(
             spec.requester.as_deref(),
-            Some("agent/fleet/repository/standing/owner")
+            Some("agent/example/repository/standing/owner")
         );
     }
 
@@ -5642,7 +5964,7 @@ resource "pull" { kind "vcs.pull-request" }
 observer "pull" { resource "resource/pull"; provider "github.pull-request"; locator "owner/repo#1"; field "checks" }
 subscription "green" {
   observer "observer/pull"
-  to "agent/fleet/cos/standing/cos"
+  to "agent/example/cos/standing/cos"
   on "checks"
   when {
     every "checks" {
@@ -5682,6 +6004,44 @@ subscription "green" {
         assert_eq!(
             parse_test_intent(&invalid, "node").unwrap_err().code,
             "unknown-subscription-condition"
+        );
+    }
+    #[test]
+    fn only_scheduled_work_accepts_an_unpinned_mission() {
+        for anchor in ["2026-10-25T01:00:00Z", "2027-03-28T01:00:00Z"] {
+            let source = format!(r#"version 2
+schedule "cycle" {{
+  host "local"
+  every "1h"
+  anchor "{anchor}"
+  work {{ mission "mission/fabric/cycle"; workspace "/tmp/cycles" }}
+}}"#);
+            let intent = parse_test_intent(&source, "node").unwrap();
+            let schedule = intent.subjects.values().find(|item| item.kind == "schedule").unwrap();
+            let spec = schedule_spec(&schedule.desired, "node").unwrap();
+            assert_eq!(spec.anchor_unix_ms, Some(parse_utc_time(anchor).unwrap()));
+            let work = spec.work.unwrap();
+            assert_eq!(work.mission, "fabric/cycle");
+            assert_eq!(work.revision, None);
+            let pinned = source.replace(
+                "mission/fabric/cycle\"",
+                &format!("mission/fabric/cycle@{}\"", "a".repeat(64)),
+            );
+            let intent = parse_test_intent(&pinned, "node").unwrap();
+            let schedule = intent.subjects.values().find(|item| item.kind == "schedule").unwrap();
+            assert_eq!(
+                schedule_spec(&schedule.desired, "node").unwrap().work.unwrap().revision,
+                Some("a".repeat(64)),
+            );
+        }
+        assert_eq!(
+            parse_test_intent(
+                "version 2\nmission-run \"cycle\" { mission \"fabric/cycle\"; workspace \"/tmp/cycles\"; requester \"person/operator\" }",
+                "node",
+            )
+            .unwrap_err()
+            .code,
+            "unpinned-mission-run",
         );
     }
 }

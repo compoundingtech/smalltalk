@@ -1,4 +1,5 @@
 mod cache;
+mod connection;
 mod feed;
 mod model;
 mod tree;
@@ -23,9 +24,9 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use st3_client::{
-    AttentionResolveParameters, Client, ClientError, ErrorCode, Fence, LaunchCreateParameters,
-    LaunchTarget, LaunchVariantParameters, MessageSendParameters, Resource, TargetParameters,
-    TerminalInputMode, TerminalInputParameters, TerminalScreen,
+    Client, ClientError, ErrorCode, Fence, LaunchCreateParameters, LaunchTarget,
+    LaunchVariantParameters, MessageSendParameters, PersonStepParameters, Resource,
+    TargetParameters, TerminalInputMode, TerminalInputParameters, TerminalScreen,
 };
 use std::{
     cell::Cell,
@@ -1312,7 +1313,7 @@ fn mission_display_label(mission: &st3_client::Mission) -> String {
 }
 fn action_label(action: &str) -> String {
     match action {
-        "attention.resolve" => "Resolve [r]".into(),
+        "work.done" => "Complete step [c]".into(),
         "review.approve" | "launch.approve" => "Approve [a]".into(),
         "review.reject" => "Reject [j]".into(),
         "launch.cancel" => "Cancel [d]".into(),
@@ -1324,7 +1325,7 @@ fn action_label(action: &str) -> String {
 }
 fn action_key(action: &str) -> Option<char> {
     match action {
-        "attention.resolve" => Some('r'),
+        "work.done" => Some('c'),
         "review.approve" | "launch.approve" => Some('a'),
         "review.reject" => Some('j'),
         "launch.cancel" => Some('d'),
@@ -1637,12 +1638,12 @@ fn poll_terminal() -> Result<bool> {
     }
     Ok(true)
 }
-#[cfg(target_os = "macos")]
 fn watch_terminal_hangup() {
-    // On Darwin, crossterm can loop inside event::poll on PTY EOF and never
-    // return to the main loop's terminal check. A separate poller observes the
-    // hangup without consuming input. Once the PTY is gone there is no terminal
-    // left to restore, so end the process even if crossterm is stuck.
+    // crossterm can loop inside event::poll (Darwin) or event::read (Linux) on PTY EOF and
+    // never return to the main loop's terminal check; a stui left like that spins at full CPU
+    // and keeps polling the daemon for hours. A separate poller observes the hangup without
+    // consuming input. Once the PTY is gone there is no terminal left to restore, so end the
+    // process even if crossterm is stuck.
     std::thread::spawn(|| {
         loop {
             let mut fd = libc::pollfd {
@@ -1700,8 +1701,8 @@ fn agent_is_child_of(child: &st3_client::Agent, parent: &st3_client::Agent) -> b
         return true;
     }
     child.under.is_empty()
-        && parent.header.id == "agent/fleet/st3/standing/st3"
-        && (child.header.id.starts_with("agent/fleet/st3/")
+        && parent.header.id == "agent/example/st3/standing/st3"
+        && (child.header.id.starts_with("agent/example/st3/")
             || child.header.id.starts_with("agent/st3/"))
 }
 fn session_is_importable(session: &st3_client::Session) -> bool {
@@ -1980,16 +1981,20 @@ async fn attention_action(
     }
     let (id, idem) = action_pair();
     let result = match action {
-        "attention.resolve" => {
+        "work.done" => {
+            let summary = reason
+                .filter(|summary| !summary.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("a person step needs a response"))?;
             client
-                .attention_resolve(
+                .work_done(
                     id,
                     idem,
                     fence,
-                    AttentionResolveParameters {
-                        attention_id: attention.header.id.clone(),
-                        outcome: "resolved".into(),
-                        reason: None,
+                    PersonStepParameters {
+                        target_id: source,
+                        episode: attention.episode.clone(),
+                        summary,
+                        evidence: vec![],
                     },
                 )
                 .await?
@@ -2297,8 +2302,7 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
                 match app.mode {
                     Mode::ActionReason => {
                         if value.trim().is_empty() {
-                            app.action_result =
-                                Some("Enter a reason for this review decision".into());
+                            app.action_result = Some("Enter a response or decision reason".into());
                         } else {
                             app.action_result = None;
                             app.pending_reason = Some(value);
@@ -2449,7 +2453,7 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
         KeyCode::Char('o') if app.tab == 1 && app.history_open && app.model.timeline_truncated => {
             load_older_history(app);
         }
-        KeyCode::Char(c) if app.tab == 0 && "arjdm".contains(c) => {
+        KeyCode::Char(c) if app.tab == 0 && "arjdmc".contains(c) => {
             if let Some(attention) = app.model.attention().nth(app.selected[0]) {
                 if let Some(action) = attention
                     .actions
@@ -2458,7 +2462,7 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
                 {
                     app.pending_action = Some((attention.header.id.clone(), action.clone()));
                     app.pending_reason = None;
-                    app.mode = if action.starts_with("review.") {
+                    app.mode = if action.starts_with("review.") || action == "work.done" {
                         Mode::ActionReason
                     } else {
                         Mode::Confirm
@@ -2573,6 +2577,24 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
 
 fn main() -> Result<()> {
     let args = std::env::args().collect::<Vec<_>>();
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
+    {
+        println!(
+            "stui [--client | --local] [--old] [--glasses | --glass NAME]\nstui pair MEMBER_URL PAIRING_ID\n\nPairing reads the single-use code privately from the terminal (or stdin).\nPaired devices use the network automatically; --local selects the local daemon.\n--client requires a paired device. --demo opens invented data.\n--glasses tries the tabs-and-palette layout (an experiment); --glass NAME opens that glass."
+        );
+        return Ok(());
+    }
+    if args.get(1).is_some_and(|arg| arg == "pair") {
+        anyhow::ensure!(args.len() == 4, "Usage: stui pair MEMBER_URL PAIRING_ID");
+        let path = connection::profile_path()?;
+        let code = connection::read_code()?;
+        let runtime = tokio::runtime::Runtime::new()?;
+        let person = runtime.block_on(connection::pair(&path, &args[2], &args[3], &code))?;
+        println!("Paired as {person}. Run stui to connect; no local daemon is needed.");
+        return Ok(());
+    }
     if args.iter().any(|arg| arg == "--demo") {
         return ui::run_demo(&args);
     }
@@ -2587,22 +2609,63 @@ fn main() -> Result<()> {
     ] {
         signal_hook::flag::register(signal, stopping.clone())?;
     }
-    let path =
-        st3_client::discover_unix_endpoint(std::env::var_os("ST3_ENDPOINT").map(PathBuf::from))?;
-    let person = configured_person()?;
+    let local = args.iter().any(|arg| arg == "--local");
+    let client_only = args.iter().any(|arg| arg == "--client");
+    anyhow::ensure!(!(local && client_only), "Choose --client or --local");
+    let profile = if local {
+        None
+    } else if std::env::var_os("XDG_CONFIG_HOME").is_none() && std::env::var_os("HOME").is_none() {
+        None
+    } else {
+        connection::profile_path().and_then(|path| connection::Profile::load(&path))?
+    };
+    anyhow::ensure!(
+        !client_only || profile.is_some(),
+        "Run stui pair MEMBER_URL PAIRING_ID first"
+    );
+    anyhow::ensure!(
+        profile.is_none() || !args.iter().any(|arg| arg == "--old"),
+        "Client-only mode uses the current screens; omit --old"
+    );
+    let person = match &profile {
+        Some(profile) => Some(profile.person()?.to_owned()),
+        None => configured_person()?,
+    };
     anyhow::ensure!(
         person
             .as_deref()
             .is_some_and(|person| person.starts_with("person/") && person.len() > 7),
         "stui needs ST3_PERSON=person/NAME or person = \"person/NAME\" in the st config"
     );
-    let cache_path = person
-        .as_deref()
-        .and_then(|actor| cache::path(&path, actor));
-    let client = match person.as_deref() {
-        Some(person) => Client::unix_as(&path, person),
-        None => Client::unix(&path),
+    let (clients, cache_path) = match &profile {
+        Some(profile) => {
+            // Scope cached snapshots to this device grant, including every known member.
+            let identity = profile
+                .devices
+                .iter()
+                .map(|device| format!("{}:{}", device.endpoint, device.session.device_id))
+                .collect::<Vec<_>>()
+                .join("|");
+            (
+                profile.clients(),
+                cache::path(
+                    std::path::Path::new(&identity),
+                    person.as_deref().unwrap_or_default(),
+                ),
+            )
+        }
+        None => {
+            let path = st3_client::discover_unix_endpoint(
+                std::env::var_os("ST3_ENDPOINT").map(PathBuf::from),
+            )?;
+            let actor = person.as_deref().unwrap_or_default();
+            (
+                vec![Client::unix_as(&path, actor)],
+                cache::path(&path, actor),
+            )
+        }
     };
+    let client = clients[0].clone();
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
@@ -2615,7 +2678,13 @@ fn main() -> Result<()> {
             .and_then(|(path, actor)| cache::load(path, actor));
         let (updates, incoming) = mpsc::channel::<feed::Update>();
         let (commands, command_receiver) = tokio::sync::mpsc::unbounded_channel();
-        runtime.spawn(feed::run(client.clone(), updates, command_receiver));
+        runtime.spawn(feed::run_members(
+            clients,
+            profile.is_some(),
+            ui::glass_request(&args).is_some(),
+            updates,
+            command_receiver,
+        ));
         return ui::live::run(ui::live::Context {
             client,
             runtime,
@@ -2624,6 +2693,7 @@ fn main() -> Result<()> {
             person: person.unwrap_or_default(),
             cache_path,
             cached,
+            glass: ui::glass_request(&args),
         });
     }
     let (updates, incoming) = mpsc::channel::<Update>();
@@ -3094,10 +3164,10 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
     fn local_machine(model: &mut Model) {
-        model.machines.items.push(serde_json::from_str(r#"{"kind":"machine","id":"machine/hetz","revision":"one","updated_at":"2026-09-25T08:00:00Z","host_id":"host/hetz","name":"hetz","state":"local","fleet_id":null,"capacity":{"state":"available","reason":""},"occupancy":{"running_runtimes":1}}"#).unwrap());
+        model.machines.items.push(serde_json::from_str(r#"{"kind":"machine","id":"machine/example-linux","revision":"one","updated_at":"2026-09-25T08:00:00Z","host_id":"host/example-linux","name":"example-linux","state":"local","fleet_id":null,"capacity":{"state":"available","reason":""},"occupancy":{"running_runtimes":1}}"#).unwrap());
         model.sessions.snapshot = Some(st3_client::Snapshot {
-            id: "snapshot/hetz/1".into(),
-            host_id: "host/hetz".into(),
+            id: "snapshot/example-linux/1".into(),
+            host_id: "host/example-linux".into(),
             store_index: 1,
             projection_version: "v0".into(),
             created_at: "2026-09-25T08:00:00Z".into(),
@@ -3108,10 +3178,10 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("stui-person-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("config.toml");
-        std::fs::write(&path, "person = \"person/nathan\"\n").unwrap();
+        std::fs::write(&path, "person = \"person/alex\"\n").unwrap();
         assert_eq!(
             person_from_config(&path).unwrap().as_deref(),
-            Some("person/nathan")
+            Some("person/alex")
         );
         std::fs::remove_dir_all(dir).unwrap();
     }
@@ -3155,24 +3225,24 @@ mod tests {
 
     #[test]
     fn regression_now_action_has_a_useful_label_and_key() {
-        assert_eq!(action_label("attention.resolve"), "Resolve [r]");
+        assert_eq!(action_label("work.done"), "Complete step [c]");
     }
 
     #[test]
     fn regression_fleet_agent_work_is_scoped_to_selected_host() {
         let agent: st3_client::Resource = serde_json::from_str(r#"{"kind":"agent","id":"agent/worker","revision":"a","updated_at":"2026-09-25T08:00:00Z","name":"Worker","state":"running","reachability":"reachable","runtime_ids":["runtime/worker"],"active_work_count":1}"#).unwrap();
-        let runtime: st3_client::Resource = serde_json::from_str(r#"{"kind":"runtime","id":"runtime/worker","revision":"a","updated_at":"2026-09-25T08:00:00Z","runtime_kind":"agent","owner_id":"agent/worker","owner_host_id":"host/Silber","state":"running","runtime_id":"worker","incarnation_id":null,"desired_revision":"a"}"#).unwrap();
+        let runtime: st3_client::Resource = serde_json::from_str(r#"{"kind":"runtime","id":"runtime/worker","revision":"a","updated_at":"2026-09-25T08:00:00Z","runtime_kind":"agent","owner_id":"agent/worker","owner_host_id":"host/ExampleMac","state":"running","runtime_id":"worker","incarnation_id":null,"desired_revision":"a"}"#).unwrap();
         let mut model = Model::default();
         model.agents.items.push(agent);
         model.runtimes.items.push(runtime);
         let app = App::new(model);
-        assert!(!app.agent_on_host("agent/worker", "host/hetz"));
-        assert!(app.agent_on_host("agent/worker", "host/Silber"));
+        assert!(!app.agent_on_host("agent/worker", "host/example-linux"));
+        assert!(app.agent_on_host("agent/worker", "host/ExampleMac"));
     }
 
     #[test]
     fn regression_device_rows_identify_each_device() {
-        let device: st3_client::Resource = serde_json::from_str(r#"{"kind":"device","id":"device/iphone-15","revision":"a","updated_at":"2026-09-25T08:00:00Z","person_id":"person/nathan","session_actor":"person/nathan/session/abc","state":"active","expires_at":"2026-10-01T00:00:00Z"}"#).unwrap();
+        let device: st3_client::Resource = serde_json::from_str(r#"{"kind":"device","id":"device/iphone-15","revision":"a","updated_at":"2026-09-25T08:00:00Z","person_id":"person/alex","session_actor":"person/alex/session/abc","state":"active","expires_at":"2026-10-01T00:00:00Z"}"#).unwrap();
         let st3_client::Resource::Device(device) = device else {
             panic!()
         };
@@ -3628,7 +3698,7 @@ mod tests {
 
     #[test]
     fn omp_agent_label_names_the_seat_and_driver() {
-        let agent: st3_client::Agent = serde_json::from_str(r#"{"kind":"agent","id":"agent/fleet/pty-rust/omp","revision":"one","updated_at":"2026-09-25T08:00:00Z","name":"fleet/pty-rust/omp","state":"running","reachability":"local","runtime_ids":[],"under":[]}"#).unwrap();
+        let agent: st3_client::Agent = serde_json::from_str(r#"{"kind":"agent","id":"agent/example/pty-rust/omp","revision":"one","updated_at":"2026-09-25T08:00:00Z","name":"fleet/pty-rust/omp","state":"running","reachability":"local","runtime_ids":[],"under":[]}"#).unwrap();
         assert_eq!(agent_label(&agent), "PTY Rust · OMP");
     }
 
@@ -3663,7 +3733,7 @@ mod tests {
     fn st3_descendants_nest_and_top_level_omp_shows_its_work() {
         let mut model = Model::default();
         for (id, name, driver, active) in [
-            ("agent/fleet/st3/standing/st3", "ST", "codex", 0),
+            ("agent/example/st3/standing/st3", "ST", "codex", 0),
             (
                 "agent/st3/tui-ios-fixes/2026-09-25/st3-tui-fixer",
                 "TUI fixer",
@@ -3671,12 +3741,12 @@ mod tests {
                 1,
             ),
             (
-                "agent/fleet/st3/delivery-soak/recipient",
+                "agent/example/st3/delivery-soak/recipient",
                 "Recipient",
                 "codex",
                 0,
             ),
-            ("agent/fleet/pty-rust/omp", "OMP", "omp", 1),
+            ("agent/example/pty-rust/omp", "OMP", "omp", 1),
         ] {
             model.agents.items.push(
                 serde_json::from_value(serde_json::json!({
@@ -3793,7 +3863,7 @@ mod tests {
         let mut model = Model::default();
         model.agents.items.push(agent);
         model.work.items.push(serde_json::from_str(r#"{"kind":"work","id":"step-run/new/review","revision":"one","updated_at":"2026-09-24T11:56:00Z","mission_run_id":"mission-run/new","generation_id":"run-generation/new","definition_id":"one","path":"review","state":"ready","attempt":1,"readiness_epoch":1,"claimant":null,"claim_incarnation":null,"blocked_reason":null}"#).unwrap());
-        model.runtimes.items.push(serde_json::from_str(r#"{"kind":"runtime","id":"runtime/worker","revision":"one","updated_at":"2026-09-25T08:00:00Z","runtime_kind":"agent","owner_id":"agent/worker","owner_host_id":"host/hetz","state":"running","runtime_id":"worker","incarnation_id":null,"desired_revision":"one"}"#).unwrap());
+        model.runtimes.items.push(serde_json::from_str(r#"{"kind":"runtime","id":"runtime/worker","revision":"one","updated_at":"2026-09-25T08:00:00Z","runtime_kind":"agent","owner_id":"agent/worker","owner_host_id":"host/example-linux","state":"running","runtime_id":"worker","incarnation_id":null,"desired_revision":"one"}"#).unwrap());
         local_machine(&mut model);
         let mut app = App::new(model);
         let mut terminal = Terminal::new(TestBackend::new(100, 35)).unwrap();
@@ -3929,7 +3999,7 @@ mod tests {
         let notice = st3_client::SyncNotice {
             state: "catching-up".into(),
             peers: vec![st3_client::SyncPeer {
-                host_id: "host/Silber".into(),
+                host_id: "host/ExampleMac".into(),
                 peer_only_envelopes: 124_384,
                 local_only_envelopes: 3,
                 last_exchange_at: None,
@@ -3957,10 +4027,11 @@ mod tests {
         assert!(!rows[0].contains("Online"));
         assert!(
             rows.iter().any(|row| row.contains(
-                "SYNCING  Silber has 124,384 envelopes this host lacks · caught up in about 14m"
+                "SYNCING  ExampleMac has 124,384 envelopes this host lacks · caught up in about"
             )),
             "{rows:#?}"
         );
+        assert!(rows.iter().any(|row| row.contains("14m")), "{rows:#?}");
 
         // A newer collection served after the host caught up clears the notice.
         app.model.agents.snapshot = Some(snapshot(11));
@@ -4080,8 +4151,8 @@ mod tests {
     #[test]
     fn now_card_lists_actions_and_confirmation_keys() {
         let mut model = Model::default();
-        model.actor = "person/nathan".into();
-        model.now.items.push(serde_json::from_str(r#"{"kind":"attention","id":"attention/a","revision":"one","updated_at":"2026-09-25T08:00:00Z","attention_kind":"human-gate","source_id":"step-run/a","person_id":"person/nathan","title":"Review deployment","detail":"Approve the release?","priority":"high","state":"open","requested_at":"2026-09-25T08:00:00Z","actions":["review.approve","review.reject"]}"#).unwrap());
+        model.actor = "person/alex".into();
+        model.now.items.push(serde_json::from_str(r#"{"kind":"attention","id":"attention/a","revision":"one","updated_at":"2026-09-25T08:00:00Z","attention_kind":"human-gate","source_id":"step-run/a","person_id":"person/alex","title":"Review deployment","detail":"Approve the release?","priority":"high","state":"open","requested_at":"2026-09-25T08:00:00Z","actions":["review.approve","review.reject"]}"#).unwrap());
         let app = App::new(model);
         let mut terminal = Terminal::new(TestBackend::new(110, 35)).unwrap();
         terminal.draw(|frame| app.render(frame)).unwrap();
@@ -4099,8 +4170,8 @@ mod tests {
     #[tokio::test]
     async fn attention_key_requires_explicit_confirmation() {
         let mut model = Model::default();
-        model.actor = "person/nathan".into();
-        model.now.items.push(serde_json::from_str(r#"{"kind":"attention","id":"attention/a","revision":"one","updated_at":"2026-09-25T08:00:00Z","attention_kind":"human-gate","source_id":"step-run/a","person_id":"person/nathan","title":"Review","detail":"Approve?","priority":"high","state":"open","requested_at":"2026-09-25T08:00:00Z","actions":["review.approve","review.reject"]}"#).unwrap());
+        model.actor = "person/alex".into();
+        model.now.items.push(serde_json::from_str(r#"{"kind":"attention","id":"attention/a","revision":"one","updated_at":"2026-09-25T08:00:00Z","attention_kind":"human-gate","source_id":"step-run/a","person_id":"person/alex","title":"Review","detail":"Approve?","priority":"high","state":"open","requested_at":"2026-09-25T08:00:00Z","actions":["review.approve","review.reject"]}"#).unwrap());
         let mut app = App::new(model);
         let client = Client::unix("/nonexistent-stui-test.sock");
         handle_key(

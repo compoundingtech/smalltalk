@@ -5,6 +5,12 @@ set -Eeuo pipefail
 install="$(cd "$(dirname "$0")" && pwd)/install"
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+# These fixtures test regular-file installation; native macOS app transactions
+# are covered separately by install-macos-test.
+mkdir -p "$work/platform-bin"
+printf '#!/bin/sh\necho Linux\n' > "$work/platform-bin/uname"
+chmod +x "$work/platform-bin/uname"
+export PATH="$work/platform-bin:$PATH"
 
 fail() {
   echo "install-test: $*" >&2
@@ -14,7 +20,7 @@ fail() {
 build() {
   local dir=$1 version=$2 binary
   mkdir -p "$dir"
-  for binary in st2 st3 st3-migrate stui; do
+  for binary in st3 st3-migrate stui; do
     printf '#!/bin/sh\necho "%s %s"\n' "$binary" "$version" > "$dir/$binary"
     chmod 0755 "$dir/$binary"
   done
@@ -24,7 +30,7 @@ check() {
   local bin=$1 version=$2 binary
   [[ -L $bin/st && $(readlink "$bin/st") == st3 ]] || fail "$bin/st is not a symlink to st3"
   [[ $("$bin/st") == "st3 $version" ]] || fail "st does not run st3 $version"
-  for binary in st2 st3 st3-migrate stui; do
+  for binary in st3 st3-migrate stui; do
     [[ -f $bin/$binary && ! -L $bin/$binary ]] || fail "$bin/$binary is not a regular file"
     [[ $("$bin/$binary") == "$binary $version" ]] || fail "$bin/$binary is not version $version"
   done

@@ -11,6 +11,10 @@
     { "file": "terminal-screen.json", "definition": "Envelope" },
     { "file": "terminal-screen-changed.json", "definition": "Envelope" },
     { "file": "terminal-stale-fence-error.json", "definition": "ErrorEnvelope" },
-    { "file": "cursor-gap-error.json", "definition": "ErrorEnvelope" }
+    { "file": "cursor-gap-error.json", "definition": "ErrorEnvelope" },
+    { "file": "glasses.json", "definition": "Envelope" },
+    { "file": "glass-put.json", "definition": "GlassPut" },
+    { "file": "glass-delete.json", "definition": "GlassDelete" },
+    { "file": "glass-put-empty.json", "definition": "GlassPut" }
   ]
 }

@@ -7,8 +7,8 @@ export type Data = { attention: Attention[]; agents: Agent[]; missions: Mission[
 export const emptyData: Data = { attention: [], agents: [], missions: [], launches: [], machines: [], devices: [], sessions: [] };
 export const PROJECTION_CACHE_KEY = 'st3.projection.v1';
 
-// Version 3: mission rows carry their steps and agents their queues; work and runtimes are gone.
-const VERSION = 3;
+// Version 4: attention is derived from current source episodes.
+const VERSION = 4;
 const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000;
 const MAX_BYTES = 512 * 1024;
 const LIMITS: Record<keyof Data, number> = { attention: 50, agents: 100, missions: 40, launches: 30, machines: 30, devices: 30, sessions: 100 };

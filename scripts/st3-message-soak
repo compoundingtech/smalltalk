@@ -5,14 +5,14 @@ umask 077
 : "${ST3_BIN:?set ST3_BIN to the installed st3 executable}"
 : "${ST_AGENT:?set ST_AGENT to the authorized st3 operator identity}"
 : "${FABRIC_BIN:?set FABRIC_BIN to the installed Fabric executable}"
-: "${ST3_SOAK_SILBER_BIN:?set ST3_SOAK_SILBER_BIN to the installed st3 executable on Silber}"
+: "${ST3_SOAK_EXAMPLE_MAC_BIN:?set ST3_SOAK_EXAMPLE_MAC_BIN to the installed st3 executable on ExampleMac}"
 
-MONITOR=agent/fleet/st3/delivery-soak-20260924/monitor
+MONITOR=agent/example/st3/delivery-soak-20260924/monitor
 # ST_AGENT authorizes operator attention actions below. The probe sender has
 # its own graph identity, so clear the harness guard only for its mutations.
-SILBER_RECIPIENT=agent/fleet/st3/delivery-soak-20260924/recipient
-HETZ_RECIPIENT=agent/fleet/st3/delivery-soak-20260924/hetz-recipient
-SILBER_ST3=$ST3_SOAK_SILBER_BIN
+EXAMPLE_MAC_RECIPIENT=agent/example/st3/delivery-soak-20260924/recipient
+EXAMPLE_LINUX_RECIPIENT=agent/example/st3/delivery-soak-20260924/example-linux-recipient
+EXAMPLE_MAC_ST3=$ST3_SOAK_EXAMPLE_MAC_BIN
 DEADLINE_SECONDS=${ST3_SOAK_DEADLINE_SECONDS:-180}
 INTERVAL_SECONDS=${ST3_SOAK_INTERVAL_SECONDS:-300}
 STATE_DIR=${ST3_SOAK_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/st3/message-soak}
@@ -50,15 +50,29 @@ recover_sent_subject() {
   return 1
 }
 
+# Both directions depend on the same remote member. Absence pauses the probe and
+# its attention streak; a fresh exchange makes it eligible again without intervention.
+route_available() {
+  local direction=$1 status
+  status=$(/usr/bin/timeout 15s "$ST3_BIN" replication status --json 2>/dev/null) || return 1
+  /usr/bin/jq -e --arg source "${direction%%-to-*}" --arg target "${direction#*-to-}" \
+    '[.peers[] | select(.peer == $source or .peer == $target)] | length > 0 and all(.status == "up")' \
+    <<<"$status" >/dev/null
+}
+
 probe() {
   local direction=$1 recipient response subject token started deadline thread count reply_ids reply_id
   LAST_SUBJECT=
   LAST_TOKEN=
+  if ! route_available "$direction"; then
+    log "waiting direction=$direction reason=member-last-seen"
+    return 3
+  fi
   token="probe-$(/usr/bin/date -u +%Y%m%dT%H%M%S)-${RANDOM}-${direction}"
   LAST_TOKEN=$token
   started=$(/usr/bin/date +%s)
-  if [[ $direction == hetz-to-silber ]]; then
-    recipient=$SILBER_RECIPIENT
+  if [[ $direction == example-linux-to-example-mac ]]; then
+    recipient=$EXAMPLE_MAC_RECIPIENT
     if ! response=$(/usr/bin/timeout 30s /usr/bin/env -u ST_AGENT "$ST3_BIN" conversations send "$recipient" --from "$MONITOR" \
       --subject 'soak request' --body "Reply once with exact receipt token $token." --json); then
       if subject=$(recover_sent_subject "$recipient" "$token" "$((started + DEADLINE_SECONDS))"); then
@@ -69,9 +83,9 @@ probe() {
         return 1
       fi
     fi
-  elif [[ $direction == silber-to-hetz ]]; then
-    recipient=$HETZ_RECIPIENT
-    if ! response=$(/usr/bin/timeout 30s "$FABRIC_BIN" exec silber -- "$SILBER_ST3" conversations send "$recipient" \
+  elif [[ $direction == example-mac-to-example-linux ]]; then
+    recipient=$EXAMPLE_LINUX_RECIPIENT
+    if ! response=$(/usr/bin/timeout 30s "$FABRIC_BIN" exec example-mac -- "$EXAMPLE_MAC_ST3" conversations send "$recipient" \
       --from "$MONITOR" --subject 'soak request' \
       --body "Reply once with exact receipt token $token." --json); then
       if subject=$(recover_sent_subject "$recipient" "$token" "$((started + DEADLINE_SECONDS))"); then
@@ -130,6 +144,10 @@ probe() {
     fi
     /usr/bin/sleep 2
   done
+  if ! route_available "$direction"; then
+    log "waiting direction=$direction reason=member-last-seen subject=$subject"
+    return 3
+  fi
   log "FAILED direction=$direction subject=$subject token=$token timeout_seconds=$DEADLINE_SECONDS"
   return 1
 }
@@ -182,7 +200,7 @@ record_result() {
   if [[ $pending == message/* ]]; then
     target_args=(--target "$pending")
   fi
-  if response=$(/usr/bin/timeout 20s "$ST3_BIN" attention request --as "$ST_AGENT" --for person/nathan \
+  if response=$(/usr/bin/timeout 20s "$ST3_BIN" attention request --as "$ST_AGENT" --for person/alex \
     --title "st3 cross-host delivery failing: $direction" \
     --reason "Three consecutive exact-receipt probes failed in $direction; latest message $pending, token ${LAST_TOKEN:-unknown}. Inspect the st3-message-soak service journal and both recipient agents." \
     "${target_args[@]}" --severity error \
@@ -201,23 +219,30 @@ if [[ ${1:-} == --recover-sent-subject ]]; then
 fi
 
 if [[ ${1:-} == --once ]]; then
-  probe "${2:?pass hetz-to-silber or silber-to-hetz}"
+  probe "${2:?pass example-linux-to-example-mac or example-mac-to-example-linux}"
   exit
 fi
 
-direction=hetz-to-silber
+direction=example-linux-to-example-mac
 log 'monitor-started evidence_format=2'
 while true; do
   if probe "$direction"; then
     record_result "$direction" true
   else
-    record_result "$direction" false
-    log "delivery soak will retry after ${INTERVAL_SECONDS}s"
+    result=$?
+    # A member can go away while the probe is in flight. Keep its message queued
+    # and wait for a new exchange before attributing a delivery fault to its route.
+    if (( result == 3 )) || ! route_available "$direction"; then
+      log "waiting direction=$direction reason=member-last-seen"
+    else
+      record_result "$direction" false
+      log "delivery soak will retry after ${INTERVAL_SECONDS}s"
+    fi
   fi
-  if [[ $direction == hetz-to-silber ]]; then
-    direction=silber-to-hetz
+  if [[ $direction == example-linux-to-example-mac ]]; then
+    direction=example-mac-to-example-linux
   else
-    direction=hetz-to-silber
+    direction=example-linux-to-example-mac
   fi
   /usr/bin/sleep "$INTERVAL_SECONDS"
 done

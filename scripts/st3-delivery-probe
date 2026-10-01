@@ -1,0 +1,398 @@
+#!/usr/bin/env python3
+"""A durable, token-free native-channel recipient and cross-node delivery monitor.
+
+Run as its own declared st seat. This consumer reads only envelopes delivered by
+the actual omp-channel driver; no mailbox poll can manufacture a read receipt.
+Python 3.9+ and the installed st3 binary are its only dependencies.
+"""
+import argparse
+import asyncio
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import signal
+import time
+from urllib.parse import urlencode
+import uuid
+
+FORMAT = "st3.delivery-probes.v1"
+PREFIX = "doc/delivery-probes/"
+
+
+def now_ms():
+    return time.time_ns() // 1_000_000
+
+
+def save(path, value):
+    temporary = path.with_suffix(".tmp")
+    with temporary.open("w") as output:
+        json.dump(value, output, separators=(",", ":"), sort_keys=True)
+        output.flush()
+        os.fsync(output.fileno())
+    temporary.replace(path)
+    descriptor = os.open(str(path.parent), os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+class ApiError(RuntimeError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
+class Api:
+    def __init__(self, socket):
+        self.socket = socket
+
+    async def request(self, method, path, body=None):
+        async def exchange():
+            reader, writer = await asyncio.open_unix_connection(self.socket)
+            try:
+                data = json.dumps(body).encode() if body is not None else b""
+                writer.write((f"{method} {path} HTTP/1.0\r\nHost: localhost\r\n"
+                              f"Content-Type: application/json\r\nContent-Length: {len(data)}\r\n\r\n").encode() + data)
+                await writer.drain()
+                response = await reader.read()
+                headers, content = response.split(b"\r\n\r\n", 1)
+                if headers.split(b" ", 2)[1] != b"200":
+                    error = json.loads(content)
+                    raise ApiError(error.get("code", "http-error"), error.get("message", "probe request failed"))
+                payload = json.loads(content)
+                return payload.get("value", payload) if isinstance(payload, dict) else payload
+            finally:
+                writer.close()
+                await writer.wait_closed()
+        return await asyncio.wait_for(exchange(), 3)
+
+    async def get(self, path):
+        return await self.request("GET", path)
+
+    async def post(self, path, body):
+        return await self.request("POST", path, body)
+
+
+class Probe:
+    def __init__(self, config):
+        self.config = config
+        self.actor = config["agent"]
+        if os.environ.get("ST_AGENT") != self.actor:
+            raise ValueError("run this probe as its own declared ST_AGENT seat")
+        self.source = config["host"]
+        self.peers = {peer["agent"]: peer["host"] for peer in config["peers"]}
+        if not self.peers or self.actor in self.peers or len(self.peers) != len(config["peers"]):
+            raise ValueError("peers must be distinct other probe seats")
+        self.interval = int(config.get("interval_ms", 180_000))
+        self.deadline = int(config.get("deadline_ms", 60_000))
+        if self.interval < 1000 or self.deadline < 1000 or self.deadline > 60_000:
+            raise ValueError("interval must be positive; deadline must be 1–60 seconds")
+        self.directory = Path(config["state_dir"])
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.lock = (self.directory / "probe.lock").open("a")
+        fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.path = self.directory / "state.json"
+        self.state = json.loads(self.path.read_text()) if self.path.exists() else {"routes": {}, "receipts": {}}
+        self.api = Api(config.get("socket") or os.environ["ST3_ENDPOINT"])
+        self.st3 = config.get("binary") or os.environ["ST3_BIN"]
+        self.child = None
+        self.last_publish = 0
+        self.changed = True
+        self.tasks = set()
+        self.measuring = {}
+
+    def persist(self):
+        save(self.path, self.state)
+        self.changed = True
+
+    def event(self, event, **fields):
+        with (self.directory / "events.jsonl").open("a") as output:
+            output.write(json.dumps({"at_unix_ms": now_ms(), "event": event, **fields}) + "\n")
+
+    async def claims(self, subject):
+        page = await self.api.get("/v1/claims?" + urlencode({"subject": subject, "limit": 100, "order": "desc"}))
+        return page["claims"]
+
+    async def acknowledge(self, subject):
+        # The durable native receipt exists before either the channel's delivered
+        # acknowledgement or the graph read. Restarts replay these idempotently.
+        for lifecycle in ("delivered", "read", "closed"):
+            try:
+                await self.api.post(f"/v1/messages/{subject[8:]}/claims", {
+                    "lifecycle": lifecycle, "actor": self.actor,
+                    "idempotency_key": f"delivery-probe:{subject}:{lifecycle}",
+                })
+            except Exception:
+                # A native-channel ack can win the delivery race. The API may
+                # return its existing claim without retaining our retry key.
+                # After a crash, never try to regress a message that advanced;
+                # prove the forward state instead. Closed alone is not a read.
+                message = await self.api.get("/v1/messages/read/" + subject)
+                rank = {"sent": 0, "staged": 1, "delivered": 2, "read": 3, "closed": 4}
+                actual = rank.get(message["status"], -1)
+                if message["to"] != self.actor or actual < rank[lifecycle]:
+                    raise
+                if actual >= rank["read"]:
+                    claims = await self.claims(subject)
+                    if not any(claim["kind"] == "message.read" and claim.get("actor") == self.actor for claim in claims):
+                        raise
+        self.state["receipts"].pop(subject, None)
+        self.persist()
+        self.event("read", message=subject)
+
+    async def consume(self, frame, child):
+        subject = frame["meta"]["messageId"]
+        try:
+            message = await self.api.get("/v1/messages/read/" + subject)
+            content = json.loads(message["content"])
+            if (message["from"] not in self.peers or message["to"] != self.actor
+                    or content.get("format") != FORMAT or content.get("to") != self.actor
+                    or content.get("from") != message["from"] or not content.get("nonce")):
+                raise ValueError("not an authorized delivery probe")
+            # Join the graph ID to the actual consumed native bytes. Looking up
+            # the graph alone is never proof that the consumer saw the envelope.
+            if message["content"] not in frame["content"]:
+                raise ValueError("native envelope and graph message differ")
+            self.state["receipts"][subject] = {"consumed_at_unix_ms": now_ms()}
+            self.persist()
+            self.event("consumed", message=subject)
+            child.stdin.write((json.dumps({"type": "delivered", "meta": frame["meta"]}) + "\n").encode())
+            await child.stdin.drain()
+            await self.acknowledge(subject)
+        except Exception as error:
+            self.event("receiver-retry", message=subject, error=str(error))
+            if child.returncode is None:
+                child.stdin.write((json.dumps({"type": "failed", "meta": frame["meta"]}) + "\n").encode())
+                await child.stdin.drain()
+
+    async def receiver(self):
+        catalog = self.directory / "channel-catalog"
+        catalog.mkdir(exist_ok=True)
+        while True:
+            child = await asyncio.create_subprocess_exec(
+                self.st3, "--catalog", str(catalog), "driver", "omp-channel",
+                "--identity", self.actor[6:], stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+                env={**os.environ, "ST3_ENDPOINT": self.api.socket})
+            self.child = child
+            self.event("channel-started", pid=child.pid)
+            try:
+                while True:
+                    line = await child.stdout.readline()
+                    if not line:
+                        break
+                    frame = json.loads(line)
+                    if frame.get("type") == "hello":
+                        child.stdin.write(b'{"type":"ready"}\n{"type":"state","state":"idle"}\n')
+                        await child.stdin.drain()
+                    elif frame.get("type") == "message":
+                        task = asyncio.create_task(self.consume(frame, child))
+                        self.tasks.add(task)
+                        task.add_done_callback(self.finished)
+            finally:
+                if child.returncode is None:
+                    child.terminate()
+                await child.wait()
+                self.event("channel-exited", pid=child.pid, exit=child.returncode)
+            await asyncio.sleep(1)
+
+    def finished(self, task):
+        self.tasks.discard(task)
+        if not task.cancelled() and task.exception():
+            self.event("receiver-retry", error=str(task.exception()))
+
+    async def route(self, target):
+        route = self.state["routes"].get(target)
+        if route and route.get("attention", "").startswith("attention/"):
+            route.pop("attention")
+            self.persist()
+        presence = await self.api.get("/v1/replication/status")
+        direct = next((peer for peer in presence["peers"] if peer["peer"] == self.peers[target]), {})
+        # A grant refusal says nothing about end-to-end reachability through a hub.
+        # Continue real delivery probes while another replication path is active.
+        online = direct.get("status") == "up" or (
+            direct.get("status") == "refused" and any(peer["status"] == "up" for peer in presence["peers"]))
+        if not online:
+            if route is None:
+                route = {"target": self.peers[target], "to": target, "status": "unstarted"}
+                self.state["routes"][target] = route
+            if not route.get("waiting_for_member"):
+                await self.cancel_ask(route, "Member is last seen; delivery waits for a new exchange.", "absent")
+                route["waiting_for_member"] = True
+                self.measuring.pop(target, None)
+                self.persist()
+            return
+        if route and route.pop("waiting_for_member", False):
+            if route["status"] not in ("read", "unstarted"):
+                route["started_at_unix_ms"] = now_ms()
+                route["status"] = "sending" if route["status"] == "sending" else "pending"
+                route.pop("previous_read", None)
+                self.measuring[target] = time.monotonic_ns()
+            self.persist()
+        if route is None or route.get("status") == "unstarted" or (route.get("status") == "read" and now_ms() >= route["next_at_unix_ms"]):
+            previous_read = {key: route[key] for key in ("message", "latency_ms", "late") if key in route} if route else None
+            nonce = str(uuid.uuid4())
+            key = f"delivery-probe:{self.actor}:{target}:{nonce}"
+            # Persist the send intent BEFORE a request that might commit then time
+            # out. Replay the same key and body, rather than inventing duplicates.
+            route = {"target": self.peers[target], "to": target, "nonce": nonce,
+                     "idempotency_key": key, "message": "message/" + hashlib.sha256(key.encode()).hexdigest()[:16],
+                     "started_at_unix_ms": now_ms(), "status": "sending"}
+            if previous_read:
+                route["previous_read"] = previous_read
+            self.state["routes"][target] = route
+            self.measuring[target] = time.monotonic_ns()
+            self.persist()
+        if route["status"] == "sending":
+            try:
+                await self.api.post("/v1/messages", {
+                    "from": self.actor, "to": target, "title": "Native delivery probe",
+                    "content": json.dumps({"format": FORMAT, "from": self.actor, "to": target, "nonce": route["nonce"]}, sort_keys=True),
+                    "idempotency_key": route["idempotency_key"], "tags": ["delivery-probe"],
+                })
+                route["status"] = "pending"
+                route.pop("error", None)
+                self.persist()
+                self.event("sent", message=route["message"], target=route["target"])
+            except Exception as error:
+                route["error"] = str(error)[:1000]
+                self.persist()
+        if route["status"] == "read":
+            if route.get("attention"):
+                await self.withdraw(route)
+            return
+        try:
+            claims = await self.claims(route["message"])
+        except Exception as error:
+            route["error"] = str(error)[:1000]
+            claims = []
+        sent = next((claim for claim in claims if claim["kind"] == "message.sent"), None)
+        if sent:
+            route["sent_at_unix_ms"] = sent["accepted_at_unix_ms"]
+        read = next((claim for claim in claims if claim["kind"] == "message.read" and claim.get("actor") == target), None)
+        elapsed = max(0, now_ms() - route["started_at_unix_ms"])
+        if target in self.measuring:
+            elapsed = (time.monotonic_ns() - self.measuring[target]) // 1_000_000
+        if read:
+            route.update(status="read", read_at_unix_ms=read["accepted_at_unix_ms"],
+                         observed_read_at_unix_ms=now_ms(), latency_ms=elapsed,
+                         next_at_unix_ms=now_ms() + self.interval)
+            route["late"] = elapsed > self.deadline
+            route.pop("previous_read", None)
+            self.measuring.pop(target, None)
+            self.persist()
+            self.event("read-observed", message=route["message"], latency_ms=elapsed, late=route["late"])
+            await self.withdraw(route)
+        elif elapsed >= self.deadline:
+            # Keep replaying an unaccepted send intent even after its deadline.
+            if route["status"] not in ("overdue", "sending"):
+                route["status"] = "overdue"
+                self.persist()
+            if not route.get("attention"):
+                attention = await self.api.post("/v1/work/ask", {
+                    "actor": self.actor, "person": self.config["reviewer"],
+                    "new_run": f"delivery-probe-{route['nonce']}",
+                    "title": f"Delivery probe {self.source} → {self.peers[target]} has no read receipt",
+                    "reason": f"{route['message']} was not read within {self.deadline // 1000}s. The native probe keeps watching; a real read cancels this person step automatically. Inspect the node's probe seat, replication and daemon.",
+                    "idempotency_key": f"delivery-probe-overdue:{route['message']}:{route['started_at_unix_ms']}",
+                })
+                route["attention"] = attention["subject"]
+                self.persist()
+                self.event("attention", message=route["message"], attention=route["attention"])
+
+    async def cancel_ask(self, route, summary, key):
+        if route.get("attention"):
+            subject = route["attention"]
+            # Old versions stored legacy attention IDs. Those are historical audit data now.
+            if subject.startswith("step-run/"):
+                try:
+                    await self.api.post("/v1/work/cancel-ask", {
+                        "subject": subject, "actor": self.actor, "summary": summary,
+                        "idempotency_key": f"delivery-probe-{key}:{subject}",
+                    })
+                except ApiError as error:
+                    if error.code not in ("stale-fence", "missing-step-run"):
+                        raise
+            route.pop("attention", None)
+            self.persist()
+
+    async def withdraw(self, route):
+        await self.cancel_ask(route,
+            f"The recipient read {route['message']}; observed latency {route['latency_ms']}ms.", "recovered")
+
+    def report(self):
+        return {"format": FORMAT, "source": self.source, "agent": self.actor,
+                "updated_at_unix_ms": now_ms(), "interval_ms": self.interval,
+                "deadline_ms": self.deadline, "members": sorted([self.source] + list(self.peers.values())),
+                "routes": [dict(self.state["routes"][target], status="last-seen") if self.state["routes"].get(target, {}).get("waiting_for_member") else self.state["routes"].get(target, {"target": host, "to": target, "status": "unstarted"})
+                           for target, host in sorted(self.peers.items())]}
+
+    async def publish(self):
+        report = self.report()
+        # No personal paths, environment, credentials or native message bodies
+        # enter the replicated result. The local state remains the retry journal.
+        data = json.dumps(report, sort_keys=True).encode()
+        name = PREFIX + self.source
+        versions = await self.api.get("/v1/documents?" + urlencode({"name": name, "limit": 1}))
+        expected = versions["items"][0]["binding_claim_id"] if versions["items"] else None
+        await self.api.post("/v1/documents", {"name": name, "expected_document": expected,
+                            "bytes": list(data), "idempotency_key": "delivery-probe-report:" + hashlib.sha256(data).hexdigest()})
+        save(self.directory / "latest.json", report)
+        self.last_publish = now_ms()
+        self.changed = False
+
+    async def monitor(self):
+        async def safely(operation):
+            try:
+                await operation
+            except Exception as error:
+                self.event("retry", error=str(error))
+        while True:
+            # One failed route cannot prevent the other deadlines or receipts.
+            await asyncio.gather(*(safely(self.route(target)) for target in self.peers),
+                                 *(safely(self.acknowledge(subject)) for subject in list(self.state["receipts"])))
+            if self.changed or now_ms() - self.last_publish >= 30_000:
+                await safely(self.publish())
+            await asyncio.sleep(1)
+
+    async def run(self):
+        tasks = [asyncio.create_task(self.receiver()), asyncio.create_task(self.monitor())]
+        try:
+            await asyncio.gather(*tasks)
+        finally:
+            for task in tasks + list(self.tasks):
+                task.cancel()
+            if self.child and self.child.returncode is None:
+                try:
+                    self.child.terminate()
+                except ProcessLookupError:
+                    pass
+                await self.child.wait()
+            await asyncio.gather(*(tasks + list(self.tasks)), return_exceptions=True)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--config", type=Path, required=True)
+    args = parser.parse_args()
+    os.umask(0o077)
+    config = json.loads(args.config.read_text())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    task = loop.create_task(Probe(config).run())
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, task.cancel)
+    try:
+        loop.run_until_complete(task)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        loop.run_until_complete(loop.shutdown_asyncgens())
+        loop.close()
+
+
+if __name__ == "__main__":
+    main()

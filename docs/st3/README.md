@@ -17,20 +17,19 @@ Use these documents for implementation details:
 - [Resource subscriptions](resource-subscriptions.md) defines observers and automatic intake.
 - [Seats across deploys](seat-deploys.md) explains how a running seat's driver and channels follow
   a replaced st binary without ending the provider session, and how st reports a stale message path.
+- [Delivery probes](delivery-probes.md) describes token-free native-channel probes, per-direction
+  read latency, overdue attention, and the replicated results in `st doctor`.
 - [Live-path priority](priority.md) explains how the daemon and each PTY server outrank the builds
   and tests their harnesses run, on Linux and macOS, and what needs root.
 - [Command recorder](command-recorder.md) explains how every `git` and `gh` call st starts is
   recorded, the log format, and what the recorder cannot see.
 - [Profiling the daemon](profiling.md) explains how the daemon accounts for its own time: waits
   for the writer and read connections, SQLite statements, CPU, and callers.
+- [Operational queries](operational-queries.md) explains bounded mission lists, outcome history,
+  mission run summaries, and the five-minute performance report in `st doctor`.
 - [Agent migration](agent-migration.md) defines isolated rehearsal, cutover, and rollback.
 - [Eval audit](eval-audit.md) records the test intent and prompt boundary for each st eval.
-- [Running st with omp](omp.md) covers omp seat setup, behavior, and known limits;
-  [omp readiness evals](omp-readiness-2026-09-26.md) holds the evidence.
-- [Message envelope evals](message-envelope-2026-09-27.md) records the `<smalltalk-message>`
-  envelope and boot-contract sentence, measured before and after on cross-harness message wake.
-- [st3-next](st3-next.md) records the merge of seat queues and omp readiness into st, its checks
-  and evals, and the steps to fast-forward `st3`.
+- [Running st with omp](omp.md) covers omp seat setup, behavior, and known limits.
 - [Product roadmap](roadmap.md) records accepted future work.
 - [Guided CLI tour](cli-guided-tour.md) is the complete human walkthrough for every public command
   and subcommand.

@@ -24,8 +24,8 @@ fn has(r: &Report, code: &str, sev: Severity) -> bool {
 #[test]
 fn a_well_formed_service_catalog_is_clean() {
     let c = catalog(&[(
-        "hetz/worker/agent.kdl",
-        r#"agent "worker" { host "hetz"; type "service"; pty "agent" { command "claude" } }"#,
+        "example-linux/worker/agent.kdl",
+        r#"agent "worker" { host "example-linux"; type "service"; pty "agent" { command "claude" } }"#,
     )]);
     let r = validate(c.path());
     assert_eq!(r.errors(), 0, "unexpected issues: {:?}", r.issues);
@@ -36,10 +36,10 @@ fn a_well_formed_service_catalog_is_clean() {
 #[test]
 fn compact_agent_catalog_is_clean() {
     let c = catalog(&[(
-        "Silber/cos/agent.kdl",
+        "ExampleMac/cos/agent.kdl",
         r#"agent "cos" {
-  host "Silber"
-  env { ST_AGENT "Silber.cos" }
+  host "ExampleMac"
+  env { ST_AGENT "ExampleMac.cos" }
   command "codex"
   ding
 }"#,
@@ -114,8 +114,8 @@ fn explicit_and_typed_session_drivers_preempt_ding() {
 fn adjacent_non_agent_kdl_is_not_subject_to_agent_shape_policy() {
     let c = catalog(&[
         (
-            "hetz/worker/agent.kdl",
-            r#"agent "worker" { host "hetz"; command "true" }"#,
+            "example-linux/worker/agent.kdl",
+            r#"agent "worker" { host "example-linux"; command "true" }"#,
         ),
         (
             "themes/layout.kdl",
@@ -130,9 +130,9 @@ fn adjacent_non_agent_kdl_is_not_subject_to_agent_shape_policy() {
 #[test]
 fn opaque_resource_bindings_are_structurally_valid() {
     let c = catalog(&[(
-        "Silber/cos/agent.kdl",
+        "ExampleMac/cos/agent.kdl",
         r#"agent "cos" {
-  host "Silber"
+  host "ExampleMac"
   resource "work" uri="vendor+thing://authority/exact%20identity" reason="example vendor work item"
   command "codex"
 }"#,
@@ -197,9 +197,9 @@ fn duplicate_bus_ids_remain_an_error_when_resources_are_shared() {
 #[test]
 fn an_invalid_resource_binding_is_a_parse_error() {
     let c = catalog(&[(
-        "Silber/cos/agent.kdl",
+        "ExampleMac/cos/agent.kdl",
         r#"agent "cos" {
-  host "Silber"
+  host "ExampleMac"
   resource "work" uri="not-an-absolute-uri"
   command "codex"
 }"#,
@@ -281,8 +281,8 @@ fn type_batch_is_retired_and_flagged_unknown() {
 #[test]
 fn unknown_type_is_an_error() {
     let c = catalog(&[(
-        "hetz/w/agent.kdl",
-        r#"agent "w" { host "hetz"; type "srvice"; pty "agent" { command "x" } }"#,
+        "example-linux/w/agent.kdl",
+        r#"agent "w" { host "example-linux"; type "srvice"; pty "agent" { command "x" } }"#,
     )]);
     assert!(has(&validate(c.path()), "unknown-type", Severity::Error));
 }
@@ -296,15 +296,15 @@ fn a_spec_with_no_identity_is_an_error() {
 
 #[test]
 fn a_malformed_file_is_a_parse_error() {
-    let c = catalog(&[("hetz/w/agent.kdl", r#"agent "w" { host "hetz""#)]);
+    let c = catalog(&[("example-linux/w/agent.kdl", r#"agent "w" { host "example-linux""#)]);
     assert!(has(&validate(c.path()), "parse-error", Severity::Error));
 }
 
 #[test]
 fn a_relative_path_is_an_error() {
     let c = catalog(&[(
-        "hetz/w/agent.kdl",
-        r#"agent "w" { host "hetz"; type "service"; workspace "some/rel/dir"; pty "agent" { command "x" } }"#,
+        "example-linux/w/agent.kdl",
+        r#"agent "w" { host "example-linux"; type "service"; workspace "some/rel/dir"; pty "agent" { command "x" } }"#,
     )]);
     assert!(has(&validate(c.path()), "bad-path", Severity::Error));
 }
@@ -313,14 +313,14 @@ fn a_relative_path_is_an_error() {
 fn canonical_relative_workspace_and_task_cwd_are_clean() {
     let c = catalog(&[
         (
-            "hetz/w/agent.kdl",
+            "example-linux/w/agent.kdl",
             r#"agent "w" {
-  host "hetz"
+  host "example-linux"
   workspace ".workspace"
   pty "agent" { cwd ".workspace"; command "x" }
 }"#,
         ),
-        ("hetz/w/.workspace/.keep", ""),
+        ("example-linux/w/.workspace/.keep", ""),
     ]);
     assert!(!has(&validate(c.path()), "bad-path", Severity::Error));
 }
@@ -361,10 +361,10 @@ fn normalized_relative_workspace_is_clean_but_indeterminate_relative_fails_close
 fn environment_expanded_canonical_relative_workspace_is_clean() {
     let c = catalog(&[
         (
-            "hetz/w/agent.kdl",
-            r#"agent "w" { host "hetz"; workspace "$ST2_TEST_WORKSPACE"; argv "true" }"#,
+            "example-linux/w/agent.kdl",
+            r#"agent "w" { host "example-linux"; workspace "$ST2_TEST_WORKSPACE"; argv "true" }"#,
         ),
-        ("hetz/w/.workspace/.keep", ""),
+        ("example-linux/w/.workspace/.keep", ""),
     ]);
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("--catalog")
@@ -384,8 +384,8 @@ fn environment_expanded_canonical_relative_workspace_is_clean() {
 fn a_missing_catalog_rooted_path_is_an_error() {
     // The renderer's own output — its absence is a real render bug.
     let c = catalog(&[(
-        "hetz/w/agent.kdl",
-        r#"agent "w" { host "hetz"; type "service"; workspace "$CATALOG/not-emitted"; pty "agent" { command "x" } }"#,
+        "example-linux/w/agent.kdl",
+        r#"agent "w" { host "example-linux"; type "service"; workspace "$CATALOG/not-emitted"; pty "agent" { command "x" } }"#,
     )]);
     assert!(has(&validate(c.path()), "bad-path", Severity::Error));
 }
@@ -395,8 +395,8 @@ fn a_missing_external_path_is_only_a_warning() {
     // The workspace repo may not be checked out on the host running validate (≠ the run host) — a
     // nix build gate legitimately validates a catalog whose workspace lives elsewhere.
     let c = catalog(&[(
-        "hetz/w/agent.kdl",
-        r#"agent "w" { host "hetz"; type "service"; workspace "/no/such/dir/xyz123"; pty "agent" { command "x" } }"#,
+        "example-linux/w/agent.kdl",
+        r#"agent "w" { host "example-linux"; type "service"; workspace "/no/such/dir/xyz123"; pty "agent" { command "x" } }"#,
     )]);
     let r = validate(c.path());
     assert!(has(&r, "bad-path", Severity::Warn));
@@ -411,10 +411,10 @@ fn a_missing_external_path_is_only_a_warning() {
 #[test]
 fn a_remote_hosts_missing_external_path_is_not_a_local_warning() {
     let c = catalog(&[(
-        "hetz/w/agent.kdl",
-        r#"agent "w" { host "hetz"; type "service"; workspace "/no/such/dir/xyz123"; pty "agent" { command "x" } }"#,
+        "example-linux/w/agent.kdl",
+        r#"agent "w" { host "example-linux"; type "service"; workspace "/no/such/dir/xyz123"; pty "agent" { command "x" } }"#,
     )]);
-    let r = validate_for_host(c.path(), "Silber");
+    let r = validate_for_host(c.path(), "ExampleMac");
     assert_eq!(r.errors(), 0, "unexpected errors: {:?}", r.issues);
     assert_eq!(
         r.warnings(),
@@ -427,8 +427,8 @@ fn a_remote_hosts_missing_external_path_is_not_a_local_warning() {
 #[test]
 fn an_environment_expanded_absolute_path_is_checked_normally() {
     let c = catalog(&[(
-        "hetz/w/agent.kdl",
-        r#"agent "w" { host "hetz"; type "service"; workspace "$HOME/repo"; pty "agent" { command "x" } }"#,
+        "example-linux/w/agent.kdl",
+        r#"agent "w" { host "example-linux"; type "service"; workspace "$HOME/repo"; pty "agent" { command "x" } }"#,
     )]);
     assert!(!has(&validate(c.path()), "bad-path", Severity::Error));
 }
@@ -437,8 +437,8 @@ fn an_environment_expanded_absolute_path_is_checked_normally() {
 fn a_catalog_rooted_path_that_exists_is_clean() {
     let c = catalog(&[
         (
-            "hetz/w/agent.kdl",
-            r#"agent "w" { host "hetz"; type "service"; workspace "$CATALOG/repo"; pty "agent" { command "x" } }"#,
+            "example-linux/w/agent.kdl",
+            r#"agent "w" { host "example-linux"; type "service"; workspace "$CATALOG/repo"; pty "agent" { command "x" } }"#,
         ),
         ("repo/.keep", ""),
     ]);
@@ -449,12 +449,12 @@ fn a_catalog_rooted_path_that_exists_is_clean() {
 fn a_duplicate_bus_id_is_an_error() {
     let c = catalog(&[
         (
-            "hetz/one/agent.kdl",
-            r#"agent "twin" { host "hetz"; type "service"; pty "agent" { command "a" } }"#,
+            "example-linux/one/agent.kdl",
+            r#"agent "twin" { host "example-linux"; type "service"; pty "agent" { command "a" } }"#,
         ),
         (
-            "hetz/two/agent.kdl",
-            r#"agent "twin" { host "hetz"; type "service"; pty "agent" { command "b" } }"#,
+            "example-linux/two/agent.kdl",
+            r#"agent "twin" { host "example-linux"; type "service"; pty "agent" { command "b" } }"#,
         ),
     ]);
     assert!(has(&validate(c.path()), "dup-id", Severity::Error));
@@ -475,8 +475,8 @@ fn explicit_identity_and_host_are_path_independent_but_still_unique() {
 #[test]
 fn an_unrendered_service_is_not_runnable() {
     let c = catalog(&[(
-        "hetz/w/agent.kdl",
-        r#"agent "w" { host "hetz"; type "service" }"#,
+        "example-linux/w/agent.kdl",
+        r#"agent "w" { host "example-linux"; type "service" }"#,
     )]);
     assert!(has(&validate(c.path()), "not-runnable", Severity::Error));
 }
@@ -484,9 +484,9 @@ fn an_unrendered_service_is_not_runnable() {
 #[test]
 fn fleet_validation_compiles_remote_driver_launches() {
     let c = catalog(&[(
-        "Silber/worker/agent.kdl",
+        "ExampleMac/worker/agent.kdl",
         r#"agent "worker" {
-  host "Silber"
+  host "ExampleMac"
   workspace "/tmp"
   claude { prompt "boot" }
   delivery-readiness "credential" account-id="tokengate/shared"
@@ -526,13 +526,13 @@ fn validation_reports_shared_task_compiler_errors() {
 
 #[test]
 fn a_generated_ding_sidecar_is_not_authored_runnable_work() {
-    let c = catalog(&[("hetz/w/agent.kdl", r#"agent "w" { host "hetz"; ding }"#)]);
+    let c = catalog(&[("example-linux/w/agent.kdl", r#"agent "w" { host "example-linux"; ding }"#)]);
     assert!(has(&validate(c.path()), "not-runnable", Severity::Error));
 }
 
 #[test]
 fn ls_marks_a_generated_ding_only_agent_as_unrendered() {
-    let c = catalog(&[("hetz/w/agent.kdl", r#"agent "w" { host "hetz"; ding }"#)]);
+    let c = catalog(&[("example-linux/w/agent.kdl", r#"agent "w" { host "example-linux"; ding }"#)]);
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_st2"))
         .arg("--catalog")
         .arg(c.path())
@@ -578,14 +578,14 @@ fn a_missing_render_source_is_an_error() {
     let workspace = tempfile::tempdir().unwrap();
     let agent = format!(
         r#"agent "w" {{
-  host "hetz"
+  host "example-linux"
   workspace "{}"
   command "x"
   render {{ copy "_templates/missing.md" "AGENTS.md" }}
 }}"#,
         workspace.path().display()
     );
-    let c = catalog(&[("hetz/w/agent.kdl", &agent)]);
+    let c = catalog(&[("example-linux/w/agent.kdl", &agent)]);
     assert!(has(&validate(c.path()), "render-error", Severity::Error));
 }
 
@@ -594,14 +594,14 @@ fn a_non_boolean_render_executable_property_is_an_error() {
     let workspace = tempfile::tempdir().unwrap();
     let agent = format!(
         r#"agent "w" {{
-  host "hetz"
+  host "example-linux"
   workspace "{}"
   command "x"
   render {{ file "tool" "content" executable="yes" }}
 }}"#,
         workspace.path().display()
     );
-    let c = catalog(&[("hetz/w/agent.kdl", &agent)]);
+    let c = catalog(&[("example-linux/w/agent.kdl", &agent)]);
     let report = validate(c.path());
     let issue = report
         .issues
@@ -616,8 +616,8 @@ fn a_non_boolean_render_executable_property_is_an_error() {
 fn a_nameless_task_is_an_error() {
     // A `pty` block with no name is silently dropped by the parser — the task never runs.
     let c = catalog(&[(
-        "hetz/w/agent.kdl",
-        r#"agent "w" { host "hetz"; type "service"; pty { command "claude" } }"#,
+        "example-linux/w/agent.kdl",
+        r#"agent "w" { host "example-linux"; type "service"; pty { command "claude" } }"#,
     )]);
     assert!(has(
         &validate(c.path()),
@@ -629,9 +629,9 @@ fn a_nameless_task_is_an_error() {
 #[test]
 fn the_future_schedule_preview_is_explicitly_rejected() {
     let c = catalog(&[(
-        "hetz/w/agent.kdl",
+        "example-linux/w/agent.kdl",
         r#"agent "w" {
-  host "hetz"
+  host "example-linux"
   command "x"
   schedule "local-health" {
     every "2h"
@@ -766,12 +766,12 @@ fn a_dangling_supervisor_is_an_error() {
     // structural error, not a warning.
     let c = catalog(&[
         (
-            "hetz/base/agent.kdl",
-            r#"agent "base" { host "hetz"; command "x" }"#,
+            "example-linux/base/agent.kdl",
+            r#"agent "base" { host "example-linux"; command "x" }"#,
         ),
         (
-            "hetz/w/agent.kdl",
-            r#"agent "w" { host "hetz"; type "service"; supervisor "ghost"; pty "agent" { command "x" } }"#,
+            "example-linux/w/agent.kdl",
+            r#"agent "w" { host "example-linux"; type "service"; supervisor "ghost"; pty "agent" { command "x" } }"#,
         ),
     ]);
     let r = validate(c.path());
@@ -783,16 +783,16 @@ fn a_dangling_supervisor_is_an_error() {
 fn a_fully_qualified_supervisor_in_the_catalog_is_clean() {
     let c = catalog(&[
         (
-            "Silber/cos/agent.kdl",
-            r#"agent "cos" { host "Silber"; command "x" }"#,
+            "ExampleMac/cos/agent.kdl",
+            r#"agent "cos" { host "ExampleMac"; command "x" }"#,
         ),
         (
-            "hetz/base/agent.kdl",
-            r#"agent "base" { host "hetz"; command "x" }"#,
+            "example-linux/base/agent.kdl",
+            r#"agent "base" { host "example-linux"; command "x" }"#,
         ),
         (
-            "hetz/w/agent.kdl",
-            r#"agent "w" { host "hetz"; supervisor "Silber.cos"; command "x" }"#,
+            "example-linux/w/agent.kdl",
+            r#"agent "w" { host "example-linux"; supervisor "ExampleMac.cos"; command "x" }"#,
         ),
     ]);
     let r = validate(c.path());
@@ -909,7 +909,7 @@ fn a_host_may_have_no_active_root() {
 #[test]
 fn an_identity_folder_mismatch_is_a_warning() {
     let c = catalog(&[(
-        "hetz/folder-name/agent.kdl",
+        "example-linux/folder-name/agent.kdl",
         r#"agent "content-name" { type "service"; pty "agent" { command "x" } }"#,
     )]);
     assert!(has(&validate(c.path()), "id-path-mismatch", Severity::Warn));
@@ -936,11 +936,11 @@ fn a_dangling_overlay_import_is_a_warning() {
     std::fs::create_dir_all(ws.join(".claude/rules")).unwrap();
     std::fs::write(ws.join(".claude/rules/st2.md"), "@../../.st2/PERSONA.md\n").unwrap();
     let agent = format!(
-        r#"agent "w" {{ host "hetz"; type "service"; workspace {:?}; pty "agent" {{ command "x" }} }}"#,
+        r#"agent "w" {{ host "example-linux"; type "service"; workspace {:?}; pty "agent" {{ command "x" }} }}"#,
         ws.display()
     );
-    std::fs::create_dir_all(d.path().join("hetz/w")).unwrap();
-    std::fs::write(d.path().join("hetz/w/agent.kdl"), agent).unwrap();
+    std::fs::create_dir_all(d.path().join("example-linux/w")).unwrap();
+    std::fs::write(d.path().join("example-linux/w/agent.kdl"), agent).unwrap();
     assert!(has(&validate(d.path()), "dangling-import", Severity::Warn));
 }
 
@@ -1001,8 +1001,8 @@ fn run_validate(args: &[&std::ffi::OsStr]) -> std::process::Output {
 #[test]
 fn cli_exits_zero_on_a_clean_catalog() {
     let c = catalog(&[(
-        "hetz/w/agent.kdl",
-        r#"agent "w" { host "hetz"; type "service"; pty "agent" { command "x" } }"#,
+        "example-linux/w/agent.kdl",
+        r#"agent "w" { host "example-linux"; type "service"; pty "agent" { command "x" } }"#,
     )]);
     let out = run_validate(&[c.path().as_os_str()]);
     assert!(
@@ -1015,13 +1015,13 @@ fn cli_exits_zero_on_a_clean_catalog() {
 #[test]
 fn cli_host_scope_keeps_remote_paths_out_of_strict_validation() {
     let c = catalog(&[(
-        "hetz/w/agent.kdl",
-        r#"agent "w" { host "hetz"; workspace "/no/such/dir/xyz123"; command "x" }"#,
+        "example-linux/w/agent.kdl",
+        r#"agent "w" { host "example-linux"; workspace "/no/such/dir/xyz123"; command "x" }"#,
     )]);
     let out = run_validate(&[
         c.path().as_os_str(),
         std::ffi::OsStr::new("--host"),
-        std::ffi::OsStr::new("Silber"),
+        std::ffi::OsStr::new("ExampleMac"),
         std::ffi::OsStr::new("--strict"),
     ]);
     assert!(
@@ -1036,14 +1036,14 @@ fn cli_host_scope_keeps_remote_paths_out_of_strict_validation() {
 fn cli_exits_nonzero_on_an_error_and_strict_promotes_warnings() {
     // An error catalog exits non-zero without --strict.
     let err = catalog(&[(
-        "hetz/w/agent.kdl",
-        r#"agent "w" { host "hetz"; type "srvice" }"#,
+        "example-linux/w/agent.kdl",
+        r#"agent "w" { host "example-linux"; type "srvice" }"#,
     )]);
     assert!(!run_validate(&[err.path().as_os_str()]).status.success());
 
     // A warning-only catalog exits 0 normally and exits 1 under --strict.
     let warn = catalog(&[(
-        "hetz/folder-name/agent.kdl",
+        "example-linux/folder-name/agent.kdl",
         r#"agent "content-name" { type "service"; pty "agent" { command "x" } }"#,
     )]);
     assert!(run_validate(&[warn.path().as_os_str()]).status.success());
@@ -1058,12 +1058,12 @@ fn cli_exits_nonzero_on_an_error_and_strict_promotes_warnings() {
 #[test]
 fn cli_json_is_well_formed() {
     let c = catalog(&[(
-        "hetz/w/agent.kdl",
-        r#"agent "w" { host "hetz"; type "srvice"; pty "agent" { command "x" } }"#,
+        "example-linux/w/agent.kdl",
+        r#"agent "w" { host "example-linux"; type "srvice"; pty "agent" { command "x" } }"#,
     )]);
     let out = run_validate(&[c.path().as_os_str(), std::ffi::OsStr::new("--json")]);
     let v: serde_json::Value = serde_json::from_slice(&out.stdout).expect("valid JSON");
-    assert_eq!(v["schema"], "st2.validate.v2");
+    assert_eq!(v["schema"], "st.validate.v2");
     assert_eq!(v["policyProfile"], "st2.core+catalog.v1");
     let revision = v["agentSpecRevision"]
         .as_str()
@@ -1121,11 +1121,11 @@ fn a_hand_authored_native_catalog_validates_without_errors() {
 fn an_unbindable_session_socket_path_is_rejected_at_admission() {
     let long_identity = "a".repeat(200);
     let c = catalog(&[(
-        &format!("hetz/{long_identity}/agent.kdl"),
-        &format!(r#"agent "{long_identity}" {{ host "hetz"; pty "agent" {{ command "x" }} }}"#),
+        &format!("example-linux/{long_identity}/agent.kdl"),
+        &format!(r#"agent "{long_identity}" {{ host "example-linux"; pty "agent" {{ command "x" }} }}"#),
     )]);
 
-    let r = validate_for_host(c.path(), "hetz");
+    let r = validate_for_host(c.path(), "example-linux");
     assert!(
         has(&r, "socket-path-too-long", Severity::Error),
         "unbindable socket path must fail admission: {:?}",
@@ -1156,20 +1156,20 @@ fn inactive_unbindable_session_sockets_are_accepted() {
     ] {
         let declaration = format!(
             r#"agent "{long_identity}" {{
-  host "hetz"
-  supervisor "hetz.base"
+  host "example-linux"
+  supervisor "example-linux.base"
   {lifecycle}
   pty "agent" {{ command "x" }}
 }}"#
         );
         let c = catalog(&[
             (
-                "hetz/base/agent.kdl",
-                r#"agent "base" { host "hetz"; command "x" }"#,
+                "example-linux/base/agent.kdl",
+                r#"agent "base" { host "example-linux"; command "x" }"#,
             ),
-            (&format!("hetz/{long_identity}/agent.kdl"), &declaration),
+            (&format!("example-linux/{long_identity}/agent.kdl"), &declaration),
         ]);
-        let report = validate_for_host(c.path(), "hetz");
+        let report = validate_for_host(c.path(), "example-linux");
         assert!(
             !has(&report, "socket-path-too-long", Severity::Error),
             "{name}: inactive declarations do not bind sockets: {:?}",
@@ -1187,34 +1187,34 @@ fn inactive_unbindable_session_sockets_are_accepted() {
 #[test]
 fn activating_an_unbindable_session_socket_restores_the_admission_refusal() {
     let long_identity = "a".repeat(200);
-    let path = format!("hetz/{long_identity}/agent.kdl");
+    let path = format!("example-linux/{long_identity}/agent.kdl");
     let suspended = format!(
         r#"agent "{long_identity}" {{
-  host "hetz"
-  supervisor "hetz.base"
+  host "example-linux"
+  supervisor "example-linux.base"
   desired-state "suspended" reason="Waiting"
   pty "agent" {{ command "x" }}
 }}"#
     );
     let c = catalog(&[
         (
-            "hetz/base/agent.kdl",
-            r#"agent "base" { host "hetz"; command "x" }"#,
+            "example-linux/base/agent.kdl",
+            r#"agent "base" { host "example-linux"; command "x" }"#,
         ),
         (&path, &suspended),
     ]);
-    let inactive = validate_for_host(c.path(), "hetz");
+    let inactive = validate_for_host(c.path(), "example-linux");
     assert!(!has(&inactive, "socket-path-too-long", Severity::Error));
     assert_eq!(inactive.errors(), 0, "{:?}", inactive.issues);
 
     std::fs::write(
         c.path().join(path),
         format!(
-            r#"agent "{long_identity}" {{ host "hetz"; supervisor "hetz.base"; pty "agent" {{ command "x" }} }}"#
+            r#"agent "{long_identity}" {{ host "example-linux"; supervisor "example-linux.base"; pty "agent" {{ command "x" }} }}"#
         ),
     )
     .unwrap();
-    let report = validate_for_host(c.path(), "hetz");
+    let report = validate_for_host(c.path(), "example-linux");
     assert!(
         has(&report, "socket-path-too-long", Severity::Error),
         "activation must refuse before attempting the impossible bind: {:?}",
@@ -1227,11 +1227,11 @@ fn activating_an_unbindable_session_socket_restores_the_admission_refusal() {
 fn a_long_exec_task_id_is_not_a_socket_path_issue() {
     let long_identity = "a".repeat(200);
     let c = catalog(&[(
-        &format!("hetz/{long_identity}/agent.kdl"),
-        &format!(r#"agent "{long_identity}" {{ host "hetz"; exec "job" {{ command "true" }} }}"#),
+        &format!("example-linux/{long_identity}/agent.kdl"),
+        &format!(r#"agent "{long_identity}" {{ host "example-linux"; exec "job" {{ command "true" }} }}"#),
     )]);
 
-    let r = validate_for_host(c.path(), "hetz");
+    let r = validate_for_host(c.path(), "example-linux");
     assert!(
         !has(&r, "socket-path-too-long", Severity::Error),
         "an exec task never binds a session socket: {:?}",
@@ -1251,7 +1251,7 @@ fn another_hosts_long_identity_is_not_judged_against_this_hosts_pty_root() {
         ),
     )]);
 
-    let r = validate_for_host(c.path(), "hetz");
+    let r = validate_for_host(c.path(), "example-linux");
     assert!(
         !has(&r, "socket-path-too-long", Severity::Error),
         "only the selected host's tasks are judged against its pty root: {:?}",

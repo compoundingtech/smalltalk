@@ -277,7 +277,7 @@ cleanup, and active cleanup. It covers payload/filename mismatch; missing, extra
 unreadable, and unsupported-version head/node/row state; digest, predecessor, ordinal, count, and
 genesis mismatch; valid-prefix rollback with an unexplained suffix; idempotency scope; unkeyed
 response loss; symmetric external-eval exclusion; and recipient-independent reads.
-`crates/st2-wire/src/message.rs` verifies the coverage tags, `to` direction, and body omission.
+`crates/st-wire/src/message.rs` verifies the coverage tags, `to` direction, and body omission.
 
 The catalog performance procedure is defined in the experiment record. It compares Sent with
 same-sender message-ls on one captured catalog and must satisfy both the absolute and relative

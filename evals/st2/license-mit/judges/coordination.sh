@@ -19,7 +19,7 @@ SM="${ST_ROOT:-$ROOT}"                                       # flat native st2 b
 SUP_ID="${SUP_ID:-mix.sup}"; WORKER_ID="${WORKER_ID:-mix.worker}"; REQUESTER="${REQUESTER:-requester}"
 TIMEOUT_SECONDS="${COORDINATION_TIMEOUT_SECONDS:-900}"
 
-# Resolve an id to its on-disk bus dir, tolerating a host/team prefix (e.g. hetz.mix.sup or mix.sup).
+# Resolve an id to its on-disk bus dir, tolerating a host/team prefix (e.g. example-linux.mix.sup or mix.sup).
 busdir(){ local id="$1" d; d="$(ls -d "$SM"/*."$id" "$SM/$id" 2>/dev/null | head -1)"
   d="${d:-$SM/$id}"; [ -d "$d/resources/inbox" ] && d="$d/resources"; printf '%s\n' "$d"; }
 # messages in <owner>'s inbox+archive whose `from:` is <from>, tolerating a leading host/team prefix.

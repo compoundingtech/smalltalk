@@ -5,14 +5,14 @@ umask 077
 : "${ST3_BIN:?set ST3_BIN to the installed st3 executable}"
 : "${ST_AGENT:?set ST_AGENT to the claimed st3 operator identity}"
 : "${FABRIC_BIN:?set FABRIC_BIN to the installed Fabric executable}"
-: "${ST3_FRIEND_READY_IDLE_START_UNIX:?set the first local Silber sample epoch}"
+: "${ST3_FRIEND_READY_IDLE_START_UNIX:?set the first local ExampleMac sample epoch}"
 : "${ST3_FRIEND_READY_MESSAGE_START_UNIX:?set the complete-logging message monitor epoch}"
 
 for value in "$ST3_FRIEND_READY_IDLE_START_UNIX" "$ST3_FRIEND_READY_MESSAGE_START_UNIX"; do
   [[ $value =~ ^[0-9]+$ ]] || { echo 'invalid gate start epoch' >&2; exit 2; }
 done
 
-MONITOR=agent/fleet/st3/delivery-soak-20260924/monitor
+MONITOR=agent/example/st3/delivery-soak-20260924/monitor
 STATE_DIR=${ST3_GATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/st3/friend-ready-gates}
 REPORT_DIR=$(/usr/bin/dirname "$0")
 IDLE_REPORT="$REPORT_DIR/st3-idle-soak-report"
@@ -85,8 +85,8 @@ if (( now >= ST3_FRIEND_READY_IDLE_START_UNIX + 7200 )); then
       <<<"$idle_risk_output")
     if /usr/bin/jq -e 'all(.hosts[];
       .quiet_cpu_median_pct != null and .quiet_cpu_median_pct >= 0 and
-      (if .host == "hetz" then .quiet_cpu_median_pct <= 15
-       elif .host == "silber" then .quiet_cpu_median_pct <= 50 else false end))' \
+      (if .host == "example-linux" then .quiet_cpu_median_pct <= 15
+       elif .host == "example-mac" then .quiet_cpu_median_pct <= 50 else false end))' \
       <<<"$idle_risk_output" >/dev/null; then
       idle_risk=within-limit
     else

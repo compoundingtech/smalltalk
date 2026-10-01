@@ -29,7 +29,7 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
   await settle();
   assert.equal(sockets.length, 1);
   assert.deepEqual(sockets[0].sent, [
-    { kind: 'subscribe', id: 'attention', collection: 'attention', limit: 50 },
+    { kind: 'subscribe', id: 'attention', collection: 'attention', limit: 200 },
     { kind: 'subscribe', id: 'missions', collection: 'missions', limit: 200 },
     { kind: 'subscribe', id: 'agents', collection: 'agents', limit: 200 },
   ]);
@@ -135,8 +135,8 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
   const feed = new Feed(client, handlers, new ForegroundGate('active'), () => 'action/test', [5]);
   await settle();
   const frames = [], issues = [];
-  const follow = feed.followConversation('agent/fleet/worker', { onEntries: frame => frames.push(frame), onIssue: issue => issues.push(issue) });
-  assert.deepEqual(sockets[0].sent.at(-1), { kind: 'subscribe', id: 'conversation', collection: 'conversation', conversation: 'agent/fleet/worker' });
+  const follow = feed.followConversation('agent/example/worker', { onEntries: frame => frames.push(frame), onIssue: issue => issues.push(issue) });
+  assert.deepEqual(sockets[0].sent.at(-1), { kind: 'subscribe', id: 'conversation', collection: 'conversation', conversation: 'agent/example/worker' });
   sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: true, items: [{ id: 'entry/1' }], has_more: true });
   sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: false, items: [{ id: 'entry/2' }] });
   assert.deepEqual(frames.map(frame => [frame.replace, frame.items.map(item => item.id), frame.hasMore]), [[true, ['entry/1'], true], [false, ['entry/2'], false]]);
@@ -152,3 +152,29 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
   assert.ok(!subscribed(sockets[2]).includes('conversation'), 'a closed conversation is not followed again');
   feed.close();
 }
+
+{
+  // The person's glasses ride the socket while followed: a snapshot, changes, and again after a
+  // reconnect; nothing once closed.
+  const { client, sockets } = fakeClient();
+  const { handlers } = watch();
+  const feed = new Feed(client, handlers, new ForegroundGate('active'), () => 'action/test', [5]);
+  await settle();
+  const seen = [], issues = [];
+  const follow = feed.followGlasses({ onGlasses: glasses => seen.push(glasses.map(glass => glass.body.name)), onIssue: issue => issues.push(issue) });
+  assert.deepEqual(sockets[0].sent.at(-1), { kind: 'subscribe', id: 'glasses', collection: 'glasses', limit: 100 });
+  const glass = (id, name) => ({ id: `glass/person/avery/${id}`, kind: 'glass', revision: 'r1', updated_at: '', deleted: false, body: { name, tabs: [] } });
+  const snapshot = { id: 'snapshot/1', host_id: 'host/one', store_index: 1, projection_version: '1', created_at: '' };
+  sockets[0].frame({ kind: 'snapshot', id: 'glasses', collection: 'glasses', snapshot, items: [glass('a', 'main')], order: ['glass/person/avery/a'], has_more: false });
+  sockets[0].frame({ kind: 'changes', id: 'glasses', collection: 'glasses', snapshot, upserts: [glass('b', 'review')], removes: [], order: ['glass/person/avery/a', 'glass/person/avery/b'], has_more: false });
+  assert.deepEqual(seen, [['main'], ['main', 'review']]);
+  sockets[0].frame({ kind: 'error', id: 'glasses', collection: 'glasses', code: 'forbidden', message: 'this device lacks read.glasses' });
+  assert.equal(issues.at(-1), 'forbidden: this device lacks read.glasses');
+  sockets[0].drop(new Error('lost'));
+  await settle();
+  assert.ok(subscribed(sockets[1]).includes('glasses'), 'a reconnect follows the glasses again');
+  follow.close();
+  assert.deepEqual(sockets[1].sent.at(-1), { kind: 'unsubscribe', id: 'glasses' });
+  feed.close();
+}
+

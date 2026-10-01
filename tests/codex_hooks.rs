@@ -28,7 +28,7 @@ impl Fixture {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let catalog = tmp.path().join("catalog");
-        let agent = catalog.join("agents/Silber/cos");
+        let agent = catalog.join("agents/ExampleMac/cos");
         let context = context::context_dir(&agent);
         let inbox = message::inbox_dir(&agent);
         fs::create_dir_all(&context).unwrap();
@@ -36,9 +36,9 @@ impl Fixture {
         fs::write(
             agent.join("agent.kdl"),
             r#"agent "cos" {
-  host "Silber"
+  host "ExampleMac"
   workspace "/tmp"
-  env { ST_AGENT "Silber.cos" }
+  env { ST_AGENT "ExampleMac.cos" }
   command "codex"
   ding
 }"#,
@@ -63,7 +63,7 @@ impl Fixture {
     fn run(&self, script: &str) -> Output {
         self.run_path(
             &Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("hooks")
+                .join("crates/st-drivers/hooks")
                 .join(script),
         )
     }
@@ -75,7 +75,7 @@ impl Fixture {
             .env("PATH", format!("{}:{current_path}", self.bin.display()))
             .env("ST_ROOT", &self.catalog)
             .env("CATALOG", &self.catalog)
-            .env("ST_AGENT", "Silber.cos")
+            .env("ST_AGENT", "ExampleMac.cos")
             .env("ST_HOOKS", self.state.join("st2/hooks"))
             .env("XDG_STATE_HOME", &self.state)
             .output()
@@ -133,7 +133,7 @@ fn session_start_emits_current_codex_context_envelope() {
     context::write_now(&fixture.context, "working on the materializer\n").unwrap();
     message::send_to_inbox(
         &fixture.inbox,
-        "Silber.worker",
+        "ExampleMac.worker",
         Some("status"),
         None,
         &[],
@@ -185,7 +185,7 @@ fn stop_uses_since_cursor_and_emits_only_new_messages() {
     let fixture = Fixture::new();
     message::send_to_inbox(
         &fixture.inbox,
-        "Silber.worker",
+        "ExampleMac.worker",
         Some("first"),
         None,
         &[],
@@ -204,7 +204,7 @@ fn stop_uses_since_cursor_and_emits_only_new_messages() {
     std::thread::sleep(Duration::from_millis(3));
     message::send_to_inbox(
         &fixture.inbox,
-        "Silber.worker",
+        "ExampleMac.worker",
         Some("second"),
         None,
         &[],
@@ -228,7 +228,7 @@ fn installed_versioned_stop_hook_preserves_the_scope_a_envelope_and_cursor() {
     assert!(hooks.to_string_lossy().contains("/sets/sha256-"));
     message::send_to_inbox(
         &fixture.inbox,
-        "Silber.worker",
+        "ExampleMac.worker",
         Some("installed"),
         None,
         &[],
@@ -250,13 +250,13 @@ fn stop_fails_open_without_required_commands() {
     let output = Command::new(bash())
         .arg(
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("hooks")
+                .join("crates/st-drivers/hooks")
                 .join("codex-stop.sh"),
         )
         .env("PATH", fixture._tmp.path().join("missing-bin"))
         .env("ST_ROOT", &fixture.catalog)
         .env("CATALOG", &fixture.catalog)
-        .env("ST_AGENT", "Silber.cos")
+        .env("ST_AGENT", "ExampleMac.cos")
         .env("ST_HOOKS", fixture.state.join("st2/hooks"))
         .env("XDG_STATE_HOME", &fixture.state)
         .output()

@@ -248,12 +248,16 @@ mission-authority {
   publish "project/generated/*"
   start "project/generated/*"
   revise "project/generated/*"
+  cancel "project/generated/*"
 }
 ```
 
 Use exact mission IDs or terminal `/*` namespaces without the `mission/` prefix. Name narrower
 rules than the default, such as `publish "fleet/website/docs/*"`, or withhold all mission authority
-with `mission-authority "none"`. Only a person writes either form into a top-level seat.
+with `mission-authority "none"`. Cancellation needs an explicit `cancel` rule; the project default
+continues to grant only `publish`, `start`, and `revise`. Use `st missions cancel RUN --as agent/PATH
+--reason TEXT` to cancel a run of a mission under a granted path. The daemon checks the current
+grant and the run generation before cancellation.
 
 An agent publishing a generated nested mission needs `publish` authority, a claimed producing step,
 and an exact `produces-mission` match. Use `st work publish-mission` for that case.
@@ -321,9 +325,33 @@ recorded with the agent as its actor. The daemon reads the grant from the agent'
 declaration when the move arrives, as it does for mission authority. [Agent seat
 queues](seat-queue.md) describes the queue and the move.
 
-Only a person grants authority in a top-level agent declaration. When an agent publishes a
-top-level agent declaration that carries `mission-authority` or `queue-authority`, for itself or
-for another seat, the daemon refuses it with `agent-authority-grant-denied`.
+## Agent declaration authority
+
+A person can authorize a seat to apply, start, and stop agent declarations under named paths:
+
+```kdl
+agent-authority {
+  apply "fleet/example/operations/*"
+  apply "fleet/example/ci/*"
+}
+```
+
+Each `apply` rule names an exact agent identity or a terminal `/*` namespace without `agent/`.
+The seat uses its own identity with `st agents apply FILE --as agent/PATH`, `st agents start`,
+and `st agents stop`. Existing `seat-authority { declare PATH; stop PATH }` rules still work.
+
+An agent with `agent-authority` may also delegate authority in a top-level declaration it applies.
+Every proposed rule must have the same authority kind and verb as a rule the caller currently
+holds, over the same or a narrower path. This covers `mission-authority`, `queue-authority`,
+`seat-authority`, and `agent-authority` itself. An exact rule cannot delegate a namespace, and
+`project/*` does not cover `project` or `project-other/*`. A wider path, extra verb, or different
+kind is refused with `agent-authority-grant-denied`, which names the refused rule. The candidate
+cannot grant itself permission: checks read the caller's current declaration before applying it.
+Delegated seats have no implicit project mission authority; their explicit rules are the grant.
+
+Mission publication and revision retain their existing guard: authority in agents declared
+inside a mission, step, or nested mission must match authority already published for that agent.
+This includes `agent-authority`; publishing a mission cannot bypass declaration grants.
 
 ## Planning a new mission
 
@@ -453,61 +481,32 @@ Mission-level, loop, and agentless gates use approve mode.
 
 ## Human attention
 
-`st attention ls --as person/NAME` is the complete inbox for one explicit person. It includes these current items:
-
-- pending human gates;
-- launch previews that have no blockers;
-- pending mission revision approvals;
-- unread messages to a person;
-- explicit fault attention requests.
+`st attention ls --as person/NAME` reads current source state: ready person steps, human
+gates, valid launch previews, outstanding proposal reviews, unread person messages/reminders,
+and failures whose current source needs a person. Priority precedes waiting age. Each card's
+identity includes its source, recipient and waiting episode. A cancelled or retired owner,
+removed source, replacement generation or changed attempt removes the card before cleanup.
+Failed sources can retain their own repair fault. Held subscription requests do not appear.
 
 ```sh
 st attention ls --as person/operator
-st attention ls --as person/operator --json
+st work ask --for person/operator --title "Choose a release date" \
+  --reason "The release needs a date" --step step-run/release/prepare \
+  --as agent/release/operator --idempotency-key release-date
+st work done step-run/release/ask-ID --as person/operator --summary "Friday"
 ```
 
-The formatted view shows each item with its age, graph context, targets, and exact action commands. The JSON view returns the same items as structured data. The list uses oldest-first order across all item kinds.
+An ask creates a person-assigned runtime step in the live owning generation. Its origin waits in
+`waiting-person`, without a lease or time/retry consumption. Only the assigned person can
+complete it. The response resumes the same origin attempt with a new readiness epoch. A requester
+can use `st work cancel-ask STEP --as AGENT --summary TEXT`. An unclaimed live requester can
+use `--new-run NAME`; claimed work must name `--step`. Repeated keys return the same source.
 
-A message leaves attention when the person reads it. Reading a sent message records delivery before the read. The person does not need to archive it. A blocked launch preview does not enter attention.
-
-The runtime does not infer a fault request from ordinary diagnostics. A component creates one explicit request when it needs a person:
-
-```sh
-st attention request \
-  --for person/operator \
-  --title "The deployment needs recovery" \
-  --reason "The automatic rollback could not restore the service." \
-  --severity error \
-  --target mission-run/release/demo \
-  --as agent/release/operator \
-  --idempotency-key release-demo-recovery
-```
-
-The idempotency key gives one stable `attention/ID` subject. A retry with the same key returns the same request.
-
-A request names what closes it, so no item waits in an inbox after its cause is gone:
-
-- a target that can end, such as a step, run, generation, mission, agent, observer, subscription,
-  loop run, message, another attention item, or an observed pull request;
-- `--until CONDITION`, which st re-checks against every target;
-- `--step STEP_RUN`, which closes it when that step completes, fails, is cancelled, starts another
-  attempt, or leaves its run's current generation;
-- `--person-closes`, when nothing st observes can say the item is done.
-
-An agent's request that names none of these closes when the step that agent has claimed ends. st
-refuses any other request that names nothing, with `attention-closes-never`. `st doctor` lists every
-attention item that has been open for more than a day as `attention-age`.
-
-Any person can close a request. The person records whether the fault was resolved or dismissed:
-
-```sh
-st attention resolve attention/REQUEST_ID \
-  --outcome resolved \
-  --reason "The service is healthy after the manual rollback." \
-  --as person/operator
-```
-
-An attention request can target any registered graph subject. It does not change that subject or its lifecycle.
+A person message leaves on read or archive, without an age expiry. A launch needs its current
+valid preview. Faults describe source recovery and inspection; they have no independent dismiss
+state. Legacy `attention request`, `resolve` and `withdraw` return `attention-migrated`.
+Historical attention claims remain audit data; only provably live agent asks are imported as
+person steps. `st doctor` reads the same snapshot for attention age checks.
 
 ## Cancellation and cleanup
 

@@ -110,10 +110,33 @@ repeating a handoff already accepted by the native transport.
 The client message view carries the same `delivery` assessment, including the local recipient
 path when one is known. A remote path stays unverified. A message waiting more than ten seconds
 for read is visible as `waiting`; it stays durable. `st doctor` warns about stale local paths and
-overdue messages to current agents. Reading the message clears its pending-read warning.
+overdue graph read receipts for current agents. It excludes obsolete seat recipients and people,
+and distinguishes accepted native handoffs. A missing graph read receipt on a legacy channel
+does not prove that its provider failed to consume the envelope. Reading the message clears its
+pending-read warning. Both `driver claude` and the older `driver claude-mcp` are recognized as
+native delivery peers; ordinary mailbox inspection never refreshes this health assessment.
+
+Older Claude, Codex and OpenCode outer drivers poll with `include_closed=true` to archive
+consumed inbox files. Those polls count as legacy delivery activity when the local Unix peer
+is proven to be that recipient's native outer driver. An ordinary CLI history read, a poll for
+another recipient, or a channel process's history query does not count. Claude's MCP child
+watches inbox files; the outer `driver claude` process supplies the mailbox poll.
 
 The path must stay the same. A deploy that starts the daemon from a new path, such as a new store
 path, leaves every running seat on the old one, and st reports them as stale.
+
+The Home Manager module installs a real executable at `services.smalltalk.stateDir/bin/st3`
+and provides `st` as a relative symlink there. Activation copies a changed build to a temporary
+file in that directory and atomically renames it over `st3` before Home Manager restarts the
+daemon. Identical contents leave the file's inode and modification time unchanged, so a no-op
+activation does not make seats re-exec. Both the daemon and declaration-apply service use this
+stable executable, and the service PATH puts its directory first; `pty` still comes from the
+configured package. A systemd restart trigger or a build reference in the launchd plist makes
+Home Manager restart the daemon when the package changes despite its stable executable path.
+
+Seats already running an old Nix store path before this migration still watch that immutable
+path. They stay stale until restarted; installing the stable executable cannot move an existing
+seat's watch to it.
 
 `scripts/st3-graceful-messaging-eval/run` proves this end to end for each harness; see
 [the eval](../../evals/st3/graceful-messaging/README.md).

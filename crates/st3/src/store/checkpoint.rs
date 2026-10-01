@@ -938,6 +938,17 @@ fn claims_of_kind_in_order(
 /// Every answer about `subject` that a checkpoint must leave unchanged, as of the cut.
 fn subject_answers(connection: &Connection, subject: &str, cut: u128) -> Result<Value> {
     let mut answers = serde_json::Map::new();
+    if subject.starts_with("glass/") {
+        let person = st3_schema::glasses::owner(subject).map_err(anyhow::Error::new)?;
+        answers.insert(
+            "glasses".into(),
+            json!(super::glasses::glasses_at(
+                connection,
+                person,
+                i64::MAX as u64
+            )?),
+        );
+    }
     answers.insert(
         "actual".into(),
         json!(latest_actual_at(connection, subject, None)?),
@@ -1147,6 +1158,7 @@ fn answer_mismatches(
 /// reader answer. `copy` is a store file holding at least the sealed set; it is changed.
 pub fn prove_on_copy(copy: &Path, sealed: &SealedSet, plan: &DropPlan) -> Result<CheckpointProof> {
     let mut connection = Connection::open(copy)?;
+    projection_digest::register(&connection)?;
     connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = MEMORY;")?;
     let transaction = connection.transaction()?;
     // Keep only the sealed set.
@@ -1207,6 +1219,7 @@ pub fn prove_on_copy(copy: &Path, sealed: &SealedSet, plan: &DropPlan) -> Result
         .collect::<BTreeSet<_>>();
     replay_from_nothing(&transaction)?;
     let graph_digest_before = graph_digest(&transaction)?;
+    let digests_before = projection_digest::tables(&transaction)?;
     let before = reader_answers(&transaction, &subjects, sealed.cut_unix_ms)?;
     // As a trim does: tombstones first, which readers that walk ancestry pass through.
     record_checkpoint_tombstones_tx(
@@ -1221,7 +1234,15 @@ pub fn prove_on_copy(copy: &Path, sealed: &SealedSet, plan: &DropPlan) -> Result
     let after = reader_answers(&transaction, &subjects, sealed.cut_unix_ms)?;
     let mut mismatches = answer_mismatches(&before, &after);
     if graph_digest_before != graph_digest_after {
-        mismatches.insert(0, "graph".into());
+        mismatches.splice(
+            0..0,
+            projection_digest::differing(
+                &digests_before,
+                &projection_digest::tables(&transaction)?,
+            )
+            .into_iter()
+            .map(|table| format!("graph {table}")),
+        );
     }
     let proof = CheckpointProof {
         reader_digest_before: answers_digest(&before)?,
@@ -2787,14 +2808,15 @@ mod tests {
     }
 
     /// Plans a checkpoint over a copy of a real store and prints the dry run:
-    /// `ST3_CHECKPOINT_STORE=/var/tmp/copy.sqlite3 ST3_CHECKPOINT_ORIGIN=hetz
+    /// `ST3_CHECKPOINT_STORE=/var/tmp/copy.sqlite3 ST3_CHECKPOINT_ORIGIN=example-linux
     /// ST3_CHECKPOINT_DAY=2026-09-27 cargo test -p st3 --lib plan_a_copy_of_a_real_store --
     /// --ignored --nocapture`. The copy is changed; the store it came from is not read.
     #[test]
     #[ignore = "reads the store copy named by ST3_CHECKPOINT_STORE"]
     fn plan_a_copy_of_a_real_store() {
         let path = PathBuf::from(std::env::var("ST3_CHECKPOINT_STORE").unwrap());
-        let origin = std::env::var("ST3_CHECKPOINT_ORIGIN").unwrap_or_else(|_| "hetz".into());
+        let origin =
+            std::env::var("ST3_CHECKPOINT_ORIGIN").unwrap_or_else(|_| "example-linux".into());
         let day = std::env::var("ST3_CHECKPOINT_DAY").unwrap();
         let started = std::time::Instant::now();
         let store = Store::open(&path, origin).unwrap();

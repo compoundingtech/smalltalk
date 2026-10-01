@@ -387,16 +387,6 @@ fn seal_difference(ours: &SealTerms, theirs: &SealTerms) -> String {
 }
 
 /// The agent that asks for attention about checkpoints on this node.
-fn checkpoint_actor(origin: &str) -> String {
-    format!("agent/st3/checkpoint-{origin}")
-}
-
-fn attention_subject(checkpoint: &str) -> String {
-    format!(
-        "attention/checkpoint-{}",
-        checkpoint.trim_start_matches("checkpoint/")
-    )
-}
 
 impl Store {
     /// Every admitted `checkpoint.*` claim, in canonical order.
@@ -622,7 +612,6 @@ impl Store {
         }
         let stable = stable_checkpoints(&claims);
         let newest_stable = stable.keys().next_back().copied();
-        self.withdraw_checkpoint_attention(&claims, newest_stable, &mut actions)?;
         let cut = newest_due_cut(context.now_unix_ms);
         if cut == 0 || newest_stable.is_some_and(|stable| stable >= cut) {
             return Ok(actions);
@@ -667,7 +656,6 @@ impl Store {
                 )?;
             }
         }
-        self.request_checkpoint_attention(&claims, newest_stable, cut, context, &mut actions)?;
         Ok(actions)
     }
 
@@ -735,120 +723,65 @@ impl Store {
     /// The first checkpoint after the newest stable one that is still not stable
     /// `CHECKPOINT_ATTENTION_AFTER_MS` after it became due. The participant that sorts first
     /// among those that sealed asks the person to bring the others back or excuse them.
-    fn request_checkpoint_attention(
+    pub(super) fn checkpoint_attention_items(
         &self,
-        claims: &[CheckpointClaim],
-        newest_stable: Option<u128>,
-        cut: u128,
-        context: &CheckpointContext,
-        actions: &mut Vec<CheckpointAction>,
-    ) -> Result<()> {
+        person: Option<&str>,
+        as_of: u128,
+    ) -> Result<Vec<AttentionItemView>> {
+        if person.is_some_and(|person| person != "person/operator") {
+            return Ok(Vec::new());
+        }
+        let claims = self.checkpoint_claims()?;
+        let newest_stable = stable_checkpoints(&claims).keys().next_back().copied();
+        let due = newest_due_cut(as_of);
+        let cut = claims
+            .iter()
+            .filter_map(CheckpointClaim::seal_terms)
+            .map(|terms| terms.cut_unix_ms)
+            .filter(|cut| *cut <= due && newest_stable.is_none_or(|stable| *cut > stable))
+            .max();
+        let Some(cut) = cut else {
+            return Ok(Vec::new());
+        };
         let checkpoint = checkpoint_name(cut);
-        let seals = newest_seals(claims, &checkpoint);
-        let Some(terms) = seals.get(&self.origin) else {
-            return Ok(());
+        let seals = newest_seals(&claims, &checkpoint);
+        let Some((writer, terms)) = seals.first_key_value() else {
+            return Ok(Vec::new());
         };
         let first_waiting = newest_stable.map_or_else(
             || {
                 claims
                     .iter()
-                    .filter_map(|claim| claim.seal_terms())
+                    .filter_map(CheckpointClaim::seal_terms)
                     .map(|terms| terms.cut_unix_ms)
                     .min()
                     .unwrap_or(cut)
             },
             |stable| stable + DAY_MS,
         );
-        let waiting_since = first_waiting + 2 * DAY_MS;
-        if context.now_unix_ms < waiting_since + CHECKPOINT_ATTENTION_AFTER_MS {
-            return Ok(());
+        let since = first_waiting + 2 * DAY_MS;
+        if as_of < since + CHECKPOINT_ATTENTION_AFTER_MS {
+            return Ok(Vec::new());
         }
-        if seals.keys().next() != Some(&self.origin) {
-            return Ok(());
-        }
-        let waiting_for = terms
+        let left = self.checkpoint_left_writers()?;
+        let current = participants(&BTreeSet::new(), &left, &claims);
+        let waiting = terms
             .participants
-            .iter()
+            .intersection(&current)
             .filter(|writer| seals.get(*writer) != Some(terms))
             .cloned()
-            .collect::<BTreeSet<_>>();
-        if waiting_for.is_empty() {
-            return Ok(());
+            .collect::<Vec<_>>();
+        if waiting.is_empty() {
+            return Ok(Vec::new());
         }
-        let episode = checkpoint_name(first_waiting);
-        let subject = attention_subject(&episode);
-        if self.attention_request(&subject)?.is_some() {
-            return Ok(());
-        }
-        let names = waiting_for.iter().cloned().collect::<Vec<_>>().join(", ");
-        self.request_attention(
-            &subject,
-            &AttentionRequest {
-                reviewer: context.reviewer.clone(),
-                title: format!("Checkpoints are waiting for {names}"),
-                reason: format!(
-                    "No checkpoint has become stable since {episode} was due, because {names} \
-                     has not sealed {checkpoint}. Bring it back, upgrade it, or run `st \
-                     replication checkpoint excuse NAME --reason ...` for a machine that stays \
-                     away; its writes still replicate when it returns. Remove it with `st fleet \
-                     remove` only if its storage is gone."
-                ),
-                severity: "warning".into(),
-                targets: vec![checkpoint.clone()],
-                actor: checkpoint_actor(&self.origin),
-                idempotency_key: format!("checkpoint-attention:{}:{episode}", self.origin),
-            },
-        )
-        .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
-        actions.push(CheckpointAction::AttentionRequested {
-            checkpoint,
-            waiting_for,
-        });
-        Ok(())
-    }
-
-    /// Withdraw this node's attention requests about checkpoints once a checkpoint at or after
-    /// the one they were about is stable.
-    fn withdraw_checkpoint_attention(
-        &self,
-        claims: &[CheckpointClaim],
-        newest_stable: Option<u128>,
-        actions: &mut Vec<CheckpointAction>,
-    ) -> Result<()> {
-        let Some(newest_stable) = newest_stable else {
-            return Ok(());
-        };
-        let cuts = claims
-            .iter()
-            .filter(|claim| claim.writer == self.origin)
-            .filter_map(|claim| claim.seal_terms())
-            .map(|terms| terms.cut_unix_ms)
-            .filter(|cut| *cut <= newest_stable)
-            .collect::<BTreeSet<_>>();
-        for cut in cuts {
-            let subject = attention_subject(&checkpoint_name(cut));
-            let Some(request) = self.attention_request(&subject)? else {
-                continue;
-            };
-            // Requests replicate; each node withdraws only its own.
-            if request.status != "pending" || request.actor != checkpoint_actor(&self.origin) {
-                continue;
-            }
-            self.withdraw_attention(
-                &subject,
-                &AttentionWithdrawRequest {
-                    reason: format!("{} is stable", checkpoint_name(newest_stable)),
-                    actor: checkpoint_actor(&self.origin),
-                    idempotency_key: format!(
-                        "checkpoint-attention-withdrawn:{}:{cut}",
-                        self.origin
-                    ),
-                },
-            )
-            .map_err(|error| anyhow::anyhow!("{}: {}", error.code, error.message))?;
-            actions.push(CheckpointAction::AttentionWithdrawn { attention: subject });
-        }
-        Ok(())
+        Ok(vec![AttentionItemView {
+            episode: format!("{}:{writer}", checkpoint_name(first_waiting)), priority: "normal".into(), kind: "fault".into(),
+            review_mode: None, subject: checkpoint.clone(), person: "person/operator".into(), requester_id: None,
+            launch_id: None, variant_id: None, message_id: None, title: format!("Checkpoints are waiting for {}", waiting.join(", ")),
+            detail: "Bring the waiting machines back, upgrade them, or excuse a machine that stays away.".into(),
+            mission: None, mission_run: None, step: None, targets: vec![checkpoint.clone()], requested_at_unix_ms: since,
+            actions: vec![attention_action("inspect checkpoint", &["st", "replication", "checkpoint", "status"])],
+        }])
     }
 
     /// Whether a trim stopped because the graph would change. Checkpoints then wait for a
@@ -1462,16 +1395,22 @@ mod tests {
         step(&alder, &late);
         step(&birch, &late);
         sync(&[&alder, &birch]);
-        let actions = step(&alder, &late);
-        assert!(
-            actions.iter().any(|action| matches!(
-                action,
-                CheckpointAction::AttentionRequested { waiting_for, .. }
-                    if waiting_for == &names(&["cedar"])
-            )),
-            "{actions:?}"
+        step(&alder, &late);
+        let items = alder
+            .checkpoint_attention_items(Some("person/operator"), late.now_unix_ms)
+            .unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(items[0].title.contains("cedar"));
+        assert_eq!(
+            serde_json::to_value(&items).unwrap(),
+            serde_json::to_value(
+                birch
+                    .checkpoint_attention_items(Some("person/operator"), late.now_unix_ms)
+                    .unwrap()
+            )
+            .unwrap()
         );
-        assert!(!kinds(&step(&birch, &late)).contains(&"attention"));
+        assert!(alder.attention_requests(None, true).unwrap().is_empty());
 
         // An agent cannot excuse it.
         assert!(
@@ -1501,7 +1440,7 @@ mod tests {
         sync(&[&alder, &birch]);
         let cut = newest_due_cut(late.now_unix_ms);
         assert_eq!(stable_cuts(&alder), [cut]);
-        assert_eq!(kinds(&step(&alder, &late)), ["trimmed", "withdrawn"]);
+        assert_eq!(kinds(&step(&alder, &late)), ["trimmed"]);
         assert_eq!(kinds(&step(&birch, &late)), ["trimmed"]);
 
         // Cedar comes back. What it wrote while away replicates. It adopts the checkpoint it
@@ -1614,11 +1553,38 @@ mod tests {
         alder.set_trim_fault(Some(TrimFault::TouchGraph));
         assert_eq!(kinds(&step(&alder, &context)), ["trimmed"]);
 
-        let (_, graph) = authority(&birch);
+        let mut projection_tables = projection_digest::tables(&birch.readers.get()).unwrap();
+        projection_tables.remove("claim_sources");
+        projection_tables.remove("operations");
+        let previous_operations = projection_digest::operation_rows();
+        let previous_operations = birch
+            .readers
+            .get()
+            .prepare(&previous_operations)
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .unwrap();
         let held = claim_ids(&birch);
         birch.set_trim_fault(Some(TrimFault::ChangeGraph));
         assert_eq!(kinds(&step(&birch, &context)), ["graph-changed"]);
-        assert_eq!(authority(&birch).1, graph);
+        let mut current_tables = projection_digest::tables(&birch.readers.get()).unwrap();
+        current_tables.remove("claim_sources");
+        current_tables.remove("operations");
+        let current_operations = birch
+            .readers
+            .get()
+            .prepare(&projection_digest::operation_rows())
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .unwrap();
+        assert!(current_operations.is_superset(&previous_operations));
+        // The new checkpoint fault, diagnostic claims and their operation rows change digests.
+        // Earlier shared rows remain intact when the trim transaction is refused.
+        assert_eq!(current_tables, projection_tables);
         assert!(claim_ids(&birch).is_superset(&held));
         let status = birch.checkpoint_status(context.now_unix_ms, &[]).unwrap();
         assert!(status.halted);

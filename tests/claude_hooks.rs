@@ -38,15 +38,15 @@ impl Fixture {
     fn new() -> Self {
         let tmp = tempfile::tempdir().unwrap();
         let catalog = tmp.path().join("catalog");
-        let agent = catalog.join("agents/Silber/cos");
+        let agent = catalog.join("agents/ExampleMac/cos");
         let context = context::context_dir(&agent);
         fs::create_dir_all(&context).unwrap();
         fs::write(
             agent.join("agent.kdl"),
             r#"agent "cos" {
-  host "Silber"
+  host "ExampleMac"
   workspace "/tmp"
-  env { ST_AGENT "Silber.cos" }
+  env { ST_AGENT "ExampleMac.cos" }
   command "claude"
 }"#,
         )
@@ -73,7 +73,7 @@ impl Fixture {
     /// `overrides` are applied last, so a test can drop `PATH` entries or retune staleness.
     fn run_with(&self, script: &str, overrides: &[(&str, &str)]) -> Output {
         let script = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("hooks")
+            .join("crates/st-drivers/hooks")
             .join(script);
         let current_path = std::env::var("PATH").unwrap_or_default();
         let mut command = Command::new(bash());
@@ -82,7 +82,7 @@ impl Fixture {
             .env("PATH", format!("{}:{current_path}", self.bin.display()))
             .env("ST_ROOT", &self.catalog)
             .env("CATALOG", &self.catalog)
-            .env("ST_AGENT", "Silber.cos")
+            .env("ST_AGENT", "ExampleMac.cos")
             .env("XDG_STATE_HOME", &self.state);
         for (key, value) in overrides {
             command.env(key, value);
@@ -123,7 +123,7 @@ fn session_start_delivers_context_on_the_supported_channel_and_never_on_stderr()
         .as_str()
         .unwrap();
     assert!(additional.contains("rehydration canary PELICAN-7742"));
-    assert!(additional.contains(r#"<context source="st2/context/now.md" agent="Silber.cos">"#));
+    assert!(additional.contains(r#"<context source="st2/context/now.md" agent="ExampleMac.cos">"#));
     assert!(additional.contains("Run the st2 boot ritual"));
     assert!(additional.contains("set your status to busy"));
 }

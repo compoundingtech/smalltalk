@@ -1,12 +1,184 @@
 # st fleet replication
 
-Fleet replication is optional. A node without peer configuration is a complete local-only st system.
+Fleet replication is optional. A node outside a fleet is a complete local-only st system.
+`st doctor` reports this default as `pass` with “no fleet is configured” and points to
+`st fleet create` or `st fleet join`. It reports “intentionally local-only after leaving its
+fleet” only when `st fleet leave` has recorded that explicit decision in `left-fleet.json`.
+
+A laptop running only stui can instead be a [paired client device](client-only.md), with no daemon
+or replica. Devices read and act through a member's client gateway and are not sync peers.
 
 Replication makes the logical authority equal across configured nodes. It does not make the SQLite files byte-identical.
 
-## Configuration
+## Sync invariants
 
-Each fleet node needs these values:
+Every shared projection folds claims in the canonical total order: numeric acceptance time,
+writer, replica sequence, batch identity and immutable position, with claim identity as the final
+tie break. Arrival order belongs to local cursors, caches and operational overlays. Equal claims
+must produce equal shared rows and selected source identities through incremental admission,
+restart replay and checkpoint trimming.
+
+The digest covers everything that is synced: authenticated claim and blob identity, and every
+shared logical projection and its shared columns. Each shared table or claim-derived source has
+its own digest so a mismatch names the source. Local receipt metadata, physical indexes, secrets,
+lease overlays and live reachability are excluded explicitly. Retained history and checkpoint
+tombstones represent the same logical source identity.
+
+Uploaded bytes in `local_blobs` are staged locally until a durable claim references them.
+Claim admission promotes those bytes into `blobs` in the claim's transaction; every column of
+`blobs` remains in the shared digest. Unreferenced uploads never enter envelopes and cannot be
+compared as shared authority. On upgrade, retained claim references, document bindings and valid
+received blob records identify existing shared bytes. Other bytes move to local staging without
+being deleted. If checkpoint tombstones already removed historical references, the upgrade
+conservatively keeps all existing shared blobs.
+
+A keyed worker signs batches beyond its last processed batch, including envelopes another
+unkeyed process already sealed at startup. Signature requests recover missing signatures after
+an upgrade. Equal envelope inventories alone cannot prove equal claim admission.
+
+`store::tests::canonical_audit::every_shared_projection_agrees_after_shuffle_restart_and_checkpoint`
+checks both invariants by comparing shared rows, selected readers and per-table digest oracles
+across isolated stores. `shared_folds_never_order_by_local_arrival` rejects raw shared arrival
+folds, and `every_persistent_table_has_a_projection_scope` rejects unclassified tables. A new
+shared table must join the shuffle test's inventory and history fixture,
+the canonical ordering guard, and the production digest registry in the same change. A new
+shared claim-derived view must compare its answer at the same explicit time and recipients.
+
+The [canonical projections audit](canonical-projections-audit.md) records the original gaps and
+local exceptions. Modern status reports a graph digest over the complete projection registry,
+plus one digest for every table. The original six-table hash remains a compatibility field on
+the peer protocol; it cannot prove that every shared outcome agrees.
+
+Shared reducers use `store/canonical.rs`. `canonical_sql` expands `CANONICAL_ASC(ALIAS)` and
+`CANONICAL_DESC(ALIAS)` in a query; `CANONICAL_ORDER` and its descending counterpart format the
+same order for existing claim queries. In-memory comparisons use `claim_key` or
+`key_from_record`, and claim-to-claim predicates use `after_sql`. Legacy batch position is its
+relative position within the batch. A global arrival index never chooses a shared winner.
+
+Document version rows retain the earliest canonical binding for repeated name/hash pairs;
+mission revision rows do the same for repeated identical revisions. Document latest flags,
+history order and cursor boundaries use binding claim keys. Complete mailbox readers and
+selected unread reminders use canonical sent-claim keys; bounded mailbox cursors remain local.
+The shuffle fixture compares paged document answers and the existing person attention view,
+including unread messages, reminder selection and episode onset. Proposal lifecycle tests
+compare all shared rows and digests through creation, review, draining, cancellation and apply.
+
+Documents record a sortable encoding of the complete binding claim key at admission.
+`document_canonical_latest(name,binding_key DESC)` serves latest selection and history order;
+readers never sort a name's entire claim history for each returned version. Schema 15 backfills
+the keys once, choosing the earliest canonical binding for each repeated name/hash. The key is
+a shared derived column and is digested with the document row. The fleet-size regression builds
+260,000 claims and 10,000 document versions, then requires latest listings, history pages,
+lookup and cursor reads to finish within two seconds and verifies the indexed latest query plan.
+
+## Projection digest coverage and cost
+
+`store/projection_digest.rs::TABLES` lists the shared tables: operations, blobs, documents,
+desired, message_index, mission_revisions, mission_definitions, mission_runs,
+mission_run_deadlines, mission_run_after, run_generations, step_runs, revision_proposals,
+planning_sessions, planning_candidates and planning_previews. Every column joins the digest
+by default. Only document/message/mission-revision arrival indexes and the effective step lease
+expiry/change timestamps are excluded. Those step timestamps include member-local renewals;
+the original durable lease facts remain covered through their authenticated claim identity.
+`planning_previews.store_index` is an originating preview input and is covered.
+
+The `claim_sources` digest covers admitted claim identities and immutable acceptance times,
+including claims represented by checkpoint tombstones. Claim identities commit bodies,
+predecessors, actors and batch identity; authenticated envelope inventory commits complete wire
+payloads and ordering metadata. This covers the sources of on-demand views such as ownership,
+subscriptions, fleet membership, usage, observer/fault episodes, and attention. A timed view's
+answer must still be tested at the same explicit time and recipients. Host-local liveness,
+leases, receipts, cursors, secrets and notification bookkeeping stay outside shared digests.
+
+A repaired original is no longer an admitted projection source. One member may retain its
+old claim row while another rejected it before admission; both exclude it from claim-source
+and operation projections. The original wire bytes remain committed by authenticated envelope
+inventory, and the repair and replacement remain shared claim sources. A local
+`projection_digest_repaired_claims` cache retains the exclusion after receipt cleanup; repair
+record updates and cached source digests commit or roll back together. Registry version 5
+backfills existing repairs once, and operation rules version 2 rebuilds older operation rows.
+
+Operations are logical rows over the hot operation table and operation facts retained in
+checkpoint tombstones. Trimming a claim changes its storage representation, preserving its
+logical operation and claim-source digests. The shuffle test compares that logical union.
+
+SQLite triggers update per-table row counts and 512-bit modular sums of domain-separated
+SHA-512 row hashes in the row's own transaction. Insert, update, delete, replacement, savepoint
+rollback and commit therefore change rows and cached digest state together. SHA-256 commits the
+table name, column schema, count and sum; a sorted map of those table digests commits the graph.
+Shared columns are encoded in sorted name order, including the logical operation row. A fresh
+schema and an additive migration can place the same column at different physical positions;
+that layout does not change the digest. Registry version 6 rebuilds older physical-order caches.
+These are diagnostic digests; authenticated envelopes and signatures remain the replication
+integrity boundary. Work scales with changed row bytes, plus the fixed-size accumulator.
+Reading all table digests reads one small cache, independent of retained history size. Operations
+keep a local row cache to update their hot/tombstone union by operation identity. The first open
+of a registry/schema version backfills these caches; routine reads and subsequent opens never
+rescan projection histories to compute digests.
+
+`incremental_digests_cover_each_shared_column_and_roll_back_with_rows` changes every shared
+column and compares cached digests with a full-scan oracle, including local exclusions, no-op
+updates, replacement and rollback. The shuffle/restart/checkpoint regression compares every
+cached table digest with that oracle in every phase. The table classification guard requires
+the test inventory and production registry to agree, and the fixture exercises every table.
+
+`st replication status` prints `table-digest` entries and names differing tables under each
+peer. `st replication diff PEER` and `st doctor` also name them. Table differences are meaningful
+only when inventories agree, projection is current and local committed batches are sealed. Old peers omit `projection_digests`;
+exchanges and heals then compare their unchanged six-table compatibility hash. Old peers cannot
+verify full projection coverage. Modern peers compare complete maps. SQLite schema 14 adds the
+transactional digest machinery and rebuilds shared projections once, correcting older stored
+creation/change dates from claim facts. New writer connections must register the projection
+functions, including isolated checkpoint proof connections.
+
+## Add any machine
+
+Install st on the new machine and configure the person who operates it, as described in the
+[README](../../README.md#run-the-daemon). On an existing listening member, invite the new name:
+
+```sh
+st fleet invite beacon
+```
+
+On the new machine:
+
+```sh
+st fleet join
+st fleet status
+st replication status
+```
+
+Paste the invitation when asked. These are the same steps for a laptop or server. Join receives
+the fleet settings, installs the services, and catches up its replica. It discovers usable
+Tailscale and Fabric endpoints; a firewall that permits only outbound connections needs no
+extra sync setting. Existing Fabric trust and permission for the sponsor's fleet protocol, or
+a Tailscale ACL permitting its worker port, must allow the connection.
+
+To choose the sponsor route explicitly, use its actual tailnet address/port or canonical Fabric
+NodeID/protocol. Each command prompts for the same invitation:
+
+```sh
+st fleet join --via http://100.64.0.10:31313
+st fleet join --via fabric://NODE_ID/PROTOCOL
+```
+
+When the machines are already Fabric peers, the invitation can travel as a file instead:
+
+```sh
+# On the sponsor:
+st fleet invite beacon --via fabric --send-fabric
+# On beacon:
+st fleet join --fabric-inbox
+```
+
+No helper needs to maintain a loopback dial port. The worker obtains Fabric tunnels itself and
+uses available alternative member routes. `--dial-out` is optional when you explicitly want
+no inbound listener; it does not change retry or presence behavior. See [Fleet join](../fleet-join.md)
+for trust, invitation expiry, removal, and the migration of an existing config-peer fleet.
+
+## Legacy configuration and route overrides
+
+A fleet configured with a shared secret and fixed peers remains supported. Its values look like:
 
 ```toml
 node = "node-a"
@@ -23,7 +195,12 @@ The fleet ID is a persistent UUID. A store rejects another fleet ID after its fi
 
 The secret contains 32 raw bytes or 64 hexadecimal characters. Its file mode must deny group and other access.
 
-The listener and every peer URL must use loopback. Fabric or a similar local port exposer carries traffic between hosts.
+The peer listener binds loopback; the worker can additionally bind discovered tailnet addresses.
+Explicit routes accept loopback or tailnet HTTP and `fabric://NODE_ID/PROTOCOL`. Fabric routes
+name the lasting remote endpoint: the worker creates or reacquires the local tunnel itself.
+Several peer entries may name the same member with distinct routes. Arbitrary LAN/public HTTP
+addresses remain rejected. See [the migration procedure](../fleet-join.md#move-an-existing-fleet-off-local-dial-helpers)
+to replace a legacy local dial helper.
 
 On a node that only receives connections from a peer, list its name without a URL:
 
@@ -34,16 +211,21 @@ name = "node-b"
 
 This accepts node-b's authenticated exchanges and never dials it. The equivalent command-line
 entry is `--peer node-b`. A peer is observed as up after a successful exchange in either
-direction; it becomes down only after 90 seconds without a success. The worker checks peers
-without URLs once a minute. Repeated checks do not write repeated transport claims.
+direction. After 90 seconds without an exchange it is shown as `last-seen`, with the time
+of its last successful exchange, rather than as a fault. Doctor does not warn about absence,
+and delivery probes and their attention streaks wait for the member to exchange again.
+A config-peer node can omit `peer_listen` and initiate every exchange itself; it still pushes
+and pulls the full graph.
 
 ### Fleet members
 
 A node that joined or migrated keeps its fleet settings in `STATE/fleet/fleet.toml`, written by
 `st fleet` commands, and needs no `[[peers]]`. Its peers come from membership claims in the graph:
 it dials every current listening member and accepts exchanges from current members that sign with
-their member keys. A dial-out member accepts no connections, is never dialed, and neither records
-nor receives transport observations. A `[[peers]]` entry for a member is that member's first route
+their member keys. The existing dial-out mode controls whether the worker opens a listener; it needs no separate
+presence policy. Every current member appears in replication status and machine views with its
+last exchange time. Members behind NAT can initiate exchanges and converge in both directions,
+even while other members' attempts to reach their advertised addresses fail. A `[[peers]]` entry for a member is that member's first route
 from this machine. Service units for a member carry no peer, fleet, or secret arguments. See
 [Fleet join](../fleet-join.md) for invites, removal, and migration.
 
@@ -59,7 +241,39 @@ A local graph change writes `replication.wake`. The worker watches only this fil
 
 The worker coalesces wake bursts for one second, so new authority, such as a mission publish, reaches every peer within seconds. An exchange that stored new envelopes on either side runs again at once until a backlog drains. An exchange that stored nothing new waits for the next wake, even if it carried envelopes the other side already held.
 
-The worker also runs a 30-second anti-entropy exchange. This timer repairs a missed file event or a network interruption.
+The worker also runs a 30-second anti-entropy exchange. A recent inbound exchange suppresses
+a redundant connection in the opposite direction; local graph changes still request a prompt
+push. Failed attempts back off exponentially from one second through minutes to one hour, with 20 percent
+jitter. Graph wakes do not reset failure backoff. An authenticated inbound request, a successful
+peer request, a change to the member's routes, or a local connectivity change interrupts it
+immediately, including activity received while an outbound request is still failing. Peer
+activity has a separate notification channel used only by failure waits, so ordinary
+authenticated traffic does not start redundant healthy exchanges. A returning outbound-only member starts its own
+push and pull without waiting for the other members' retry timers. Fabric tunnels are obtained
+again on each attempt, so a restarted Fabric does not leave a stale cached tunnel. With Fabric
+0.2.21 or later, the worker also consumes its passive `peer-events --watch` stream: an online
+admission resets that member's retry, and a daemon reset refreshes exposures and announces this
+node. Offline transport events create no fault. Older Fabric keeps using address-change,
+suspend-gap, and anti-entropy recovery. Tailnet listeners and advertised endpoints also
+refresh on local connectivity changes, without waiting for their minute timer; disappeared
+interface addresses stop being advertised.
+
+An HTTP link can return silently without changing either machine's addresses. For five minutes
+after a successful outbound exchange, a failed dialer's retry wait probes that same HTTP route
+every three seconds, with a one-second timeout. The probe uses `HEAD` on the existing exchange
+route: any HTTP response, including an older build's `405`, wakes a signed exchange at once.
+It neither exports an inventory nor records a failure. A route that has never worked, a replaced
+route, or a peer absent for more than five minutes keeps the long retry schedule. Transport life
+only schedules an exchange; the exchange still authenticates every claim and peer.
+
+The same recovery applies to every member. A server may be absent for hours just as a laptop
+may be asleep. On daemon start, wake from sleep, network change or Fabric recovery, a member
+announces its current endpoints and attempts exchanges with every reachable member. Either
+side can initiate; one connection transfers both sides' missing history and repeats until the
+backlog drains. The other side need not open a second connection or wait for its retry timer.
+An absent member is shown with its last exchange time, and doctor and delivery attention wait
+for contact before judging its routes. Invalid signatures, rejected membership and corrupt
+records remain faults.
 
 ## Protocol
 
@@ -179,6 +393,19 @@ st doctor
 ```
 
 The status view reports the authority digest, graph digest, record counts, projection health, and last peer results.
+
+A Fabric `peer not permitted for service` answer means the member's grants refuse that direct
+route. It shows as `refused`, with the Fabric node and service, in `st replication status`,
+`st fleet status` and `st doctor`. It is neither an absent member nor a replication error;
+`last_error` is empty and the JSON status carries `refusal_reason`. Doctor's replication check
+passes when the refusal is the only issue.
+
+The worker retries that route every 24–36 minutes, at most three attempts per hour including
+the first refusal. Local writes, inbound exchanges, Fabric online events and local network
+changes do not shorten this delay. A changed route retries immediately, and a later successful outbound
+exchange clears the refusal. Other routes to the same member remain usable. Members that do
+not grant each other the service can still converge through a common hub; the hub must grant
+and exchange with both leaves. The worker never changes Fabric grants itself.
 
 For each peer, the status view also reports when the last exchange happened and how far apart the
 two envelope sets were at that exchange:

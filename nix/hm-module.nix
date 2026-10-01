@@ -24,10 +24,17 @@ let
           ln -s ${cfg.ptyPackage}/bin/pty "$out/bin/pty"
         '';
       };
-  executable = "${effectivePackage}/bin/st3";
+  # Keep the real executable with the daemon's per-user state: current_exe()
+  # resolves store symlinks, but seats must watch one replaceable path across deploys.
+  binDir = "${cfg.stateDir}/bin";
+  executable = "${binDir}/st3";
   environment = cfg.environment // {
-    PATH = lib.makeBinPath (lib.optional (cfg.ptyPackage != null) cfg.ptyPackage ++ [ effectivePackage ])
-      + ":/usr/local/bin:/usr/bin:/bin";
+    # The Linux daemon asks the user manager to move PTY servers into their own scopes via busctl.
+    PATH = binDir + ":" + lib.makeBinPath (
+      lib.optional (cfg.ptyPackage != null) cfg.ptyPackage
+      ++ [ effectivePackage ]
+      ++ lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.systemd
+    ) + ":/usr/local/bin:/usr/bin:/bin";
     XDG_CONFIG_HOME = config.xdg.configHome;
     XDG_STATE_HOME = config.xdg.stateHome;
   };
@@ -107,6 +114,30 @@ in
 
   config = mkIf cfg.enable {
     home.packages = [ effectivePackage ];
+    home.activation.smalltalkBinary = lib.hm.dag.entryBetween
+      [ (if pkgs.stdenv.hostPlatform.isLinux then "reloadSystemd" else "setupLaunchAgents") ]
+      [ "writeBoundary" ] ''
+        if [[ -n "''${DRY_RUN_CMD:-}" ]]; then
+          verboseEcho "Would install the smalltalk executable at ${executable}"
+        else
+          (
+            set -eu
+            binDir=${lib.escapeShellArg binDir}
+            source=${lib.escapeShellArg "${effectivePackage}/bin/st3"}
+            target=${lib.escapeShellArg executable}
+            ${pkgs.coreutils}/bin/mkdir -p "$binDir"
+            # Preserve the inode on no-op activation; replace symlinks even if bytes match.
+            if [[ -L "$target" ]] || ! ${pkgs.diffutils}/bin/cmp -s "$source" "$target"; then
+              temporary=$(${pkgs.coreutils}/bin/mktemp "$binDir/.st3.XXXXXX")
+              trap '${pkgs.coreutils}/bin/rm -f "$temporary"' EXIT
+              ${pkgs.coreutils}/bin/cp "$source" "$temporary"
+              ${pkgs.coreutils}/bin/chmod 755 "$temporary"
+              ${pkgs.coreutils}/bin/mv -f "$temporary" "$target"
+            fi
+            ${pkgs.coreutils}/bin/ln -sfn st3 "$binDir/st"
+          )
+        fi
+      '';
     xdg.configFile."st3/config.toml".text =
       "person = ${builtins.toJSON cfg.person}\n"
       + lib.optionalString (cfg.node != null) "node = ${builtins.toJSON cfg.node}\n"
@@ -117,7 +148,12 @@ in
 
     systemd.user.services = mkIf pkgs.stdenv.hostPlatform.isLinux ({
       smalltalk = {
-        Unit = { Description = "st claims graph daemon"; After = [ "network.target" ]; };
+        Unit = {
+          Description = "st claims graph daemon";
+          After = [ "network.target" ];
+          # ExecStart is stable; sd-switch still needs to restart on a new build.
+          X-Restart-Triggers = [ effectivePackage ];
+        };
         Service = {
           Type = "simple";
           ExecStart = lib.concatStringsSep " " (map systemdArg ([ executable ] ++ upArgs));
@@ -167,7 +203,9 @@ in
           SoftResourceLimits.NumberOfFiles = 8192;
           StandardOutPath = "${cfg.stateDir}/logs/st3.stdout.log";
           StandardErrorPath = "${cfg.stateDir}/logs/st3.stderr.log";
-          EnvironmentVariables = environment;
+          # Home Manager reloads changed plists; retain a build reference even
+          # though ProgramArguments now points at the stable executable.
+          EnvironmentVariables = environment // { SMALLTALK_PACKAGE = toString effectivePackage; };
         };
       };
     } // lib.optionalAttrs (cfg.declarationsApply.enable && hasDeclarations) {

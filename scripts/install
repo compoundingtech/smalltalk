@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install st2 and st3 from one source build. `st` is always a symlink to the installed `st3`,
+# Install st3 and its tools from one source build. `st` is always a symlink to the installed `st3`,
 # never a separate build, so the two names cannot drift apart.
 #
 # usage: scripts/install [--bin-dir DIR] [--from DIR]
@@ -8,7 +8,7 @@
 #   --from DIR     install already-built binaries from DIR instead of running cargo
 set -Eeuo pipefail
 
-bin_dir="$HOME/.local/bin"
+bin_dir="${ST_MACOS_BIN_DIR:-$HOME/.local/bin}"
 from=""
 while (($#)); do
   case $1 in
@@ -19,12 +19,12 @@ while (($#)); do
   esac
 done
 
-binaries=(st2 st3 st3-migrate stui)
+binaries=(st3 st3-migrate stui)
 
 if [[ -z $from ]]; then
   repo=$(cd "$(dirname "$0")/.." && pwd)
   cargo build --release --locked --manifest-path "$repo/Cargo.toml" \
-    -p st2 -p st3 -p st3-migrate -p stui
+    -p st3 -p st3-migrate -p stui
   from=${CARGO_TARGET_DIR:-$repo/target}/release
 fi
 
@@ -43,9 +43,15 @@ for name in "${binaries[@]}" st; do
 done
 
 mkdir -p "$bin_dir"
+macos=false
+if [[ $(uname -s) == Darwin ]]; then
+  python3 "$(cd "$(dirname "$0")" && pwd)/install-macos.py" --from "$from" --bin-dir "$bin_dir"
+  macos=true
+fi
 # Each name is replaced by rename, so a running process keeps its old inode and a concurrent
 # caller sees either the old or the new file, never a partial copy.
 for binary in "${binaries[@]}"; do
+  if [[ $macos == true && ($binary == st3 || $binary == stui) ]]; then continue; fi
   staged=$(mktemp "$bin_dir/.$binary.install.XXXXXX")
   cp "$from/$binary" "$staged"
   chmod 0755 "$staged"

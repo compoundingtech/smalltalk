@@ -1,17 +1,17 @@
-import { applyWindow, type Agent, type Attention, type CollectionFrame, type CollectionName, type CollectionStream, type CollectionWindow, type Mission, type Snapshot, type St3Client, type TerminalScreen, type TimelineEntry } from '../../clients/typescript/st3-client';
+import { applyWindow, type Agent, type Attention, type CollectionFrame, type Glass, type CollectionName, type CollectionStream, type CollectionWindow, type Mission, type Snapshot, type St3Client, type TerminalScreen, type TimelineEntry } from '../../clients/typescript/st3-client';
 import { TERMINAL_RESTARTED, withFreshTerminalFence, type Foreground, type TerminalFollowHandlers } from './terminalControls';
 
 // The app holds three windows on one collections socket. It needs no work window: missions carry
 // their steps and agents name theirs. Subscription IDs are the window names.
 export const FEED_WINDOWS = {
-  attention: { collection: 'attention', limit: 50 },
+  attention: { collection: 'attention', limit: 200 },
   missions: { collection: 'missions', limit: 200 },
   agents: { collection: 'agents', limit: 200 },
 } as const satisfies Record<string, { collection: CollectionName; limit: number }>;
 export type FeedWindow = keyof typeof FEED_WINDOWS;
 export type FeedLists = { attention: Attention[]; missions: Mission[]; agents: Agent[] };
 const KINDS = { attention: 'attention', missions: 'mission', agents: 'agent' } as const;
-const TERMINAL = 'terminal', CONVERSATION = 'conversation';
+const TERMINAL = 'terminal', CONVERSATION = 'conversation', GLASSES = 'glasses';
 export const RETRY_DELAYS_MS = [1_000, 2_000, 5_000, 10_000, 30_000];
 
 export type FeedHandlers = {
@@ -21,6 +21,13 @@ export type FeedHandlers = {
   onConnection: (state: 'connecting' | 'live' | 'reconnecting', issue?: string) => void;
   /** The server refused a window; the others keep going. */
   onWindowError?: (name: FeedWindow, message: string) => void;
+};
+
+/** The person's glasses, all of them, after each frame that changed them. */
+export type GlassesHandlers = {
+  onGlasses: (glasses: Glass[]) => void;
+  /** A problem to show; an empty string clears it. */
+  onIssue: (issue: string) => void;
 };
 
 export type ConversationFrame = { replace: boolean; items: TimelineEntry[]; hasMore: boolean };
@@ -61,6 +68,7 @@ export class Feed {
   private windows: Partial<Record<FeedWindow, CollectionWindow>> = {};
   private terminal: TerminalFollow | undefined;
   private conversation: { target: string; handlers: ConversationHandlers } | undefined;
+  private glasses: { handlers: GlassesHandlers; window?: CollectionWindow } | undefined;
   private readonly unsubscribe: () => void;
   private readonly client: Client;
   private readonly handlers: FeedHandlers;
@@ -113,6 +121,14 @@ export class Feed {
     return { close: () => { if (this.conversation !== follow) return; this.conversation = undefined; this.stream?.unsubscribe(CONVERSATION); } };
   }
 
+  /** Follow the person's glasses (st keeps at most 100 live); a second call replaces the first. */
+  followGlasses(handlers: GlassesHandlers): Follow {
+    const follow = { handlers };
+    this.glasses = follow;
+    this.stream?.subscribeGlasses(GLASSES);
+    return { close: () => { if (this.glasses !== follow) return; this.glasses = undefined; this.stream?.unsubscribe(GLASSES); } };
+  }
+
   private suspend(): void {
     this.attempt++;
     clearTimeout(this.timer);
@@ -139,6 +155,7 @@ export class Feed {
       this.stream = opened;
       for (const name of Object.keys(FEED_WINDOWS) as FeedWindow[]) this.subscribeWindow(name);
       if (this.conversation) opened.subscribeConversation(CONVERSATION, this.conversation.target);
+      if (this.glasses) { this.glasses.window = undefined; opened.subscribeGlasses(GLASSES); }
       if (this.terminal) void this.terminal.attach();
     } catch (error) { if (!stale()) this.dropped(error); }
   }
@@ -162,7 +179,15 @@ export class Feed {
 
   private frame(frame: CollectionFrame): void {
     const id = 'id' in frame ? frame.id : undefined;
-    if (frame.kind === 'snapshot' || frame.kind === 'changes') {
+    if ((frame.kind === 'snapshot' || frame.kind === 'changes') && frame.id === GLASSES) {
+      const follow = this.glasses;
+      if (!follow) return;
+      const next = applyWindow(follow.window, frame);
+      if (!next) { follow.window = undefined; this.stream?.subscribeGlasses(GLASSES); return; }
+      follow.window = next;
+      follow.handlers.onIssue('');
+      follow.handlers.onGlasses(next.items.filter(item => item.kind === 'glass') as Glass[]);
+    } else if (frame.kind === 'snapshot' || frame.kind === 'changes') {
       if (!(frame.id in FEED_WINDOWS)) return;
       const name = frame.id as FeedWindow;
       const next = applyWindow(this.windows[name], frame);
@@ -175,7 +200,8 @@ export class Feed {
       const items = next.items.filter(item => item.kind === KINDS[name]) as FeedLists[typeof name];
       this.handlers.onWindow(name, items, next.hasMore, next.snapshot);
     } else if (frame.kind === 'resync') {
-      if (frame.id in FEED_WINDOWS) this.subscribeWindow(frame.id as FeedWindow);
+      if (frame.id === GLASSES && this.glasses) { this.glasses.window = undefined; this.stream?.subscribeGlasses(GLASSES); }
+      else if (frame.id in FEED_WINDOWS) this.subscribeWindow(frame.id as FeedWindow);
     } else if (frame.kind === 'screen') {
       if (id === TERMINAL) this.terminal?.screen(frame.value);
     } else if (frame.kind === 'conversation') {
@@ -186,6 +212,7 @@ export class Feed {
     } else if (frame.kind === 'error') {
       if (id === TERMINAL) this.terminal?.failed(frame.code, frame.message);
       else if (id === CONVERSATION) this.conversation?.handlers.onIssue(frame.code ? `${frame.code}: ${frame.message}` : frame.message);
+      else if (id === GLASSES) this.glasses?.handlers.onIssue(frame.code ? `${frame.code}: ${frame.message}` : frame.message);
       else if (id && id in FEED_WINDOWS) this.handlers.onWindowError?.(id as FeedWindow, frame.message);
     }
   }

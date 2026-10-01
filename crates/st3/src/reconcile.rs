@@ -7,6 +7,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result};
+use chrono::{Datelike as _, NaiveDate, TimeZone as _, Utc};
 use notify::Watcher as _;
 use serde_json::Value;
 use sha2::Digest as _;
@@ -17,11 +18,11 @@ use crate::mission::{
     CANDIDATE_INDEX_INPUT, LOOP_FEEDBACK_INPUT, LOOP_ITEM_INPUT, LOOP_ROUND_INPUT,
 };
 use crate::model::{
-    AttentionRequest, ClaimInput, CurrentHarnessView, DependencySpec, DesiredSubject, GateContext,
-    GateSpec, LaunchSpec, LoopCandidateSelector, LoopExhaustionSpec, LoopSpec, MemberKind,
-    MemberLifecycle, MemberSpec, MessageView, MetricSource, MissionInputKind, MissionRunRequest,
-    MissionRunView, MissionSpec, MissionState, RestartIntensity, RestartType, StepRunView,
-    StepSpec, SubscriptionSpec, UsedMissionSpec, WorkSelector,
+    AttentionRequest, CalendarSchedule, ClaimInput, CurrentHarnessView, DependencySpec,
+    DesiredSubject, GateContext, GateSpec, LaunchSpec, LoopCandidateSelector, LoopExhaustionSpec,
+    LoopSpec, MemberKind, MemberLifecycle, MemberSpec, MessageView, MetricSource, MissionInputKind,
+    MissionRunRequest, MissionRunView, MissionSpec, MissionState, RestartIntensity, RestartType,
+    StepRunView, StepSpec, SubscriptionSpec, UsedMissionSpec, WorkSelector,
 };
 use crate::resource::{
     ObservationRequest, ProviderForbidden, ProviderRateLimit, ProviderUnauthenticated,
@@ -62,6 +63,103 @@ const DECLARED_CHECKOUT_LIMIT: usize = 4096;
 thread_local! {
     static DECLARATION_PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
+
+/// Resolve the local date, not an elapsed 24-hour interval. A gap fires at the
+/// first real minute after the requested wall time; a fold takes its first instant.
+fn calendar_instant(zone: chrono_tz::Tz, at_minute: u16, date: NaiveDate) -> Result<i64> {
+    let midnight = date.and_hms_opt(0, 0, 0).context("invalid calendar date")?;
+    let requested = midnight + chrono::Duration::minutes(i64::from(at_minute));
+    for minute in 0..=2880 {
+        let local = requested + chrono::Duration::minutes(minute);
+        match zone.from_local_datetime(&local) {
+            chrono::LocalResult::Single(instant) => return Ok(instant.timestamp_millis()),
+            chrono::LocalResult::Ambiguous(earlier, later) => {
+                return Ok(earlier.timestamp_millis().min(later.timestamp_millis()));
+            }
+            chrono::LocalResult::None => {}
+        }
+    }
+    anyhow::bail!("no valid local instant within two days of {requested} in {zone}")
+}
+
+fn calendar_date_on_or_after(date: NaiveDate, weekday: Option<u8>) -> Result<NaiveDate> {
+    let Some(weekday) = weekday else {
+        return Ok(date);
+    };
+    let ahead = (u32::from(weekday) - 1 + 7 - date.weekday().num_days_from_monday()) % 7;
+    date.checked_add_days(chrono::Days::new(u64::from(ahead)))
+        .context("calendar date overflow")
+}
+
+fn calendar_occurrence(
+    calendar: &CalendarSchedule,
+    last: Option<u64>,
+    now: i64,
+    catch_up: &str,
+    max_catch_up: Option<u32>,
+) -> Result<(u64, i64)> {
+    let zone: chrono_tz::Tz = calendar.timezone.parse()?;
+    let today = Utc
+        .timestamp_millis_opt(now)
+        .single()
+        .context("invalid schedule clock")?
+        .with_timezone(&zone)
+        .date_naive();
+    let stride = if calendar.weekday.is_some() { 7 } else { 1 };
+    let next_after_last = match last {
+        Some(key) => NaiveDate::from_ymd_opt(
+            (key / 10000).try_into()?,
+            ((key / 100) % 100).try_into()?,
+            (key % 100).try_into()?,
+        )
+        .context("invalid calendar occurrence date")?
+        .succ_opt()
+        .context("calendar date overflow")?,
+        None => today,
+    };
+    let mut next = calendar_date_on_or_after(next_after_last, calendar.weekday)?;
+    let current_day = if let Some(weekday) = calendar.weekday {
+        let behind = (today.weekday().number_from_monday() + 7 - u32::from(weekday)) % 7;
+        today.checked_sub_days(chrono::Days::new(u64::from(behind)))
+            .context("calendar date overflow")?
+    } else {
+        today
+    };
+    let current_at = calendar_instant(zone, calendar.at_minute, current_day)?;
+    let current = if now >= current_at {
+        current_day
+    } else {
+        current_day
+            .checked_sub_days(chrono::Days::new(stride))
+            .context("calendar date overflow")?
+    };
+    if next <= current {
+        match catch_up {
+            "latest" => next = current,
+            "skip" => {
+                next = current
+                    .checked_add_days(chrono::Days::new(stride))
+                    .context("calendar date overflow")?;
+            }
+            "all" => {
+                let missed = current.signed_duration_since(next).num_days() / stride as i64 + 1;
+                let max = max_catch_up.unwrap_or(0);
+                if missed > i64::from(max) {
+                    anyhow::bail!(
+                        "the missed occurrences exceed max-catch-up {max}; raise max-catch-up \
+                         or choose catch-up \"latest\" or \"skip\""
+                    );
+                }
+            }
+            _ => anyhow::bail!("invalid schedule catch-up policy"),
+        }
+    }
+    let key = u64::try_from(next.year())? * 10000
+        + u64::from(next.month()) * 100
+        + u64::from(next.day());
+    Ok((key, calendar_instant(zone, calendar.at_minute, next)?))
+}
+
 
 /// The screen line on which Claude asks for /login. Claude prints the prompt as its own line,
 /// at most after a status glyph, so a line that only quotes the phrase, such as source code or
@@ -478,9 +576,10 @@ impl Reconciler<NativeRuntime> {
                     "PTY_ROOT".into(),
                     selected_pty_root.to_string_lossy().into_owned(),
                 ),
+                // st3's own hook set, which `st up` publishes beneath this state directory.
                 (
                     "ST_HOOKS".into(),
-                    st2::hooks::versioned_hooks_dir()?
+                    crate::hooks::set_dir(&crate::hooks::root(state_dir))
                         .to_string_lossy()
                         .into_owned(),
                 ),
@@ -766,7 +865,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let title = format!("Disk space is low on {}", self.host);
         let pending = self
             .store
-            .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
+            .pending_operational_failures(RECONCILER_ACTOR, &self.host)?
             .into_iter()
             .filter(|request| request.title == title && request.targets == [daemon.as_str()])
             .collect::<Vec<_>>();
@@ -783,7 +882,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             if pending.is_empty() && !check.1 {
                 let key = format!("disk-low:{}:{}", self.host, self.store.index()?);
                 let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
-                self.store.request_attention(
+                self.store.record_operational_failure(
                     &format!("attention/{}", &digest[..32]),
                     &AttentionRequest {
                         reviewer: "person/operator".into(),
@@ -808,7 +907,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         }
         for request in pending {
-            self.store.resolve_attention_automatically(
+            self.store.recover_operational_failure(
                 &request.subject,
                 "every filesystem this daemon writes to has 4 GiB and 4% free again",
                 &format!("disk-recovered:{}", request.request),
@@ -828,7 +927,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         let daemon = format!("daemon/{}", self.host);
         if self
             .store
-            .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
+            .pending_operational_failures(RECONCILER_ACTOR, &self.host)?
             .iter()
             .any(|request| {
                 request.title == RECONCILER_FAILING_TITLE && request.targets == [daemon.as_str()]
@@ -838,7 +937,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         let key = format!("reconciler-failing:{}:{}", self.host, now_ms());
         let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
-        self.store.request_attention(
+        self.store.record_operational_failure(
             &format!("attention/{}", &digest[..32]),
             &AttentionRequest {
                 reviewer: "person/operator".into(),
@@ -860,10 +959,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         let daemon = format!("daemon/{}", self.host);
         for request in self
             .store
-            .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
+            .pending_operational_failures(RECONCILER_ACTOR, &self.host)?
         {
             if request.title == RECONCILER_FAILING_TITLE && request.targets == [daemon.as_str()] {
-                self.store.resolve_attention_automatically(
+                self.store.recover_operational_failure(
                     &request.subject,
                     "a reconcile pass succeeded",
                     &format!("reconciler-recovered:{}", request.request),
@@ -924,13 +1023,9 @@ impl<R: RuntimeControl> Reconciler<R> {
                 let key = (subject.to_owned(), scope.to_owned());
                 if open.get(&key) == Some(&reason) {
                     drop(faults);
-                    return self.request_fault_attention(subject, scope);
+                    return Ok(());
                 }
-                let replaced = open.contains_key(&key);
                 drop(faults);
-                if replaced {
-                    self.resolve_fault_attention(subject, scope, "its cause changed")?;
-                }
                 self.append_fault(subject, scope, "faulted", &reason)?;
                 self.open_faults()?
                     .get_or_insert_with(BTreeMap::new)
@@ -950,69 +1045,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             return Ok(());
         }
-        self.resolve_fault_attention(subject, scope, reason)?;
         self.append_fault(subject, scope, "recovered", reason)?;
         self.open_faults()?
             .get_or_insert_with(BTreeMap::new)
             .remove(&key);
-        Ok(())
-    }
-
-    /// Raise the attention item of the open fault on `subject` in `scope` once it has lasted
-    /// long enough that st's own retries did not clear it.
-    fn request_fault_attention(&self, subject: &str, scope: &str) -> Result<()> {
-        let Some(fault) = self.store.open_reconcile_fault_claim(subject, scope)? else {
-            return Ok(());
-        };
-        if now_ms().saturating_sub(fault.accepted_at_unix_ms) < FAULT_ATTENTION_AFTER_MS {
-            return Ok(());
-        }
-        let attention = fault_attention_subject(&fault.id);
-        if self.store.attention_request(&attention)?.is_some() {
-            return Ok(());
-        }
-        let reason = fault
-            .body
-            .pointer("/fields/reason")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        self.store.request_attention(
-            &attention,
-            &AttentionRequest {
-                reviewer: "person/operator".into(),
-                title: format!("st cannot reconcile {subject}"),
-                reason: format!(
-                    "{scope} for {subject} on {} keeps failing: {reason}. st retries it on every pass. Inspect it with `st subject {subject}`; `st doctor` checks the host. This item closes when it reconciles.",
-                    self.host
-                ),
-                severity: "error".into(),
-                targets: vec![subject.into()],
-                actor: RECONCILER_ACTOR.into(),
-                idempotency_key: format!("reconcile-fault-attention:{}", fault.id),
-            },
-        )?;
-        self.signal_changed();
-        Ok(())
-    }
-
-    /// Close the attention item of the open fault on `subject` in `scope`, if it raised one.
-    fn resolve_fault_attention(&self, subject: &str, scope: &str, reason: &str) -> Result<()> {
-        let Some(fault) = self.store.open_reconcile_fault_claim(subject, scope)? else {
-            return Ok(());
-        };
-        let attention = fault_attention_subject(&fault.id);
-        if self
-            .store
-            .attention_request(&attention)?
-            .is_some_and(|request| request.status == "pending")
-        {
-            self.store.resolve_attention_automatically(
-                &attention,
-                &format!("{scope} for {subject}: {reason}"),
-                &format!("reconcile-fault-closed:{}", fault.id),
-            )?;
-            self.signal_changed();
-        }
         Ok(())
     }
 
@@ -1139,44 +1175,8 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     /// A request that declared `until` closes on its own once every target meets that `trace
-    /// wait` condition, and one tied to a step closes once that step ends. The host that accepted
+    /// Person asks are runtime dependencies fenced by their owning work. The host that accepted
     /// the request evaluates it, so it closes once.
-    fn resolve_attention_whose_until_holds(&self) -> Result<()> {
-        for request in self
-            .store
-            .pending_attention_closed_by_condition(&self.host)?
-        {
-            if let Some(ended) = self.store.attention_step_ended(&request)? {
-                self.store.resolve_attention_automatically(
-                    &request.subject,
-                    &format!("the step that raised it ended: {ended}"),
-                    &format!("{}:step", request.request),
-                )?;
-                self.signal_changed();
-                continue;
-            }
-            let Some(until) = request.until.as_deref() else {
-                continue;
-            };
-            let mut holds = !request.targets.is_empty();
-            for target in &request.targets {
-                let status = self.store.status_at(Some(target), None, None)?;
-                if !crate::model::status_wait_condition_holds(until, status.subjects.first()) {
-                    holds = false;
-                    break;
-                }
-            }
-            if holds {
-                self.store.resolve_attention_automatically(
-                    &request.subject,
-                    &format!("every target is {until}"),
-                    &format!("{}:until", request.request),
-                )?;
-                self.signal_changed();
-            }
-        }
-        Ok(())
-    }
 
     fn next_provider_capacity_retry_deadline(&self) -> Result<Option<u128>> {
         let mut deadline = None;
@@ -1218,6 +1218,24 @@ impl<R: RuntimeControl> Reconciler<R> {
     }
 
     pub fn reconcile_once(&self) -> Result<()> {
+        for runner in self.store.mission_gate_runners()? {
+            if runner.retired && runner.host == self.host {
+                let _ = self.isolate("gate", &runner.subject, || {
+                    let runtime_id = runner.subject.replace('/', ".");
+                    let observation = self.runtime.observe_exec(&runtime_id)?;
+                    self.reconcile_runtime_stop(
+                        &runner.subject,
+                        &runtime_id,
+                        false,
+                        observation
+                            .as_ref()
+                            .and_then(|value| value.incarnation_id.as_deref()),
+                        0,
+                        observation.as_ref(),
+                    )
+                });
+            }
+        }
         let desired_span = crate::profile::span("pass/desired");
         let mut desired = self.store.desired_subjects()?;
         let terminal_owned = self.store.terminal_owned_runtime_subjects()?;
@@ -1624,8 +1642,8 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.isolate("stage/provider-capacity-retries", &daemon, || {
             self.reconcile_provider_capacity_retries(&desired)
         });
-        self.isolate("stage/retired-agent-attention", &daemon, || {
-            self.resolve_attention_for_retired_agents(&desired)
+        self.isolate("stage/person-asks", &daemon, || {
+            self.store.reconcile_person_asks()
         });
         self.isolate("stage/disk-space", &daemon, || {
             self.reconcile_disk_space(&desired)
@@ -1636,9 +1654,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             .clear();
         self.isolate("stage/missions", &daemon, || self.evaluate_mission_runs());
         self.release_unused_file_watchers();
-        self.isolate("stage/attention-until", &daemon, || {
-            self.resolve_attention_whose_until_holds()
-        });
+
         // Mission state is the primary control-plane projection. Evaluate it before
         // wake-message bookkeeping so a large mailbox or work history cannot starve
         // newly-created runs of their first readiness pass.
@@ -1945,7 +1961,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                     .and_then(Value::as_str)
                     == Some(incarnation)
             });
-        let attention_recorded = self.store.attention_request(&attention_subject)?.is_some();
+        let attention_recorded = self
+            .store
+            .operational_failure(&attention_subject)?
+            .is_some();
         let mut changed = false;
         if !deadline_recorded {
             self.store.append_claim(&ClaimInput {
@@ -1972,7 +1991,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             changed = true;
         }
         if !attention_recorded {
-            self.store.request_attention(
+            self.store.record_runtime_failure(
                 &attention_subject,
                 &AttentionRequest {
                     reviewer: "person/operator".into(),
@@ -1983,6 +2002,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                     actor: "agent/st3/reconciler".into(),
                     idempotency_key: format!("{attention_key}:requested"),
                 },
+                "readiness",
             )?;
             changed = true;
         }
@@ -2043,72 +2063,21 @@ impl<R: RuntimeControl> Reconciler<R> {
                 "a later runtime incarnation became ready",
             )?;
         }
-        let token = self
-            .store
-            .selected_desired_token(subject)?
-            .unwrap_or_default();
-        for claim in self
-            .store
-            .claims_for(subject, Some("runtime.reconcile-decision"))?
-        {
-            let Some(old_token) = claim
-                .body
-                .pointer("/fields/key")
-                .and_then(Value::as_str)
-                .and_then(|key| key.strip_prefix("codex-crash-loop:"))
-            else {
-                continue;
-            };
-            if old_token == token {
-                continue;
-            }
-            self.resolve_pending_alert(
-                &format!("codex-crash-loop:{subject}:{old_token}"),
-                "a new desired revision became ready",
-            )?;
-        }
         Ok(())
     }
 
     /// Alerts this host raised about an agent that is no longer desired, or is desired stopped,
     /// have nothing left to fix. Alerts with any other target stay with their reviewer.
-    fn resolve_attention_for_retired_agents(&self, desired: &[DesiredSubject]) -> Result<()> {
-        let active = desired
-            .iter()
-            .filter(|subject| subject.kind != "stop")
-            .map(|subject| subject.subject.as_str())
-            .collect::<BTreeSet<_>>();
-        for request in self
-            .store
-            .pending_attention_requests_raised_by("agent/st3/reconciler", &self.host)?
-        {
-            if request.targets.is_empty()
-                || !request
-                    .targets
-                    .iter()
-                    .all(|target| target.starts_with("agent/") && !active.contains(target.as_str()))
-            {
-                continue;
-            }
-            self.store.resolve_attention_automatically(
-                &request.subject,
-                "the agent it names was removed or stopped",
-                &format!("{}:agent-retired", request.request),
-            )?;
-            self.signal_changed();
-        }
-        Ok(())
-    }
 
     fn resolve_pending_alert(&self, key: &str, reason: &str) -> Result<()> {
         let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
         let attention_subject = format!("attention/{}", &digest[..32]);
         if self
             .store
-            .attention_request(&attention_subject)?
+            .operational_failure(&attention_subject)?
             .is_some_and(|attention| attention.status == "pending")
         {
-            self.store.resolve_attention_automatically(
+            self.store.recover_operational_failure(
                 &attention_subject,
                 reason,
                 &format!("{key}:resolved"),
@@ -2174,7 +2143,11 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
         let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
         let attention_subject = format!("attention/{}", &digest[..32]);
-        if self.store.attention_request(&attention_subject)?.is_some() {
+        if self
+            .store
+            .operational_failure(&attention_subject)?
+            .is_some()
+        {
             return Ok(());
         }
         self.store.append_claim(&ClaimInput {
@@ -2193,15 +2166,15 @@ impl<R: RuntimeControl> Reconciler<R> {
                 expected_subject: None,
                 idempotency_key: Some(key.clone()),
         })?;
-        self.store.request_attention(&attention_subject, &AttentionRequest {
-                reviewer: "person/nathan".into(),
+        self.store.record_runtime_failure(&attention_subject, &AttentionRequest {
+                reviewer: "person/alex".into(),
                 title: "Claude login expired".into(),
                 reason: format!("{} on {} is unauthenticated. Run /login in its terminal, then restart this harness; work delivery is held until a new authenticated incarnation.", subject.subject, self.host),
                 severity: "error".into(),
                 targets: vec![subject.subject.clone()],
                 actor: "agent/st3/reconciler".into(),
                 idempotency_key: format!("{key}:attention"),
-        })?;
+        }, "provider-auth")?;
         self.signal_changed();
         Ok(())
     }
@@ -2319,8 +2292,12 @@ impl<R: RuntimeControl> Reconciler<R> {
             );
             let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
             let attention_subject = format!("attention/{}", &digest[..32]);
-            if self.store.attention_request(&attention_subject)?.is_none() {
-                self.store.request_attention(
+            if self
+                .store
+                .operational_failure(&attention_subject)?
+                .is_none()
+            {
+                self.store.record_runtime_failure(
                     &attention_subject,
                     &AttentionRequest {
                         reviewer: "person/operator".into(),
@@ -2335,8 +2312,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                         targets: vec![subject.subject.clone()],
                         actor: "agent/st3/reconciler".into(),
                         idempotency_key: format!("{key}:requested"),
-                    },
-                )?;
+                    }, "provider-trust",
+            )?;
                 self.signal_changed();
             }
             return Ok(());
@@ -3653,8 +3630,6 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn raise_runtime_crash_loop(&self, subject: &str, token: &str, reason: &str) -> Result<()> {
         let key = format!("runtime-crash-loop:{subject}:{token}");
         let decision_key = format!("runtime-crash-loop:{token}");
-        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
-        let attention_subject = format!("attention/{}", &digest[..32]);
         let mut changed = false;
         if !self.runtime_crash_loop_raised(subject, token)? {
             self.store.append_claim(&ClaimInput {
@@ -3673,17 +3648,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             })?;
             changed = true;
         }
-        if self.store.attention_request(&attention_subject)?.is_none() {
-            self.store.request_attention(&attention_subject, &AttentionRequest {
-                reviewer: "person/operator".into(),
-                title: "An agent stopped after repeated runtime failures".into(),
-                reason: format!("{subject}: {reason}. Inspect the seat and revise its desired declaration before restarting."),
-                severity: "error".into(), targets: vec![subject.into()],
-                actor: "agent/st3/reconciler".into(),
-                idempotency_key: format!("{key}:attention"),
-            })?;
-            changed = true;
-        }
         if changed {
             self.signal_changed();
         }
@@ -3693,8 +3657,6 @@ impl<R: RuntimeControl> Reconciler<R> {
     fn raise_codex_crash_loop(&self, subject: &str, token: &str, reason: &str) -> Result<()> {
         let key = format!("codex-crash-loop:{subject}:{token}");
         let decision_key = format!("codex-crash-loop:{token}");
-        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
-        let attention_subject = format!("attention/{}", &digest[..32]);
         let existing = self
             .store
             .claims_for(subject, Some("runtime.reconcile-decision"))?
@@ -3703,11 +3665,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                 claim.body.pointer("/fields/key").and_then(Value::as_str)
                     == Some(decision_key.as_str())
             });
-        let retained_reason = existing
-            .as_ref()
-            .and_then(|claim| claim.body.pointer("/fields/reason"))
-            .and_then(Value::as_str)
-            .unwrap_or(reason);
         let mut changed = false;
         if existing.is_none() {
             self.store.append_claim(&ClaimInput {
@@ -3724,21 +3681,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                 expected_subject: None,
                 idempotency_key: Some(format!("{key}:raised")),
             })?;
-            changed = true;
-        }
-        if self.store.attention_request(&attention_subject)?.is_none() {
-            self.store.request_attention(
-                &attention_subject,
-                &AttentionRequest {
-                    reviewer: "person/nathan".into(),
-                    title: "A Codex agent stopped after repeated failures".into(),
-                    reason: format!("{subject}: {retained_reason}. Inspect the seat and revise its desired declaration before restarting."),
-                    severity: "error".into(),
-                    targets: vec![subject.into()],
-                    actor: "agent/st3/reconciler".into(),
-                    idempotency_key: format!("{key}:attention"),
-                },
-            )?;
             changed = true;
         }
         if changed {
@@ -4055,7 +3997,11 @@ impl<R: RuntimeControl> Reconciler<R> {
             changed |= self.store.set_mission_run_state(
                 &run.id,
                 "running",
-                "cleanup-failed",
+                if run.phase == "final-cancelled" {
+                    "cleanup-cancelled"
+                } else {
+                    "cleanup-failed"
+                },
                 Some(&reason),
             )?;
             return Ok(changed);
@@ -4307,18 +4253,38 @@ impl<R: RuntimeControl> Reconciler<R> {
                         !step.step.is_empty()
                             && matches!(step.status.as_str(), "failed" | "cancelled")
                     });
-                let terminal_status = if final_failed || failed {
-                    "failed"
-                } else if run.phase == "final-cancelled" {
+                let terminal_status = if run.phase == "final-cancelled" {
                     "cancelled"
+                } else if final_failed || failed {
+                    "failed"
                 } else {
                     "completed"
+                };
+                let failure_reason = if final_failed {
+                    Some(format!(
+                        "finally steps failed: {}",
+                        flat.iter()
+                            .filter(|step| step.spec.finally)
+                            .filter_map(|step| views.get(step.spec.path.as_str()))
+                            .filter(|view| view.status == "failed")
+                            .map(|view| format!(
+                                "{}: {}",
+                                view.step,
+                                view.blocked_reason.as_deref().unwrap_or("the step failed")
+                            ))
+                            .collect::<Vec<_>>()
+                            .join("; ")
+                    ))
+                } else if failed {
+                    Some("one or more mission steps failed".to_owned())
+                } else {
+                    None
                 };
                 changed |= self.store.set_mission_run_state(
                     &run.id,
                     "running",
                     &format!("cleanup-{terminal_status}"),
-                    (final_failed || failed).then_some("one or more mission steps failed"),
+                    failure_reason.as_deref(),
                 )?;
                 return Ok(changed);
             }
@@ -4359,7 +4325,10 @@ impl<R: RuntimeControl> Reconciler<R> {
                         }
                         return Ok(changed);
                     }
-                    if matches!(view.status.as_str(), "completed" | "cancelled") {
+                    if matches!(
+                        view.status.as_str(),
+                        "completed" | "cancelled" | "waiting-person"
+                    ) {
                         return Ok(changed);
                     }
                     if view.status == "orphaned" {
@@ -4472,7 +4441,12 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 .iter()
                                 .any(|kind| kind.as_deref() == Some("agent")))
                         };
-                        let mut eligible = view.agentless || eligible_agent()?;
+                        let mut eligible = view.agentless
+                            || view
+                                .assigned_to
+                                .as_deref()
+                                .is_some_and(|actor| actor.starts_with("person/"))
+                            || eligible_agent()?;
                         if !eligible {
                             // A step can declare its own assigned agent. Create only that agent before
                             // checking eligibility; other declarations still wait for active execution.
@@ -4547,7 +4521,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                     if let Some(loop_spec) = &step.spec.loop_spec {
                         if self.evaluate_loop_step(run, &step, view, loop_spec)? {
                             changed = true;
-                            self.request_stopped_loop_attention(run, view, loop_spec)?;
                         }
                         return Ok(changed);
                     }
@@ -4674,13 +4647,28 @@ impl<R: RuntimeControl> Reconciler<R> {
         } else {
             BTreeSet::from([run.subject.clone()])
         };
-        let owned = owner_runs
+        let mut owned = owner_runs
             .iter()
             .map(|owner| self.store.desired_subjects_for_owner_run(owner))
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .flatten()
             .collect::<Vec<_>>();
+        owned.extend(
+            self.store
+                .mission_gate_runners()?
+                .into_iter()
+                .filter(|runner| owner_runs.contains(&runner.owner_run))
+                .map(|runner| DesiredSubject {
+                    subject: runner.subject,
+                    kind: "stop".into(),
+                    desired: Value::Null,
+                    member: None,
+                    owner_run: Some(runner.owner_run),
+                    owner_generation: None,
+                    owner_step: None,
+                }),
+        );
         let intake_stopped = self.stop_owned_intake(
             &owned.iter().collect::<Vec<_>>(),
             None,
@@ -4839,9 +4827,22 @@ impl<R: RuntimeControl> Reconciler<R> {
             self.record_once(&run.subject, "eval.verdict", fields)?;
             changed = true;
         }
-        changed |=
-            self.store
-                .set_mission_run_state(&run.id, status, "terminal", unstopped.as_deref())?;
+        let failure_reason = self
+            .store
+            .latest_claim(&run.subject, Some("mission-run.state"))?
+            .and_then(|claim| {
+                claim
+                    .body
+                    .pointer("/fields/reason")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            });
+        changed |= self.store.set_mission_run_state(
+            &run.id,
+            status,
+            "terminal",
+            unstopped.as_deref().or(failure_reason.as_deref()),
+        )?;
         Ok(changed)
     }
 
@@ -5573,6 +5574,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             BTreeMap::from([
                 ("status".into(), Value::String("requested".into())),
                 ("runner".into(), Value::String("loop-metric".into())),
+                ("owner".into(), Value::String(view.subject.clone())),
             ]),
         )?;
         let member = MemberSpec {
@@ -7021,118 +7023,6 @@ impl<R: RuntimeControl> Reconciler<R> {
         }
     }
 
-    /// Raise one attention item for a loop whose step just failed or was cancelled: it failed
-    /// at exhaustion or in its human review, or a round or branch mission stopped it. The item
-    /// names the loop, the cause and the command that continues or ends it. It closes when the
-    /// loop runs again, a revision replaces its generation, or its run is cancelled. A loop that
-    /// declares `on-exhausted { attention }` names its title, reviewer and severity; any other
-    /// loop asks the person who requested the run.
-    fn request_stopped_loop_attention(
-        &self,
-        run: &MissionRunView,
-        view: &crate::model::StepRunView,
-        loop_spec: &LoopSpec,
-    ) -> Result<()> {
-        let Some(state) = self
-            .store
-            .latest_claim(&view.subject, Some("step-run.state"))?
-        else {
-            return Ok(());
-        };
-        let status = state
-            .body
-            .pointer("/fields/status")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        if !matches!(status, "failed" | "cancelled") {
-            return Ok(());
-        }
-        let reason = state
-            .body
-            .pointer("/fields/reason")
-            .and_then(Value::as_str)
-            .unwrap_or("the loop stopped");
-        let loop_subject = format!(
-            "loop-run/{}/{}",
-            run.generation
-                .strip_prefix("run-generation/")
-                .unwrap_or(&run.generation),
-            loop_spec.path
-        );
-        let feedback = self
-            .store
-            .claims_for(&loop_subject, Some("loop.round-result"))?
-            .into_iter()
-            .rev()
-            .find_map(|claim| {
-                claim
-                    .body
-                    .pointer("/fields/feedback")
-                    .and_then(Value::as_str)
-                    .filter(|feedback| !feedback.is_empty())
-                    .map(str::to_owned)
-            });
-        let mission = run.mission.strip_prefix("mission/").unwrap_or(&run.mission);
-        let remedy = if status == "failed" {
-            format!(
-                "`st work retry {} --reason \"...\"` runs round {} after you address the cause; `st missions cancel {} --reason \"...\"` ends the run.",
-                view.subject,
-                view.attempt.saturating_add(1),
-                run.subject
-            )
-        } else {
-            format!(
-                "st cannot retry a cancelled step. Correct the mission, then end this run with `st missions cancel {} --reason \"...\"` if it still runs, and start a new one with `st missions start {mission}`.",
-                run.subject
-            )
-        };
-        let mut detail = format!(
-            "Loop `{loop_subject}` stopped in round {}: {reason}.",
-            view.attempt
-        );
-        if let Some(feedback) = feedback {
-            detail.push_str(&format!(" Latest feedback: `{feedback}`."));
-        }
-        detail.push(' ');
-        detail.push_str(&remedy);
-        detail.push_str(
-            " This item closes when the loop runs again or its run is revised or cancelled.",
-        );
-        let (title, reviewer, severity) = match &loop_spec.exhaustion_attention {
-            Some(attention) => (
-                attention.title.clone(),
-                attention.reviewer.clone(),
-                attention.severity.clone(),
-            ),
-            None => (
-                format!("Loop `{}` stopped", loop_spec.id),
-                if run.requester.starts_with("person/") {
-                    run.requester.clone()
-                } else {
-                    "person/operator".into()
-                },
-                "error".into(),
-            ),
-        };
-        // One item per stop. A retry runs the next round, so a later stop raises a new item.
-        let idempotency_key = format!("loop-stopped-attention:{loop_subject}:{}", view.attempt);
-        let digest = hex::encode(sha2::Sha256::digest(idempotency_key.as_bytes()));
-        self.store.request_attention(
-            &format!("attention/{}", &digest[..32]),
-            &AttentionRequest {
-                reviewer,
-                title,
-                reason: detail,
-                severity,
-                targets: vec![loop_subject, run.subject.clone()],
-                actor: RECONCILER_ACTOR.into(),
-                idempotency_key,
-            },
-        )?;
-        self.signal_changed();
-        Ok(())
-    }
-
     fn step_dependencies_hold(
         &self,
         run: &MissionRunView,
@@ -8085,6 +7975,8 @@ impl<R: RuntimeControl> Reconciler<R> {
                 return Ok(());
             }
             (0_u64, at)
+        } else if let Some(calendar) = &spec.calendar {
+            calendar_occurrence(calendar, last, now, &spec.catch_up, spec.max_catch_up)?
         } else {
             let Some(interval) = spec.every_ms else {
                 return Ok(());
@@ -8137,6 +8029,25 @@ impl<R: RuntimeControl> Reconciler<R> {
                 .context("schedule timestamp overflow")?;
             (next, scheduled)
         };
+        let scheduled_at = if spec.calendar.is_some() {
+            self.store
+                .claims_for(&schedule.subject, Some("schedule.occurrence-scheduled"))?
+                .into_iter()
+                .find(|claim| {
+                    claim.body["fields"]["revision"].as_str() == Some(revision.as_str())
+                        && claim.body["fields"]["occurrence"].as_u64() == Some(occurrence)
+                })
+                .map(|claim| -> Result<i64> {
+                    Ok(claim.body["fields"]["scheduled_at_unix_ms"]
+                        .as_str()
+                        .context("scheduled occurrence has no instant")?
+                        .parse()?)
+                })
+                .transpose()?
+                .unwrap_or(scheduled_at)
+        } else {
+            scheduled_at
+        };
         let operation = format!("{}:{revision}:{occurrence}", schedule.subject);
         if !self
             .armed_schedules
@@ -8162,6 +8073,13 @@ impl<R: RuntimeControl> Reconciler<R> {
             expected_subject: None,
             idempotency_key: Some(format!("clock-wake:{operation}")),
         })?;
+        // The claim's instant remains authoritative when tzdata changes after arming.
+        let scheduled_at = request
+            .body
+            .pointer("/fields/scheduled_at_unix_ms")
+            .and_then(Value::as_str)
+            .context("scheduled occurrence has no instant")?
+            .parse::<i64>()?;
         self.event_notify
             .send_modify(|generation| *generation = generation.saturating_add(1));
         let work = spec.work.clone();
@@ -8221,6 +8139,52 @@ impl<R: RuntimeControl> Reconciler<R> {
                     idempotency_key: Some(format!("clock-reached:{operation}")),
                 });
                 if let (Ok(reached), Some(work)) = (reached, work) {
+                    let (selected_revision, failure_code, failure_reason) =
+                        match scheduled_work_revision(&store, &work) {
+                            Ok(Some(revision)) => (Some(revision), "", String::new()),
+                            Ok(None) => (
+                                None,
+                                "no-ready-mission-revision",
+                                format!(
+                                    "mission/{} has no ready published head on schedule host",
+                                    work.mission
+                                ),
+                            ),
+                            Err(error) => (
+                                None,
+                                "mission-head-unavailable",
+                                format!("cannot read mission/{} head: {error}", work.mission),
+                            ),
+                        };
+                    let Some(selected_revision) = selected_revision else {
+                        let _ = store.append_claim(&ClaimInput {
+                            subject: schedule_subject.clone(),
+                            kind: "schedule.work-failed".into(),
+                            actor: None,
+                            fields: BTreeMap::from([
+                                ("request".into(), Value::String(reached.id.clone())),
+                                ("code".into(), Value::String(failure_code.into())),
+                                ("reason".into(), Value::String(failure_reason.clone())),
+                            ]),
+                            evidence: vec![reached.id.clone()],
+                            expected_subject: None,
+                            idempotency_key: Some(format!("schedule-work-failed:{operation}")),
+                        });
+                        if failure_code == "no-ready-mission-revision" {
+                            let _ = request_schedule_head_attention(
+                                &store,
+                                &schedule_subject,
+                                &reached.id,
+                                &failure_reason,
+                            );
+                        }
+                        armed
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .remove(&operation);
+                        signal_changed(&notify, &event_notify);
+                        return;
+                    };
                     let _ = store.append_claim(&ClaimInput {
                         subject: schedule_subject.clone(),
                         kind: "schedule.work-requested".into(),
@@ -8232,7 +8196,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                                 "mission".into(),
                                 Value::String(format!("mission/{}", work.mission)),
                             ),
-                            ("mission_revision".into(), Value::String(work.revision)),
+                            ("mission_revision".into(), Value::String(selected_revision)),
                             ("workspace".into(), Value::String(work.workspace)),
                             (
                                 "inputs".into(),
@@ -8405,6 +8369,18 @@ impl<R: RuntimeControl> Reconciler<R> {
                 expected_subject: None,
                 idempotency_key: Some(format!("schedule-work-started:{}", run.id)),
             })?;
+            let attention = schedule_head_attention_subject(&schedule.subject);
+            if self
+                .store
+                .operational_failure(&attention)?
+                .is_some_and(|item| item.status == "pending")
+            {
+                self.store.recover_operational_failure(
+                    &attention,
+                    "A subsequent schedule occurrence started successfully.",
+                    &format!("schedule-head-ready:{}", run.id),
+                )?;
+            }
         }
         anyhow::ensure!(waiting.is_empty(), "{}", waiting.join("; "));
         Ok(())
@@ -8456,9 +8432,9 @@ impl<R: RuntimeControl> Reconciler<R> {
         {
             return Ok(());
         }
+        self.retire_legacy_held_subscription_attention(&item.subject)?;
         if spec.stopped {
             self.cancel_unstarted_subscription_requests(&item.subject)?;
-            self.resolve_released_held_attention(&item.subject, &BTreeMap::new())?;
             return Ok(());
         }
         if spec.delivery != "mission" {
@@ -8468,7 +8444,6 @@ impl<R: RuntimeControl> Reconciler<R> {
             .store
             .pending_subscription_mission_requests(&item.subject)?;
         if requests.is_empty() {
-            self.resolve_released_held_attention(&item.subject, &BTreeMap::new())?;
             return Ok(());
         }
         let is_held = |request: &crate::model::ClaimRecord| {
@@ -8493,10 +8468,10 @@ impl<R: RuntimeControl> Reconciler<R> {
         } else {
             BTreeSet::new()
         };
-        let mut held = BTreeMap::<String, usize>::new();
+        let mut capacity_waiting = BTreeSet::new();
         let mut waiting = Vec::new();
         for request in requests {
-            // A review waiting for capacity or a person reviews only the current head of an open
+            // A queued review runs only for the current head of an open
             // pull request.
             let pull_request = request
                 .body
@@ -8529,21 +8504,24 @@ impl<R: RuntimeControl> Reconciler<R> {
                 })?;
                 continue;
             }
+            // Older builds held excess deliveries for a person. Migrate current requests into
+            // the automatic queue, even when their mission is still waiting for capacity.
             if is_held(&request) && !released.contains(&request.id) {
-                let observation = request
-                    .body
-                    .pointer("/evidence/0")
-                    .and_then(Value::as_str)
-                    .unwrap_or(request.id.as_str())
-                    .to_owned();
-                *held.entry(observation).or_default() += 1;
-                continue;
-            }
-            let deferral = self
-                .store
-                .subscription_mission_deferral(&item.subject, &request.id)?;
-            if deferral.is_some_and(|(deadline, _)| deadline > now_ms()) {
-                continue;
+                self.store.append_claim(&ClaimInput {
+                    subject: item.subject.clone(),
+                    kind: "subscription.mission-request-released".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("request".into(), Value::String(request.id.clone())),
+                        (
+                            "reason".into(),
+                            Value::String("migrated held request to the automatic queue".into()),
+                        ),
+                    ]),
+                    evidence: vec![request.id.clone()],
+                    expected_subject: None,
+                    idempotency_key: Some(format!("subscription-request-queued:{}", request.id)),
+                })?;
             }
             let fields = request.body.get("fields").unwrap_or(&request.body);
             let field = |name: &str| fields.get(name).and_then(Value::as_str);
@@ -8585,6 +8563,18 @@ impl<R: RuntimeControl> Reconciler<R> {
                     continue;
                 }
             }
+            // A younger request must not pass an older capacity retry. Keep examining the
+            // rest of the queue so stale requests are cancelled and legacy holds are migrated.
+            if capacity_waiting.contains(mission) {
+                continue;
+            }
+            let deferral = self
+                .store
+                .subscription_mission_deferral(&item.subject, &request.id)?;
+            if deferral.is_some_and(|(deadline, _)| deadline > now_ms()) {
+                capacity_waiting.insert(mission.to_owned());
+                continue;
+            }
             let requester = field("requester")
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("daemon/{}", self.host));
@@ -8620,6 +8610,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             let run = match created {
                 Ok(run) => run,
                 Err(error) if error.code == "mission-run-capacity" => {
+                    capacity_waiting.insert(mission.to_owned());
                     let attempt =
                         deferral.map_or(1_u32, |(_, attempts)| attempts.saturating_add(1));
                     let delay_ms =
@@ -8661,10 +8652,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                 idempotency_key: Some(format!("subscription-mission-started:{}", run.id)),
             })?;
         }
-        for (observation, count) in &held {
-            self.request_held_subscription_attention(&item.subject, observation, *count)?;
-        }
-        self.resolve_released_held_attention(&item.subject, &held)?;
         anyhow::ensure!(waiting.is_empty(), "{}", waiting.join("; "));
         Ok(())
     }
@@ -8718,62 +8705,19 @@ impl<R: RuntimeControl> Reconciler<R> {
         Ok(())
     }
 
-    /// Ask a person once per observation to release or cancel the requests it held.
-    fn request_held_subscription_attention(
-        &self,
-        subscription: &str,
-        observation: &str,
-        count: usize,
-    ) -> Result<()> {
-        let attention_subject = held_subscription_attention_subject(subscription, observation);
-        let digest = attention_subject
-            .strip_prefix("attention/")
-            .unwrap_or(&attention_subject);
-        if self.store.attention_request(&attention_subject)?.is_some() {
-            return Ok(());
-        }
-        self.store.request_attention(
-            &attention_subject,
-            &AttentionRequest {
-                reviewer: "person/operator".into(),
-                title: HELD_SUBSCRIPTION_TITLE.into(),
-                reason: format!(
-                    "One observation for {subscription} requested more than {} mission runs, so {count} wait for a person. List them with `st missions requests {subscription}`, then release or cancel each one.",
-                    crate::store::MAX_OBSERVATION_DELIVERIES
-                ),
-                severity: "warning".into(),
-                targets: vec![subscription.into()],
-                actor: RECONCILER_ACTOR.into(),
-                idempotency_key: format!("held-subscription-requests:{digest}"),
-            },
-        )?;
-        self.signal_changed();
-        Ok(())
-    }
-
-    /// Close each held-requests item of `subscription` once none of its observation's requests
-    /// is held: each was released, cancelled or started, or the subscription stopped.
-    fn resolve_released_held_attention(
-        &self,
-        subscription: &str,
-        held: &BTreeMap<String, usize>,
-    ) -> Result<()> {
-        let still_held = held
-            .keys()
-            .map(|observation| held_subscription_attention_subject(subscription, observation))
-            .collect::<BTreeSet<_>>();
+    /// Retire stored attention from the old burst cap. Queued requests now start automatically.
+    fn retire_legacy_held_subscription_attention(&self, subscription: &str) -> Result<()> {
         for request in self
             .store
             .pending_attention_requests_raised_by(RECONCILER_ACTOR, &self.host)?
         {
             if request.targets == [subscription]
-                && request.title == HELD_SUBSCRIPTION_TITLE
-                && !still_held.contains(&request.subject)
+                && request.title == "A subscription is holding mission requests"
             {
                 self.store.resolve_attention_automatically(
                     &request.subject,
-                    &format!("{subscription} holds no request from that observation"),
-                    &format!("held-subscription-released:{}", request.request),
+                    "subscription requests now wait in an automatic queue",
+                    &format!("held-subscription-queued:{}", request.request),
                 )?;
                 self.signal_changed();
             }
@@ -8955,14 +8899,6 @@ impl<R: RuntimeControl> Reconciler<R> {
         let deadlines = self.observer_deadlines.clone();
         let cursors = self.observer_cursors.clone();
         let observer_subject = observer.subject.clone();
-        let observer_owner_run = observer.owner_run.clone();
-        let host = self.host.clone();
-        let was_failing = observer_actual.as_ref().is_some_and(|actual| {
-            matches!(
-                actual.get("state").and_then(Value::as_str),
-                Some("unreachable" | "degraded")
-            )
-        });
         let previous_facts = self
             .store
             .latest_actual_value(&spec.resource)?
@@ -9043,13 +8979,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     .lock()
                                     .unwrap_or_else(PoisonError::into_inner)
                                     .insert(deadline_key.clone(), observation.cursor);
-                                if was_failing {
-                                    let _ = resolve_observer_attention(
-                                        &store,
-                                        &host,
-                                        &observer_subject,
-                                    );
-                                }
                             }
                             Err(error) => {
                                 let retry_at = now_ms().saturating_add(60_000);
@@ -9088,17 +9017,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     expected_subject: None,
                                     idempotency_key: Some(key),
                                 });
-                                // A permanent error is not polled again, so it waits for a
-                                // person to correct the declaration.
-                                if permanent_observation_error(error.code) {
-                                    let _ = request_observer_attention(
-                                        &store,
-                                        &observer_subject,
-                                        observer_owner_run.as_deref(),
-                                        &revision,
-                                        &ObserverCondition::Rejected(error.to_string()),
-                                    );
-                                }
                             }
                         }
                     }
@@ -9122,7 +9040,17 @@ impl<R: RuntimeControl> Reconciler<R> {
                         });
                         if !unchanged_failure || refresh_attempt.is_some() {
                             let failure_hash = hex::encode(sha2::Sha256::digest(
-                                format!("{operation}:{reason}").as_bytes(),
+                                format!(
+                                    "{operation}:{reason}:{}",
+                                    store
+                                        .claims_for(&observer_subject, Some("observer.state"))
+                                        .unwrap_or_default()
+                                        .into_iter()
+                                        .rev()
+                                        .find(|claim| claim.body["fields"]["state"] == "healthy")
+                                        .map_or_else(|| "first".into(), |claim| claim.id)
+                                )
+                                .as_bytes(),
                             ));
                             let mut fields = BTreeMap::from([
                                 ("state".into(), Value::String("unreachable".into())),
@@ -9149,19 +9077,6 @@ impl<R: RuntimeControl> Reconciler<R> {
                                     &failure_hash[..20]
                                 )),
                             });
-                        }
-                        let since = observer_unreachable_since(&store, &observer_subject)
-                            .ok()
-                            .flatten()
-                            .unwrap_or_else(now_ms);
-                        if condition.needs_person(now_ms().saturating_sub(since)) {
-                            let _ = request_observer_attention(
-                                &store,
-                                &observer_subject,
-                                observer_owner_run.as_deref(),
-                                &revision,
-                                &condition,
-                            );
                         }
                     }
                 }
@@ -9502,6 +9417,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             BTreeMap::from([
                 ("status".into(), Value::String("requested".into())),
                 ("runner".into(), Value::String("exec".into())),
+                ("owner".into(), Value::String(stage.subject.clone())),
             ]),
         )?;
         let member = MemberSpec {
@@ -9741,6 +9657,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             BTreeMap::from([
                 ("status".into(), Value::String("requested".into())),
                 ("model".into(), Value::String(model.into())),
+                ("owner".into(), Value::String(stage.subject.clone())),
                 ("token_budget".into(), Value::from(token_budget)),
                 (
                     "tools".into(),
@@ -10069,7 +9986,6 @@ fn permanent_observation_error(code: &str) -> bool {
     )
 }
 
-const HELD_SUBSCRIPTION_TITLE: &str = "A subscription is holding mission requests";
 /// How often the disk stage reads free space.
 const DISK_CHECK_EVERY_MS: u128 = 30_000;
 
@@ -10078,37 +9994,11 @@ const RECONCILER_FAILING_TITLE: &str = "The reconciler is failing";
 
 /// How long a fault must last before it asks a person. st retries a faulted item on every pass,
 /// so most faults clear sooner and never reach anyone.
+#[cfg(test)]
 const FAULT_ATTENTION_AFTER_MS: u128 = 120_000;
 
-fn fault_attention_subject(fault: &str) -> String {
-    let digest = hex::encode(sha2::Sha256::digest(
-        format!("reconcile-fault-attention:{fault}").as_bytes(),
-    ));
-    format!("attention/{}", &digest[..32])
-}
-
-fn held_subscription_attention_subject(subscription: &str, observation: &str) -> String {
-    let digest = hex::encode(sha2::Sha256::digest(
-        format!("held-subscription-requests:{subscription}:{observation}").as_bytes(),
-    ));
-    format!("attention/{}", &digest[..32])
-}
-
-fn observer_unreachable_since(store: &Store, subject: &str) -> Result<Option<u128>> {
-    let mut since = None;
-    for claim in store.claims_for(subject, Some("observer.state"))? {
-        let state = claim.body.pointer("/fields/state").and_then(Value::as_str);
-        if state == Some("unreachable") {
-            since.get_or_insert(claim.accepted_at_unix_ms);
-        } else {
-            since = None;
-        }
-    }
-    Ok(since)
-}
-
 /// Why an observer cannot observe, and whether a person has to act.
-enum ObserverCondition {
+pub(crate) enum ObserverCondition {
     /// GitHub rejected the token or refused access. Nothing changes until a person acts.
     Access(String),
     /// A rate limit ends at a known reset. It needs a person only when the observer was already
@@ -10158,7 +10048,7 @@ impl ObserverCondition {
         }
     }
 
-    fn needs_person(&self, failing_for_ms: u128) -> bool {
+    pub(crate) fn needs_person(&self, failing_for_ms: u128) -> bool {
         match self {
             Self::Access(_) | Self::Rejected(_) => true,
             Self::RateLimited { outlasted, .. } => *outlasted,
@@ -10166,7 +10056,7 @@ impl ObserverCondition {
         }
     }
 
-    fn title(&self) -> &'static str {
+    pub(crate) fn title(&self) -> &'static str {
         match self {
             Self::Access(_) => "An observer has no access to GitHub",
             Self::RateLimited { .. } => "A GitHub rate limit outlasted its reset",
@@ -10176,7 +10066,7 @@ impl ObserverCondition {
     }
 
     /// The cause and the command that fixes it. `host` polls the observer.
-    fn reason(&self, subject: &str, host: &str) -> String {
+    pub(crate) fn reason(&self, subject: &str, host: &str) -> String {
         let closes = "This item closes when the observer observes again.";
         match self {
             Self::Access(reason) => format!(
@@ -10193,67 +10083,6 @@ impl ObserverCondition {
             ),
         }
     }
-}
-
-/// Raise one attention item per observer, revision, cause and failure episode. An episode ends
-/// when the observer records a healthy state, so a later failure raises a new item even after a
-/// person closed the last one.
-fn request_observer_attention(
-    store: &Store,
-    subject: &str,
-    owner_run: Option<&str>,
-    revision: &str,
-    condition: &ObserverCondition,
-) -> Result<()> {
-    let episode = store
-        .claims_for(subject, Some("observer.state"))?
-        .into_iter()
-        .rev()
-        .find(|claim| {
-            claim.body.pointer("/fields/state").and_then(Value::as_str) == Some("healthy")
-        })
-        .map_or_else(|| "first".to_owned(), |claim| claim.id);
-    let key = format!(
-        "observer-attention:{subject}:{revision}:{}:{episode}",
-        condition.code()
-    );
-    let hash = hex::encode(sha2::Sha256::digest(key.as_bytes()));
-    let attention = format!("attention/observer-{}", &hash[..24]);
-    if store.attention_request(&attention)?.is_some() {
-        return Ok(());
-    }
-    let reviewer = owner_run
-        .and_then(|owner| store.mission_run(owner).ok().flatten())
-        .map(|run| run.requester)
-        .filter(|requester| requester.starts_with("person/"))
-        .unwrap_or_else(|| "person/operator".into());
-    store.request_attention(
-        &attention,
-        &AttentionRequest {
-            reviewer,
-            title: condition.title().into(),
-            reason: condition.reason(subject, store.origin()),
-            severity: "error".into(),
-            targets: vec![subject.into()],
-            actor: RECONCILER_ACTOR.into(),
-            idempotency_key: key,
-        },
-    )?;
-    Ok(())
-}
-
-/// Close every item this host raised about `subject` once the observer observes again.
-fn resolve_observer_attention(store: &Store, host: &str, subject: &str) -> Result<()> {
-    for request in store.pending_attention_requests_raised_by(RECONCILER_ACTOR, host)? {
-        if request.targets == [subject] {
-            store.resolve_attention_automatically(
-                &request.subject,
-                &format!("{subject} observes again"),
-                &format!("observer-recovered:{}", request.request),
-            )?;
-        }
-    }
-    Ok(())
 }
 
 struct RuntimeStep<'a> {
@@ -10506,6 +10335,55 @@ fn expand_gate(
         GateSpec::Deadline { .. } => {}
     }
     Ok(())
+}
+
+fn schedule_head_attention_subject(schedule: &str) -> String {
+    let digest = hex::encode(sha2::Sha256::digest(schedule.as_bytes()));
+    format!("attention/schedule-head-{}", &digest[..32])
+}
+
+fn request_schedule_head_attention(
+    store: &Store,
+    schedule: &str,
+    occurrence: &str,
+    reason: &str,
+) -> Result<()> {
+    let attention = schedule_head_attention_subject(schedule);
+    if store
+        .operational_failure(&attention)?
+        .is_some_and(|item| item.status == "pending")
+    {
+        return Ok(());
+    }
+    store.record_operational_failure(
+        &attention,
+        &AttentionRequest {
+            reviewer: "person/operator".into(),
+            title: "A scheduled mission has no ready head".into(),
+            reason: format!("{schedule}: {reason}. Publish a ready head to resume scheduled work."),
+            severity: "warning".into(),
+            targets: vec![schedule.into()],
+            actor: RECONCILER_ACTOR.into(),
+            idempotency_key: format!("schedule-head-unready:{occurrence}"),
+        },
+    )?;
+    Ok(())
+}
+
+/// Select the authoritative head at the occurrence request boundary, never when a queued
+/// request eventually starts. `None` means the current head is not ready, not that an older
+/// ready revision may be used.
+fn scheduled_work_revision(
+    store: &Store,
+    work: &crate::model::ScheduledWork,
+) -> Result<Option<String>> {
+    if let Some(revision) = &work.revision {
+        return Ok(Some(revision.clone()));
+    }
+    Ok(store
+        .mission_spec(&work.mission, None)?
+        .filter(|head| head.state == MissionState::Ready)
+        .map(|head| head.revision))
 }
 
 /// Report whether a lane, observer, subscription, or schedule declaration is a stop.
@@ -11001,7 +10879,7 @@ enum UsedMissionOutcome {
 /// the daemon, and in between Linux names this process's image `PATH (deleted)`. Launching that
 /// name fails every start in the window and can hold a seat in a crash loop, so use the
 /// replacement installed at the original path.
-fn launch_executable() -> Result<PathBuf> {
+pub(crate) fn launch_executable() -> Result<PathBuf> {
     let current = std::env::current_exe()?;
     Ok(replaced_executable(&current).unwrap_or(current))
 }
@@ -13261,7 +13139,7 @@ version 2
     step "approval" {
       title "The candidate change"
       gate "human-review" type="human" {
-        reviewer "person/nathan"
+        reviewer "person/alex"
         question "Is the candidate ready?"
         review "resource/mission-run/${ST_MISSION_RUN}/candidate"
       }
@@ -13333,7 +13211,7 @@ version 2
             .append_claim(&ClaimInput {
                 subject: request.subject.clone(),
                 kind: "gate.result".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([("verdict".into(), Value::String("pass".into()))]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -13350,7 +13228,7 @@ version 2
             .append_claim(&ClaimInput {
                 subject: request.subject.clone(),
                 kind: "gate.result".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
                     ("verdict".into(), Value::String("pass".into())),
                     ("request".into(), Value::String(request.id.clone())),
@@ -13391,7 +13269,7 @@ version 2
             .append_claim(&ClaimInput {
                 subject: rejected_request.subject,
                 kind: "gate.result".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
                     ("verdict".into(), Value::String("fail".into())),
                     (
@@ -15247,7 +15125,7 @@ mission "render-retire" state="ready" { goal "Retire a broken renderer."; step "
     }
 
     #[test]
-    fn an_attention_request_closes_when_its_until_condition_holds_and_not_before() {
+    fn legacy_attention_until_conditions_no_longer_mutate_or_surface() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         apply_source(
             &store,
@@ -15264,7 +15142,7 @@ mission "publish" state="ready" {
                 mission: "publish".into(),
                 revision: None,
                 workspace: "/tmp".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "until-run".into(),
@@ -15275,7 +15153,7 @@ mission "publish" state="ready" {
                 .request_attention_closing(
                     subject,
                     &AttentionRequest {
-                        reviewer: "person/nathan".into(),
+                        reviewer: "person/alex".into(),
                         title: "Publish this revision".into(),
                         reason: "Publish the prepared revision as a person.".into(),
                         severity: "warning".into(),
@@ -15308,24 +15186,17 @@ mission "publish" state="ready" {
             .unwrap();
         reconciler.reconcile_once().unwrap();
 
-        let resolved = store.attention_request(&until.subject).unwrap().unwrap();
-        assert_eq!(resolved.status, "resolved");
         assert_eq!(
-            resolved.resolution_reason.as_deref(),
-            Some("every target is completed")
-        );
-        assert_eq!(
-            store
-                .claims_for(&until.subject, Some("attention.resolved"))
-                .unwrap()[0]
-                .actor
-                .as_deref(),
-            Some("daemon/runtime")
-        );
-        assert_eq!(
-            status(&plain.subject),
+            status(&until.subject),
             "pending",
-            "a request without until waits for a person"
+            "legacy claims are retained for audit"
+        );
+        assert_eq!(status(&plain.subject), "pending");
+        assert!(
+            store
+                .attention_items(Some("person/alex"))
+                .unwrap()
+                .is_empty()
         );
     }
 
@@ -15347,7 +15218,7 @@ mission "asks" state="ready" {
                 mission: "asks".into(),
                 revision: None,
                 workspace: "/tmp".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "asks-run".into(),
@@ -15373,7 +15244,7 @@ mission "asks" state="ready" {
             .request_attention_closing(
                 "attention/asked",
                 &AttentionRequest {
-                    reviewer: "person/nathan".into(),
+                    reviewer: "person/alex".into(),
                     title: "Decide the rollout".into(),
                     reason: "A person needs to decide before the rollout.".into(),
                     severity: "warning".into(),
@@ -15385,13 +15256,19 @@ mission "asks" state="ready" {
             )
             .unwrap();
         assert_eq!(asked.step.as_deref(), Some(step.as_str()));
-        let reconciler = Reconciler::new(
+        let _reconciler = Reconciler::new(
             store.clone(),
             Arc::new(FakeRuntime::default()),
             "node".into(),
             Arc::new(Notify::new()),
         );
-        reconciler.resolve_attention_whose_until_holds().unwrap();
+        assert!(
+            store
+                .attention_items(None)
+                .unwrap()
+                .iter()
+                .all(|item| item.subject != asked.subject)
+        );
         assert_eq!(
             store
                 .attention_request(&asked.subject)
@@ -15402,12 +15279,18 @@ mission "asks" state="ready" {
         );
 
         store.set_step_state(&step, "failed", None).unwrap();
-        reconciler.resolve_attention_whose_until_holds().unwrap();
+        assert!(
+            store
+                .attention_items(None)
+                .unwrap()
+                .iter()
+                .all(|item| item.subject != asked.subject)
+        );
         let resolved = store.attention_request(&asked.subject).unwrap().unwrap();
-        assert_eq!(resolved.status, "resolved");
-        assert_eq!(
-            resolved.resolution_reason,
-            Some(format!("the step that raised it ended: `{step}` failed"))
+        assert_eq!(resolved.status, "pending");
+        assert!(
+            resolved.resolution_reason.is_none(),
+            "legacy requests remain immutable audit data"
         );
     }
 
@@ -15446,16 +15329,12 @@ agent "worker" {
             .selected_desired_token("agent/node.worker")
             .unwrap()
             .unwrap();
-        let key = format!("codex-crash-loop:agent/node.worker:{token}");
-        let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
-        let attention = store
-            .attention_request(&format!("attention/{}", &digest[..32]))
-            .unwrap()
-            .unwrap();
-        assert_eq!(attention.status, "pending");
+        let attention = store.attention_items(Some("person/alex")).unwrap();
+        assert_eq!(attention.len(), 1);
+        assert_eq!(attention[0].subject, "agent/node.worker");
         assert!(
-            attention
-                .reason
+            attention[0]
+                .detail
                 .contains("the fake runtime rejected the start")
         );
         let decisions = store
@@ -15694,7 +15573,7 @@ agent "worker" {
         assert_eq!(runtime.starts.lock().unwrap().len(), 3);
         assert!(
             store
-                .attention_requests(None, false)
+                .attention_items(None)
                 .unwrap()
                 .iter()
                 .any(|attention| { attention.targets.contains(&"agent/node.worker".to_owned()) })
@@ -16040,6 +15919,473 @@ mission "scheduled-cycle" state="ready" {
             .unwrap()
             .unwrap()
             .revision
+    }
+    #[test]
+    fn daily_calendar_gap_fold_and_catch_up_keep_local_date_keys() {
+        let berlin = CalendarSchedule {
+            at_minute: 150,
+            weekday: None,
+            timezone: "Europe/Berlin".into(),
+        };
+        let date = |value| NaiveDate::parse_from_str(value, "%Y-%m-%d").unwrap();
+        let utc = |value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .unwrap()
+                .timestamp_millis()
+        };
+        assert_eq!(
+            calendar_instant(chrono_tz::Europe::Berlin, berlin.at_minute, date("2027-03-28")).unwrap(),
+            utc("2027-03-28T01:00:00Z"),
+            "02:30 is nonexistent: fire at the first valid instant 03:00 local"
+        );
+        assert_eq!(
+            calendar_instant(chrono_tz::Europe::Berlin, berlin.at_minute, date("2026-10-25")).unwrap(),
+            utc("2026-10-25T00:30:00Z"),
+            "02:30 occurs twice: choose the earlier offset"
+        );
+        let morning = CalendarSchedule {
+            at_minute: 480,
+            weekday: None,
+            timezone: "Europe/Berlin".into(),
+        };
+        let now = utc("2027-03-30T05:00:00Z"); // Before today's 08:00 local.
+        assert_eq!(
+            calendar_occurrence(&morning, Some(20270327), now, "latest", None).unwrap(),
+            (20270329, utc("2027-03-29T06:00:00Z"))
+        );
+        assert_eq!(
+            calendar_occurrence(&morning, Some(20270327), now, "skip", None).unwrap().0,
+            20270330
+        );
+        assert!(calendar_occurrence(&morning, Some(20270327), now, "all", Some(1))
+            .unwrap_err().to_string().contains("max-catch-up 1"));
+        assert_eq!(
+            calendar_occurrence(&morning, Some(20270327), now, "all", Some(2)).unwrap().0,
+            20270328
+        );
+        // The second instant of the fold is after the first local 02:30,
+        // but the already-reached date is never selected again.
+        assert_eq!(
+            calendar_occurrence(&berlin, Some(20261025), utc("2026-10-25T01:30:00Z"), "latest", None).unwrap().0,
+            20261026
+        );
+    }
+    #[test]
+    fn weekly_calendar_tracks_berlin_mondays_across_dst_and_catch_up() {
+        let weekly = CalendarSchedule {
+            at_minute: 540, weekday: Some(1), timezone: "Europe/Berlin".into(),
+        };
+        let utc = |value| {
+            chrono::DateTime::parse_from_rfc3339(value)
+                .unwrap()
+                .timestamp_millis()
+        };
+        assert_eq!(
+            calendar_occurrence(&weekly, Some(20260323), utc("2026-03-29T12:00:00Z"), "latest", None).unwrap(),
+            (20260330, utc("2026-03-30T07:00:00Z")),
+            "the spring transition moves Monday 09:00 one UTC hour earlier"
+        );
+        let before_monday = utc("2026-10-26T07:00:00Z");
+        assert_eq!(
+            calendar_occurrence(&weekly, Some(20261005), before_monday, "latest", None).unwrap(),
+            (20261019, utc("2026-10-19T07:00:00Z"))
+        );
+        assert_eq!(
+            calendar_occurrence(&weekly, Some(20261005), before_monday, "skip", None).unwrap(),
+            (20261026, utc("2026-10-26T08:00:00Z")),
+            "the autumn transition moves Monday 09:00 one UTC hour later"
+        );
+        assert!(calendar_occurrence(&weekly, Some(20261005), before_monday, "all", Some(1))
+            .unwrap_err().to_string().contains("max-catch-up 1"));
+        assert_eq!(
+            calendar_occurrence(&weekly, Some(20261005), before_monday, "all", Some(2)).unwrap().0,
+            20261012
+        );
+        assert_eq!(
+            calendar_occurrence(&weekly, None, utc("2026-10-27T12:00:00Z"), "all", Some(1)).unwrap().0,
+            20261102,
+            "first publication starts at the next matching weekday, not an unbounded history"
+        );
+        let sunday = CalendarSchedule {
+            at_minute: 150, weekday: Some(7), timezone: "Europe/Berlin".into(),
+        };
+        assert_eq!(
+            calendar_occurrence(&sunday, Some(20270321), utc("2027-03-28T01:30:00Z"), "latest", None).unwrap(),
+            (20270328, utc("2027-03-28T01:00:00Z")),
+            "a weekly spring gap fires at the first valid local instant"
+        );
+        assert_eq!(
+            calendar_occurrence(&sunday, Some(20261018), utc("2026-10-25T01:30:00Z"), "latest", None).unwrap(),
+            (20261025, utc("2026-10-25T00:30:00Z")),
+            "a weekly autumn fold fires at its earlier instant"
+        );
+        assert_eq!(
+            calendar_occurrence(&sunday, Some(20261025), utc("2026-10-25T01:30:00Z"), "latest", None).unwrap().0,
+            20261101,
+            "the repeated local clock cannot fire the same Sunday twice"
+        );
+    }
+
+
+    #[tokio::test]
+    async fn daily_calendar_reaches_once_and_preserves_durable_claim_key() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let revision = scheduled_mission_revision(&store);
+        apply_source(&store, &format!(r#"version 2
+schedule "daily" {{
+  calendar {{ at "00:00"; timezone "Etc/UTC" }}
+  catch-up "latest"
+  work {{ mission "scheduled-cycle@{revision}"; workspace "/tmp/st3-calendar-test" }}
+}}"#
+            ),
+            "calendar-schedule",
+        );
+        let reconciler = Reconciler::new(
+            store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let reached = store.claims_for("schedule/daily", Some("schedule.occurrence-reached")).unwrap();
+        assert_eq!(reached.len(), 1);
+        let key = reached[0].body["fields"]["occurrence"].as_u64().unwrap();
+        assert_eq!(key, Utc::now().format("%Y%m%d").to_string().parse::<u64>().unwrap());
+        reconciler.reconcile_once().unwrap();
+        let restarted = Reconciler::new(
+            store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+        );
+        restarted.reconcile_once().unwrap();
+        assert_eq!(store.claims_for("schedule/daily", Some("schedule.occurrence-reached")).unwrap().len(), 1);
+    }
+    #[tokio::test]
+    async fn daily_calendar_reuses_recorded_instant_after_rule_change() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let mission_revision = scheduled_mission_revision(&store);
+        apply_source(&store, &format!(r#"version 2
+schedule "daily" {{
+  calendar {{ at "23:59"; timezone "Etc/UTC" }}
+  work {{ mission "scheduled-cycle@{mission_revision}"; workspace "/tmp/st3-calendar-test" }}
+}}"#
+            ),
+            "calendar-schedule",
+        );
+        let revision = store
+            .selected_desired_revision("schedule/daily")
+            .unwrap()
+            .unwrap();
+        let key: u64 = Utc::now().format("%Y%m%d").to_string().parse().unwrap();
+        let recorded = (now_ms() as i64 - 100).to_string();
+        store
+            .append_claim(&ClaimInput {
+                subject: "schedule/daily".into(),
+                kind: "schedule.occurrence-scheduled".into(),
+                actor: None,
+                fields: BTreeMap::from([
+                    ("revision".into(), Value::String(revision.clone())),
+                    ("occurrence".into(), Value::from(key)),
+                    (
+                        "scheduled_at_unix_ms".into(),
+                        Value::String(recorded.clone()),
+                    ),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some(format!("clock-wake:schedule/daily:{revision}:{key}")),
+            })
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(), Arc::new(FakeRuntime::default()), "node".into(), Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let reached = store.claims_for("schedule/daily", Some("schedule.occurrence-reached")).unwrap();
+        assert_eq!(reached.len(), 1);
+        assert_eq!(reached[0].body["fields"]["occurrence"], key);
+        assert_eq!(reached[0].body["fields"]["scheduled_at_unix_ms"], recorded);
+    }
+
+
+
+    #[test]
+    fn ready_head_selection_across_dst_transition_date_anchors() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let first = scheduled_mission_revision(&store);
+        for anchor in ["2026-10-25T01:00:00Z", "2027-03-28T01:00:00Z"] {
+            if anchor == "2027-03-28T01:00:00Z" {
+                apply_source(
+                    &store,
+                    r#"version 2
+mission "scheduled-cycle" state="ready" {
+  goal "Run the improved cycle after publication."
+  step "improved" { agentless }
+}"#,
+                    "improved-cycle-across-dst",
+                );
+            }
+            let expected = store
+                .mission_spec("scheduled-cycle", None)
+                .unwrap()
+                .unwrap()
+                .revision;
+            assert_eq!(expected == first, anchor == "2026-10-25T01:00:00Z");
+            let source = format!(
+                r#"version 2
+schedule "cycle" {{
+  every "1h"
+  anchor "{anchor}"
+  work {{ mission "scheduled-cycle"; workspace "/tmp/cycles" }}
+}}"#
+            );
+            let intent = parse_intent(&source, "node").unwrap();
+            let schedule = intent
+                .subjects
+                .values()
+                .find(|item| item.kind == "schedule")
+                .unwrap();
+            let work = crate::graph::schedule_spec(&schedule.desired, "node")
+                .unwrap()
+                .work
+                .unwrap();
+            assert_eq!(
+                scheduled_work_revision(&store, &work).unwrap(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unpinned_schedule_selects_ready_head_at_each_request_and_keeps_started_revision() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let first = scheduled_mission_revision(&store);
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().display();
+        let at = (Utc::now() + chrono::Duration::milliseconds(40))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        apply_source(
+            &store,
+            &format!(
+                r#"version 2
+schedule "first" {{
+  at "{at}"
+  work {{ mission "scheduled-cycle"; workspace "{workspace}" }}
+}}"#
+            ),
+            "first-unpinned",
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let first_request = store
+            .claims_for("schedule/first", Some("schedule.work-requested"))
+            .unwrap();
+        assert_eq!(first_request.len(), 1);
+        assert_eq!(first_request[0].body["fields"]["mission_revision"], first);
+
+        apply_source(
+            &store,
+            r#"version 2
+mission "scheduled-cycle" state="ready" {
+  goal "Complete an improved scheduled cycle."
+  step "improved" { agentless }
+}"#,
+            "improved-cycle",
+        );
+        let second = store
+            .mission_spec("scheduled-cycle", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        assert_ne!(first, second);
+        reconciler.reconcile_once().unwrap();
+        let started = store
+            .claims_for("schedule/first", Some("schedule.work-started"))
+            .unwrap();
+        assert_eq!(started.len(), 1);
+        let run = started[0].body["fields"]["mission_run"].as_str().unwrap();
+        assert_eq!(store.mission_run(run).unwrap().unwrap().revision, first);
+        for _ in 0..4 {
+            reconciler.reconcile_once().unwrap();
+        }
+
+        let at = (Utc::now() + chrono::Duration::milliseconds(40))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        apply_source(
+            &store,
+            &format!(
+                r#"version 2
+schedule "second" {{
+  at "{at}"
+  work {{ mission "scheduled-cycle"; workspace "{workspace}" }}
+}}"#
+            ),
+            "second-unpinned",
+        );
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        reconciler.reconcile_once().unwrap();
+        let request = store
+            .claims_for("schedule/second", Some("schedule.work-requested"))
+            .unwrap();
+        assert_eq!(request.len(), 1);
+        assert_eq!(request[0].body["fields"]["mission_revision"], second);
+        let started = store
+            .claims_for("schedule/second", Some("schedule.work-started"))
+            .unwrap();
+        assert_eq!(started.len(), 1);
+        let run = started[0].body["fields"]["mission_run"].as_str().unwrap();
+        assert_eq!(store.mission_run(run).unwrap().unwrap().revision, second);
+    }
+
+    #[tokio::test]
+    async fn unpinned_schedule_fails_when_current_head_is_not_ready() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        let previous = scheduled_mission_revision(&store);
+        apply_source(
+            &store,
+            r#"version 2
+mission "scheduled-cycle" state="draft" {
+  goal "Unreviewed cycle is not runnable."
+}"#,
+            "draft-cycle",
+        );
+        let head = store
+            .mission_spec("scheduled-cycle", None)
+            .unwrap()
+            .unwrap();
+        assert_ne!(head.revision, previous);
+        assert_eq!(head.state, MissionState::Draft);
+        let root = tempfile::tempdir().unwrap();
+        let at = (Utc::now() + chrono::Duration::milliseconds(40))
+            .to_rfc3339_opts(SecondsFormat::Millis, true);
+        apply_source(
+            &store,
+            &format!(
+                r#"version 2
+schedule "unready" {{
+  at "{at}"
+  work {{ mission "scheduled-cycle"; workspace "{}" }}
+}}"#,
+                root.path().display()
+            ),
+            "unready-schedule",
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        reconciler.reconcile_once().unwrap();
+        let failed = store
+            .claims_for("schedule/unready", Some("schedule.work-failed"))
+            .unwrap();
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed[0].body["fields"]["code"],
+            "no-ready-mission-revision"
+        );
+        assert!(
+            store
+                .claims_for("schedule/unready", Some("schedule.work-requested"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .claims_for("schedule/unready", Some("schedule.work-started"))
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn unpinned_schedule_keeps_one_attention_until_an_occurrence_succeeds() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+mission "scheduled-cycle" state="draft" { goal "Not ready." }"#,
+            "draft-cycle",
+        );
+        let root = tempfile::tempdir().unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let attention = schedule_head_attention_subject("schedule/unready");
+        for occurrence in 0..4 {
+            if occurrence == 3 {
+                scheduled_mission_revision(&store);
+            }
+            let at = (Utc::now() + chrono::Duration::milliseconds(40))
+                .to_rfc3339_opts(SecondsFormat::Millis, true);
+            apply_source(
+                &store,
+                &format!(
+                    r#"version 2
+schedule "unready" {{
+  at "{at}"
+  work {{ mission "scheduled-cycle"; workspace "{}" }}
+}}"#,
+                    root.path().display()
+                ),
+                &format!("occurrence-{occurrence}"),
+            );
+            reconciler.reconcile_once().unwrap();
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            reconciler.reconcile_once().unwrap();
+            assert_eq!(
+                store
+                    .claims_for("schedule/unready", Some("operational.failure"))
+                    .unwrap()
+                    .len(),
+                1
+            );
+            if occurrence < 3 {
+                assert_eq!(
+                    store
+                        .operational_failure(&attention)
+                        .unwrap()
+                        .unwrap()
+                        .status,
+                    "pending"
+                );
+            }
+        }
+        assert_eq!(
+            store
+                .claims_for("schedule/unready", Some("schedule.work-failed"))
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            store
+                .claims_for("schedule/unready", Some("schedule.work-started"))
+                .unwrap()
+                .len(),
+            1
+        );
+        let closed = store
+            .claims_for("schedule/unready", Some("operational.recovered"))
+            .unwrap();
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].kind, "operational.recovered");
+        assert!(
+            store
+                .attention_items(None)
+                .unwrap()
+                .iter()
+                .all(|item| item.subject != attention)
+        );
     }
 
     #[tokio::test]
@@ -16828,6 +17174,214 @@ mission "scheduled-cycle" state="ready" {
                 .status,
             "failed"
         );
+    }
+
+    #[test]
+    fn cancellation_recovers_legacy_gates_and_preserves_final_failure() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+mission "orchid/cancel" state="ready" {
+  goal "Cancel all owned runners."
+  step "wait" { agentless }
+  finally { step "report" { agentless } }
+}
+"#,
+            "legacy-cancel-mission",
+        );
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "orchid/cancel".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "legacy-cancel-run".into(),
+            })
+            .unwrap();
+        let step = run.steps.iter().find(|step| step.step == "wait").unwrap();
+        let final_step = run.steps.iter().find(|step| step.step == "report").unwrap();
+        let legacy_prefix = format!("gate-operation/{}/", step.subject.replace('/', "."));
+        let runtime = Arc::new(FakeRuntime::default());
+        for (subject, fields) in [
+            (
+                format!("{legacy_prefix}mechanical"),
+                serde_json::json!({"runner": "exec"}),
+            ),
+            (
+                format!("{legacy_prefix}llm"),
+                serde_json::json!({"model": "orchid-model"}),
+            ),
+            (
+                format!("gate-operation/{}/baseline", run.subject.replace('/', ".")),
+                serde_json::json!({"runner": "exec"}),
+            ),
+            (
+                "gate-operation/loop-metric/orchid".into(),
+                serde_json::json!({"runner": "loop-metric", "owner": step.subject}),
+            ),
+            (
+                "gate-operation/unrelated/other".into(),
+                serde_json::json!({"runner": "exec"}),
+            ),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: "gate.requested".into(),
+                    actor: None,
+                    fields: serde_json::from_value(fields).unwrap(),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            let runtime_id = subject.replace('/', ".");
+            runtime.execs.lock().unwrap().insert(
+                runtime_id.clone(),
+                RuntimeObservation {
+                    runtime_id,
+                    terminal: false,
+                    status: "running".into(),
+                    exit_code: None,
+                    incarnation_id: Some(subject),
+                },
+            );
+        }
+        let remote = Store::open_memory("remote").unwrap();
+        remote
+            .append_claim(&ClaimInput {
+                subject: "gate-operation/loop-metric/remote".into(),
+                kind: "gate.requested".into(),
+                actor: None,
+                fields: serde_json::from_value(
+                    serde_json::json!({"runner": "loop-metric", "owner": step.subject}),
+                )
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        store
+            .import_replication("remote", &remote.export_replication(0).unwrap())
+            .unwrap();
+        let runners = store.mission_gate_runners().unwrap();
+        assert_eq!(runners.len(), 5);
+        assert!(runners.iter().all(|runner| !runner.retired));
+        store
+            .request_mission_run_cancellation(&run.id, "no longer needed")
+            .unwrap();
+        store
+            .set_step_state(
+                &final_step.subject,
+                "failed",
+                Some("the final status gate failed"),
+            )
+            .unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            runtime.clone(),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.stops.lock().unwrap().len(), 4);
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().phase,
+            "cleanup-cancelled"
+        );
+        // A live gate keeps cleanup pending, and a resistant gate reaches SIGKILL.
+        reconciler.reconcile_once().unwrap();
+        assert_eq!(runtime.kills.lock().unwrap().len(), 4);
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().phase,
+            "cleanup-cancelled"
+        );
+        for observation in runtime.execs.lock().unwrap().values_mut() {
+            observation.status = "exited".into();
+        }
+        reconciler.reconcile_once().unwrap();
+        // The remote runner still needs its owner's stopped observation.
+        assert_eq!(
+            store.mission_run(&run.id).unwrap().unwrap().phase,
+            "cleanup-cancelled"
+        );
+        store
+            .append_claim(&ClaimInput {
+                subject: "gate-operation/loop-metric/remote".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), Value::String("stopped".into()))]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        reconciler.reconcile_once().unwrap();
+        let terminal = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(
+            (terminal.status.as_str(), terminal.phase.as_str()),
+            ("cancelled", "terminal")
+        );
+        let state = store
+            .latest_claim(&run.subject, Some("mission-run.state"))
+            .unwrap()
+            .unwrap();
+        assert!(
+            state.body["fields"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("report: the final status gate failed")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_runs_final_timeout_still_reaches_terminal_cancellation() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"version 2
+mission "orchid/timeout" state="ready" timeout="1ms" {
+  goal "Bound cancelled final work."
+  step "wait" { agentless }
+  finally { step "report" { agentless } }
+}
+"#,
+            "cancelled-timeout-mission",
+        );
+        let run = store
+            .create_mission_run(&crate::model::MissionRunRequest {
+                mission: "orchid/timeout".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/test".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: "cancelled-timeout-run".into(),
+            })
+            .unwrap();
+        store
+            .request_mission_run_cancellation(&run.id, "no longer needed")
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..4 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let terminal = store.mission_run(&run.id).unwrap().unwrap();
+        assert_eq!(
+            (terminal.status.as_str(), terminal.phase.as_str()),
+            ("cancelled", "terminal")
+        );
+        assert!(terminal.steps.iter().all(|step| step.status == "cancelled"));
     }
 
     #[tokio::test]
@@ -17901,7 +18455,7 @@ mission "human-exhaustion" state="ready" {
     round { completion { when "all-steps-exhausted" } }
     on-exhausted {
       gate "accept-best" type="human" {
-        reviewer "person/nathan"
+        reviewer "person/alex"
         question "Accept the best bounded result?"
       }
     }
@@ -17967,7 +18521,7 @@ mission "human-exhaustion" state="ready" {
             .append_claim(&ClaimInput {
                 subject: request.subject.clone(),
                 kind: "gate.result".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([
                     ("verdict".into(), Value::String("pass".into())),
                     ("request".into(), Value::String(request.id.clone())),
@@ -18146,7 +18700,7 @@ mission "alert-exhaustion" state="ready" {
     on-exhausted {
       fail
       attention "Automatic review failed" {
-        reviewer "person/nathan"
+        reviewer "person/alex"
         severity "error"
       }
     }
@@ -18178,7 +18732,7 @@ mission "alert-exhaustion" state="ready" {
             store.mission_run(&run.id).unwrap().unwrap().status,
             "failed"
         );
-        let attention = store.attention_items(Some("person/nathan")).unwrap();
+        let attention = store.attention_items(Some("person/alex")).unwrap();
         assert_eq!(attention.len(), 1);
         assert_eq!(attention[0].title, "Automatic review failed");
         assert_eq!(attention[0].kind, "fault");
@@ -18192,7 +18746,7 @@ mission "alert-exhaustion" state="ready" {
             reconciler.reconcile_once().unwrap();
         }
         assert_eq!(
-            store.attention_items(Some("person/nathan")).unwrap().len(),
+            store.attention_items(Some("person/alex")).unwrap().len(),
             1
         );
     }
@@ -18304,7 +18858,7 @@ mission "stopping" state="ready" {{
     #[test]
     fn a_loop_stopped_by_a_cancelled_round_says_how_to_start_over() {
         let (store, reconciler, run) = stopping_loop_run(
-            "agent/fleet/orchid",
+            "agent/example/orchid",
             r#"step "wait" {
         agentless
         gate "never" { field "status" "resource/never" "is" "ready" }
@@ -18955,8 +19509,8 @@ mission "eval/demo" state="ready" timeout="1m" {
 
     #[test]
     fn a_remote_reconciler_does_not_observe_a_local_stop_for_another_host() {
-        let store = Arc::new(Store::open_memory("Silber").unwrap());
-        let subject = "agent/fleet/probe";
+        let store = Arc::new(Store::open_memory("ExampleMac").unwrap());
+        let subject = "agent/example/probe";
         store
             .append_claim(&ClaimInput {
                 subject: subject.into(),
@@ -18964,7 +19518,7 @@ mission "eval/demo" state="ready" timeout="1m" {
                 actor: None,
                 fields: BTreeMap::from([
                     ("status".into(), Value::String("running".into())),
-                    ("host".into(), Value::String("Silber".into())),
+                    ("host".into(), Value::String("ExampleMac".into())),
                     ("runtime_id".into(), Value::String("fleet.probe".into())),
                     ("terminal".into(), Value::Bool(true)),
                 ]),
@@ -18985,7 +19539,7 @@ mission "eval/demo" state="ready" timeout="1m" {
         let remote = Reconciler::new(
             store.clone(),
             Arc::new(FakeRuntime::default()),
-            "hetz".into(),
+            "example-linux".into(),
             Arc::new(Notify::new()),
         );
         remote.reconcile_stop(&stop, Some(&HashMap::new())).unwrap();
@@ -18999,7 +19553,7 @@ mission "eval/demo" state="ready" timeout="1m" {
         let owner = Reconciler::new(
             store.clone(),
             Arc::new(FakeRuntime::default()),
-            "Silber".into(),
+            "ExampleMac".into(),
             Arc::new(Notify::new()),
         );
         owner.reconcile_stop(&stop, Some(&HashMap::new())).unwrap();
@@ -19652,8 +20206,9 @@ observer "repo" {
                 idempotency_key: None,
             })
             .unwrap();
-        rusqlite::Connection::open(&database)
-            .unwrap()
+        let connection = rusqlite::Connection::open(&database).unwrap();
+        crate::store::configure_projection_writer(&connection).unwrap();
+        connection
             .execute(
                 "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
                 rusqlite::params![(now_ms() - 3_600_001).to_string(), old.id],
@@ -19808,6 +20363,14 @@ observer "repo" {
         .expect("the observation finished");
     }
 
+    fn failure_for_item(
+        store: &Store,
+        item: &crate::model::AttentionItemView,
+    ) -> Result<Option<crate::model::AttentionRequestView>> {
+        let claim = store.claim_by_id(&item.episode)?.unwrap();
+        store.operational_failure(claim.body["fields"]["episode"].as_str().unwrap())
+    }
+
     fn observer_items(store: &Store) -> Vec<crate::model::AttentionItemView> {
         store
             .attention_items(None)
@@ -19886,8 +20449,14 @@ observer "repo" {
         // Observing again closes it.
         observe_now(&reconciler, &calls).await;
         assert!(observer_items(&store).is_empty());
-        let closed = store.attention_request(&items[0].subject).unwrap().unwrap();
-        assert_eq!(closed.status, "resolved");
+        assert_eq!(
+            store
+                .latest_claim("observer/repo", Some("observer.state"))
+                .unwrap()
+                .unwrap()
+                .body["fields"]["state"],
+            "healthy"
+        );
     }
 
     #[tokio::test]
@@ -19923,18 +20492,19 @@ observer "repo" {
         assert!(observer_items(&store).is_empty());
         assert_eq!(
             store
-                .attention_request(&first[0].subject)
+                .latest_claim("observer/repo", Some("observer.state"))
                 .unwrap()
                 .unwrap()
-                .status,
-            "resolved"
+                .body["fields"]["state"],
+            "healthy"
         );
 
         // A later failure is a new episode, and raises a new item.
         observe_now(&reconciler, &calls).await;
         let second = observer_items(&store);
         assert_eq!(second.len(), 1);
-        assert_ne!(second[0].subject, first[0].subject);
+        assert_eq!(second[0].subject, first[0].subject);
+        assert_ne!(second[0].episode, first[0].episode);
     }
 
     #[test]
@@ -19958,8 +20528,9 @@ observer "repo" {
                 .open_reconcile_fault_claim("daemon/node", "stage/example")
                 .unwrap()
                 .unwrap();
-            rusqlite::Connection::open(&database)
-                .unwrap()
+            let connection = rusqlite::Connection::open(&database).unwrap();
+            crate::store::configure_projection_writer(&connection).unwrap();
+            connection
                 .execute(
                     "UPDATE claims SET accepted_at_unix_ms=?1 WHERE id=?2",
                     rusqlite::params![
@@ -20006,11 +20577,11 @@ observer "repo" {
         assert!(items().is_empty());
         assert_eq!(
             store
-                .attention_request(&second[0].subject)
+                .latest_claim(&second[0].subject, Some("reconcile.fault"))
                 .unwrap()
                 .unwrap()
-                .status,
-            "resolved"
+                .body["fields"]["status"],
+            "recovered"
         );
     }
 
@@ -20072,7 +20643,7 @@ observer "repo" {
         set(10 * GIB);
         reconciler.reconcile_once().unwrap();
         assert!(items().is_empty());
-        let closed = store.attention_request(&first[0].subject).unwrap().unwrap();
+        let closed = failure_for_item(&store, &first[0]).unwrap().unwrap();
         assert_eq!(closed.status, "resolved");
 
         // A new episode raises a new item. A person who closes it early is not asked again
@@ -20081,22 +20652,12 @@ observer "repo" {
         reconciler.reconcile_once().unwrap();
         let second = items();
         assert_eq!(second.len(), 1);
-        assert_ne!(second[0].subject, first[0].subject);
-        store
-            .resolve_attention(
-                &second[0].subject,
-                &crate::model::AttentionResolveRequest {
-                    outcome: "dismissed".into(),
-                    reason: Some("cleaning up".into()),
-                    actor: "person/operator".into(),
-                    idempotency_key: "dismiss-disk".into(),
-                },
-            )
-            .unwrap();
+        assert_eq!(second[0].subject, first[0].subject);
+        assert_ne!(second[0].episode, first[0].episode);
         for _ in 0..3 {
             reconciler.reconcile_once().unwrap();
         }
-        assert!(items().is_empty());
+        assert_eq!(items().len(), 1, "the source is still low");
     }
 
     #[test]
@@ -20432,29 +20993,19 @@ subscription "reviews" {{
             .into_iter()
             .find(|item| item.kind == "fault" && item.targets == ["subscription/reviews"])
             .unwrap();
-        assert!(
-            failure_attention
-                .subject
-                .starts_with("attention/subscription-failure-")
+        assert_eq!(failure_attention.subject, "subscription/reviews");
+        apply_source(
+            &store,
+            r#"version 2
+subscription "reviews" { stop }"#,
+            "stop-failed-subscription",
         );
-        let resolved = store
-            .resolve_attention(
-                &failure_attention.subject,
-                &crate::model::AttentionResolveRequest {
-                    outcome: "resolved".into(),
-                    reason: Some("Corrected the subscription input".into()),
-                    actor: "person/nathan".into(),
-                    idempotency_key: "resolve-subscription-failure".into(),
-                },
-            )
-            .unwrap();
-        assert_eq!(resolved.status, "resolved");
         assert!(
-            !store
+            store
                 .attention_items(None)
                 .unwrap()
                 .iter()
-                .any(|item| item.subject == failure_attention.subject)
+                .all(|item| item.subject != failure_attention.subject)
         );
     }
 
@@ -20550,31 +21101,12 @@ subscription "reviews" {{
                 .attention_items(None)
                 .unwrap()
                 .into_iter()
-                .filter(|item| item.subject.starts_with("attention/subscription-failure-"))
+                .filter(|item| item.subject == "subscription/reviews")
                 .collect::<Vec<_>>()
         };
         let open = failures();
         assert_eq!(open.len(), 2);
-        assert!(
-            open.iter().all(|item| item.person.is_empty()),
-            "a failure requested by an agent is routed to no person"
-        );
-
-        // The requester is an agent, which cannot close an item. Any person can.
-        let closed = store
-            .resolve_attention(
-                &open[0].subject,
-                &crate::model::AttentionResolveRequest {
-                    outcome: "dismissed".into(),
-                    reason: Some("The intake run was cancelled days ago".into()),
-                    actor: "person/nathan".into(),
-                    idempotency_key: "dismiss-agent-subscription-failure".into(),
-                },
-            )
-            .unwrap();
-        assert_eq!(closed.status, "dismissed");
-        assert_eq!(closed.reviewer, "person/nathan");
-        assert_eq!(failures().len(), 1);
+        assert!(open.iter().all(|item| item.person == "person/operator"));
 
         // A stopped subscription starts nothing more, so its failures end on their own.
         apply_source(
@@ -20669,7 +21201,7 @@ subscription "reviews" {{
     mission "review@{revision}"
     resource "source"
     workspace "/tmp/st3-review"
-    requester "agent/fleet/repository/standing/owner"
+    requester "agent/example/repository/standing/owner"
   }}
 }}"#
         );
@@ -20791,7 +21323,7 @@ subscription "reviews" {{
         let runs = store.active_mission_runs_for_mission("review").unwrap();
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].revision, revision);
-        assert_eq!(runs[0].requester, "agent/fleet/repository/standing/owner");
+        assert_eq!(runs[0].requester, "agent/example/repository/standing/owner");
         assert_eq!(
             runs[0].inputs["source"].subject.as_deref(),
             Some("resource/repo/pull-request/7")
@@ -21780,10 +22312,19 @@ subscription "triage" {{
         );
     }
 
+    const QUEUED_REVIEW_SOURCE: &str = r#"version 2
+mission "review" state="ready" {
+  concurrent-runs max=1
+  input "source" kind="resource"
+  completion { when "all-steps-exhausted" }
+  goal "Review one discovered item."
+  step "review" { agentless }
+}"#;
+
     #[test]
-    fn one_observation_holds_excess_deliveries_for_a_person() {
+    fn twenty_subscription_deliveries_start_in_order_without_holds() {
         let store = Arc::new(Store::open_memory("node").unwrap());
-        apply_source(&store, REDELIVERY_REVIEW_SOURCE, "review-mission");
+        apply_source(&store, QUEUED_REVIEW_SOURCE, "review-mission");
         let review = store
             .mission_spec("review", None)
             .unwrap()
@@ -21791,24 +22332,115 @@ subscription "triage" {{
             .revision;
         let subscriptions = watch_repository(&store, "acme/repo", &review, "watch");
         observe_issues(&store, "acme/repo", [1], &subscriptions);
-        observe_issues(&store, "acme/repo", 1..=8, &subscriptions);
-        let statuses = || {
+        observe_issues(&store, "acme/repo", 1..=21, &subscriptions);
+        let requests = store.subscription_requests("subscription/triage").unwrap();
+        assert_eq!(requests.len(), 20);
+        assert!(requests.iter().all(|request| request.status == "pending"));
+        assert!(
             store
-                .subscription_requests("subscription/triage")
+                .claims_for(
+                    "subscription/triage",
+                    Some("subscription.mission-requested")
+                )
                 .unwrap()
-                .into_iter()
-                .map(|request| (request.request, request.status))
+                .iter()
+                .all(|claim| claim.body["fields"].get("held").is_none())
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        let desired = store.desired_subjects().unwrap();
+        for (position, request) in requests.iter().enumerate() {
+            // Expire the local retry deadline rather than sleeping through twenty backoffs.
+            if let Some((_, attempts)) = store
+                .subscription_mission_deferral("subscription/triage", &request.request)
+                .unwrap()
+            {
+                store
+                    .record_subscription_mission_deferral(
+                        "subscription/triage",
+                        &request.request,
+                        0,
+                        attempts,
+                    )
+                    .unwrap();
+            }
+            reconciler
+                .reconcile_subscription_missions(&desired)
+                .unwrap();
+            let active = store.active_mission_runs_for_mission("review").unwrap();
+            assert_eq!(active.len(), 1, "mission capacity must control the queue");
+            assert_eq!(
+                active[0].inputs["source"].subject.as_deref(),
+                Some(request.resource.as_str())
+            );
+            let statuses = store.subscription_requests("subscription/triage").unwrap();
+            assert!(
+                statuses[..=position]
+                    .iter()
+                    .all(|request| request.status == "started")
+            );
+            assert!(
+                statuses[position + 1..]
+                    .iter()
+                    .all(|request| request.status == "pending")
+            );
+            for _ in 0..5 {
+                reconciler.evaluate_mission_runs().unwrap();
+            }
+            assert!(
+                store
+                    .active_mission_runs_for_mission("review")
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+        let started = store
+            .claims_for("subscription/triage", Some("subscription.mission-started"))
+            .unwrap();
+        assert_eq!(
+            started
+                .iter()
+                .map(|claim| claim.body["fields"]["request"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            requests
+                .iter()
+                .map(|request| request.request.as_str())
                 .collect::<Vec<_>>()
-        };
-        let requested = statuses();
-        assert_eq!(requested.len(), 7);
-        let held = requested
-            .iter()
-            .filter(|(_, status)| status == "held")
-            .map(|(request, _)| request.clone())
-            .collect::<Vec<_>>();
-        assert_eq!(held.len(), 7 - crate::store::MAX_OBSERVATION_DELIVERIES);
+        );
+        reconciler
+            .reconcile_subscription_missions(&desired)
+            .unwrap();
+        assert_eq!(
+            store
+                .claims_for("subscription/triage", Some("subscription.mission-started"))
+                .unwrap()
+                .len(),
+            20
+        );
+        assert!(
+            store
+                .attention_requests(Some("person/operator"), true)
+                .unwrap()
+                .is_empty()
+        );
+    }
 
+    #[test]
+    fn a_new_delivery_cannot_pass_an_older_capacity_retry() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(&store, QUEUED_REVIEW_SOURCE, "review-mission");
+        let review = store
+            .mission_spec("review", None)
+            .unwrap()
+            .unwrap()
+            .revision;
+        let subscriptions = watch_repository(&store, "acme/repo", &review, "watch");
+        observe_issues(&store, "acme/repo", [1], &subscriptions);
+        observe_issues(&store, "acme/repo", 1..=3, &subscriptions);
         let reconciler = Reconciler::new(
             store.clone(),
             Arc::new(FakeRuntime::default()),
@@ -21819,85 +22451,307 @@ subscription "triage" {{
         reconciler
             .reconcile_subscription_missions(&desired)
             .unwrap();
-        let runs = || {
-            store
-                .active_mission_runs_for_mission("review")
-                .unwrap()
-                .len()
-        };
-        assert_eq!(runs(), crate::store::MAX_OBSERVATION_DELIVERIES);
-        let attention = store.attention_items(Some("person/operator")).unwrap();
-        assert_eq!(
-            attention
-                .iter()
-                .filter(|item| item.title == "A subscription is holding mission requests")
-                .count(),
-            1
-        );
-
-        let decide = |request: &str, decision: &str, actor: &str, key: &str| {
-            store.decide_subscription_request(
-                request,
-                decision,
-                &crate::model::SubscriptionRequestDecision {
-                    actor: actor.into(),
-                    reason: "a person reviewed the held request".into(),
-                    idempotency_key: key.into(),
-                },
+        let older = store.subscription_requests("subscription/triage").unwrap()[1]
+            .request
+            .clone();
+        // Keep the older capacity retry in the future after its predecessor finishes.
+        store
+            .record_subscription_mission_deferral(
+                "subscription/triage",
+                &older,
+                now_ms() + 60_000,
+                1,
             )
-        };
-        let agent = decide(&held[0], "release", "agent/node.triage", "agent-release").unwrap_err();
-        assert_eq!(agent.code, "subscription-request-person-only");
-        assert_eq!(
-            decide(&held[0], "release", "person/operator", "release")
-                .unwrap()
-                .status,
-            "pending"
-        );
-        assert_eq!(
-            decide(&held[1], "cancel", "person/operator", "cancel")
-                .unwrap()
-                .status,
-            "cancelled"
-        );
-        assert_eq!(
-            decide(&held[1], "cancel", "person/operator", "cancel")
-                .unwrap()
-                .status,
-            "cancelled",
-            "an exact retry returns the recorded decision"
-        );
-        let closed = decide(&held[1], "release", "person/operator", "late-release").unwrap_err();
-        assert_eq!(closed.code, "subscription-request-not-open");
-
+            .unwrap();
+        for _ in 0..5 {
+            reconciler.evaluate_mission_runs().unwrap();
+        }
+        observe_issues(&store, "acme/repo", 1..=4, &subscriptions);
         reconciler
             .reconcile_subscription_missions(&desired)
             .unwrap();
-        assert_eq!(runs(), crate::store::MAX_OBSERVATION_DELIVERIES + 1);
-        let final_statuses = statuses();
+        assert!(
+            store
+                .active_mission_runs_for_mission("review")
+                .unwrap()
+                .is_empty(),
+            "the new request must wait behind the older retry"
+        );
+        store
+            .record_subscription_mission_deferral("subscription/triage", &older, 0, 1)
+            .unwrap();
+        reconciler
+            .reconcile_subscription_missions(&desired)
+            .unwrap();
         assert_eq!(
-            final_statuses
+            store.active_mission_runs_for_mission("review").unwrap()[0].inputs["source"]
+                .subject
+                .as_deref(),
+            Some("resource/repo/issue/3")
+        );
+    }
+
+    #[test]
+    fn legacy_held_requests_migrate_and_stale_requests_cancel_across_restart() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("queue.sqlite");
+        let store = Arc::new(Store::open(&path, "node").unwrap());
+        apply_source(&store, QUEUED_REVIEW_SOURCE, "review");
+        apply_source(
+            &store,
+            r#"version 2
+resource "repo" { kind "vcs.repository" }
+observer "repo" { resource "resource/repo"; provider "github.repository"; locator "acme/repo"; field "pull_requests" }
+subscription "reviews" {
+  observer "observer/repo"; on "pull_requests"
+  delivery "mission" { mission "review"; resource "source"; workspace "/tmp/st3-queue-reviews" }
+}"#,
+            "watch",
+        );
+        let desired = store.desired_subjects().unwrap();
+        let item = desired
+            .iter()
+            .find(|item| item.subject == "subscription/reviews")
+            .unwrap();
+        let subscriptions = vec![(
+            item.subject.clone(),
+            crate::graph::subscription_spec(&item.desired).unwrap(),
+        )];
+        let observer_revision = store
+            .selected_desired_revision("observer/repo")
+            .unwrap()
+            .unwrap();
+        let observe = |pulls, deliveries: &[(String, crate::model::SubscriptionSpec)]| {
+            store
+                .record_resource_observation(
+                    "observer/repo",
+                    &observer_revision,
+                    None,
+                    "resource/repo",
+                    None,
+                    &serde_json::json!({"repository_id": 7, "pull_requests": pulls}),
+                    now_ms() + 60_000,
+                    deliveries,
+                )
+                .unwrap()
+        };
+        observe(serde_json::json!([]), &[]);
+        let head = "a".repeat(40);
+        observe(
+            serde_json::json!([
+                {"number": 1, "head": head, "state": "open", "draft": false},
+                {"number": 2, "head": head, "state": "open", "draft": false},
+                {"number": 3, "head": head, "state": "open", "draft": false},
+                {"number": 4, "head": head, "state": "open", "draft": false},
+            ]),
+            &[],
+        );
+        let legacy = (1..=4)
+            .map(|number| {
+                let resource = format!("resource/repo/pull-request/{number}");
+                let mut discovery = store
+                    .claims_for(&resource, Some("resource.observed"))
+                    .unwrap()
+                    .pop()
+                    .unwrap();
+                if number == 2 {
+                    // This held request predates item head_sha. Its cited listing still pins
+                    // the old head, so migration must cancel it when the new head arrives.
+                    let mut facts = discovery.body["fields"]["facts"].clone();
+                    facts.as_object_mut().unwrap().remove("head_sha");
+                    discovery = store
+                        .append_claim(&ClaimInput {
+                            subject: resource.clone(),
+                            kind: "resource.observed".into(),
+                            actor: None,
+                            fields: BTreeMap::from([
+                                ("kind".into(), Value::String("vcs.pull-request".into())),
+                                ("facts".into(), facts),
+                            ]),
+                            evidence: vec![
+                                discovery.body["evidence"][0].as_str().unwrap().to_owned(),
+                            ],
+                            expected_subject: None,
+                            idempotency_key: Some("legacy-headless-item".into()),
+                        })
+                        .unwrap();
+                }
+                store
+                    .append_claim(&ClaimInput {
+                        subject: "subscription/reviews".into(),
+                        kind: "subscription.mission-requested".into(),
+                        actor: None,
+                        fields: BTreeMap::from([
+                            ("mission".into(), Value::String("mission/review".into())),
+                            ("resource".into(), Value::String(resource)),
+                            ("resource_input".into(), Value::String("source".into())),
+                            (
+                                "workspace".into(),
+                                Value::String(directory.path().to_string_lossy().into_owned()),
+                            ),
+                            ("discovery".into(), Value::String(discovery.id)),
+                            ("held".into(), Value::Bool(true)),
+                        ]),
+                        evidence: vec![],
+                        expected_subject: None,
+                        idempotency_key: Some(format!("legacy-request-{number}")),
+                    })
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        store
+            .request_attention(
+                "attention/legacy-held",
+                &AttentionRequest {
+                    reviewer: "person/operator".into(),
+                    title: "A subscription is holding mission requests".into(),
+                    reason: "one observation exceeded the old burst cap".into(),
+                    severity: "warning".into(),
+                    targets: vec!["subscription/reviews".into()],
+                    actor: RECONCILER_ACTOR.into(),
+                    idempotency_key: "legacy-held-attention".into(),
+                },
+            )
+            .unwrap();
+        // Occupy capacity so the migration must queue the valid hold rather than just start it.
+        let discovery = legacy[0].body["fields"]["discovery"].as_str().unwrap();
+        let occupied = store
+            .create_mission_run(&MissionRunRequest {
+                mission: "review".into(),
+                revision: None,
+                workspace: directory.path().to_string_lossy().into_owned(),
+                requester: None,
+                mode: None,
+                inputs: BTreeMap::from([(
+                    "source".into(),
+                    format!("resource/repo/pull-request/1@{discovery}"),
+                )]),
+                idempotency_key: "occupied".into(),
+            })
+            .unwrap();
+        observe(
+            serde_json::json!([
+                {"number": 1, "head": head, "state": "open", "draft": false},
+                {"number": 2, "head": "b".repeat(40), "state": "open", "draft": false},
+                {"number": 3, "head": head, "state": "closed", "draft": false},
+                {"number": 4, "head": head, "state": "open", "draft": true},
+            ]),
+            &subscriptions,
+        );
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        reconciler
+            .reconcile_subscription_missions(&desired)
+            .unwrap();
+        let queue = store.subscription_requests("subscription/reviews").unwrap();
+        assert_eq!(
+            queue
                 .iter()
-                .filter(|(_, status)| status == "started")
-                .count(),
-            crate::store::MAX_OBSERVATION_DELIVERIES + 1
+                .map(|request| request.status.as_str())
+                .collect::<Vec<_>>(),
+            ["pending", "cancelled", "cancelled", "cancelled", "pending"]
+        );
+        let cancelled = store
+            .claims_for(
+                "subscription/reviews",
+                Some("subscription.mission-request-cancelled"),
+            )
+            .unwrap();
+        assert!(
+            cancelled[0].body["fields"]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("moved from head")
         );
         assert_eq!(
-            final_statuses
+            cancelled[1].body["fields"]["reason"],
+            "pull request #3 is closed"
+        );
+        assert_eq!(
+            cancelled[2].body["fields"]["reason"],
+            "pull request #4 is a draft again"
+        );
+        let attention = store
+            .attention_request("attention/legacy-held")
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            attention.status, "resolved",
+            "the queue never asks a person, even at capacity"
+        );
+        for _ in 0..5 {
+            reconciler.evaluate_mission_runs().unwrap();
+        }
+        assert_eq!(
+            store.mission_run(&occupied.id).unwrap().unwrap().status,
+            "completed"
+        );
+        drop(reconciler);
+        drop(store);
+
+        let store = Arc::new(Store::open(&path, "node").unwrap());
+        let desired = store.desired_subjects().unwrap();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for request in [&legacy[0].id, &queue[4].request] {
+            if let Some((_, attempts)) = store
+                .subscription_mission_deferral("subscription/reviews", request)
+                .unwrap()
+            {
+                store
+                    .record_subscription_mission_deferral(
+                        "subscription/reviews",
+                        request,
+                        0,
+                        attempts,
+                    )
+                    .unwrap();
+            }
+            reconciler
+                .reconcile_subscription_missions(&desired)
+                .unwrap();
+            let active = store.active_mission_runs_for_mission("review").unwrap();
+            assert_eq!(active.len(), 1);
+            for _ in 0..5 {
+                reconciler.evaluate_mission_runs().unwrap();
+            }
+        }
+        let started = store
+            .claims_for("subscription/reviews", Some("subscription.mission-started"))
+            .unwrap();
+        assert_eq!(
+            started
                 .iter()
-                .filter(|(_, status)| status == "cancelled")
-                .count(),
+                .map(|claim| claim.body["fields"]["request"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [&legacy[0].id, &queue[4].request]
+        );
+        let released = store
+            .claims_for(
+                "subscription/reviews",
+                Some("subscription.mission-request-released"),
+            )
+            .unwrap();
+        assert_eq!(released.len(), 1, "migration is durable and happens once");
+        assert!(
+            released[0].actor.is_none(),
+            "no person releases the migrated request"
+        );
+        assert_eq!(
+            store
+                .attention_requests(Some("person/operator"), true)
+                .unwrap()
+                .len(),
             1
         );
-        // Nothing is held any more, so the item closes.
-        let held_items = store
-            .attention_requests(Some("person/operator"), true)
-            .unwrap()
-            .into_iter()
-            .filter(|request| request.title == "A subscription is holding mission requests")
-            .collect::<Vec<_>>();
-        assert_eq!(held_items.len(), 1);
-        assert_eq!(held_items[0].status, "resolved");
     }
 
     const INTAKE_REVIEW_SOURCE: &str = r#"version 2
@@ -22789,7 +23643,7 @@ version 2
         );
         let harness = store.current_harness("agent/node.seat-b").unwrap().unwrap();
         assert_eq!(harness.reason.as_deref(), Some("providerAuth"));
-        let attention = store.attention_items(Some("person/nathan")).unwrap();
+        let attention = store.attention_items(Some("person/alex")).unwrap();
         assert_eq!(attention.len(), 1);
         assert_eq!(attention[0].targets, ["agent/node.seat-b"]);
     }
@@ -22830,7 +23684,7 @@ version 2
         reconciler.reconcile_once().unwrap();
         assert!(fenced());
         assert_eq!(
-            store.attention_items(Some("person/nathan")).unwrap().len(),
+            store.attention_items(Some("person/alex")).unwrap().len(),
             1
         );
 
@@ -22840,7 +23694,7 @@ version 2
         assert!(!fenced());
         assert!(
             store
-                .attention_items(Some("person/nathan"))
+                .attention_items(Some("person/alex"))
                 .unwrap()
                 .is_empty()
         );
@@ -22864,7 +23718,7 @@ version 2
         reconciler.reconcile_once().unwrap();
         assert!(fenced());
         assert_eq!(
-            store.attention_items(Some("person/nathan")).unwrap().len(),
+            store.attention_items(Some("person/alex")).unwrap().len(),
             1
         );
     }
@@ -23274,7 +24128,7 @@ version 2
         );
         assert_eq!(
             store
-                .claims_for(&attention[0].subject, Some("attention.resolved"))
+                .claims_for(&attention[0].subject, Some("operational.recovered"))
                 .unwrap()[0]
                 .actor
                 .as_deref(),
@@ -23330,11 +24184,11 @@ version 2
     fn alert_resolution_actor(store: &Store, key: &str) -> Option<String> {
         let digest = hex::encode(sha2::Sha256::digest(key.as_bytes()));
         let attention = store
-            .attention_request(&format!("attention/{}", &digest[..32]))
+            .operational_failure(&format!("attention/{}", &digest[..32]))
             .unwrap()
             .expect("the alert was raised");
         store
-            .claims_for(&attention.subject, Some("attention.resolved"))
+            .claims_for(&attention.targets[0], Some("operational.recovered"))
             .unwrap()
             .last()
             .and_then(|claim| claim.actor.clone())
@@ -23438,8 +24292,7 @@ version 2
         reconciler
             .raise_codex_crash_loop("agent/node.worker", &token_a, "the start failed")
             .unwrap();
-        let key = format!("codex-crash-loop:agent/node.worker:{token_a}");
-        assert_eq!(alert_resolution_actor(&store, &key), None);
+        assert_eq!(store.attention_items(Some("person/alex")).unwrap().len(), 1);
 
         // A person revises the declaration, and the new revision's incarnation becomes ready.
         apply_source(&store, &source("gpt-5.6-sol"), "crash-loop-b");
@@ -23464,20 +24317,16 @@ version 2
             )
             .unwrap();
 
-        assert_eq!(
-            alert_resolution_actor(&store, &key).as_deref(),
-            Some("daemon/runtime")
-        );
         assert!(
             store
-                .attention_items(Some("person/nathan"))
+                .attention_items(Some("person/alex"))
                 .unwrap()
                 .is_empty()
         );
     }
 
     #[test]
-    fn removing_an_agent_resolves_its_reconciler_alerts() {
+    fn removed_agents_disappear_from_snapshot_before_cleanup() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         apply_source(
             &store,
@@ -23490,7 +24339,7 @@ agent "keeper" { workspace "/tmp"; command "true"; restart "never" }
         let raise = |agent: &str, actor: &str| {
             let subject = format!("attention/alert-{}", agent.replace('/', "-"));
             store
-                .request_attention(
+                .record_operational_failure(
                     &subject,
                     &AttentionRequest {
                         reviewer: "person/operator".into(),
@@ -23508,35 +24357,20 @@ agent "keeper" { workspace "/tmp"; command "true"; restart "never" }
         let stopped = raise("agent/node.worker", "agent/st3/reconciler");
         let gone = raise("agent/node.gone", "agent/st3/reconciler");
         let kept = raise("agent/node.keeper", "agent/st3/reconciler");
-        let personal = raise("agent/node.elsewhere", "agent/node.keeper");
         apply_source(
             &store,
             "version 2\nstop \"agent/node.worker\"\n",
             "retired-agent-stop",
         );
-        let reconciler = Reconciler::new(
-            store.clone(),
-            Arc::new(FakeRuntime::default()),
-            "node".into(),
-            Arc::new(Notify::new()),
-        );
-
-        reconciler.reconcile_once().unwrap();
-
-        let status = |subject: &str| store.attention_request(subject).unwrap().unwrap().status;
-        assert_eq!(status(&stopped), "resolved");
-        assert_eq!(status(&gone), "resolved");
-        assert_eq!(status(&kept), "pending");
-        // Only the reconciler's own alerts close this way; an agent's request stays with it.
-        assert_eq!(status(&personal), "pending");
-        assert_eq!(
-            store
-                .claims_for(&stopped, Some("attention.resolved"))
-                .unwrap()[0]
-                .actor
-                .as_deref(),
-            Some("daemon/runtime")
-        );
+        let current = store.attention_items(Some("person/operator")).unwrap();
+        assert_eq!(current.len(), 1);
+        assert_eq!(current[0].subject, "agent/node.keeper");
+        for episode in [&stopped, &gone, &kept] {
+            assert_eq!(
+                store.operational_failure(episode).unwrap().unwrap().status,
+                "pending"
+            );
+        }
     }
 
     #[test]
@@ -24115,7 +24949,7 @@ mission "work-alert" state="ready" {
     }
 
     #[test]
-    fn unresolved_external_attention_suppresses_ready_work_wakes_until_resolved() {
+    fn person_asks_suspend_wakes_and_resume_once_after_response() {
         let store = Arc::new(Store::open_memory("node").unwrap());
         let source = r#"
 version 2
@@ -24132,7 +24966,7 @@ mission "ios-proof-blocked" state="ready" {
                 mission: "ios-proof-blocked".into(),
                 revision: None,
                 workspace: "/tmp".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "ios-proof-blocked-run".into(),
@@ -24171,31 +25005,18 @@ mission "ios-proof-blocked" state="ready" {
         store
             .work_action(&subject, "claim", &work("ios-proof-claim", None))
             .unwrap();
-        let attention = store
-            .request_attention(
-                "attention/ios-proof-xcode",
-                &crate::model::AttentionRequest {
-                    reviewer: "person/nathan".into(),
-                    title: "Silber needs its Xcode simulator components updated".into(),
-                    reason: "CoreSimulator cannot start until the privileged repair runs.".into(),
-                    severity: "error".into(),
-                    targets: vec!["host/silber".into(), subject.clone()],
-                    actor: "agent/node.ios-owner".into(),
-                    idempotency_key: "ios-proof-xcode-attention".into(),
-                },
-            )
-            .unwrap();
-        store
-            .work_action(
-                &subject,
-                "release",
-                &work(
-                    "ios-proof-release",
-                    Some(
-                        "A privileged Xcode repair is required; an idle lease would be misleading.",
-                    ),
-                ),
-            )
+        let ask = store
+            .ask_person(&crate::model::PersonAskRequest {
+                legacy_request: None,
+                person: "person/alex".into(),
+                title: "Repair simulator components".into(),
+                reason: "Repair CoreSimulator before automated proof can run.".into(),
+                actor: desired.subject.clone(),
+                step: Some(subject.clone()),
+                new_run: None,
+                incarnation: Some("ios-owner-one".into()),
+                idempotency_key: "repair-simulator".into(),
+            })
             .unwrap();
         store
             .append_claim(&ClaimInput {
@@ -24219,7 +25040,10 @@ mission "ios-proof-blocked" state="ready" {
         for _ in 0..2 {
             reconciler.reconcile_once().unwrap();
         }
-        assert_eq!(store.step_run(&subject).unwrap().unwrap().status, "blocked");
+        assert_eq!(
+            store.step_run(&subject).unwrap().unwrap().status,
+            "waiting-person"
+        );
         assert!(
             store
                 .messages(Some("agent/node.ios-owner"), true)
@@ -24229,14 +25053,16 @@ mission "ios-proof-blocked" state="ready" {
         );
 
         store
-            .resolve_attention(
-                &attention.subject,
-                &crate::model::AttentionResolveRequest {
-                    outcome: "resolved".into(),
-                    reason: Some("Xcode simulator components are healthy.".into()),
-                    actor: "person/nathan".into(),
-                    idempotency_key: "ios-proof-xcode-resolved".into(),
+            .finish_person_step(
+                &crate::model::PersonStepResponse {
+                    subject: ask.subject,
+                    actor: "person/alex".into(),
+                    summary: "Simulator components repaired.".into(),
+                    episode: None,
+                    evidence: Vec::new(),
+                    idempotency_key: "simulator-repaired".into(),
                 },
+                false,
             )
             .unwrap();
         reconciler.reconcile_once().unwrap();

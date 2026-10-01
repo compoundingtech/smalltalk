@@ -92,6 +92,366 @@ fn value(output: &Output) -> Value {
     })
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_granted_seat_bootstraps_and_cancels_with_its_own_cli_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let parent = root.path().join("coordinator.kdl");
+    std::fs::write(
+        &parent,
+        r#"version 2
+agent "example/operations/coordinator" {
+  workspace "."
+  command "true"
+  agent-authority { apply "example/operations/*" }
+  mission-authority { publish "example/jobs/*"; start "example/jobs/*"; cancel "example/jobs/*" }
+}
+"#,
+    )
+    .unwrap();
+    value(
+        &run_cli(
+            &socket,
+            &[
+                "agents",
+                "apply",
+                parent.to_str().unwrap(),
+                "--as",
+                "person/operator",
+            ],
+        )
+        .await,
+    );
+    let actor = "agent/example/operations/coordinator";
+    let deputy = root.path().join("deputy.kdl");
+    std::fs::write(
+        &deputy,
+        r#"version 2
+agent "example/operations/deputy" {
+  workspace "."
+  command "true"
+  mission-authority { cancel "example/jobs/docs/*" }
+}
+"#,
+    )
+    .unwrap();
+    value(
+        &run_cli_with_agent_env(
+            &socket,
+            actor,
+            &["agents", "apply", deputy.to_str().unwrap(), "--as", actor],
+        )
+        .await,
+    );
+    let mission = root.path().join("mission.kdl");
+    std::fs::write(&mission, "version 2\nmission \"example/jobs/docs/one\" state=\"ready\" { goal \"Do the assigned work.\"; step \"wait\" { agentless } }\n").unwrap();
+    value(
+        &run_cli_with_agent_env(
+            &socket,
+            actor,
+            &[
+                "missions",
+                "publish",
+                mission.to_str().unwrap(),
+                "--as",
+                actor,
+            ],
+        )
+        .await,
+    );
+    value(
+        &run_cli_with_agent_env(
+            &socket,
+            actor,
+            &[
+                "missions",
+                "start",
+                "example/jobs/docs/one",
+                "--id",
+                "example/jobs/docs/one/run",
+                "--workspace",
+                root.path().to_str().unwrap(),
+                "--as",
+                actor,
+            ],
+        )
+        .await,
+    );
+    let deputy_actor = "agent/example/operations/deputy";
+    value(
+        &run_cli_with_agent_env(
+            &socket,
+            deputy_actor,
+            &[
+                "missions",
+                "cancel",
+                "mission-run/example/jobs/docs/one/run",
+                "--reason",
+                "The work was superseded.",
+                "--as",
+                deputy_actor,
+            ],
+        )
+        .await,
+    );
+    assert_eq!(
+        store
+            .mission_run("example/jobs/docs/one/run")
+            .unwrap()
+            .unwrap()
+            .phase,
+        "cleanup-cancelled"
+    );
+    let escalate = root.path().join("escalate.kdl");
+    std::fs::write(&escalate, "version 2\nagent \"example/operations/deputy\" { workspace \".\"; command \"true\"; mission-authority { publish \"example/*\" } }\n").unwrap();
+    let denied = run_cli_with_agent_env(
+        &socket,
+        actor,
+        &["agents", "apply", escalate.to_str().unwrap(), "--as", actor],
+    )
+    .await;
+    assert!(!denied.status.success());
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("agent-authority-grant-denied"),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    value(
+        &run_cli_with_agent_env(
+            &socket,
+            actor,
+            &["agents", "stop", deputy_actor, "--as", actor],
+        )
+        .await,
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operational_cli_lists_outcomes_summarizes_runs_and_reports_performance() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let source = "version 2\nmission \"example/operations\" state=\"ready\" {\n concurrent-runs max=20\n goal \"Build the example.\"\n step \"build\" {goal \"Build.\"}\n}\n";
+    let intent = st3::graph::parse_intent(source, "client-v0-cli").unwrap();
+    let planned = state
+        .store
+        .mission(
+            &intent,
+            IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    state
+        .store
+        .apply(&intent, &planned.subject_tokens, "operations")
+        .unwrap();
+    for i in 0..16 {
+        let run = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "example/operations".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/operator".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: format!("operations-{i}"),
+            })
+            .unwrap();
+        if i < 2 {
+            state
+                .store
+                .set_step_state(
+                    &run.steps[0].subject,
+                    "failed",
+                    Some("the active execution timeout expired"),
+                )
+                .unwrap();
+            // Runtime cleanup may write the terminal state without repeating the original reason.
+            state
+                .store
+                .set_mission_run_state(
+                    &run.id,
+                    "running",
+                    "cleanup-failed",
+                    Some("the mission timeout expired"),
+                )
+                .unwrap();
+            state
+                .store
+                .set_mission_run_state(&run.id, "failed", "terminal", None)
+                .unwrap();
+        }
+    }
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let overview =
+        value(&run_cli(&socket, &["missions", "show", "mission/example/operations"]).await);
+    assert_eq!(overview["total_runs"], 16);
+    assert_eq!(overview["counts"]["running"], 14);
+    assert_eq!(overview["counts"]["failed"], 2);
+    let shown = run_cli_human(&socket, &["missions", "show", "mission/example/operations"]).await;
+    assert!(shown.status.success());
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("running: 14"));
+    let listing = value(&run_cli(&socket, &["missions", "ls", "--all"]).await);
+    assert_eq!(listing["value"]["items"][0]["total_runs"], 16);
+    for collection in ["missions", "work"] {
+        let page = value(
+            &run_cli(
+                &socket,
+                &[
+                    collection, "ls", "--since", "6h", "--status", "failed", "--limit", "1",
+                ],
+            )
+            .await,
+        );
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert!(
+            page["items"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("timeout")
+        );
+        let next = page["next_cursor"].as_str().unwrap();
+        let next_page = value(
+            &run_cli(
+                &socket,
+                &[collection, "ls", "--limit", "1", "--cursor", next],
+            )
+            .await,
+        );
+        assert_ne!(next_page["items"][0]["id"], page["items"][0]["id"]);
+        let timed = value(
+            &run_cli(
+                &socket,
+                &[collection, "ls", "--since", "6h", "--status", "timed-out"],
+            )
+            .await,
+        );
+        assert_eq!(timed["items"].as_array().unwrap().len(), 2);
+        let empty = value(
+            &run_cli(
+                &socket,
+                &[
+                    collection,
+                    "ls",
+                    "--since",
+                    "2020-01-01T00:00:00Z",
+                    "--until",
+                    "2020-01-02T00:00:00Z",
+                    "--status",
+                    "cancelled",
+                ],
+            )
+            .await,
+        );
+        assert!(empty["items"].as_array().unwrap().is_empty());
+    }
+    let report = value(&run_cli(&socket, &["doctor", "--performance"]).await);
+    assert_eq!(report["window_seconds"], 300);
+    assert!(!report["requests"].as_array().unwrap().is_empty());
+    assert!(!report["queries"].as_array().unwrap().is_empty());
+    let shown = run_cli_human(&socket, &["doctor", "--performance"]).await;
+    assert!(shown.status.success());
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("REQUESTS AND TASKS"));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_declaration_cli_redacts_environment_unless_explicitly_requested() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let source = "version 2\nagent \"read/test\" { workspace \"/tmp\"; command \"true\"; env { API_TOKEN \"private-value\" } }";
+    let intent = st3::graph::parse_intent(source, "client-v0-cli").unwrap();
+    let planned = state
+        .store
+        .mission(
+            &intent,
+            IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    assert!(planned.blockers.is_empty(), "{:?}", planned.blockers);
+    state
+        .store
+        .apply(&intent, &planned.subject_tokens, source)
+        .unwrap();
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(socket.exists());
+    for show_values in [false, true] {
+        let mut args = vec!["subject", "show", "agent/read/test", "--kdl"];
+        if show_values {
+            args.push("--show-env-values");
+        }
+        let output = run_cli_human(&socket, &args).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let kdl = String::from_utf8(output.stdout).unwrap();
+        let parsed = st3::graph::parse_intent(&kdl, "client-v0-cli").unwrap();
+        let desired = &parsed.subjects["agent/read/test"].desired;
+        let env = desired["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["name"] == "env")
+            .unwrap();
+        assert_eq!(env["children"][0]["name"], "API_TOKEN");
+        assert_eq!(
+            env["children"][0]["arguments"][0],
+            if show_values {
+                "private-value"
+            } else {
+                "<redacted>"
+            }
+        );
+        if !show_values {
+            assert!(!kdl.contains("private-value"), "{kdl}");
+        }
+    }
+    server.abort();
+}
+
 #[test]
 fn service_permissions_honors_global_json_flag() {
     let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
@@ -337,7 +697,7 @@ async fn a_conversation_thread_pages_through_the_history_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn attention_withdraw_removes_an_obsolete_request_from_now() {
+async fn legacy_attention_mutation_requires_source_migration() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     let state = test_state(root.path());
@@ -346,7 +706,7 @@ async fn attention_withdraw_removes_an_obsolete_request_from_now() {
         .request_attention(
             "attention/obsolete",
             &AttentionRequest {
-                reviewer: "person/nathan".into(),
+                reviewer: "person/alex".into(),
                 title: "No action needed".into(),
                 reason: "The original blocker has cleared.".into(),
                 severity: "warning".into(),
@@ -368,80 +728,39 @@ async fn attention_withdraw_removes_an_obsolete_request_from_now() {
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     assert!(socket.exists());
-    let withdrawn = value(
-        &run_cli(
-            &socket,
-            &[
-                "attention",
-                "withdraw",
-                &request.subject,
-                "--reason",
-                "No action needed now",
-                "--as",
-                "agent/typecase/worker",
-            ],
-        )
-        .await,
-    );
-    assert_eq!(withdrawn["status"], "withdrawn");
-    let current = value(&run_cli(&socket, &["attention", "ls", "--as", "person/nathan"]).await);
+    let withdrawn = run_cli(
+        &socket,
+        &[
+            "attention",
+            "withdraw",
+            &request.subject,
+            "--reason",
+            "No action needed now",
+            "--as",
+            "agent/typecase/worker",
+        ],
+    )
+    .await;
+    assert!(!withdrawn.status.success());
+    assert!(String::from_utf8_lossy(&withdrawn.stderr).contains("attention-migrated"));
+    let current = value(&run_cli(&socket, &["attention", "ls", "--as", "person/alex"]).await);
     assert!(current["value"]["items"].as_array().unwrap().is_empty());
     server.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn now_shows_the_state_of_each_fault_target() {
+async fn cli_person_ask_is_completed_by_its_assigned_person() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     let state = test_state(root.path());
     let store = state.store.clone();
-    let source = r#"version 2
-mission "typecase" state="ready" {
-  goal "Publish a revision."
-  step "publish" { agentless }
-}
-"#;
-    let intent = st3::graph::parse_intent(source, "client-v0-cli").unwrap();
-    let planned = store
-        .mission(
-            &intent,
-            IntentInput {
-                kdl: source.into(),
-                source_name: None,
-            },
-        )
-        .unwrap();
-    store
-        .apply(&intent, &planned.subject_tokens, "typecase-source")
-        .unwrap();
-    let run = store
-        .create_mission_run(&MissionRunRequest {
-            mission: "typecase".into(),
-            revision: None,
-            workspace: "/tmp".into(),
-            requester: Some("person/nathan".into()),
-            mode: Some("run".into()),
-            inputs: BTreeMap::new(),
-            idempotency_key: "typecase-run".into(),
-        })
-        .unwrap();
-    store
-        .set_mission_run_state(&run.id, "cancelled", "terminal", Some("moved to a seat"))
-        .unwrap();
-    store
-        .request_attention(
-            "attention/typecase-remote-control",
-            &AttentionRequest {
-                reviewer: "person/nathan".into(),
-                title: "Publish Typecase without remote control".into(),
-                reason: "Publish the prepared revision as a person.".into(),
-                severity: "warning".into(),
-                targets: vec!["mission/typecase".into(), "resource/typecase/kdl".into()],
-                actor: "agent/fleet/st3".into(),
-                idempotency_key: "typecase-remote-control".into(),
-            },
-        )
-        .unwrap();
+    let intent = st3::graph::parse_intent(
+        "version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }",
+        store.origin(),
+    )
+    .unwrap();
+    store.apply_internal(&intent, "cli-person-asker").unwrap();
+    let actor = format!("agent/{}.asker", store.origin());
     let server_socket = socket.clone();
     let server =
         tokio::spawn(
@@ -453,30 +772,67 @@ mission "typecase" state="ready" {
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    assert!(socket.exists());
-
-    let now = run_cli_human(&socket, &["now", "--as", "person/nathan"]).await;
-    assert!(
-        now.status.success(),
-        "{}",
-        String::from_utf8_lossy(&now.stderr)
+    let ask_args = [
+        "work",
+        "ask",
+        "--for",
+        "person/avery",
+        "--title",
+        "Choose release date",
+        "--reason",
+        "The release needs a date",
+        "--new-run",
+        "release-date",
+        "--as",
+        &actor,
+        "--idempotency-key",
+        "cli-ask",
+    ];
+    let ask = value(&run_cli(&socket, &ask_args).await);
+    let subject = ask["subject"].as_str().unwrap();
+    assert_eq!(
+        value(&run_cli(&socket, &ask_args).await)["subject"],
+        subject
     );
-    let now = String::from_utf8(now.stdout).unwrap();
+    let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/avery"]).await);
+    assert_eq!(listed["value"]["items"][0]["source_id"], subject);
+    assert_eq!(listed["value"]["items"][0]["attention_kind"], "person-step");
+    let wrong = run_cli(
+        &socket,
+        &[
+            "work",
+            "done",
+            subject,
+            "--as",
+            "person/robin",
+            "--summary",
+            "Friday",
+        ],
+    )
+    .await;
+    assert!(!wrong.status.success());
+    let done = [
+        "work",
+        "done",
+        subject,
+        "--as",
+        "person/avery",
+        "--summary",
+        "Friday",
+        "--idempotency-key",
+        "cli-done",
+    ];
+    assert_eq!(value(&run_cli(&socket, &done).await)["status"], "completed");
+    assert_eq!(value(&run_cli(&socket, &done).await)["status"], "completed");
+    let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/avery"]).await);
+    assert!(listed["value"]["items"].as_array().unwrap().is_empty());
     assert!(
-        now.contains("  target mission/typecase: cancelled "),
-        "now did not show the target state:\n{now}"
+        !store
+            .events_after_bounded(0, 200)
+            .unwrap()
+            .iter()
+            .any(|c| c.subject.starts_with("attention/"))
     );
-    assert!(
-        !now.contains("target resource/"),
-        "a resource has no state to show:\n{now}"
-    );
-
-    let listed = value(&run_cli(&socket, &["attention", "ls", "--as", "person/nathan"]).await);
-    let states = &listed["value"]["items"][0]["target_states"];
-    assert_eq!(states[0]["id"], "mission/typecase");
-    assert_eq!(states[0]["state"], "cancelled");
-    assert!(states[0]["since"].is_string());
-    assert_eq!(states.as_array().unwrap().len(), 1);
     server.abort();
 }
 
@@ -538,7 +894,7 @@ mission "cli/child" state="ready" {
             mission: "cli/root".into(),
             revision: None,
             workspace: "/tmp".into(),
-            requester: Some("person/nathan".into()),
+            requester: Some("person/alex".into()),
             mode: Some("run".into()),
             inputs: BTreeMap::new(),
             idempotency_key: "cli-root-run".into(),
@@ -550,7 +906,7 @@ mission "cli/child" state="ready" {
                 mission: "cli/child".into(),
                 revision: None,
                 workspace: "/tmp".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "cli-child-run".into(),
@@ -603,17 +959,17 @@ mission "cli/child" state="ready" {
         .append_claim(&ClaimInput {
             subject: "custom/client/cli-device".into(),
             kind: "custom.client.pairing-completed".into(),
-            actor: Some("person/nathan".into()),
+            actor: Some("person/alex".into()),
             fields: BTreeMap::from([
                 (
                     "credential_hash".into(),
                     Value::String(hex::encode(Sha256::digest(b"cli credential"))),
                 ),
                 ("device_id".into(), Value::String("device/cli".into())),
-                ("person_id".into(), Value::String("person/nathan".into())),
+                ("person_id".into(), Value::String("person/alex".into())),
                 (
                     "session_actor".into(),
-                    Value::String("person/nathan/session/cli".into()),
+                    Value::String("person/alex/session/cli".into()),
                 ),
                 ("scopes".into(), serde_json::json!(["read.projections"])),
                 ("expires_at_unix_ms".into(), serde_json::json!(u64::MAX / 2)),
@@ -637,13 +993,13 @@ mission "cli/child" state="ready" {
     }
     assert!(socket.exists(), "client-v0 test socket did not appear");
 
-    let now = value(&run_cli(&socket, &["now", "--as", "person/nathan"]).await);
+    let now = value(&run_cli(&socket, &["now", "--as", "person/alex"]).await);
     assert_eq!(now["api_version"], "st3.client.v0");
     assert_eq!(now["value"]["collection"], "now");
-    assert_eq!(now["value"]["filters"]["person"], "person/nathan");
+    assert_eq!(now["value"]["filters"]["person"], "person/alex");
 
     for arguments in [
-        vec!["attention", "ls", "--as", "person/nathan"],
+        vec!["attention", "ls", "--as", "person/alex"],
         vec!["agents", "ls"],
         vec!["agents", "tree"],
         vec!["work", "ls"],
@@ -712,7 +1068,7 @@ mission "cli/child" state="ready" {
             .is_empty()
     );
     assert_eq!(machines["value"]["items"][1]["id"], "machine/offline-peer");
-    assert_eq!(machines["value"]["items"][1]["state"], "indeterminate");
+    assert_eq!(machines["value"]["items"][1]["state"], "last-seen");
     assert!(
         machines["value"]["items"]
             .as_array()
@@ -786,14 +1142,14 @@ mission "cli/child" state="ready" {
     assert_eq!(activity["api_version"], "st3.client.v0");
     assert_eq!(activity["value"]["kind"], "event-page");
 
-    let devices = value(&run_cli(&socket, &["devices", "--as", "person/nathan"]).await);
+    let devices = value(&run_cli(&socket, &["devices", "--as", "person/alex"]).await);
     assert_eq!(devices["value"]["items"][0]["id"], "device/cli");
     assert_eq!(devices["value"]["items"][0]["state"], "active");
 
     let pairing = value(
         &run_cli(
             &socket,
-            &["devices", "--as", "person/nathan", "pair", "test-phone"],
+            &["devices", "--as", "person/alex", "pair", "test-phone"],
         )
         .await,
     );
@@ -803,32 +1159,32 @@ mission "cli/child" state="ready" {
     let revoked = value(
         &run_cli(
             &socket,
-            &["devices", "--as", "person/nathan", "revoke", "device/cli"],
+            &["devices", "--as", "person/alex", "revoke", "device/cli"],
         )
         .await,
     );
     assert_eq!(revoked["api_version"], "st3.client.v0");
     assert_eq!(revoked["value"]["status"], "completed");
 
-    let current = value(&run_cli(&socket, &["devices", "--as", "person/nathan"]).await);
+    let current = value(&run_cli(&socket, &["devices", "--as", "person/alex"]).await);
     assert!(current["value"]["items"].as_array().unwrap().is_empty());
-    let history = value(&run_cli(&socket, &["devices", "--as", "person/nathan", "--all"]).await);
+    let history = value(&run_cli(&socket, &["devices", "--as", "person/alex", "--all"]).await);
     assert_eq!(history["value"]["items"][0]["state"], "revoked");
 
     for (arguments, heading) in [
-        (vec!["now", "--as", "person/nathan"], "NEEDS YOU"),
+        (vec!["now", "--as", "person/alex"], "NEEDS YOU"),
         (vec!["machines"], "MACHINES"),
         (vec!["activity", "--limit", "10"], "ACTIVITY"),
-        (vec!["devices", "--as", "person/nathan", "--all"], "DEVICES"),
+        (vec!["devices", "--as", "person/alex", "--all"], "DEVICES"),
         (
-            vec!["attention", "ls", "--as", "person/nathan"],
+            vec!["attention", "ls", "--as", "person/alex"],
             "HUMAN ATTENTION",
         ),
         (vec!["agents", "ls"], "AGENTS"),
         (vec!["agents", "tree"], "AGENT TREE"),
         (vec!["work", "ls"], "WORK"),
         (vec!["terminals", "ls"], "TERMINALS"),
-        (vec!["conversations", "ls", "person/nathan"], "MESSAGES"),
+        (vec!["conversations", "ls", "person/alex"], "MESSAGES"),
     ] {
         let output = run_cli_human(&socket, &arguments).await;
         assert!(
@@ -1864,5 +2220,320 @@ mission "example/merge-train" state="ready" {
     let closed = failure(&cli(None, true, args(&["lanes", "join", &lane, "45"])).await);
     assert!(closed.contains("is closed"), "{closed}");
 
+    server.abort();
+}
+
+#[test]
+fn help_starts_with_examples_and_keeps_plumbing_reachable() {
+    let help = |args: &[&str]| {
+        let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    let default = help(&["--help"]);
+    assert_eq!(default, help(&["help"]));
+    assert!(default.starts_with("See what needs you:\n  st now\n"));
+    assert!(default.contains("st agents new NAME --harness claude --attach"));
+    assert!(default.contains("Everyday use:"));
+    assert!(default.contains("Inside an agent seat:"));
+    assert!(default.contains("Running st on a machine or fleet:"));
+    assert!(!default.contains("Plumbing:"));
+    assert!(help(&["help", "--all"]).contains("Plumbing:"));
+    assert_eq!(
+        help(&["help", "--all"]),
+        help(&["--endpoint", "help", "help", "--all"])
+    );
+    assert!(!help(&["agents", "ls", "--all", "--help"]).contains("Plumbing:"));
+    for path in [
+        vec!["schema"],
+        vec!["agents", "new"],
+        vec!["missions", "start"],
+    ] {
+        let mut flag = path.clone();
+        flag.push("--help");
+        let mut named = vec!["help"];
+        named.extend(path.clone());
+        assert_eq!(help(&flag), help(&named));
+        let mut nested = path;
+        nested.insert(1, "help");
+        assert_eq!(help(&flag), help(&nested));
+    }
+    let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
+        .args(["help", "missing-command"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+}
+
+// Serve the real API without a reconciler: these tests create graph declarations only.
+async fn serve_creation_api(
+    root: &Path,
+    harness_state: Option<&'static str>,
+) -> (PathBuf, tokio::task::JoinHandle<Result<(), anyhow::Error>>) {
+    let socket = root.join("st3.sock");
+    let state = test_state(root);
+    let store = state.store.clone();
+    let router = st3::api::router(state).layer(axum::middleware::from_fn(
+        move |request: axum::extract::Request, next: axum::middleware::Next| {
+            let store = store.clone();
+            async move {
+                let applied = request.uri().path() == "/v1/intent/apply";
+                let response = next.run(request).await;
+                // Simulate the observations a newly started process would publish.
+                if applied
+                    && response.status().is_success()
+                    && let Some(harness_state) = harness_state
+                {
+                    for (kind, fields) in [
+                        (
+                            "runtime.observed",
+                            serde_json::json!({
+                                "runtime_id": "demo", "incarnation_id": "demo:1",
+                                "status": "running", "reachability": "reachable"
+                            }),
+                        ),
+                        (
+                            "harness.observed",
+                            serde_json::json!({
+                                "driver": "omp", "incarnation_id": "demo:1", "state": harness_state
+                            }),
+                        ),
+                    ] {
+                        store
+                            .append_claim(&ClaimInput {
+                                subject: "agent/client-v0-cli.demo".into(),
+                                kind: kind.into(),
+                                actor: Some("agent/client-v0-cli.demo".into()),
+                                fields: serde_json::from_value(fields).unwrap(),
+                                evidence: Vec::new(),
+                                expected_subject: None,
+                                idempotency_key: None,
+                            })
+                            .unwrap();
+                    }
+                }
+                response
+            }
+        },
+    ));
+    let server_socket = socket.clone();
+    let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, router).await });
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(socket.exists());
+    (socket, server)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn new_agent_explains_ready_starting_and_waiting_states_and_preserves_json() {
+    for (harness, json) in [
+        (None, false),
+        (Some("ready"), false),
+        (Some("blocked"), false),
+        (Some("ready"), true),
+    ] {
+        let root = tempfile::tempdir().unwrap();
+        let (socket, server) = serve_creation_api(root.path(), harness).await;
+        let workspace = root.path().to_str().unwrap();
+        let output = run_cli_mode(
+            &socket,
+            json,
+            &[
+                "agents",
+                "new",
+                "demo",
+                "--harness",
+                "omp",
+                "--model",
+                "example-model",
+                "--workspace",
+                workspace,
+                "--as",
+                "person/avery",
+                "--timeout",
+                "100ms",
+            ],
+        )
+        .await;
+        if json {
+            let response = value(&output);
+            assert_eq!(
+                response,
+                serde_json::json!({
+                    "subject": "agent/client-v0-cli.demo", "host_id": "host/client-v0-cli",
+                    "workspace": workspace, "state": "running", "harness_state": "ready",
+                })
+            );
+        } else {
+            let rendered = String::from_utf8(output.stdout).unwrap();
+            let progress = String::from_utf8(output.stderr).unwrap();
+            assert!(!progress.contains("unobserved"), "{progress}");
+            let expected = match harness {
+                None => "Still starting — waiting for the agent process to appear.",
+                Some("ready") => "Ready — the agent is running.",
+                _ => "Waiting for you",
+            };
+            assert!(rendered.contains(expected), "{rendered}\n{progress}");
+            assert_eq!(
+                output.status.success(),
+                harness == Some("ready"),
+                "{progress}"
+            );
+            for action in [
+                "st terminals attach agent/client-v0-cli.demo --as person/avery",
+                "st conversations send agent/client-v0-cli.demo --from person/avery --body 'Hello'",
+                "st agents show agent/client-v0-cli.demo",
+                "st agents stop agent/client-v0-cli.demo --as person/avery",
+                "--attach",
+            ] {
+                assert!(rendered.contains(action), "{rendered}");
+            }
+        }
+        server.abort();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn creation_commands_end_with_actions_and_json_remains_parseable() {
+    let root = tempfile::tempdir().unwrap();
+    let (socket, server) = serve_creation_api(root.path(), None).await;
+    for json in [false, true] {
+        let output = run_cli_mode(
+            &socket,
+            json,
+            &["devices", "pair", "demo-phone", "--as", "person/avery"],
+        )
+        .await;
+        if json {
+            let response = value(&output);
+            assert_eq!(response["value"]["kind"], "pairing-challenge");
+        } else {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let rendered = String::from_utf8(output.stdout).unwrap();
+            assert!(rendered.contains("Waiting for your device"), "{rendered}");
+            assert!(
+                rendered.contains("st devices --as person/avery"),
+                "{rendered}"
+            );
+        }
+    }
+    let request = root.path().join("request.txt");
+    std::fs::write(&request, "Build an example site.").unwrap();
+    let mission = root.path().join("mission.kdl");
+    std::fs::write(&mission, "version 2\nmission \"demo\" state=\"ready\" {\n concurrent-runs max=2\n goal \"Build an example.\"\n step \"work\" {}\n}\n").unwrap();
+    value(
+        &run_cli(
+            &socket,
+            &[
+                "missions",
+                "publish",
+                mission.to_str().unwrap(),
+                "--as",
+                "person/avery",
+            ],
+        )
+        .await,
+    );
+    for json in [false, true] {
+        let id = if json { "demo/json" } else { "demo/human" };
+        let output = run_cli_mode(
+            &socket,
+            json,
+            &[
+                "missions",
+                "start",
+                "demo",
+                "--id",
+                id,
+                "--as",
+                "person/avery",
+                "--workspace",
+                root.path().to_str().unwrap(),
+            ],
+        )
+        .await;
+        if json {
+            let response = value(&output);
+            assert_eq!(
+                response["mission_run"]["subject"],
+                format!("mission-run/{id}")
+            );
+            assert!(response["publication"].is_object());
+        } else {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let rendered = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                rendered.contains("st missions show mission-run/demo/human --follow"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains(
+                    "st missions cancel mission-run/demo/human --as person/avery --reason"
+                ),
+                "{rendered}"
+            );
+        }
+        let output = run_cli_mode(
+            &socket,
+            json,
+            &[
+                "launch",
+                "start",
+                "--id",
+                id,
+                request.to_str().unwrap(),
+                "--as",
+                "person/avery",
+                "--workspace",
+                root.path().to_str().unwrap(),
+            ],
+        )
+        .await;
+        if json {
+            let response = value(&output);
+            assert!(
+                response["subject"]
+                    .as_str()
+                    .unwrap()
+                    .starts_with("planning-session/launch/demo/json/")
+            );
+            assert_eq!(response["status"], "planning");
+        } else {
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let rendered = String::from_utf8(output.stdout).unwrap();
+            assert!(rendered.contains("Started — the planner"), "{rendered}");
+            assert!(
+                rendered.contains("st launch show planning-session/launch/demo/human/"),
+                "{rendered}"
+            );
+            assert!(
+                rendered.contains("st launch cancel planning-session/launch/demo/human/"),
+                "{rendered}"
+            );
+        }
+    }
     server.abort();
 }

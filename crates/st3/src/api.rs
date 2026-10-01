@@ -27,8 +27,10 @@ use tower::ServiceExt as _;
 
 use crate::archive::hydrate_eval;
 use crate::graph::{parse_intent, resolve_document_references};
+#[cfg(test)]
+use crate::model::AttentionRequest;
 use crate::model::{
-    ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView, AttentionRequest,
+    ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView,
     AttentionRequestView, AttentionResolveRequest, AttentionWithdrawRequest, ClaimInput,
     ClaimRecord, ClaimsPage, ClientPageInfo, ClientResourcePage, ClientSyncNotice, ClientSyncPeer,
     ContextClearRequest, DoctorCheck, DoctorReport, DocumentListResponse, DocumentPutRequest,
@@ -52,10 +54,12 @@ use crate::model::{
     SessionLogChunk, SessionScreen, SessionSignalRequest, St3Error, StatusResponse, StepRunView,
     WorkRequest, WorkRetryRequest, WorkWakeRequest,
 };
+use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
 mod client_v0;
 mod delivery_presence;
+mod delivery_probes;
 mod terminal_view;
 
 #[derive(Clone)]
@@ -200,11 +204,14 @@ impl ApiError {
             | "stale-document-token"
             | "stale-incarnation"
             | "stale-launch-preview"
-            | "fleet-leaving" => StatusCode::CONFLICT,
-            "launch-review-not-authorized" | "wrong-message-recipient" | "lane-approval-denied" => {
-                StatusCode::FORBIDDEN
-            }
-            "lane-not-found" => StatusCode::NOT_FOUND,
+            | "fleet-leaving"
+            | "glass-deleted"
+            | "glass-limit" => StatusCode::CONFLICT,
+            "launch-review-not-authorized"
+            | "wrong-message-recipient"
+            | "lane-approval-denied"
+            | "glass-owner-forbidden" => StatusCode::FORBIDDEN,
+            "lane-not-found" | "not-found" => StatusCode::NOT_FOUND,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
@@ -260,6 +267,13 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/client/capabilities", get(client_capabilities))
+        .route("/v1/client/glasses", get(client_v0::glasses_list))
+        .route(
+            "/v1/client/glasses/{id}",
+            get(client_v0::glass_get)
+                .put(client_v0::glass_put)
+                .delete(client_v0::glass_delete),
+        )
         .route(
             "/v1/client/request-latency",
             get(client_v0::request_latency),
@@ -302,6 +316,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/work/{*id}", get(client_work_detail))
         .route("/v1/client/agents", get(client_agents))
         .route("/v1/client/agents/{*id}", get(client_agents_detail))
+        .route(
+            "/v1/client/agent-declarations/{*id}",
+            get(client_v0::agent_declaration),
+        )
         .route("/v1/client/agent-queues/{*id}", get(client_v0::agent_queue))
         .route("/v1/client/lanes", get(client_v0::lanes))
         .route("/v1/client/lanes/{*id}", get(client_v0::lane_detail))
@@ -497,6 +515,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*run}", get(get_eval))
         .route("/v1/mission-runs", get(list_mission_runs))
+        .route("/v1/mission-overview", get(mission_overview))
+        .route("/v1/outcome-history", get(outcome_history))
+        .route("/v1/performance", get(performance_report))
         .route(
             "/v1/mission-runs/{run}/generations",
             get(list_run_generations),
@@ -524,6 +545,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/revision-proposals/{proposal}/cancel",
             post(cancel_revision_proposal),
         )
+        .route("/v1/work/ask", post(ask_person))
+        .route("/v1/work/done", post(done_person_step))
+        .route("/v1/work/cancel-ask", post(cancel_person_ask))
         .route("/v1/work", get(list_work))
         .route("/v1/work-items/{*subject}", get(get_work))
         .route("/v1/work/mission/{*subject}", post(publish_work_mission))
@@ -657,12 +681,15 @@ async fn response_envelope(
         (None, Ok(_)) => {
             let runtime = tokio::runtime::Handle::current();
             let handler_profile = profile.clone();
+            let cpu_kind = request_route.clone();
             match tokio::task::spawn_blocking(move || {
                 if let Some(profile) = &handler_profile {
                     profile.queued();
                 }
                 let _entered = crate::profile::enter(handler_profile.as_ref());
-                runtime.block_on(next.run(request))
+                crate::performance::with_cpu(Some(&cpu_kind), || {
+                    runtime.block_on(next.run(request))
+                })
             })
             .await
             {
@@ -810,6 +837,7 @@ fn request_latency_snapshot() -> Vec<Value> {
 
 fn record_request_latency(route: &str, path: &str, started: Instant) {
     let elapsed = started.elapsed();
+    crate::performance::record_request(route, elapsed);
     {
         let mut routes = request_latency().lock().unwrap();
         if routes.len() < 256 || routes.contains_key(route) {
@@ -927,6 +955,7 @@ fn client_error_code(code: Option<&str>) -> String {
     match code.unwrap_or("internal") {
         "not-found"
         | "forbidden"
+        | "attention-migrated"
         | "unsupported-capability"
         | "validation-failed"
         | "idempotency-conflict"
@@ -938,10 +967,18 @@ fn client_error_code(code: Option<&str>) -> String {
         | "runtime-authority-indeterminate"
         | "remote-unavailable"
         | "internal" => code.unwrap_or("internal").to_owned(),
-        "launch-review-not-authorized" | "wrong-message-recipient" | "lane-approval-denied" => {
-            "forbidden".into()
-        }
+        "launch-review-not-authorized"
+        | "wrong-message-recipient"
+        | "lane-approval-denied"
+        | "glass-owner-forbidden"
+        | "mission-authority-denied"
+        | "missing-agent-mission-authority" => "forbidden".into(),
         "lane-not-found" => "not-found".into(),
+        "invalid-person-ask"
+        | "invalid-person-response"
+        | "missing-ask-owner"
+        | "ambiguous-ask-owner" => "validation-failed".into(),
+        "stale-work-ask" => "stale-fence".into(),
         "run-not-queued"
         | "missing-queue-anchor"
         | "unexpected-queue-anchor"
@@ -958,7 +995,7 @@ fn client_error_code(code: Option<&str>) -> String {
         | "unexpected-lane-anchor"
         | "invalid-lane-anchor"
         | "invalid-lane-state"
-        | "invalid-lane-change" => "validation-failed".into(),
+        | "invalid-lane-change" | "glass-limit" | "glass-deleted" | "invalid-glass-base" => "validation-failed".into(),
         // A retry of a request whose claim a checkpoint dropped cannot be answered again.
         "claim-checkpointed" => "idempotency-conflict".into(),
         _ => "internal".into(),
@@ -1301,7 +1338,11 @@ async fn client_capabilities(
             "max_page_items": CLIENT_MAX_PAGE_ITEMS,
             "max_event_items": 500,
             "max_response_bytes": CLIENT_MAX_RESPONSE_BYTES,
-            "max_wait_ms": 30_000
+            "max_wait_ms": 30_000,
+            "max_glass_body_bytes": st3_schema::glasses::MAX_BODY_BYTES,
+            "max_glasses": st3_schema::glasses::MAX_GLASSES,
+            "max_glass_depth": st3_schema::glasses::MAX_DEPTH,
+            "max_glass_nodes": st3_schema::glasses::MAX_NODES
         },
         "event_cursor": cursor,
         "oldest_event_cursor": format!("event-cursor/{}/{oldest}", state.node),
@@ -1428,6 +1469,15 @@ fn client_work_item(
     Ok(client_work_values(store, vec![work], &desired, snapshot_index)?.pop())
 }
 
+/// Translate internal step states once for every client projection.
+fn client_work_state(status: &str) -> &str {
+    match status {
+        "pending" => "waiting",
+        "working" => "claimed",
+        other => other,
+    }
+}
+
 /// Client resources for `work`, with the usage of the seats in `desired` that its steps own.
 fn client_work_values(
     store: &Store,
@@ -1482,11 +1532,7 @@ fn client_work_values(
             let operational = work_annotations
                 .get(&work.subject)
                 .expect("every work item has an annotation");
-            let state = match work.status.as_str() {
-                "pending" => "waiting",
-                "working" => "claimed",
-                other => other,
-            };
+            let state = client_work_state(&work.status);
             let usage = aggregate_usage_values(
                 usage_by_step
                     .get(work.subject.as_str())
@@ -1768,7 +1814,7 @@ fn client_agent_resources_uncached(
                 "path": step.path,
                 "title": step.title,
                 "goal": step.goal,
-                "state": step.status,
+                "state": client_work_state(&step.status),
                 "since": client_timestamp(step.updated_at_unix_ms),
             })
         })
@@ -2093,31 +2139,7 @@ fn client_session_resources(
         }));
     }
     for unresolved in external.unresolved_processes {
-        sessions.push(json!({
-            "id": unresolved.id,
-            "kind": "session",
-            "revision": unresolved.revision,
-            "updated_at": crate::external_sessions::timestamp(snapshot_time_ms(at)),
-            "owner_id": format!("external-process/{}/{}", unresolved.driver.as_str(), unresolved.process.pid),
-            "state": "running",
-            "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
-            "ended_at": null,
-            "timeline_cursor": format!("timeline-cursor/process-{}/latest", unresolved.process.pid),
-            "usage": null,
-            "managed": false,
-            "driver": unresolved.driver.as_str(),
-            "native_session_id": null,
-            "workspace": unresolved.process.cwd.map(|path| path.display().to_string()),
-            "title": null,
-            "importable": false,
-            "import_reason": "a running harness in this workspace does not expose its exact native session ID; select a saved session and explicitly confirm this PID before takeover",
-            "process": {
-                "pid": unresolved.process.pid,
-                "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
-                "fingerprint": unresolved.process.fingerprint,
-                "exact_session": false
-            }
-        }));
+        sessions.push(unresolved_session_resource(unresolved, at));
     }
     sessions.sort_by(|left, right| {
         right["updated_at"]
@@ -2126,6 +2148,37 @@ fn client_session_resources(
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
     Ok(sessions)
+}
+
+fn unresolved_session_resource(
+    unresolved: crate::external_sessions::UnresolvedProcess,
+    at: &str,
+) -> Value {
+    json!({
+        "id": unresolved.id,
+        "kind": "session",
+        "revision": unresolved.revision,
+        "updated_at": crate::external_sessions::timestamp(snapshot_time_ms(at)),
+        "owner_id": format!("external-process/{}/{}", unresolved.driver.as_str(), unresolved.process.pid),
+        "state": "running",
+        "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
+        "ended_at": null,
+        "timeline_cursor": format!("timeline-cursor/process-{}/latest", unresolved.process.pid),
+        "usage": null,
+        "managed": false,
+        "driver": unresolved.driver.as_str(),
+        "native_session_id": null,
+        "workspace": unresolved.process.cwd.map(|path| path.display().to_string()),
+        "title": null,
+        "importable": false,
+        "import_reason": "a running harness in this workspace does not expose its exact native session ID; select a saved session and explicitly confirm this PID before takeover",
+        "process": {
+            "pid": unresolved.process.pid,
+            "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
+            "fingerprint": unresolved.process.fingerprint,
+            "exact_session": false
+        }
+    })
 }
 
 fn managed_session_resources(
@@ -2261,15 +2314,6 @@ fn snapshot_time_ms(timestamp: &str) -> u128 {
         .unwrap_or_default()
 }
 
-fn attention_resource_id(subject: &str) -> String {
-    if subject.starts_with("attention/") {
-        subject.to_owned()
-    } else {
-        let digest = hex::encode(Sha256::digest(subject.as_bytes()));
-        format!("attention/{}", &digest[..24])
-    }
-}
-
 fn client_attention_actions(kind: &str, review_mode: Option<&str>) -> Vec<&'static str> {
     match kind {
         "human-gate" if review_mode == Some("feedback") => {
@@ -2281,23 +2325,13 @@ fn client_attention_actions(kind: &str, review_mode: Option<&str>) -> Vec<&'stat
             vec!["mission.approve-revision", "mission.cancel-revision"]
         }
         "unread-message" => vec!["message.read"],
-        "fault" | "agent-request" => vec!["attention.resolve"],
+        "person-step" => vec!["work.done"],
+        "fault" | "agent-request" => Vec::new(),
         _ => Vec::new(),
     }
 }
 
-/// Both the default and the history view rank a request by the severity its requester gave.
-fn attention_priority(severity: &str) -> &'static str {
-    match severity {
-        "critical" => "critical",
-        "error" => "high",
-        "warning" => "normal",
-        _ => "low",
-    }
-}
-
-/// Beside each request target, what that target is doing now, so a leftover request is
-/// recognizable without opening every target.
+/// Describe the current source targets beside a failure.
 fn insert_attention_target_states(
     store: &Store,
     resource: &mut serde_json::Map<String, Value>,
@@ -2323,158 +2357,51 @@ fn insert_attention_target_states(
 fn client_attention_resources(
     store: &Store,
     person: Option<&str>,
-    history: bool,
+    _history: bool,
 ) -> anyhow::Result<Vec<Value>> {
-    let current = store.attention_items(person)?;
-    let current_subjects = current
-        .iter()
-        .map(|item| item.subject.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut retired_seats = None;
-    let mut resources = BTreeMap::new();
-    for item in &current {
-        let id = attention_resource_id(&item.subject);
-        let priority = if matches!(item.kind.as_str(), "fault" | "agent-request") {
-            store
-                .attention_request(&item.subject)?
-                .map_or("high", |request| attention_priority(&request.severity))
-        } else {
-            "normal"
-        };
-        let revision = store
-            .claims_for(&item.subject, None)?
-            .last()
-            .map(|claim| claim.id.clone())
-            .or_else(|| {
-                item.subject
-                    .strip_prefix("attention/subscription-failure-")
-                    .map(str::to_owned)
-            })
-            .ok_or_else(|| anyhow::anyhow!("attention `{}` has no accepted claim", item.subject))?;
+    let current = store.attention_snapshot(person, client_now_ms())?;
+    let mut resources = Vec::new();
+    for item in current {
+        let identity = serde_json::to_vec(&(&item.subject, &item.person, &item.episode))?;
+        let id = format!("attention/{}", &hex::encode(Sha256::digest(identity))[..32]);
         let mut resource = json!({
-            "id": id,
-            "kind": "attention",
-            "attention_kind": item.kind,
-            "source_id": item.subject,
-            "person_id": if item.person.is_empty() { "person/any" } else { &item.person },
-            "revision": revision,
+            "id": id, "kind": "attention", "attention_kind": item.kind,
+            "source_id": item.subject, "source_kind": item.kind, "episode": item.episode,
+            "person_id": item.person, "revision": item.episode,
             "updated_at": client_timestamp(item.requested_at_unix_ms),
-            "title": item.title,
-            "detail": item.detail,
-            "priority": priority,
-            "state": "open",
-            "requested_at": client_timestamp(item.requested_at_unix_ms),
-            "targets": item.targets,
-            "actions": client_attention_actions(&item.kind, item.review_mode.as_deref()),
-            "operational": { "layer": "current", "actionable": true, "reasons": [] }
+            "title": item.title, "detail": item.detail, "priority": item.priority,
+            "state": "open", "requested_at": client_timestamp(item.requested_at_unix_ms),
+            "targets": item.targets, "actions": client_attention_actions(&item.kind, item.review_mode.as_deref()),
+            "operational": {"layer": "current", "actionable": true, "reasons": []}
         });
-        let object = resource
-            .as_object_mut()
-            .expect("an attention resource is an object");
-        if let Some(requester) = &item.requester_id {
-            object.insert("requester_id".into(), Value::String(requester.clone()));
-        }
         for (name, value) in [
-            ("launch_id", &item.launch_id),
-            ("variant_id", &item.variant_id),
-            ("message_id", &item.message_id),
+            ("requester_id", item.requester_id),
+            ("launch_id", item.launch_id),
+            ("variant_id", item.variant_id),
+            ("message_id", item.message_id),
+            ("mission_id", item.mission),
+            ("mission_run_id", item.mission_run),
+            ("step_run_id", item.step),
         ] {
             if let Some(value) = value {
-                object.insert(name.into(), Value::String(value.clone()));
+                resource[name] = json!(value);
             }
         }
-        if let Some(mode) = &item.review_mode {
-            object.insert("review_mode".into(), Value::String(mode.clone()));
+        if let Some(mode) = item.review_mode {
+            resource["review_mode"] = json!(mode);
         }
-        if matches!(item.kind.as_str(), "fault" | "agent-request")
-            && attention_requester_retired(store, item, &mut retired_seats)?
-        {
-            object["operational"]["reasons"] = json!(["requester-retired"]);
-        }
-        if let Some(mission) = &item.mission {
-            object.insert("mission_id".into(), Value::String(mission.clone()));
-        }
-        if let Some(run) = &item.mission_run {
-            object.insert("mission_run_id".into(), Value::String(run.clone()));
-        }
-        if let Some(step) = &item.step {
-            object.insert("step_run_id".into(), Value::String(step.clone()));
-        }
-        if matches!(item.kind.as_str(), "fault" | "agent-request") {
-            insert_attention_target_states(store, object, &item.targets)?;
+        if item.kind == "person-step" {
+            resource["action_parameters"] =
+                json!({"work.done": {"target_id": item.subject, "episode": item.episode}});
         }
         if item.kind == "fault" {
-            object.insert("what".into(), Value::String(item.title.clone()));
-            object.insert("because".into(), Value::String(item.detail.clone()));
-            object.insert("fix".into(), json!({"action": "attention.resolve", "parameters": {"attention_id": item.subject, "outcome": "resolved"}}));
+            resource["what"] = json!(item.title);
+            resource["because"] = json!(item.detail);
+            let targets = vec![item.subject.clone()];
+            insert_attention_target_states(store, resource.as_object_mut().unwrap(), &targets)?;
         }
-        resources.insert(id, resource);
+        resources.push(resource);
     }
-    if history {
-        for request in store.attention_requests(person, true)? {
-            let current = current_subjects.contains(request.subject.as_str());
-            let mut reasons = Vec::new();
-            if request.status != "pending" {
-                reasons.push(request.status.as_str());
-            } else if !current {
-                reasons.push("superseded");
-            }
-            let id = attention_resource_id(&request.subject);
-            let kind = if crate::store::agent_attention_requester(&request.actor) {
-                "agent-request"
-            } else {
-                "fault"
-            };
-            let mut resource = json!({
-                    "id": id,
-                    "kind": "attention",
-                    "attention_kind": kind,
-                    "source_id": request.subject,
-                    "person_id": request.reviewer,
-                    "requester_id": request.actor,
-                    "revision": request.request,
-                    "updated_at": client_timestamp(request.resolved_at_unix_ms.unwrap_or(request.requested_at_unix_ms)),
-                    "title": request.title,
-                    "detail": request.reason,
-                    "priority": attention_priority(&request.severity),
-                    "state": if request.status == "pending" { "open" } else { "resolved" },
-                    "requested_at": client_timestamp(request.requested_at_unix_ms),
-                    "targets": request.targets,
-                    "actions": if current { client_attention_actions(kind, None) } else { Vec::<&str>::new() },
-                    "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
-            });
-            if kind == "fault" {
-                resource["what"] = Value::String(request.title.clone());
-                resource["because"] = Value::String(request.reason.clone());
-                resource["fix"] = json!({"action": "attention.resolve", "parameters": {"attention_id": request.subject, "outcome": "resolved"}});
-            }
-            insert_attention_target_states(
-                store,
-                resource
-                    .as_object_mut()
-                    .expect("an attention resource is an object"),
-                &request.targets,
-            )?;
-            resources.insert(id, resource);
-        }
-    }
-    let mut resources = resources.into_values().collect::<Vec<_>>();
-    let priority = |value: &Value| match value["priority"].as_str() {
-        Some("critical") => 0,
-        Some("high") => 1,
-        Some("normal") => 2,
-        _ => 3,
-    };
-    resources.sort_by(|left, right| {
-        priority(left)
-            .cmp(&priority(right))
-            .then_with(|| {
-                left["requested_at"]
-                    .as_str()
-                    .cmp(&right["requested_at"].as_str())
-            })
-            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
-    });
     Ok(resources)
 }
 
@@ -2509,30 +2436,6 @@ fn client_attention_resources_with_previews(
         }
     }
     Ok(items)
-}
-
-/// A fault whose requesting seat was stopped, or whose owning run or generation ended, has no
-/// one left to withdraw it. Only its reviewer can close it now.
-fn attention_requester_retired(
-    store: &Store,
-    item: &crate::model::AttentionItemView,
-    retired_seats: &mut Option<std::collections::BTreeSet<String>>,
-) -> anyhow::Result<bool> {
-    let Some(request) = store.attention_request(&item.subject)? else {
-        return Ok(false);
-    };
-    if !request.actor.starts_with("agent/") {
-        return Ok(false);
-    }
-    if store.selected_desired_kind(&request.actor)?.as_deref() == Some("stop") {
-        return Ok(true);
-    }
-    if retired_seats.is_none() {
-        *retired_seats = Some(store.terminal_owned_runtime_subjects()?);
-    }
-    Ok(retired_seats
-        .as_ref()
-        .is_some_and(|seats| seats.contains(&request.actor)))
 }
 
 fn client_message_resources(
@@ -3667,14 +3570,21 @@ async fn client_launches_detail(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ClientListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    client_detail(
-        client_launch_resources(&state, query.history).map_err(ApiError::internal)?,
-        "launch",
-        &id,
-    )
+    let items = client_launch_resources(&state, query.history).map_err(ApiError::internal)?;
+    // The route carries a session ID. A native ID may itself start with `launch/`.
+    let resource_id = format!("launch/{id}");
+    let id = if items.iter().any(|item| item["id"] == resource_id) {
+        resource_id
+    } else {
+        id
+    };
+    client_detail(items, "launch", &id)
 }
 
 fn client_launch_session(state: &AppState, id: &str) -> Result<PlanningSessionView, ApiError> {
+    if let Some(session) = state.store.planning_session(id).map_err(ApiError::internal)? {
+        return Ok(session);
+    }
     state
         .store
         .planning_session(launch_session_id(id))
@@ -3920,9 +3830,10 @@ where
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
     let profile = crate::profile::current();
+    let cpu_kind = crate::performance::current();
     tokio::task::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
-        operation()
+        crate::performance::with_cpu(cpu_kind.as_deref(), operation)
     })
     .await
     .map_err(ApiError::internal)?
@@ -3935,9 +3846,10 @@ where
     F: FnOnce() -> Result<T, St3Error> + Send + 'static,
 {
     let profile = crate::profile::current();
+    let cpu_kind = crate::performance::current();
     tokio::task::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
-        operation()
+        crate::performance::with_cpu(cpu_kind.as_deref(), operation)
     })
     .await
     .map_err(ApiError::internal)?
@@ -3952,9 +3864,10 @@ where
     F: FnOnce() -> Result<T, ApiError> + Send + 'static,
 {
     let profile = crate::profile::current();
+    let cpu_kind = crate::performance::current();
     tokio::task::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
-        operation()
+        crate::performance::with_cpu(cpu_kind.as_deref(), operation)
     })
     .await
     .map_err(ApiError::internal)?
@@ -3985,17 +3898,23 @@ pub fn start_native_session_discovery(state: &AppState) {
 }
 
 /// The local daemon binds a Unix peer to the harness identity inherited by that peer or one of
-/// its parents. Test servers and the paired gateway use the ordinary unbound listener.
-pub async fn serve_unix_bound(socket: &Path, app: Router) -> anyhow::Result<()> {
-    serve_unix_inner(socket, app, true).await
+/// its parents. `state_socket` gives clients without the daemon's runtime environment a stable
+/// address for the same listener. Test servers and the paired gateway use the unbound listener.
+pub async fn serve_unix_bound(
+    socket: &Path,
+    state_socket: &Path,
+    app: Router,
+) -> anyhow::Result<()> {
+    serve_unix_with_ancestor(socket, Some(state_socket), app, true, harness_ancestor).await
 }
 
 async fn serve_unix_inner(socket: &Path, app: Router, bind_harness: bool) -> anyhow::Result<()> {
-    serve_unix_with_ancestor(socket, app, bind_harness, harness_ancestor).await
+    serve_unix_with_ancestor(socket, None, app, bind_harness, harness_ancestor).await
 }
 
 async fn serve_unix_with_ancestor(
     socket: &Path,
+    state_socket: Option<&Path>,
     app: Router,
     bind_harness: bool,
     ancestor: fn(u32) -> Option<String>,
@@ -4004,6 +3923,13 @@ async fn serve_unix_with_ancestor(
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent)?;
     }
+    // A second daemon must never detach an active listener by unlinking its pathname.
+    if tokio::net::UnixStream::connect(socket).await.is_ok() {
+        anyhow::bail!(
+            "refusing to replace live Unix socket listener at {}",
+            socket.display()
+        );
+    }
     match fs::remove_file(socket) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -4011,6 +3937,9 @@ async fn serve_unix_with_ancestor(
     }
     let listener = UnixListener::bind(socket)?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
+    if let Some(state_socket) = state_socket {
+        publish_state_socket(socket, state_socket)?;
+    }
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
@@ -4072,6 +4001,48 @@ async fn serve_unix_with_ancestor(
         });
     }
 }
+/// Atomically replace only the discovery link, never the listener itself. On macOS (and when
+/// XDG_RUNTIME_DIR is absent) the default listener already lives at this state path.
+fn publish_state_socket(socket: &Path, state_socket: &Path) -> anyhow::Result<()> {
+    if socket == state_socket
+        || fs::canonicalize(state_socket).ok() == fs::canonicalize(socket).ok()
+    {
+        return Ok(());
+    }
+    let parent = state_socket
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("state socket has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+    let temporary = state_socket.with_extension(format!("sock.{}.tmp", std::process::id()));
+    let _ = fs::remove_file(&temporary);
+    let target = fs::canonicalize(socket)?;
+    std::os::unix::fs::symlink(target, &temporary)?;
+    if let Err(error) = fs::rename(&temporary, state_socket) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod gateway_listener_tests {
+    #[tokio::test]
+    async fn live_listener_cannot_be_unlinked_by_another_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("gateway.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let error = super::serve_unix(&socket, axum::Router::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("refusing to replace live Unix socket listener"),
+            "{error}"
+        );
+        assert!(tokio::net::UnixStream::connect(&socket).await.is_ok());
+        drop(listener);
+    }
+}
 
 #[cfg(target_os = "linux")]
 fn harness_ancestor(mut pid: u32) -> Option<String> {
@@ -4110,20 +4081,30 @@ struct NativeDeliveryPeer {
     agent: String,
     transport: &'static str,
     pid: u32,
+    archives_inbox: bool,
 }
 
 fn native_delivery_peer(pid: u32) -> Option<NativeDeliveryPeer> {
     let (args, env) = local_process_arguments(pid)?;
-    let transport = args.windows(2).find_map(|pair| {
+    native_delivery_identity(pid, &args, &env)
+}
+
+fn native_delivery_identity(
+    pid: u32,
+    args: &[String],
+    env: &[String],
+) -> Option<NativeDeliveryPeer> {
+    let (transport, archives_inbox) = args.windows(2).find_map(|pair| {
         if pair[0] != "driver" {
             return None;
         }
         match pair[1].as_str() {
-            "omp-channel" => Some("omp-channel"),
-            "pi-channel" => Some("pi-channel"),
-            "claude" => Some("claude-channel"),
-            "codex" => Some("app-server"),
-            "opencode" => Some("opencode-server"),
+            "omp-channel" => Some(("omp-channel", false)),
+            "pi-channel" => Some(("pi-channel", false)),
+            "claude-mcp" => Some(("claude-channel", false)),
+            "claude" => Some(("claude-channel", true)),
+            "codex" => Some(("app-server", true)),
+            "opencode" => Some(("opencode-server", true)),
             _ => None,
         }
     })?;
@@ -4136,6 +4117,7 @@ fn native_delivery_peer(pid: u32) -> Option<NativeDeliveryPeer> {
         agent,
         transport,
         pid,
+        archives_inbox,
     })
 }
 
@@ -4253,9 +4235,12 @@ fn record_legacy_poll(
     recipient: Option<&str>,
     include_closed: bool,
 ) {
-    if !include_closed
-        && let Some(peer) = peer
+    // Older outer drivers project closed messages too, so they can archive
+    // native inbox files. Their poll still proves liveness. Channel processes
+    // have no archive projection; a history query from one does not count.
+    if let Some(peer) = peer
         && recipient == Some(peer.agent.as_str())
+        && (!include_closed || peer.archives_inbox)
     {
         delivery_presence::record_legacy(&peer.agent, peer.transport, peer.pid);
     }
@@ -4598,6 +4583,94 @@ fn daemon_pty(state: &AppState) -> anyhow::Result<st_runtime::PtyRuntime> {
 
 /// The references already in the graph that no longer resolve. Publication refuses new ones, so
 /// each of these was published before that check, or its target was removed later.
+/// Every Claude seat this host runs needs its hooks to run st3, and each running Claude session
+/// needs the native-session binding its SessionStart hook writes; without it st cannot find the
+/// seat's transcript.
+fn claude_hooks_check(
+    state: &AppState,
+    desired: &[crate::model::DesiredSubject],
+) -> Result<DoctorCheck, ApiError> {
+    let seats = desired
+        .iter()
+        .filter(|subject| {
+            subject.member.as_ref().is_some_and(|member| {
+                member.host == state.store.origin() && member.driver.as_deref() == Some("claude")
+            })
+        })
+        .map(|subject| subject.subject.as_str())
+        .collect::<Vec<_>>();
+    if seats.is_empty() {
+        return Ok(DoctorCheck {
+            name: "claude-hooks".into(),
+            status: "pass".into(),
+            message: "no Claude seat runs on this host".into(),
+        });
+    }
+    let mut faults = Vec::new();
+    match crate::reconcile::launch_executable() {
+        Ok(binary) if is_executable_file(&binary) => {}
+        Ok(binary) => faults.push(format!(
+            "the hooks run ST3_BIN={}, which is not an executable file",
+            binary.display()
+        )),
+        Err(error) => faults.push(format!("the hooks' st3 binary does not resolve: {error:#}")),
+    }
+    let set = crate::hooks::set_dir(&crate::hooks::root(&state.state_dir));
+    if let Err(error) = crate::hooks::verify(&set) {
+        faults.push(format!(
+            "the hook set {} is not usable: {error:#}",
+            set.display()
+        ));
+    }
+    let drivers = state.state_dir.join("drivers");
+    let host = st_drivers::run::detect_host();
+    let mut bound = 0;
+    for subject in &seats {
+        let Some(observed) = state
+            .store
+            .latest_claim(subject, Some("harness.observed"))
+            .map_err(ApiError::internal)?
+        else {
+            continue;
+        };
+        let fields = observed.body.get("fields").unwrap_or(&observed.body);
+        if fields["driver"] != "claude" || matches!(fields["state"].as_str(), Some("ended")) {
+            continue;
+        }
+        let Some(session) = fields["evidence_incarnation"].as_str() else {
+            continue;
+        };
+        let agent_dir = crate::hooks::claude_agent_dir(&drivers, subject, &host);
+        if crate::hooks::claude_binding(&agent_dir, session).is_some() {
+            bound += 1;
+        } else {
+            faults.push(format!(
+                "{subject}: Claude session {session} has no native-session binding in {}; its SessionStart hook did not run st3",
+                agent_dir.display()
+            ));
+        }
+    }
+    Ok(DoctorCheck {
+        name: "claude-hooks".into(),
+        status: if faults.is_empty() { "pass" } else { "fail" }.into(),
+        message: if faults.is_empty() {
+            format!(
+                "{} Claude seats; the hooks run st3 from {}; {bound} running sessions are bound to their transcripts",
+                seats.len(),
+                set.display()
+            )
+        } else {
+            faults.join("; ")
+        },
+    })
+}
+
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
 fn graph_references_check(unresolved: &[String]) -> DoctorCheck {
     const LISTED: usize = 20;
     let mut listed = unresolved.iter().take(LISTED).cloned().collect::<Vec<_>>();
@@ -4629,6 +4702,42 @@ fn graph_references_check(unresolved: &[String]) -> DoctorCheck {
     }
 }
 
+fn unread_current_seat_counts(
+    store: &Store,
+    recipients: &BTreeSet<&str>,
+    messages: &[MessageView],
+    now: u128,
+) -> anyhow::Result<(usize, usize)> {
+    let mut pending = 0;
+    let mut accepted = 0;
+    for message in messages.iter().filter(|message| {
+        recipients.contains(message.to.as_str())
+            && !matches!(message.status.as_str(), "read" | "closed")
+    }) {
+        let owners = store.desired_subjects_named(std::slice::from_ref(&message.to))?;
+        if let Some(host) = owners
+            .first()
+            .and_then(|owner| owner.member.as_ref())
+            .map(|member| member.host.as_str())
+            && host != store.origin()
+            && !store
+                .replication_peer_last_success(host)?
+                .is_some_and(|at| now.saturating_sub(at) < 90_000)
+        {
+            continue;
+        }
+        let claims = store.claims_for(&message.subject, Some("message.sent"))?;
+        let sent_at = claims
+            .first()
+            .map(|claim| claim.accepted_at_unix_ms)
+            .unwrap_or_default();
+        if now.saturating_sub(sent_at) > 10_000 {
+            pending += 1;
+            accepted += usize::from(message.status == "delivered");
+        }
+    }
+    Ok((pending, accepted))
+}
 fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     let mut checks = Vec::new();
     match state.store.index() {
@@ -4803,6 +4912,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
             format!("duplicate runtime owners: {}", duplicates.join("; "))
         },
     });
+    checks.push(claude_hooks_check(state, &desired)?);
     checks.push(graph_references_check(
         &state
             .store
@@ -4947,13 +5057,23 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         Ok(replication) if !replication.configured => checks.push(DoctorCheck {
             name: "replication".into(),
             status: "pass".into(),
-            message: "this node is intentionally local-only".into(),
+            message: if state.state_dir.join("left-fleet.json").is_file() {
+                "this node is intentionally local-only after leaving its fleet".into()
+            } else {
+                "no fleet is configured; use st fleet create or st fleet join to connect this node"
+                    .into()
+            },
         }),
         Ok(replication) => {
             let unavailable = replication
                 .peers
                 .iter()
-                .filter(|peer| peer.status != "up")
+                .filter(|peer| {
+                    !matches!(
+                        peer.status.as_str(),
+                        "up" | "last-seen" | "unknown" | "refused"
+                    )
+                })
                 .map(|peer| format!("{}={}", peer.peer, peer.status))
                 .collect::<Vec<_>>();
             let unresolved = replication.invalid_records + replication.unknown_records;
@@ -4963,6 +5083,25 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 .filter(|peer| peer.sync.as_ref().is_some_and(|sync| sync.diverged))
                 .map(|peer| peer.peer.as_str())
                 .collect::<Vec<_>>();
+            let differing_tables = replication
+                .peers
+                .iter()
+                .flat_map(|peer| {
+                    peer.differing_tables
+                        .iter()
+                        .map(|table| format!("{}/{table}", peer.peer))
+                })
+                .collect::<Vec<_>>();
+            if !differing_tables.is_empty() {
+                checks.push(DoctorCheck {
+                    name: "shared-projections".into(),
+                    status: "fail".into(),
+                    message: format!(
+                        "shared tables differ at equal inventory: {}",
+                        differing_tables.join(", ")
+                    ),
+                });
+            }
             let first_sync_failed = replication
                 .first_sync
                 .as_ref()
@@ -5014,11 +5153,17 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                                 .unwrap_or("no reason recorded")
                         ))
                         .unwrap_or_default(),
-                    if unavailable.is_empty() {
-                        "up".into()
-                    } else {
-                        unavailable.join(", ")
-                    }
+                    replication
+                        .peers
+                        .iter()
+                        .map(|peer| {
+                            match &peer.refusal_reason {
+                                Some(reason) => format!("{}: {reason}", peer.peer),
+                                None => format!("{}={}", peer.peer, peer.status),
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             });
         }
@@ -5044,6 +5189,10 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         state.store.operational_messages(None, false),
     ) {
         (Ok(agents), Ok(messages)) => {
+            let current_recipients = agents
+                .iter()
+                .filter_map(|agent| agent["id"].as_str())
+                .collect::<BTreeSet<_>>();
             let mut blocked = agents
                 .iter()
                 .filter(|agent| {
@@ -5060,25 +5209,15 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                     )
                 })
                 .collect::<Vec<_>>();
-            let mut pending = 0;
-            for message in messages.iter().filter(|message| {
-                message.to.starts_with("agent/")
-                    && !matches!(message.status.as_str(), "read" | "closed")
-            }) {
-                let claims = state
-                    .store
-                    .claims_for(&message.subject, Some("message.sent"))
-                    .map_err(ApiError::internal)?;
-                let sent_at = claims
-                    .first()
-                    .map(|claim| claim.accepted_at_unix_ms)
-                    .unwrap_or_default();
-                if client_now_ms().saturating_sub(sent_at) > 10_000 {
-                    pending += 1;
-                }
-            }
+            let (pending, accepted) = unread_current_seat_counts(
+                &state.store,
+                &current_recipients,
+                &messages,
+                client_now_ms(),
+            )
+            .map_err(ApiError::internal)?;
             if pending > 0 {
-                blocked.push(format!("{pending} messages have waited more than 10s for recipient read; inspect `st conversations status MESSAGE`"));
+                blocked.push(format!("{pending} current-seat messages older than 10s lack a recipient graph read receipt ({accepted} accepted native handoffs); this does not prove that a legacy channel failed to consume them. Inspect `st conversations status MESSAGE`"));
             }
             checks.push(DoctorCheck {
                 name: "message-delivery".into(),
@@ -5092,6 +5231,19 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         }
         (Err(error), _) | (_, Err(error)) => checks.push(DoctorCheck {
             name: "message-delivery".into(),
+            status: "warn".into(),
+            message: error.to_string(),
+        }),
+    }
+    match delivery_probes::check(
+        &state.store,
+        client_now_ms(),
+        &replication_peer_names(state),
+    ) {
+        Ok(Some(check)) => checks.push(check),
+        Ok(None) => {}
+        Err(error) => checks.push(DoctorCheck {
+            name: "delivery-probes".into(),
             status: "warn".into(),
             message: error.to_string(),
         }),
@@ -5159,6 +5311,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     Ok(Json(DoctorReport {
         status: report_status.into(),
         checks,
+        performance: crate::performance::snapshot(),
     }))
 }
 
@@ -5555,16 +5708,13 @@ fn replication_peer_names(state: &AppState) -> Vec<String> {
     names.extend(
         view.members
             .iter()
-            .filter(|member| member.state == "current" && member.mode == "listening")
+            .filter(|member| member.state == "current")
             .map(|member| member.name.clone()),
     );
     names.retain(|name| {
         let current = view.current(name);
         let ended = view.members.iter().any(|member| member.name == *name) && current.is_empty();
-        *name != state.node
-            && !ended
-            && !view.legacy_removed.contains(name)
-            && current.iter().all(|member| member.mode != "dial-out")
+        *name != state.node && !ended && !view.legacy_removed.contains(name)
     });
     names.into_iter().collect()
 }
@@ -7565,21 +7715,10 @@ async fn apply(
         for mission in crate::mission::top_level_mission_ids(&intent.missions) {
             require_agent_mission_authority(&state, actor, "publish", &mission)?;
         }
-        // Only a person grants authority in a top-level seat declaration. Otherwise an agent
-        // could declare itself, or another seat, with authority nobody gave it.
-        if let Some(granted) = intent.subjects.values().find(|desired| {
+        for granted in intent.subjects.values().filter(|desired| {
             desired.kind == "agent" && crate::graph::declares_authority(&desired.desired)
         }) {
-            return Err(ApiError::bad(
-                St3Error::new(
-                    "agent-authority-grant-denied",
-                    format!(
-                        "`{actor}` cannot grant authority in the declaration of `{}`; only a person can",
-                        granted.subject
-                    ),
-                )
-                .with_detail("agent", granted.subject.clone()),
-            ));
+            require_non_escalating_agent_grant(&state, actor, &granted.subject, &granted.desired)?;
         }
         for desired in intent.subjects.values() {
             if desired.subject.starts_with("agent/")
@@ -7587,7 +7726,7 @@ async fn apply(
             {
                 require_agent_seat_authority(
                     &state,
-                    actor,
+                    &normalized_agent_actor(actor).expect("agent actor checked"),
                     if desired.kind == "stop" {
                         "stop"
                     } else {
@@ -7940,6 +8079,7 @@ async fn get_claim(
     let id_for_read = id.clone();
     blocking_store(move || store.claim_by_id(&id_for_read))
         .await?
+        .filter(|claim| !claim.subject.starts_with("glass/"))
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("claim `{id}` does not exist")))
 }
@@ -8015,6 +8155,39 @@ struct AttentionQuery {
     person: Option<String>,
 }
 
+async fn ask_person(
+    State(state): State<AppState>,
+    Json(request): Json<PersonAskRequest>,
+) -> Result<Json<StepRunView>, ApiError> {
+    let result = state.store.ask_person(&request).map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(result))
+}
+
+async fn done_person_step(
+    State(state): State<AppState>,
+    Json(request): Json<PersonStepResponse>,
+) -> Result<Json<StepRunView>, ApiError> {
+    let result = state
+        .store
+        .finish_person_step(&request, false)
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(result))
+}
+
+async fn cancel_person_ask(
+    State(state): State<AppState>,
+    Json(request): Json<PersonStepResponse>,
+) -> Result<Json<StepRunView>, ApiError> {
+    let result = state
+        .store
+        .finish_person_step(&request, true)
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(result))
+}
+
 async fn list_attention(
     State(state): State<AppState>,
     Query(query): Query<AttentionQuery>,
@@ -8042,60 +8215,24 @@ async fn list_attention(
 }
 
 async fn request_attention(
-    State(state): State<AppState>,
-    Json(post): Json<crate::model::AttentionRequestPost>,
+    State(_state): State<AppState>,
+    Json(_post): Json<crate::model::AttentionRequestPost>,
 ) -> Result<Json<AttentionRequestView>, ApiError> {
-    let request: &AttentionRequest = &post.request;
-    if post.closing.closed_by.as_deref() == Some("st") {
-        return Err(ApiError::bad(St3Error::new(
-            "invalid-attention-closed-by",
-            "only st closes the requests it raises for conditions it watches; name a target, --until, --step or --person-closes",
-        )));
-    }
-    let id = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()));
-    let subject = format!("attention/{}", &id[..32]);
-    let response = state
-        .store
-        .request_attention_closing(&subject, request, &post.closing)
-        .map_err(ApiError::bad)?;
-    signal_changed(&state);
-    Ok(Json(response))
+    Err(ApiError::bad(St3Error::new(
+        "attention-migrated",
+        "attention is a derived view; use work ask/done/cancel-ask or act on its source",
+    )))
 }
 
 async fn resolve_attention(
-    State(state): State<AppState>,
-    AxumPath(subject): AxumPath<String>,
-    Json(request): Json<AttentionResolveRequest>,
+    State(_state): State<AppState>,
+    AxumPath(_subject): AxumPath<String>,
+    Json(_request): Json<AttentionResolveRequest>,
 ) -> Result<Json<AttentionRequestView>, ApiError> {
-    let response = state
-        .store
-        .resolve_attention(&subject, &request)
-        .map_err(ApiError::bad)?;
-    if crate::store::agent_attention_requester(&response.actor) {
-        let content = match response.resolution_reason.as_deref() {
-            Some(reason) if !reason.trim().is_empty() => format!(
-                "Your attention request `{}` was {}. Reason: {}",
-                response.subject, request.outcome, reason
-            ),
-            _ => format!(
-                "Your attention request `{}` was {}.",
-                response.subject, request.outcome
-            ),
-        };
-        send_planning_message(
-            &state,
-            &format!(
-                "attention-resolution:{}:{}",
-                response.request, request.idempotency_key
-            ),
-            &request.actor,
-            &response.actor,
-            &content,
-            "Attention request answered",
-        )?;
-    }
-    signal_changed(&state);
-    Ok(Json(response))
+    Err(ApiError::bad(St3Error::new(
+        "attention-migrated",
+        "attention is a derived view; use work ask/done/cancel-ask or act on its source",
+    )))
 }
 
 #[derive(Deserialize)]
@@ -8133,16 +8270,14 @@ async fn decide_subscription_request(
 }
 
 async fn withdraw_attention(
-    State(state): State<AppState>,
-    AxumPath(subject): AxumPath<String>,
-    Json(request): Json<AttentionWithdrawRequest>,
+    State(_state): State<AppState>,
+    AxumPath(_subject): AxumPath<String>,
+    Json(_request): Json<AttentionWithdrawRequest>,
 ) -> Result<Json<AttentionRequestView>, ApiError> {
-    let response = state
-        .store
-        .withdraw_attention(&subject, &request)
-        .map_err(ApiError::bad)?;
-    signal_changed(&state);
-    Ok(Json(response))
+    Err(ApiError::bad(St3Error::new(
+        "attention-migrated",
+        "attention is a derived view; use work ask/done/cancel-ask or act on its source",
+    )))
 }
 
 async fn post_review(
@@ -9143,6 +9278,73 @@ struct MissionRunQuery {
     mission: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct MissionOverviewQuery {
+    mission: String,
+}
+async fn mission_overview(
+    State(state): State<AppState>,
+    Query(query): Query<MissionOverviewQuery>,
+) -> Result<Json<Value>, ApiError> {
+    blocking_store(move || {
+        state
+            .store
+            .read_snapshot(|_| state.store.mission_overview(&query.mission, 10))
+    })
+    .await
+    .map(Json)
+}
+
+#[derive(Deserialize)]
+struct OutcomeHistoryQuery {
+    collection: String,
+    #[serde(default)]
+    since: u64,
+    until: Option<u64>,
+    status: Option<String>,
+    actor: Option<String>,
+    before: Option<u64>,
+    limit: Option<usize>,
+}
+async fn outcome_history(
+    State(state): State<AppState>,
+    Query(query): Query<OutcomeHistoryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if !matches!(query.collection.as_str(), "missions" | "work")
+        || query
+            .status
+            .as_deref()
+            .is_some_and(|s| !matches!(s, "failed" | "cancelled" | "timed-out" | "completed"))
+        || query.limit.is_some_and(|limit| !(1..=200).contains(&limit))
+        || query.until.is_some_and(|until| until < query.since)
+        || query.since > i64::MAX as u64
+        || query.until.is_some_and(|until| until > i64::MAX as u64)
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-history-filter",
+            "select missions or work, a terminal status, a valid time window, and a limit of 1 through 200",
+        )));
+    }
+    blocking_store(move || {
+        state.store.read_snapshot(|index| {
+            state.store.outcome_history(
+                &query.collection,
+                u128::from(query.since),
+                query.until.map(u128::from).unwrap_or_else(client_now_ms),
+                query.status.as_deref(),
+                query.actor.as_deref(),
+                query.before.unwrap_or(index.saturating_add(1)),
+                query.limit.unwrap_or(50),
+            )
+        })
+    })
+    .await
+    .map(Json)
+}
+async fn performance_report() -> Json<Value> {
+    Json(crate::performance::snapshot())
+}
+
 async fn list_mission_runs(
     State(state): State<AppState>,
     Query(query): Query<MissionRunQuery>,
@@ -9940,6 +10142,73 @@ fn refuse_agent_granted_mission_authority(
     Ok(())
 }
 
+/// An agent may delegate only rules of the same kind and verb within its current grants.
+/// Declaration permission and grants are read before the candidate is applied, even for self-apply.
+fn require_non_escalating_agent_grant(
+    state: &AppState,
+    actor: &str,
+    subject: &str,
+    proposed: &Value,
+) -> Result<(), ApiError> {
+    let actor = normalized_agent_actor(actor).expect("agent actor checked");
+    let held = state
+        .store
+        .desired_subject_with_writer(&actor)
+        .map_err(ApiError::internal)?
+        .filter(|(desired, _)| desired.kind == "agent");
+    let denied = |kind: &str, verb: &str, pattern: &str| {
+        ApiError::bad(St3Error::new(
+            "agent-authority-grant-denied",
+            format!("`{actor}` cannot grant {kind} `{verb} {pattern}` to `{subject}`; it must hold the same kind and verb over the same or a wider path and agent-authority apply over the declaration"),
+        ).with_detail("agent", subject.to_owned())
+         .with_detail("authority_kind", kind.to_owned())
+         .with_detail("verb", verb.to_owned())
+         .with_detail("pattern", pattern.to_owned()))
+    };
+    for kind in [
+        "mission-authority",
+        "queue-authority",
+        "seat-authority",
+        "agent-authority",
+    ] {
+        for (verb, pattern) in crate::graph::authority_rules(proposed, kind) {
+            let Some((held, writer)) = &held else {
+                return Err(denied(kind, verb, pattern));
+            };
+            if !crate::graph::agent_declaration_authority(&held.desired).allows_apply(subject) {
+                return Err(denied(kind, verb, pattern));
+            }
+            let mission = crate::graph::effective_agent_mission_authority(
+                held,
+                declared_by_agent(writer.as_deref()),
+            );
+            let mission_patterns = match verb {
+                "publish" => &mission.authority.publish,
+                "start" => &mission.authority.start,
+                "revise" => &mission.authority.revise,
+                "cancel" => &mission.authority.cancel,
+                _ => &Vec::new(),
+            };
+            let covers = if kind == "mission-authority" {
+                mission_patterns
+                    .iter()
+                    .any(|held| crate::model::authority_pattern_contains(held, pattern))
+            } else {
+                crate::graph::authority_rules(&held.desired, kind)
+                    .iter()
+                    .any(|(held_verb, held_pattern)| {
+                        *held_verb == verb
+                            && crate::model::authority_pattern_contains(held_pattern, pattern)
+                    })
+            };
+            if !covers {
+                return Err(denied(kind, verb, pattern));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The actor's current desired agent declaration, which is where a person grants it authority.
 fn current_agent_declaration(
     state: &AppState,
@@ -10036,7 +10305,9 @@ fn require_agent_seat_authority(
     seat: &str,
 ) -> Result<(), ApiError> {
     let desired = current_agent_declaration(state, actor, "missing-agent-seat-authority")?;
-    if crate::graph::agent_seat_authority(&desired).allows(action, seat) {
+    if crate::graph::agent_declaration_authority(&desired).allows_apply(seat)
+        || crate::graph::agent_seat_authority(&desired).allows(action, seat)
+    {
         Ok(())
     } else {
         Err(ApiError::bad(
@@ -11329,8 +11600,8 @@ mod tests {
         for path in [
             "/v1/agent-queue-moves",
             "/v1/work/revision/approve/proposal",
-            "/v1/mission-runs/fleet%2Fdemo%2F1/outcome",
-            "/v1/missions/fleet%2Fdemo/retire",
+            "/v1/mission-runs/example%2Fdemo%2F1/outcome",
+            "/v1/missions/example%2Fdemo/retire",
         ] {
             for actor in ["agent/peer", "person/operator"] {
                 let request = Request::builder()
@@ -11580,12 +11851,134 @@ mod tests {
             agent: recipient.into(),
             transport: "omp-channel",
             pid: 37,
+            archives_inbox: false,
         };
         record_legacy_poll(Some(&peer), Some("agent/eval/other-mailbox"), false);
         record_legacy_poll(Some(&peer), Some(recipient), true);
         assert!(delivery_presence::known(recipient).is_none());
         record_legacy_poll(Some(&peer), Some(recipient), false);
         assert_eq!(delivery_presence::known(recipient).unwrap().state, "legacy");
+    }
+
+    #[test]
+    fn legacy_claude_mcp_is_a_delivery_peer_but_ordinary_mailbox_queries_are_not() {
+        let env = vec!["ST_AGENT=agent/example/legacy".into()];
+        let args = ["st3", "driver", "claude-mcp"].map(str::to_owned);
+        let peer = native_delivery_identity(37, &args, &env).unwrap();
+        assert_eq!(peer.transport, "claude-channel");
+        assert_eq!(peer.agent, "agent/example/legacy");
+        let query = ["st3", "conversations", "ls"].map(str::to_owned);
+        assert!(native_delivery_identity(37, &query, &env).is_none());
+        assert!(native_delivery_identity(37, &args, &[]).is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_native_drivers_renew_delivery_when_their_projection_includes_closed_mail() {
+        // Before a63824ef, native drivers polled include_closed=true to archive
+        // inbox files. This is the real pre-September-25 request shape, rather
+        // than the newer pre-reexec channel's active-mail-only poll.
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        for driver in ["claude", "codex", "opencode"] {
+            for endpoint in ["messages/page", "messages"] {
+                let recipient = format!(
+                    "agent/example/closed-{driver}-{}",
+                    endpoint.replace('/', "-")
+                );
+                let query = format!("/v1/{endpoint}?to={recipient}&include_closed=true&limit=100");
+                let (status, _) = get_request(app.clone(), &query).await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(
+                    delivery_presence::known(&recipient).is_none(),
+                    "ordinary history query renewed a beat"
+                );
+
+                let args = ["st3", "driver", driver].map(str::to_owned);
+                let env = vec![format!("ST_AGENT={recipient}")];
+                let peer = native_delivery_identity(37, &args, &env).unwrap();
+                let other = format!("{recipient}-other");
+                let other_query =
+                    format!("/v1/{endpoint}?to={other}&include_closed=true&limit=100");
+                let (status, _) =
+                    get_request(app.clone().layer(Extension(peer.clone())), &other_query).await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(delivery_presence::known(&other).is_none());
+                assert!(delivery_presence::known(&recipient).is_none());
+                let (status, _) = get_request(app.clone().layer(Extension(peer)), &query).await;
+                assert_eq!(status, StatusCode::OK);
+                let assessment = delivery_presence::known(&recipient)
+                    .expect("native projection did not renew its beat");
+                assert_eq!(assessment.state, "legacy");
+                assert_eq!(assessment.polled_seconds_ago, Some(0));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn channel_history_queries_do_not_renew_delivery() {
+        let root = tempfile::tempdir().unwrap();
+        let app = router(state(root.path()));
+        for driver in ["claude-mcp", "pi-channel", "omp-channel"] {
+            for endpoint in ["messages/page", "messages"] {
+                let recipient = format!(
+                    "agent/example/history-{driver}-{}",
+                    endpoint.replace('/', "-")
+                );
+                let args = ["st3", "driver", driver].map(str::to_owned);
+                let env = vec![format!("ST_AGENT={recipient}")];
+                let peer = native_delivery_identity(37, &args, &env).unwrap();
+                let query = format!("/v1/{endpoint}?to={recipient}&include_closed=true&limit=100");
+                let (status, _) = get_request(app.clone().layer(Extension(peer)), &query).await;
+                assert_eq!(status, StatusCode::OK);
+                assert!(
+                    delivery_presence::known(&recipient).is_none(),
+                    "channel history query renewed a beat"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn doctor_unread_counts_exclude_historical_recipients_and_people() {
+        let store = Store::open_memory("amber").unwrap();
+        for (id, recipient) in [
+            ("current", "agent/example/current"),
+            ("retired", "agent/example/retired"),
+            ("person", "person/eval"),
+        ] {
+            store
+                .append_claim(&ClaimInput {
+                    subject: format!("message/{id}"),
+                    kind: "message.sent".into(),
+                    actor: Some("person/operator".into()),
+                    fields: BTreeMap::from([
+                        ("from".into(), json!("person/operator")),
+                        ("to".into(), json!(recipient)),
+                        ("status".into(), json!("sent")),
+                        ("content".into(), json!("probe")),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(id.into()),
+                })
+                .unwrap();
+        }
+        let current = BTreeSet::from(["agent/example/current"]);
+        let messages = store.operational_messages(None, false).unwrap();
+        assert_eq!(
+            unread_current_seat_counts(&store, &current, &messages, client_now_ms()).unwrap(),
+            (0, 0)
+        );
+        assert_eq!(
+            unread_current_seat_counts(&store, &current, &messages, client_now_ms() + 20_000)
+                .unwrap(),
+            (1, 0)
+        );
+        assert_eq!(
+            store.messages(None, false).unwrap().len(),
+            3,
+            "inspection does not erase historical messages"
+        );
     }
 
     fn state(root: &Path) -> AppState {
@@ -11603,6 +11996,37 @@ mod tests {
             native_session_home: None,
             planner_default: PlannerSpec::default(),
         }
+    }
+
+    #[test]
+    fn doctor_distinguishes_no_fleet_from_explicitly_leaving_a_fleet() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let replication_check = || {
+            doctor_report(&state)
+                .unwrap()
+                .0
+                .checks
+                .into_iter()
+                .find(|check| check.name == "replication")
+                .unwrap()
+        };
+        let check = replication_check();
+        assert_eq!(check.status, "pass");
+        assert!(check.message.contains("no fleet is configured"));
+        assert!(check.message.contains("st fleet create"));
+        assert!(check.message.contains("st fleet join"));
+        assert!(!check.message.contains("intentionally"));
+
+        fs::write(
+            root.path().join("left-fleet.json"),
+            r#"{"fleet_id":"previous-fleet","offline":true,"confirmed_by":null}"#,
+        )
+        .unwrap();
+        let check = replication_check();
+        assert_eq!(check.status, "pass");
+        assert!(check.message.contains("intentionally local-only"));
+        assert!(check.message.contains("after leaving its fleet"));
     }
 
     #[tokio::test]
@@ -12207,7 +12631,7 @@ mod tests {
         let server_socket = socket.clone();
         let app = router(state(root.path()));
         let server = tokio::spawn(async move {
-            serve_unix_with_ancestor(&server_socket, app, true, slow_ancestor).await
+            serve_unix_with_ancestor(&server_socket, None, app, true, slow_ancestor).await
         });
         while !socket.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -12241,7 +12665,7 @@ mod tests {
         let snapshot = new_client_snapshot(&state);
         let query = ClientListQuery {
             limit: Some(2),
-            person: Some("person/nathan".into()),
+            person: Some("person/alex".into()),
             ..ClientListQuery::default()
         };
         let first = client_page(
@@ -12272,7 +12696,7 @@ mod tests {
                         "session_actor".into(),
                         Value::String("client/unused".into()),
                     ),
-                    ("person_id".into(), Value::String("person/nathan".into())),
+                    ("person_id".into(), Value::String("person/alex".into())),
                     ("scopes".into(), json!(["read.projections"])),
                     ("expires_at_unix_ms".into(), json!(u64::MAX)),
                 ]),
@@ -12408,7 +12832,7 @@ mod tests {
             .unwrap();
     }
 
-    /// Hetz, 2026-09-29: under CI load an attach waited behind the store writer until its
+    /// example-linux, 2026-09-29: under CI load an attach waited behind the store writer until its
     /// WebSocket handshake gave up. Naming a local terminal must not wait for the writer.
     #[tokio::test]
     async fn a_local_terminal_is_named_by_reads_alone_while_the_writer_is_busy() {
@@ -12945,6 +13369,84 @@ agent "good" {{ workspace {:?}; command "true" }}
         );
     }
 
+    #[tokio::test]
+    async fn doctor_and_replication_status_explain_fabric_refusals_without_errors() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.fleet_id = Some("94cd11ba-c582-4558-9c84-c3bda922eb6d".into());
+        state.configured_peers = vec!["cobalt".into()];
+        let app = router(state.clone());
+        let (status, recorded) = json_request(app.clone(), "/v1/internal/replication/peer-failure", json!({
+            "peer": "cobalt", "status": "refused", "error": "refused by that member's Fabric grants (service st3-peer-v1); replication can continue through other members"
+        })).await;
+        assert_eq!(status, StatusCode::OK, "{recorded}");
+        let (status, replication) = get_request(app.clone(), "/v1/replication/status").await;
+        assert_eq!(status, StatusCode::OK, "{replication}");
+        assert_eq!(replication["peers"][0]["status"], "refused");
+        assert!(replication["peers"][0]["last_error"].is_null());
+        assert!(
+            replication["peers"][0]["refusal_reason"]
+                .as_str()
+                .unwrap()
+                .contains("Fabric grants")
+        );
+        let (status, doctor) = get_request(app, "/v1/doctor").await;
+        assert_eq!(status, StatusCode::OK, "{doctor}");
+        let check = doctor["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|check| check["name"] == "replication")
+            .unwrap();
+        assert_eq!(check["status"], "pass", "{check}");
+        assert!(
+            check["message"]
+                .as_str()
+                .unwrap()
+                .contains("cobalt: refused by that member's Fabric grants")
+        );
+    }
+
+    #[test]
+    fn doctor_names_shared_tables_that_differ_at_equal_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.fleet_id = Some("fleet/audit".into());
+        state.configured_peers = vec!["alder".into()];
+        state.store.bind_fleet("fleet/audit").unwrap();
+        let source = Store::open_memory("alder").unwrap();
+        source.bind_fleet("fleet/audit").unwrap();
+        let original = source.export_replication_summary("fleet/audit").unwrap();
+        let mut different = original.clone();
+        different
+            .projection_digests
+            .insert("planning_sessions".into(), "different".into());
+        state
+            .store
+            .receive_replication_exchange("alder", "fleet/audit", &different)
+            .unwrap();
+        let report = doctor_report(&state).unwrap().0;
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "shared-projections")
+            .unwrap();
+        assert_eq!(check.status, "fail");
+        assert!(check.message.contains("alder/planning_sessions"));
+        state
+            .store
+            .receive_replication_exchange("alder", "fleet/audit", &original)
+            .unwrap();
+        assert!(
+            !doctor_report(&state)
+                .unwrap()
+                .0
+                .checks
+                .iter()
+                .any(|check| check.name == "shared-projections")
+        );
+    }
+
     #[test]
     fn doctor_lists_attention_items_open_for_more_than_a_day() {
         let root = tempfile::tempdir().unwrap();
@@ -12955,15 +13457,15 @@ agent "good" {{ workspace {:?}; command "true" }}
         ] {
             state
                 .store
-                .request_attention(
-                    &format!("attention/{key}"),
+                .record_operational_failure(
+                    &format!("disk-{key}"),
                     &AttentionRequest {
-                        reviewer: "person/nathan".into(),
+                        reviewer: "person/alex".into(),
                         title: title.into(),
                         reason: "A person needs to decide.".into(),
                         severity: "warning".into(),
-                        targets: Vec::new(),
-                        actor: "agent/fleet/worker".into(),
+                        targets: vec![format!("daemon/{key}")],
+                        actor: "daemon/runtime".into(),
                         idempotency_key: key.into(),
                     },
                 )
@@ -12994,7 +13496,7 @@ agent "good" {{ workspace {:?}; command "true" }}
         assert!(
             stale
                 .message
-                .contains("attention/first for person/nathan, open 2d 3h: Renew the signing key"),
+                .contains("daemon/first for person/alex, open 2d 3h: Renew the signing key"),
             "{}",
             stale.message
         );
@@ -13260,7 +13762,7 @@ agent "good" {{ workspace {:?}; command "true" }}
                 expected_subjects: serde_json::from_value(preview["subject_tokens"].clone())
                     .unwrap(),
                 idempotency_key: format!("apply-{}", hex::encode(Sha256::digest(kdl))),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
             })
             .unwrap(),
         )
@@ -13278,10 +13780,10 @@ agent "good" {{ workspace {:?}; command "true" }}
         let kdl = r#"version 2
 mission "work" state="ready" {
   goal "Complete the work."
-  step "do-work" { assigned-to "agent/fleet/nobody" }
+  step "do-work" { assigned-to "agent/example/nobody" }
 }"#;
         let refusal =
-            "mission `mission/work` references missing eligible agent `agent/fleet/nobody`";
+            "mission `mission/work` references missing eligible agent `agent/example/nobody`";
 
         let (preview, status, error) = preview_and_apply(app.clone(), kdl).await;
         assert_eq!(preview["blockers"], json!([refusal]));
@@ -13292,7 +13794,7 @@ mission "work" state="ready" {
         assert_eq!(store.index().unwrap(), before);
 
         let declared =
-            format!("{kdl}\nagent \"fleet/nobody\" {{ workspace \"/tmp\"; command \"true\" }}");
+            format!("{kdl}\nagent \"example/nobody\" {{ workspace \"/tmp\"; command \"true\" }}");
         let (preview, status, applied) = preview_and_apply(app, &declared).await;
         assert_eq!(preview["blockers"], json!([]));
         assert_eq!(status, StatusCode::OK, "{applied}");
@@ -13374,7 +13876,7 @@ agent "four" {{ workspace {workspace_path:?}; command "true"; render {{ file "ow
                     r#"version 2
 mission "work" state="ready" {
   goal "Complete the work."
-  step "do-work" { assigned-to "agent/fleet/nobody" }
+  step "do-work" { assigned-to "agent/example/nobody" }
 }"#,
                     "node",
                 )
@@ -13393,7 +13895,7 @@ mission "work" state="ready" {
         assert_eq!(check["status"], "warn");
         assert_eq!(
             check["message"],
-            "1 reference no longer resolves: mission `mission/work` references missing eligible agent `agent/fleet/nobody`"
+            "1 reference no longer resolves: mission `mission/work` references missing eligible agent `agent/example/nobody`"
         );
     }
 
@@ -13444,7 +13946,7 @@ mission "invalid-message" state="ready" {
                 },
                 expected_subjects: BTreeMap::new(),
                 idempotency_key: "reject-invalid-nested-message".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
             })
             .unwrap(),
         )
@@ -13562,7 +14064,7 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
                 run: None,
                 request: b"Plan the first mission.".to_vec(),
                 workspace: workspace.display().to_string(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 provider: None,
                 model: None,
                 effort: None,
@@ -13590,7 +14092,7 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
                 run: None,
                 request: b"Plan the second mission.".to_vec(),
                 workspace: workspace.display().to_string(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 provider: None,
                 model: None,
                 effort: None,
@@ -13644,7 +14146,7 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
                 run: None,
                 request: b"Mission a two-step release without changing this workspace.".to_vec(),
                 workspace: workspace.display().to_string(),
-                requester: Some("nathan".into()),
+                requester: Some("alex".into()),
                 provider: None,
                 model: Some("gpt-5.6-sol".into()),
                 effort: Some("medium".into()),
@@ -13657,7 +14159,7 @@ mission "unrequested/work" state="ready" { goal "Do unrelated work." }
         let session = started["id"].as_str().unwrap();
         let planner = started["planner"].as_str().unwrap();
         assert!(planner.ends_with(&format!("/planner.{}", &session[..10])));
-        assert_eq!(started["requester"], "person/nathan");
+        assert_eq!(started["requester"], "person/alex");
         let request_reference = started["request"].as_str().unwrap();
         assert!(request_reference.starts_with("doc/planning/"));
         let (request_name, request_hash) = request_reference.rsplit_once('@').unwrap();
@@ -13786,7 +14288,7 @@ version 2
                 .unwrap()
                 .contains("mission/planned/work")
         );
-        let (_, attention) = get_request(app.clone(), "/v1/attention?person=nathan").await;
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=alex").await;
         assert_eq!(attention.as_array().unwrap().len(), 1);
         assert_eq!(attention[0]["kind"], "launch-approval");
         assert_eq!(
@@ -13801,7 +14303,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/revise"),
             serde_json::to_value(PlanningRevisionRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 feedback: b"Add a verification step.".to_vec(),
                 idempotency_key: "planning-revision-one".into(),
             })
@@ -13812,7 +14314,7 @@ version 2
         assert_eq!(revised["status"], "revision-requested");
         assert!(revised.get("preview").is_none());
         assert!(store.mission_spec("planned/work", None).unwrap().is_none());
-        let (_, attention) = get_request(app.clone(), "/v1/attention?person=nathan").await;
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=alex").await;
         assert_eq!(attention, json!([]));
 
         let second = br#"
@@ -13877,7 +14379,7 @@ version 2
         assert_eq!(status, StatusCode::OK, "{launch_page}");
         assert_eq!(launch_page["items"][0]["preview"], variant["preview"]);
         let (status, attention_page) =
-            get_request(app.clone(), "/v1/client/attention?person=person%2Fnathan").await;
+            get_request(app.clone(), "/v1/client/attention?person=person%2Falex").await;
         assert_eq!(status, StatusCode::OK, "{attention_page}");
         assert_eq!(
             attention_page["items"][0]["launch_id"],
@@ -13970,7 +14472,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/decisions/{decision_path}/answer"),
             serde_json::to_value(LaunchDecisionAnswerRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 response: LaunchDecisionResponse::SingleChoice("full".into()),
                 explanation: Some("release candidate requires the full suite".into()),
                 expected_revision: 1,
@@ -13993,7 +14495,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/decisions/{decision_path}/answer"),
             serde_json::to_value(LaunchDecisionAnswerRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 response: LaunchDecisionResponse::SingleChoice("focused".into()),
                 explanation: None,
                 expected_revision: 1,
@@ -14004,7 +14506,7 @@ version 2
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{immutable}");
         assert_eq!(immutable["code"], "launch-decision-immutable");
-        let (_, attention) = get_request(app.clone(), "/v1/attention?person=nathan").await;
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=alex").await;
         assert_eq!(attention.as_array().unwrap().len(), 1);
         assert_eq!(attention[0]["kind"], "launch-approval");
 
@@ -14027,7 +14529,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/approve"),
             serde_json::to_value(PlanningApprovalRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 preview_hash: first_hash,
                 idempotency_key: "planning-approve-stale".into(),
             })
@@ -14042,7 +14544,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/approve"),
             serde_json::to_value(PlanningApprovalRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 preview_hash: preview_token.clone(),
                 idempotency_key: "planning-approve-current".into(),
             })
@@ -14062,7 +14564,7 @@ version 2
         assert!(store.active_mission_runs().unwrap().is_empty());
         assert_eq!(fs::read_to_string(&marker).unwrap(), "unchanged\n");
         assert_eq!(fs::read_dir(&workspace).unwrap().count(), 1);
-        let (_, attention) = get_request(app.clone(), "/v1/attention?person=nathan").await;
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=alex").await;
         assert_eq!(attention, json!([]));
 
         let documents = store
@@ -14093,7 +14595,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/approve"),
             serde_json::to_value(PlanningApprovalRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 preview_hash: approved["preview"]["hash"].as_str().unwrap().into(),
                 idempotency_key: "planning-approve-retry".into(),
             })
@@ -14106,7 +14608,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/approve-and-launch"),
             serde_json::to_value(LaunchApproveAndStartRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 preview_hash: preview_token.clone(),
                 workspace: workspace.display().to_string(),
                 inputs: BTreeMap::new(),
@@ -14125,7 +14627,7 @@ version 2
             app,
             &format!("/v1/launches/{session}/approve-and-launch"),
             serde_json::to_value(LaunchApproveAndStartRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 preview_hash: preview_token,
                 workspace: workspace.display().to_string(),
                 inputs: BTreeMap::new(),
@@ -14728,7 +15230,7 @@ version 2
                 mission: "variants".into(),
                 revision: None,
                 workspace: workspace.display().to_string(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "variant-run".into(),
@@ -14743,7 +15245,7 @@ version 2
                 run: Some(run.subject.clone()),
                 request: b"Compare a compact mission with an extended mission.".to_vec(),
                 workspace: workspace.display().to_string(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 provider: None,
                 model: None,
                 effort: None,
@@ -14831,7 +15333,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/variants/extended/propose"),
             serde_json::to_value(PlanningProposalRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 reason: "the extended variant has the required check".into(),
                 idempotency_key: "variant-propose-extended".into(),
             })
@@ -14846,7 +15348,7 @@ version 2
             app.clone(),
             &format!("/v1/launches/{session}/variants/extended/propose"),
             serde_json::to_value(PlanningProposalRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 reason: "the extended variant has the required check".into(),
                 idempotency_key: "variant-propose-extended".into(),
             })
@@ -14863,7 +15365,7 @@ version 2
             app,
             &format!("/v1/launches/{session}/variants/compact/propose"),
             serde_json::to_value(PlanningProposalRequest {
-                actor: "person/nathan".into(),
+                actor: "person/alex".into(),
                 reason: "try the stale compact variant".into(),
                 idempotency_key: "variant-propose-compact".into(),
             })
@@ -15790,7 +16292,7 @@ mission "labelled" state="ready" {
                     step["state"].as_str().unwrap()
                 ))
                 .collect::<Vec<_>>(),
-            [("first", "ready"), ("second", "pending")]
+            [("first", "ready"), ("second", "waiting")]
         );
         assert_eq!(steps[0]["goals"], json!(["Greet the fleet."]));
         assert_eq!(steps[0]["assignee"], format!("agent/{}/worker", run.id));
@@ -16134,7 +16636,7 @@ mission "revision" state="ready" {
             &format!("/v1/mission-runs/{}/revision", run.id),
             serde_json::to_value(MissionRevisionRequest {
                 intent: crate::model::IntentInput {
-                    kdl: source.replace("agentless", r#"assigned-to "agent/fleet/nobody""#),
+                    kdl: source.replace("agentless", r#"assigned-to "agent/example/nobody""#),
                     source_name: None,
                 },
                 actor: "person/test".into(),
@@ -16148,7 +16650,7 @@ mission "revision" state="ready" {
         assert_eq!(error["code"], "mission-revision-blocked");
         assert!(
             error["message"].as_str().unwrap().contains(
-                "mission `mission/revision` references missing eligible agent `agent/fleet/nobody`"
+                "mission `mission/revision` references missing eligible agent `agent/example/nobody`"
             ),
             "{error}"
         );
@@ -16570,23 +17072,23 @@ mission "authority-self-grant" state="ready" {
     /// The replacement cannot carry authority, so it silently strips the grant a person gave.
     #[tokio::test]
     async fn review_an_agent_redeclares_another_seat_and_strips_its_grant() {
-        const SEAT: &str = "agent/fleet/worker";
+        const SEAT: &str = "agent/example/worker";
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let source = r#"
 version 2
 
-agent "fleet/worker" { workspace "."; command "true"; }
-agent "fleet/chief" {
+agent "example/worker" { workspace "."; command "true"; }
+agent "example/chief" {
   workspace "."
   command "true"
-  queue-authority { move "fleet/worker" }
+  queue-authority { move "example/worker" }
 }
-agent "fleet/helper" { workspace "."; command "true"; }
+agent "example/helper" { workspace "."; command "true"; }
 mission "queued" state="ready" {
   concurrent-runs
   goal "Give the durable seat one step in each run."
-  step "work" { assigned-to "agent/fleet/worker" }
+  step "work" { assigned-to "agent/example/worker" }
 }
 "#;
         let intent = parse_intent(source, "node").unwrap();
@@ -16639,8 +17141,8 @@ mission "queued" state="ready" {
             "/v1/intent/apply",
             serde_json::to_value(apply_request(
                 &state,
-                "version 2\nagent \"fleet/chief\" { workspace \".\"; command \"sh -c 'echo replaced'\"; }\n",
-                "agent/fleet/helper",
+                "version 2\nagent \"example/chief\" { workspace \".\"; command \"sh -c 'echo replaced'\"; }\n",
+                "agent/example/helper",
                 "helper-redeclares-chief",
             ))
             .unwrap(),
@@ -16653,8 +17155,8 @@ mission "queued" state="ready" {
             "/v1/intent/apply",
             serde_json::to_value(apply_request(
                 &state,
-                "version 2\nstop \"agent/fleet/worker\"\n",
-                "agent/fleet/helper",
+                "version 2\nstop \"agent/example/worker\"\n",
+                "agent/example/helper",
                 "helper-stops-worker",
             ))
             .unwrap(),
@@ -16664,7 +17166,7 @@ mission "queued" state="ready" {
         let (move_status, move_body) = json_request(
             app,
             "/v1/agent-queue-moves",
-            promote("agent/fleet/chief", "chief-after-redeclare"),
+            promote("agent/example/chief", "chief-after-redeclare"),
         )
         .await;
         eprintln!("REVIEW chief move after redeclare: {move_status} {move_body}");
@@ -16685,15 +17187,242 @@ mission "queued" state="ready" {
     }
 
     #[tokio::test]
+    async fn agent_authority_applies_and_delegates_only_current_narrower_grants() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        let source = r#"version 2
+    agent "example/managed/coordinator" {
+      workspace "."
+      command "true"
+      agent-authority { apply "example/managed/*" }
+      mission-authority { publish "example/jobs/*"; start "example/jobs/*"; cancel "example/jobs/*" }
+      queue-authority { move "example/managed/*" }
+      seat-authority { declare "example/managed/*" }
+    }
+    "#;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                source,
+                "person/operator",
+                "grant-coordinator",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let actor = "agent/example/managed/coordinator";
+        // A bare actor follows the same normalization as mission publication.
+        let child = r#"version 2
+    agent "example/managed/deputy" {
+      workspace "."
+      command "true"
+      agent-authority { apply "example/managed/workers/*" }
+      mission-authority { publish "example/jobs/docs/*"; start "example/jobs/docs/one"; cancel "example/jobs/docs/*" }
+      queue-authority { move "example/managed/workers/*" }
+      seat-authority { declare "example/managed/workers/*" }
+    }
+    "#;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                child,
+                "example/managed/coordinator",
+                "delegate-deputy",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            shown_mission_authority(&state, "agent/example/managed/deputy")["cancel"],
+            json!(["example/jobs/docs/*"])
+        );
+        // Delegation can continue down the path, and apply covers both start and stop.
+        for (source, key) in [
+            (
+                "version 2\nagent \"example/managed/workers/one\" { workspace \".\"; command \"true\"; mission-authority { publish \"example/jobs/docs/one\" } }\n",
+                "deputy-delegates-worker",
+            ),
+            (
+                "version 2\nstop \"agent/example/managed/workers/one\"\n",
+                "deputy-stops-worker",
+            ),
+        ] {
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/intent/apply",
+                serde_json::to_value(apply_request(
+                    &state,
+                    source,
+                    "agent/example/managed/deputy",
+                    key,
+                ))
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        for (key, grant) in [
+            ("wider-path", "mission-authority { publish \"example/*\" }"),
+            (
+                "extra-verb",
+                "mission-authority { revise \"example/jobs/docs/*\" }",
+            ),
+            (
+                "different-kind",
+                "seat-authority { stop \"example/managed/workers/*\" }",
+            ),
+            (
+                "wider-agent-path",
+                "agent-authority { apply \"example/*\" }",
+            ),
+            ("wider-queue-path", "queue-authority { move \"example/*\" }"),
+            (
+                "namespace-root",
+                "mission-authority { publish \"example/jobs\" }",
+            ),
+            (
+                "prefix-lookalike",
+                "mission-authority { cancel \"example/jobsmith/*\" }",
+            ),
+        ] {
+            let before = state.store.desired_subjects().unwrap();
+            let source = format!(
+                "version 2\nagent \"example/managed/deputy\" {{ workspace \".\"; command \"true\"; {grant} }}\n"
+            );
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/intent/apply",
+                serde_json::to_value(apply_request(&state, &source, actor, key)).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{key}: {body}");
+            assert_eq!(
+                body["code"], "agent-authority-grant-denied",
+                "{key}: {body}"
+            );
+            assert_eq!(
+                serde_json::to_value(state.store.desired_subjects().unwrap()).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+        }
+        // The candidate cannot supply its own missing verb, even when self-apply is granted.
+        let self_grant = source.replace("cancel \"example/jobs/*\"", "revise \"example/jobs/*\"");
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(&state, &self_grant, actor, "self-extra-verb")).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "agent-authority-grant-denied");
+        // A held grant does not authorize writing an unrelated declaration.
+        let outside = child.replace("example/managed/deputy", "example/other/deputy");
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                &outside,
+                actor,
+                "outside-declaration",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "agent-authority-grant-denied");
+        // Removing apply authority takes effect on the next request.
+        let revoked = source.replace("agent-authority { apply \"example/managed/*\" }", "");
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                &revoked,
+                "person/operator",
+                "revoke-coordinator",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = json_request(
+            app,
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(&state, child, actor, "revoked-delegation")).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "agent-authority-grant-denied");
+    }
+
+    #[tokio::test]
+    async fn default_mission_authority_can_be_delegated_without_adding_cancel() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        let parent = "version 2\nagent \"fleet/fixture-grants/coordinator\" { workspace \".\"; command \"true\"; agent-authority { apply \"fleet/fixture-grants/workers/*\" } }\n";
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                parent,
+                "person/operator",
+                "default-parent",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for (verb, allowed) in [("publish", true), ("cancel", false)] {
+            let child = format!(
+                "version 2\nagent \"fleet/fixture-grants/workers/one\" {{ workspace \".\"; command \"true\"; mission-authority {{ {verb} \"fleet/fixture-grants/docs/*\" }} }}\n"
+            );
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/intent/apply",
+                serde_json::to_value(apply_request(
+                    &state,
+                    &child,
+                    "agent/fleet/fixture-grants/coordinator",
+                    &format!("default-delegate-{verb}"),
+                ))
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                if allowed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                },
+                "{body}"
+            );
+            if !allowed {
+                assert_eq!(body["code"], "agent-authority-grant-denied");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn agent_with_seat_authority_can_declare_and_stop_only_granted_seats() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let source = r#"
 version 2
-agent "fleet/builder" {
+agent "example/builder" {
   workspace "."
   command "true"
-  seat-authority { declare "fleet/workers/*"; stop "fleet/workers/*" }
+  seat-authority { declare "example/workers/*"; stop "example/workers/*" }
 }
 "#;
         let intent = parse_intent(source, "node").unwrap();
@@ -16712,14 +17441,14 @@ agent "fleet/builder" {
             .apply(&intent, &preview.subject_tokens, "seat-grant")
             .unwrap();
         let app = router(state.clone());
-        let actor = "agent/fleet/builder";
+        let actor = "agent/example/builder";
         for (source, key) in [
             (
-                "version 2\nagent \"fleet/workers/one\" { workspace \".\"; command \"true\" }\n",
+                "version 2\nagent \"example/workers/one\" { workspace \".\"; command \"true\" }\n",
                 "declare-granted",
             ),
             (
-                "version 2\nstop \"agent/fleet/workers/one\"\n",
+                "version 2\nstop \"agent/example/workers/one\"\n",
                 "stop-granted",
             ),
         ] {
@@ -16736,7 +17465,7 @@ agent "fleet/builder" {
             "/v1/intent/apply",
             serde_json::to_value(apply_request(
                 &state,
-                "version 2\nagent \"fleet/chief\" { workspace \".\"; command \"true\" }\n",
+                "version 2\nagent \"example/chief\" { workspace \".\"; command \"true\" }\n",
                 actor,
                 "declare-ungranted",
             ))
@@ -16760,11 +17489,11 @@ agent "fleet/builder" {
 
     /// A person declares a top-level project seat without `mission-authority`, as a person did
     /// for a website seat that st then refused its own mission with `mission-authority-denied`.
-    /// The seat now publishes, starts, and revises missions under `fleet/website/*`, and still
+    /// The seat now publishes, starts, and revises missions under `fleet/fixture-website/*`, and still
     /// reaches no other project's missions and cannot rewrite its own declaration.
     #[tokio::test]
     async fn a_person_declared_project_seat_holds_its_own_mission_namespace() {
-        const SEAT: &str = "agent/fleet/website/standing/website";
+        const SEAT: &str = "agent/fleet/fixture-website/standing/website";
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let app = router(state.clone());
@@ -16773,8 +17502,8 @@ agent "fleet/builder" {
         };
         let person = r#"
 version 2
-agent "fleet/website/standing/website" { workspace "."; command "true"; }
-mission "fleet/other/deploy" state="ready" {
+agent "fleet/fixture-website/standing/website" { workspace "."; command "true"; }
+mission "fleet/fixture-other/deploy" state="ready" {
   concurrent-runs
   goal "Belong to another project."
   step "ship" { goal "Ship the other project." }
@@ -16787,7 +17516,7 @@ mission "fleet/other/deploy" state="ready" {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        let namespace = json!(["fleet/website/*"]);
+        let namespace = json!(["fleet/fixture-website/*"]);
         assert_eq!(
             shown_mission_authority(&state, SEAT),
             json!({
@@ -16798,7 +17527,7 @@ mission "fleet/other/deploy" state="ready" {
 
         let own = r#"
 version 2
-mission "fleet/website/refresh" state="ready" {
+mission "fleet/fixture-website/refresh" state="ready" {
   concurrent-runs
   goal "Refresh the website."
   step "build" { goal "Build the website." }
@@ -16827,7 +17556,10 @@ mission "fleet/website/refresh" state="ready" {
             app.clone(),
             "/v1/intent/apply",
             apply(
-                &run("fleet/website/refresh/one", "fleet/website/refresh"),
+                &run(
+                    "fleet/fixture-website/refresh/one",
+                    "fleet/fixture-website/refresh",
+                ),
                 SEAT,
                 "website-starts-own",
             ),
@@ -16852,14 +17584,14 @@ mission "fleet/website/refresh" state="ready" {
                 .unwrap(),
             )
         };
-        let (path, request) = retry("fleet/website/refresh/one", "website-revises-own");
+        let (path, request) = retry("fleet/fixture-website/refresh/one", "website-revises-own");
         let (status, body) = json_request(app.clone(), &path, request).await;
         assert_eq!(status, StatusCode::OK, "revise: {body}");
 
         // Another project's missions stay out of reach for every verb.
         let other = r#"
 version 2
-mission "fleet/other/deploy" state="ready" {
+mission "fleet/fixture-other/deploy" state="ready" {
   concurrent-runs
   goal "Rewrite another project's mission."
 }
@@ -16877,7 +17609,10 @@ mission "fleet/other/deploy" state="ready" {
             app.clone(),
             "/v1/intent/apply",
             apply(
-                &run("fleet/other/deploy/one", "fleet/other/deploy"),
+                &run(
+                    "fleet/fixture-other/deploy/one",
+                    "fleet/fixture-other/deploy",
+                ),
                 SEAT,
                 "website-starts-other",
             ),
@@ -16888,7 +17623,7 @@ mission "fleet/other/deploy" state="ready" {
         let other_run = state
             .store
             .create_mission_run(&MissionRunRequest {
-                mission: "fleet/other/deploy".into(),
+                mission: "fleet/fixture-other/deploy".into(),
                 revision: None,
                 workspace: root.path().display().to_string(),
                 requester: Some("person/operator".into()),
@@ -16905,12 +17640,12 @@ mission "fleet/other/deploy" state="ready" {
         // The seat cannot rewrite its own declaration, with or without authority in it.
         for (source, key, code) in [
             (
-                "version 2\nagent \"fleet/website/standing/website\" { workspace \".\"; command \"sh -c 'echo mine'\"; }\n",
+                "version 2\nagent \"fleet/fixture-website/standing/website\" { workspace \".\"; command \"sh -c 'echo mine'\"; }\n",
                 "website-redeclares-itself",
                 "agent-seat-publication-denied",
             ),
             (
-                "version 2\nagent \"fleet/website/standing/website\" {\n  workspace \".\"\n  command \"true\"\n  mission-authority { publish \"fleet/*\"; start \"fleet/*\"; revise \"fleet/*\" }\n}\n",
+                "version 2\nagent \"fleet/fixture-website/standing/website\" {\n  workspace \".\"\n  command \"true\"\n  mission-authority { publish \"example/*\"; start \"example/*\"; revise \"example/*\" }\n}\n",
                 "website-widens-itself",
                 "agent-authority-grant-denied",
             ),
@@ -16936,22 +17671,22 @@ mission "fleet/other/deploy" state="ready" {
         };
         let person = r#"
 version 2
-agent "fleet/docs/standing/docs" {
+agent "fleet/fixture-docs/standing/docs" {
   workspace "."
   command "true"
-  mission-authority { publish "fleet/docs/guides/*" }
+  mission-authority { publish "fleet/fixture-docs/guides/*" }
 }
-agent "fleet/quiet/standing/quiet" {
+agent "fleet/fixture-quiet/standing/quiet" {
   workspace "."
   command "true"
   mission-authority "none"
 }
-agent "fleet/builder" {
+agent "fleet/fixture-builder" {
   workspace "."
   command "true"
-  seat-authority { declare "fleet/workers/*" }
+  seat-authority { declare "fleet/fixture-workers/*" }
 }
-mission "fleet/crew/host" state="ready" {
+mission "fleet/fixture-crew/host" state="ready" {
   goal "Hold one mission-scoped seat in the crew project."
   agent "helper" { workspace "."; command "true"; }
 }
@@ -16967,8 +17702,8 @@ mission "fleet/crew/host" state="ready" {
             app.clone(),
             "/v1/intent/apply",
             apply(
-                "version 2\nagent \"fleet/workers/one\" { workspace \".\"; command \"true\"; }\n",
-                "agent/fleet/builder",
+                "version 2\nagent \"fleet/fixture-workers/one\" { workspace \".\"; command \"true\"; }\n",
+                "agent/fleet/fixture-builder",
                 "builder-declares-worker",
             ),
         )
@@ -16976,7 +17711,7 @@ mission "fleet/crew/host" state="ready" {
         assert_eq!(status, StatusCode::OK, "{body}");
         let revision = state
             .store
-            .mission_spec("fleet/crew/host", None)
+            .mission_spec("fleet/fixture-crew/host", None)
             .unwrap()
             .unwrap()
             .revision;
@@ -16985,7 +17720,7 @@ mission "fleet/crew/host" state="ready" {
             "/v1/intent/apply",
             apply(
                 &format!(
-                    "version 2\nmission-run \"fleet/crew/host/one\" {{\n  mission \"mission/fleet/crew/host@{revision}\"\n  workspace {:?}\n  requester \"person/operator\"\n}}\n",
+                    "version 2\nmission-run \"fleet/fixture-crew/host/one\" {{\n  mission \"mission/fleet/fixture-crew/host@{revision}\"\n  workspace {:?}\n  requester \"person/operator\"\n}}\n",
                     root.path().display().to_string(),
                 ),
                 "person/operator",
@@ -16996,12 +17731,12 @@ mission "fleet/crew/host" state="ready" {
         assert_eq!(status, StatusCode::OK, "{body}");
         let host = state
             .store
-            .mission_run("fleet/crew/host/one")
+            .mission_run("fleet/fixture-crew/host/one")
             .unwrap()
             .unwrap();
         materialize_run_agents(&state, &host);
         // Named like a project seat, but owned by its mission run.
-        let helper = "agent/fleet/crew/host/one/helper".to_owned();
+        let helper = "agent/fleet/fixture-crew/host/one/helper".to_owned();
 
         let publish = |mission: &str| {
             format!(
@@ -17010,31 +17745,36 @@ mission "fleet/crew/host" state="ready" {
         };
         for (actor, mission, allowed, source) in [
             (
-                "agent/fleet/docs/standing/docs",
-                "fleet/docs/guides/intro",
+                "agent/fleet/fixture-docs/standing/docs",
+                "fleet/fixture-docs/guides/intro",
                 true,
                 "declared",
             ),
             (
-                "agent/fleet/docs/standing/docs",
-                "fleet/docs/release",
+                "agent/fleet/fixture-docs/standing/docs",
+                "fleet/fixture-docs/release",
                 false,
                 "declared",
             ),
             (
-                "agent/fleet/quiet/standing/quiet",
-                "fleet/quiet/anything",
+                "agent/fleet/fixture-quiet/standing/quiet",
+                "fleet/fixture-quiet/anything",
                 false,
                 "declared",
             ),
             (
-                "agent/fleet/workers/one",
-                "fleet/workers/job",
+                "agent/fleet/fixture-workers/one",
+                "fleet/fixture-workers/job",
                 false,
                 "none",
             ),
-            ("agent/fleet/builder", "fleet/builder/job", true, "default"),
-            (helper.as_str(), "fleet/crew/job", false, "none"),
+            (
+                "agent/fleet/fixture-builder",
+                "fleet/fixture-builder/job",
+                true,
+                "default",
+            ),
+            (helper.as_str(), "fleet/fixture-crew/job", false, "none"),
         ] {
             let (status, body) = json_request(
                 app.clone(),
@@ -17118,7 +17858,7 @@ mission "gen/escalate" state="ready" {
     workspace "."
     command "true"
     mission-authority { publish "victim"; start "victim"; revise "victim" }
-    queue-authority { move "fleet/*" }
+    queue-authority { move "example/*" }
   }
   step "work" { assigned-to "agent/${ST_MISSION_RUN}/boss" }
 }
@@ -17141,6 +17881,49 @@ mission "gen/escalate" state="ready" {
             "an agent publication must not grant authority: {body}"
         );
         assert_eq!(body["code"], "agent-authority-grant-denied", "{body}");
+    }
+
+    #[tokio::test]
+    async fn mission_publication_cannot_smuggle_agent_declaration_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        let parent = "version 2\nagent \"example/publisher\" { workspace \".\"; command \"true\"; mission-authority { publish \"example/jobs/*\" } }\n";
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                parent,
+                "person/operator",
+                "smuggle-parent",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let proposed = "version 2\nmission \"example/jobs/escalate\" state=\"ready\" { goal \"Refuse the smuggled grant.\"; agent \"boss\" { workspace \".\"; command \"true\"; agent-authority { apply \"example/*\" } } }\n";
+        let (status, body) = json_request(
+            app,
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                proposed,
+                "agent/example/publisher",
+                "smuggle-apply",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "agent-authority-grant-denied");
+        assert!(
+            state
+                .store
+                .mission_spec("example/jobs/escalate", None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Review 2026-09-27 area 1: the consequence of the accepted publication above. The
@@ -17199,7 +17982,7 @@ mission "gen/escalate" state="ready" {
     workspace "."
     command "true"
     mission-authority { publish "victim"; start "victim"; revise "victim" }
-    queue-authority { move "fleet/*" }
+    queue-authority { move "example/*" }
   }
   step "work" { assigned-to "agent/${ST_MISSION_RUN}/boss" }
 }
@@ -17257,11 +18040,11 @@ mission "gen/escalate" state="ready" {
         let mission_authority = crate::graph::agent_mission_authority(&desired.desired);
         let queue_authority = crate::graph::agent_queue_authority(&desired.desired);
         eprintln!(
-            "REVIEW {boss} publish victim={} start victim={} revise victim={} move fleet/worker={}",
+            "REVIEW {boss} publish victim={} start victim={} revise victim={} move example/worker={}",
             mission_authority.allows("publish", "victim"),
             mission_authority.allows("start", "victim"),
             mission_authority.allows("revise", "victim"),
-            queue_authority.allows_move("agent/fleet/worker"),
+            queue_authority.allows_move("agent/example/worker"),
         );
         // The boss now publishes a mission outside the planner's namespace.
         let victim = "version 2\nmission \"victim\" state=\"ready\" {\n  goal \"Published with escalated authority.\"\n}\n";
@@ -17281,28 +18064,28 @@ mission "gen/escalate" state="ready" {
 
     #[tokio::test]
     async fn an_agent_moves_a_seat_queue_only_with_queue_authority() {
-        const SEAT: &str = "agent/fleet/worker";
+        const SEAT: &str = "agent/example/worker";
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let source = r#"
 version 2
 
-agent "fleet/worker" { workspace "."; command "true"; }
-agent "fleet/chief" {
+agent "example/worker" { workspace "."; command "true"; }
+agent "example/chief" {
   workspace "."
   command "true"
-  queue-authority { move "fleet/worker" }
+  queue-authority { move "example/worker" }
 }
-agent "fleet/other-chief" {
+agent "example/other-chief" {
   workspace "."
   command "true"
-  queue-authority { move "fleet/other-worker" }
+  queue-authority { move "example/other-worker" }
 }
-agent "fleet/helper" { workspace "."; command "true"; }
+agent "example/helper" { workspace "."; command "true"; }
 mission "queued" state="ready" {
   concurrent-runs
   goal "Give the durable seat one step in each run."
-  step "work" { assigned-to "agent/fleet/worker" }
+  step "work" { assigned-to "agent/example/worker" }
 }
 "#;
         let intent = parse_intent(source, "node").unwrap();
@@ -17352,10 +18135,10 @@ mission "queued" state="ready" {
         };
 
         for (actor, code) in [
-            ("agent/fleet/helper", "queue-authority-denied"),
-            ("agent/fleet/other-chief", "queue-authority-denied"),
-            ("agent/fleet/worker", "queue-authority-denied"),
-            ("agent/fleet/undeclared", "missing-agent-queue-authority"),
+            ("agent/example/helper", "queue-authority-denied"),
+            ("agent/example/other-chief", "queue-authority-denied"),
+            ("agent/example/worker", "queue-authority-denied"),
+            ("agent/example/undeclared", "missing-agent-queue-authority"),
             ("daemon/runtime", "invalid-queue-move-actor"),
         ] {
             let (status, body) = json_request(
@@ -17375,15 +18158,15 @@ mission "queued" state="ready" {
         for (key, declaration) in [
             (
                 "self-grant",
-                r#"agent "fleet/helper" { workspace "."; command "true"; queue-authority { move "fleet/worker" } }"#,
+                r#"agent "example/helper" { workspace "."; command "true"; queue-authority { move "example/worker" } }"#,
             ),
             (
                 "other-grant",
-                r#"agent "fleet/deputy" { workspace "."; command "true"; queue-authority { move "fleet/*" } }"#,
+                r#"agent "example/deputy" { workspace "."; command "true"; queue-authority { move "example/*" } }"#,
             ),
             (
                 "mission-grant",
-                r#"agent "fleet/helper" { workspace "."; command "true"; mission-authority { publish "queued" } }"#,
+                r#"agent "example/helper" { workspace "."; command "true"; mission-authority { publish "queued" } }"#,
             ),
         ] {
             let (status, body) = json_request(
@@ -17392,7 +18175,7 @@ mission "queued" state="ready" {
                 serde_json::to_value(apply_request(
                     &state,
                     &format!("version 2\n{declaration}\n"),
-                    "agent/fleet/helper",
+                    "agent/example/helper",
                     key,
                 ))
                 .unwrap(),
@@ -17409,8 +18192,8 @@ mission "queued" state="ready" {
             "/v1/intent/apply",
             serde_json::to_value(apply_request(
                 &state,
-                "version 2\nagent \"fleet/deputy\" { workspace \".\"; command \"true\"; }\n",
-                "agent/fleet/helper",
+                "version 2\nagent \"example/deputy\" { workspace \".\"; command \"true\"; }\n",
+                "agent/example/helper",
                 "plain-seat",
             ))
             .unwrap(),
@@ -17421,7 +18204,7 @@ mission "queued" state="ready" {
         let (status, body) = json_request(
             app.clone(),
             "/v1/agent-queue-moves",
-            promote("agent/fleet/helper", "still-refused"),
+            promote("agent/example/helper", "still-refused"),
         )
         .await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
@@ -17431,16 +18214,16 @@ mission "queued" state="ready" {
         let (status, body) = json_request(
             app.clone(),
             "/v1/agent-queue-moves",
-            promote("fleet/chief", "authorized"),
+            promote("example/chief", "authorized"),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{body}");
-        assert_eq!(body["actor"], "agent/fleet/chief");
+        assert_eq!(body["actor"], "agent/example/chief");
         assert_eq!(body["subject"], SEAT);
         assert_eq!(order(), [second.clone(), first.clone()]);
         let queue = state.store.seat_queue(SEAT).unwrap();
         assert_eq!(queue.move_count, 1);
-        assert_eq!(queue.moves[0].actor.as_deref(), Some("agent/fleet/chief"));
+        assert_eq!(queue.moves[0].actor.as_deref(), Some("agent/example/chief"));
         assert_eq!(queue.moves[0].run, second);
         assert_eq!(
             queue.moves[0].reason.as_deref(),
@@ -17705,7 +18488,7 @@ version 2
         let resource = ClaimInput {
             subject: "resource/example".into(),
             kind: "resource.observed".into(),
-            actor: Some("person/nathan".into()),
+            actor: Some("person/alex".into()),
             fields: BTreeMap::from([
                 (
                     "kind".into(),
@@ -17839,7 +18622,7 @@ version 2
     step "approval" {
       goal "Submit the candidate."
       assigned-to "agent/worker"
-      gate "human-review" type="human" { reviewer "person/nathan" }
+      gate "human-review" type="human" { reviewer "person/alex" }
     }
   }
 
@@ -17911,7 +18694,7 @@ version 2
         let request_fields = |owner: String, definition: String, operation: &str| {
             BTreeMap::from([
                 ("owner".into(), Value::String(owner)),
-                ("reviewer".into(), Value::String("person/nathan".into())),
+                ("reviewer".into(), Value::String("person/alex".into())),
                 (
                     "question".into(),
                     Value::String("Is the candidate ready?".into()),
@@ -17985,11 +18768,11 @@ version 2
         assert!(listed[1].get("step").is_none());
 
         let (status, selected) =
-            get_request(app.clone(), "/v1/reviews?reviewer=person%2Fnathan").await;
+            get_request(app.clone(), "/v1/reviews?reviewer=person%2Falex").await;
         assert_eq!(status, StatusCode::OK, "{selected}");
         assert_eq!(selected.as_array().unwrap().len(), 2);
         let (status, attention) =
-            get_request(app.clone(), "/v1/attention?person=person%2Fnathan").await;
+            get_request(app.clone(), "/v1/attention?person=person%2Falex").await;
         assert_eq!(status, StatusCode::OK, "{attention}");
         assert_eq!(attention.as_array().unwrap().len(), 2);
         assert!(
@@ -18033,7 +18816,7 @@ version 2
             .append_claim(&ClaimInput {
                 subject: step_request.subject.clone(),
                 kind: "gate.result".into(),
-                actor: Some("person/nathan".into()),
+                actor: Some("person/alex".into()),
                 fields: BTreeMap::from([("verdict".into(), Value::String("pass".into()))]),
                 evidence: Vec::new(),
                 expected_subject: None,
@@ -18092,7 +18875,7 @@ version 2
         let (status, accepted_mission) = json_request(
             app.clone(),
             &format!("/v1/reviews/{}", run.subject),
-            body("person/nathan"),
+            body("person/alex"),
         )
         .await;
         assert_eq!(status, StatusCode::OK, "{accepted_mission}");
@@ -18106,7 +18889,7 @@ version 2
         let missing_reason = serde_json::to_value(ReviewRequest {
             decision: "rejected".into(),
             reason: None,
-            actor: Some("person/nathan".into()),
+            actor: Some("person/alex".into()),
             expected_subject: None,
         })
         .unwrap();
@@ -18122,7 +18905,7 @@ version 2
         let reject = serde_json::to_value(ReviewRequest {
             decision: "rejected".into(),
             reason: Some("the evidence is incomplete".into()),
-            actor: Some("person/nathan".into()),
+            actor: Some("person/alex".into()),
             expected_subject: None,
         })
         .unwrap();
@@ -18193,7 +18976,7 @@ version 2
                 idempotency_key: Some("feedback-api-request".into()),
             })
             .unwrap();
-        let (_, attention) = get_request(app.clone(), "/v1/attention?person=person%2Fnathan").await;
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=person%2Falex").await;
         assert_eq!(attention[0]["review_mode"], "feedback");
         assert!(
             attention[0]["actions"]
@@ -18207,7 +18990,7 @@ version 2
             app.clone(),
             &feedback_path,
             json!({
-                "decision": "rejected", "reason": "More detail", "actor": "person/nathan"
+                "decision": "rejected", "reason": "More detail", "actor": "person/alex"
             }),
         )
         .await;
@@ -18217,7 +19000,7 @@ version 2
             app.clone(),
             &feedback_path,
             json!({
-                "decision": "changes-requested", "reason": "Add a source.", "actor": "person/nathan"
+                "decision": "changes-requested", "reason": "Add a source.", "actor": "person/alex"
             }),
         )
         .await;
@@ -18225,99 +19008,36 @@ version 2
         assert_eq!(accepted["body"]["fields"]["verdict"], "feedback");
         assert_eq!(accepted["body"]["fields"]["request"], feedback_request.id);
 
-        let (_, empty) = get_request(app, "/v1/reviews?reviewer=person%2Fnathan").await;
+        let (_, empty) = get_request(app, "/v1/reviews?reviewer=person%2Falex").await;
         assert_eq!(empty, json!([]));
     }
 
     #[tokio::test]
-    async fn attention_routes_show_agent_request_and_deliver_resolution_reason() {
+    async fn legacy_attention_mutations_report_migration_without_writes() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let store = state.store.clone();
         let app = router(state);
-        let request = serde_json::to_value(AttentionRequest {
-            reviewer: "nathan".into(),
-            title: "Fabric needs review".into(),
-            reason: "The queue did not recover.".into(),
-            severity: "error".into(),
-            targets: vec!["resource/fabric/queue".into()],
-            actor: "agent/fabric/worker".into(),
-            idempotency_key: "api-attention-fabric".into(),
-        })
-        .unwrap();
-        let mut refused = request.clone();
-        refused["closed_by"] = json!("st");
-        let (status, error) = json_request(app.clone(), "/v1/attention", refused).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
-        assert_eq!(error["code"], "invalid-attention-closed-by");
-        let (status, error) = json_request(app.clone(), "/v1/attention", request.clone()).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
-        assert_eq!(error["code"], "attention-closes-never");
-        let mut request = request;
-        request["closed_by"] = json!("person");
-        let (status, created) = json_request(app.clone(), "/v1/attention", request).await;
-        assert_eq!(status, StatusCode::OK, "{created}");
-        assert_eq!(created["reviewer"], "person/nathan");
-        assert_eq!(created["status"], "pending");
-
-        let (status, selected) = get_request(app.clone(), "/v1/attention?person=nathan").await;
-        assert_eq!(status, StatusCode::OK, "{selected}");
-        assert_eq!(selected.as_array().unwrap().len(), 1);
-        assert_eq!(selected[0]["kind"], "agent-request");
-        assert_eq!(selected[0]["requester_id"], "agent/fabric/worker");
-        assert_eq!(selected[0]["actions"][0]["label"], "answer");
-        let client = client_attention_resources(&store, Some("person/nathan"), false).unwrap();
-        assert_eq!(client[0]["attention_kind"], "agent-request");
-        assert_eq!(client[0]["requester_id"], "agent/fabric/worker");
-        let (_, filtered) =
-            get_request(app.clone(), "/v1/attention?person=person%2Fsomeone-else").await;
-        assert_eq!(filtered, json!([]));
-
-        let subject = created["subject"].as_str().unwrap();
-        let agent = serde_json::to_value(AttentionResolveRequest {
-            outcome: "resolved".into(),
-            reason: None,
-            actor: "agent/fabric/other".into(),
-            idempotency_key: "api-attention-agent".into(),
-        })
-        .unwrap();
-        let (status, rejected) = json_request(
-            app.clone(),
-            &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
-            agent,
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
-        assert_eq!(rejected["code"], "attention-resolver-not-person");
-
-        let resolution = serde_json::to_value(AttentionResolveRequest {
-            outcome: "resolved".into(),
-            reason: Some("The queue recovered.".into()),
-            actor: "person/nathan".into(),
-            idempotency_key: "api-attention-resolve".into(),
-        })
-        .unwrap();
-        let (status, resolved) = json_request(
-            app.clone(),
-            &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
-            resolution.clone(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{resolved}");
-        assert_eq!(resolved["status"], "resolved");
-        let (status, replayed) = json_request(
-            app.clone(),
-            &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
-            resolution,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{replayed}");
-        let messages = store.messages(Some("agent/fabric/worker"), false).unwrap();
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0].content.contains("The queue recovered."));
-        assert!(messages[0].content.contains("resolved"));
-        let (_, empty) = get_request(app, "/v1/attention?person=nathan").await;
-        assert_eq!(empty, json!([]));
+        for (path, body) in [
+            (
+                "/v1/attention",
+                json!({"reviewer":"person/avery","title":"Decide","reason":"Choose a date","severity":"warning","targets":[],"actor":"agent/alder.asker","idempotency_key":"legacy-ask"}),
+            ),
+            (
+                "/v1/attention/resolve/attention%2Flegacy",
+                json!({"outcome":"resolved","actor":"person/avery","idempotency_key":"legacy-done"}),
+            ),
+            (
+                "/v1/attention/withdraw/attention%2Flegacy",
+                json!({"reason":"Ended","actor":"agent/alder.asker","idempotency_key":"legacy-cancel"}),
+            ),
+        ] {
+            let (status, error) = json_request(app.clone(), path, body).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+            assert_eq!(error["code"], "attention-migrated");
+        }
+        assert!(store.attention_requests(None, true).unwrap().is_empty());
+        assert!(store.messages(None, true).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -18325,40 +19045,37 @@ version 2
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let store = state.store.clone();
-        for (subject, severity) in [
-            ("attention/a-low", "warning"),
-            ("attention/z-high", "error"),
-        ] {
+        for (subject, severity) in [("daemon/low", "warning"), ("daemon/high", "error")] {
             store
-                .request_attention(
+                .record_operational_failure(
                     subject,
                     &AttentionRequest {
-                        reviewer: "person/nathan".into(),
+                        reviewer: "person/alex".into(),
                         title: format!("Fault {severity}"),
                         reason: "The subscription needs a correction.".into(),
                         severity: severity.into(),
-                        targets: vec![],
-                        actor: "person/system".into(),
+                        targets: vec![subject.into()],
+                        actor: "daemon/runtime".into(),
                         idempotency_key: subject.into(),
                     },
                 )
                 .unwrap();
         }
         let app = router(state);
-        let (status, page) = get_request(app, "/v1/client/now?person=person%2Fnathan").await;
+        let (status, page) = get_request(app, "/v1/client/now?person=person%2Falex").await;
         assert_eq!(status, StatusCode::OK, "{page}");
-        assert_eq!(page["items"][0]["source_id"], "attention/z-high");
-        assert_eq!(page["items"][1]["source_id"], "attention/a-low");
+        assert_eq!(page["items"][0]["source_id"], "daemon/high");
+        assert_eq!(page["items"][1]["source_id"], "daemon/low");
         assert_eq!(page["items"][0]["what"], "Fault error");
         assert_eq!(
             page["items"][0]["because"],
             "The subscription needs a correction."
         );
-        assert_eq!(page["items"][0]["fix"]["action"], "attention.resolve");
+        assert!(page["items"][0]["actions"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn a_fault_from_a_retired_requester_seat_is_labelled() {
+    fn legacy_attention_from_live_and_retired_requesters_is_not_current() {
         let store = Store::open_memory("node").unwrap();
         let apply = |intent: &crate::model::NormalizedIntent, key: &str| {
             let planned = store
@@ -18391,7 +19108,7 @@ mission "standing" state="ready" {
                 mission: "standing".into(),
                 revision: None,
                 workspace: "/tmp".into(),
-                requester: Some("person/nathan".into()),
+                requester: Some("person/alex".into()),
                 mode: Some("run".into()),
                 inputs: BTreeMap::new(),
                 idempotency_key: "standing-run".into(),
@@ -18417,7 +19134,7 @@ agent "seat" { workspace "/tmp"; command "true" }
                 .request_attention(
                     subject,
                     &AttentionRequest {
-                        reviewer: "person/nathan".into(),
+                        reviewer: "person/alex".into(),
                         title: format!("Fault from {actor}"),
                         reason: "a person must decide".into(),
                         severity: "warning".into(),
@@ -18429,7 +19146,7 @@ agent "seat" { workspace "/tmp"; command "true" }
                 .unwrap();
         }
         let reasons = |store: &Store| {
-            client_attention_resources(store, Some("person/nathan"), false)
+            client_attention_resources(store, Some("person/alex"), false)
                 .unwrap()
                 .into_iter()
                 .map(|resource| {
@@ -18454,105 +19171,78 @@ agent "seat" { workspace "/tmp"; command "true" }
             .set_mission_run_state(&run.id, "cancelled", "terminal", Some("moved to a seat"))
             .unwrap();
 
-        let reasons = reasons(&store);
-        assert_eq!(
-            reasons["attention/from-stopped"],
-            json!(["requester-retired"])
-        );
-        assert_eq!(reasons["attention/from-seat"], json!(["requester-retired"]));
-        assert_eq!(reasons["attention/from-live"], json!([]));
+        assert!(reasons(&store).is_empty(), "legacy rows are audit data");
     }
 
-    #[tokio::test]
-    async fn attention_priority_follows_severity_with_and_without_history() {
-        let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
-        let app = router(state.clone());
-        for (severity, key) in [
-            ("warning", "api-attention-warning"),
-            ("error", "api-attention-error"),
-        ] {
-            let request = serde_json::to_value(AttentionRequest {
-                reviewer: "person/nathan".into(),
-                title: format!("{severity} fault"),
-                reason: "The queue did not recover.".into(),
-                severity: severity.into(),
-                targets: vec!["resource/fabric/queue".into()],
-                actor: "agent/fabric/worker".into(),
-                idempotency_key: key.into(),
-            })
-            .unwrap();
-            let mut request = request;
-            request["closed_by"] = json!("person");
-            let (status, created) = json_request(app.clone(), "/v1/attention", request).await;
-            assert_eq!(status, StatusCode::OK, "{created}");
+    #[test]
+    fn source_failure_priorities_are_shared_across_readers() {
+        let store = Store::open_memory("alder").unwrap();
+        for severity in ["warning", "error"] {
+            store
+                .record_operational_failure(
+                    severity,
+                    &AttentionRequest {
+                        reviewer: "person/avery".into(),
+                        title: format!("{severity} fault"),
+                        reason: "The disk needs attention.".into(),
+                        severity: severity.into(),
+                        targets: vec![format!("daemon/{severity}")],
+                        actor: "daemon/runtime".into(),
+                        idempotency_key: severity.into(),
+                    },
+                )
+                .unwrap();
         }
         for history in [false, true] {
             let resources =
-                client_attention_resources(&state.store, Some("person/nathan"), history).unwrap();
-            let priority = |title: &str| {
-                resources
-                    .iter()
-                    .find(|resource| resource["title"] == title)
-                    .map(|resource| resource["priority"].clone())
-            };
-            assert_eq!(
-                priority("warning fault"),
-                Some(json!("normal")),
-                "history={history}"
-            );
-            assert_eq!(
-                priority("error fault"),
-                Some(json!("high")),
-                "history={history}"
-            );
+                client_attention_resources(&store, Some("person/avery"), history).unwrap();
+            assert_eq!(resources[0]["priority"], "high");
+            assert_eq!(resources[1]["priority"], "normal");
         }
     }
 
     #[tokio::test]
-    async fn requester_can_withdraw_obsolete_attention_without_person_impersonation() {
+    async fn person_work_routes_share_snapshot_and_reject_stale_or_wrong_responses() {
         let root = tempfile::tempdir().unwrap();
-        let app = router(state(root.path()));
-        let request = serde_json::to_value(AttentionRequest {
-            reviewer: "person/nathan".into(),
-            title: "Old blocker".into(),
-            reason: "A logout might eventually help, but no action is needed now.".into(),
-            severity: "error".into(),
-            targets: vec![],
-            actor: "agent/typecase/worker".into(),
-            idempotency_key: "withdraw-old-blocker".into(),
-        })
+        let state = state(root.path());
+        let intent = crate::graph::parse_internal_intent(
+            "version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }",
+            state.store.origin(),
+        )
         .unwrap();
-        let mut request = request;
-        request["closed_by"] = json!("person");
-        let (_, created) = json_request(app.clone(), "/v1/attention", request).await;
-        let subject = created["subject"].as_str().unwrap();
-        let path = format!("/v1/attention/withdraw/{}", urlencoding::encode(subject));
-        let wrong = serde_json::to_value(AttentionWithdrawRequest {
-            reason: "No action needed".into(),
-            actor: "agent/other".into(),
-            idempotency_key: "withdraw-wrong".into(),
-        })
-        .unwrap();
-        let (status, rejected) = json_request(app.clone(), &path, wrong).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
-        let request = serde_json::to_value(AttentionWithdrawRequest {
-            reason: "The milestone continued; no action is needed now.".into(),
-            actor: "agent/typecase/worker".into(),
-            idempotency_key: "withdraw-right".into(),
-        })
-        .unwrap();
-        let (status, withdrawn) = json_request(app.clone(), &path, request.clone()).await;
-        assert_eq!(status, StatusCode::OK, "{withdrawn}");
-        assert_eq!(withdrawn["status"], "withdrawn");
-        let (status, repeated) = json_request(app.clone(), &path, request).await;
-        assert_eq!(status, StatusCode::OK, "{repeated}");
-        assert_eq!(
-            withdrawn["resolved_at_unix_ms"],
-            repeated["resolved_at_unix_ms"]
-        );
-        let (_, current) = get_request(app, "/v1/attention?person=person%2Fnathan").await;
-        assert_eq!(current, json!([]));
+        state
+            .store
+            .apply_internal(&intent, "api-person-asker")
+            .unwrap();
+        let actor = format!("agent/{}.asker", state.store.origin());
+        let app = router(state.clone());
+        let body = json!({"person":"person/avery","title":"Choose a date","reason":"Reply with a date","actor":actor,"new_run":"release-date","idempotency_key":"api-ask"});
+        let (status, ask) = json_request(app.clone(), "/v1/work/ask", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{ask}");
+        let (_, duplicate) = json_request(app.clone(), "/v1/work/ask", body).await;
+        assert_eq!(ask["subject"], duplicate["subject"]);
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=person%2Favery").await;
+        assert_eq!(attention[0]["subject"], ask["subject"]);
+        let (_, now) = get_request(app.clone(), "/v1/client/now?person=person%2Favery").await;
+        assert_eq!(now["items"][0]["source_id"], ask["subject"]);
+        assert_eq!(now["items"][0]["actions"], json!(["work.done"]));
+        let episode = attention[0]["episode"].clone();
+        let mut done = json!({"subject":ask["subject"],"actor":"person/robin","summary":"Friday","episode":episode,"evidence":[],"idempotency_key":"api-done"});
+        let (_, refused) = json_request(app.clone(), "/v1/work/done", done.clone()).await;
+        assert_eq!(refused["code"], "forbidden");
+        done["actor"] = json!("person/avery");
+        done["episode"] = json!("old");
+        let (_, stale) = json_request(app.clone(), "/v1/work/done", done.clone()).await;
+        assert_eq!(stale["code"], "stale-fence");
+        done["episode"] = episode;
+        let (status, completed) = json_request(app.clone(), "/v1/work/done", done.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{completed}");
+        assert_eq!(completed["status"], "completed");
+        let (_, again) = json_request(app.clone(), "/v1/work/done", done).await;
+        assert_eq!(again["status"], "completed");
+        let (_, empty) = get_request(app, "/v1/client/now?person=person%2Favery").await;
+        assert_eq!(empty["items"], json!([]));
+        assert!(state.store.messages(Some(&actor), true).unwrap().is_empty());
     }
 
     #[tokio::test]

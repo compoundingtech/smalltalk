@@ -65,9 +65,9 @@ principal is a `service` actor that does not. This is the crux: the differentiat
 `src/actor.rs` in this worktree is the prototype of this table.
 
 **Identity grammar is explicitly two namespaces, and they do not merge.** Bus ids stay
-two-component (`hetz.gh-ci`). Task ids stay three-component (`hetz.demo.ding`,
-`hetz.demo.source-gh-ci`). A task is not an actor and never becomes one — which is precisely why the
-lifecycle prototype's `from = "hetz.demo.pipe-gh-ci"` failed, and why the fix is to give the source a
+two-component (`example-linux.gh-ci`). Task ids stay three-component (`example-linux.demo.ding`,
+`example-linux.demo.source-gh-ci`). A task is not an actor and never becomes one — which is precisely why the
+lifecycle prototype's `from = "example-linux.demo.pipe-gh-ci"` failed, and why the fix is to give the source a
 real actor rather than to teach the ledger about task ids.
 
 ### 1.2 Declaration surface
@@ -79,26 +79,26 @@ The principal declaration grows two optional children and the agent declaration 
 principal "example-ci" host="host-a"
 
 // a supervised event source
-principal "gh-ci" host="hetz" {
+principal "gh-ci" host="example-linux" {
   serves "demo"                          // lifecycle owner; must be an agent on this host
   source { command "poll-gh-ci.sh" }     // or: argv "poll" "--json"
 }
 ```
 
 `source` requires `serves`. `serves` names the agent whose lifecycle the source is coupled to, and
-lowers to a derived exec task `hetz.demo.source-gh-ci` — inheriting, unchanged, everything the
+lowers to a derived exec task `example-linux.demo.source-gh-ci` — inheriting, unchanged, everything the
 lifecycle prototype measured: restart policy, flapping and parking, suspend/retire teardown,
 crash-loop surfacing, and `st2 tasks --json` reporting. `serves` is *not* the recipient: the source
 addresses whomever it likes, and fan-out works because the key scope includes the recipient.
 
-The runner injects `ST_PRINCIPAL=hetz.gh-ci` beside the existing `ST_AGENT`, so the source script
+The runner injects `ST_PRINCIPAL=example-linux.gh-ci` beside the existing `ST_AGENT`, so the source script
 publishes as itself.
 
 **What the source command does is call the ordinary CLI.** This is the largest single deletion in
 the design:
 
 ```sh
-st2 message send hetz.demo \
+st2 message send example-linux.demo \
   --idempotency-key "$run_id" \
   --subject "CI $state on PR #42" \
   -m "$payload"
@@ -123,7 +123,7 @@ Frontmatter gains exactly one key:
 
 ```
 ---
-from: hetz.gh-ci
+from: example-linux.gh-ci
 subject: CI failure on PR #42
 kind: event
 idempotency-key: run-7
@@ -189,9 +189,9 @@ This is +1 glyph and it is worth it, because it removes two measured lies and on
 
 ```
 today, routed through an agent (ingress Rep 1):   [DING] ← h.pipe-agent: CI failure on PR #42
-today, routed through the owning agent (lifecycle): [DING] ↺ hetz.demo: pipe gh-ci: {"id":…}
+today, routed through the owning agent (lifecycle): [DING] ↺ example-linux.demo: pipe gh-ci: {"id":…}
 today, routed through a principal (ingress Rep 2): [DING] ? h.pipe-gh-ci: request github:ci#run-11
-target:                                            [DING] » hetz.gh-ci: CI failure on PR #42
+target:                                            [DING] » example-linux.gh-ci: CI failure on PR #42
 ```
 
 `?` goes back to meaning only "unknown or unreadable", and the hardcoded `request <key>` subject —
@@ -251,7 +251,7 @@ Every axis is flat or down against today, and every axis is down against the dif
 | `src/request.rs` | **deleted.** `publish_once`, `record_path`, `atomic_create`, `RequestEnvelope`, `ReplyEnvelope`, `PublicationRecord`, and the hardcoded subject all go. `discover_principals` and `ServicePrincipal` (~100 lines) relocate to `src/actor.rs`; the remaining ~400 lines are deleted outright. |
 | `src/ding/mod.rs` | `RelationshipResolver` gains `services`; `relationship_marker` gains the `»` branch *after* the fail-closed validity check. |
 | `src/main.rs` | `RequestCmd` deleted; `MessageCmd::Status` added; `--kind` on send. |
-| `crates/st2-wire/src/message.rs` | `MessageRow.kind` / `SentMessageRow.kind`, optional, no `deny_unknown_fields` (unchanged policy). |
+| `crates/st-wire/src/message.rs` | `MessageRow.kind` / `SentMessageRow.kind`, optional, no `deny_unknown_fields` (unchanged policy). |
 | `crates/agent-spec/src/spec.rs`, `kdl_format.rs`, `declared.rs` | `serves` + `source` on the principal declaration; source-task synthesis. No `pipe` node on the agent. |
 | `src/reconcile.rs` | Extend the "unsupported derived task" gate to source companions — one arm, exactly as the lifecycle prototype measured. |
 | `src/eval_run.rs` | Declare a service actor instead of provisioning an `ExternalInbox`. |
@@ -457,7 +457,7 @@ Stated so the design is not credited with coverage it lacks:
 through them. So a new field in the request envelope is a **hard parse failure** in an older binary,
 not a tolerated addition. In-place evolution of the request wire is therefore not available.
 
-The message wire is the opposite: `crates/st2-wire` documents that no type uses
+The message wire is the opposite: `crates/st-wire` documents that no type uses
 `deny_unknown_fields`, and `parse_message` ignores unknown frontmatter keys outright. Adding `kind`
 is safe in both directions.
 
@@ -597,7 +597,7 @@ Not derivable — taste, policy, or product:
 2. **Declaration locality (§7.3).** `principal { serves }` versus `agent { source }`. Both work; the
    tradeoff is single-source-of-truth for identity versus locality when reading an agent.
 3. **Does R11's purpose survive a default filter?** §4 argues yes. This is a judgment about what
-   "honest Sent history" means, and it is Johannes's and Nathan's call, not a derivation.
+   "honest Sent history" means, and it is Johannes's and Alex's call, not a derivation.
 4. **Is one ledger shape acceptable for a high-rate source (§7.1)?** The alternative re-splits the
    store. This is the one place where the design's central claim could be traded away for
    performance, and it should be traded knowingly or not at all.

@@ -1449,9 +1449,11 @@ mod tests {
     fn attention_list_shows_kind_age_targets_and_safe_commands() {
         let item = AttentionItemView {
             kind: "fault".into(),
+            episode: "failure-one".into(),
+            priority: "high".into(),
             review_mode: None,
             subject: "attention/fabric".into(),
-            person: "person/nathan".into(),
+            person: "person/alex".into(),
             requester_id: None,
             launch_id: None,
             variant_id: None,
@@ -1476,12 +1478,12 @@ mod tests {
             }],
         };
         let rendered = render_attention_list(
-            Some("person/nathan"),
+            Some("person/alex"),
             std::slice::from_ref(&item),
             OutputStyle::plain(),
             180_000,
         );
-        assert!(rendered.contains("HUMAN ATTENTION FOR person/nathan"));
+        assert!(rendered.contains("HUMAN ATTENTION FOR person/alex"));
         assert!(rendered.contains("1 waiting · oldest first"));
         assert!(rendered.contains("[fault] Fabric needs review"));
         assert!(rendered.contains("requested 2m ago"));
@@ -1489,7 +1491,7 @@ mod tests {
         assert!(rendered.contains("--reason 'It is fixed'"));
         assert!(!rendered.contains("The queue did not recover."));
         assert!(
-            rendered.contains("inspect: st attention show attention/fabric --as person/nathan")
+            rendered.contains("inspect: st attention show attention/fabric --as person/alex")
         );
 
         let shown = render_attention_show(&item, OutputStyle::plain(), 180_000);

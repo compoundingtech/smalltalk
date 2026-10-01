@@ -20,7 +20,7 @@ or build from source below.
 With Nix, from a checkout:
 
 ```sh
-nix profile install .#st3
+nix profile install .
 ```
 
 For local development, enter `nix develop`. The shell provides Rust, sccache,
@@ -32,7 +32,9 @@ Outside the Nix shell, install mold on Linux and cargo-nextest separately; the
 repository's `.cargo/config.toml` still selects mold for Linux builds.
 
 This installs `st3`, the `st` symlink, the `stui` terminal app, `st3-migrate`, and the pinned
-`pty` terminal runtime.
+`pty` terminal runtime. The default, `st`, `st3`, and `small-talk` Nix package names all select
+this package. The previous generation is built and tested separately as `.#st2`;
+install it explicitly with `nix profile install .#st2`.
 
 Without Nix, build and install from a checkout with a Rust toolchain:
 
@@ -41,9 +43,8 @@ scripts/install                  # into ~/.local/bin
 scripts/install --bin-dir DIR    # or anywhere else
 ```
 
-The script builds everything once, installs `st3`, `stui`, and `st3-migrate` (and `st2`, the
-previous generation), and makes `st` a symlink to the installed `st3`. `st` is never a separate
-build. A source install also needs [`pty`](https://github.com/compoundingtech/pty-rust) on `PATH`.
+The script builds and installs `st3`, `stui`, and `st3-migrate`, and makes `st` a symlink to
+the installed `st3`. `st` is never a separate build. On macOS, both tools live in a fixed app bundle; see [macOS installation and signing](docs/st3/macos-installation.md). A source install also needs [`pty`](https://github.com/compoundingtech/pty-rust) on `PATH`.
 
 Each seat runs a coding harness, so install and log in to at least one: Claude Code, Codex, omp,
 pi, or OpenCode. Log in as the same user that runs the daemon.
@@ -72,6 +73,15 @@ disables this step. Reapplying is safe, but removing a file does **not** delete
 its previously published declaration until managed-set apply exists (#646).
 The optional `ptyPackage` replaces the bundled `pty` for both the daemon and
 seats, working around the executable-directory PATH precedence in #633.
+
+Activation atomically installs a real `st3` executable at `stateDir/bin/st3` (by default
+`~/.local/state/st3/bin/st3`) before restarting the daemon, with `st` as an alias in that directory.
+The daemon, declaration-apply service, and service PATH use this stable location so running seats
+can follow new builds without ending their harness sessions. Unchanged contents are not rewritten.
+Package references in the systemd unit or launchd plist still trigger daemon restarts on upgrades.
+Seats started from store paths before this change remain stale until restarted; see
+[seats across deploys](docs/st3/seat-deploys.md).
+
 Linux user-manager lingering and macOS `st service permissions` remain host
 setup prerequisites. Fleet/replication setup is not managed by this module.
 
@@ -107,6 +117,11 @@ Seat drivers wait as long as the restart takes, keep their notes out of the seat
 `~/.local/state/st3/driver-api-warnings.log`, and resume from the graph. To run the daemon in the
 foreground instead, use `st up`.
 
+On Linux, the daemon normally listens in `XDG_RUNTIME_DIR`; it also publishes
+`STATE/run/st3.sock` as a link to that socket, so commands without the daemon's
+runtime environment can reach it. On macOS the socket already lives at that state path.
+An explicit `--endpoint` or `ST3_ENDPOINT` still takes precedence.
+
 st records every `git` and `gh` call it starts, including its own, in
 `~/.local/state/st3/recorder/commands.jsonl`, then runs the real program unchanged. A call by
 absolute path is not recorded. The [command recorder](docs/st3/command-recorder.md) describes the
@@ -114,6 +129,29 @@ log.
 
 If the state directory has a long path, set `XDG_RUNTIME_DIR` to a shorter directory or pass
 `--socket` and `--client-gateway-socket` to `st up` so both Unix socket paths fit the OS limit.
+When `st up` receives a private `--state-dir` or `--socket` without an explicit
+`--client-gateway-socket`, its paired gateway is placed beside that private socket (or
+in the private state directory when no socket is specified). An existing live listener
+at either socket path is never replaced; choose a different path instead.
+
+## Run st on more than one machine
+
+Install st on each machine. On an existing listening member, run `st fleet invite beacon`.
+On the new machine, run `st fleet join` and paste the code when asked, then check
+`st fleet status` and `st replication status`. These steps are the same for a laptop or server.
+Join installs the services and catches up the replica over Tailscale or Fabric.
+
+Any member may be offline. It shows its last exchange time, retries with increasing delays,
+and announces itself when it returns so one successful connection synchronizes both directions.
+A machine that can only connect out needs no special sync setting.
+
+See [fleet replication](docs/st3/replication.md#add-any-machine) for explicit tailnet/Fabric
+routes and Fabric inbox invitations, and [fleet join](docs/fleet-join.md) for transport trust,
+removal, and migrating an existing fleet off local dial helpers. A client-only stui or app
+instead pairs as a [device](docs/st3/client-only.md), keeping a cache rather than a full replica.
+
+The [sync invariants](docs/st3/replication.md#sync-invariants) require canonical shared ordering
+and digest coverage for every synced logical source and shared projection.
 
 ## First commands
 
@@ -125,6 +163,10 @@ st work ls              # steps that are ready or in progress
 st attention ls         # decisions and requests waiting for you
 st conversations ls person/ada
 ```
+
+`st --help` and `st help` open with the main uses, then group commands for everyday use, agent
+seats, and running a machine or fleet. `st help --all` also lists plumbing commands.
+Use `st help agents new` to open a command's full help.
 
 Lists show current state. Add `--all` for history. Every command has `--help`, and the global
 `--json` flag prints the stable client format that the apps read. Run `stui` for the same views
@@ -142,7 +184,7 @@ st agents new site --host builder --harness claude --model claude-opus-5-5 --att
 It writes the same declaration a person writes by hand, with the harness defaults of the fleet's
 Claude and Codex seats, and applies it as the `person` in your st config (or `--as`). Without
 `--workspace`, the agent gets a new directory below that host's home, `~/st/agents/site`, which the
-host creates. The command prints the agent's subject, here `agent/builder.site`. `--print-kdl` shows
+host creates. Its next-step commands name the agent's subject, here `agent/builder.site`. `--print-kdl` shows
 the declaration without applying it, and `--description` says what the agent is for.
 
 Ctrl+\\ detaches and leaves the agent running. `st terminals attach agent/builder.site` attaches
@@ -150,6 +192,12 @@ again later, from any machine in the fleet. A terminal on another host is attach
 Fabric when that host runs `st terminals expose-fabric` and grants your machine the protocol it
 prints; no st daemon carries the bytes. Otherwise it goes through the client gateway as your
 person, the same path the apps use.
+
+After creating a seat, st explains whether it is ready or still starting and prints the exact
+commands to attach, send it a message, inspect it, and stop it. These commands are also printed
+when startup times out or the agent needs your input. Attaching stays opt-in with `--attach`.
+Mission starts, launches, device pairing, and fleet creation or joining also finish with their
+next steps. JSON output keeps its existing shape.
 
 ## Declare a seat
 
@@ -165,7 +213,7 @@ st agents start example/worker --harness claude --model claude-sonnet-5 --effort
 ```kdl
 version 2
 agent "example/worker" {
-    workspace "/home/ada/src/garden"
+    workspace "/home/example/src/garden"
     restart always
     harness claude {
         model claude-sonnet-5

@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 : "${ST3_BIN:?set ST3_BIN to the installed st3 executable}"
 : "${ST_AGENT:?set ST_AGENT to the standing st3 operator identity}"
-: "${ST3_FRIEND_READY_AUDIT_WORKSPACE:?set the Hetz st3 checkout in the host-local gate environment}"
+: "${ST3_FRIEND_READY_AUDIT_WORKSPACE:?set the ExampleLinux st3 checkout in the host-local gate environment}"
 : "${ST3_FRIEND_READY_IDLE_START_UNIX:?set the idle window start}"
 : "${ST3_FRIEND_READY_MESSAGE_START_UNIX:?set the delivery window start}"
 for start in "$ST3_FRIEND_READY_IDLE_START_UNIX" "$ST3_FRIEND_READY_MESSAGE_START_UNIX"; do

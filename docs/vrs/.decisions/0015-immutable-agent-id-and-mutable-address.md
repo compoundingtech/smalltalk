@@ -3,7 +3,7 @@
 Status: accepted
 
 Design confirmed by Johannes on 2026-09-05 through the issue #401 interview.
-Nathan confirmed the graph-subject model in the design discussion supplied by
+Alex confirmed the graph-subject model in the design discussion supplied by
 Johannes: the subject keeps a stable ID while its semantic name changes.
 
 ## Context
@@ -143,7 +143,7 @@ latent argument into a live obligation:
 Two corrections to the premises this decision was implemented against:
 
 - **Version-1 readers are additively tolerant, so a new field is not a version
-  bump.** `crates/st2-wire/src/lib.rs` states the opposite of the assumption as
+  bump.** `crates/st-wire/src/lib.rs` states the opposite of the assumption as
   policy: no type in the reader crate uses `deny_unknown_fields`, precisely so a
   reader older than the binary it shells out to ignores unknown fields. The one
   genuine cross-build hazard is single-field and about routing, not records: a

@@ -77,18 +77,19 @@ export async function listSessionPages(
 type Entry = { id: string; sequence: number; type: string; body: unknown };
 export type Conversation<T extends Entry> = { entries: T[]; hasOlder: boolean; newestSequence: number };
 
-// Text content, and the Small Talk to or from an agent that st joins into its conversation.
+// Everything a person reads in a conversation: the harness's turns, tool calls and results, Small
+// Talk st joins in, and st's diagnostics. Status heartbeats and usage are not conversation.
 export function isConversational(entry: Entry): boolean {
-  return entry.type === 'message' || (entry.type === 'content' && !!timelineText(entry.body)?.trim());
+  return entry.type !== 'status' && entry.type !== 'usage';
 }
 
-// A followed conversation arrives as its newest page (`replace`), then as each change since. Status
-// heartbeats, tool calls, and usage are left out; a revised entry replaces its earlier revision in
-// place. Only the newest `want` entries are kept, and anything older is marked as older history.
+// A followed conversation arrives as its newest page (`replace`), then as each change since. A
+// revised entry replaces its earlier revision in place. Only the newest `want` entries are kept,
+// and anything older is marked as older history.
 export function applyConversation<T extends Entry>(
   previous: Conversation<T> | undefined,
   frame: { replace: boolean; items: T[]; hasMore: boolean },
-  want = 100,
+  want = 200,
 ): Conversation<T> {
   const base = frame.replace ? undefined : previous;
   const found = new Map<string, T>(base?.entries.map(entry => [entry.id, entry]));
