@@ -15,10 +15,10 @@ use serde_json::{Value, json};
 pub const MARKETPLACE: &str = "st2";
 pub const PLUGIN: &str = "st2-channel";
 pub const CHANNEL: &str = "plugin:st2-channel@st2";
-pub const ST3_MARKETPLACE: &str = "st3";
-pub const ST3_PLUGIN: &str = "st3-channel";
-pub const ST3_CHANNEL: &str = "plugin:st3-channel@st3";
-const PLUGINS: [&str; 2] = [PLUGIN, ST3_PLUGIN];
+pub const ST3_MARKETPLACE: &str = "st";
+pub const ST3_PLUGIN: &str = "st-channel";
+pub const ST3_CHANNEL: &str = "plugin:st-channel@st";
+const PLUGINS: [&str; 1] = [PLUGIN];
 
 const MARKETPLACE_MANIFEST: &[u8] =
     include_bytes!("../../../claude-channel/.claude-plugin/marketplace.json");
@@ -26,12 +26,12 @@ const PLUGIN_MANIFEST: &[u8] =
     include_bytes!("../../../claude-channel/plugins/st2-channel/.claude-plugin/plugin.json");
 const MCP_CONFIG: &[u8] = include_bytes!("../../../claude-channel/plugins/st2-channel/.mcp.json");
 const ST3_PLUGIN_MANIFEST: &[u8] =
-    include_bytes!("../../../claude-channel/plugins/st3-channel/.claude-plugin/plugin.json");
-const ST3_MCP_CONFIG: &[u8] = include_bytes!("../../../claude-channel/plugins/st3-channel/.mcp.json");
+    include_bytes!("../../../plugins/claude/st-channel/.claude-plugin/plugin.json");
+const ST3_MCP_CONFIG: &[u8] = include_bytes!("../../../plugins/claude/st-channel/.mcp.json");
 const ST3_MARKETPLACE_MANIFEST: &[u8] =
-    include_bytes!("../st3-claude-channel/.claude-plugin/marketplace.json");
+    include_bytes!("../../../plugins/claude/.claude-plugin/marketplace.json");
 const POLICY_FILE: &str = "50-st2-channel.json";
-const ST3_POLICY_FILE: &str = "50-st3-channel.json";
+const ST3_POLICY_FILE: &str = "50-st-channel.json";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InstallPaths {
@@ -283,7 +283,7 @@ fn marketplace_root() -> Result<PathBuf> {
 }
 
 fn st3_marketplace_root() -> Result<PathBuf> {
-    Ok(data_home()?.join("st3/claude-channel/marketplace"))
+    Ok(data_home()?.join("st/plugins/claude/marketplace"))
 }
 
 #[cfg(target_os = "linux")]
@@ -322,7 +322,7 @@ fn st3_policy_path() -> Result<PathBuf> {
     bail!("the Claude channel policy installer supports Linux and macOS")
 }
 
-fn embedded_files() -> [(&'static str, &'static [u8]); 5] {
+fn embedded_files() -> [(&'static str, &'static [u8]); 3] {
     [
         (".claude-plugin/marketplace.json", MARKETPLACE_MANIFEST),
         (
@@ -330,11 +330,6 @@ fn embedded_files() -> [(&'static str, &'static [u8]); 5] {
             PLUGIN_MANIFEST,
         ),
         ("plugins/st2-channel/.mcp.json", MCP_CONFIG),
-        (
-            "plugins/st3-channel/.claude-plugin/plugin.json",
-            ST3_PLUGIN_MANIFEST,
-        ),
-        ("plugins/st3-channel/.mcp.json", ST3_MCP_CONFIG),
     ]
 }
 
@@ -362,11 +357,8 @@ pub fn verify_marketplace_at(root: &Path) -> Result<()> {
 fn st3_embedded_files() -> [(&'static str, &'static [u8]); 3] {
     [
         (".claude-plugin/marketplace.json", ST3_MARKETPLACE_MANIFEST),
-        (
-            "plugins/st3-channel/.claude-plugin/plugin.json",
-            ST3_PLUGIN_MANIFEST,
-        ),
-        ("plugins/st3-channel/.mcp.json", ST3_MCP_CONFIG),
+        ("st-channel/.claude-plugin/plugin.json", ST3_PLUGIN_MANIFEST),
+        ("st-channel/.mcp.json", ST3_MCP_CONFIG),
     ]
 }
 
@@ -724,7 +716,7 @@ mod tests {
         .unwrap();
         assert_eq!(marketplace["name"], MARKETPLACE);
         assert_eq!(marketplace["plugins"][0]["name"], PLUGIN);
-        assert_eq!(marketplace["plugins"][1]["name"], ST3_PLUGIN);
+        assert_eq!(marketplace["plugins"].as_array().unwrap().len(), 1);
 
         let mcp: Value = serde_json::from_slice(
             &fs::read(temp.path().join("plugins/st2-channel/.mcp.json")).unwrap(),
@@ -745,21 +737,17 @@ mod tests {
         .unwrap();
         assert_eq!(plugin["version"], env!("CARGO_PKG_VERSION"));
 
-        let st3_mcp: Value = serde_json::from_slice(
-            &fs::read(temp.path().join("plugins/st3-channel/.mcp.json")).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(st3_mcp["mcpServers"]["st3"]["command"], "st3");
+        install_st3_marketplace_at(temp.path()).unwrap();
+        let st3_mcp: Value =
+            serde_json::from_slice(&fs::read(temp.path().join("st-channel/.mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(st3_mcp["mcpServers"]["st"]["command"], "st");
         assert_eq!(
-            st3_mcp["mcpServers"]["st3"]["args"],
+            st3_mcp["mcpServers"]["st"]["args"],
             json!(["driver", "claude-mcp"])
         );
         let st3_plugin: Value = serde_json::from_slice(
-            &fs::read(
-                temp.path()
-                    .join("plugins/st3-channel/.claude-plugin/plugin.json"),
-            )
-            .unwrap(),
+            &fs::read(temp.path().join("st-channel/.claude-plugin/plugin.json")).unwrap(),
         )
         .unwrap();
         assert_eq!(st3_plugin["version"], env!("CARGO_PKG_VERSION"));
@@ -790,14 +778,14 @@ mod tests {
         assert_eq!(marketplace["name"], ST3_MARKETPLACE);
         assert_eq!(marketplace["plugins"][0]["name"], ST3_PLUGIN);
         assert_eq!(marketplace["plugins"].as_array().unwrap().len(), 1);
-        assert_eq!(ST3_CHANNEL, "plugin:st3-channel@st3");
+        assert_eq!(ST3_CHANNEL, "plugin:st-channel@st");
 
         let policy = temp.path().join(ST3_POLICY_FILE);
         install_st3_policy_at(&policy).unwrap();
         assert!(st3_policy_is_current_at(&policy));
         let value: Value = serde_json::from_slice(&fs::read(policy).unwrap()).unwrap();
         assert_eq!(value, st3_policy_value());
-        assert_eq!(value["allowedChannelPlugins"][0]["marketplace"], "st3");
+        assert_eq!(value["allowedChannelPlugins"][0]["marketplace"], "st");
     }
 
     #[test]

@@ -357,6 +357,7 @@ struct Adoption {
 
 fn run_session(mut session: Session, child: &mut ProviderProcess, agent_dir: &Path) -> Result<()> {
     let (wake_tx, wake_rx) = mpsc::channel();
+    crate::push_mailbox::watch(agent_dir, wake_tx.clone());
     let _watcher = crate::watch::watch_delivery_inputs_with_status(
         agent_dir,
         wake_tx,
@@ -1613,11 +1614,14 @@ impl Delivery {
         client: &Client,
         mut diagnostics: Option<&mut DiagnosticPublisher>,
     ) -> Result<()> {
-        let unread = message::list_inbox(&self.inbox)?;
+        let unread = crate::push_mailbox::messages(
+            self.inbox.parent().and_then(Path::parent).unwrap(),
+            &self.inbox,
+        )?;
         // Archive is the recipient agent's act and the only settlement authority. An entry whose
         // file left the inbox releases ownership here; this pump never moves a file itself.
         self.ledger
-            .prune(|filename| unread.iter().any(|entry| entry.filename == filename))?;
+            .prune(|filename| crate::push_mailbox::is_unread(self.inbox.parent().and_then(Path::parent).unwrap(), filename, &unread))?;
         // Under graph control, continue receipt read-back for an existing attempt. No new
         // input can pass `send` while held. Catalog DND retains its historical behavior.
         if self.control.held(&self.status_path)
@@ -1625,7 +1629,8 @@ impl Delivery {
         {
             return Ok(());
         }
-        let Some(head) = unread.into_iter().next() else {
+        let managed = crate::push_mailbox::managed(self.inbox.parent().and_then(Path::parent).unwrap());
+        let Some(head) = unread.into_iter().find(|message| !managed || !self.ledger.settled(&message.filename)) else {
             if let Some(diagnostics) = diagnostics.as_deref_mut() {
                 diagnostics.clear(DiagnosticStage::Delivery);
                 diagnostics.clear(DiagnosticStage::ReadBack);
@@ -1731,7 +1736,10 @@ impl Delivery {
         if Instant::now() < self.next_attempt {
             return Ok(());
         }
-        let unread = message::list_inbox(&self.inbox)?;
+        let unread = crate::push_mailbox::messages(
+            self.inbox.parent().and_then(Path::parent).unwrap(),
+            &self.inbox,
+        )?;
         let Some(head) = unread
             .into_iter()
             .find(|message| message.filename == entry.filename)
@@ -2520,6 +2528,60 @@ mod tests {
             r#"{"type":"question.replied","properties":{"requestID":"que_pending","answers":[["Yes"]]}}"#,
         ));
         assert_eq!(observed(&machine).blocked_on, BlockedOn::None);
+    }
+
+    #[test]
+    fn opencode_native_push_delivery_waits_for_consumption_without_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agents/h/worker");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        crate::push_mailbox::register(&agent_dir);
+        let key = "message/quartz-native";
+        let mut input = message::parse_message(key, "---\nfrom: person/eval\n---\nQUARTZ SIGNAL\n");
+        input.tags.push(format!("st3-message:{key}"));
+        crate::push_mailbox::replace(&agent_dir, vec![input.clone()]);
+        let server = spawn_fake_server();
+        let client = Client::new(server.port, "pw");
+        let path = tmp.path().join("state/delivery-ledger.json");
+        let mut delivery = Delivery::with_state_path(
+            tmp.path(),
+            &agent_dir,
+            "h",
+            "h.worker",
+            "h.worker",
+            path.clone(),
+        );
+        delivery.saw_session("ses_target");
+        server.read_back_error.store(true, Ordering::SeqCst);
+        delivery.pump(&client);
+        delivery.pump(&client);
+        assert_eq!(
+            server.posts.lock().unwrap().len(),
+            1,
+            "uncertain storage never resends"
+        );
+        assert_eq!(
+            ledger_phase(&path, key),
+            Some(delivery_ledger::Phase::TransportAccepted)
+        );
+        crate::push_mailbox::replace_active(&agent_dir, Vec::new(), BTreeSet::from([key.into()]));
+        delivery.pump(&client);
+        assert_eq!(ledger_phase(&path, key), Some(delivery_ledger::Phase::TransportAccepted));
+        crate::push_mailbox::replace(&agent_dir, vec![input]);
+        server.read_back_error.store(false, Ordering::SeqCst);
+        delivery.pump(&client);
+        assert_eq!(
+            ledger_phase(&path, key),
+            Some(delivery_ledger::Phase::Persisted)
+        );
+        let id = stable_message_id("h.worker", "ses_target", key);
+        delivery.observe_event(&event(&format!(r#"{{"type":"message.updated","properties":{{"sessionID":"ses_target","info":{{"role":"assistant","parentID":"{id}","sessionID":"ses_target"}}}}}}"#))).unwrap();
+        assert_eq!(
+            ledger_phase(&path, key),
+            Some(delivery_ledger::Phase::Consumed)
+        );
+        assert!(!message::inbox_dir(&agent_dir).exists());
+        assert!(!message::archive_dir(&agent_dir).exists());
     }
 
     fn delivery_fixture(tmp: &Path, state_path: PathBuf) -> (Delivery, String) {

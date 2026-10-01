@@ -627,6 +627,11 @@ fn with_resume_and_option_terminator(
 }
 
 fn transcript_matches(root: &Path, native_session_id: &str, codex: bool) -> Result<Vec<PathBuf>> {
+    // A Claude-only machine need not have a Codex transcript store. An absent store
+    // contributes no candidates; existing unreadable or invalid stores still fail closed.
+    if fs::symlink_metadata(root).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) {
+        return Ok(Vec::new());
+    }
     let root = fs::canonicalize(root)
         .with_context(|| format!("opening managed transcript store {}", root.display()))?;
     let expected = format!("{native_session_id}.jsonl");
@@ -845,6 +850,21 @@ fn load_binding(
     runtime_id: &str,
 ) -> Result<Option<ClaudeSessionBinding>> {
     load_binding_file(&state_dir.join(BINDING_FILE), agent, runtime_id)
+}
+
+/// The verified transcript of this wrapper session. Channel receipts observe native user
+/// records directly; they never depend on a UserPromptSubmit marker or hook receipt.
+pub fn channel_transcript(
+    catalog_root: &Path,
+    identity: &str,
+    runtime_id: &str,
+    incarnation: &str,
+) -> Result<Option<PathBuf>> {
+    Ok(
+        load_binding(&state_dir(catalog_root, identity), identity, runtime_id)?
+            .filter(|binding| binding.runtime_incarnation == incarnation)
+            .map(|binding| binding.transcript_path),
+    )
 }
 
 fn load_pending_binding(
@@ -3201,6 +3221,23 @@ mod tests {
         let link = link_root.join(format!("{RESUME_ID}.jsonl"));
         symlink(&transcript, &link).unwrap();
         assert!(validate_transcript(&link, RESUME_ID, &workspace).is_err());
+    }
+
+    #[test]
+    fn claude_transcript_can_bind_without_a_codex_store() {
+        let temp = tempfile::tempdir().unwrap();
+        let claude_root = temp.path().join("claude/projects/project");
+        let codex_root = temp.path().join("codex/sessions");
+        fs::create_dir_all(&claude_root).unwrap();
+        let transcript = claude_root.join(format!("{RESUME_ID}.jsonl"));
+        fs::write(&transcript, "{}\n").unwrap();
+        assert_eq!(resolve_managed_transcript(&transcript, RESUME_ID,
+            &temp.path().join("claude/projects"), &codex_root).unwrap(),
+            fs::canonicalize(&transcript).unwrap());
+        fs::create_dir_all(codex_root.parent().unwrap()).unwrap();
+        fs::write(&codex_root, "not a directory").unwrap();
+        assert!(resolve_managed_transcript(&transcript, RESUME_ID,
+            &temp.path().join("claude/projects"), &codex_root).is_err());
     }
 
     #[test]

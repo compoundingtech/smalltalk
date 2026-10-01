@@ -43,6 +43,8 @@ fn every_persistent_table_has_a_projection_scope() {
         "replication_refusals",
         "capabilities",
         "local_work_lease_renewals",
+        "local_mailbox_owners",
+        "local_mailbox_bindings",
         "local_observations",
         "local_blobs",
         "local_subscription_mission_deferrals",
@@ -85,6 +87,23 @@ fn every_persistent_table_has_a_projection_scope() {
         tables, classified,
         "classify new tables and include shared logical rows in both ordering and digest tests"
     );
+}
+
+#[test]
+fn native_mailbox_ownership_changes_no_shared_projection_digest() {
+    let store = Store::open_memory("alder").unwrap();
+    crate::mailbox::tests::ready(&store, "session-1");
+    let before = graph_digest(&store.readers.get()).unwrap();
+    let first = crate::mailbox::Fence::new("agent/eval.worker", "session-1", "delivery");
+    store.bind_mailbox(&first).unwrap();
+    store
+        .bind_mailbox(&crate::mailbox::Fence::new(
+            "agent/eval.worker",
+            "session-1",
+            "delivery",
+        ))
+        .unwrap();
+    assert_eq!(before, graph_digest(&store.readers.get()).unwrap());
 }
 
 #[test]

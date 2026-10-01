@@ -4,6 +4,7 @@ pub mod api;
 pub mod archive;
 pub mod boot;
 pub(crate) mod checkout;
+pub mod claude_channel;
 pub mod client;
 pub mod config;
 pub(crate) mod disk;
@@ -17,6 +18,7 @@ pub mod graph;
 /// The lifecycle hook set st3 publishes beneath its own state directory.
 pub mod hooks;
 pub mod lane;
+pub mod mailbox;
 pub mod mission;
 pub mod model;
 pub mod otlp;
