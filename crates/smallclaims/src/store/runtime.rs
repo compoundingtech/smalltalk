@@ -51,7 +51,8 @@ pub trait Runtime: Send + Sync {
     /// Append a claim this node writes, from a client's input. The runtime decides how the claim
     /// is kept (some kinds stay local observations), validates it, appends it through the graph
     /// and projects it. The bool says whether the claim is new rather than an idempotent repeat.
-    fn append_claim(&self, store: &Store, input: &ClaimInput) -> Result<(ClaimRecord, bool), Error>;
+    fn append_claim(&self, store: &Store, input: &ClaimInput)
+    -> Result<(ClaimRecord, bool), Error>;
 
     /// Apply a replicated repair: `replacement` now stands for `repaired` in the runtime's
     /// projections.
@@ -79,8 +80,11 @@ pub trait Runtime: Send + Sync {
 
     /// Project newly admitted replicated claims from a healthy frontier. `Ok(false)` asks for a
     /// replay from nothing instead.
-    fn project_incremental(&self, transaction: &Transaction<'_>, origin: &str)
-    -> Result<bool, Error>;
+    fn project_incremental(
+        &self,
+        transaction: &Transaction<'_>,
+        origin: &str,
+    ) -> Result<bool, Error>;
 
     /// Clear every shared projection and fold the claims into it again in canonical order.
     fn replay_from_nothing(&self, transaction: &Transaction<'_>) -> Result<(), Error>;

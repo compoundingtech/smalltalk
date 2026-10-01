@@ -416,7 +416,12 @@ impl Store {
         Ok(forgotten)
     }
 
-    pub fn set_checkpoint_state(&self, checkpoint: &str, cut_unix_ms: u128, state: &str) -> Result<()> {
+    pub fn set_checkpoint_state(
+        &self,
+        checkpoint: &str,
+        cut_unix_ms: u128,
+        state: &str,
+    ) -> Result<()> {
         let connection = self.connection.write();
         connection.execute(
             "INSERT INTO checkpoints(id, cut_unix_ms, state, updated_at_unix_ms)

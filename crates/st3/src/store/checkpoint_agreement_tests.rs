@@ -186,10 +186,7 @@ fn sync(nodes: &[&Store]) {
                     continue;
                 }
                 let exchange = source
-                    .export_replication_exchange(
-                        FLEET,
-                        &target.replication_inventory().unwrap(),
-                    )
+                    .export_replication_exchange(FLEET, &target.replication_inventory().unwrap())
                     .unwrap();
                 target
                     .receive_replication_exchange(&source.origin, FLEET, &exchange)

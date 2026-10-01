@@ -10,8 +10,8 @@
 //! same claims drops the same ones.
 
 use super::*;
-use smallclaims::store::checkpoint::*;
 use smallclaims::store::checkpoint::DAY_MS;
+use smallclaims::store::checkpoint::*;
 use smallclaims::store::checkpoint_agreement::*;
 
 /// The rule engine's version. It is part of the rules digest, so nodes agree on a checkpoint only
@@ -145,7 +145,11 @@ pub(crate) fn slot_of(claim: &ClaimRecord) -> Option<(Rule, Vec<String>)> {
 /// names are `later`. Folds read these kinds last writer wins, field by field, so the later
 /// claims replace it whatever arrives in between. A state transition clears every field of its
 /// kind, so any later claim of the kind replaces one that sets only schema fields.
-pub(crate) fn witnessed(claim: &ClaimRecord, later: &BTreeSet<String>, later_claims: usize) -> bool {
+pub(crate) fn witnessed(
+    claim: &ClaimRecord,
+    later: &BTreeSet<String>,
+    later_claims: usize,
+) -> bool {
     let own = fields(claim).map(|fields| fields.keys().cloned().collect::<Vec<_>>());
     let own = own.unwrap_or_default();
     if later_claims > 0
@@ -249,7 +253,11 @@ pub(crate) fn timing_event(claim: &ClaimRecord) -> TimingEvent {
     )
 }
 
-pub(crate) fn timing_answers(events: &[TimingEvent], attempt: u32, cut: u128) -> Vec<(Option<u128>, u128)> {
+pub(crate) fn timing_answers(
+    events: &[TimingEvent],
+    attempt: u32,
+    cut: u128,
+) -> Vec<(Option<u128>, u128)> {
     [cut, u128::MAX]
         .into_iter()
         .flat_map(|snapshot| {

@@ -19,42 +19,43 @@ use uuid::Uuid;
 use crate::model::{
     ApplyResponse, AttentionActionView, AttentionClosing, AttentionItemView, AttentionRequest,
     AttentionRequestView, AttentionResolveRequest, AttentionWithdrawRequest, Capability,
-    ClaimInput, ClaimRecord, ClaimsPage, ContextUsage, DependencySpec, DesiredSubject, EventRecord, HumanReviewView, IntentInput, LoopRoundView, LoopRunView,
-    MAX_EVAL_TIMEOUT_MS, MessageView, MissionDefinitionView, MissionInputKind, MissionOutputView,
-    MissionResponse, MissionRevisionOperation, MissionRunDeclaration, MissionRunInput,
-    MissionRunOutcomeView, MissionRunRequest, MissionRunView, MissionSpec, MissionState,
-    NormalizedIntent, OperationalAnnotation, OperationalRepairItem, OperationalRepairPlan,
-    OperationalRepairResult, PlannedAction, PlannerSpec, PlanningCandidateView,
-    PlanningPreviewView, PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView,
-    ReplicaBatch, ReplicaRepairDeclaration, ResourceObservationOutcome, ResourceRefreshOperation, RevisionCutover,
-    RevisionProposalView, RevisionSubmissionView, RunGenerationView, RuntimeResetOperation,
-    St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus, SubscriptionConditionSpec,
-    SubscriptionRequestDecision, SubscriptionRequestView, SubscriptionSpec, UsageSummary,
-    WorkRequest, WorkSelector, WorkWakeView,
+    ClaimInput, ClaimRecord, ClaimsPage, ContextUsage, DependencySpec, DesiredSubject, EventRecord,
+    HumanReviewView, IntentInput, LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS, MessageView,
+    MissionDefinitionView, MissionInputKind, MissionOutputView, MissionResponse,
+    MissionRevisionOperation, MissionRunDeclaration, MissionRunInput, MissionRunOutcomeView,
+    MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent,
+    OperationalAnnotation, OperationalRepairItem, OperationalRepairPlan, OperationalRepairResult,
+    PlannedAction, PlannerSpec, PlanningCandidateView, PlanningPreviewView,
+    PlanningSessionDeclaration, PlanningSessionView, PlanningVariantView, ReplicaBatch,
+    ReplicaRepairDeclaration, ResourceObservationOutcome, ResourceRefreshOperation,
+    RevisionCutover, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
+    RuntimeResetOperation, St3Error, StatusResponse, StepRunView, SubjectChange, SubjectStatus,
+    SubscriptionConditionSpec, SubscriptionRequestDecision, SubscriptionRequestView,
+    SubscriptionSpec, UsageSummary, WorkRequest, WorkSelector, WorkWakeView,
 };
 #[cfg(test)]
 use crate::model::{
     ReplicaEnvelope, ReplicaEnvelopeId, ReplicaRange, ReplicationBatch, ReplicationExchange,
     ReplicationHealReport, ReplicationInventory, ReplicationReceipt, ReplicationResponse,
 };
+use crate::model::{SeatQueueMoveRequest, SeatQueueMoveView, SeatQueueRunView, SeatQueueView};
+use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 #[cfg(test)]
 use base64::Engine as _;
 #[cfg(test)]
 use smallclaims::claim::ReplicaEnvelopePayload;
-#[cfg(test)]
-use std::sync::atomic::Ordering;
-#[cfg(test)]
-use smallclaims::hash::{
-    claim_id_is_content_hash, replica_envelope_hash, replica_record_ref,
-    verify_replica_batch_header,
-};
-use crate::model::{SeatQueueMoveRequest, SeatQueueMoveView, SeatQueueRunView, SeatQueueView};
-use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 use smallclaims::error::internal;
 use smallclaims::hash::{
     batch_header_hash, canonical_hash, canonical_json_text, canonical_json_value,
     canonical_serialized_json_text, claim_hash,
 };
+#[cfg(test)]
+use smallclaims::hash::{
+    claim_id_is_content_hash, replica_envelope_hash, replica_record_ref,
+    verify_replica_batch_header,
+};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 
 // The graph half of the store: the claim log, envelopes, replication, checkpoints, heals,
 // documents and blobs. Everything it exports is in scope here as it was before the carve.
@@ -76,9 +77,8 @@ pub use smallclaims::store::{
     FleetRedemption, FleetRemoval, PendingCheckpointView, ReplicationAdmission, SealTerms,
     SealedSet, TRIM_CHUNK_ENVELOPES, TrimFault, VerifiedTerms, certificates, checkpoint_build,
     checkpoint_cut, checkpoint_name, checkpoint_participants, chosen_certificate,
-    configure_projection_writer, drop_digest, excused_writers, first_verifications,
-    newest_due_cut, newest_seals, stable_checkpoints, valid_fleet_node_name,
-    verify_checkpoint_manifest,
+    configure_projection_writer, drop_digest, excused_writers, first_verifications, newest_due_cut,
+    newest_seals, stable_checkpoints, valid_fleet_node_name, verify_checkpoint_manifest,
 };
 
 mod attention_snapshot;
@@ -1577,7 +1577,9 @@ impl Store {
         history: bool,
         build: impl FnOnce() -> Result<Vec<Value>>,
     ) -> Result<Vec<Value>> {
-        let mut cache = self.smalltalk.agent_resources_cache
+        let mut cache = self
+            .smalltalk
+            .agent_resources_cache
             .lock()
             .expect("agent resources cache poisoned");
         if let Some((_, _, _, items)) = cache.iter().find(|(cached_index, _, cached_history, _)| {
@@ -8104,7 +8106,9 @@ impl Store {
             // a snapshot can see a commit a moment before the writer publishes its index.
             let current = current_index(&self.readers.get())?;
             let index = selected_index(current, at_index).map_err(anyhow::Error::new)?;
-            let mut cache = self.smalltalk.agent_status_cache
+            let mut cache = self
+                .smalltalk
+                .agent_status_cache
                 .lock()
                 .expect("agent status cache poisoned");
             if let Some((_, _, _, status)) = cache.iter().find(|(cached_index, _, history, _)| {
@@ -8210,7 +8214,9 @@ impl Store {
     /// answers read at `store_index` may be kept: only those at the newest applied snapshot are
     /// known to hold afterwards.
     fn advance_subject_cache(&self, connection: &Connection, store_index: u64) -> Result<bool> {
-        let mut cache = self.smalltalk.subject_cache
+        let mut cache = self
+            .smalltalk
+            .subject_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if store_index > cache.through {
@@ -8260,7 +8266,9 @@ impl Store {
         newest: bool,
     ) -> Result<(SubjectStatus, Option<PlannedAction>)> {
         {
-            let cache = self.smalltalk.subject_cache
+            let cache = self
+                .smalltalk
+                .subject_cache
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             if let Some(entry) = cache
@@ -8274,7 +8282,9 @@ impl Store {
         let (status, action) = subject_status_at(connection, subject, Some(store_index), None)?
             .expect("a reduction without an owner filter always has a status");
         if newest {
-            let mut cache = self.smalltalk.subject_cache
+            let mut cache = self
+                .smalltalk
+                .subject_cache
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             // Keep it only if no later snapshot was applied meanwhile.
@@ -8320,7 +8330,9 @@ impl Store {
                 continue;
             }
             // Without the owner checks, only an answer that used no declaration applies.
-            let known = self.smalltalk.subject_cache
+            let known = self
+                .smalltalk
+                .subject_cache
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .views
@@ -8333,7 +8345,9 @@ impl Store {
                     let entry = runtime_view_entry(connection, &subject, store_index, owners)?;
                     let history = entry.history;
                     if newest && owners {
-                        let mut cache = self.smalltalk.subject_cache
+                        let mut cache = self
+                            .smalltalk
+                            .subject_cache
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner);
                         if cache.through == store_index {
@@ -9123,7 +9137,9 @@ impl Store {
             Ok((row.get::<_, u64>(0)?, row.get::<_, Option<String>>(1)?))
         })?;
         drop(statement);
-        if let Some(view) = self.smalltalk.message_cache
+        if let Some(view) = self
+            .smalltalk
+            .message_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(subject)
@@ -9137,7 +9153,9 @@ impl Store {
             return Ok(view);
         }
         let view = message_view_tx(connection, subject, created_index)?;
-        let mut cache = self.smalltalk.message_cache
+        let mut cache = self
+            .smalltalk
+            .message_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if cache.len() >= MESSAGE_CACHE_LIMIT && !cache.contains_key(subject) {
@@ -11732,7 +11750,9 @@ impl Store {
         let newest: u64 = connection
             .prepare_cached("SELECT COALESCE(MAX(store_index), 0) FROM claims WHERE subject=?1")?
             .query_row([subject], |row| row.get(0))?;
-        if let Some((_, value)) = self.smalltalk.actual_cache
+        if let Some((_, value)) = self
+            .smalltalk
+            .actual_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .get(subject)
@@ -11743,7 +11763,9 @@ impl Store {
         // A claim committed after `newest` can only make this value newer than its key, and the
         // next read then misses and folds again.
         let value = latest_actual(&connection, subject)?;
-        let mut cache = self.smalltalk.actual_cache
+        let mut cache = self
+            .smalltalk
+            .actual_cache
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         if cache.len() >= ACTUAL_CACHE_LIMIT && !cache.contains_key(subject) {
@@ -27759,8 +27781,15 @@ version 2
             store.latest_actual_value(subject).unwrap().unwrap()["status"],
             "stopped"
         );
-        let cached =
-            |store: &Store| store.smalltalk.actual_cache.lock().unwrap().get(subject).cloned();
+        let cached = |store: &Store| {
+            store
+                .smalltalk
+                .actual_cache
+                .lock()
+                .unwrap()
+                .get(subject)
+                .cloned()
+        };
         assert_eq!(cached(&store).unwrap().0, stopped.store_index);
 
         // Other subjects' writes leave a stopped runtime's folded state valid.
@@ -41177,7 +41206,8 @@ fn append_local_observation(
     input: &ClaimInput,
 ) -> Result<(ClaimRecord, bool), St3Error> {
     validate_local_observation(input)?;
-    graph.connection
+    graph
+        .connection
         .batched(|transaction| {
             insert_local_observation_tx(transaction, &graph.origin, input, now_ms())
         })
@@ -41193,7 +41223,8 @@ fn append_latest_observation(
     now: u128,
 ) -> Result<(ClaimRecord, bool), St3Error> {
     validate_local_observation(input)?;
-    graph.connection
+    graph
+        .connection
         .batched(|transaction| {
             let (local, appended) =
                 insert_local_observation_tx(transaction, &graph.origin, input, now)?;

@@ -22,14 +22,14 @@ use sha2::{Digest as _, Sha256};
 use uuid::Uuid;
 
 use crate::claim::{
-    ClaimInput, ClaimRecord, DocumentVersion, ReplicaBatch, ReplicaEnvelope,
-    ReplicaEnvelopeId, ReplicaEnvelopePayload,
+    ClaimInput, ClaimRecord, DocumentVersion, ReplicaBatch, ReplicaEnvelope, ReplicaEnvelopeId,
+    ReplicaEnvelopePayload,
 };
 use crate::error::{Error as St3Error, internal};
 use crate::hash::{
     batch_header_hash, canonical_hash, canonical_json_text, canonical_json_value, claim_hash,
-    claim_id_is_content_hash,
-    replica_envelope_hash, replica_record_ref, verify_replica_batch_header,
+    claim_id_is_content_hash, replica_envelope_hash, replica_record_ref,
+    verify_replica_batch_header,
 };
 use crate::replication::*;
 use crate::sqlite::{
@@ -49,7 +49,6 @@ pub mod runtime;
 pub use runtime::Runtime;
 
 pub use canonical::{CANONICAL_ORDER, CANONICAL_ORDER_DESC, canonical_sql};
-pub use checkpoint_agreement::write_time;
 pub use checkpoint::{
     CHECKPOINT_MANIFEST_PAGE_LIMIT, CheckpointManifest, CheckpointManifestCursor,
     CheckpointManifestPage, CheckpointManifestRequest, CheckpointPlanRequest, CheckpointPlanView,
@@ -57,6 +56,7 @@ pub use checkpoint::{
     SealedSet, checkpoint_cut, checkpoint_name, drop_digest, newest_due_cut,
     verify_checkpoint_manifest,
 };
+pub use checkpoint_agreement::write_time;
 pub use checkpoint_agreement::{
     CHECKPOINT_ATTENTION_AFTER_MS, CHECKPOINT_EXCUSED, CHECKPOINT_PROTOCOL, CHECKPOINT_SEALED,
     CHECKPOINT_VERIFIED, Certificate, CheckpointAction, CheckpointClaim, CheckpointContext,
@@ -834,7 +834,11 @@ impl CompactReplicationInventory {
             })
     }
 
-    pub fn hash_text<'a>(&'a self, envelope: &CompactEnvelopeId, buffer: &'a mut [u8; 64]) -> &'a str {
+    pub fn hash_text<'a>(
+        &'a self,
+        envelope: &CompactEnvelopeId,
+        buffer: &'a mut [u8; 64],
+    ) -> &'a str {
         if envelope.irregular == 0 {
             hex::encode_to_slice(envelope.hash, buffer).expect("a SHA-256 hash has 64 hex bytes");
             std::str::from_utf8(buffer).expect("hex is ASCII")
@@ -1039,16 +1043,15 @@ pub fn previous_batch_hash(transaction: &Transaction<'_>, origin: &str) -> Resul
 }
 
 // Seek the newest time block before evaluating canonical writer/sequence/position ties.
-pub const LATEST_CLAIM_QUERY: &str = "SELECT id FROM claims INDEXED BY claims_subject_accepted_index
+pub const LATEST_CLAIM_QUERY: &str =
+    "SELECT id FROM claims INDEXED BY claims_subject_accepted_index
     WHERE subject=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1";
 
 pub fn latest_claim_id_tx(transaction: &Transaction<'_>, subject: &str) -> Result<Option<String>> {
     transaction
-        .query_row(
-            &canonical_sql(LATEST_CLAIM_QUERY),
-            [subject],
-            |row| row.get(0),
-        )
+        .query_row(&canonical_sql(LATEST_CLAIM_QUERY), [subject], |row| {
+            row.get(0)
+        })
         .optional()
         .map_err(Into::into)
 }
@@ -2938,7 +2941,9 @@ pub fn update_identity_digest(digest: &mut Sha256, writer: &str, sequence: u64, 
 
 /// Range digests computed from public identities, independent of the compact inventory.
 #[cfg(any(test, feature = "test-support"))]
-pub fn test_replication_buckets(envelopes: &[ReplicaEnvelopeId]) -> Vec<ReplicationInventoryBucket> {
+pub fn test_replication_buckets(
+    envelopes: &[ReplicaEnvelopeId],
+) -> Vec<ReplicationInventoryBucket> {
     envelopes
         .chunk_by(|left, right| {
             left.writer == right.writer
@@ -3015,8 +3020,18 @@ pub fn compact_replication_inventory_matches_its_public_identities() {
                 .collect::<Vec<_>>()
         );
     }
-    assert!(inventory_holds(&incremental, "example-linux-like", 256, &upper));
-    assert!(inventory_holds(&incremental, "example-peer-like", 7, "not-a-hash"));
+    assert!(inventory_holds(
+        &incremental,
+        "example-linux-like",
+        256,
+        &upper
+    ));
+    assert!(inventory_holds(
+        &incremental,
+        "example-peer-like",
+        7,
+        "not-a-hash"
+    ));
     assert!(bulk.range("absent", 0).is_empty());
 
     fn inventory_holds(
@@ -3139,7 +3154,12 @@ impl TestReplica {
 
     /// Run one exchange where each side lists differing ranges up to its own limit, and return
     /// the largest listing either side sent.
-    pub fn exchange_listing(&mut self, own_limit: usize, peer: &mut Self, peer_limit: usize) -> usize {
+    pub fn exchange_listing(
+        &mut self,
+        own_limit: usize,
+        peer: &mut Self,
+        peer_limit: usize,
+    ) -> usize {
         let (pulled, response) = peer.answer_listing(&self.summary(), peer_limit);
         let mut listed = response.envelopes.len();
         self.0.extend(pulled);
@@ -3711,8 +3731,7 @@ pub fn validate_and_admit_envelope_tx(
             .optional()
             .map_err(internal)?;
         let started = std::time::Instant::now();
-        let classification =
-            validate_replicated_claim(transaction, batch, claim, runtime);
+        let classification = validate_replicated_claim(transaction, batch, claim, runtime);
         outcome.verify += started.elapsed();
         match classification {
             Ok(ReplicatedClaimAdmission::Valid) => {
@@ -3861,7 +3880,10 @@ impl Store {
 
     /// Append a claim this node writes, and say whether it is new rather than an idempotent
     /// repeat. Every local write from a client's input comes through here.
-    pub fn append_claim_outcome(&self, input: &ClaimInput) -> Result<(ClaimRecord, bool), St3Error> {
+    pub fn append_claim_outcome(
+        &self,
+        input: &ClaimInput,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
         self.runtime.append_claim(self, input)
     }
 
@@ -4570,7 +4592,10 @@ impl Store {
         })
     }
 
-    pub fn replica_envelopes(&self, missing: Vec<ReplicaEnvelopeId>) -> Result<Vec<ReplicaEnvelope>> {
+    pub fn replica_envelopes(
+        &self,
+        missing: Vec<ReplicaEnvelopeId>,
+    ) -> Result<Vec<ReplicaEnvelope>> {
         let connection = self.readers.get();
         let mut envelopes = Vec::with_capacity(missing.len());
         for identity in missing {
@@ -5680,8 +5705,7 @@ impl Store {
                 if peer_inventory.as_deref() == Some(snapshot.inventory.digest.as_str())
                     && !self.replication_projection_deferred()
                     && !unsealed_local
-                    && status.schema_digest.as_deref()
-                        == Some(registry_digest.as_str())
+                    && status.schema_digest.as_deref() == Some(registry_digest.as_str())
                     && waiting_claims == 0
                 {
                     status.differing_tables = projection_digest::differing(
@@ -5691,7 +5715,10 @@ impl Store {
                 }
             }
             status.projection_comparison_waiting = waiting_claims != 0
-                || status.schema_digest.as_deref().is_some_and(|digest| digest != registry_digest);
+                || status
+                    .schema_digest
+                    .as_deref()
+                    .is_some_and(|digest| digest != registry_digest);
             peers.push(status);
         }
         Ok(ReplicationStatus {
@@ -5833,7 +5860,6 @@ impl Store {
             .map(|value| value.unwrap_or(0))
             .map_err(Into::into)
     }
-
 }
 
 /// Name an actor by kind, as `person/NAME`, when it was given as a bare name.
@@ -6144,7 +6170,6 @@ pub fn register_operation_tx(transaction: &Transaction<'_>, claim: &ClaimRecord)
         }
     }
 }
-
 
 pub fn graph_digest(connection: &Connection) -> Result<String> {
     Ok(projection_digest::root(&projection_digest::tables(

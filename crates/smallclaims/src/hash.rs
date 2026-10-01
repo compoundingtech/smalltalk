@@ -119,7 +119,12 @@ pub fn replica_envelope_hash(
     hex::encode(digest.finalize())
 }
 
-pub fn replica_record_ref(writer: &str, sequence: u64, envelope_hash: &str, position: u64) -> String {
+pub fn replica_record_ref(
+    writer: &str,
+    sequence: u64,
+    envelope_hash: &str,
+    position: u64,
+) -> String {
     let digest = Sha256::digest(
         format!("st3-replica-record-v1\0{writer}\0{sequence}\0{envelope_hash}\0{position}")
             .as_bytes(),

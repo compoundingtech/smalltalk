@@ -1,6 +1,6 @@
 //! Tests of `smallclaims::store::checkpoint` through smalltalk's store.
-use super::*;
 use super::checkpoint::*;
+use super::*;
 use proptest::prelude::*;
 
 const CUT: u128 = 20 * DAY_MS;
@@ -54,8 +54,8 @@ impl Sealed {
         for (position, draft) in drafts.into_iter().enumerate() {
             self.next += 1;
             let id = format!("claim-{}", self.next);
-            let operation = operation_parts(&draft.body)
-                .map(|(id, digest)| (id.to_owned(), digest.to_owned()));
+            let operation =
+                operation_parts(&draft.body).map(|(id, digest)| (id.to_owned(), digest.to_owned()));
             self.claims.push((
                 at,
                 origin.to_owned(),
@@ -554,8 +554,7 @@ fn guards_keep_claims_a_rule_would_drop() {
     let protected = sealed.add("alder", T + 3, observed(3));
     let cited = sealed.add("alder", T + 4, observed(4));
     let mut with_operation = observed(5);
-    with_operation.body["_operation"] =
-        json!({"id": "operation/shared", "request_digest": "d"});
+    with_operation.body["_operation"] = json!({"id": "operation/shared", "request_digest": "d"});
     let shared = sealed.add("alder", T + 5, with_operation);
     let mut citing = draft(
         "attention.requested",
@@ -899,13 +898,7 @@ proptest! {
     }
 }
 
-fn input(
-    subject: &str,
-    kind: &str,
-    actor: Option<&str>,
-    fields: Value,
-    key: &str,
-) -> ClaimInput {
+fn input(subject: &str, kind: &str, actor: Option<&str>, fields: Value, key: &str) -> ClaimInput {
     ClaimInput {
         subject: subject.into(),
         kind: kind.into(),
@@ -971,10 +964,7 @@ fn receive(target: &Store, relay: &str, exchange: &ReplicationExchange) {
     target.project_replication_backlog().unwrap();
 }
 
-fn only(
-    exchange: &ReplicationExchange,
-    envelopes: Vec<ReplicaEnvelope>,
-) -> ReplicationExchange {
+fn only(exchange: &ReplicationExchange, envelopes: Vec<ReplicaEnvelope>) -> ReplicationExchange {
     ReplicationExchange {
         inventory: ReplicationInventory {
             digest: String::new(),
@@ -1104,13 +1094,8 @@ fn a_trimmed_node_seals_and_digests_like_an_untrimmed_one() {
         let mut connection = trimmed.connection.write();
         let transaction = connection.transaction().unwrap();
         let checkpoint = checkpoint_name(first);
-        record_checkpoint_tombstones_tx(
-            &transaction,
-            &checkpoint,
-            &plan.envelopes,
-            &plan.claims,
-        )
-        .unwrap();
+        record_checkpoint_tombstones_tx(&transaction, &checkpoint, &plan.envelopes, &plan.claims)
+            .unwrap();
         delete_dropped_rows_tx(&transaction, &plan.envelopes, &plan.claims).unwrap();
         transaction.commit().unwrap();
     }
@@ -1177,9 +1162,8 @@ fn ancestry_walks_through_a_dropped_claim() {
         .unwrap();
     assert_eq!(middle.predecessors, std::slice::from_ref(&older.id));
     assert_eq!(newest.predecessors, std::slice::from_ref(&middle.id));
-    let source = |store: &Store| {
-        selected_actual_source_at(&store.readers.get(), AGENT, None, None).unwrap()
-    };
+    let source =
+        |store: &Store| selected_actual_source_at(&store.readers.get(), AGENT, None, None).unwrap();
     assert_eq!(
         source(&alder),
         (Some(newest.id.clone()), Some("alder".into()), false)
@@ -1235,8 +1219,7 @@ fn ancestry_walks_through_a_dropped_claim() {
 #[ignore = "reads the store copy named by ST3_CHECKPOINT_STORE"]
 fn plan_a_copy_of_a_real_store() {
     let path = PathBuf::from(std::env::var("ST3_CHECKPOINT_STORE").unwrap());
-    let origin =
-        std::env::var("ST3_CHECKPOINT_ORIGIN").unwrap_or_else(|_| "example-linux".into());
+    let origin = std::env::var("ST3_CHECKPOINT_ORIGIN").unwrap_or_else(|_| "example-linux".into());
     let day = std::env::var("ST3_CHECKPOINT_DAY").unwrap();
     let started = std::time::Instant::now();
     let store = Store::open(&path, origin).unwrap();

@@ -979,7 +979,10 @@ pub fn differing_ranges(local: &[ClaimRangeDigest], peer: &[ClaimRangeDigest]) -
 }
 
 /// The subjects whose digests differ, or that only one side has, in any range.
-pub fn differing_subjects(local: &[ClaimSubjectDigest], peer: &[ClaimSubjectDigest]) -> Vec<String> {
+pub fn differing_subjects(
+    local: &[ClaimSubjectDigest],
+    peer: &[ClaimSubjectDigest],
+) -> Vec<String> {
     let index = |subjects: &[ClaimSubjectDigest]| {
         subjects
             .iter()

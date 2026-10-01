@@ -4,9 +4,9 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use crate::claim::{ReplicaEnvelope, ReplicaEnvelopeId, ReplicaEnvelopeSignature};
 #[cfg(any(test, feature = "test-support"))]
 use crate::claim::ReplicaBatch;
+use crate::claim::{ReplicaEnvelope, ReplicaEnvelopeId, ReplicaEnvelopeSignature};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct ReplicationInventory {

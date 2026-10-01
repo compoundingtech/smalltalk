@@ -194,9 +194,7 @@ pub fn checkpointed_operation(
 }
 
 /// Every operation with a dropped claim, as `(operation, request digest, claim)`.
-pub fn checkpointed_operations(
-    connection: &Connection,
-) -> Result<Vec<(String, String, String)>> {
+pub fn checkpointed_operations(connection: &Connection) -> Result<Vec<(String, String, String)>> {
     connection
         .prepare_cached(
             "SELECT operation_id, request_digest, id FROM checkpoint_claims

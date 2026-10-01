@@ -1,6 +1,6 @@
 //! Tests of `smallclaims::store::checkpoint::tombstones` through smalltalk's store.
-use super::*;
 use super::checkpoint::*;
+use super::*;
 
 const FLEET: &str = "fleet/test";
 const CHECKPOINT: &str = "checkpoint/2026-09-27";
@@ -126,13 +126,8 @@ fn a_trim_keeps_every_identity_and_the_authority_digest() {
     {
         let mut connection = store.connection.write();
         let transaction = connection.transaction().unwrap();
-        record_checkpoint_tombstones_tx(
-            &transaction,
-            CHECKPOINT,
-            &plan.envelopes,
-            &plan.claims,
-        )
-        .unwrap();
+        record_checkpoint_tombstones_tx(&transaction, CHECKPOINT, &plan.envelopes, &plan.claims)
+            .unwrap();
         transaction.commit().unwrap();
     }
     store.replica_rows_changed();
@@ -331,7 +326,9 @@ fn trimmed_untrimmed_and_full_inventory_nodes_keep_replicating() {
 /// checkpoint dropped, even when the peer offers it.
 #[test]
 fn a_heal_never_fetches_back_what_a_checkpoint_dropped() {
-    use smallclaims::replication::{ReplicationHealAnswer, ReplicationHealQuery, ReplicationHealStep};
+    use smallclaims::replication::{
+        ReplicationHealAnswer, ReplicationHealQuery, ReplicationHealStep,
+    };
 
     let (alder, plan) = store_with_drops("alder");
     let birch = Store::open_memory("birch").unwrap();
