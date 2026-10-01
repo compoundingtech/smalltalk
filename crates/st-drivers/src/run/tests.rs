@@ -1255,7 +1255,7 @@ fn write_notify_chain_profile(catalog: &Path) {
     std::fs::create_dir_all(&resolver_dir).unwrap();
     std::fs::copy(
         Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("crates/agent-spec/tests/fixtures/demo_resolver.wasm"),
+            .join("../agent-spec/tests/fixtures/demo_resolver.wasm"),
         resolver_dir.join("goal.wasm"),
     )
     .unwrap();

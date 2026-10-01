@@ -1,8 +1,8 @@
 use std::fs;
 use std::path::Path;
 
-use st2::DeliveryTransport;
-use st2::reconcile::{TaskCompileContext, compile_generated_tasks};
+use st_drivers::DeliveryTransport;
+use st_drivers::reconcile::{TaskCompileContext, compile_generated_tasks};
 
 fn write(path: &Path, body: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
@@ -28,7 +28,7 @@ fn app_server_selector_wraps_the_canonical_argv_with_exact_owner_inputs() {
 }
 "#,
     );
-    let mut found = st2::discover(tmp.path());
+    let mut found = st_drivers::discover(tmp.path());
     assert!(found.errors.is_empty(), "{:?}", found.errors);
 
     compile_generated_tasks(&mut found.specs, "h", &context(tmp.path())).unwrap();
@@ -91,12 +91,12 @@ fn codex_driver_matches_deliver_after_normalizing_only_the_subcommand_alias() {
 }
 "#,
     );
-    let (legacy, _) = st2::discover_file(tmp.path(), &legacy_path).unwrap();
-    let (driver, _) = st2::discover_file(tmp.path(), &driver_path).unwrap();
+    let (legacy, _) = st_drivers::discover_file(tmp.path(), &legacy_path).unwrap();
+    let (driver, _) = st_drivers::discover_file(tmp.path(), &driver_path).unwrap();
     let mut legacy = legacy.into_iter().next().unwrap();
     let mut driver = driver.into_iter().next().unwrap();
     let compile_context = context(tmp.path());
-    assert!(st2::hooks::required_by_codex_agent(
+    assert!(st_drivers::hooks::required_by_codex_agent(
         &driver,
         "h",
         tmp.path()
@@ -143,7 +143,7 @@ fn app_server_selector_rejects_shell_and_pre_remote_launches_without_mutating_th
             &tmp.path().join(format!("agents/h/{name}/agent.kdl")),
             &format!("agent \"{name}\" {{ host \"h\"; deliver \"app-server\"; {launch} }}"),
         );
-        let mut found = st2::discover(tmp.path());
+        let mut found = st_drivers::discover(tmp.path());
         assert!(found.errors.is_empty(), "{name}: {:?}", found.errors);
         let before = found.specs.clone();
         let error =
@@ -160,7 +160,7 @@ fn mcp_selector_wraps_the_authored_claude_launch_with_session_ownership() {
         &tmp.path().join("agents/h/worker/agent.kdl"),
         r#"agent "worker" { host "h"; deliver "mcp"; argv "claude" "boot" }"#,
     );
-    let mut found = st2::discover(tmp.path());
+    let mut found = st_drivers::discover(tmp.path());
     compile_generated_tasks(&mut found.specs, "h", &context(tmp.path())).unwrap();
 
     let task = &found.specs[0].tasks[0];

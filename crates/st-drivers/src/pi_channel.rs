@@ -1528,7 +1528,7 @@ mod tests {
     /// asks a fixture to bound.
     #[test]
     fn the_measured_pi_release_is_the_one_the_extension_gate_pins() {
-        let flake = include_str!("../flake.nix");
+        let flake = include_str!("../../../flake.nix");
         let pin = format!(
             "piVersion = \"{}\";",
             crate::pi_session::MEASURED_CONTEXT_VERSION

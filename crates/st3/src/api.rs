@@ -303,6 +303,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/client/work/{*id}", get(client_work_detail))
         .route("/v1/client/agents", get(client_agents))
         .route("/v1/client/agents/{*id}", get(client_agents_detail))
+        .route(
+            "/v1/client/agent-declarations/{*id}",
+            get(client_v0::agent_declaration),
+        )
         .route("/v1/client/agent-queues/{*id}", get(client_v0::agent_queue))
         .route("/v1/client/lanes", get(client_v0::lanes))
         .route("/v1/client/lanes/{*id}", get(client_v0::lane_detail))
@@ -4730,7 +4734,7 @@ fn claude_hooks_check(
         ));
     }
     let drivers = state.state_dir.join("drivers");
-    let host = st2::run::detect_host();
+    let host = st_drivers::run::detect_host();
     let mut bound = 0;
     for subject in &seats {
         let Some(observed) = state
