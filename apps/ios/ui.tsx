@@ -24,8 +24,8 @@ export function SectionHeader({ title, count, color = theme.overlay1 }: { title:
 }
 
 /** One list row: glyph, name, right-hand detail, and an optional dim second line. */
-export function ListRow({ glyph, glyphColor, title, right, second, onPress, indent = 0, selected, accessibilityLabel }: { glyph?: string; glyphColor?: string; title: ReactNode; right?: ReactNode; second?: ReactNode; onPress?: () => void; indent?: number; selected?: boolean; accessibilityLabel?: string }) {
-  return <Pressable accessibilityRole={onPress ? 'button' : undefined} accessibilityLabel={accessibilityLabel} disabled={!onPress} onPress={onPress} style={({ pressed }) => [styles.row, (pressed || selected) && { backgroundColor: theme.rowSelected }, { paddingLeft: 12 + indent * 16 }]}>
+export function ListRow({ glyph, glyphColor, title, right, second, onPress, onLongPress, indent = 0, selected, accessibilityLabel }: { glyph?: string; glyphColor?: string; title: ReactNode; right?: ReactNode; second?: ReactNode; onPress?: () => void; onLongPress?: () => void; indent?: number; selected?: boolean; accessibilityLabel?: string }) {
+  return <Pressable accessibilityRole={onPress ? 'button' : undefined} accessibilityLabel={accessibilityLabel} disabled={!onPress && !onLongPress} onPress={onPress} onLongPress={onLongPress} style={({ pressed }) => [styles.row, (pressed || selected) && { backgroundColor: theme.rowSelected }, { paddingLeft: 12 + indent * 16 }]}>
     <View style={styles.rowFirst}>
       {glyph ? <T bold color={glyphColor} style={styles.glyph}>{glyph}</T> : null}
       <View style={styles.rowTitle}>{typeof title === 'string' ? <T bold numberOfLines={1}>{title}</T> : title}</View>
