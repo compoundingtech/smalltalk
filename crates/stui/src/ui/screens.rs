@@ -244,6 +244,8 @@ pub fn home_list(world: &World, snoozed: &std::collections::HashSet<String>) -> 
 
 pub struct Drafts<'a> {
     pub text: Option<&'a str>,
+    /// Where typing goes in `text`, as a byte offset.
+    pub cursor: usize,
     pub editing: bool,
     pub confirm: Option<char>,
     /// "Chat about this": who it goes to, the draft, and the thread so far.
@@ -253,6 +255,7 @@ pub struct Drafts<'a> {
 pub struct Chat<'a> {
     pub to: String,
     pub text: &'a str,
+    pub cursor: usize,
     pub editing: bool,
     pub thread: Vec<Line<'static>>,
 }
@@ -280,12 +283,10 @@ fn text_box(doc: &mut Doc, title: &str, drafts: &Drafts<'_>, placeholder: &str, 
     if body.is_empty() && !drafts.editing {
         inner.line(Line::from(span(placeholder.to_owned(), theme::dim())));
     } else {
-        let mut runs = vec![run(body.to_owned(), theme::text())];
-        if drafts.editing {
-            runs.push(run("█", theme::fg(theme::ACCENT)));
+        let at = drafts.editing.then_some(drafts.cursor);
+        for runs in super::edit::lines(body, at, theme::text()) {
+            inner.lines(text::wrap(&runs, width.saturating_sub(4), &[], &[], None));
         }
-        let lines = text::wrap(&runs, width.saturating_sub(4), &[], &[], None);
-        inner.lines(lines);
     }
     let start = doc.lines.len();
     doc.card(
@@ -854,6 +855,7 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
         card.blank();
         let box_drafts = Drafts {
             text: Some(chat.text),
+            cursor: chat.cursor,
             editing: chat.editing,
             confirm: None,
             chat: None,
@@ -2389,7 +2391,8 @@ pub const NEW_MISSION_FIELDS: [(&str, &str); 4] = [
 
 /// The form behind Missions' New mission: it creates a launch, which a planner turns into a
 /// proposed mission on Home. Nothing runs until the person approves it there.
-pub fn new_mission_form(fields: &[String; 4], focus: usize, width: usize) -> Doc {
+/// `cursor` is where typing goes in the focused field.
+pub fn new_mission_form(fields: &[String; 4], focus: usize, cursor: usize, width: usize) -> Doc {
     let mut inner = Doc::new();
     let w = width.saturating_sub(4);
     inner.blank();
@@ -2408,11 +2411,7 @@ pub fn new_mission_form(fields: &[String; 4], focus: usize, width: usize) -> Doc
         if value.is_empty() && !focused {
             body.line(Line::from(span(*hint, theme::dim())));
         } else {
-            for (line_index, paragraph) in value.split('\n').enumerate() {
-                let mut runs = vec![run(paragraph.to_owned(), theme::text())];
-                if focused && line_index == value.split('\n').count() - 1 {
-                    runs.push(run("█", theme::fg(theme::ACCENT)));
-                }
+            for runs in super::edit::lines(value, focused.then_some(cursor), theme::text()) {
                 body.lines(text::wrap(&runs, w.saturating_sub(4), &[], &[], None));
             }
         }
@@ -2551,7 +2550,13 @@ pub fn random_name() -> String {
     )
 }
 
-pub fn new_agent_form(form: &AgentForm, hosts: &[String], width: usize) -> Doc {
+/// `cursors` are where typing goes in the prompt and the name.
+pub fn new_agent_form(
+    form: &AgentForm,
+    hosts: &[String],
+    cursors: [usize; 2],
+    width: usize,
+) -> Doc {
     let mut inner = Doc::new();
     let w = width.saturating_sub(4);
     inner.blank();
@@ -2599,12 +2604,8 @@ pub fn new_agent_form(form: &AgentForm, hosts: &[String], width: usize) -> Doc {
         if value.is_empty() && !focused {
             body.line(Line::from(span(hint, theme::dim())));
         } else {
-            let paragraphs = value.split('\n').collect::<Vec<_>>();
-            for (line_index, paragraph) in paragraphs.iter().enumerate() {
-                let mut runs = vec![run((*paragraph).to_owned(), theme::text())];
-                if focused && line_index == paragraphs.len() - 1 {
-                    runs.push(run("█", theme::fg(theme::ACCENT)));
-                }
+            for runs in super::edit::lines(value, focused.then_some(cursors[index]), theme::text())
+            {
                 body.lines(text::wrap(&runs, w.saturating_sub(4), &[], &[], None));
             }
         }

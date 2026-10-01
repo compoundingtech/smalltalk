@@ -493,6 +493,21 @@ impl Ui {
                 Pane::Agent(Some(agent.id.clone())),
             );
         }
+        // An agent's terminal, once something is typed: "atlas term".
+        if !query.trim().is_empty() {
+            for agent in screens::agent_order(&self.world)
+                .into_iter()
+                .filter(|agent| agent.terminal)
+            {
+                open(
+                    1,
+                    ("⌨", theme::OVERLAY1),
+                    format!("{} terminal", agent.name),
+                    "its terminal, attached".to_owned(),
+                    Pane::Terminal(agent.id.clone()),
+                );
+            }
+        }
         for mission in screens::mission_order(&self.world, true) {
             open(
                 2,
@@ -1418,6 +1433,7 @@ impl Ui {
 
     /// Keys glasses own. Returns whether the key was used here.
     pub(crate) fn glass_key(&mut self, key: KeyEvent) -> bool {
+        let terminal_focused = self.terminal_focused();
         let Some(glasses) = self.glasses.as_mut() else {
             return false;
         };
@@ -1491,8 +1507,8 @@ impl Ui {
         {
             return false;
         }
-        // In an attached terminal every key is the agent's; Ctrl+\ leaves it first.
-        if self.terminal.is_some() && self.tab == 1 {
+        // In a focused, attached terminal every key is the agent's; Ctrl+\ leaves it first.
+        if terminal_focused {
             return false;
         }
         let glass = glasses.glass();
@@ -1671,6 +1687,11 @@ impl Ui {
         };
         glasses.palette = None;
         match choice.action {
+            // Choosing an agent's terminal is asking to attach it.
+            Action::Open(Pane::Terminal(agent)) => {
+                self.open_in_glass(Pane::Terminal(agent.clone()), how);
+                self.attach_terminal(&agent);
+            }
             Action::Open(pane) => self.open_in_glass(pane, how),
             Action::ShowGlass(index) => self.show_glass(index),
             Action::NewAgent(task) => self.open_new_agent(task),
@@ -2176,9 +2197,13 @@ impl Ui {
         let Some(group) = glass.layout.group_mut(focus) else {
             return;
         };
+        let mut detach = false;
         match group.current.checked_sub(offset(focus)) {
             Some(index) if index < group.tabs.len() => {
-                group.tabs.remove(index);
+                let closed = group.tabs.remove(index);
+                // Closing the attached terminal's tab lets it go.
+                detach = matches!(Pane::parse(&closed.pane), Some(Pane::Terminal(agent))
+                    if self.terminal.as_ref().is_some_and(|view| view.agent == agent));
                 let shown = group.tabs.len() + offset(focus);
                 group.current = group.current.min(shown.saturating_sub(1));
             }
@@ -2190,6 +2215,10 @@ impl Ui {
             glass.focus = focus.saturating_sub(1);
         }
         let id = glass.id.clone();
+        if detach {
+            self.terminal = None;
+            self.effects.push(Effect::CloseTerminal);
+        }
         self.glass_changed(&id);
         self.show_focused();
     }
@@ -2206,13 +2235,56 @@ impl Ui {
         self.show_focused();
     }
 
+    /// Whether keys go to the attached terminal: in glasses only while its tab has focus.
+    pub(crate) fn terminal_focused(&self) -> bool {
+        let Some(view) = self.terminal.as_ref() else {
+            return false;
+        };
+        if self.glasses.is_some() {
+            self.focused_pane() == Some(Pane::Terminal(view.agent.clone()))
+        } else {
+            self.tab == 1
+        }
+    }
+
+    /// Show `pane` in the focused tab in place of what it shows: an agent's conversation and
+    /// its terminal are one tab, switched by Ctrl+] and Ctrl+\.
+    pub(crate) fn swap_focused_pane(&mut self, pane: Pane) {
+        let Some(glasses) = self.glasses.as_mut() else {
+            return;
+        };
+        let glass = glasses.glass_mut();
+        let focus = glass.focus;
+        let Some(group) = glass.layout.group_mut(focus) else {
+            return;
+        };
+        let Some(tab) = group
+            .current
+            .checked_sub(offset(focus))
+            .and_then(|index| group.tabs.get_mut(index))
+        else {
+            return;
+        };
+        tab.pane = pane.key();
+        let id = glass.id.clone();
+        self.glass_changed(&id);
+    }
+
+    /// The pane in the focused split's current tab, in glasses.
+    pub(crate) fn focused_pane(&self) -> Option<Pane> {
+        self.glasses
+            .as_ref()
+            .and_then(|glasses| glasses.glass().focused().and_then(Pane::parse))
+    }
+
     /// Point stui's own tab and selection at a pane's subject, so its keys act on it.
     fn focus_pane(&mut self, pane: &Pane) {
         let Some((tab, subject)) = pane_subject(pane) else {
             return;
         };
         self.tab = tab;
-        self.terminal = self.terminal.take().filter(|_| tab == 1);
+        // Focus only moves focus: an attached terminal stays attached until Ctrl+\\ or its tab
+        // closes, and takes keys only while its tab has focus.
         self.kdl = matches!(pane, Pane::Declaration(_));
         self.agent_form = matches!(pane, Pane::NewAgent);
         let Some(subject) = subject else { return };
@@ -2241,6 +2313,7 @@ fn pane_subject(pane: &Pane) -> Option<(usize, Option<String>)> {
     Some(match pane {
         Pane::Home(id) => (0, id.clone()),
         Pane::Agent(id) => (1, id.clone()),
+        Pane::Terminal(id) => (1, Some(id.clone())),
         Pane::Mission(id) | Pane::Declaration(id) => (2, id.clone()),
         Pane::NewAgent => (1, None),
         Pane::Machine(id) => (
@@ -2567,6 +2640,100 @@ mod tests {
         assert_eq!(tabs(&ui), (0, 0, vec![vec![ATLAS.to_owned()]]));
         ctrl(&mut ui, 'w');
         assert_eq!(tabs(&ui), (0, 0, vec![vec![]]));
+    }
+
+    #[test]
+    fn ctrl_bracket_turns_an_agents_tab_into_its_terminal_and_ctrl_backslash_turns_it_back() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ui.open_in_glass(
+            Pane::Mission(Some("mission/fleet/release/weekly".into())),
+            Open::Right,
+        );
+        screen(&ui);
+        ui.move_focus(KeyCode::Left);
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(ui.terminal.is_none(), "Enter alone never attaches");
+        // Crossterm reports 0x1d as Ctrl+5. The same tab shows the terminal: no second tab.
+        press(&mut ui, KeyCode::Char('5'), KeyModifiers::CONTROL);
+        let terminal = "terminal:agent/example/atlas/builder";
+        assert_eq!(tabs(&ui).2[0], vec![terminal.to_owned()]);
+        assert_eq!(
+            ui.terminal.as_ref().map(|view| view.agent.as_str()),
+            Some("agent/example/atlas/builder")
+        );
+        assert!(screen(&ui).contains("demo terminal"));
+        assert!(ui.terminal_focused());
+        // Focus only moves focus: on the mission the terminal stays attached but takes no keys,
+        // and its tab takes them again.
+        screen(&ui);
+        ui.move_focus(KeyCode::Right);
+        assert!(ui.terminal.is_some() && !ui.terminal_focused());
+        screen(&ui);
+        ui.move_focus(KeyCode::Left);
+        assert!(ui.terminal_focused());
+        assert!(
+            !ui.effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CloseTerminal))
+        );
+        // In it every key is the terminal's, Ctrl+W too; Ctrl+\ turns the tab back into the
+        // conversation and lets the terminal go.
+        ctrl(&mut ui, 'w');
+        assert!(ui.terminal.is_some(), "Ctrl+W went to the terminal");
+        ctrl(&mut ui, '\\');
+        assert_eq!(tabs(&ui).2[0], vec![ATLAS.to_owned()]);
+        assert!(ui.terminal.is_none());
+        assert!(
+            ui.effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CloseTerminal))
+        );
+        // Closing an attached terminal's tab lets it go too.
+        ctrl(&mut ui, ']');
+        ui.effects.clear();
+        ui.close_tab();
+        assert!(ui.terminal.is_none());
+        assert!(
+            ui.effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CloseTerminal))
+        );
+        // Ctrl+K finds it by name, and choosing it attaches it.
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, "builder term");
+        assert!(screen(&ui).contains("Atlas Builder terminal"));
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(ui.terminal_focused());
+    }
+
+    #[test]
+    fn a_draft_edits_at_its_cursor_with_the_shell_keys() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        typed(&mut ui, "c");
+        typed(&mut ui, "ship it");
+        ctrl(&mut ui, 'a');
+        typed(&mut ui, "please ");
+        ctrl(&mut ui, 'e');
+        press(&mut ui, KeyCode::Left, KeyModifiers::NONE);
+        press(&mut ui, KeyCode::Left, KeyModifiers::NONE);
+        typed(&mut ui, "out ");
+        let draft = ui.conversation_state.drafts["agent/example/atlas/builder"].clone();
+        assert_eq!(draft, "please ship out it");
+        ctrl(&mut ui, 'k');
+        assert_eq!(
+            ui.conversation_state.drafts["agent/example/atlas/builder"],
+            "please ship out "
+        );
+        let shown = screen(&ui);
+        assert!(shown.contains("please ship out █"), "{shown}");
     }
 
     #[test]
@@ -3022,7 +3189,24 @@ mod tests {
             .map(|agent| agent.id.clone())
             .unwrap();
         ui.open_in_glass(Pane::Agent(Some(working.clone())), Open::Tab);
-        assert!(screen(&ui).contains("■ stop · ctrl+c"));
+        assert!(screen(&ui).contains("ctrl+c twice stops it"));
+        // The hint is not a button: nothing on the box's rule stops anything.
+        assert!(
+            !ui.frame
+                .borrow()
+                .hits
+                .iter()
+                .any(|(_, hit)| *hit == Hit::Key('S'))
+        );
+        // Enter, which sends messages, never confirms a stop.
+        ctrl(&mut ui, 'c');
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            ui.effects
+                .iter()
+                .all(|effect| !matches!(effect, Effect::StopAgent { .. }))
+        );
+        ui.effects.clear();
         ctrl(&mut ui, 'c');
         assert!(!ui.quit && ui.effects.is_empty(), "the first asks");
         ctrl(&mut ui, 'c');
@@ -3096,6 +3280,74 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!((tabs(&ui).0, ui.tab), (0, 1));
+    }
+
+    #[test]
+    fn clicking_another_split_only_moves_focus_away_from_an_attached_terminal() {
+        let mut ui = glass();
+        ui.live = true;
+        let working = ui
+            .world
+            .agents
+            .items()
+            .iter()
+            .find(|agent| agent.state == AgentState::Working && !agent.unmanaged)
+            .map(|agent| agent.id.clone())
+            .unwrap();
+        ui.open_in_glass(Pane::Agent(Some(working.clone())), Open::Tab);
+        ui.open_in_glass(
+            Pane::Terminal("agent/example/atlas/builder".into()),
+            Open::Right,
+        );
+        // Opening a terminal tab never attaches it; Ctrl+] does.
+        assert!(ui.terminal.is_none());
+        ui.attach_terminal("agent/example/atlas/builder");
+        ui.terminal = Some(crate::ui::TerminalView {
+            agent: "agent/example/atlas/builder".into(),
+            title: "demo".into(),
+            name: "Atlas Builder".into(),
+            lines: Vec::new(),
+            cursor: None,
+            stale: None,
+            ended: None,
+        });
+        ui.effects.clear();
+        assert!(ui.terminal_focused());
+        screen(&ui);
+        // Click the working agent's conversation, as one does to switch to it.
+        let left = ui.frame.borrow().glass_leaves[0];
+        for row in left.y..left.y + left.height {
+            ui.mouse(MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: left.x + 3,
+                row,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(
+                ui.confirm, None,
+                "a click at row {row} armed {:?}",
+                ui.confirm
+            );
+        }
+        assert_eq!(tabs(&ui).0, 0, "focus moved");
+        assert!(ui.terminal.is_some(), "focus never detaches");
+        assert!(!ui.terminal_focused());
+        // Typing and Enter there write to the agent: nothing reaches the terminal and nothing
+        // stops anyone.
+        typed(&mut ui, "c");
+        typed(&mut ui, "hello");
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            ui.effects.iter().all(|effect| !matches!(
+                effect,
+                Effect::TerminalKey(_)
+                    | Effect::StopAgent { .. }
+                    | Effect::CloseTerminal
+                    | Effect::OpenTerminal { .. }
+            )),
+            "{:?}",
+            ui.effects
+        );
     }
 
     #[test]
