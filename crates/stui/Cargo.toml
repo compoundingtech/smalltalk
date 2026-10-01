@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 description = "Smalltalk terminal UI starter shell"
 license = "MIT"
+# The workspace's build identity stamp, shared with st2 and st-drivers (see src/version.rs).
+build = "../../build.rs"
 
 [dependencies]
 anyhow = "1"
