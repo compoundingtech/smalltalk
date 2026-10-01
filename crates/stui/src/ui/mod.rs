@@ -1843,10 +1843,9 @@ impl Ui {
                             self.flash("Put off until later · demo, this machine only");
                         }
                     }
-                    (
-                        "review" | "feedback" | "launch" | "message" | "revision" | "request",
-                        'c',
-                    ) => self.editing = true,
+                    ("review" | "feedback" | "launch" | "message" | "revision" | "request", 'c') => {
+                        self.editing = true
+                    }
                     ("review" | "feedback" | "launch" | "revision", 'a') => {
                         self.confirm = Some('a')
                     }
@@ -2621,8 +2620,7 @@ impl Ui {
         }
         if cos > 8.0 && !demo.mail {
             demo.mail = true;
-            if let Some(Load::Ready(entries)) =
-                self.world.conversations.get_mut("agent/example/cos")
+            if let Some(Load::Ready(entries)) = self.world.conversations.get_mut("agent/example/cos")
             {
                 entries.push(demo::late_mail());
             }
