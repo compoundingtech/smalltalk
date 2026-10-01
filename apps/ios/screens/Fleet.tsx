@@ -18,7 +18,7 @@ function machineGlyph(state: string): { glyph: string; color: string } {
 
 // Fleet: machines, what runs where, this connection and the paired devices.
 export function FleetScreen() {
-  const { data, truncated, caps, url, gatewayMachineId, gatewayHost, order, actions } = useStore();
+  const { data, truncated, caps, url, gatewayMachineId, gatewayHost, order, actions, glassesOn } = useStore();
   useListsOnFocus(['machines', 'devices', 'sessions']);
   const refresh = useRefresh(['machines', 'devices', 'sessions']);
   const scroll = useRef<ScrollView>(null);
@@ -52,6 +52,15 @@ export function FleetScreen() {
       <SectionHeader title="agent work" count={busy.length + unhealthy.length} />
       {unhealthy.map(agent => <ListRow key={`unhealthy-${agent.id}`} glyph="✕" glyphColor={theme.fault} title={agentName(agent)} second={`${agentHealth(agent).label} · observed ${ago(agent.updated_at, now)} ago`} />)}
       {busy.map(agent => <ListRow key={agent.id} glyph="⠿" glyphColor={theme.working} title={agentName(agent)} right={<T dim>{agent.active_work_count ?? 0} active</T>} second={queuedWorkSummary(agent, now) ?? undefined} />)}
+      <SectionHeader title="experiments" />
+      <ListRow
+        glyph={glassesOn ? '●' : '○'}
+        glyphColor={glassesOn ? theme.green : theme.overlay1}
+        title={`glasses · ${glassesOn ? 'on' : 'off'}`}
+        second="stui's tabs and splits, one at a time, in a Glasses tab"
+        onPress={() => actions.setGlassesOn(!glassesOn)}
+        accessibilityLabel={`Glasses experiment, ${glassesOn ? 'on' : 'off'}. Double-tap to turn ${glassesOn ? 'off' : 'on'}.`}
+      />
       <SectionHeader title="this connection" />
       <View style={{ paddingHorizontal: 12, gap: 2 }}>
         <T>{caps ? `${caps.session_actor} · ${caps.transport}` : 'reconnecting'}</T>
