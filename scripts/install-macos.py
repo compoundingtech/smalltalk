@@ -275,57 +275,57 @@ def main():
     home = Path.home()
     lock_root = home / '.local/state/st3/macos-installs'
     lock_root.mkdir(parents=True, exist_ok=True)
-    lock = open(lock_root / (hashlib.sha256(str(fixed(home)).encode()).hexdigest() + '.lock'), 'a')
-    fcntl.flock(lock, fcntl.LOCK_EX)
-    verifying_artifact = args.verify_app or args.install_app or args.backup_only or args.restore_app
-    if verifying_artifact and CERTIFICATE and re.fullmatch(r'[a-fA-F0-9]{40}', CERTIFICATE):
-        # A staged signed bundle carries its certificate. Verification/install
-        # needs no signing private key on the receiving machine.
-        CERTIFICATE = CERTIFICATE.upper()
-    else:
-        resolve_identity()
-    if args.verify_app:
-        print(json.dumps(verify(args.verify_app), sort_keys=True))
-        return
-    if args.job is None:
-        if args.prepare_only or args.backup_only or args.restore_app:
-            parser.error('--job is required for preparing, backing up or restoring a transaction')
-        root = home / '.local/state/st3/macos-installs'
-        root.mkdir(parents=True, exist_ok=True)
-        args.job = Path(tempfile.mkdtemp(prefix='install-', dir=root))
-    args.job.mkdir(parents=True, exist_ok=True)
-    if args.backup_only:
+    with open(lock_root / (hashlib.sha256(str(fixed(home)).encode()).hexdigest() + '.lock'), 'a' as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        verifying_artifact = args.verify_app or args.install_app or args.backup_only or args.restore_app
+        if verifying_artifact and CERTIFICATE and re.fullmatch(r'[a-fA-F0-9]{40}', CERTIFICATE):
+            # A staged signed bundle carries its certificate. Verification/install
+            # needs no signing private key on the receiving machine.
+            CERTIFICATE = CERTIFICATE.upper()
+        else:
+            resolve_identity()
+        if args.verify_app:
+            print(json.dumps(verify(args.verify_app), sort_keys=True))
+            return
+        if args.job is None:
+            if args.prepare_only or args.backup_only or args.restore_app:
+                parser.error('--job is required for preparing, backing up or restoring a transaction')
+            root = home / '.local/state/st3/macos-installs'
+            root.mkdir(parents=True, exist_ok=True)
+            args.job = Path(tempfile.mkdtemp(prefix='install-', dir=root))
+        args.job.mkdir(parents=True, exist_ok=True)
+        if args.backup_only:
+            had_app = backup(home, args.job)
+            write_atomic(args.job / 'previous.json', json.dumps({'had_app': had_app}).encode())
+            print(json.dumps({'had_app': had_app}))
+            return
+        if args.restore_app:
+            prior = json.loads((args.job / 'previous.json').read_text())
+            restore(home, args.job, prior['had_app'])
+            return
+        if args.install_app:
+            identity = verify(args.install_app)
+            install(args.install_app, home, args.job)
+            print(json.dumps(identity, sort_keys=True))
+            return
+        if args.source is None:
+            parser.error('--from is required')
+        built = {name: args.source / name for name in ['st3', 'stui']}
+        for path in built.values():
+            if not path.is_file() or not os.access(path, os.X_OK):
+                parser.error('missing executable: ' + str(path))
+        app, identity, payload = prepare(home, args.job, built)
+        if args.prepare_only:
+            print(json.dumps({'app': str(app), 'identity': identity, 'payload_hashes': payload}, sort_keys=True))
+            return
         had_app = backup(home, args.job)
         write_atomic(args.job / 'previous.json', json.dumps({'had_app': had_app}).encode())
-        print(json.dumps({'had_app': had_app}))
-        return
-    if args.restore_app:
-        prior = json.loads((args.job / 'previous.json').read_text())
-        restore(home, args.job, prior['had_app'])
-        return
-    if args.install_app:
-        identity = verify(args.install_app)
-        install(args.install_app, home, args.job)
-        print(json.dumps(identity, sort_keys=True))
-        return
-    if args.source is None:
-        parser.error('--from is required')
-    built = {name: args.source / name for name in ['st3', 'stui']}
-    for path in built.values():
-        if not path.is_file() or not os.access(path, os.X_OK):
-            parser.error('missing executable: ' + str(path))
-    app, identity, payload = prepare(home, args.job, built)
-    if args.prepare_only:
-        print(json.dumps({'app': str(app), 'identity': identity, 'payload_hashes': payload}, sort_keys=True))
-        return
-    had_app = backup(home, args.job)
-    write_atomic(args.job / 'previous.json', json.dumps({'had_app': had_app}).encode())
-    try:
-        install(app, home, args.job)
-    except Exception:
-        restore(home, args.job, had_app)
-        raise
-    print(json.dumps({'app': str(fixed(home)), 'identity': identity, 'payload_hashes': payload}, sort_keys=True))
+        try:
+            install(app, home, args.job)
+        except Exception:
+            restore(home, args.job, had_app)
+            raise
+        print(json.dumps({'app': str(fixed(home)), 'identity': identity, 'payload_hashes': payload}, sort_keys=True))
 
 
 if __name__ == '__main__':
