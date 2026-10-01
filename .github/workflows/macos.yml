@@ -35,15 +35,25 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Mount Rust and CI caches
-        id: cache
+      - name: Restore the Cargo target and registry
+        id: cargo-cache
         if: runner.os == 'Linux'
-        uses: namespacelabs/nscloud-cache-action@v1
+        uses: actions/cache@v4
         with:
-          cache: rust
           path: |
             ${{ github.workspace }}/target
-            ~/.cache/st-ci
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}"
+          restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
+      - name: Restore the local Nix cache
+        id: nix-cache
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/st-ci
+          key: "nix-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}"
+          restore-keys: "nix-${{ github.job }}-${{ runner.os }}-"
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:

@@ -7,11 +7,10 @@ import {
 
 export const linuxRunner = namespaceRunner({ profile: 'namespace-profile-linux-x86-64', runId: '${{ github.run_id }}' })
 /**
- * Each job gets its own Namespace cache volume, so parallel jobs never overwrite each other's
- * Cargo target or Nix store contents.
+ * The Linux gate's stage jobs use a bigger shape than the profile's 8x16: the test build, nextest
+ * and clippy scale with the CPU count. Cost is not a constraint for this trial.
  */
-export const linuxCachedRunner = (tag: string) =>
-  namespaceRunner({ profile: `namespace-profile-linux-x86-64;overrides.cache-tag=${tag}`, runId: '${{ github.run_id }}' })
+export const linuxStageRunner = ['nscloud-ubuntu-24.04-amd64-16x32'] as const
 export const macosRunner = namespaceRunner({ profile: 'namespace-profile-macos-arm64', runId: '${{ github.run_id }}' })
 
 /** The public, read-only effect-utils cache supplies genie and other pinned effect-utils packages. */
@@ -26,17 +25,30 @@ export const buildEnv = { CARGO_PROFILE_DEV_DEBUG: '0', CARGO_PROFILE_TEST_DEBUG
  */
 export const commonSetupSteps = [
   { uses: 'actions/checkout@v4', with: { 'fetch-depth': 0, 'persist-credentials': false } },
-  // Namespace cache volume: the last committed cache is mounted at these paths for every run.
-  // /nix is deliberately not cached (see scripts/ci-nix-cache); ~/.cache/st-ci holds a local Nix binary cache.
-  // Linux only: the macOS profile has no cache volume.
+  // actions/cache is served by Namespace's accelerated cache backend and is keyed, not tied to a node.
+  // Namespace cache volumes are per node and replicate in the background, so a job on another node
+  // starts empty. /nix itself cannot be cached (see scripts/ci-nix-cache); ~/.cache/st-ci holds a
+  // local Nix binary cache instead. Linux only: the key names the job, so each stage keeps its own.
   {
-    name: 'Mount Rust and CI caches',
-    id: 'cache',
+    name: 'Restore the Cargo target and registry',
+    id: 'cargo-cache',
     if: "runner.os == 'Linux'",
-    uses: 'namespacelabs/nscloud-cache-action@v1',
+    uses: 'actions/cache@v4',
     with: {
-      cache: 'rust',
-      path: '${{ github.workspace }}/target\n~/.cache/st-ci',
+      path: '${{ github.workspace }}/target\n~/.cargo/registry\n~/.cargo/git',
+      key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}",
+      'restore-keys': 'cargo-${{ github.job }}-${{ runner.os }}-',
+    },
+  },
+  {
+    name: 'Restore the local Nix cache',
+    id: 'nix-cache',
+    if: "runner.os == 'Linux'",
+    uses: 'actions/cache@v4',
+    with: {
+      path: '~/.cache/st-ci',
+      key: "nix-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}",
+      'restore-keys': 'nix-${{ github.job }}-${{ runner.os }}-',
     },
   },
   ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),

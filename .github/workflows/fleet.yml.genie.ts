@@ -5,7 +5,7 @@ import {
   plainFlakeJob,
   plainFlakeSetupSteps,
 } from '../../repos/effect-utils/genie/external.ts'
-import { buildEnv, commonSetupSteps, linuxCachedRunner, linuxRunner, readOnlyBinaryCaches, workspacePreparationSteps } from './workspace-ci.ts'
+import { buildEnv, commonSetupSteps, linuxStageRunner, linuxRunner, readOnlyBinaryCaches, workspacePreparationSteps } from './workspace-ci.ts'
 
 // Namespace offers nested virtualization on linux/amd64. Prove /dev/kvm can create a VM before
 // anything else; QEMU is also forbidden to fall back to emulation (nix/transport-isolation-vm.nix).
@@ -25,7 +25,7 @@ print(f"KVM API {version}: created a VM")
 EOF
 printf 'KVM: \\x60%s\\x60, CPU virtualization flag %s, VM creation succeeded\\n\\n| Phase | Elapsed |\\n| --- | --- |\\n' "$(ls -l /dev/kvm)" "$(grep -m1 -oE 'vmx|svm' /proc/cpuinfo || echo none)" >> "$GITHUB_STEP_SUMMARY"`
 
-// One Linux gate stage: its own runner and cache volume, the common setup, then scripts/ci-linux.
+// One Linux gate stage: its own runner and caches, the common setup, then scripts/ci-linux.
 const linuxStageJob = ({
   name,
   stage,
@@ -42,7 +42,7 @@ const linuxStageJob = ({
   extraLogs?: string
 }) => ({
   name,
-  'runs-on': linuxCachedRunner(`st-ci-${stage}`),
+  'runs-on': linuxStageRunner,
   'timeout-minutes': 120,
   defaults: { run: { shell: 'bash' } },
   env: { ...buildEnv, ...env },
@@ -54,7 +54,7 @@ const linuxStageJob = ({
     },
     nixDevelopStep({ name: description ?? 'Run nextest', command: ['bash', 'scripts/ci-linux', stage] }),
     {
-      name: 'Save Nix outputs to the cache volume',
+      name: 'Save Nix outputs to the local Nix cache',
       if: 'success()',
       run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
     },
@@ -84,13 +84,10 @@ export default githubWorkflow({
     group: 'workspace-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}',
     'cancel-in-progress': '${{ github.event_name == \'pull_request\' }}',
   },
-  // actionlint must know the per-job cache-tag runner labels.
+  // actionlint must know the Namespace shape label the stage jobs use.
   actionlint: {
     ...defaultActionlintConfig,
-    selfHostedRunnerLabels: [
-      ...(defaultActionlintConfig.selfHostedRunnerLabels ?? []),
-      ...['tests', 'clippy', 'fleet-compat'].map((stage) => `namespace-profile-linux-x86-64;overrides.cache-tag=st-ci-${stage}`),
-    ],
+    selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxStageRunner],
   },
   jobs: {
     'genie-freshness': plainFlakeJob({
@@ -100,7 +97,7 @@ export default githubWorkflow({
       nix: { binaryCaches: readOnlyBinaryCaches },
       step: nixDevelopStep({ name: 'Check generated files', flake: '.#genie', command: ['genie', '--check'] }),
     }),
-    // The Linux gate runs as three jobs on separate runners, each with its own cache volume.
+    // The Linux gate runs as three jobs on separate runners, each with its own caches.
     // `linux-gate` below is the single required check that collects them.
     'linux-tests': linuxStageJob({
       name: 'linux-tests',

@@ -48,11 +48,7 @@ jobs:
         run: "nix develop '.#genie' -c genie --check"
   linux-tests:
     name: linux-tests
-    runs-on:
-      [
-        namespace-profile-linux-x86-64;overrides.cache-tag=st-ci-tests,
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: [nscloud-ubuntu-24.04-amd64-16x32]
     timeout-minutes: 120
     defaults:
       run:
@@ -67,15 +63,25 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Mount Rust and CI caches
-        id: cache
+      - name: Restore the Cargo target and registry
+        id: cargo-cache
         if: runner.os == 'Linux'
-        uses: namespacelabs/nscloud-cache-action@v1
+        uses: actions/cache@v4
         with:
-          cache: rust
           path: |
             ${{ github.workspace }}/target
-            ~/.cache/st-ci
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}"
+          restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
+      - name: Restore the local Nix cache
+        id: nix-cache
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/st-ci
+          key: "nix-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}"
+          restore-keys: "nix-${{ github.job }}-${{ runner.os }}-"
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -117,7 +123,7 @@ jobs:
       - name: Run nextest
         shell: bash
         run: nix develop -c bash scripts/ci-linux tests
-      - name: Save Nix outputs to the cache volume
+      - name: Save Nix outputs to the local Nix cache
         if: success()
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
       - name: Retain stage logs and timings
@@ -131,11 +137,7 @@ jobs:
           if-no-files-found: ignore
   linux-clippy:
     name: linux-clippy
-    runs-on:
-      [
-        namespace-profile-linux-x86-64;overrides.cache-tag=st-ci-clippy,
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: [nscloud-ubuntu-24.04-amd64-16x32]
     timeout-minutes: 120
     defaults:
       run:
@@ -149,15 +151,25 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Mount Rust and CI caches
-        id: cache
+      - name: Restore the Cargo target and registry
+        id: cargo-cache
         if: runner.os == 'Linux'
-        uses: namespacelabs/nscloud-cache-action@v1
+        uses: actions/cache@v4
         with:
-          cache: rust
           path: |
             ${{ github.workspace }}/target
-            ~/.cache/st-ci
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}"
+          restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
+      - name: Restore the local Nix cache
+        id: nix-cache
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/st-ci
+          key: "nix-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}"
+          restore-keys: "nix-${{ github.job }}-${{ runner.os }}-"
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -185,7 +197,7 @@ jobs:
       - name: Run clippy and the generated-client check
         shell: bash
         run: nix develop -c bash scripts/ci-linux clippy
-      - name: Save Nix outputs to the cache volume
+      - name: Save Nix outputs to the local Nix cache
         if: success()
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
       - name: Retain stage logs and timings
@@ -199,11 +211,7 @@ jobs:
           if-no-files-found: ignore
   linux-fleet-compat:
     name: linux-fleet-compat
-    runs-on:
-      [
-        namespace-profile-linux-x86-64;overrides.cache-tag=st-ci-fleet-compat,
-        "namespace-features:github.run-id=${{ github.run_id }}",
-      ]
+    runs-on: [nscloud-ubuntu-24.04-amd64-16x32]
     timeout-minutes: 120
     defaults:
       run:
@@ -217,15 +225,25 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - name: Mount Rust and CI caches
-        id: cache
+      - name: Restore the Cargo target and registry
+        id: cargo-cache
         if: runner.os == 'Linux'
-        uses: namespacelabs/nscloud-cache-action@v1
+        uses: actions/cache@v4
         with:
-          cache: rust
           path: |
             ${{ github.workspace }}/target
-            ~/.cache/st-ci
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}"
+          restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
+      - name: Restore the local Nix cache
+        id: nix-cache
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/st-ci
+          key: "nix-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}"
+          restore-keys: "nix-${{ github.job }}-${{ runner.os }}-"
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -253,7 +271,7 @@ jobs:
       - name: Run fleet compatibility against the pinned older st3
         shell: bash
         run: nix develop -c bash scripts/ci-linux fleet-compat
-      - name: Save Nix outputs to the cache volume
+      - name: Save Nix outputs to the local Nix cache
         if: success()
         run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"'
       - name: Retain stage logs and timings
