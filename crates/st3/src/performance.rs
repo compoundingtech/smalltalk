@@ -159,10 +159,11 @@ fn query_kind(sql: &str) -> String {
     out.trim().to_owned()
 }
 pub fn record_query(sql: &str, duration: Duration) {
+    let kind = query_kind(sql);
     METER.get_or_init(Mutex::default).lock().unwrap().record(
         Instant::now(),
         true,
-        query_kind(sql),
+        kind,
         duration,
         0,
     );
