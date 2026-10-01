@@ -187,6 +187,13 @@ pub(crate) struct TerminalView {
     pub(crate) native: Option<pty::NativeTerminal>,
 }
 
+/// The entry at the top of a pane read back, how far into it, and the top it gave.
+struct Anchor {
+    entry: String,
+    offset: usize,
+    top: usize,
+}
+
 /// `/` in a conversation: what to find there, and which match is current.
 struct Find {
     /// The agent whose conversation is searched.
@@ -271,6 +278,8 @@ pub struct Ui {
     attachments: HashMap<String, Vec<attach::Attachment>>,
     /// Where typing goes in the input that has the keyboard.
     cursor: edit::Cursor,
+    /// Where each pane being read back was, by entry, so it keeps its place.
+    anchors: RefCell<HashMap<String, Anchor>>,
     /// The rows and columns the terminal pane last had, to attach at.
     pub(crate) terminal_size: Cell<(u16, u16)>,
     /// How this terminal draws images (kitty, sixel, iTerm2, half blocks), asked once at start.
@@ -339,6 +348,7 @@ impl Ui {
             attachments: HashMap::new(),
             cursor: edit::Cursor::default(),
             terminal_size: Cell::new((24, 80)),
+            anchors: RefCell::new(HashMap::new()),
             picker: None,
             thumbnails: RefCell::new(HashMap::new()),
             updated: HashMap::new(),
@@ -1773,7 +1783,38 @@ impl Ui {
                 seen: total,
                 ..PaneState::default()
             });
+            // Someone reading back keeps their place by entry: lines added, removed or grown
+            // above it (a window that slid, a late entry, a tool call that grew) never move
+            // what they read. Unless they scrolled since, the entry at the top stays there.
+            let mut anchors = self.anchors.borrow_mut();
+            if !state.follow
+                && let Some(anchor) = anchors.get(key)
+                && anchor.top == state.top
+                && let Some((_, start)) = doc.entries.iter().find(|(id, _)| *id == anchor.entry)
+            {
+                state.top = start + anchor.offset;
+            }
             state.reconcile(total, height);
+            match doc
+                .entries
+                .iter()
+                .rev()
+                .find(|(_, start)| *start <= state.top)
+            {
+                Some((entry, start)) if !state.follow => {
+                    anchors.insert(
+                        key.to_owned(),
+                        Anchor {
+                            entry: entry.clone(),
+                            offset: state.top - start,
+                            top: state.top,
+                        },
+                    );
+                }
+                _ => {
+                    anchors.remove(key);
+                }
+            }
             *state
         };
         let top = state.top;
@@ -4307,6 +4348,63 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(screen.contains("Not attached"));
+    }
+
+    #[test]
+    fn a_conversation_read_back_keeps_its_place_while_entries_come_and_go() {
+        let mut ui = Ui::new(demo::world());
+        ui.tab = 1;
+        let id = ui.selected_id().unwrap();
+        frame(&ui, 120, 30);
+        let pane = ui
+            .frame
+            .borrow()
+            .panes
+            .iter()
+            .find(|pane| pane.key.starts_with("chat:"))
+            .map(|pane| pane.rect)
+            .unwrap();
+        for _ in 0..4 {
+            ui.mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: pane.x + 2,
+                row: pane.y + 2,
+                modifiers: KeyModifiers::NONE,
+            });
+            frame(&ui, 120, 30);
+        }
+        // The rows read, without the scrollbar, whose thumb moves as the length changes.
+        let shown = |ui: &Ui| {
+            frame(ui, 120, 30)[usize::from(pane.y) + 1..usize::from(pane.y) + 8]
+                .iter()
+                .map(|line| {
+                    line.chars()
+                        .take(usize::from(pane.x + pane.width) - 2)
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = shown(&ui);
+        // The window slides (the oldest entry leaves), a reply arrives, and an entry above
+        // grows: what is being read stays where it is.
+        let Some(Load::Ready(entries)) = ui.world.conversations.get_mut(&id) else {
+            panic!("the demo agent has a conversation")
+        };
+        entries.remove(0);
+        entries.push(Entry {
+            id: "late".into(),
+            at: "09:59".into(),
+            body: Body::Assistant("a reply arrives below".into()),
+        });
+        assert_eq!(shown(&ui), before);
+        // At the bottom it follows as before.
+        press(&mut ui, KeyCode::End);
+        frame(&ui, 120, 30);
+        assert!(
+            frame(&ui, 120, 30)
+                .join("\n")
+                .contains("a reply arrives below")
+        );
     }
 
     #[test]

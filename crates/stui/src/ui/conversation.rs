@@ -22,6 +22,7 @@ impl Cache {
         Doc {
             lines: rendered.lines,
             messages: rendered.messages,
+            entries: rendered.entries,
             targets: rendered
                 .targets
                 .into_iter()

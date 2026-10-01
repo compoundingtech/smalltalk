@@ -16,6 +16,9 @@ pub struct Doc<H = crate::PaneIntent> {
     /// Canonical messages whose body occupies these document lines. A client acknowledges only
     /// spans that intersect its rendered viewport, never a fetched page or a message header.
     pub messages: Vec<(String, std::ops::Range<usize>)>,
+    /// The line each conversation entry starts on, so a pane read in the middle can keep its
+    /// place by entry while lines are added or removed above it.
+    pub entries: Vec<(String, usize)>,
 }
 
 impl<H> Doc<H> {
@@ -43,6 +46,12 @@ impl<H> Doc<H> {
                 .into_iter()
                 .map(|(id, range)| (id, range.start + base..range.end + base)),
         );
+        self.entries.extend(
+            other
+                .entries
+                .into_iter()
+                .map(|(id, line)| (id, line + base)),
+        );
         for target in other.targets {
             self.targets.push(Target {
                 line: base + target.line,
@@ -69,6 +78,7 @@ impl<H> Default for Doc<H> {
             lines: Vec::new(),
             targets: Vec::new(),
             messages: Vec::new(),
+            entries: Vec::new(),
         }
     }
 }

@@ -73,6 +73,7 @@ impl Cache {
                 .entry(key)
                 .or_insert_with(|| Rc::new(render_entry(entry, width, open, spinner, theme)))
                 .clone();
+            doc.entries.push((entry.id.clone(), doc.lines.len()));
             doc.append((*rendered).clone(), 0);
         }
         doc
