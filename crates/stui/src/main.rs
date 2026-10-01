@@ -2678,6 +2678,7 @@ fn main() -> Result<()> {
         runtime.spawn(feed::run_members(
             clients,
             profile.is_some(),
+            ui::glass_request(&args).is_some(),
             updates,
             command_receiver,
         ));

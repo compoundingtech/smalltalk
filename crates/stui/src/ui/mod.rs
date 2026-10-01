@@ -147,6 +147,8 @@ pub enum Effect {
         title: String,
         text: String,
     },
+    /// Keep a glass in st, or delete it there.
+    SaveGlass(glass::GlassWrite),
 }
 
 /// An agent's live terminal screen, drawn in place of its conversation.

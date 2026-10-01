@@ -9,6 +9,8 @@ use super::glass_store::{self, Stored, StoredGlass, StoredTab};
 use super::layout::{Layout, Side};
 use super::*;
 use ratatui::style::Color;
+use st3_client::{GlassBody, GlassLayout, GlassSplit, GlassTab};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 /// The palette's sections, in order; a digit key opens the palette at one.
@@ -22,6 +24,41 @@ pub(crate) struct Glasses {
     palette: Option<Palette>,
     /// Where they are kept on this device; none in the demo.
     store: Option<PathBuf>,
+    /// st keeps them too: it granted glasses and sent the person's set.
+    graph: bool,
+    /// Changes st has not confirmed, newest per glass id, each with the key a retry reuses.
+    pending: BTreeMap<String, GlassWrite>,
+}
+
+/// A change for st to keep. The body travels as JSON text and the idempotency key goes with
+/// it, so a retry is the same request.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum GlassWrite {
+    Put {
+        id: String,
+        body: String,
+        base: Option<String>,
+        key: String,
+    },
+    Delete {
+        id: String,
+        base: Option<String>,
+        key: String,
+    },
+}
+
+impl GlassWrite {
+    pub(crate) fn id(&self) -> &str {
+        match self {
+            GlassWrite::Put { id, .. } | GlassWrite::Delete { id, .. } => id,
+        }
+    }
+
+    pub(crate) fn key(&self) -> &str {
+        match self {
+            GlassWrite::Put { key, .. } | GlassWrite::Delete { key, .. } => key,
+        }
+    }
 }
 
 /// A named workspace: Home, then tabs of panes.
@@ -29,6 +66,8 @@ pub(crate) struct Glasses {
 struct Glass {
     /// Stable across renames; the graph will keep the glass under it.
     id: String,
+    /// The graph's revision this glass last matched; `None` until st has kept it.
+    revision: Option<String>,
     name: String,
     /// The tabs after Home, which is always first and cannot be closed.
     tabs: Vec<Tab>,
@@ -46,9 +85,47 @@ struct Tab {
 }
 
 impl Glass {
+    /// The glass as st keeps it: structure only.
+    fn body(&self) -> GlassBody {
+        GlassBody {
+            name: self.name.clone(),
+            tabs: self
+                .tabs
+                .iter()
+                .map(|tab| GlassTab {
+                    title: tab.title.clone(),
+                    layout: to_wire(&tab.layout),
+                })
+                .collect(),
+        }
+    }
+
+    /// Take st's structure, keeping which tab and pane this window shows where they still are.
+    fn take(&mut self, body: GlassBody, revision: Option<String>) {
+        let focus = self.tabs.iter().map(|tab| tab.focus).collect::<Vec<_>>();
+        self.name = body.name;
+        self.tabs = body
+            .tabs
+            .into_iter()
+            .enumerate()
+            .map(|(index, tab)| {
+                let layout = from_wire(tab.layout);
+                let leaves = layout.leaves().len();
+                Tab {
+                    title: tab.title,
+                    focus: focus.get(index).copied().unwrap_or(0).min(leaves - 1),
+                    layout,
+                }
+            })
+            .collect();
+        self.current = self.current.min(self.tabs.len());
+        self.revision = revision;
+    }
+
     fn new(name: String) -> Self {
         Self {
             id: new_id(),
+            revision: None,
             name,
             tabs: Vec::new(),
             current: 0,
@@ -92,6 +169,7 @@ impl Glasses {
                 } else {
                     glass.id
                 },
+                revision: glass.revision,
                 name: glass.name,
                 tabs: glass
                     .tabs
@@ -118,7 +196,26 @@ impl Glasses {
             shown,
             palette: None,
             store,
+            graph: false,
+            pending: BTreeMap::new(),
         }
+    }
+
+    /// A write keeping glass `id` as it is now, when st keeps glasses; it replaces any write
+    /// for that glass st has not confirmed.
+    fn write(&mut self, id: &str) -> Option<GlassWrite> {
+        if !self.graph {
+            return None;
+        }
+        let glass = self.all.iter().find(|glass| glass.id == id)?;
+        let write = GlassWrite::Put {
+            id: glass.id.clone(),
+            body: serde_json::to_string(&glass.body()).ok()?,
+            base: glass.revision.clone(),
+            key: new_id(),
+        };
+        self.pending.insert(glass.id.clone(), write.clone());
+        Some(write)
     }
 
     fn glass(&self) -> &Glass {
@@ -140,6 +237,7 @@ impl Glasses {
                 .iter()
                 .map(|glass| StoredGlass {
                     id: glass.id.clone(),
+                    revision: glass.revision.clone(),
                     name: glass.name.clone(),
                     tabs: glass
                         .tabs
@@ -999,32 +1097,48 @@ impl Ui {
             Action::ShowGlass(index) => self.show_glass(index),
             Action::NewGlass(name) => {
                 let name = glasses.unused_name(&name);
-                glasses.all.push(Glass::new(name));
+                let glass = Glass::new(name);
+                let id = glass.id.clone();
+                glasses.all.push(glass);
                 let last = glasses.all.len() - 1;
                 self.show_glass(last);
+                self.glass_changed(&id);
             }
             Action::RenameGlass(name) => {
                 if glasses.all.iter().any(|glass| glass.name == name) {
                     self.flash(format!("A glass is already called “{name}”"));
                 } else {
                     glasses.glass_mut().name = name;
-                    glasses.save();
+                    let id = glasses.glass().id.clone();
+                    self.glass_changed(&id);
                 }
             }
             Action::DuplicateGlass(name) => {
                 let mut copy = glasses.glass().clone();
                 copy.id = new_id();
+                copy.revision = None;
                 copy.name = glasses.unused_name(&name);
+                let id = copy.id.clone();
                 glasses.all.push(copy);
                 let last = glasses.all.len() - 1;
                 self.show_glass(last);
+                self.glass_changed(&id);
             }
             Action::CloseGlass => {
                 if glasses.all.len() > 1 {
-                    let closed = glasses.all.remove(glasses.shown).name;
+                    let closed = glasses.all.remove(glasses.shown);
                     let next = glasses.shown.saturating_sub(1);
+                    if glasses.graph {
+                        let write = GlassWrite::Delete {
+                            id: closed.id.clone(),
+                            base: closed.revision.clone(),
+                            key: new_id(),
+                        };
+                        glasses.pending.insert(closed.id.clone(), write.clone());
+                        self.effects.push(Effect::SaveGlass(write));
+                    }
                     self.show_glass(next);
-                    self.flash(format!("Closed the glass “{closed}”"));
+                    self.flash(format!("Closed the glass “{}”", closed.name));
                 }
             }
         }
@@ -1051,10 +1165,12 @@ impl Ui {
                 layout: Layout::pane(&key),
                 focus: 0,
             });
+            let id = glass.id.clone();
             glasses.all.push(glass);
             let last = glasses.all.len() - 1;
             self.show_glass(last);
             self.show_tab(1);
+            self.glass_changed(&id);
             return;
         }
         if let Some((tab, leaf)) = glasses.glass().find(&key) {
@@ -1084,9 +1200,145 @@ impl Ui {
                 glass.current = glass.tabs.len();
             }
         }
-        glasses.save();
-        let current = glasses.glass().current;
+        let (id, current) = (glasses.glass().id.clone(), glasses.glass().current);
+        self.glass_changed(&id);
         self.show_tab(current);
+    }
+
+    /// Keep a changed glass: on this device, and in st when st keeps glasses.
+    fn glass_changed(&mut self, id: &str) {
+        let Some(glasses) = self.glasses.as_mut() else {
+            return;
+        };
+        glasses.save();
+        if let Some(write) = glasses.write(id) {
+            self.effects.push(Effect::SaveGlass(write));
+        }
+    }
+
+    /// The person's glasses as st has them now. A glass st changed takes st's structure, a
+    /// glass made elsewhere appears, and one deleted elsewhere goes, except while a change of
+    /// ours is on its way. The first time, glasses kept only on this device move into st.
+    pub(crate) fn glasses_from_graph(&mut self, remote: Vec<st3_client::Glass>) {
+        let Some(glasses) = self.glasses.as_mut() else {
+            return;
+        };
+        let first = !glasses.graph;
+        glasses.graph = true;
+        let shown = glasses.glass().id.clone();
+        let mut present = BTreeSet::new();
+        for item in remote {
+            let (Some(body), false) = (item.body, item.deleted) else {
+                continue;
+            };
+            let id = item
+                .header
+                .id
+                .rsplit('/')
+                .next()
+                .unwrap_or_default()
+                .to_owned();
+            present.insert(id.clone());
+            if glasses.pending.contains_key(&id) {
+                continue;
+            }
+            let revision = Some(item.header.revision);
+            match glasses.all.iter_mut().find(|glass| glass.id == id) {
+                Some(glass) if glass.revision == revision => {}
+                Some(glass) => glass.take(body, revision),
+                None => {
+                    let mut glass = Glass::new(String::new());
+                    glass.id = id;
+                    glass.take(body, revision);
+                    glasses.all.push(glass);
+                }
+            }
+        }
+        let Glasses { all, pending, .. } = glasses;
+        let before = all.len();
+        all.retain(|glass| {
+            present.contains(&glass.id)
+                || glass.revision.is_none()
+                || pending.contains_key(&glass.id)
+        });
+        let gone = before - all.len();
+        if all.is_empty() {
+            all.push(Glass::new("main".into()));
+        }
+        glasses.shown = glasses
+            .all
+            .iter()
+            .position(|glass| glass.id == shown)
+            .unwrap_or(0);
+        let unsent = glasses
+            .all
+            .iter()
+            .filter(|glass| glass.revision.is_none() && !glasses.pending.contains_key(&glass.id))
+            .filter(|_| first)
+            .map(|glass| glass.id.clone())
+            .collect::<Vec<_>>();
+        for id in unsent {
+            if let Some(write) = glasses.write(&id) {
+                self.effects.push(Effect::SaveGlass(write));
+            }
+        }
+        if let Some(glasses) = self.glasses.as_ref() {
+            glasses.save();
+        }
+        if gone > 0 {
+            self.flash(match gone {
+                1 => "A glass was closed elsewhere".to_owned(),
+                n => format!("{n} glasses were closed elsewhere"),
+            });
+        }
+        let current = self
+            .glasses
+            .as_ref()
+            .map(|glasses| glasses.glass().current)
+            .unwrap_or_default();
+        self.show_tab(current);
+    }
+
+    /// st answered a write. A newer write for the same glass waits for its own answer; a
+    /// failed one stays pending and goes again when st is reachable.
+    pub(crate) fn glass_saved(
+        &mut self,
+        id: &str,
+        key: &str,
+        outcome: Result<Option<String>, String>,
+    ) {
+        let Some(glasses) = self.glasses.as_mut() else {
+            return;
+        };
+        let current = glasses
+            .pending
+            .get(id)
+            .is_some_and(|write| write.key() == key);
+        match outcome {
+            Ok(revision) => {
+                if current {
+                    glasses.pending.remove(id);
+                }
+                if let Some(glass) = glasses.all.iter_mut().find(|glass| glass.id == id)
+                    && revision.is_some()
+                {
+                    glass.revision = revision;
+                }
+                glasses.save();
+            }
+            Err(error) if current => self.flash(format!(
+                "st did not keep a glass yet ({error}); stui will try again"
+            )),
+            Err(_) => {}
+        }
+    }
+
+    /// Writes st has not confirmed, to send again once it is reachable.
+    pub(crate) fn unsent_glass_writes(&self) -> Vec<GlassWrite> {
+        self.glasses
+            .as_ref()
+            .map(|glasses| glasses.pending.values().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub(crate) fn show_tab(&mut self, index: usize) {
@@ -1219,8 +1471,8 @@ impl Ui {
             }
             None => glass.current = glass.current.min(glass.tabs.len()),
         }
-        glasses.save();
-        let current = glasses.glass().current;
+        let (id, current) = (glasses.glass().id.clone(), glasses.glass().current);
+        self.glass_changed(&id);
         self.show_tab(current);
     }
 
@@ -1288,6 +1540,51 @@ impl Ui {
         }
         if let Some(position) = position {
             self.selected[tab] = position;
+        }
+    }
+}
+
+/// A layout as st's client types spell it. stui splits two at a time; a longer split nests.
+fn to_wire(layout: &Layout) -> GlassLayout {
+    match layout {
+        Layout::Pane { pane } => GlassLayout::Pane { pane: pane.clone() },
+        Layout::Split { split, children } => {
+            let split_wire = match split {
+                Side::Right => GlassSplit::Right,
+                Side::Below => GlassSplit::Below,
+            };
+            match children.as_slice() {
+                [] => GlassLayout::Pane {
+                    pane: String::new(),
+                },
+                [only] => to_wire(only),
+                [first, rest @ ..] => GlassLayout::Split {
+                    split: split_wire,
+                    children: [
+                        Box::new(to_wire(first)),
+                        Box::new(to_wire(&Layout::Split {
+                            split: *split,
+                            children: rest.to_vec(),
+                        })),
+                    ],
+                },
+            }
+        }
+    }
+}
+
+fn from_wire(layout: GlassLayout) -> Layout {
+    match layout {
+        GlassLayout::Pane { pane } => Layout::Pane { pane },
+        GlassLayout::Split { split, children } => {
+            let [first, second] = children;
+            Layout::Split {
+                split: match split {
+                    GlassSplit::Right => Side::Right,
+                    GlassSplit::Below => Side::Below,
+                },
+                children: vec![from_wire(*first), from_wire(*second)],
+            }
         }
     }
 }
@@ -1534,6 +1831,155 @@ mod tests {
                 .glass()
                 .name,
             "review"
+        );
+    }
+
+    /// A glass as st sends it.
+    fn graph_glass(id: &str, revision: &str, name: &str, panes: &[&str]) -> st3_client::Glass {
+        serde_json::from_value(serde_json::json!({
+            "kind": "glass", "id": format!("glass/person/avery/{id}"), "revision": revision,
+            "updated_at": "2026-10-01T09:00:00Z", "deleted": false,
+            "base_revision": null, "replaced_revision": null,
+            "body": {"name": name, "tabs": panes.iter().map(|pane| serde_json::json!({"layout": {"pane": pane}})).collect::<Vec<_>>()},
+        }))
+        .unwrap()
+    }
+
+    /// The glass writes stui asked to send, leaving other effects.
+    fn writes(ui: &mut Ui) -> Vec<GlassWrite> {
+        std::mem::take(&mut ui.effects)
+            .into_iter()
+            .filter_map(|effect| match effect {
+                Effect::SaveGlass(write) => Some(write),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn layouts_cross_the_wire_unchanged() {
+        let mut layout = Layout::pane("agent:a");
+        layout.split(0, Side::Right, "mission:m");
+        layout.split(1, Side::Below, "machine:h");
+        assert_eq!(from_wire(to_wire(&layout)), layout);
+    }
+
+    #[test]
+    fn st_keeps_glasses_once_it_sends_them_and_device_glasses_move_in_once() {
+        let mut ui = glass();
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, "atlas builder");
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(
+            writes(&mut ui).is_empty(),
+            "nothing is written before st sends glasses"
+        );
+        let local = ui.glasses.as_ref().unwrap().glass().id.clone();
+
+        // st has one glass made elsewhere; this device's glass moves in.
+        ui.glasses_from_graph(vec![graph_glass("0190-a", "r1", "review", &[WEEKLY])]);
+        let sent = writes(&mut ui);
+        assert_eq!(sent.len(), 1);
+        let GlassWrite::Put {
+            id,
+            body,
+            base,
+            key,
+        } = &sent[0]
+        else {
+            panic!("a put")
+        };
+        assert_eq!((id, base), (&local, &None));
+        let body: GlassBody = serde_json::from_str(body).unwrap();
+        assert_eq!(body.name, "main");
+        assert_eq!(body.tabs.len(), 1);
+        let names = ui
+            .glasses
+            .as_ref()
+            .unwrap()
+            .all
+            .iter()
+            .map(|glass| glass.name.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["main", "review"]);
+        assert_eq!(
+            ui.glasses.as_ref().unwrap().glass().name,
+            "main",
+            "still showing main"
+        );
+
+        // Until st answers, the write is pending, and a snapshot without it does not drop it.
+        ui.glasses_from_graph(vec![graph_glass("0190-a", "r1", "review", &[WEEKLY])]);
+        assert!(writes(&mut ui).is_empty(), "no glass moves in twice");
+        assert_eq!(
+            ui.unsent_glass_writes(),
+            sent,
+            "a retry reuses the same key"
+        );
+        ui.glass_saved(&local, key, Ok(Some("r7".into())));
+        assert!(ui.unsent_glass_writes().is_empty());
+        assert_eq!(
+            ui.glasses.as_ref().unwrap().glass().revision.as_deref(),
+            Some("r7")
+        );
+
+        // A change made elsewhere arrives.
+        ui.glasses_from_graph(vec![
+            graph_glass(&local, "r8", "main", &[ATLAS, WEEKLY]),
+            graph_glass("0190-a", "r1", "review", &[WEEKLY]),
+        ]);
+        assert_eq!(
+            tabs(&ui).1,
+            vec![vec![ATLAS.to_owned()], vec![WEEKLY.to_owned()]]
+        );
+
+        // A change here goes to st on top of what st last sent.
+        press(&mut ui, KeyCode::Char('2'), KeyModifiers::ALT);
+        ctrl(&mut ui, 'w');
+        let sent = writes(&mut ui);
+        assert!(
+            matches!(&sent[..], [GlassWrite::Put { base, .. }] if base.as_deref() == Some("r8"))
+        );
+        // A failure keeps it for the next try.
+        ui.glass_saved(&local, sent[0].key(), Err("member restarting".into()));
+        assert_eq!(ui.unsent_glass_writes(), sent);
+    }
+
+    #[test]
+    fn a_glass_closed_elsewhere_goes_and_closing_one_here_deletes_it_in_st() {
+        let mut ui = glass();
+        let main = ui.glasses.as_ref().unwrap().glass().id.clone();
+        ui.glasses_from_graph(vec![
+            graph_glass(&main, "r1", "main", &[]),
+            graph_glass("0190-b", "r2", "spare", &[]),
+            graph_glass("0190-c", "r3", "old", &[]),
+        ]);
+        writes(&mut ui);
+        assert_eq!(ui.glasses.as_ref().unwrap().all.len(), 3);
+        ui.glasses_from_graph(vec![
+            graph_glass(&main, "r1", "main", &[]),
+            graph_glass("0190-b", "r2", "spare", &[]),
+        ]);
+        assert_eq!(
+            ui.glasses.as_ref().unwrap().all.len(),
+            2,
+            "old was closed elsewhere"
+        );
+
+        // Close "spare" from here: st is told to delete it, against what st last sent.
+        ui.show_glass(1);
+        ui.open_palette(Some(GLASSES), Open::Here);
+        let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
+        let close = ui
+            .matches(palette)
+            .iter()
+            .position(|choice| choice.action == Action::CloseGlass)
+            .unwrap();
+        ui.open_choice(Some(close), Open::Here);
+        let sent = writes(&mut ui);
+        assert!(
+            matches!(&sent[..], [GlassWrite::Delete { id, base, .. }] if id == "0190-b" && base.as_deref() == Some("r2")),
+            "{sent:?}"
         );
     }
 
