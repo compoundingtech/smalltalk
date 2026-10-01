@@ -150,6 +150,9 @@ WHERE kind='message.sent';
 CREATE INDEX IF NOT EXISTS claims_actor_progress_index
 ON claims(actor, store_index)
 WHERE kind IN ('work.progress', 'work.submitted');
+CREATE INDEX IF NOT EXISTS claims_actor_work_activity_index
+ON claims(actor, json_extract(body, '$.fields.claim_incarnation'), store_index)
+WHERE kind IN ('work.claimed', 'work.progress');
 CREATE INDEX IF NOT EXISTS claims_timeline_incarnation_index
 ON claims(subject, kind, json_extract(body, '$.fields.incarnation_id'), store_index)
 WHERE kind='harness.timeline';
@@ -512,6 +515,9 @@ CREATE INDEX IF NOT EXISTS step_runs_assignee_index ON step_runs(assignee, statu
 -- The steps a lease holds, a handful of all the steps a fleet has ever run.
 CREATE INDEX IF NOT EXISTS step_runs_lease_index ON step_runs(lease_owner)
 WHERE lease_owner IS NOT NULL;
+-- The few steps offered to several seats, so a seat's steps are found without reading every step.
+CREATE INDEX IF NOT EXISTS step_runs_available_index ON step_runs(run_id)
+WHERE available_to!='[]';
 -- The steps that have not finished, a few of every step a fleet has run.
 CREATE INDEX IF NOT EXISTS step_runs_open_index ON step_runs(created_at_unix_ms, step_path)
 WHERE status NOT IN ('completed','failed','cancelled');
@@ -6509,7 +6515,12 @@ impl Store {
     ) -> Result<Vec<StepRunView>> {
         let actor = actor.map(|value| normalize_actor(value, "agent"));
         let connection = self.readers.get();
-        let mut statement = connection.prepare(&work_at_snapshot_query(open_only))?;
+        let query = if actor.is_some() {
+            seat_work_at_snapshot_query(open_only)
+        } else {
+            work_at_snapshot_query(open_only)
+        };
+        let mut statement = connection.prepare_cached(&query)?;
         let rows = statement.query_map(
             params![actor.as_deref(), include_terminal, include_agentless],
             step_run_from_row,
@@ -11124,6 +11135,8 @@ impl Store {
 
     pub fn pending_observer_refresh_attempt(&self, observer: &str) -> Result<Option<String>> {
         let connection = self.readers.get();
+        // The observations are listed once, not scanned for each request; see
+        // `pending_subscription_mission_requests`.
         connection
             .query_row(
                 &canonical_sql(
@@ -11131,12 +11144,14 @@ impl Store {
                  FROM claims request
                  WHERE request.subject=?1
                    AND request.kind='observer.refresh-requested'
-                   AND NOT EXISTS (
-                     SELECT 1 FROM claims result
-                     WHERE result.subject=request.subject
-                       AND result.kind IN ('observer.observed', 'observer.state')
-                       AND json_extract(result.body, '$.fields.attempt')=
-                           json_extract(request.body, '$.fields.attempt')
+                   AND (
+                     json_extract(request.body, '$.fields.attempt') IS NULL
+                     OR json_extract(request.body, '$.fields.attempt') NOT IN (
+                       SELECT json_extract(result.body, '$.fields.attempt') FROM claims result
+                       WHERE result.subject=?1
+                         AND result.kind IN ('observer.observed', 'observer.state')
+                         AND json_extract(result.body, '$.fields.attempt') IS NOT NULL
+                     )
                    )
                  ORDER BY CANONICAL_ASC(request)
                  LIMIT 1",
@@ -11876,16 +11891,14 @@ impl Store {
     /// non-runtime claims, without reducing the subject's entire history.
     pub fn selected_actual_origin(&self, subject: &str) -> Result<Option<String>> {
         let connection = self.readers.get();
+        // Walk the accepted-time index newest first: sorting every runtime observation of the
+        // subject cost each settled stop, checked on every pass, a tenth of a millisecond.
         let runtime_origin = connection
-            .query_row(
-                &canonical_sql(
-                    "SELECT origin FROM claims
-                 WHERE subject=?1 AND kind='runtime.observed'
-                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-                ),
-                [subject],
-                |row| row.get(0),
-            )
+            .prepare_cached(&format!(
+                "{} LIMIT 1",
+                newest_claims_of_kind_query("claims.origin", "runtime.observed")
+            ))?
+            .query_row(params![subject, i64::MAX as u64], |row| row.get(0))
             .optional()?;
         if runtime_origin.is_some() {
             return Ok(runtime_origin);
@@ -12558,21 +12571,24 @@ impl Store {
 
     pub fn pending_subscription_mission_requests(&self, subject: &str) -> Result<Vec<ClaimRecord>> {
         let connection = self.readers.get();
+        // Every pass asks this for every subscription. The finished requests are listed once, not
+        // scanned for each request: a correlated NOT EXISTS read every finished claim once per
+        // request, 0.4 s a pass for a subscription with hundreds of runs.
         let mut statement = connection.prepare(&canonical_sql(
             "SELECT request.id, request.store_index, request.batch_id, request.subject,
                     request.kind, request.origin, request.actor, request.body,
                     request.predecessors, request.accepted_at_unix_ms
              FROM claims AS request
              WHERE request.subject=?1 AND request.kind='subscription.mission-requested'
-               AND NOT EXISTS (
-                 SELECT 1 FROM claims AS finished
-                 WHERE finished.subject=request.subject
+               AND request.id NOT IN (
+                 SELECT json_extract(finished.body, '$.fields.request') FROM claims AS finished
+                 WHERE finished.subject=?1
                    AND finished.kind IN (
                      'subscription.mission-started',
                      'subscription.mission-failed',
                      'subscription.mission-request-cancelled'
                    )
-                   AND json_extract(finished.body, '$.fields.request')=request.id
+                   AND json_extract(finished.body, '$.fields.request') IS NOT NULL
                )
              ORDER BY CANONICAL_ASC(request)",
         ))?;
@@ -12747,11 +12763,11 @@ impl Store {
                     request.predecessors, request.accepted_at_unix_ms
              FROM claims AS request
              WHERE request.subject=?1 AND request.kind='schedule.work-requested'
-               AND NOT EXISTS (
-                 SELECT 1 FROM claims AS closed
-                 WHERE closed.subject=request.subject
+               AND request.id NOT IN (
+                 SELECT json_extract(closed.body, '$.fields.request') FROM claims AS closed
+                 WHERE closed.subject=?1
                    AND closed.kind IN ('schedule.work-started','schedule.work-failed')
-                   AND json_extract(closed.body, '$.fields.request')=request.id
+                   AND json_extract(closed.body, '$.fields.request') IS NOT NULL
                )
              ORDER BY CANONICAL_ASC(request)",
         ))?;
@@ -29176,6 +29192,34 @@ fn work_at_snapshot_query(open_only: bool) -> String {
     )
 }
 
+/// [`work_at_snapshot_query`] for one named actor `?1`. The reconciler reads each running seat's
+/// steps on every pass; the actor's steps are found through the assignee and lease indexes, and
+/// the few steps offered to several seats through their own index, instead of scanning every
+/// step the store ever ran.
+fn seat_work_at_snapshot_query(open_only: bool) -> String {
+    let open = if open_only {
+        "AND status NOT IN ('completed','failed','cancelled')"
+    } else {
+        ""
+    };
+    format!(
+        "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
+                lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
+         FROM step_runs
+         WHERE rowid IN (
+                 SELECT rowid FROM step_runs WHERE assignee=?1
+                 UNION SELECT rowid FROM step_runs WHERE lease_owner=?1
+                 UNION SELECT rowid FROM step_runs WHERE available_to!='[]'
+                   AND EXISTS (SELECT 1 FROM json_each(step_runs.available_to) WHERE value=?1)
+               )
+           AND (agentless=0 OR (?3 AND ?1 IS NULL))
+           AND generation_id=(SELECT current_generation_id FROM mission_runs WHERE id=step_runs.run_id)
+           AND (?2 OR status NOT IN ('pending','completed','failed','cancelled'))
+           {open}
+         ORDER BY created_at_unix_ms, step_path"
+    )
+}
+
 /// Read seat-queue inputs for one seat or the whole roster. A live run is queued
 /// while its current generation has a step for the seat, and it keeps the join
 /// time of its first such step in any generation. Runs that are no longer
@@ -40377,6 +40421,16 @@ version 2
             open_steps.contains("step_runs_open_index"),
             "a seat queue must read the open steps, not every step:\n{open_steps}"
         );
+        for open_only in [false, true] {
+            let seat_steps = plan(&seat_work_at_snapshot_query(open_only));
+            assert!(
+                seat_steps.contains("step_runs_assignee_index (assignee=?)")
+                    && seat_steps.contains("step_runs_lease_index (lease_owner=?)")
+                    && seat_steps.contains("step_runs_available_index")
+                    && !seat_steps.contains("SCAN step_runs\n"),
+                "a seat's steps must be found by seat, not by reading every step:\n{seat_steps}"
+            );
+        }
         let joins = plan(&seat_queue_joins_query());
         assert!(
             joins.contains("SCAN mission_runs USING INDEX mission_runs_open_index")

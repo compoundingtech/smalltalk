@@ -166,6 +166,14 @@ struct ClientPageCursor {
 }
 
 fn signal_changed(state: &AppState) {
+    crate::performance::record_wake("api", None);
+    state.notify.notify_one();
+    signal_visible_change(state);
+}
+
+/// [`signal_changed`] for a claim, counting the wake under the claim's kind.
+fn signal_claim_changed(state: &AppState, kind: &str) {
+    crate::performance::record_wake("api", Some(kind));
     state.notify.notify_one();
     signal_visible_change(state);
 }
@@ -5615,6 +5623,7 @@ async fn replication_receive(
     .await?;
     if response.changed {
         if reconcile_changed {
+            crate::performance::record_wake("replication receive", None);
             state.notify.notify_one();
         }
         state
@@ -8050,7 +8059,7 @@ async fn post_claim(
         } else if kind == "harness.usage" {
             signal_visible_change(&state);
         } else {
-            signal_changed(&state);
+            signal_claim_changed(&state, &kind);
         }
     }
     Ok(Json(response))
