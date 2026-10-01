@@ -71,6 +71,11 @@ st agents apply agents/example.kdl --as person/operator
 The convenience form is `st agents start agents/example --harness codex --workspace
 /work/example --as person/operator`. Add `--print-kdl` to review its exact KDL first.
 
+`st agents start agent/agents/example --harness codex --workspace /work/example --as
+person/operator` names the same seat: pass either the identity or its complete `agent/` subject.
+Slash-qualified and dotted identities are exact; a simple name is prefixed with its placement
+host, as in `agent/HOST.NAME`. A doubled `agent/agent/` prefix is rejected.
+
 ## Review before start
 
 Create and review a launch before any cutover:

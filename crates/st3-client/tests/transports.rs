@@ -15,8 +15,8 @@ use st3::model::ClaimInput;
 use st3::store::Store;
 use st3_client::{
     Capabilities, Client, ClientError, CollectionEvent, Envelope, ErrorCode, Fence,
-    LaunchVariantParameters, PairingBegin, PairingComplete, PersonStepParameters, Resource,
-    TargetParameters, TerminalAttachment, TerminalColor, TerminalInputMode,
+    LaunchVariantParameters, PairingBegin, PairingComplete, PersonStepParameters, RawTerminalMode,
+    Resource, TargetParameters, TerminalAttachment, TerminalColor, TerminalInputMode,
     TerminalInputParameters, TerminalResizeParameters, TerminalRun, TerminalScreen, TerminalStream,
     TimelineBody, TimelineUsageSemantics,
 };
@@ -94,12 +94,14 @@ fn publish_terminal(state: &AppState, incarnation: &str) {
         .send_modify(|generation| *generation = generation.saturating_add(1));
 }
 
-/// A PTY session socket that answers a read-only PEEK the way `pty` does: the geometry, the
-/// replayed screen, then live output until the process exits.
+/// A PTY session socket that answers ATTACH/PEEK with replay, then live output until exit.
+/// Its input and close notifications let raw transports prove byte fidelity and cancellation.
 #[derive(Clone)]
 struct FakePty {
     replay: Arc<std::sync::Mutex<Vec<u8>>>,
     output: tokio::sync::broadcast::Sender<Option<Vec<u8>>>,
+    input: tokio::sync::broadcast::Sender<Vec<u8>>,
+    closed: Arc<Notify>,
 }
 
 fn pty_packet(kind: u8, payload: &[u8]) -> Vec<u8> {
@@ -112,12 +114,19 @@ fn pty_packet(kind: u8, payload: &[u8]) -> Vec<u8> {
 impl FakePty {
     fn start(state: &AppState, rows: u16, columns: u16) -> Self {
         std::fs::create_dir_all(&state.pty_root).unwrap();
+        std::fs::write(
+            state.pty_root.join("terminal-demo-runtime.json"),
+            serde_json::json!({ "createdAt": "2026-09-30T00:00:00.000Z" }).to_string(),
+        )
+        .unwrap();
         let listener =
             tokio::net::UnixListener::bind(state.pty_root.join("terminal-demo-runtime.sock"))
                 .unwrap();
         let pty = Self {
             replay: Arc::new(std::sync::Mutex::new(b"terminal ready\r\n$ ".to_vec())),
             output: tokio::sync::broadcast::channel(4_096).0,
+            input: tokio::sync::broadcast::channel(32).0,
+            closed: Arc::new(Notify::new()),
         };
         let session = pty.clone();
         tokio::spawn(async move {
@@ -127,28 +136,64 @@ impl FakePty {
                     let replay = session.replay.lock().unwrap();
                     (replay.clone(), session.output.subscribe())
                 };
+                let input = session.input.clone();
+                let closed = session.closed.clone();
                 tokio::spawn(async move {
-                    let mut peek = [0_u8; 6];
-                    if stream.read_exact(&mut peek).await.is_err() || peek[0] != 6 {
-                        return;
-                    }
-                    let mut geometry = rows.to_be_bytes().to_vec();
-                    geometry.extend(columns.to_be_bytes());
-                    if stream.write_all(&pty_packet(10, &geometry)).await.is_err()
-                        || stream.write_all(&pty_packet(5, &replay)).await.is_err()
-                    {
-                        return;
-                    }
-                    while let Ok(output) = output.recv().await {
-                        let exited = output.is_none();
-                        let packet = match output {
-                            Some(bytes) => pty_packet(0, &bytes),
-                            None => pty_packet(4, &0_i32.to_be_bytes()),
-                        };
-                        if stream.write_all(&packet).await.is_err() || exited {
+                    async {
+                        let mut header = [0_u8; 5];
+                        if stream.read_exact(&mut header).await.is_err()
+                            || !matches!(header[0], 1 | 6)
+                        {
                             return;
                         }
-                    }
+                        let length = u32::from_be_bytes(header[1..].try_into().unwrap()) as usize;
+                        if length > 16_384 {
+                            return;
+                        }
+                        let mut opening = header.to_vec();
+                        opening.resize(5 + length, 0);
+                        if stream.read_exact(&mut opening[5..]).await.is_err() {
+                            return;
+                        }
+                        let _ = input.send(opening);
+                        if header[0] == 6 {
+                            let mut geometry = rows.to_be_bytes().to_vec();
+                            geometry.extend(columns.to_be_bytes());
+                            if stream.write_all(&pty_packet(10, &geometry)).await.is_err() {
+                                return;
+                            }
+                        }
+                        if stream.write_all(&pty_packet(5, &replay)).await.is_err() {
+                            return;
+                        }
+                        let (mut reader, mut writer) = stream.into_split();
+                        let uploads = async {
+                            let mut bytes = [0_u8; 16_384];
+                            loop {
+                                let Ok(count @ 1..) = reader.read(&mut bytes).await else {
+                                    return;
+                                };
+                                let _ = input.send(bytes[..count].to_vec());
+                            }
+                        };
+                        let downloads = async {
+                            while let Ok(output) = output.recv().await {
+                                let exited = output.is_none();
+                                let packet = match output {
+                                    Some(bytes) => pty_packet(0, &bytes),
+                                    None => pty_packet(4, &0_i32.to_be_bytes()),
+                                };
+                                if writer.write_all(&packet).await.is_err() || exited {
+                                    return;
+                                }
+                            }
+                        };
+                        tokio::select! {
+                            () = uploads => {}
+                            () = downloads => {}
+                        }
+                    }.await;
+                    closed.notify_one();
                 });
             }
         });
@@ -212,6 +257,185 @@ async fn serve_terminal_state(
         Client::unix_as(&socket, "person/avery"),
         server.abort_handle(),
     )
+}
+
+async fn assert_raw_terminal_transport(
+    client: &Client,
+    pty: &FakePty,
+    incarnation: &str,
+    mode: RawTerminalMode,
+    replay: &mut Vec<u8>,
+) {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let mut input = pty.input.subscribe();
+    let attachment = client
+        .raw_terminal_attachment("terminal/agent/terminal-demo", incarnation, mode)
+        .await
+        .unwrap();
+    assert_eq!(attachment.terminal_id, "terminal/agent/terminal-demo");
+    assert_eq!(attachment.runtime_incarnation, incarnation);
+    assert_eq!(attachment.mode, mode);
+    let mut stream = client.raw_terminal_stream(&attachment).await.unwrap();
+    assert!(
+        client.raw_terminal_stream(&attachment).await.is_err(),
+        "a consumed capability must not open a second connector",
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), input.recv()).await.is_err(),
+        "the consumer, not the transport, must send the opening PTY frame",
+    );
+    let opening = match mode {
+        RawTerminalMode::Attach => pty_packet(1, &[0, 24, 0, 80]),
+        RawTerminalMode::Peek => pty_packet(6, &[0]),
+    };
+    // Split inside the PTY header: WebSocket messages must not become PTY frame boundaries.
+    stream.write_all(&opening[..2]).await.unwrap();
+    stream.write_all(&opening[2..]).await.unwrap();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), input.recv())
+            .await.unwrap().unwrap(),
+        opening,
+    );
+    let mut expected = Vec::new();
+    if mode == RawTerminalMode::Peek {
+        expected.extend(pty_packet(10, &[0, 24, 0, 80]));
+    }
+    expected.extend(pty_packet(5, replay));
+    let mut received = vec![0; expected.len()];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut received))
+        .await.unwrap().unwrap();
+    assert_eq!(received, expected);
+
+    let upload = match mode {
+        RawTerminalMode::Attach => pty_packet(0, b"\0\xff\x1b[31mtyped\r\n"),
+        RawTerminalMode::Peek => pty_packet(7, b"{}"),
+    };
+    stream.write_all(&upload).await.unwrap();
+    let mut uploaded = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while uploaded.len() < upload.len() {
+            uploaded.extend(input.recv().await.unwrap());
+        }
+    }).await.unwrap();
+    assert_eq!(uploaded, upload);
+
+    let output = b"\0\xff\x1b[?1049h\x1b[38;2;1;2;3mraw\r\n";
+    pty.write(output);
+    replay.extend_from_slice(output);
+    let expected = pty_packet(0, output);
+    let mut received = vec![0; expected.len()];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut received))
+        .await.unwrap().unwrap();
+    assert_eq!(received, expected, "output must remain PTY bytes, not a screen projection");
+    pty.exit();
+    let mut exit = [0_u8; 9];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut exit))
+        .await.unwrap().unwrap();
+    assert_eq!(exit.as_slice(), pty_packet(4, &0_i32.to_be_bytes()));
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), stream.read(&mut [0_u8; 1]))
+            .await.unwrap().unwrap(),
+        0,
+        "the remote PTY close must reach the returned connector",
+    );
+    tokio::time::timeout(Duration::from_secs(5), pty.closed.notified())
+        .await.unwrap();
+}
+
+#[tokio::test]
+async fn raw_terminal_bytes_capability_replay_and_close_over_unix() {
+    let (_root, state, pty, client, server) =
+        serve_terminal_state("raw-client-unix", 24, 80).await;
+    let incarnation = format!("{}:2026-09-30T00:00:00.000Z", std::process::id());
+    publish_terminal(&state, &incarnation);
+    let mut replay = b"terminal ready\r\n$ ".to_vec();
+    for mode in [RawTerminalMode::Attach, RawTerminalMode::Peek] {
+        assert_raw_terminal_transport(&client, &pty, &incarnation, mode, &mut replay).await;
+    }
+    server.abort();
+}
+
+#[tokio::test]
+async fn dropping_a_raw_connector_closes_a_backpressured_attachment() {
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    let (_root, state, pty, client, server) =
+        serve_terminal_state("raw-client-drop", 24, 80).await;
+    let incarnation = format!("{}:2026-09-30T00:00:00.000Z", std::process::id());
+    publish_terminal(&state, &incarnation);
+    let attachment = client
+        .raw_terminal_attachment("terminal/agent/terminal-demo", &incarnation, RawTerminalMode::Peek)
+        .await.unwrap();
+    let mut stream = client.raw_terminal_stream(&attachment).await.unwrap();
+    stream.write_all(&pty_packet(6, &[0])).await.unwrap();
+    let replay = [pty_packet(10, &[0, 24, 0, 80]), pty_packet(5, b"terminal ready\r\n$ ")].concat();
+    let mut received = vec![0_u8; replay.len()];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut received))
+        .await.unwrap().unwrap();
+    assert_eq!(received, replay);
+    pty.write(&vec![0xff; 8 * 1024 * 1024]);
+    let mut first = [0_u8; 1];
+    tokio::time::timeout(Duration::from_secs(5), stream.read_exact(&mut first))
+        .await.unwrap().unwrap();
+    assert_eq!(first, [0]);
+    drop(stream);
+    tokio::time::timeout(Duration::from_secs(5), pty.closed.notified())
+        .await.expect("dropping a slow consumer must release the PTY connection");
+    server.abort();
+}
+
+#[tokio::test]
+async fn raw_terminal_bytes_capability_replay_and_close_over_paired_gateways() {
+    let (_root, state, pty, local, unix_server) =
+        serve_terminal_state("raw-client-paired", 24, 80).await;
+    let incarnation = format!("{}:2026-09-30T00:00:00.000Z", std::process::id());
+    publish_terminal(&state, &incarnation);
+    let challenge = local.pairing_begin(&PairingBegin {
+        api_version: st3_client::API_VERSION.into(),
+        device_name: "Raw terminal device".into(),
+        person_id: "person/avery".into(),
+        full_control: Some(true),
+    }).await.unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = st3::api::fabric_router(state.clone());
+    let http_server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let paired = Client::fabric_pairing(&base).pairing_complete(
+        &challenge.value.pairing_id,
+        &PairingComplete {
+            api_version: st3_client::API_VERSION.into(),
+            code: challenge.value.code,
+            device_public_key: "raw-terminal-public-key-000000000000000000000".into(),
+        },
+    ).await.unwrap();
+    let gateway_socket = state.state_dir.join("raw-client-gateway.sock");
+    let server_socket = gateway_socket.clone();
+    let app = st3::api::fabric_router(state);
+    let gateway_server = tokio::spawn(async move {
+        st3::api::serve_unix(&server_socket, app).await
+    });
+    wait_for_socket(&gateway_socket).await;
+    let clients = [
+        Client::unix_gateway(&gateway_socket, &paired.value.credential),
+        Client::fabric_loopback(&base, &paired.value.credential),
+    ];
+    let mut replay = b"terminal ready\r\n$ ".to_vec();
+    for client in clients {
+        for mode in [RawTerminalMode::Attach, RawTerminalMode::Peek] {
+            assert_raw_terminal_transport(&client, &pty, &incarnation, mode, &mut replay).await;
+        }
+    }
+    for client in [
+        Client::unix_gateway(&gateway_socket, "invalid-credential"),
+        Client::fabric_loopback(&base, "invalid-credential"),
+    ] {
+        assert!(matches!(
+            client.raw_terminal_attachment("terminal/agent/terminal-demo", &incarnation, RawTerminalMode::Peek).await,
+            Err(ClientError::Api(ErrorCode::Forbidden, _, _)),
+        ));
+    }
+    gateway_server.abort();
+    http_server.abort();
+    unix_server.abort();
 }
 
 #[tokio::test]

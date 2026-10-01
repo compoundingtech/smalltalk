@@ -38,9 +38,19 @@ pub(crate) fn watch_recursive_mutations(
 /// never wake delivery, or a writer that observes on every turn boundary pumps itself
 /// continuously. The allowlist is what makes that free: a new sibling record is ignored with no
 /// production change (HC-R08).
+#[cfg(test)]
 pub(crate) fn watch_delivery_inputs(
     agent_dir: &Path,
     tx: Sender<()>,
+) -> Option<notify::RecommendedWatcher> {
+    watch_delivery_inputs_with_status(agent_dir, tx, true)
+}
+
+/// Native graph-owned pumps watch the inbox only; catalog pumps also watch status/DND.
+pub(crate) fn watch_delivery_inputs_with_status(
+    agent_dir: &Path,
+    tx: Sender<()>,
+    legacy_status: bool,
 ) -> Option<notify::RecommendedWatcher> {
     let inbox = agent_dir.join("resources").join("inbox");
     let inbox_for_callback = inbox.clone();
@@ -48,10 +58,9 @@ pub(crate) fn watch_delivery_inputs(
     let mut watcher = recommended_watcher(move |result: notify::Result<Event>| {
         if result.is_ok_and(|event| {
             is_mutation(&event)
-                && event
-                    .paths
-                    .iter()
-                    .any(|path| path.starts_with(&inbox_for_callback) || *path == status)
+                && event.paths.iter().any(|path| {
+                    path.starts_with(&inbox_for_callback) || (legacy_status && *path == status)
+                })
         }) {
             let _ = tx.send(());
         }
@@ -63,7 +72,9 @@ pub(crate) fn watch_delivery_inputs(
     // stays shallow because everything beside `status` is runtime state; the inbox itself is
     // st2-owned and message-flat, so its recursion is bounded by delivery traffic, not payloads.
     let inbox_for_watch = inbox;
-    watcher.watch(agent_dir, RecursiveMode::NonRecursive).ok()?;
+    if legacy_status {
+        watcher.watch(agent_dir, RecursiveMode::NonRecursive).ok()?;
+    }
     watcher
         .watch(&inbox_for_watch, RecursiveMode::Recursive)
         .ok()?;

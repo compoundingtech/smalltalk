@@ -189,6 +189,24 @@ function diagnosticTone(body: Record<string, unknown>): 'quiet' | 'warning' | 'f
 }
 
 /**
+ * Why a conversation cannot be shown whole: st could not read the harness's transcript, and sent
+ * only the Small Talk around it. Half a conversation reads as the agent ignoring the person, so
+ * neither half shows; this says why, with the transcript's path so it can be reported (Nathan,
+ * 2026-10-01). As stui's `unreadable_transcript`.
+ */
+export function unreadableTranscript(timeline: Entry[]): string | null {
+  for (const entry of [...timeline].reverse()) {
+    if (entry.type !== 'error') continue;
+    const body = record(entry.body);
+    if (str(body.code) !== 'transcript-not-bound') continue;
+    const reason = (str(body.message) ?? '').replace(/^transcript not bound: /, '');
+    const path = str(record(body.details).transcript);
+    return path ? `This conversation could not be loaded: ${reason} (transcript ${path})` : `This conversation could not be loaded: ${reason}`;
+  }
+  return null;
+}
+
+/**
  * One conversation as st joined it: the harness's turns and the agent's Small Talk, in time
  * order. `names` maps graph ids to what a person calls them; the viewer is `you`.
  */

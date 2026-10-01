@@ -274,6 +274,10 @@ agent "no-st2" {{
                 if schema != f"st.{name}.v1":
                     fail(f"fresh {name} record has legacy or unsupported schema {schema!r}")
                 checks["record_schemas"][name] = schema
+        status_files = [str(path.relative_to(root)) for path in (root / "state").rglob("status")]
+        checks["legacy_status_files"] = status_files
+        if status_files:
+            fail(f"the native seat created legacy status files: {status_files}")
         leftovers = [str(path) for path in root.rglob("st2") if path.is_dir()]
         if leftovers:
             fail(f"st2 state directories were created: {leftovers}")
