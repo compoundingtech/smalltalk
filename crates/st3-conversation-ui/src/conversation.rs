@@ -19,7 +19,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-const COLLAPSED_TOOL_LINES: usize = 5;
+/// The most rows a tool call's output takes until it is expanded, wrapped lines counted.
+const COLLAPSED_TOOL_LINES: usize = 6;
 
 #[derive(Default)]
 pub struct Cache {
@@ -161,17 +162,31 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                     Style::default().bg(bg),
                 ),
             ]));
-            let shell =
-                matches!(state, ToolState::Failed) || output.len() <= COLLAPSED_TOOL_LINES || open;
-            let shown: Vec<&String> = if shell {
-                output.iter().collect()
+            // Every row the output takes once wrapped; collapsed, a call shows its last few.
+            let mut rows = Vec::new();
+            for line in output {
+                let line = text::sanitize(line);
+                let style = if line.starts_with('+') {
+                    Style::default().fg(theme.green)
+                } else if line.starts_with('-') || line.contains("error") {
+                    Style::default().fg(theme.red)
+                } else {
+                    Style::default().fg(theme.subtext0)
+                };
+                rows.extend(text::wrap(
+                    &[run(line, style)],
+                    width,
+                    &[run("   ", style)],
+                    &[run("   ", style)],
+                    Some(bg),
+                ));
+            }
+            let total = rows.len();
+            let hidden = if open {
+                0
             } else {
-                output
-                    .iter()
-                    .skip(output.len() - COLLAPSED_TOOL_LINES)
-                    .collect()
+                total.saturating_sub(COLLAPSED_TOOL_LINES)
             };
-            let hidden = output.len() - shown.len();
             if hidden > 0 {
                 doc.targets.push(Target {
                     line: doc.lines.len(),
@@ -181,31 +196,15 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 });
                 doc.line(pad(
                     Line::from(Span::styled(
-                        format!("   … {hidden} earlier lines · o or click to expand"),
+                        format!("   … {hidden} more lines · o or click to show"),
                         Style::default().fg(theme.overlay0).bg(bg),
                     )),
                     width,
                     bg,
                 ));
             }
-            for line in shown {
-                let line = text::sanitize(line);
-                let style = if line.starts_with('+') {
-                    Style::default().fg(theme.green)
-                } else if line.starts_with('-') || line.contains("error") {
-                    Style::default().fg(theme.red)
-                } else {
-                    Style::default().fg(theme.subtext0)
-                };
-                doc.lines(text::wrap(
-                    &[run(line, style)],
-                    width,
-                    &[run("   ", style)],
-                    &[run("   ", style)],
-                    Some(bg),
-                ));
-            }
-            if open && output.len() > COLLAPSED_TOOL_LINES {
+            doc.lines(rows.into_iter().skip(hidden));
+            if open && total > COLLAPSED_TOOL_LINES {
                 doc.targets.push(Target {
                     line: doc.lines.len(),
                     column: 0,
@@ -253,13 +252,24 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 doc.line(Line::from(spans));
             }
         }
-        Body::Pending { text: body, failed } => {
-            // Dim until st has it; red if it never got there.
-            let (bar, label, style) = match failed {
-                None => (theme.surface2, "you · sending…".to_owned(), theme.dim()),
-                Some(error) => (
+        Body::Pending {
+            text: body,
+            failed,
+            unconfirmed,
+        } => {
+            // Dim until st has it; red if it never got there, peach if st never said.
+            let (bar, label, style) = match (failed, unconfirmed) {
+                (None, _) => (theme.surface2, "you · sending…".to_owned(), theme.dim()),
+                (Some(error), true) => (
+                    theme.peach,
+                    format!(
+                        "you · unconfirmed, st did not answer ({error}) · r send again · x clear"
+                    ),
+                    theme::fg(theme.peach),
+                ),
+                (Some(error), false) => (
                     theme.red,
-                    format!("you · not sent: {error}"),
+                    format!("you · not sent: {error} · r retry · x clear"),
                     theme::fg(theme.red),
                 ),
             };
@@ -354,8 +364,22 @@ mod tests {
         )];
         let doc = cache.render(&entries, 40, &HashSet::new(), "⠋", &crate::tests::theme());
         let text = doc.lines.iter().map(text::plain).collect::<Vec<_>>();
-        assert!(text[1].contains("15 earlier lines"));
+        assert!(text[1].contains("14 more lines"));
+        assert_eq!(text.len(), 2 + 6, "a title, the more line, six rows");
         assert!(text.last().unwrap().contains("line 19"));
+        // Rows count once wrapped, and a failed call collapses too.
+        let wide = vec![entry(
+            "w",
+            Body::Tool {
+                title: "$ test".into(),
+                state: ToolState::Failed,
+                output: vec!["word ".repeat(80)],
+            },
+        )];
+        let doc = cache.render(&wide, 40, &HashSet::new(), "⠋", &crate::tests::theme());
+        let text = doc.lines.iter().map(text::plain).collect::<Vec<_>>();
+        assert!(text[1].contains("more lines"), "{text:?}");
+        assert_eq!(text.len(), 2 + 6);
         let mut open = HashSet::new();
         open.insert("t".to_owned());
         assert!(
