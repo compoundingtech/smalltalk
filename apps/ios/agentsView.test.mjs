@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { agentName, agentRows, agentSections, agentState, agentTreeLines, filterAgentRows, UNMANAGED_GROUP } from './agentsView.ts';
+import { compactFolders, agentName, agentRows, agentSections, agentState, agentTreeLines, filterAgentRows, UNMANAGED_GROUP } from './agentsView.ts';
 
 const now = Date.parse('2026-09-30T12:00:00Z');
 const agent = (id, extra = {}) => ({ id: `agent/${id}`, name: id, kind: 'agent', updated_at: '2026-09-30T11:00:00Z', state: 'running', harness_state: 'idle', driver: 'claude', runtime_ids: [], reachability: 'local', ...extra });
@@ -57,3 +57,11 @@ assert.deepEqual(tree.map(line => line.kind === 'folder' ? `${'  '.repeat(line.d
 assert.deepEqual(filterAgentRows(rows, 'CODEX').map(row => row.name), ['Busy', 'codex in app']);
 assert.deepEqual(filterAgentRows(rows, 'example ZE').map(row => row.name), ['Zeta']);
 assert.equal(filterAgentRows(rows, '  ').length, rows.length);
+
+// A folder holding only one folder joins it on one line.
+assert.deepEqual(compactFolders([
+  'fleet/smalltalk/operations/2026-10-01/operator'.split('/'),
+  'fleet/smalltalk/ci/watcher'.split('/'),
+  'fleet/cos/standing/cos'.split('/'),
+  ['solo'],
+]), [['fleet', 'smalltalk', 'operations/2026-10-01'], ['fleet', 'smalltalk', 'ci'], ['fleet', 'cos/standing'], []]);

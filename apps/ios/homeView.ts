@@ -56,8 +56,14 @@ export const HOME_LEGEND: ReadonlyArray<{ glyph: string; color: string; word: st
 ];
 
 /** Whether Home shows an item: it is not resolved and, when st names a person, it is for this one. */
+/** The person a session acts for: a paired device acts as `person/NAME/session/ID`. */
+export function sessionPerson(actor: string | undefined): string | undefined {
+  return actor?.replace(/\/session\/.*$/, '');
+}
+
 export function onHome(item: Pick<Attention, 'state' | 'person_id'>, actor: string | undefined): boolean {
-  return item.state !== 'resolved' && (!actor || !item.person_id || item.person_id === actor);
+  const person = sessionPerson(actor);
+  return item.state !== 'resolved' && (!person || !item.person_id || item.person_id === person);
 }
 
 export function homeRows(items: Attention[], actor: string | undefined, now = Date.now()): HomeRow[] {

@@ -415,15 +415,22 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 card.field("step", step, inner, theme::soft());
             }
             card.blank();
-            if !confirm_row(&mut card, drafts, "Approve the cut-over") {
-                if drafts.editing || drafts.text.is_some_and(|text| !text.is_empty()) {
-                    text_box(
-                        &mut card,
-                        "what should change · the agent reads this",
-                        drafts,
-                        "",
-                        inner,
-                    );
+            // There is always somewhere to write: the agent reads the words with either answer.
+            let written = drafts.text.is_some_and(|text| !text.trim().is_empty());
+            let label = if written {
+                "Approve, with your notes"
+            } else {
+                "Approve"
+            };
+            if !confirm_row(&mut card, drafts, label) {
+                text_box(
+                    &mut card,
+                    "your notes · the agent reads these",
+                    drafts,
+                    "c or click to write what you think, what should change, anything it should know",
+                    inner,
+                );
+                if drafts.editing {
                     card.buttons(&[
                         (
                             "enter",
@@ -431,12 +438,28 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                             Hit::Enter,
                             theme::YELLOW,
                         ),
-                        ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
+                        ("esc", "Stop writing", Hit::Escape, theme::OVERLAY1),
+                    ]);
+                } else if written {
+                    card.buttons(&[
+                        ("a", "Approve, with your notes", Hit::Key('a'), theme::GREEN),
+                        ("c", "Keep writing", Hit::Key('c'), theme::OVERLAY1),
+                        (
+                            "enter",
+                            "Send back with these notes",
+                            Hit::Enter,
+                            theme::YELLOW,
+                        ),
                     ]);
                 } else {
                     card.buttons(&[
                         ("a", "Approve", Hit::Key('a'), theme::GREEN),
-                        ("c", "Request changes", Hit::Key('c'), theme::YELLOW),
+                        (
+                            "c",
+                            "Write notes or request changes",
+                            Hit::Key('c'),
+                            theme::YELLOW,
+                        ),
                     ]);
                 }
             }
@@ -2143,11 +2166,12 @@ fn tree_listing(
     legend: Vec<Line<'static>>,
 ) -> Listing {
     leaves.sort_by(|a, b| a.0.cmp(&b.0));
+    let compact = compact_folders(&leaves.iter().map(|leaf| leaf.0.clone()).collect::<Vec<_>>());
     let mut items = Vec::new();
     let mut ids = Vec::new();
     let mut open: Vec<String> = Vec::new();
-    for (path, id, first, right) in leaves {
-        let folders = &path[..path.len().saturating_sub(1)];
+    for ((_, id, first, right), folders) in leaves.into_iter().zip(compact) {
+        let folders = &folders[..];
         let shared = open.iter().zip(folders).take_while(|(a, b)| a == b).count();
         open.truncate(shared);
         for (depth, folder) in folders.iter().enumerate().skip(shared) {
@@ -2176,6 +2200,46 @@ fn tree_listing(
         state,
         legend,
     }
+}
+
+/// Each path's folders, with a folder that holds only one folder joined to it on one line
+/// (Nathan, 2026-10-01): `fleet/smalltalk/operations/` rather than three nested folders.
+fn compact_folders(paths: &[Vec<String>]) -> Vec<Vec<String>> {
+    use std::collections::{BTreeMap, BTreeSet};
+    // What each folder holds: its subfolders by name, and a leaf as the empty name.
+    let mut holds = BTreeMap::<Vec<String>, BTreeSet<String>>::new();
+    for path in paths {
+        let folders = &path[..path.len().saturating_sub(1)];
+        for depth in 0..folders.len() {
+            let child = folders.get(depth + 1).cloned().unwrap_or_default();
+            holds
+                .entry(folders[..=depth].to_vec())
+                .or_default()
+                .insert(child);
+        }
+    }
+    paths
+        .iter()
+        .map(|path| {
+            let folders = &path[..path.len().saturating_sub(1)];
+            let mut compact = Vec::new();
+            let mut depth = 0;
+            while depth < folders.len() {
+                let mut name = folders[depth].clone();
+                while depth + 1 < folders.len()
+                    && holds
+                        .get(&folders[..=depth])
+                        .is_some_and(|children| children.len() == 1)
+                {
+                    depth += 1;
+                    name = format!("{name}/{}", folders[depth]);
+                }
+                compact.push(name);
+                depth += 1;
+            }
+            compact
+        })
+        .collect()
 }
 
 pub fn agents_tree(world: &World, spinner: &'static str) -> Listing {
@@ -2253,6 +2317,30 @@ pub fn missions_tree(world: &World, spinner: &'static str, system: bool) -> List
 #[cfg(test)]
 mod tree_tests {
     use super::*;
+
+    #[test]
+    fn a_folder_holding_only_a_folder_joins_it_on_one_line() {
+        let path = |text: &str| text.split('/').map(str::to_owned).collect::<Vec<_>>();
+        let compact = compact_folders(&[
+            path("fleet/smalltalk/operations/2026-10-01/operator"),
+            path("fleet/smalltalk/ci/watcher"),
+            path("fleet/cos/standing/cos"),
+            path("solo"),
+        ]);
+        assert_eq!(
+            compact,
+            [
+                vec![
+                    "fleet".to_owned(),
+                    "smalltalk".into(),
+                    "operations/2026-10-01".into()
+                ],
+                vec!["fleet".to_owned(), "smalltalk".into(), "ci".into()],
+                vec!["fleet".to_owned(), "cos/standing".into()],
+                Vec::<String>::new(),
+            ]
+        );
+    }
 
     #[test]
     fn a_tree_has_one_line_per_folder_and_leaf_in_path_order() {
@@ -2358,6 +2446,229 @@ pub fn new_mission_form(fields: &[String; 4], focus: usize, width: usize) -> Doc
     inner.blank();
     let mut doc = Doc::new();
     doc.card("new mission", theme::ACCENT, false, inner, width);
+    doc
+}
+
+// ------------------------------------------------------------------ new agent
+
+/// The harnesses st runs, the models each is known to take (the first, "default", leaves it to
+/// the harness), and the efforts. Fixed lists until st can say what each harness offers.
+pub const HARNESSES: [&str; 5] = ["claude", "codex", "omp", "pi", "opencode"];
+pub const EFFORTS: [&str; 5] = ["default", "low", "medium", "high", "xhigh"];
+
+pub fn models(harness: &str) -> &'static [&'static str] {
+    match harness {
+        "claude" => &[
+            "default",
+            "claude-opus-5-5",
+            "claude-sonnet-5-5",
+            "claude-haiku-4-5",
+            "claude-fable-5-1",
+        ],
+        "codex" => &["default", "gpt-6-sol"],
+        _ => &["default"],
+    }
+}
+
+/// The new agent form: what it should do (its first message), its name, and how it runs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentForm {
+    pub task: String,
+    pub name: String,
+    pub harness: usize,
+    pub model: usize,
+    pub effort: usize,
+    /// 0 is this machine; then the fleet's other machines in their list order.
+    pub host: usize,
+    pub focus: usize,
+}
+
+impl AgentForm {
+    pub const FIELDS: usize = 6;
+
+    pub fn new(task: String) -> Self {
+        Self {
+            task,
+            name: random_name(),
+            ..Self::default()
+        }
+    }
+
+    pub fn harness(&self) -> &'static str {
+        HARNESSES[self.harness % HARNESSES.len()]
+    }
+
+    pub fn model(&self) -> Option<&'static str> {
+        let models = models(self.harness());
+        Some(models[self.model % models.len()]).filter(|model| *model != "default")
+    }
+
+    pub fn effort(&self) -> Option<&'static str> {
+        Some(EFFORTS[self.effort % EFFORTS.len()]).filter(|effort| *effort != "default")
+    }
+
+    /// Step a choice field (2 harness, 3 model, 4 effort, 5 host) by one, either way.
+    pub fn cycle(&mut self, forward: bool, hosts: usize) {
+        let step = |value: &mut usize, count: usize| {
+            *value = if forward {
+                (*value + 1) % count.max(1)
+            } else {
+                (*value + count.max(1) - 1) % count.max(1)
+            }
+        };
+        match self.focus {
+            2 => {
+                step(&mut self.harness, HARNESSES.len());
+                self.model = 0;
+            }
+            3 => {
+                let count = models(self.harness()).len();
+                step(&mut self.model, count)
+            }
+            4 => step(&mut self.effort, EFFORTS.len()),
+            5 => step(&mut self.host, hosts + 1),
+            _ => {}
+        }
+    }
+}
+
+/// A name nobody has to think of: `amber-otter`. The person can change it.
+pub fn random_name() -> String {
+    const FIRST: [&str; 16] = [
+        "amber", "brisk", "calm", "clever", "dusky", "eager", "gentle", "keen", "lucky", "merry",
+        "nimble", "quiet", "rapid", "steady", "sunny", "witty",
+    ];
+    const SECOND: [&str; 16] = [
+        "badger", "comet", "falcon", "fern", "harbor", "heron", "lantern", "maple", "otter",
+        "pebble", "quartz", "raven", "sparrow", "tide", "willow", "wren",
+    ];
+    let bits = uuid::Uuid::now_v7().as_u128();
+    // The low bits of a v7 id are random.
+    format!(
+        "{}-{}",
+        FIRST[(bits & 15) as usize],
+        SECOND[((bits >> 4) & 15) as usize]
+    )
+}
+
+pub fn new_agent_form(form: &AgentForm, hosts: &[String], width: usize) -> Doc {
+    let mut inner = Doc::new();
+    let w = width.saturating_sub(4);
+    inner.blank();
+    inner.wrap(
+        &[run(
+            "The prompt is the agent's first message. st starts the agent and its conversation opens here.",
+            theme::soft(),
+        )],
+        w,
+    );
+    inner.blank();
+    let field = |inner: &mut Doc, index: usize, label: &str, body: Doc| {
+        let start = inner.lines.len();
+        inner.card(
+            label,
+            if form.focus == index {
+                theme::ACCENT
+            } else {
+                theme::OVERLAY1
+            },
+            false,
+            body,
+            w,
+        );
+        for line in start..inner.lines.len() {
+            inner.targets.push(super::doc::Target {
+                line,
+                column: 0,
+                width: w as u16,
+                hit: Hit::Field(index),
+            });
+        }
+    };
+    for (index, label, value, hint) in [
+        (
+            0,
+            "prompt",
+            &form.task,
+            "Fix the flaky login test, then open a PR.",
+        ),
+        (1, "name", &form.name, "a name"),
+    ] {
+        let mut body = Doc::new();
+        let focused = form.focus == index;
+        if value.is_empty() && !focused {
+            body.line(Line::from(span(hint, theme::dim())));
+        } else {
+            let paragraphs = value.split('\n').collect::<Vec<_>>();
+            for (line_index, paragraph) in paragraphs.iter().enumerate() {
+                let mut runs = vec![run((*paragraph).to_owned(), theme::text())];
+                if focused && line_index == paragraphs.len() - 1 {
+                    runs.push(run("█", theme::fg(theme::ACCENT)));
+                }
+                body.lines(text::wrap(&runs, w.saturating_sub(4), &[], &[], None));
+            }
+        }
+        // The prompt gets room to write in from the start (Nathan, 2026-10-01).
+        if index == 0 {
+            while body.lines.len() < 4 {
+                body.blank();
+            }
+        }
+        field(&mut inner, index, label, body);
+    }
+    let host = match form.host {
+        0 => "this machine".to_owned(),
+        index => hosts
+            .get(index - 1)
+            .cloned()
+            .unwrap_or_else(|| "this machine".into()),
+    };
+    for (index, label, value) in [
+        (2, "harness", form.harness().to_owned()),
+        (
+            3,
+            "model",
+            form.model().unwrap_or("the harness's default").to_owned(),
+        ),
+        (
+            4,
+            "effort",
+            form.effort().unwrap_or("the harness's default").to_owned(),
+        ),
+        (5, "host", host),
+    ] {
+        let focused = form.focus == index;
+        let mut body = Doc::new();
+        body.line(Line::from(vec![
+            span(if focused { "◂ " } else { "  " }, theme::fg(theme::ACCENT)),
+            span(
+                value,
+                if focused {
+                    theme::text()
+                } else {
+                    theme::soft()
+                },
+            ),
+            span(
+                if focused {
+                    " ▸   ← → to choose"
+                } else {
+                    ""
+                },
+                theme::dim(),
+            ),
+        ]));
+        field(&mut inner, index, label, body);
+    }
+    inner.blank();
+    inner.buttons(&[
+        ("tab", "Next field", Hit::Key('\t'), theme::OVERLAY1),
+        ("enter", "Start the agent", Hit::Enter, theme::GREEN),
+        ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
+    ]);
+    inner.blank();
+    let mut doc = Doc::new();
+    doc.card("new agent", theme::ACCENT, false, inner, width);
     doc
 }
 
