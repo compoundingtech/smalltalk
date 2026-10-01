@@ -1267,7 +1267,11 @@ pub fn mission_detail(
             ),
             span(format!("{:<11}", word), theme::fg(color)),
             span(
-                format!("{:<18}", step.owner.as_deref().unwrap_or("nobody")),
+                // A long owner is cut so its age never runs into it.
+                format!(
+                    "{:<18}",
+                    text::truncate(step.owner.as_deref().unwrap_or("nobody"), 17)
+                ),
                 if step.owner.is_some() {
                     theme::soft()
                 } else {
