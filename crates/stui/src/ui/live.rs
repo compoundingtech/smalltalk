@@ -128,6 +128,18 @@ enum Fetched {
     Sent(String, Result<Option<String>, (String, bool)>),
     /// st started an agent asked for here.
     AgentStarted(String),
+    /// A direct stream to an agent's PTY session, named by its runtime.
+    Native {
+        agent: String,
+        name: String,
+        stream: std::os::unix::net::UnixStream,
+    },
+    /// st gave no direct stream; follow its view of the terminal instead.
+    NativeFailed {
+        agent: String,
+        runtime_ids: Vec<String>,
+        reason: String,
+    },
     /// st answered a glass write: the glass, the write's key, and the revision it accepted.
     GlassSaved {
         id: String,
@@ -432,6 +444,35 @@ pub fn run(context: Context) -> Result<()> {
                 Fetched::Devices(devices) => model.devices = devices,
                 Fetched::GlassSaved { id, key, outcome } => ui.glass_saved(&id, &key, outcome),
                 Fetched::AgentStarted(id) => ui.agent_started(id),
+                Fetched::Native {
+                    agent,
+                    name,
+                    stream,
+                } => {
+                    let (rows, columns) = ui.terminal_size.get();
+                    if let Some(view) = ui
+                        .terminal
+                        .as_mut()
+                        .filter(|view| view.agent == agent && view.native.is_none())
+                    {
+                        view.native = Some(super::pty::NativeTerminal::spawn(
+                            stream, &name, rows, columns,
+                        ));
+                        view.stale = None;
+                    }
+                }
+                Fetched::NativeFailed {
+                    agent,
+                    runtime_ids,
+                    reason,
+                } => {
+                    if ui.terminal.as_ref().is_some_and(|view| view.agent == agent) {
+                        ui.flash(format!(
+                            "No direct terminal ({reason}); showing st's view of it"
+                        ));
+                        let _ = commands.send(Command::Follow { runtime_ids });
+                    }
+                }
             }
             changed = true;
         }
@@ -598,7 +639,9 @@ pub fn run(context: Context) -> Result<()> {
             }
             match effect {
                 Effect::OpenTerminal { agent } => {
-                    // The feed attaches and follows on its socket; screens arrive as updates.
+                    // The PTY session's own bytes, through st's raw stream to whichever host owns
+                    // it; st's screen view (the feed follows it on its socket) only when st cannot
+                    // give a direct stream.
                     let found = model
                         .agents()
                         .find(|candidate| candidate.header.id == agent);
@@ -610,7 +653,27 @@ pub fn run(context: Context) -> Result<()> {
                         .unwrap_or_else(|| agent.clone());
                     attached = None;
                     terminal_runtimes = Some(runtime_ids.clone());
-                    if commands.send(Command::Follow { runtime_ids }).is_ok() {
+                    let _ = commands.send(Command::Unfollow);
+                    {
+                        let client = client.clone();
+                        let tx = fetched_tx.clone();
+                        let agent = agent.clone();
+                        runtime.spawn(async move {
+                            let _ = tx.send(match raw_attach(&client, &runtime_ids).await {
+                                Ok((name, stream)) => Fetched::Native {
+                                    agent,
+                                    name,
+                                    stream,
+                                },
+                                Err(reason) => Fetched::NativeFailed {
+                                    agent,
+                                    runtime_ids,
+                                    reason,
+                                },
+                            });
+                        });
+                    }
+                    {
                         ui.terminal = Some(super::TerminalView {
                             agent: agent.clone(),
                             title: name.clone(),
@@ -619,6 +682,7 @@ pub fn run(context: Context) -> Result<()> {
                             cursor: None,
                             stale: Some("connecting".into()),
                             ended: None,
+                            native: None,
                         });
                     }
                 }
@@ -787,7 +851,13 @@ pub fn run(context: Context) -> Result<()> {
                 let _ = tx.send(Fetched::Read(id, result));
             });
         }
-        if event::poll(Duration::from_millis(80))? {
+        // While an attached terminal's output flows, draw it as it comes.
+        let flowing = ui
+            .terminal
+            .as_ref()
+            .and_then(|view| view.native.as_ref())
+            .is_some_and(|native| native.flowing());
+        if event::poll(Duration::from_millis(if flowing { 16 } else { 80 }))? {
             // crossterm's read never returns on a closed terminal, so check for one before each.
             while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
                 match event::read()? {
@@ -1548,4 +1618,47 @@ mod tests {
         assert_eq!(plain(&lines[1]), "Finished");
         assert_eq!(plain(&lines[2]), "[redacted]");
     }
+}
+
+/// A direct stream to the PTY session of the first of `runtime_ids` that has a terminal: st's
+/// raw terminal stream, fenced to the runtime's incarnation and routed to the host that owns it.
+async fn raw_attach(
+    client: &Client,
+    runtime_ids: &[String],
+) -> Result<(String, std::os::unix::net::UnixStream), String> {
+    let mut reason = "the agent has no terminal right now".to_owned();
+    for id in runtime_ids {
+        let Ok(envelope) = client.runtimes_get(id).await else {
+            continue;
+        };
+        let Resource::Runtime(runtime) = envelope.value else {
+            continue;
+        };
+        let (Some(terminal), Some(incarnation)) = (
+            runtime.terminal_id.as_deref(),
+            runtime.incarnation_id.as_deref(),
+        ) else {
+            continue;
+        };
+        let attachment = match client
+            .raw_terminal_attachment(terminal, incarnation, st3_client::RawTerminalMode::Attach)
+            .await
+        {
+            Ok(attachment) => attachment,
+            Err(error) => {
+                reason = error.to_string();
+                continue;
+            }
+        };
+        match client.raw_terminal_stream(&attachment).await {
+            Ok(stream) => {
+                return stream
+                    .into_std()
+                    .map(|stream| (runtime.runtime_id.clone(), stream))
+                    .map_err(|error| error.to_string());
+            }
+            Err(error) => reason = error.to_string(),
+        }
+    }
+    Err(reason)
 }

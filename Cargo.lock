@@ -4340,6 +4340,8 @@ dependencies = [
  "image",
  "libc",
  "portable-pty",
+ "pty-client",
+ "pty-core",
  "ratatui",
  "ratatui-image",
  "reqwest",

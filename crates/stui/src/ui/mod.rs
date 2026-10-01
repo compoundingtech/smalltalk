@@ -18,6 +18,7 @@ mod glass_store;
 pub mod layout;
 pub mod live;
 pub mod pane;
+mod pty;
 pub mod screens;
 pub mod text;
 pub mod theme;
@@ -181,6 +182,9 @@ pub(crate) struct TerminalView {
     /// Why the screen shown is not current: still connecting, or reconnecting after a drop.
     pub(crate) stale: Option<String>,
     pub(crate) ended: Option<String>,
+    /// The terminal attached through its PTY session, once that connects; until then, or when
+    /// st cannot give a direct stream, the screens above are st's view of it.
+    pub(crate) native: Option<pty::NativeTerminal>,
 }
 
 /// `/` in a conversation: what to find there, and which match is current.
@@ -267,6 +271,8 @@ pub struct Ui {
     attachments: HashMap<String, Vec<attach::Attachment>>,
     /// Where typing goes in the input that has the keyboard.
     cursor: edit::Cursor,
+    /// The rows and columns the terminal pane last had, to attach at.
+    pub(crate) terminal_size: Cell<(u16, u16)>,
     /// How this terminal draws images (kitty, sixel, iTerm2, half blocks), asked once at start.
     pub(crate) picker: Option<ratatui_image::picker::Picker>,
     /// Each attachment's thumbnail, encoded once so a redraw never sends the image again.
@@ -332,6 +338,7 @@ impl Ui {
             started: None,
             attachments: HashMap::new(),
             cursor: edit::Cursor::default(),
+            terminal_size: Cell::new((24, 80)),
             picker: None,
             thumbnails: RefCell::new(HashMap::new()),
             updated: HashMap::new(),
@@ -544,6 +551,12 @@ impl Ui {
     /// included, so a paste never sends anything by itself. A pasted path to an image, such as a
     /// file dropped on the terminal, attaches that image to a message to an agent.
     pub fn paste(&mut self, text: String) {
+        if self.terminal_focused()
+            && let Some(native) = self.native_terminal()
+        {
+            native.paste(&text);
+            return;
+        }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let first = text.lines().next().unwrap_or("").to_owned();
         if let Some(find) = self.find.as_mut() {
@@ -1920,6 +1933,37 @@ impl Ui {
             );
             return;
         };
+        if let Some(native) = view.native.as_ref() {
+            // One line for where this is and how to leave; the PTY gets the rest of the pane.
+            let scrolled = native.scrolled();
+            let status = match (native.ended(), native.attached(), scrolled) {
+                (Some(reason), _, _) => format!("ended: {reason}"),
+                (None, false, _) => "attaching…".into(),
+                (None, true, 0) => {
+                    "ctrl-c twice reaches it · wheel or shift+pgup scrolls back".into()
+                }
+                (None, true, lines) => format!("↑ {lines} lines back · type to return"),
+            };
+            let header = Line::from(vec![
+                Span::styled(
+                    format!(" ← Ctrl+\\  {}", view.title),
+                    theme::strong(theme::ACCENT),
+                ),
+                Span::styled(format!("   {status}"), theme::dim()),
+            ]);
+            buf.set_line(area.x, area.y, &header, area.width);
+            self.hit(Rect { height: 1, ..area }, Hit::Detach);
+            let body = Rect {
+                y: area.y + 1,
+                height: area.height.saturating_sub(1),
+                ..area
+            };
+            self.terminal_size
+                .set((body.height.max(1), body.width.max(1)));
+            native.fit(body.height, body.width);
+            native.draw(buf, body);
+            return;
+        }
         let header = format!(" ← Return · Ctrl+\\   {}", view.title);
         buf.set_stringn(
             area.x,
@@ -1958,6 +2002,24 @@ impl Ui {
             if let Some(cell) = buf.cell_mut(position) {
                 cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
             }
+        }
+    }
+
+    /// The attached terminal's direct connection, when it has one.
+    pub(crate) fn native_terminal(&self) -> Option<&pty::NativeTerminal> {
+        self.terminal.as_ref().and_then(|view| view.native.as_ref())
+    }
+
+    /// A key for the focused terminal: its bytes straight to the PTY when attached directly,
+    /// else through st.
+    fn terminal_key(&mut self, key: KeyEvent) {
+        match self.native_terminal() {
+            Some(native) => {
+                if let Some(bytes) = pty::key_bytes(key, native.mode()) {
+                    native.write(bytes);
+                }
+            }
+            None => self.effects.push(Effect::TerminalKey(key)),
         }
     }
 
@@ -2268,7 +2330,7 @@ impl Ui {
                         pending == code && at.elapsed() < Duration::from_secs(2)
                     }) {
                         self.terminal_confirm = None;
-                        self.effects.push(Effect::TerminalKey(key));
+                        self.terminal_key(key);
                     } else {
                         self.terminal_confirm = Some((code, Instant::now()));
                         self.flash(format!(
@@ -2277,7 +2339,16 @@ impl Ui {
                         ));
                     }
                 }
-                _ => self.effects.push(Effect::TerminalKey(key)),
+                // Shift+PgUp/PgDn page through what scrolled off the top.
+                KeyCode::PageUp | KeyCode::PageDown
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        && self.native_terminal().is_some() =>
+                {
+                    if let Some(native) = self.native_terminal() {
+                        native.page(key.code == KeyCode::PageUp);
+                    }
+                }
+                _ => self.terminal_key(key),
             }
             return;
         }
@@ -2757,6 +2828,7 @@ impl Ui {
                 cursor: None,
                 stale: None,
                 ended: None,
+                native: None,
             });
         }
     }
@@ -3432,7 +3504,17 @@ impl Ui {
                         .clamp(0, lines.saturating_sub(height) as isize)
                         as usize;
                 } else if let Some(key) = pane {
-                    self.scroll_pane(&key, delta);
+                    // An attached terminal scrolls its own history (or tells its program).
+                    match self.native_terminal() {
+                        Some(native)
+                            if self.terminal.as_ref().is_some_and(|view| {
+                                key == Pane::Terminal(view.agent.clone()).key()
+                            }) =>
+                        {
+                            native.wheel(-(delta as i32));
+                        }
+                        _ => self.scroll_pane(&key, delta),
+                    }
                 }
             }
             _ => {}
@@ -4179,6 +4261,7 @@ mod tests {
             cursor: None,
             stale: None,
             ended: None,
+            native: None,
         });
         for (key, shows) in [
             ("list:missions".to_owned(), "needs you".to_owned()),
@@ -4542,6 +4625,7 @@ mod tests {
             cursor: Some((5, 2)),
             stale: Some("st closed the connection".into()),
             ended: None,
+            native: None,
         });
         let screen = frame(&ui, 120, 20).join("\n");
         assert!(screen.contains("row 5"), "{screen}");

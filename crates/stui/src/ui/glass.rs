@@ -3310,6 +3310,7 @@ mod tests {
             cursor: None,
             stale: None,
             ended: None,
+            native: None,
         });
         ui.effects.clear();
         assert!(ui.terminal_focused());
