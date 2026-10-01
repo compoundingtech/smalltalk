@@ -30,6 +30,9 @@ pub(crate) struct Glasses {
     graph: bool,
     /// Changes st has not confirmed, newest per glass id, each with the key a retry reuses.
     pending: BTreeMap<String, GlassWrite>,
+    /// The focused split fills the glass for now (Ctrl+O), as tmux zooms a pane; this window
+    /// only, never stored.
+    zoomed: bool,
     /// The glass made at start only because this device had none by the name asked for. If it
     /// is still empty when st first sends the person's glasses, st's glass of that name is
     /// shown instead of keeping both.
@@ -252,6 +255,7 @@ impl Glasses {
             palette: None,
             store,
             graph: false,
+            zoomed: false,
             pending: BTreeMap::new(),
             placeholder,
         }
@@ -500,7 +504,7 @@ impl Ui {
             choices.push(glass(
                 "+",
                 format!("New glass “{name}”"),
-                "ctrl+o switches",
+                "ctrl+g switches",
                 String::new(),
                 Action::NewGlass(name.to_owned()),
             ));
@@ -567,7 +571,15 @@ impl Ui {
             height: area.height.saturating_sub(2),
             ..area
         };
-        let (rects, dividers) = glass.layout.rects(body);
+        // Zoomed, the focused split takes the whole glass and the others wait unseen.
+        let (rects, dividers) = if glasses.zoomed {
+            let groups = glass.layout.groups().len();
+            let mut rects = vec![Rect::default(); groups];
+            rects[glass.focus] = body;
+            (rects, Vec::new())
+        } else {
+            glass.layout.rects(body)
+        };
         for (rect, side) in dividers {
             let symbol = match side {
                 Side::Right => "│",
@@ -599,6 +611,9 @@ impl Ui {
             let (Some(rect), Some(content)) = (rects.get(index), contents.get(index)) else {
                 continue;
             };
+            if rect.is_empty() {
+                continue;
+            }
             self.tab_strip(buf, Rect { height: 1, ..*rect }, glass, index);
             self.draw_group(buf, *content, glass, index);
         }
@@ -895,6 +910,20 @@ impl Ui {
                 Hit::GlassAdd(index),
             );
         }
+        let zoomed = self.glasses.as_ref().is_some_and(|glasses| glasses.zoomed);
+        if zoomed && focused {
+            let label = " ⤢ zoomed · ctrl+o ";
+            let width = text::width(label) as u16;
+            if x + width < area.x + area.width {
+                buf.set_stringn(
+                    area.x + area.width - width,
+                    area.y,
+                    label,
+                    width as usize,
+                    theme::fg(theme::YELLOW).bg(strip),
+                );
+            }
+        }
     }
 
     /// A pane's title: the name of what it shows.
@@ -1144,6 +1173,7 @@ impl Ui {
         // While the person types, every editing key is the input's (Ctrl+W deletes a word);
         // Esc leaves the input and glasses keys work again.
         if self.editing
+            || self.find.is_some()
             || self.new_mission.is_some()
             || self.chat.as_ref().is_some_and(|chat| chat.editing)
         {
@@ -1164,7 +1194,10 @@ impl Ui {
             KeyCode::Char('v') if control => self.split_group(Side::Right),
             KeyCode::Char('x') if control => self.split_group(Side::Below),
             KeyCode::Char('w') if control => self.close_tab(),
-            KeyCode::Char('o') if control => self.next_glass(),
+            KeyCode::Char('o') if control => {
+                glasses.zoomed = !glasses.zoomed && glasses.glass().layout.groups().len() > 1;
+            }
+            KeyCode::Char('g') if control => self.next_glass(),
             KeyCode::Char(digit @ '1'..='9') if alt => self.show_tab(digit as usize - '1' as usize),
             // Next and previous tab in the focused split: Ctrl+PgDn/PgUp, Ctrl+Tab where the
             // terminal reports it, and ] and [ whenever nothing is being typed.
@@ -1391,6 +1424,7 @@ impl Ui {
         let Some(glasses) = self.glasses.as_mut() else {
             return;
         };
+        glasses.zoomed = false;
         let glass = glasses.glass_mut();
         let group = glass.layout.split(glass.focus, side, Group::default());
         let id = glass.id.clone();
@@ -1625,8 +1659,15 @@ impl Ui {
         }
     }
 
-    /// Focus the group nearest in the arrow's direction, on screen.
+    /// Focus the group nearest in the arrow's direction, on screen; a zoomed split comes back
+    /// to its place first.
     fn move_focus(&mut self, direction: KeyCode) {
+        if let Some(glasses) = self.glasses.as_mut()
+            && glasses.zoomed
+        {
+            glasses.zoomed = false;
+            return;
+        }
         let Some(focus) = self.glasses.as_ref().map(|glasses| glasses.glass().focus) else {
             return;
         };
@@ -2270,6 +2311,79 @@ mod tests {
     }
 
     #[test]
+    fn slash_finds_text_in_a_conversation_newest_first() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        let said = |ui: &Ui| {
+            let Some(Load::Ready(entries)) =
+                ui.world.conversations.get("agent/example/atlas/builder")
+            else {
+                panic!("the demo agent has a conversation")
+            };
+            entries.clone()
+        };
+        // A word the demo conversation says more than once.
+        let word = "the";
+        assert!(said(&ui).len() > 1);
+        typed(&mut ui, "/");
+        typed(&mut ui, word);
+        let shown = screen(&ui);
+        let find = ui.find.as_ref().unwrap();
+        let count = find.count.get();
+        assert!(count > 1, "{shown}");
+        assert!(shown.contains(&format!("1 of {count}")), "{shown}");
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        screen(&ui);
+        assert!(screen(&ui).contains(&format!("2 of {count}")));
+        press(&mut ui, KeyCode::Enter, KeyModifiers::SHIFT);
+        assert!(screen(&ui).contains(&format!("1 of {count}")));
+        // Typing goes to the find bar, not to glasses.
+        ctrl(&mut ui, 'w');
+        assert_eq!(ui.find.as_ref().unwrap().query, "");
+        assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(ui.find.is_none());
+        assert!(screen(&ui).contains("Message Atlas Builder"));
+    }
+
+    #[test]
+    fn ctrl_o_zooms_the_focused_split_and_back() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ui.open_in_glass(
+            Pane::Mission(Some("mission/fleet/release/weekly".into())),
+            Open::Right,
+        );
+        assert!(screen(&ui).contains("Atlas Builder"));
+        ctrl(&mut ui, 'o');
+        let zoomed = screen(&ui);
+        assert!(zoomed.contains("zoomed · ctrl+o"), "{zoomed}");
+        assert!(
+            !zoomed.lines().nth(1).unwrap().contains("Atlas Builder"),
+            "only the focused split shows"
+        );
+        ctrl(&mut ui, 'o');
+        assert!(
+            screen(&ui)
+                .lines()
+                .nth(1)
+                .unwrap()
+                .contains("Atlas Builder")
+        );
+        // A move between splits brings a zoomed one back first.
+        ctrl(&mut ui, 'o');
+        press(&mut ui, KeyCode::Left, KeyModifiers::ALT);
+        assert!(!ui.glasses.as_ref().unwrap().zoomed);
+        assert_eq!(tabs(&ui).0, 1);
+    }
+
+    #[test]
     fn the_wheel_moves_the_palette_and_nothing_behind_it() {
         let mut ui = glass();
         ctrl(&mut ui, 'k');
@@ -2324,7 +2438,7 @@ mod tests {
     }
 
     #[test]
-    fn glasses_are_named_kept_on_the_device_and_switched_with_ctrl_o() {
+    fn glasses_are_named_kept_on_the_device_and_switched_with_ctrl_g() {
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join("glasses.json");
         let mut ui = Ui::new(demo::world());
@@ -2351,7 +2465,7 @@ mod tests {
         );
         assert!(screen(&ui).lines().next().unwrap().contains("review ▾"));
 
-        ctrl(&mut ui, 'o');
+        ctrl(&mut ui, 'g');
         assert_eq!(ui.glasses.as_ref().unwrap().glass().name, "main");
         assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
 
