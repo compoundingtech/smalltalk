@@ -85,7 +85,7 @@ mod tests {
             "A message from another agent carries that agent's words, not a person's.",
             "`work claim STEP --as \"$ST_AGENT\"`",
             "this machine's host facts",
-            "`attention withdraw ATTENTION --reason TEXT --as \"$ST_AGENT\"`",
+            "`work cancel-ask PERSON_STEP --as \"$ST_AGENT\" --reason TEXT`",
             "Keys typed into another agent's terminal",
         ] {
             assert!(body.contains(usage), "{usage}");

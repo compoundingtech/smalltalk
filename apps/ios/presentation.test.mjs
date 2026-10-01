@@ -100,12 +100,12 @@ assert.equal(labels.get('mission/fleet/st3'), 'ST');
 assert.equal(new Set(labels.values()).size, labels.size);
 
 // (11) Actions and kinds are presented in words, never as raw action IDs.
-assert.equal(attentionActionLabel('attention.resolve'), 'Resolve');
+assert.equal(attentionActionLabel('work.done'), 'Complete step');
 assert.equal(attentionActionLabel('mission.approve-revision'), 'Approve revision');
 assert.equal(attentionActionLabel('review.request-changes'), 'Request changes');
 assert.equal(attentionKindLabel('human-gate'), 'Needs a decision');
-assert.equal(attentionKindLabel('agent-request'), 'Agent request');
-for (const action of ['attention.resolve', 'review.approve', 'review.reject', 'review.request-changes', 'launch.approve', 'launch.cancel', 'mission.approve-revision', 'mission.cancel-revision', 'message.read']) assert.doesNotMatch(attentionActionLabel(action), /\./);
+assert.equal(attentionKindLabel('agent-request'), 'Historical request');
+for (const action of ['work.done', 'review.approve', 'review.reject', 'review.request-changes', 'launch.approve', 'launch.cancel', 'mission.approve-revision', 'mission.cancel-revision', 'message.read']) assert.doesNotMatch(attentionActionLabel(action), /\./);
 
 // (6) Delivery envelopes read as a message, without the unknown marker or raw IDs.
 assert.deepEqual(pingPresentation('[PING] ? agent/example/cos/standing/cos: Reclaim bounded reads; TUI and iOS now have their own seats [id:message/2d1268c28b3151be]'), { from: 'COS', text: 'Reclaim bounded reads; TUI and iOS now have their own seats' });

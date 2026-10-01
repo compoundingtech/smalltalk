@@ -109,13 +109,17 @@ pub(super) fn register(connection: &Connection) -> Result<()> {
 }
 
 fn columns(connection: &Connection, table: &str, excluded: &[&str]) -> Result<Vec<String>> {
-    Ok(connection
+    let mut columns = connection
         .prepare(&format!("PRAGMA table_info({table})"))?
         .query_map([], |row| row.get::<_, String>(1))?
         .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
         .filter(|column| !excluded.contains(&column.as_str()))
-        .collect())
+        .collect::<Vec<_>>();
+    // An additive migration appends a column, while a fresh schema may declare it
+    // in the middle. Physical layout must not change the logical row encoding.
+    columns.sort();
+    Ok(columns)
 }
 
 fn row_sql(columns: &[String], prefix: &str) -> String {
@@ -123,7 +127,7 @@ fn row_sql(columns: &[String], prefix: &str) -> String {
         .iter()
         .map(|column| {
             // SQLite JSON does not accept blobs; their complete bytes are shared data.
-            if column == "bytes" {
+            if matches!(column.as_str(), "bytes" | "binding_key") {
                 format!("hex({prefix}{column})")
             } else {
                 format!("{prefix}{column}")
@@ -150,7 +154,7 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
         .iter()
         .map(|(table, excluded)| Ok((*table, columns(connection, table, excluded)?)))
         .collect::<Result<Vec<_>>>()?;
-    let signature = serde_json::to_string(&(5, &registry))?;
+    let signature = serde_json::to_string(&(6, &registry))?;
     let previous: Option<String> = connection
         .query_row(
             "SELECT value FROM meta WHERE key='projection_digest_registry'",
@@ -284,11 +288,12 @@ pub(super) fn initialize(connection: &Connection) -> Result<()> {
 /// The hot operations table names a retained claim because of its foreign key. Once every
 /// claim of an operation is trimmed, its complete logical row is instead in tombstones.
 fn operation_fallback(operation: &str) -> String {
-    format!("(SELECT json_array(operation_id,MIN(request_digest),
+    format!("(SELECT json_array(
         (SELECT MIN(c.id) FROM checkpoint_claims c WHERE c.operation_id={operation}
           AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=c.id)
           AND c.request_digest=(SELECT MIN(m.request_digest) FROM checkpoint_claims m WHERE m.operation_id={operation}
             AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=m.id))),
+        operation_id,MIN(request_digest),
         CASE WHEN COUNT(DISTINCT request_digest)>1 THEN 'conflict' ELSE 'active' END)
         FROM checkpoint_claims WHERE operation_id={operation}
           AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=checkpoint_claims.id)
@@ -297,7 +302,7 @@ fn operation_fallback(operation: &str) -> String {
 
 pub(super) fn operation_rows() -> String {
     format!(
-        "SELECT json_array(id,request_digest,canonical_claim_id,state) AS row_json FROM operations
+        "SELECT json_array(canonical_claim_id,id,request_digest,state) AS row_json FROM operations
         UNION ALL SELECT {} FROM
         (SELECT DISTINCT operation_id FROM checkpoint_claims WHERE operation_id IS NOT NULL
           AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=checkpoint_claims.id)) dropped
@@ -311,7 +316,7 @@ fn refresh_operation(operation: &str) -> String {
         "(SELECT row_json FROM projection_digest_operation_rows WHERE operation_id={operation})"
     );
     let current = format!(
-        "COALESCE((SELECT json_array(id,request_digest,canonical_claim_id,state) FROM operations WHERE id={operation}),{})",
+        "COALESCE((SELECT json_array(canonical_claim_id,id,request_digest,state) FROM operations WHERE id={operation}),{})",
         operation_fallback(operation)
     );
     format!("UPDATE projection_digest_state SET
@@ -330,7 +335,7 @@ fn operation_triggers(connection: &Connection, columns: &[String]) -> Result<()>
     connection.execute(
         &format!(
             "INSERT INTO projection_digest_operation_rows
-        SELECT json_extract(row_json,'$[0]'),row_json FROM ({}) AS rows",
+        SELECT json_extract(row_json,'$[1]'),row_json FROM ({}) AS rows",
             operation_rows()
         ),
         [],

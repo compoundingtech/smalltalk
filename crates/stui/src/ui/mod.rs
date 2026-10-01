@@ -1885,9 +1885,10 @@ impl Ui {
                             self.flash("Put off until later · demo, this machine only");
                         }
                     }
-                    ("review" | "feedback" | "launch" | "message" | "revision" | "request", 'c') => {
-                        self.editing = true
-                    }
+                    (
+                        "review" | "feedback" | "launch" | "message" | "revision" | "request",
+                        'c',
+                    ) => self.editing = true,
                     ("review" | "feedback" | "launch" | "revision", 'a') => {
                         self.confirm = Some('a')
                     }
@@ -2147,17 +2148,11 @@ impl Ui {
                         id: id.clone(),
                         feedback: draft,
                     }),
-                    Some(AttentionKind::Request { from_id, .. }) => {
-                        let title = self
-                            .current_item()
-                            .map(|item| item.title.clone())
-                            .unwrap_or_default();
-                        Some(Effect::Discuss {
-                            to: from_id,
-                            title: format!("Re: {title}"),
-                            text: draft,
-                        })
-                    }
+                    Some(AttentionKind::Request { .. }) => Some(Effect::Attention {
+                        id: id.clone(),
+                        action: "work.done".into(),
+                        reason: Some(draft),
+                    }),
                     Some(AttentionKind::Message { from, .. }) => Some(Effect::Reply {
                         id: id.clone(),
                         to: from,
@@ -2259,7 +2254,7 @@ impl Ui {
                 ("launch", 'd') => "launch.cancel",
                 ("revision", 'a') => "mission.approve-revision",
                 ("revision", 'j') => "mission.cancel-revision",
-                ("fault" | "request", 'r') => "attention.resolve",
+
                 ("message", 'm') => "message.read",
                 _ => return,
             };
@@ -2791,9 +2786,12 @@ fn stop_flag() -> Result<std::sync::Arc<std::sync::atomic::AtomicBool>> {
 }
 
 impl Guard {
-    /// `keys`: ask the terminal to report modifiers it usually keeps, such as Cmd on macOS,
-    /// where it can (kitty's keyboard protocol). Only glasses ask, for Cmd+K.
+    /// Take over the terminal, and start the watch that ends stui once its terminal is gone so
+    /// a stuck read can never outlive it. `keys`: ask the terminal to report modifiers it
+    /// usually keeps, such as Cmd on macOS, where it can (kitty's keyboard protocol). Only
+    /// glasses ask, for Cmd+K.
     fn enter(keys: bool) -> Result<Self> {
+        crate::watch_terminal_hangup();
         enable_raw_mode()?;
         execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
         let enhanced = keys && crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
@@ -2882,8 +2880,9 @@ pub fn run_demo(args: &[String]) -> Result<()> {
         terminal.draw(|frame| ui.render(frame))?;
         execute!(io::stdout(), EndSynchronizedUpdate)?;
         if event::poll(Duration::from_millis(80))? {
-            // Drain everything queued so a fast wheel does not lag behind.
-            loop {
+            // Drain everything queued so a fast wheel does not lag behind. crossterm's read never
+            // returns on a closed terminal, so check for one before each read.
+            while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
                 match event::read()? {
                     Event::Key(key) => ui.key(key),
                     Event::Mouse(mouse) => ui.mouse(mouse),

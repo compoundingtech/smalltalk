@@ -16,7 +16,7 @@ use sha2::{Digest as _, Sha256};
 
 /// Each file in the set, by name. The pi and omp channel extensions are the same assets st2
 /// embeds, so the library's pi-family launcher finds its exact extension here.
-pub const FILES: [(&str, &[u8]); 10] = [
+pub const FILES: [(&str, &[u8]); 4] = [
     (
         "claude-observe.sh",
         include_bytes!("../hooks/claude-observe.sh"),
@@ -25,27 +25,6 @@ pub const FILES: [(&str, &[u8]); 10] = [
         "claude-statusline.sh",
         include_bytes!("../hooks/claude-statusline.sh"),
     ),
-    (
-        "claude-session-start.sh",
-        include_bytes!("../hooks/claude-session-start.sh"),
-    ),
-    (
-        "claude-pre-compact.sh",
-        include_bytes!("../hooks/claude-pre-compact.sh"),
-    ),
-    (
-        "claude-stop-failure.sh",
-        include_bytes!("../hooks/claude-stop-failure.sh"),
-    ),
-    (
-        "codex-session-start.sh",
-        include_bytes!("../hooks/codex-session-start.sh"),
-    ),
-    (
-        "codex-pre-compact.sh",
-        include_bytes!("../hooks/codex-pre-compact.sh"),
-    ),
-    ("codex-stop.sh", include_bytes!("../hooks/codex-stop.sh")),
     (
         "pi-channel.ts",
         include_bytes!("../../st-drivers/hooks/pi-channel.ts"),
@@ -92,6 +71,29 @@ pub fn root(state_dir: &Path) -> PathBuf {
 /// This binary's set directory beneath `root`. Resolving it changes nothing.
 pub fn set_dir(root: &Path) -> PathBuf {
     root.join(SETS_DIR).join(set_id())
+}
+
+/// Whether an older immutable set contains this hook. Running harnesses retain `ST_HOOKS`
+/// across binary replacement; only their already-published scripts may use retired aliases.
+pub(crate) fn older_set_contains_hook(dir: &Path, name: &str) -> bool {
+    let Ok(bytes) = fs::read(dir.join(MANIFEST)) else {
+        return false;
+    };
+    let identity = format!("sha256-{}", sha256(&bytes));
+    if identity == set_id() || dir.file_name().and_then(|part| part.to_str()) != Some(&identity) {
+        return false;
+    }
+    let Ok(manifest) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+        return false;
+    };
+    if manifest["schema"] != 1 || manifest["owner"] != "st3" {
+        return false;
+    }
+    let file = format!("{name}.sh");
+    let Ok(script) = fs::read(dir.join(&file)) else {
+        return false;
+    };
+    manifest["files"][&file].as_str() == Some(&format!("sha256:{}", sha256(&script)))
 }
 
 /// Check that `dir` holds this binary's exact, executable set.

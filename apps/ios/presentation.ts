@@ -30,7 +30,7 @@ export function attentionHeadline({ count, loaded, error }: { count: number; loa
 }
 
 const actionLabels: Record<Attention['actions'][number], string> = {
-  'attention.resolve': 'Resolve',
+  'work.done': 'Complete step',
   'review.approve': 'Approve review',
   'review.reject': 'Reject review',
   'review.request-changes': 'Request changes',
@@ -49,7 +49,8 @@ const kindLabels: Record<string, string> = {
   'launch-approval': 'Launch approval',
   'revision-approval': 'Revision approval',
   'unread-message': 'Unread message',
-  'agent-request': 'Agent request',
+  'person-step': 'Person step',
+  'agent-request': 'Historical request',
   fault: 'Fault',
 };
 export function attentionKindLabel(kind: string): string {
@@ -85,7 +86,7 @@ export type MissionGroup = typeof missionGroups[number];
 // All contract states have a presentation; held and verifying steps take precedence
 // over dependent steps that are still waiting. Keep aliases for cached older projections.
 const stepGroups: Record<WorkState, MissionGroup | null> = {
-  waiting: 'Waiting', ready: 'Running', claimed: 'Running', blocked: 'Blocked',
+  'waiting-person': 'Waiting', waiting: 'Waiting', ready: 'Running', claimed: 'Running', blocked: 'Blocked',
   verifying: 'Running', completed: null, failed: 'Blocked', cancelled: null,
 };
 function stepGroup(state: string): MissionGroup | null {

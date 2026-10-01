@@ -151,14 +151,14 @@ the stable `id` ascending. No locale-sensitive ordering is permitted.
 | Session timeline | `/sessions/{id}/timeline` | sequence ascending |
 
 Work resources, mission steps (including `current_steps`), and agent work labels use the same
-`WorkState` vocabulary: `waiting`, `ready`, `claimed`, `blocked`, `verifying`, `completed`,
+`WorkState` vocabulary: `waiting-person`, `waiting`, `ready`, `claimed`, `blocked`, `verifying`, `completed`,
 `failed`, and `cancelled`. The API translates internal `pending` to `waiting` and `working` to
 `claimed` in every projection. Clients treat held or verifying work as active even when its
 successors are waiting.
 
 A page carries an optional `sync` notice while its host is catching up with a fleet peer. Its
-projections can then show early history as current, such as an attention request that a
-not-yet-received envelope resolves. The notice lists each peer that holds more envelopes than one
+projections can then show early history as current, such as a person step that a
+not-yet-received envelope completes. The notice lists each peer that holds more envelopes than one
 replication exchange carries, with `peer_only_envelopes` (held by the peer, missing here),
 `local_only_envelopes`, `last_exchange_at`, and `estimated_catch_up_seconds` (null until a rate is
 measured). Clients show the notice above the page. The page omits it once the host has caught up.
@@ -182,16 +182,43 @@ background as it starts; until that report is made, the collection lists one `ru
 `history` is a typed audit projection. It does not expose raw claims, replication envelopes, or
 repair internals.
 
+Attention is a read-only snapshot of current sources. Its identity is the source, recipient, and
+waiting episode. `source_kind`, `episode`, `source_id`, `priority`, `requested_at`, and
+`action_parameters` describe the source and its current remedy. Completed, cancelled, removed,
+retired, or replaced sources disappear before cleanup; a failed run can retain its own fault.
+Pending held subscription requests are not attention sources. Historical `attention.*` claims
+remain audit data. Both raw legacy mutation routes and `attention.resolve` return
+`attention-migrated`; capabilities mark that action unsupported.
+
+An agent asks through `work.ask` (`person_id`, `title`, `reason`, and exactly one of `step_id` or
+`new_run`). Claimed work requires its current generation, definition, attempt, readiness, and
+incarnation fences. The ask creates a ready person-assigned runtime step and pauses its origin
+in `waiting-person`, with no lease, timeout, or retry consumption. A named small run requires a
+live requester declaration or owning run and rejects ambiguous claimed work. Repeating the same
+ask key returns the same step. Retirement and generation replacement invalidate the ask.
+
+`work.done` takes `target_id`, `episode`, nonempty `summary`, and optional string `evidence`.
+Only the assigned person or a session explicitly delegated by that person completes it. The
+requester may instead use `work.cancel-ask`. Completion resumes a live origin in the same attempt
+with a new readiness epoch; the response and evidence stay on the source. CLI equivalents are
+`st work ask --for PERSON --title TEXT --reason TEXT --step STEP --as AGENT --idempotency-key KEY`
+(or `--new-run NAME`) and `st work done STEP --as PERSON --summary TEXT`.
+
+Clients must evict removed source cards and replace their window from fresh snapshots on
+reconnect. The iOS cache version is 4 and stui's is 3; older cached cards are discarded. Offline
+cards are marked stale and cannot submit actions. A future notification consumer should compare
+fixed-recipient snapshots at an explicit `as_of` and deduplicate transitions by source, person,
+and episode, notifying only when an episode first appears. There is no push delivery service.
+
 Every attention resource carries its concrete `person_id`, original `source_id`, semantic
 `attention_kind`, optional mission/run/step context, and currently meaningful typed actions. A
 client can therefore render a mixed inbox, navigate to the source, and act without recovering
 identity or graph context from prose.
 
 A `fault` also carries `target_states`: for each target with a lifecycle (a mission, run,
-generation, step, attention item, or agent), its current `state` and, when known, the `since`
-time it entered that state. Resource and document targets have none. A person can recognize a
-request whose targets have all moved on, such as `mission/fleet/typecase: cancelled 4h ago`,
-without opening each target.
+generation, step, or agent), its current `state` and, when known, the `since`
+time it entered that state. Resource and document targets have none. The card describes the
+current failure and offers source inspection; recovery, cancellation, or retirement removes it.
 
 Each agent resource includes `current_work_ids` and an ordered `upcoming_work_ids` preview across
 mission runs. `next_work_id` is the first ready item, even while another step occupies the agent's
@@ -314,12 +341,12 @@ The v0 action discriminators are:
 
 | Family | Actions | Required fences |
 |---|---|---|
-| Attention | `attention.resolve`, `review.approve`, `review.reject`, `review.request-changes` | attention or review revision |
+| Attention | `work.done`, `review.approve`, `review.reject`, `review.request-changes` | source episode or review revision |
 | Messages | `message.send`, `message.read`, `message.close` | reply/message revision when present |
 | Launches | `launch.create`, `launch.revise`, `launch.preview`, `launch.approve`, `launch.cancel` | launch revision; target generation and preview token where applicable |
 | Missions | `mission.start`, `mission.revise`, `mission.approve-revision`, `mission.cancel-revision`, `mission.cancel` | mission revision and current generation where applicable |
 | Sessions | `session.import` | exact native-session revision; an exact running-process fingerprint is revalidated server-side |
-| Work | `work.claim`, `work.renew`, `work.progress`, `work.complete`, `work.fail`, `work.release`, `work.retry`, `work.publish-mission` | generation, definition, attempt, readiness epoch, and claimant incarnation after claim |
+| Work | `work.ask`, `work.cancel-ask`, `work.claim`, `work.renew`, `work.progress`, `work.complete`, `work.fail`, `work.release`, `work.retry`, `work.publish-mission` | generation, definition, attempt, readiness epoch, and claimant incarnation after claim |
 | Seat queues | `agent.queue-move` | snapshot; the run and any anchor run must be queued for the seat |
 | Lanes | `lane.join`, `lane.leave`, `lane.move`, `lane.mark`, `lane.approve` | snapshot; the lane must be open and a named entry or anchor must be in it |
 | Runtimes | `runtime.stop`, `runtime.restart`, `runtime.reset`, `runtime.context-clear`, `runtime.signal` | runtime incarnation; stop, restart, and reset also require `runtime_desired_revision` from the runtime resource |

@@ -55,6 +55,22 @@ same order for existing claim queries. In-memory comparisons use `claim_key` or
 `key_from_record`, and claim-to-claim predicates use `after_sql`. Legacy batch position is its
 relative position within the batch. A global arrival index never chooses a shared winner.
 
+Document version rows retain the earliest canonical binding for repeated name/hash pairs;
+mission revision rows do the same for repeated identical revisions. Document latest flags,
+history order and cursor boundaries use binding claim keys. Complete mailbox readers and
+selected unread reminders use canonical sent-claim keys; bounded mailbox cursors remain local.
+The shuffle fixture compares paged document answers and the existing person attention view,
+including unread messages, reminder selection and episode onset. Proposal lifecycle tests
+compare all shared rows and digests through creation, review, draining, cancellation and apply.
+
+Documents record a sortable encoding of the complete binding claim key at admission.
+`document_canonical_latest(name,binding_key DESC)` serves latest selection and history order;
+readers never sort a name's entire claim history for each returned version. Schema 15 backfills
+the keys once, choosing the earliest canonical binding for each repeated name/hash. The key is
+a shared derived column and is digested with the document row. The fleet-size regression builds
+260,000 claims and 10,000 document versions, then requires latest listings, history pages,
+lookup and cursor reads to finish within two seconds and verifies the indexed latest query plan.
+
 ## Projection digest coverage and cost
 
 `store/projection_digest.rs::TABLES` lists the shared tables: operations, blobs, documents,
@@ -90,6 +106,9 @@ SQLite triggers update per-table row counts and 512-bit modular sums of domain-s
 SHA-512 row hashes in the row's own transaction. Insert, update, delete, replacement, savepoint
 rollback and commit therefore change rows and cached digest state together. SHA-256 commits the
 table name, column schema, count and sum; a sorted map of those table digests commits the graph.
+Shared columns are encoded in sorted name order, including the logical operation row. A fresh
+schema and an additive migration can place the same column at different physical positions;
+that layout does not change the digest. Registry version 6 rebuilds older physical-order caches.
 These are diagnostic digests; authenticated envelopes and signatures remain the replication
 integrity boundary. Work scales with changed row bytes, plus the fixed-size accumulator.
 Reading all table digests reads one small cache, independent of retained history size. Operations
@@ -105,7 +124,7 @@ the test inventory and production registry to agree, and the fixture exercises e
 
 `st replication status` prints `table-digest` entries and names differing tables under each
 peer. `st replication diff PEER` and `st doctor` also name them. Table differences are meaningful
-only when inventories agree and projection is current. Old peers omit `projection_digests`;
+only when inventories agree, projection is current and local committed batches are sealed. Old peers omit `projection_digests`;
 exchanges and heals then compare their unchanged six-table compatibility hash. Old peers cannot
 verify full projection coverage. Modern peers compare complete maps. SQLite schema 14 adds the
 transactional digest machinery and rebuilds shared projections once, correcting older stored
