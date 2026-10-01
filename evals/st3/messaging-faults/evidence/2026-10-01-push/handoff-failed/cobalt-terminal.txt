@@ -1,2 +1,2 @@
-st: st API returned 422 stale-mailbox-session: this is not the seat's live incar
-nation
+st: could not update seat title: updating the PTY title failed: Session "eval/fa
+ult-probe" not found.

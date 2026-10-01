@@ -28,7 +28,10 @@ and refuses new traffic. Cleanup stops reconciliation before closing the private
 PTY registry. Shared daemons and seats are never stopped or changed.
 
 Every case starts fresh nodes and proves a cross-node warmup before injecting the
-fault. The cases are:
+fault. Provider readiness and that warmup both use the setup deadline (60 seconds by
+default): a peer exchange can already be in its 30-second long poll when the warmup
+is sent. This does not change the ten-second recovery gate after a fault clears.
+Fixture errors record the phase that timed out. The cases are:
 
 | Case | Injection | Fault clears when |
 | --- | --- | --- |
@@ -113,8 +116,8 @@ successful normalized evidence under its checkout's `target/messaging-faults/run
 
 The daemon push implementation's ten-case evidence is in
 [evidence/2026-10-01-push/result.json](evidence/2026-10-01-push/result.json).
-All cases passed with no projected inbox/archive messages on the review-fix build `24bae034`,
-including daemon-allocated binding epochs and transient-error reconnect behavior. Native Codex/OpenCode ledger tests,
+All cases passed with no projected inbox/archive messages on the final implementation and fixture build `ad7b6ae1`,
+including daemon-allocated binding epochs, transient-error reconnect behavior and a deterministic historical-channel outage. Native Codex/OpenCode ledger tests,
 Claude transcript/uncertainty tests, and both owned extension smoke tests cover the other no-files
 boundaries, current-session receipt fencing and replacement reconnects. The Unix stream test
 commits a native receipt then discards the HTTP acknowledgement; its retry returns the same claim.
@@ -131,3 +134,8 @@ seat-record frames from a fixture channel, while the real provider exercises new
 in-process resume and cold resume. It also verifies a temporary native rename is replaced by the
 next authority update, including the seat's persona suffix. Results are in
 [evidence/2026-10-01-push/omp-18.4.4-labels.json](evidence/2026-10-01-push/omp-18.4.4-labels.json).
+
+The fresh Claude-only seat smoke proves managed hooks and transcript binding, native delivery/read,
+zero projected message files and zero legacy status files:
+[evidence/2026-10-01-push/claude-no-st2.json](evidence/2026-10-01-push/claude-no-st2.json).
+Each result records the tested source head; the smoke uses a provider stand-in without model calls.

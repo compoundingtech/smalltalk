@@ -24,7 +24,7 @@
     {
       "name": "disk-space",
       "status": "pass",
-      "message": "8.0 GiB of 31.2 GiB free (25.6%) on the filesystem of <eval-root>/cobalt/state"
+      "message": "469.7 GiB of 905.1 GiB free (51.9%) on the filesystem of <eval-root>/cobalt/state"
     },
     {
       "name": "pty-runtime",
@@ -104,52 +104,52 @@
     {
       "name": "request-latency//v1/internal/replication/receive",
       "status": "pass",
-      "message": "16 requests; recent p50 2 ms, p99 15 ms, max 15 ms"
-    },
-    {
-      "name": "request-latency//v1/internal/replication/export",
-      "status": "pass",
-      "message": "32 requests; recent p50 7 ms, p99 11 ms, max 11 ms"
-    },
-    {
-      "name": "request-latency//v1/client/agents/{*id}",
-      "status": "pass",
-      "message": "17 requests; recent p50 0 ms, p99 6 ms, max 6 ms"
-    },
-    {
-      "name": "request-latency//v1/messages/{message_id}/claims",
-      "status": "pass",
-      "message": "3 requests; recent p50 6 ms, p99 6 ms, max 6 ms"
-    },
-    {
-      "name": "request-latency//v1/mailbox/receipts",
-      "status": "pass",
-      "message": "3 requests; recent p50 4 ms, p99 5 ms, max 5 ms"
-    },
-    {
-      "name": "request-latency//v1/intent/mission",
-      "status": "pass",
-      "message": "1 requests; recent p50 4 ms, p99 4 ms, max 4 ms"
-    },
-    {
-      "name": "request-latency//v1/claims",
-      "status": "pass",
-      "message": "3 requests; recent p50 3 ms, p99 3 ms, max 3 ms"
-    },
-    {
-      "name": "request-latency//v1/intent/apply",
-      "status": "pass",
-      "message": "1 requests; recent p50 3 ms, p99 3 ms, max 3 ms"
+      "message": "12 requests; recent p50 11 ms, p99 72 ms, max 72 ms"
     },
     {
       "name": "request-latency//v1/internal/replication-wake",
       "status": "pass",
-      "message": "4 requests; recent p50 1 ms, p99 2 ms, max 2 ms"
+      "message": "4 requests; recent p50 1 ms, p99 66 ms, max 66 ms"
     },
     {
-      "name": "request-latency//v1/status",
+      "name": "request-latency//v1/internal/replication/export",
       "status": "pass",
-      "message": "1 requests; recent p50 2 ms, p99 2 ms, max 2 ms"
+      "message": "26 requests; recent p50 6 ms, p99 34 ms, max 34 ms"
+    },
+    {
+      "name": "request-latency//v1/messages/{message_id}/claims",
+      "status": "pass",
+      "message": "3 requests; recent p50 18 ms, p99 23 ms, max 23 ms"
+    },
+    {
+      "name": "request-latency//v1/mailbox/receipts",
+      "status": "pass",
+      "message": "3 requests; recent p50 13 ms, p99 18 ms, max 18 ms"
+    },
+    {
+      "name": "request-latency//v1/intent/apply",
+      "status": "pass",
+      "message": "1 requests; recent p50 14 ms, p99 14 ms, max 14 ms"
+    },
+    {
+      "name": "request-latency//v1/mailbox/bind",
+      "status": "pass",
+      "message": "3 requests; recent p50 10 ms, p99 14 ms, max 14 ms"
+    },
+    {
+      "name": "request-latency//v1/claims",
+      "status": "pass",
+      "message": "3 requests; recent p50 12 ms, p99 12 ms, max 12 ms"
+    },
+    {
+      "name": "request-latency//v1/client/agents/{*id}",
+      "status": "pass",
+      "message": "7 requests; recent p50 3 ms, p99 6 ms, max 6 ms"
+    },
+    {
+      "name": "request-latency//v1/intent/mission",
+      "status": "pass",
+      "message": "1 requests; recent p50 3 ms, p99 3 ms, max 3 ms"
     },
     {
       "name": "github-budget",
@@ -161,325 +161,325 @@
     "window_seconds": 300,
     "requests": [
       {
-        "kind": "task reconcile-pass",
-        "count": 19,
-        "total_ms": 255.633,
-        "max_ms": 174.546,
-        "mean_ms": 13.454368421052632,
-        "cpu_ms": 72.007
+        "kind": "startup open-store",
+        "count": 1,
+        "total_ms": 1276.307,
+        "max_ms": 1276.307,
+        "mean_ms": 1276.307,
+        "cpu_ms": 59.415
       },
       {
-        "kind": "/v1/internal/replication/export",
-        "count": 32,
-        "total_ms": 249.691,
-        "max_ms": 11.601,
-        "mean_ms": 7.80284375,
-        "cpu_ms": 231.58
+        "kind": "task reconcile-pass",
+        "count": 16,
+        "total_ms": 403.233,
+        "max_ms": 230.317,
+        "mean_ms": 25.2020625,
+        "cpu_ms": 71.858
       },
       {
         "kind": "/v1/internal/replication/receive",
-        "count": 16,
-        "total_ms": 55.473,
-        "max_ms": 15.031,
-        "mean_ms": 3.4670625,
-        "cpu_ms": 44.102
+        "count": 12,
+        "total_ms": 358.401,
+        "max_ms": 72.52,
+        "mean_ms": 29.86675,
+        "cpu_ms": 33.552
       },
       {
-        "kind": "task reconcile-deadline",
-        "count": 15,
-        "total_ms": 41.1,
-        "max_ms": 28.632,
-        "mean_ms": 2.74,
-        "cpu_ms": 31.924
-      },
-      {
-        "kind": "startup open-store",
-        "count": 1,
-        "total_ms": 36.169,
-        "max_ms": 36.169,
-        "mean_ms": 36.169,
-        "cpu_ms": 36.141
-      },
-      {
-        "kind": "/v1/client/agents/{*id}",
-        "count": 17,
-        "total_ms": 34.788,
-        "max_ms": 6.181,
-        "mean_ms": 2.0463529411764707,
-        "cpu_ms": 24.385
-      },
-      {
-        "kind": "task checkpoint",
-        "count": 1,
-        "total_ms": 31.667,
-        "max_ms": 31.667,
-        "mean_ms": 31.667,
-        "cpu_ms": 23.157
-      },
-      {
-        "kind": "/v1/messages/{message_id}/claims",
-        "count": 3,
-        "total_ms": 18.109,
-        "max_ms": 6.697,
-        "mean_ms": 6.036333333333333,
-        "cpu_ms": 2.258
-      },
-      {
-        "kind": "/v1/internal/fleet/membership",
-        "count": 16,
-        "total_ms": 14.529,
-        "max_ms": 1.683,
-        "mean_ms": 0.9080625,
-        "cpu_ms": 11.386
-      },
-      {
-        "kind": "/v1/mailbox/receipts",
-        "count": 3,
-        "total_ms": 13.456,
-        "max_ms": 5.862,
-        "mean_ms": 4.485333333333333,
-        "cpu_ms": 1.739
-      },
-      {
-        "kind": "/v1/claims",
-        "count": 3,
-        "total_ms": 9.22,
-        "max_ms": 3.202,
-        "mean_ms": 3.0733333333333337,
-        "cpu_ms": 1.809
+        "kind": "/v1/internal/replication/export",
+        "count": 26,
+        "total_ms": 272.277,
+        "max_ms": 34.612,
+        "mean_ms": 10.472192307692309,
+        "cpu_ms": 180.799
       },
       {
         "kind": "/v1/internal/replication-wake",
         "count": 4,
-        "total_ms": 8.142,
-        "max_ms": 2.441,
-        "mean_ms": 2.0355,
-        "cpu_ms": 7.499
+        "total_ms": 90.136,
+        "max_ms": 66.202,
+        "mean_ms": 22.534,
+        "cpu_ms": 22.604
       },
       {
-        "kind": "/v1/intent/mission",
+        "kind": "/v1/messages/{message_id}/claims",
+        "count": 3,
+        "total_ms": 54.585,
+        "max_ms": 23.127,
+        "mean_ms": 18.195,
+        "cpu_ms": 1.85
+      },
+      {
+        "kind": "task checkpoint",
         "count": 1,
-        "total_ms": 4.434,
-        "max_ms": 4.434,
-        "mean_ms": 4.434,
-        "cpu_ms": 4.124
+        "total_ms": 54.563,
+        "max_ms": 54.563,
+        "mean_ms": 54.563,
+        "cpu_ms": 22.15
+      },
+      {
+        "kind": "/v1/mailbox/receipts",
+        "count": 3,
+        "total_ms": 44.696,
+        "max_ms": 18.679,
+        "mean_ms": 14.898666666666664,
+        "cpu_ms": 1.897
+      },
+      {
+        "kind": "/v1/claims",
+        "count": 3,
+        "total_ms": 36.729,
+        "max_ms": 12.711,
+        "mean_ms": 12.243,
+        "cpu_ms": 2.142
+      },
+      {
+        "kind": "task reconcile-deadline",
+        "count": 12,
+        "total_ms": 31.558,
+        "max_ms": 23.087,
+        "mean_ms": 2.6298333333333335,
+        "cpu_ms": 28.129
+      },
+      {
+        "kind": "/v1/client/agents/{*id}",
+        "count": 7,
+        "total_ms": 27.671,
+        "max_ms": 6.934,
+        "mean_ms": 3.953,
+        "cpu_ms": 23.876
       },
       {
         "kind": "/v1/mailbox/bind",
-        "count": 2,
-        "total_ms": 3.782,
-        "max_ms": 1.9,
-        "mean_ms": 1.891,
-        "cpu_ms": 2.461
+        "count": 3,
+        "total_ms": 25.865,
+        "max_ms": 14.487,
+        "mean_ms": 8.621666666666666,
+        "cpu_ms": 3.758
       },
       {
         "kind": "/v1/intent/apply",
         "count": 1,
-        "total_ms": 3.42,
-        "max_ms": 3.42,
-        "mean_ms": 3.42,
-        "cpu_ms": 1.246
+        "total_ms": 14.963,
+        "max_ms": 14.963,
+        "mean_ms": 14.963,
+        "cpu_ms": 1.13
       },
       {
-        "kind": "/v1/status",
-        "count": 1,
-        "total_ms": 2.747,
-        "max_ms": 2.747,
-        "mean_ms": 2.747,
-        "cpu_ms": 2.343
-      },
-      {
-        "kind": "/v1/replication/status",
-        "count": 1,
-        "total_ms": 1.755,
-        "max_ms": 1.755,
-        "mean_ms": 1.755,
-        "cpu_ms": 1.42
+        "kind": "/v1/internal/fleet/membership",
+        "count": 16,
+        "total_ms": 13.142,
+        "max_ms": 1.241,
+        "mean_ms": 0.821375,
+        "cpu_ms": 10.636
       },
       {
         "kind": "startup settle-runs",
         "count": 1,
-        "total_ms": 1.67,
-        "max_ms": 1.67,
-        "mean_ms": 1.67,
-        "cpu_ms": 1.664
-      },
-      {
-        "kind": "/v1/mailbox",
-        "count": 1,
-        "total_ms": 1.078,
-        "max_ms": 1.078,
-        "mean_ms": 1.078,
-        "cpu_ms": 0.995
+        "total_ms": 10.625,
+        "max_ms": 10.625,
+        "mean_ms": 10.625,
+        "cpu_ms": 1.946
       },
       {
         "kind": "startup validate-replication-backlog",
         "count": 1,
-        "total_ms": 1.027,
-        "max_ms": 1.027,
-        "mean_ms": 1.027,
-        "cpu_ms": 1.018
+        "total_ms": 9.906,
+        "max_ms": 9.906,
+        "mean_ms": 9.906,
+        "cpu_ms": 1.129
+      },
+      {
+        "kind": "startup project-replication-backlog",
+        "count": 1,
+        "total_ms": 9.172,
+        "max_ms": 9.172,
+        "mean_ms": 9.172,
+        "cpu_ms": 0.371
+      },
+      {
+        "kind": "/v1/status",
+        "count": 2,
+        "total_ms": 3.536,
+        "max_ms": 1.877,
+        "mean_ms": 1.768,
+        "cpu_ms": 2.935
+      },
+      {
+        "kind": "/v1/intent/mission",
+        "count": 1,
+        "total_ms": 3.456,
+        "max_ms": 3.456,
+        "mean_ms": 3.456,
+        "cpu_ms": 3.175
+      },
+      {
+        "kind": "/v1/mailbox",
+        "count": 2,
+        "total_ms": 2.636,
+        "max_ms": 1.521,
+        "mean_ms": 1.318,
+        "cpu_ms": 2.468
       }
     ],
     "queries": [
       {
-        "kind": "(other)",
-        "count": 2944,
-        "total_ms": 68.0,
-        "max_ms": 1.0,
-        "mean_ms": 0.023097826086956524,
-        "cpu_ms": 0.0
-      },
-      {
         "kind": "COMMIT",
-        "count": 125,
-        "total_ms": 3.0,
-        "max_ms": 1.0,
-        "mean_ms": 0.024,
+        "count": 115,
+        "total_ms": 543.0,
+        "max_ms": 19.0,
+        "mean_ms": 4.721739130434783,
         "cpu_ms": 0.0
       },
       {
-        "kind": "SELECT claims.id, claims.store_index, claims.body, claims.accepted_at_unix_ms FROM claims INDEXED BY claims_subject_kind_accepted_index JOIN batches ON batches.id=claims.batch_id WHERE claims.subject=?? AND claims.kind=? AND +claims.store_index<=?? ORDER BY length(claims.accepted_at_unix_ms) DESC, claims.accepted_at_unix_ms DESC, (SELECT origin FROM batches WHERE id=claims.batch_id) DESC, (SELECT replica_sequence FROM batches WHERE id=claims.batch_id) DESC, claims.batch_id DESC, COALESCE((SELECT",
-        "count": 13,
-        "total_ms": 2.0,
-        "max_ms": 1.0,
-        "mean_ms": 0.15384615384615383,
+        "kind": "(other)",
+        "count": 3127,
+        "total_ms": 102.0,
+        "max_ms": 9.0,
+        "mean_ms": 0.032619123760793095,
         "cpu_ms": 0.0
       },
       {
-        "kind": "CREATE INDEX IF NOT EXISTS claims_message_to_index ON claims(json_extract(body, ?), subject) WHERE kind=?;",
+        "kind": "CREATE TABLE IF NOT EXISTS local_usage_totals ( subject TEXT NOT NULL, incarnation_id TEXT NOT NULL, model TEXT NOT NULL, owner_run TEXT NOT NULL, owner_step TEXT NOT NULL, host TEXT NOT NULL, input_tokens INTEGER NOT NULL DEFAULT ?, output_tokens INTEGER NOT NULL DEFAULT ?, cache_write_tokens INTEGER NOT NULL DEFAULT ?, cached_tokens INTEGER NOT NULL DEFAULT ?, total_tokens INTEGER NOT NULL DEFAULT ?, observed_at_unix_ms INTEGER NOT NULL, PRIMARY KEY(subject, incarnation_id, model, owner_run,",
         "count": 1,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 1.0,
+        "total_ms": 18.0,
+        "max_ms": 18.0,
+        "mean_ms": 18.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE TABLE IF NOT EXISTS meta ( key TEXT PRIMARY KEY, value TEXT NOT NULL );",
+        "count": 1,
+        "total_ms": 18.0,
+        "max_ms": 18.0,
+        "mean_ms": 18.0,
         "cpu_ms": 0.0
       },
       {
         "kind": "CREATE INDEX IF NOT EXISTS step_runs_open_index ON step_runs(created_at_unix_ms, step_path) WHERE status NOT IN (?,?,?);",
         "count": 1,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 1.0,
+        "total_ms": 13.0,
+        "max_ms": 13.0,
+        "mean_ms": 13.0,
         "cpu_ms": 0.0
       },
       {
-        "kind": "CREATE TABLE IF NOT EXISTS mission_runs ( id TEXT PRIMARY KEY, mission_id TEXT NOT NULL, initial_revision TEXT NOT NULL, current_generation_id TEXT NOT NULL, root_revision TEXT NOT NULL, root_run_id TEXT NOT NULL, parent_step_run TEXT, workspace TEXT NOT NULL, requester TEXT NOT NULL, inputs TEXT NOT NULL, mode TEXT NOT NULL, status TEXT NOT NULL, phase TEXT NOT NULL, created_at_unix_ms TEXT NOT NULL, updated_at_unix_ms TEXT NOT NULL );",
+        "kind": "CREATE INDEX IF NOT EXISTS desired_owner_run_index ON desired(owner_run, subject);",
         "count": 1,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 1.0,
+        "total_ms": 11.0,
+        "max_ms": 11.0,
+        "mean_ms": 11.0,
         "cpu_ms": 0.0
       },
       {
-        "kind": "CREATE TRIGGER IF NOT EXISTS run_generations_graph_delete AFTER DELETE ON run_generations BEGIN UPDATE graph_generation SET value=value+? WHERE id=?; END;",
+        "kind": "CREATE TRIGGER IF NOT EXISTS mission_definitions_graph_insert AFTER INSERT ON mission_definitions BEGIN UPDATE graph_generation SET value=value+? WHERE id=?; END;",
         "count": 1,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 1.0,
+        "total_ms": 11.0,
+        "max_ms": 11.0,
+        "mean_ms": 11.0,
         "cpu_ms": 0.0
       },
       {
-        "kind": "CREATE TRIGGER projection_digest_checkpoint_claims_identity_update BEFORE UPDATE OF id ON checkpoint_claims WHEN OLD.id IS NOT NEW.id BEGIN SELECT RAISE(ABORT,?); END;",
+        "kind": "CREATE INDEX IF NOT EXISTS checkpoint_claims_operation ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;",
         "count": 1,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 1.0,
+        "total_ms": 10.0,
+        "max_ms": 10.0,
+        "mean_ms": 10.0,
         "cpu_ms": 0.0
       },
       {
-        "kind": "CREATE TRIGGER projection_digest_mission_run_deadlines_insert AFTER INSERT ON mission_run_deadlines BEGIN UPDATE projection_digest_state SET row_count=row_count+(?), accumulator=st_projection_change(accumulator,table_name,columns_json,NULL,json_array(NEW.deadline_at_unix_ms,NEW.run_id,NEW.timeout_ms),?) WHERE table_name=?; UPDATE projection_digest_generation SET value=value+? WHERE id=?; END;",
+        "kind": "CREATE INDEX IF NOT EXISTS claims_subscription_deferred_request_index ON claims(subject, json_extract(body, ?), store_index) WHERE kind=?;",
         "count": 1,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 1.0,
+        "total_ms": 10.0,
+        "max_ms": 10.0,
+        "mean_ms": 10.0,
         "cpu_ms": 0.0
       },
       {
-        "kind": "CREATE TRIGGER projection_digest_operation_checkpoint_claims_INSERT_NEW AFTER INSERT ON checkpoint_claims WHEN NEW.operation_id IS NOT NULL AND NOT EXISTS(SELECT ? FROM operations WHERE id=NEW.operation_id) BEGIN UPDATE projection_digest_state SET row_count=row_count+(COALESCE((SELECT json_array(canonical_claim_id,id,request_digest,state) FROM operations WHERE id=NEW.operation_id),(SELECT json_array( (SELECT MIN(c.id) FROM checkpoint_claims c WHERE c.operation_id=NEW.operation_id AND NOT EXISTS(",
+        "kind": "CREATE INDEX IF NOT EXISTS document_latest ON documents(name, created_index DESC);",
         "count": 1,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 1.0,
+        "total_ms": 10.0,
+        "max_ms": 10.0,
+        "mean_ms": 10.0,
         "cpu_ms": 0.0
       },
       {
-        "kind": "CREATE TRIGGER projection_digest_operation_operations_DELETE_OLD AFTER DELETE ON operations WHEN ? BEGIN UPDATE projection_digest_state SET row_count=row_count+(COALESCE((SELECT json_array(canonical_claim_id,id,request_digest,state) FROM operations WHERE id=OLD.id),(SELECT json_array( (SELECT MIN(c.id) FROM checkpoint_claims c WHERE c.operation_id=OLD.id AND NOT EXISTS(SELECT ? FROM projection_digest_repaired_claims WHERE id=c.id) AND c.request_digest=(SELECT MIN(m.request_digest) FROM checkpoin",
+        "kind": "CREATE TABLE IF NOT EXISTS local_mailbox_owners ( subject TEXT NOT NULL, component TEXT NOT NULL, incarnation TEXT NOT NULL, epoch INTEGER NOT NULL, PRIMARY KEY(subject, component) );",
         "count": 1,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 1.0,
+        "total_ms": 10.0,
+        "max_ms": 10.0,
+        "mean_ms": 10.0,
         "cpu_ms": 0.0
       },
       {
-        "kind": "CREATE TRIGGER projection_digest_planning_sessions_insert AFTER INSERT ON planning_sessions BEGIN UPDATE projection_digest_state SET row_count=row_count+(?), accumulator=st_projection_change(accumulator,table_name,columns_json,NULL,json_array(NEW.created_at_unix_ms,NEW.id,NEW.mission_id,NEW.planner,NEW.planner_spec_json,NEW.published_revision,NEW.request_ref,NEW.requester,NEW.source_generation_id,NEW.status,NEW.target_run_id,NEW.updated_at_unix_ms,NEW.workspace),?) WHERE table_name=?; UPDATE pr",
+        "kind": "COMMIT;",
         "count": 1,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 1.0,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
         "cpu_ms": 0.0
       },
       {
-        "kind": "CREATE TRIGGER projection_digest_repaired_claims_DELETE AFTER DELETE ON projection_digest_repaired_claims WHEN (SELECT json_array(id,CAST(accepted_at_unix_ms AS TEXT)) FROM claims WHERE id=OLD.id UNION ALL SELECT json_array(id,CAST(accepted_at_unix_ms AS TEXT)) FROM checkpoint_claims WHERE id=OLD.id AND NOT EXISTS(SELECT ? FROM claims WHERE id=OLD.id) LIMIT ?) IS NOT NULL BEGIN UPDATE projection_digest_state SET row_count=row_count+(?), accumulator=st_projection_change(accumulator,table_name,col",
+        "kind": "CREATE INDEX IF NOT EXISTS batches_writer_sequence ON batches(origin, replica_sequence);",
         "count": 1,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 1.0,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
         "cpu_ms": 0.0
       },
       {
-        "kind": "CREATE TRIGGER projection_digest_repaired_claims_INSERT AFTER INSERT ON projection_digest_repaired_claims WHEN (SELECT json_array(id,CAST(accepted_at_unix_ms AS TEXT)) FROM claims WHERE id=NEW.id UNION ALL SELECT json_array(id,CAST(accepted_at_unix_ms AS TEXT)) FROM checkpoint_claims WHERE id=NEW.id AND NOT EXISTS(SELECT ? FROM claims WHERE id=NEW.id) LIMIT ?) IS NOT NULL BEGIN UPDATE projection_digest_state SET row_count=row_count+(-?), accumulator=st_projection_change(accumulator,table_name,co",
+        "kind": "CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);",
         "count": 1,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 1.0,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
         "cpu_ms": 0.0
       },
       {
-        "kind": "INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms) VALUES (??, ??, ??, ??, ??, ??, ??, ??, ??)",
+        "kind": "CREATE INDEX IF NOT EXISTS claims_accepted_order_index ON claims(length(accepted_at_unix_ms), accepted_at_unix_ms, store_index);",
         "count": 1,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 1.0,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
         "cpu_ms": 0.0
       },
       {
-        "kind": "SELECT claims.body FROM claims INDEXED BY claims_subject_kind_accepted_index JOIN batches ON batches.id=claims.batch_id WHERE claims.subject=?? AND claims.kind=? AND +claims.store_index<=?? ORDER BY length(claims.accepted_at_unix_ms) DESC, claims.accepted_at_unix_ms DESC, (SELECT origin FROM batches WHERE id=claims.batch_id) DESC, (SELECT replica_sequence FROM batches WHERE id=claims.batch_id) DESC, claims.batch_id DESC, COALESCE((SELECT MIN(position) FROM replica_records WHERE claim_id=claims.i",
-        "count": 9,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 0.11111111111111112,
-        "cpu_ms": 0.0
-      },
-      {
-        "kind": "SELECT id, predecessors FROM claims WHERE subject=?? AND kind=? AND store_index<=?? AND NOT EXISTS ( SELECT ? FROM replica_records WHERE replica_records.claim_id=claims.id AND replica_records.state=? ) ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms, (SELECT origin FROM batches WHERE id=claims.batch_id), (SELECT replica_sequence FROM batches WHERE id=claims.batch_id), claims.batch_id, COALESCE((SELECT MIN(position) FROM replica_records WHERE claim_id=claims.id), (SELECT C",
-        "count": 2,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 0.5,
-        "cpu_ms": 0.0
-      },
-      {
-        "kind": "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms FROM claims WHERE json_extract(body, ?) IS NOT NULL AND NOT EXISTS(SELECT ? FROM projection_digest_repaired_claims WHERE id=claims.id) ORDER BY id",
+        "kind": "CREATE INDEX IF NOT EXISTS claims_actor_progress_index ON claims(actor, store_index) WHERE kind IN (?, ?);",
         "count": 1,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 1.0,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
         "cpu_ms": 0.0
       },
       {
-        "kind": "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step FROM desired ORDER BY subject",
-        "count": 6,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 0.16666666666666666,
+        "kind": "CREATE INDEX IF NOT EXISTS claims_batch_index ON claims(batch_id, store_index);",
+        "count": 1,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
         "cpu_ms": 0.0
       },
       {
-        "kind": "SELECT subject, kind, body, member, owner_run, owner_generation, owner_step FROM desired WHERE subject IN (SELECT value FROM json_each(??)) ORDER BY subject",
-        "count": 4,
-        "total_ms": 1.0,
-        "max_ms": 1.0,
-        "mean_ms": 0.25,
+        "kind": "CREATE INDEX IF NOT EXISTS claims_current_view_index ON claims(subject, store_index) WHERE kind=? OR json_extract(body, ?) NOT IN (?, ?, ?) OR json_extract(body, ?) NOT IN (?, ?, ?);",
+        "count": 1,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE INDEX IF NOT EXISTS claims_generation_revision_index ON claims(json_extract(body, ?)) WHERE kind=?;",
+        "count": 1,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
+        "cpu_ms": 0.0
+      },
+      {
+        "kind": "CREATE INDEX IF NOT EXISTS claims_generation_run_index ON claims(json_extract(body, ?)) WHERE kind=?;",
+        "count": 1,
+        "total_ms": 9.0,
+        "max_ms": 9.0,
+        "mean_ms": 9.0,
         "cpu_ms": 0.0
       }
     ],

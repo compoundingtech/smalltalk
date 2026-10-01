@@ -9,5 +9,6 @@
     "cold_resume": "Quartz [gen]",
     "authority_update": "Indigo [gen]"
   },
-  "verdict": "pass"
+  "verdict": "pass",
+  "tested_source_head": "f440751cdaa967c4911a5324c5cb98f55f9f32bd"
 }

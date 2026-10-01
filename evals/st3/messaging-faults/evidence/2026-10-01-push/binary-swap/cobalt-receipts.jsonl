@@ -1,15 +1,15 @@
-{"at_unix_ms":1790859472183,"pid":1187109,"event":"started"}
-{"at_unix_ms":1790859472257,"pid":1187109,"event":"ready"}
-{"at_unix_ms":1790859472267,"pid":1187109,"event":"seat-title","label":"eval/fault-probe"}
-{"at_unix_ms":1790859501267,"pid":1187109,"event":"wire-frame","subject":"message/c78a5117e39c778b"}
-{"at_unix_ms":1790859501267,"pid":1187109,"event":"received","subject":"message/c78a5117e39c778b","content":"<smalltalk-message id=\"c78a5117e39c778b\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/c78a5117e39c778b\">\nreceipt-token:warmup\n</smalltalk-message>"}
-{"at_unix_ms":1790859501277,"pid":1187109,"event":"delivered","subject":"message/c78a5117e39c778b","accepted_at_unix_ms":1790859501273}
-{"at_unix_ms":1790859501281,"pid":1187109,"event":"read","subject":"message/c78a5117e39c778b","accepted_at_unix_ms":1790859501279}
-{"at_unix_ms":1790859501286,"pid":1187109,"event":"closed","subject":"message/c78a5117e39c778b","accepted_at_unix_ms":1790859501283}
-{"at_unix_ms":1790859502533,"pid":1187109,"event":"seat-title","label":"eval/fault-probe"}
-{"at_unix_ms":1790859503269,"pid":1187109,"event":"wire-frame","subject":"message/6d62d5bf1a4c91e6"}
-{"at_unix_ms":1790859503269,"pid":1187109,"event":"received","subject":"message/6d62d5bf1a4c91e6","content":"<smalltalk-message id=\"6d62d5bf1a4c91e6\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: binary-swap\" sha256=\"feb19e5bfafb63450a7e1e38152d7cb49fa7ec3488a281694c35b38913c37564\" graph=\"message/6d62d5bf1a4c91e6\">\nreceipt-token:binary-swap\n</smalltalk-message>"}
-{"at_unix_ms":1790859503280,"pid":1187109,"event":"delivered","subject":"message/6d62d5bf1a4c91e6","accepted_at_unix_ms":1790859503277}
-{"at_unix_ms":1790859503288,"pid":1187109,"event":"read","subject":"message/6d62d5bf1a4c91e6","accepted_at_unix_ms":1790859503286}
-{"at_unix_ms":1790859503298,"pid":1187109,"event":"closed","subject":"message/6d62d5bf1a4c91e6","accepted_at_unix_ms":1790859503295}
-{"at_unix_ms":1790859503402,"pid":1187109,"event":"seat-title","label":"eval/fault-probe"}
+{"at_unix_ms":1790866219541,"pid":2960255,"event":"started"}
+{"at_unix_ms":1790866219601,"pid":2960255,"event":"ready"}
+{"at_unix_ms":1790866219621,"pid":2960255,"event":"seat-title","label":"eval/fault-probe"}
+{"at_unix_ms":1790866220631,"pid":2960255,"event":"wire-frame","subject":"message/5a0338f1663e7520"}
+{"at_unix_ms":1790866220632,"pid":2960255,"event":"received","subject":"message/5a0338f1663e7520","content":"<smalltalk-message id=\"5a0338f1663e7520\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/5a0338f1663e7520\">\nreceipt-token:warmup\n</smalltalk-message>"}
+{"at_unix_ms":1790866220659,"pid":2960255,"event":"delivered","subject":"message/5a0338f1663e7520","accepted_at_unix_ms":1790866220645}
+{"at_unix_ms":1790866220683,"pid":2960255,"event":"read","subject":"message/5a0338f1663e7520","accepted_at_unix_ms":1790866220662}
+{"at_unix_ms":1790866220698,"pid":2960255,"event":"closed","subject":"message/5a0338f1663e7520","accepted_at_unix_ms":1790866220685}
+{"at_unix_ms":1790866222042,"pid":2960255,"event":"seat-title","label":"eval/fault-probe"}
+{"at_unix_ms":1790866222632,"pid":2960255,"event":"wire-frame","subject":"message/2adb734e9028213a"}
+{"at_unix_ms":1790866222632,"pid":2960255,"event":"received","subject":"message/2adb734e9028213a","content":"<smalltalk-message id=\"2adb734e9028213a\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: binary-swap\" sha256=\"feb19e5bfafb63450a7e1e38152d7cb49fa7ec3488a281694c35b38913c37564\" graph=\"message/2adb734e9028213a\">\nreceipt-token:binary-swap\n</smalltalk-message>"}
+{"at_unix_ms":1790866222657,"pid":2960255,"event":"delivered","subject":"message/2adb734e9028213a","accepted_at_unix_ms":1790866222645}
+{"at_unix_ms":1790866222706,"pid":2960255,"event":"read","subject":"message/2adb734e9028213a","accepted_at_unix_ms":1790866222694}
+{"at_unix_ms":1790866222730,"pid":2960255,"event":"closed","subject":"message/2adb734e9028213a","accepted_at_unix_ms":1790866222719}
+{"at_unix_ms":1790866222806,"pid":2960255,"event":"seat-title","label":"eval/fault-probe"}

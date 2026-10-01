@@ -2,14 +2,14 @@
   "agent": {
     "kind": "agent",
     "id": "agent/eval/fault-probe",
-    "revision": "483906b3010ce6733a295d0b5e2822f80cf6e285fb7d67a05427cc080a3f91b4",
-    "updated_at": "2026-10-01T12:56:42.899Z",
+    "revision": "3a1f77209e6bcb9082cbb578384fa9c3b229fb8cd4a24cbea0113eb5fc281bd3",
+    "updated_at": "2026-10-01T14:49:09.973Z",
     "operational": {
       "layer": "current",
       "actionable": true,
       "reasons": [],
       "owner_generation": null,
-      "runtime_incarnation": "1142381:2026-10-01T12:56:39.766Z",
+      "runtime_incarnation": "2950177:2026-10-01T14:49:09.661Z",
       "runtime_desired_revision": null
     },
     "name": "eval/fault-probe",
@@ -22,11 +22,11 @@
     "driver": "omp",
     "harness_state": "idle",
     "host_id": "host/cobalt",
-    "last_activity_at": "2026-10-01T12:56:45.151Z",
+    "last_activity_at": "2026-10-01T14:49:11.053Z",
     "silent_since": null,
     "fault": null,
-    "incarnation_id": "1142381:2026-10-01T12:56:39.766Z",
-    "current_session_id": "session/da30dbcfb6fafe3fe72494e7",
+    "incarnation_id": "2950177:2026-10-01T14:49:09.661Z",
+    "current_session_id": "session/6a13b62874cba69e42de96d4",
     "current_work_ids": [],
     "active_work_count": 0,
     "next_work_id": null,
@@ -53,17 +53,17 @@
   },
   "processes": [
     {
-      "pid": 1142404,
+      "pid": 2950181,
       "argv": "<eval-root>/cobalt/bin/st3 driver omp --subject agent/eval/fault-probe -- omp ",
       "image": "<eval-root>/cobalt/bin/st3"
     },
     {
-      "pid": 1142770,
-      "argv": "<home>/.nvm/versions/node/v24.18.0/bin/node <repo>/scripts/st3-messaging-faults-eval/provider.mjs --session-dir <eval-root>/cobalt/state/drivers/61ab2a675dbbb8b48329718b/catalog/agents/cobalt/54bf4d98c9bfd281/provider-sessions -e <eval-root>/cobalt/state/hooks/sets/sha256-6a1e2e628bcf8c231bcc992f265b7a15c01b70b939d3414df8e97003131bdf50/omp-channel.ts ",
+      "pid": 2950235,
+      "argv": "<home>/.nvm/versions/node/v24.18.0/bin/node <repo>/scripts/st3-messaging-faults-eval/provider.mjs --session-dir <eval-root>/cobalt/state/drivers/61ab2a675dbbb8b48329718b/catalog/agents/cobalt/54bf4d98c9bfd281/provider-sessions -e <eval-root>/cobalt/state/hooks/sets/sha256-b80ce514aeabd5ef185ebfe6a5d4dedab18073801628c730fb11f18cf0cfe9c1/omp-channel.ts ",
       "image": "<home>/.nvm/versions/node/v24.18.0/bin/node"
     },
     {
-      "pid": 1142805,
+      "pid": 2950248,
       "argv": "<eval-root>/cobalt/bin/st3 --catalog <eval-root>/cobalt/state/drivers/61ab2a675dbbb8b48329718b/catalog driver omp-channel --identity eval/fault-probe ",
       "image": "<eval-root>/cobalt/bin/st3"
     }

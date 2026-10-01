@@ -1,14 +1,14 @@
-{"at_unix_ms":1790859719218,"pid":1293220,"event":"started"}
-{"at_unix_ms":1790859719675,"pid":1293220,"event":"ready"}
-{"at_unix_ms":1790859719715,"pid":1293220,"event":"seat-title","label":"eval/fault-probe"}
-{"at_unix_ms":1790859721712,"pid":1293220,"event":"wire-frame","subject":"message/5faf004a0ddab2e4"}
-{"at_unix_ms":1790859721713,"pid":1293220,"event":"received","subject":"message/5faf004a0ddab2e4","content":"<smalltalk-message id=\"5faf004a0ddab2e4\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/5faf004a0ddab2e4\">\nreceipt-token:warmup\n</smalltalk-message>"}
-{"at_unix_ms":1790859721763,"pid":1293220,"event":"delivered","subject":"message/5faf004a0ddab2e4","accepted_at_unix_ms":1790859721722}
-{"at_unix_ms":1790859721797,"pid":1293220,"event":"read","subject":"message/5faf004a0ddab2e4","accepted_at_unix_ms":1790859721772}
-{"at_unix_ms":1790859721804,"pid":1293220,"event":"closed","subject":"message/5faf004a0ddab2e4","accepted_at_unix_ms":1790859721799}
-{"at_unix_ms":1790859726397,"pid":1293220,"event":"seat-title","label":"eval/fault-probe"}
-{"at_unix_ms":1790859726722,"pid":1293220,"event":"wire-frame","subject":"message/aa543a9872107853"}
-{"at_unix_ms":1790859726722,"pid":1293220,"event":"received","subject":"message/aa543a9872107853","content":"<smalltalk-message id=\"aa543a9872107853\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: receiver-down\" sha256=\"d5ab54c9e00e265374068f1a178a2890aa2531fe900974be413beb039c699550\" graph=\"message/aa543a9872107853\">\nreceipt-token:receiver-down\n</smalltalk-message>"}
-{"at_unix_ms":1790859726731,"pid":1293220,"event":"delivered","subject":"message/aa543a9872107853","accepted_at_unix_ms":1790859726725}
-{"at_unix_ms":1790859726767,"pid":1293220,"event":"read","subject":"message/aa543a9872107853","accepted_at_unix_ms":1790859726745}
-{"at_unix_ms":1790859726783,"pid":1293220,"event":"closed","subject":"message/aa543a9872107853","accepted_at_unix_ms":1790859726775}
+{"at_unix_ms":1790866451872,"pid":2983802,"event":"started"}
+{"at_unix_ms":1790866451925,"pid":2983802,"event":"ready"}
+{"at_unix_ms":1790866451942,"pid":2983802,"event":"seat-title","label":"eval/fault-probe"}
+{"at_unix_ms":1790866452951,"pid":2983802,"event":"wire-frame","subject":"message/a6b968ce6403e33f"}
+{"at_unix_ms":1790866452952,"pid":2983802,"event":"received","subject":"message/a6b968ce6403e33f","content":"<smalltalk-message id=\"a6b968ce6403e33f\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/a6b968ce6403e33f\">\nreceipt-token:warmup\n</smalltalk-message>"}
+{"at_unix_ms":1790866452975,"pid":2983802,"event":"delivered","subject":"message/a6b968ce6403e33f","accepted_at_unix_ms":1790866452962}
+{"at_unix_ms":1790866453001,"pid":2983802,"event":"read","subject":"message/a6b968ce6403e33f","accepted_at_unix_ms":1790866452988}
+{"at_unix_ms":1790866453020,"pid":2983802,"event":"closed","subject":"message/a6b968ce6403e33f","accepted_at_unix_ms":1790866453008}
+{"at_unix_ms":1790866457129,"pid":2983802,"event":"seat-title","label":"eval/fault-probe"}
+{"at_unix_ms":1790866457950,"pid":2983802,"event":"wire-frame","subject":"message/894c9af06ca2d8fa"}
+{"at_unix_ms":1790866457951,"pid":2983802,"event":"received","subject":"message/894c9af06ca2d8fa","content":"<smalltalk-message id=\"894c9af06ca2d8fa\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: receiver-down\" sha256=\"d5ab54c9e00e265374068f1a178a2890aa2531fe900974be413beb039c699550\" graph=\"message/894c9af06ca2d8fa\">\nreceipt-token:receiver-down\n</smalltalk-message>"}
+{"at_unix_ms":1790866457974,"pid":2983802,"event":"delivered","subject":"message/894c9af06ca2d8fa","accepted_at_unix_ms":1790866457963}
+{"at_unix_ms":1790866457996,"pid":2983802,"event":"read","subject":"message/894c9af06ca2d8fa","accepted_at_unix_ms":1790866457976}
+{"at_unix_ms":1790866458010,"pid":2983802,"event":"closed","subject":"message/894c9af06ca2d8fa","accepted_at_unix_ms":1790866457997}
