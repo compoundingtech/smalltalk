@@ -3414,6 +3414,30 @@ fn managed_omp_transcript(
         .ok_or_else(|| {
             format!("the OMP incarnation `{incarnation}` does not carry its start time")
         })?;
+    if let Some(claim) = state
+        .store
+        .latest_claim(owner, Some("harness.session-file"))
+        .map_err(|error| format!("reading the OMP session record failed: {error:#}"))?
+    {
+        let fields = claim.body.get("fields").unwrap_or(&claim.body);
+        if fields["harness"] == "omp"
+            && fields["agent"] == owner
+            && fields["source_session"].as_str().is_some()
+            && let (Some(path), Some(native_id)) =
+                (fields["path"].as_str(), fields["session_id"].as_str())
+        {
+            return match crate::external_sessions::find_imported_omp_transcript(
+                Path::new(path),
+                native_id,
+            ) {
+                Ok(Some(session)) => Ok(session),
+                Ok(None) => Err(format!("the imported OMP session {native_id} is not readable")),
+                Err(error) => Err(format!(
+                    "reading the imported OMP session {native_id} failed: {error:#}"
+                )),
+            };
+        }
+    }
     let identity = owner.strip_prefix("agent/").unwrap_or(owner);
     let directory = state
         .state_dir
@@ -6211,6 +6235,14 @@ fn validate_message_session(
     Ok(())
 }
 
+fn import_lookup_error(error: anyhow::Error) -> ApiError {
+    if error.is::<crate::external_sessions::AmbiguousSession>() {
+        ApiError::bad(St3Error::new("ambiguous-import-session", error.to_string()))
+    } else {
+        ApiError::internal(error)
+    }
+}
+
 async fn import_external_session_action(
     state: &AppState,
     session: &ClientSession,
@@ -6219,7 +6251,7 @@ async fn import_external_session_action(
     let target = parameter_string(&request.parameters, "target_id")?;
     let external =
         crate::external_sessions::find_fresh(state.native_session_home.as_deref(), &target)
-            .map_err(ApiError::internal)?
+            .map_err(import_lookup_error)?
             .ok_or_else(|| {
                 ApiError::not_found(format!("external session `{target}` does not exist"))
             })?;
@@ -6480,7 +6512,7 @@ fn validate_fence(
         } else if subject.starts_with("session/external-") {
             // A native session st3 does not own has no claims; its revision is its discovery.
             crate::external_sessions::find_fresh(state.native_session_home.as_deref(), subject)
-                .map_err(ApiError::internal)?
+                .map_err(import_lookup_error)?
                 .map(|session| session.revision)
         } else {
             state
