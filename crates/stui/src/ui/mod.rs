@@ -6,6 +6,7 @@
 //! same `World`.
 
 pub mod adapt;
+mod attach;
 #[cfg(test)]
 mod contract;
 pub mod conversation;
@@ -240,6 +241,8 @@ pub struct Ui {
     details_here: bool,
     /// Finding text in a conversation.
     find: Option<Find>,
+    /// Images attached to each draft, by its key, until it is sent.
+    attachments: HashMap<String, Vec<attach::Attachment>>,
     /// When st last sent each conversation something, shown above its message box.
     updated: HashMap<String, Instant>,
     /// Why a conversation could not be brought up to date, until st sends it again.
@@ -296,6 +299,7 @@ impl Ui {
             build: false,
             details_here: false,
             find: None,
+            attachments: HashMap::new(),
             updated: HashMap::new(),
             stalled: HashMap::new(),
         }
@@ -398,6 +402,67 @@ impl Ui {
             (false, None) => (" ○ paused · focus to follow ".to_owned(), theme::YELLOW),
         };
         Span::styled(text, theme::fg(color))
+    }
+
+    /// Text the terminal pasted (bracketed paste): it goes where typing goes, whole, newlines
+    /// included, so a paste never sends anything by itself. A pasted path to an image, such as a
+    /// file dropped on the terminal, attaches that image to a message to an agent.
+    pub fn paste(&mut self, text: String) {
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let first = text.lines().next().unwrap_or("").to_owned();
+        if let Some(find) = self.find.as_mut() {
+            find.query.push_str(&first);
+            find.current = 0;
+            find.jump.set(true);
+            return;
+        }
+        if self.paste_into_palette(&first) {
+            return;
+        }
+        if let Some((fields, focus)) = self.new_mission.as_mut() {
+            fields[*focus].push_str(&text);
+            return;
+        }
+        if let Some(chat) = self.chat.clone().filter(|chat| chat.editing) {
+            self.conversation_state
+                .drafts
+                .entry(format!("chat:{}", chat.item))
+                .or_default()
+                .push_str(&text);
+            return;
+        }
+        // A paste over an agent's conversation starts a message to it.
+        if !self.editing && self.tab == 1 && self.selected_id().is_some() {
+            self.editing = true;
+        }
+        if !self.editing {
+            return;
+        }
+        let Some(key) = self.draft_key() else { return };
+        if self.tab == 1
+            && let Some(attachment) = attach::from_path(&text)
+        {
+            self.flash(format!("Attached {}", attachment.label()));
+            self.attachments.entry(key).or_default().push(attachment);
+            return;
+        }
+        self.conversation_state
+            .drafts
+            .entry(key)
+            .or_default()
+            .push_str(&text);
+    }
+
+    /// Attach the image on this machine's clipboard to the message being written.
+    fn attach_clipboard(&mut self) {
+        let Some(key) = self.draft_key() else { return };
+        match attach::from_clipboard() {
+            Ok(attachment) => {
+                self.flash(format!("Attached {}", attachment.label()));
+                self.attachments.entry(key).or_default().push(attachment);
+            }
+            Err(error) => self.flash(format!("Nothing attached: {error}")),
+        }
     }
 
     /// The selected agent's newest message that failed or went unconfirmed, by entry id.
@@ -1703,6 +1768,48 @@ impl Ui {
         // Only the focused pane's box takes keys; the others show their draft, and how to reach
         // them by click.
         let editing = self.editing && self.composing(&agent.id);
+        // Attached images ride above the text as chips; Backspace in an empty box takes the
+        // last one back.
+        let chips = self
+            .attachments
+            .get(&agent.id)
+            .map(|list| {
+                list.iter()
+                    .enumerate()
+                    .map(|(index, attachment)| {
+                        Line::from(vec![
+                            Span::styled("  ▣ ", theme::fg(theme::LAVENDER)),
+                            Span::styled(
+                                format!("{} {}", index + 1, attachment.label()),
+                                theme::fg(theme::LAVENDER),
+                            ),
+                            Span::styled(
+                                if index + 1 == list.len() {
+                                    "  · ⌫ in an empty box removes it"
+                                } else {
+                                    ""
+                                },
+                                theme::dim(),
+                            ),
+                        ])
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut lines = self.composer_text(agent, width, editing, &draft);
+        if !chips.is_empty() {
+            lines.splice(0..0, chips);
+        }
+        lines
+    }
+
+    fn composer_text(
+        &self,
+        agent: &Agent,
+        width: usize,
+        editing: bool,
+        draft: &str,
+    ) -> Vec<Line<'static>> {
         if draft.is_empty() && !editing {
             let hint = if self.composing(&agent.id) {
                 format!("Message {} · c or click", agent.name)
@@ -2047,9 +2154,29 @@ impl Ui {
                     .push('\n');
                 return;
             }
+            let control = key.modifiers.contains(KeyModifiers::CONTROL);
+            let empty = self
+                .conversation_state
+                .drafts
+                .get(&key_id)
+                .is_none_or(String::is_empty);
             match key.code {
                 KeyCode::Esc => self.editing = false,
                 KeyCode::Enter => self.submit(),
+                // Ctrl+V while writing to an agent attaches the clipboard's image.
+                KeyCode::Char('v') if control && self.tab == 1 => self.attach_clipboard(),
+                // Backspace in an empty box takes back the last image.
+                KeyCode::Backspace
+                    if empty
+                        && self
+                            .attachments
+                            .get(&key_id)
+                            .is_some_and(|list| !list.is_empty()) =>
+                {
+                    if let Some(list) = self.attachments.get_mut(&key_id) {
+                        list.pop();
+                    }
+                }
                 _ => {
                     edit_text(
                         self.conversation_state.drafts.entry(key_id).or_default(),
@@ -2481,10 +2608,29 @@ impl Ui {
 
     fn submit(&mut self) {
         let Some(id) = self.draft_key() else { return };
-        let Some(PaneIntent::Send(draft)) = self.conversation_state.send(&id) else {
+        let images = if self.tab == 1 {
+            self.attachments.get(&id).cloned().unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        let draft = match self.conversation_state.send(&id) {
+            Some(PaneIntent::Send(draft)) => Some(draft),
+            _ if !images.is_empty() => Some(String::new()),
+            _ => None,
+        };
+        let Some(mut draft) = draft else {
             self.flash("Write something first");
             return;
         };
+        // Until st carries images, the message names each file; an agent on this machine
+        // reads it there.
+        if !images.is_empty() {
+            if !draft.is_empty() {
+                draft.push_str("\n\n");
+            }
+            draft.push_str(&attach::mention(&images));
+            self.attachments.remove(&id);
+        }
         // The input stays focused after a send; Esc leaves it.
         if self.live {
             let effect = match self.tab {
@@ -3230,7 +3376,13 @@ impl Guard {
     fn enter(keys: bool) -> Result<Self> {
         crate::watch_terminal_hangup();
         enable_raw_mode()?;
-        execute!(io::stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+        // A paste arrives whole, so its newlines never press Enter.
+        execute!(
+            io::stdout(),
+            EnterAlternateScreen,
+            EnableMouseCapture,
+            crossterm::event::EnableBracketedPaste
+        )?;
         let enhanced = keys && crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
         if enhanced {
             execute!(
@@ -3249,7 +3401,12 @@ impl Drop for Guard {
         if self.enhanced {
             let _ = execute!(io::stdout(), crossterm::event::PopKeyboardEnhancementFlags);
         }
-        let _ = execute!(io::stdout(), DisableMouseCapture, LeaveAlternateScreen);
+        let _ = execute!(
+            io::stdout(),
+            crossterm::event::DisableBracketedPaste,
+            DisableMouseCapture,
+            LeaveAlternateScreen
+        );
         let _ = disable_raw_mode();
     }
 }
@@ -3322,6 +3479,7 @@ pub fn run_demo(args: &[String]) -> Result<()> {
             while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
                 match event::read()? {
                     Event::Key(key) => ui.key(key),
+                    Event::Paste(text) => ui.paste(text),
                     Event::Mouse(mouse) => ui.mouse(mouse),
                     _ => {}
                 }
