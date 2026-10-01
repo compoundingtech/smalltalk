@@ -14,6 +14,7 @@ hex = "0.4"
 hmac = "0.12"
 libc = "0.2"
 ring = "0.17"
+rusqlite = { version = "0.32", features = ["bundled", "trace", "functions"] }
 serde = { version = "1", features = ["derive"] }
 # Claim bodies keep the writer's field order when they decode, so a claim hashed in insertion
 # order by an old build still verifies (see `hash::claim_id_is_content_hash`). Inside smalltalk
@@ -22,6 +23,11 @@ serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
 tokio = { version = "1", features = ["time"] }
 uuid = { version = "1", features = ["v7"] }
+
+[features]
+# Counters that tests of a runtime built on the graph read, such as the SQLite statements a
+# thread ran. Off in every non-test build.
+test-support = []
 
 [dev-dependencies]
 getrandom = "0.3"

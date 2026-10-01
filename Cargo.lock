@@ -3672,6 +3672,7 @@ dependencies = [
  "hmac",
  "libc",
  "ring",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
