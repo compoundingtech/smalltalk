@@ -5,7 +5,7 @@ import {
   plainFlakeJob,
   plainFlakeSetupSteps,
 } from '../../repos/effect-utils/genie/external.ts'
-import { buildEnv, linuxRunner, readOnlyBinaryCaches, workspacePreparationSteps } from './workspace-ci.ts'
+import { buildEnv, commonSetupSteps, linuxCachedRunner, linuxRunner, readOnlyBinaryCaches, workspacePreparationSteps } from './workspace-ci.ts'
 
 // Namespace offers nested virtualization on linux/amd64. Prove /dev/kvm can create a VM before
 // anything else; QEMU is also forbidden to fall back to emulation (nix/transport-isolation-vm.nix).
@@ -25,6 +25,47 @@ print(f"KVM API {version}: created a VM")
 EOF
 printf 'KVM: \\x60%s\\x60, CPU virtualization flag %s, VM creation succeeded\\n\\n| Phase | Elapsed |\\n| --- | --- |\\n' "$(ls -l /dev/kvm)" "$(grep -m1 -oE 'vmx|svm' /proc/cpuinfo || echo none)" >> "$GITHUB_STEP_SUMMARY"`
 
+// One Linux gate stage: its own runner and cache volume, the common setup, then scripts/ci-linux.
+const linuxStageJob = ({
+  name,
+  stage,
+  setup,
+  description,
+  env = {},
+  extraLogs = '',
+}: {
+  name: string
+  stage: string
+  setup: readonly unknown[]
+  description?: string
+  env?: Record<string, string>
+  extraLogs?: string
+}) => ({
+  name,
+  'runs-on': linuxCachedRunner(`st-ci-${stage}`),
+  'timeout-minutes': 120,
+  defaults: { run: { shell: 'bash' } },
+  env: { ...buildEnv, ...env },
+  steps: [
+    ...setup,
+    {
+      name: 'Summarize tested revision',
+      run: `printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' "$(git rev-parse HEAD)" "$(nproc)" "$(free -h | awk '/^Mem:/ {print $2 " memory"}')" >> "$GITHUB_STEP_SUMMARY"`,
+    },
+    nixDevelopStep({ name: description ?? 'Run nextest', command: ['bash', 'scripts/ci-linux', stage] }),
+    {
+      name: 'Retain stage logs and timings',
+      uses: 'actions/upload-artifact@v4',
+      if: 'always()',
+      with: {
+        name: `${name}-logs`,
+        path: `\${{ runner.temp }}/ci-logs/\n${extraLogs}`,
+        'if-no-files-found': 'ignore',
+      },
+    },
+  ],
+})
+
 // Required gate. Label events belong to macos.yml so they never restart or cancel this workflow.
 export default githubWorkflow({
   name: 'Workspace CI',
@@ -38,7 +79,14 @@ export default githubWorkflow({
     group: 'workspace-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}',
     'cancel-in-progress': '${{ github.event_name == \'pull_request\' }}',
   },
-  actionlint: defaultActionlintConfig,
+  // actionlint must know the per-job cache-tag runner labels.
+  actionlint: {
+    ...defaultActionlintConfig,
+    selfHostedRunnerLabels: [
+      ...(defaultActionlintConfig.selfHostedRunnerLabels ?? []),
+      ...['tests', 'clippy', 'fleet-compat'].map((stage) => `namespace-profile-linux-x86-64;overrides.cache-tag=st-ci-${stage}`),
+    ],
+  },
   jobs: {
     'genie-freshness': plainFlakeJob({
       name: 'genie-freshness',
@@ -47,29 +95,43 @@ export default githubWorkflow({
       nix: { binaryCaches: readOnlyBinaryCaches },
       step: nixDevelopStep({ name: 'Check generated files', flake: '.#genie', command: ['genie', '--check'] }),
     }),
+    // The Linux gate runs as three jobs on separate runners, each with its own cache volume.
+    // `linux-gate` below is the single required check that collects them.
+    'linux-tests': linuxStageJob({
+      name: 'linux-tests',
+      stage: 'tests',
+      setup: workspacePreparationSteps,
+      // CI_RUN_ID keeps the messaging-fault evidence under target/messaging-faults.
+      env: { CI_RUN_ID: '${{ github.run_id }}' },
+      extraLogs: 'target/messaging-faults/',
+    }),
+    'linux-clippy': linuxStageJob({
+      name: 'linux-clippy',
+      stage: 'clippy',
+      setup: commonSetupSteps,
+      description: 'Run clippy and the generated-client check',
+    }),
+    'linux-fleet-compat': linuxStageJob({
+      name: 'linux-fleet-compat',
+      stage: 'fleet-compat',
+      setup: commonSetupSteps,
+      description: 'Run fleet compatibility against the pinned older st3',
+    }),
     'linux-gate': {
       name: 'linux-gate',
+      needs: ['linux-tests', 'linux-clippy', 'linux-fleet-compat'],
+      // A skipped or cancelled stage must fail the gate, so it runs even when a stage failed.
+      if: 'always()',
       'runs-on': linuxRunner,
-      'timeout-minutes': 120,
-      defaults: { run: { shell: 'bash' } },
-      // CI_RUN_ID keeps the messaging-fault evidence under target/messaging-faults.
-      env: { ...buildEnv, CI_RUN_ID: '${{ github.run_id }}' },
+      'timeout-minutes': 5,
       steps: [
-        ...workspacePreparationSteps,
         {
-          name: 'Summarize tested revision',
-          run: `printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' "$(git rev-parse HEAD)" "$(nproc)" "$(free -h | awk '/^Mem:/ {print $2 " memory"}')" >> "$GITHUB_STEP_SUMMARY"`,
-        },
-        nixDevelopStep({ name: 'Run nextest, clippy, generated clients and fleet compatibility in parallel', command: ['bash', 'scripts/ci-linux'] }),
-        {
-          name: 'Retain stage logs, timings and messaging-fault evidence',
-          uses: 'actions/upload-artifact@v4',
-          if: 'always()',
-          with: {
-            name: 'linux-ci-logs',
-            path: '${{ runner.temp }}/ci-logs/\ntarget/messaging-faults/',
-            'if-no-files-found': 'ignore',
-          },
+          name: 'Require every Linux stage to pass',
+          env: { RESULTS: '${{ join(needs.*.result, \' \') }}' },
+          run: `echo "stage results: $RESULTS"
+for result in $RESULTS; do
+  [ "$result" = success ] || exit 1
+done`,
         },
       ],
     },

@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Invoked inside the pinned devShell, after the workspace test build completes.
+# Run one Linux gate stage inside the pinned devShell: tests, clippy, or fleet-compat.
+# Each stage is its own GitHub Actions job on its own runner; `linux-gate` requires all three.
 set -euo pipefail
+stage=${1:?usage: scripts/ci-linux tests|clippy|fleet-compat}
 # Logs stay outside the checkout: the public-content test scans untracked files.
 logs="$RUNNER_TEMP/ci-logs"
 mkdir -p "$logs"
@@ -8,6 +10,8 @@ mkdir -p "$logs"
 fleet_compat() {
   local baseline
   baseline=$(jq -er .commit .github/fleet-compat-baseline.json) || return
+  # The pinned baseline never changes, so its Nix output stays in the cached /nix store: it is
+  # built once and every later run finds it there.
   BASELINE="$baseline" nix build --impure --out-link "$RUNNER_TEMP/baseline" --print-build-logs --expr '
     ((builtins.getFlake "github:compoundingtech/smalltalk/${builtins.getEnv "BASELINE"}")
       .packages.${builtins.currentSystem}.st3).overrideAttrs (_: { doCheck = false; })' || return
@@ -22,41 +26,22 @@ fleet_compat() {
   grep -q "test result: ok. 1 passed" "$logs/compat-result.log"
 }
 
-run_stage() {
-  local stage=$1 start=$SECONDS status=0
-  shift
-  "$@" > "$logs/$stage.log" 2>&1 || status=$?
-  printf '%s %s\n' "$((SECONDS - start))" "$status" > "$logs/$stage.time"
-  return "$status"
+clippy_and_codegen() {
+  cargo clippy --workspace --all-targets --locked
+  cargo run --locked -p st3-client-codegen -- --check
 }
 
-# The nextest --no-run stage already compiled the test executables. The ci profile's
-# default filter selects the gate's tests (.config/nextest.toml). Clippy gets a separate
-# target directory so its Cargo lock cannot serialize the four lanes.
-run_stage test cargo nextest run --workspace --locked --profile ci &
-test_pid=$!
-# The real HOME's cache directory is mounted from the Namespace cache volume; fall back to the run's temp.
-clippy_target="${CI_CLIPPY_TARGET:-$RUNNER_TEMP/clippy-target}"
-run_stage clippy env CARGO_TARGET_DIR="$clippy_target" cargo clippy --workspace --all-targets --locked &
-clippy_pid=$!
-run_stage codegen cargo run --locked -p st3-client-codegen -- --check &
-codegen_pid=$!
-run_stage fleet-compat fleet_compat &
-fleet_pid=$!
-
-failed=0
-for entry in "test:$test_pid" "clippy:$clippy_pid" "codegen:$codegen_pid" "fleet-compat:$fleet_pid"; do
-  stage=${entry%%:*}
-  pid=${entry#*:}
-  if wait "$pid"; then
-    result=passed
-  else
-    result=failed
-    failed=1
-  fi
-  printf '\n--- %s (%s) ---\n' "$stage" "$result"
-  cat "$logs/$stage.log"
-  read -r elapsed status < "$logs/$stage.time"
-  printf '| %s | %s | %ss | %s |\n' "$stage" "$result" "$elapsed" "$status" >> "$GITHUB_STEP_SUMMARY"
-done
-exit "$failed"
+start=$SECONDS status=0
+case "$stage" in
+  # The nextest --no-run step already compiled the test executables.
+  tests) cargo nextest run --workspace --locked --profile ci 2>&1 | tee "$logs/$stage.log" || status=$? ;;
+  clippy) clippy_and_codegen 2>&1 | tee "$logs/$stage.log" || status=$? ;;
+  fleet-compat) fleet_compat 2>&1 | tee "$logs/$stage.log" || status=$? ;;
+  *) echo "unknown stage: $stage" >&2; exit 2 ;;
+esac
+# `tee` hides the stage's exit status behind a pipeline; pipefail restores it above.
+result=passed
+[ "$status" -eq 0 ] || result=failed
+printf '%s %s\n' "$((SECONDS - start))" "$status" > "$logs/$stage.time"
+printf '| %s | %s | %ss | %s |\n' "$stage" "$result" "$((SECONDS - start))" "$status" >> "$GITHUB_STEP_SUMMARY"
+exit "$status"

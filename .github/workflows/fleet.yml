@@ -46,10 +46,13 @@ jobs:
       - name: Check generated files
         shell: bash
         run: "nix develop '.#genie' -c genie --check"
-  linux-gate:
-    name: linux-gate
+  linux-tests:
+    name: linux-tests
     runs-on:
-      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+      [
+        namespace-profile-linux-x86-64;overrides.cache-tag=st-ci-tests,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
     timeout-minutes: 120
     defaults:
       run:
@@ -72,7 +75,6 @@ jobs:
           cache: rust
           path: |
             ${{ github.workspace }}/target
-            ~/.cache/st-ci
             /nix
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
@@ -89,7 +91,7 @@ jobs:
       - name: Isolate test home and XDG state
         run: |
           # The cached Cargo registry lives under the real HOME; tests get the isolated one.
-          printf 'CARGO_HOME=%s\nCI_CLIPPY_TARGET=%s\n' "${CARGO_HOME:-$HOME/.cargo}" "$HOME/.cache/st-ci/clippy-target" >> "$GITHUB_ENV"
+          printf 'CARGO_HOME=%s\n' "${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
           home="$RUNNER_TEMP/test-home"
           mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
@@ -109,18 +111,158 @@ jobs:
         run: nix develop -c cargo nextest run --workspace --locked --profile ci --no-run
       - name: Summarize tested revision
         run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
-      - name: Run nextest, clippy, generated clients and fleet compatibility in parallel
+      - name: Run nextest
         shell: bash
-        run: nix develop -c bash scripts/ci-linux
-      - name: Retain stage logs, timings and messaging-fault evidence
+        run: nix develop -c bash scripts/ci-linux tests
+      - name: Retain stage logs and timings
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: linux-ci-logs
+          name: linux-tests-logs
           path: |
             ${{ runner.temp }}/ci-logs/
             target/messaging-faults/
           if-no-files-found: ignore
+  linux-clippy:
+    name: linux-clippy
+    runs-on:
+      [
+        namespace-profile-linux-x86-64;overrides.cache-tag=st-ci-clippy,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Mount Rust and Nix caches
+        id: cache
+        if: runner.os == 'Linux'
+        uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: rust
+          path: |
+            ${{ github.workspace }}/target
+            /nix
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+          summarize: true
+      - name: Isolate test home and XDG state
+        run: |
+          # The cached Cargo registry lives under the real HOME; tests get the isolated one.
+          printf 'CARGO_HOME=%s\n' "${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+          home="$RUNNER_TEMP/test-home"
+          mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
+          printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
+      - name: Summarize tested revision
+        run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
+      - name: Run clippy and the generated-client check
+        shell: bash
+        run: nix develop -c bash scripts/ci-linux clippy
+      - name: Retain stage logs and timings
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-clippy-logs
+          path: |
+            ${{ runner.temp }}/ci-logs/
+
+          if-no-files-found: ignore
+  linux-fleet-compat:
+    name: linux-fleet-compat
+    runs-on:
+      [
+        namespace-profile-linux-x86-64;overrides.cache-tag=st-ci-fleet-compat,
+        "namespace-features:github.run-id=${{ github.run_id }}",
+      ]
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Mount Rust and Nix caches
+        id: cache
+        if: runner.os == 'Linux'
+        uses: namespacelabs/nscloud-cache-action@v1
+        with:
+          cache: rust
+          path: |
+            ${{ github.workspace }}/target
+            /nix
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+          summarize: true
+      - name: Isolate test home and XDG state
+        run: |
+          # The cached Cargo registry lives under the real HOME; tests get the isolated one.
+          printf 'CARGO_HOME=%s\n' "${CARGO_HOME:-$HOME/.cargo}" >> "$GITHUB_ENV"
+          home="$RUNNER_TEMP/test-home"
+          mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
+          printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
+      - name: Summarize tested revision
+        run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
+      - name: Run fleet compatibility against the pinned older st3
+        shell: bash
+        run: nix develop -c bash scripts/ci-linux fleet-compat
+      - name: Retain stage logs and timings
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: linux-fleet-compat-logs
+          path: |
+            ${{ runner.temp }}/ci-logs/
+
+          if-no-files-found: ignore
+  linux-gate:
+    name: linux-gate
+    needs: [linux-tests, linux-clippy, linux-fleet-compat]
+    if: always()
+    runs-on:
+      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+    timeout-minutes: 5
+    steps:
+      - name: Require every Linux stage to pass
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          echo "stage results: $RESULTS"
+          for result in $RESULTS; do
+            [ "$result" = success ] || exit 1
+          done
   isolation-vm:
     name: isolation-vm
     runs-on:
