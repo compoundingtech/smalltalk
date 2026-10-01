@@ -113,7 +113,7 @@
       "required": ["id", "kind", "revision", "updated_at"],
       "properties": {
         "id": { "$ref": "#/$defs/Id" },
-        "kind": { "enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "device", "operation", "history", "session"] },
+        "kind": { "enum": ["attention", "message", "launch", "launch-variant", "launch-decision", "launch-approval", "mission", "work", "agent", "runtime", "observer", "subscription", "lane", "machine", "device", "operation", "history", "session", "glass"] },
         "revision": { "$ref": "#/$defs/Revision" },
         "updated_at": { "$ref": "#/$defs/Timestamp" }
       }
