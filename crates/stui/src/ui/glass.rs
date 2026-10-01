@@ -357,6 +357,16 @@ struct Palette {
     /// The first row shown once the wheel moved the list, as content scrolls; `None` keeps the
     /// selection in view, as keys do.
     top: Option<usize>,
+    /// The palette is asking for a glass's name; the query is the name.
+    naming: Option<Naming>,
+}
+
+/// What a name typed into the palette is for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Naming {
+    Rename,
+    New,
+    Duplicate,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -369,6 +379,8 @@ enum Action {
     CloseGlass,
     /// The new agent form, with what it should do when the query says it.
     NewAgent(Option<String>),
+    /// Ask for a name, for a glass to rename, make or copy.
+    Name(Naming),
 }
 
 /// One row the palette can open.
@@ -537,6 +549,31 @@ impl Ui {
             ));
         }
         let name = query.trim();
+        // Always there, so renaming and making glasses are easy to find; each asks for the name.
+        let current = glasses.glass().name.clone();
+        for (glyph, label, search, naming) in [
+            (
+                "✎",
+                format!("Rename “{current}”…"),
+                "rename glass",
+                Naming::Rename,
+            ),
+            ("+", "New glass…".to_owned(), "new glass", Naming::New),
+            (
+                "⧉",
+                format!("Duplicate “{current}”…"),
+                "duplicate glass copy",
+                Naming::Duplicate,
+            ),
+        ] {
+            choices.push(glass(
+                glyph,
+                label,
+                "",
+                search.to_owned(),
+                Action::Name(naming),
+            ));
+        }
         if !name.is_empty() {
             choices.push(glass(
                 "+",
@@ -574,6 +611,40 @@ impl Ui {
 
     /// What the palette shows for its query: sections in order, best matches first in each.
     fn matches(&self, palette: &Palette) -> Vec<Choice> {
+        // Asking for a name: the one thing Enter will do with it.
+        if let (Some(naming), Some(glasses)) = (palette.naming, &self.glasses) {
+            let name = palette.query.trim().to_owned();
+            let current = glasses.glass().name.clone();
+            let (glyph, label, action) = match naming {
+                Naming::Rename => (
+                    "✎",
+                    format!("Rename “{current}” to “{name}”"),
+                    Action::RenameGlass(name.clone()),
+                ),
+                Naming::New => (
+                    "+",
+                    format!("New glass “{name}”"),
+                    Action::NewGlass(name.clone()),
+                ),
+                Naming::Duplicate => (
+                    "⧉",
+                    format!("Duplicate “{current}” as “{name}”"),
+                    Action::DuplicateGlass(name.clone()),
+                ),
+            };
+            return if name.is_empty() {
+                Vec::new()
+            } else {
+                vec![Choice {
+                    section: GLASSES,
+                    glyph: (glyph, theme::LAVENDER),
+                    label,
+                    detail: "enter".into(),
+                    search: String::new(),
+                    action,
+                }]
+            };
+        }
         let mut scored = self
             .choices(&palette.query)
             .into_iter()
@@ -1091,7 +1162,16 @@ impl Ui {
             }
         }
         let inner = width.saturating_sub(4) as usize;
-        let title = self.palette_target(palette.enter);
+        let title = match (palette.naming, &self.glasses) {
+            (Some(Naming::Rename), Some(glasses)) => {
+                format!(" rename “{}”: type its new name ", glasses.glass().name)
+            }
+            (Some(Naming::New), _) => " a new glass: type its name ".to_owned(),
+            (Some(Naming::Duplicate), Some(glasses)) => {
+                format!(" a copy of “{}”: type its name ", glasses.glass().name)
+            }
+            _ => self.palette_target(palette.enter),
+        };
         buf.set_stringn(
             rect.x + 2,
             rect.y,
@@ -1157,7 +1237,11 @@ impl Ui {
             rows.push((
                 None,
                 Line::from(Span::styled(
-                    "  Nothing matches.",
+                    if palette.naming.is_some() {
+                        "  Type a name."
+                    } else {
+                        "  Nothing matches."
+                    },
                     theme::dim().bg(theme::MANTLE),
                 )),
             ));
@@ -1222,6 +1306,13 @@ impl Ui {
                 KeyCode::Char('v') if control => self.open_choice(None, Open::Right),
                 KeyCode::Char('x') if control => self.open_choice(None, Open::Below),
                 KeyCode::Char('t') if control => self.open_choice(None, Open::Tab),
+                // In the glasses section, Ctrl+G again moves to the next glass, as tmux does.
+                KeyCode::Char('g')
+                    if control && palette.section == Some(GLASSES) && palette.naming.is_none() =>
+                {
+                    palette.selected += 1;
+                    palette.top = None;
+                }
                 KeyCode::Char('g') if control => self.open_choice(None, Open::Glass),
                 KeyCode::Char('k') if control || command => glasses.palette = None,
                 // Ctrl (or Alt, or ⌘) and a digit show only that section; the same again shows all.
@@ -1269,7 +1360,7 @@ impl Ui {
             KeyCode::Char('o') if control => {
                 glasses.zoomed = !glasses.zoomed && glasses.glass().layout.groups().len() > 1;
             }
-            KeyCode::Char('g') if control => self.next_glass(),
+            KeyCode::Char('g') if control => self.open_glasses_palette(),
             KeyCode::Char(digit @ '1'..='9') if alt => self.show_tab(digit as usize - '1' as usize),
             // Next and previous tab in the focused split: Ctrl+PgDn/PgUp, Ctrl+Tab where the
             // terminal reports it, and ] and [ whenever nothing is being typed.
@@ -1319,6 +1410,25 @@ impl Ui {
         palette.selected = 0;
         palette.top = None;
         true
+    }
+
+    /// Ctrl+G: the palette's glasses section, the next glass chosen, so Ctrl+G Enter switches.
+    fn open_glasses_palette(&mut self) {
+        self.open_palette(Some(GLASSES), Open::Here);
+        let next = self.glasses.as_ref().map_or(0, |glasses| {
+            if glasses.all.len() > 1 {
+                (glasses.shown + 1) % glasses.all.len()
+            } else {
+                glasses.shown
+            }
+        });
+        if let Some(palette) = self
+            .glasses
+            .as_mut()
+            .and_then(|glasses| glasses.palette.as_mut())
+        {
+            palette.selected = next;
+        }
     }
 
     pub(crate) fn palette_open(&self) -> bool {
@@ -1390,6 +1500,17 @@ impl Ui {
             Action::Open(pane) => self.open_in_glass(pane, how),
             Action::ShowGlass(index) => self.show_glass(index),
             Action::NewAgent(task) => self.open_new_agent(task),
+            Action::Name(naming) => {
+                let query = match naming {
+                    Naming::Rename => glasses.glass().name.clone(),
+                    Naming::New | Naming::Duplicate => String::new(),
+                };
+                glasses.palette = Some(Palette {
+                    query,
+                    naming: Some(naming),
+                    ..Palette::default()
+                });
+            }
             Action::NewGlass(name) => {
                 let name = glasses.unused_name(&name);
                 let glass = Glass::new(name);
@@ -1470,7 +1591,9 @@ impl Ui {
         }
         let glass = glasses.glass_mut();
         let focus = glass.focus;
-        let replace = how == Open::Here && glass.shown(focus).is_some();
+        // Opening never replaces what is shown (Nathan, 2026-10-01): Here adds a tab, as Tab
+        // does; Ctrl+W closes what is no longer wanted.
+        let replace = false;
         let (group, tab) = match how {
             Open::Right | Open::Below => {
                 let side = if how == Open::Right {
@@ -2156,7 +2279,7 @@ mod tests {
         assert_eq!(tabs(&ui).1, 1);
         assert_eq!(tabs(&ui).2[0].len(), 2);
 
-        // Here replaces the shown tab.
+        // Ctrl+K never replaces what is shown: it adds a tab too.
         ctrl(&mut ui, 'k');
         typed(&mut ui, "harbor");
         let harbor = ui
@@ -2165,10 +2288,8 @@ mod tests {
             .position(|choice| choice.section == 3)
             .unwrap();
         ui.open_choice(Some(harbor), Open::Here);
-        assert_eq!(tabs(&ui).2[0][0], "machine:machine/harbor");
-        ctrl(&mut ui, 'k');
-        typed(&mut ui, "atlas builder");
-        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(tabs(&ui).2[0], [ATLAS, WEEKLY, "machine:machine/harbor"]);
+        ctrl(&mut ui, 'w');
 
         press(&mut ui, KeyCode::Char('1'), KeyModifiers::ALT);
         assert_eq!((tabs(&ui).1, ui.tab), (0, 0));
@@ -2654,6 +2775,25 @@ mod tests {
     }
 
     #[test]
+    fn rename_is_always_in_the_palette_and_asks_for_the_name() {
+        let mut ui = glass();
+        ctrl(&mut ui, 'k');
+        let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
+        let rename = ui
+            .matches(palette)
+            .iter()
+            .position(|choice| choice.action == Action::Name(Naming::Rename))
+            .unwrap();
+        ui.open_choice(Some(rename), Open::Here);
+        assert!(screen(&ui).contains("rename “main”: type its new name"));
+        // The current name is there to edit.
+        ctrl(&mut ui, 'w');
+        typed(&mut ui, "work");
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(ui.glasses.as_ref().unwrap().glass().name, "work");
+    }
+
+    #[test]
     fn the_wheel_moves_the_palette_and_nothing_behind_it() {
         let mut ui = glass();
         ctrl(&mut ui, 'k');
@@ -2735,7 +2875,10 @@ mod tests {
         );
         assert!(screen(&ui).lines().next().unwrap().contains("review ▾"));
 
+        // Ctrl+G shows the glasses with the next one chosen; Enter switches.
         ctrl(&mut ui, 'g');
+        assert!(screen(&ui).contains("Rename “review”…"));
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
         assert_eq!(ui.glasses.as_ref().unwrap().glass().name, "main");
         assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
 
