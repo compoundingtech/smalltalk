@@ -7,6 +7,9 @@
     "public_listener": false,
     "remote_mode": "online-thin-client"
   },
+  "streams": [
+    { "id": "collections.stream", "method": "GET", "path": "/v1/client/collections/stream", "websocket_protocol": "st3.client.collections.v0", "command": "CollectionCommand", "frame": "CollectionFrame", "max_subscriptions": 8 }
+  ],
   "reads": [
     { "id": "capabilities.get", "method": "GET", "path": "/v1/client/capabilities", "response": "Capabilities" },
     { "id": "document.get", "method": "GET", "path": "/v1/client/documents/content", "response": "DocumentContent" },
