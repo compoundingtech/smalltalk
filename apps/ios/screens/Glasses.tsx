@@ -54,7 +54,7 @@ export function GlassesScreen() {
     <Banners />
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingBottom: 32 }}>
       <StatusLine />
-      {!glassesGranted ? <Note tone="warning">This gateway does not keep glasses yet, or this device was paired before it could. Glasses made in stui --glasses appear here once it does.</Note> : null}
+      {!glassesGranted ? <Note tone="warning">This gateway does not keep spaces yet, or this device was paired before it could. Spaces made in stui --spaces appear here once it does.</Note> : null}
       {glassesIssue ? <Note tone="fault">{glassesIssue}</Note> : null}
       {choices.length > 1 ? <View style={{ paddingHorizontal: 12, paddingVertical: 8 }}>
         <SegmentedControl
@@ -64,7 +64,7 @@ export function GlassesScreen() {
         />
       </View> : null}
       {shown ? <>
-        <SectionHeader title={shown.body?.name ?? 'glass'} count={splits.reduce((sum, split) => sum + split.tabs.length, 1)} />
+        <SectionHeader title={shown.body?.name ?? 'space'} count={splits.reduce((sum, split) => sum + split.tabs.length, 1)} />
         <ListRow glyph="⌂" glyphColor={theme.accent} title="Home" second="what needs you" onPress={() => navigationRef.navigate('Home', { screen: 'HomeRoot' })} />
         {splits.map(split => <View key={split.index}>
           {many ? <SectionHeader title={`split ${split.index + 1} of ${splits.length}`} count={split.tabs.length} /> : null}
@@ -81,7 +81,7 @@ export function GlassesScreen() {
           })}
           {many && split.tabs.length === 0 ? <T dim style={{ paddingHorizontal: 12, paddingVertical: 6 }}>Empty on the computer too.</T> : null}
         </View>)}
-      </> : glassesGranted ? <Empty text="No glasses yet. Make one with stui --glasses on a computer." /> : null}
+      </> : glassesGranted ? <Empty text="No spaces yet. Make one with stui --spaces on a computer." /> : null}
     </ScrollView>
   </Screen>;
 }

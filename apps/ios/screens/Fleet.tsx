@@ -56,10 +56,10 @@ export function FleetScreen() {
       <ListRow
         glyph={glassesOn ? '●' : '○'}
         glyphColor={glassesOn ? theme.green : theme.overlay1}
-        title={`glasses · ${glassesOn ? 'on' : 'off'}`}
-        second="stui's tabs and splits, one at a time, in a Glasses tab"
+        title={`spaces · ${glassesOn ? 'on' : 'off'}`}
+        second="stui's tabs and splits, one at a time, in a Spaces tab"
         onPress={() => actions.setGlassesOn(!glassesOn)}
-        accessibilityLabel={`Glasses experiment, ${glassesOn ? 'on' : 'off'}. Double-tap to turn ${glassesOn ? 'off' : 'on'}.`}
+        accessibilityLabel={`Spaces, ${glassesOn ? 'on' : 'off'}. Double-tap to turn ${glassesOn ? 'off' : 'on'}.`}
       />
       <SectionHeader title="this connection" />
       <View style={{ paddingHorizontal: 12, gap: 2 }}>

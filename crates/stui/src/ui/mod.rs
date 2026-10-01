@@ -4143,12 +4143,16 @@ impl Drop for Guard {
     }
 }
 
-/// Whether glasses are asked for, and which: `stui --glass NAME` names one, `stui --glasses`
-/// opens the last one used on this device (`Some(None)`); plain stui asks for none.
+/// Whether spaces are asked for, and which: `stui --space NAME` names one, `stui --spaces`
+/// opens the last one used on this device (`Some(None)`); plain stui asks for none. The older
+/// `--glass` and `--glasses` still work.
 pub fn glass_request(args: &[String]) -> Option<Option<String>> {
-    match arg(args, "--glass") {
+    match arg(args, "--space").or_else(|| arg(args, "--glass")) {
         Some(name) => Some(Some(name)),
-        None => args.iter().any(|arg| arg == "--glasses").then_some(None),
+        None => args
+            .iter()
+            .any(|arg| arg == "--spaces" || arg == "--glasses")
+            .then_some(None),
     }
 }
 

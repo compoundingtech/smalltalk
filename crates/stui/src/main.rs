@@ -2590,7 +2590,7 @@ fn main() -> Result<()> {
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
         println!(
-            "stui [--client | --local] [--old] [--glasses | --glass NAME]\nstui pair MEMBER_URL PAIRING_ID\n\nPairing reads the single-use code privately from the terminal (or stdin).\nPaired devices use the network automatically; --local selects the local daemon.\n--client requires a paired device. --demo opens invented data.\n--glasses tries glasses: splits with their own tabs, and a palette (an experiment);\n--glass NAME opens that glass. --version names this build."
+            "stui [--client | --local] [--old] [--spaces | --space NAME]\nstui pair MEMBER_URL PAIRING_ID\n\nPairing reads the single-use code privately from the terminal (or stdin).\nPaired devices use the network automatically; --local selects the local daemon.\n--client requires a paired device. --demo opens invented data.\n--spaces opens spaces: splits with their own tabs, Ctrl+K to open anything and Ctrl+S\nfor the sidebar; --space NAME opens that space. --version names this build."
         );
         return Ok(());
     }

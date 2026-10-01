@@ -19,7 +19,7 @@ const SECTIONS: [&str; 6] = [
     "agents",
     "missions",
     "fleet",
-    "glasses",
+    "spaces",
     "start",
 ];
 const GLASSES: usize = 4;
@@ -628,14 +628,14 @@ impl Ui {
             (
                 "✎",
                 format!("Rename “{current}”…"),
-                "rename glass",
+                "rename space glass",
                 Naming::Rename,
             ),
-            ("+", "New glass…".to_owned(), "new glass", Naming::New),
+            ("+", "New space…".to_owned(), "new space glass", Naming::New),
             (
                 "⧉",
                 format!("Duplicate “{current}”…"),
-                "duplicate glass copy",
+                "duplicate space glass copy",
                 Naming::Duplicate,
             ),
         ] {
@@ -650,7 +650,7 @@ impl Ui {
         if !name.is_empty() {
             choices.push(glass(
                 "+",
-                format!("New glass “{name}”"),
+                format!("New space “{name}”"),
                 "ctrl+g switches",
                 String::new(),
                 Action::NewGlass(name.to_owned()),
@@ -675,7 +675,7 @@ impl Ui {
                 "×",
                 format!("Close “{}”", glasses.glass().name),
                 "its tabs go with it",
-                "close glass".to_owned(),
+                "close space glass".to_owned(),
                 Action::CloseGlass,
             ));
         }
@@ -696,7 +696,7 @@ impl Ui {
                 ),
                 Naming::New => (
                     "+",
-                    format!("New glass “{name}”"),
+                    format!("New space “{name}”"),
                     Action::NewGlass(name.clone()),
                 ),
                 Naming::Duplicate => (
@@ -1473,7 +1473,7 @@ impl Ui {
             (Open::Tab, Some(title)) => format!("open in a new tab beside “{title}”"),
             (Open::Right, _) => "open in a new split to the right".to_owned(),
             (Open::Below, _) => "open in a new split below".to_owned(),
-            (Open::Glass, _) => "open in a new glass".to_owned(),
+            (Open::Glass, _) => "open in a new space".to_owned(),
         };
         let place = if split { " · focused split" } else { "" };
         format!(" {} ", text::truncate(&format!("{target}{place}"), 60))
@@ -1512,7 +1512,7 @@ impl Ui {
             (Some(Naming::Rename), Some(glasses)) => {
                 format!(" rename “{}”: type its new name ", glasses.glass().name)
             }
-            (Some(Naming::New), _) => " a new glass: type its name ".to_owned(),
+            (Some(Naming::New), _) => " a new space: type its name ".to_owned(),
             (Some(Naming::Duplicate), Some(glasses)) => {
                 format!(" a copy of “{}”: type its name ", glasses.glass().name)
             }
@@ -1620,7 +1620,7 @@ impl Ui {
         buf.set_stringn(
             rect.x + 2,
             rect.y + rect.height - 2,
-            "enter open · ctrl+v split right · ctrl+x split below · ctrl+t tab · ctrl+g glass · esc",
+            "enter open · ctrl+v split right · ctrl+x split below · ctrl+t tab · ctrl+g spaces · esc",
             inner,
             theme::dim().bg(theme::MANTLE),
         );
@@ -1927,7 +1927,7 @@ impl Ui {
             }
             Action::RenameGlass(name) => {
                 if glasses.all.iter().any(|glass| glass.name == name) {
-                    self.flash(format!("A glass is already called “{name}”"));
+                    self.flash(format!("A space is already called “{name}”"));
                 } else {
                     glasses.glass_mut().name = name;
                     let id = glasses.glass().id.clone();
@@ -1959,7 +1959,7 @@ impl Ui {
                         self.effects.push(Effect::SaveGlass(write));
                     }
                     self.show_glass(next);
-                    self.flash(format!("Closed the glass “{}”", closed.name));
+                    self.flash(format!("Closed the space “{}”", closed.name));
                 }
             }
         }
@@ -2164,8 +2164,8 @@ impl Ui {
         }
         if gone > 0 {
             self.flash(match gone {
-                1 => "A glass was closed elsewhere".to_owned(),
-                n => format!("{n} glasses were closed elsewhere"),
+                1 => "A space was closed elsewhere".to_owned(),
+                n => format!("{n} spaces were closed elsewhere"),
             });
         }
         self.show_focused();
@@ -2199,7 +2199,7 @@ impl Ui {
                 glasses.save();
             }
             Err(error) if current => self.flash(format!(
-                "st did not keep a glass yet ({error}); stui will try again"
+                "st did not keep a space yet ({error}); stui will try again"
             )),
             Err(_) => {}
         }
