@@ -2561,12 +2561,9 @@ impl Ui {
         }
         if let Some(action) = self.confirm {
             match key.code {
-                // Enter is how a message is sent; it never confirms stopping an agent.
+                // Only y confirms. Enter is how a message is sent, so it never confirms anything
+                // that acts for the person: stopping, approving, closing, cancelling, revoking.
                 KeyCode::Char('y') => {
-                    self.confirm = None;
-                    self.act(action);
-                }
-                KeyCode::Enter if action != 's' => {
                     self.confirm = None;
                     self.act(action);
                 }
@@ -3345,8 +3342,13 @@ impl Ui {
         let Some(id) = self.attention_focus() else {
             return;
         };
-        if matches!(action, 'y' | 'n') && self.current_kind() == Some("request") {
-            let answer = if action == 'y' { "Yes" } else { "No" };
+        if matches!(action, 'y' | 'n' | 'r') && self.current_kind() == Some("request") {
+            // r closes a request that needs nothing from the person; the step continues.
+            let answer = match action {
+                'y' => "Yes",
+                'n' => "No",
+                _ => "Nothing for me to do here.",
+            };
             if self.live {
                 self.effects.push(Effect::Attention {
                     id,
