@@ -152,7 +152,7 @@ pub(crate) fn run_for_with_environment(
             Some(set) => set,
             None => hooks::verify_required_set().with_context(|| {
                 format!(
-                    "{label} driver '{runtime_id}' needs this binary's verified hook set for {}; the st daemon publishes it when it starts (`st2 hooks install` on an st2 host)",
+                    "{label} driver '{runtime_id}' needs this binary's verified hook set for {}; the daemon publishes it when it starts",
                     kind.extension
                 )
             })?,
