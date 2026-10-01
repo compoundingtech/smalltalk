@@ -332,7 +332,7 @@ pub(crate) fn claude_session_of_managed_driver(
     driver_token: &str,
 ) -> std::result::Result<String, String> {
     // A seat without a wrapper names Claude's own session in its evidence token.
-    if let Some(session) = driver_token.strip_prefix(st2::harness_state::WRAPPERLESS_PREFIX) {
+    if let Some(session) = driver_token.strip_prefix(st_drivers::harness_state::WRAPPERLESS_PREFIX) {
         return if is_uuid(session) {
             Ok(session.to_owned())
         } else {
@@ -3521,7 +3521,7 @@ mod tests {
             claude_session_of_managed_driver(
                 home.path(),
                 "agent/test",
-                &format!("{}{session}", st2::harness_state::WRAPPERLESS_PREFIX)
+                &format!("{}{session}", st_drivers::harness_state::WRAPPERLESS_PREFIX)
             )
             .unwrap(),
             session

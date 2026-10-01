@@ -48,16 +48,16 @@ pub const FILES: [(&str, &[u8]); 10] = [
     ("codex-stop.sh", include_bytes!("../hooks/codex-stop.sh")),
     (
         "pi-channel.ts",
-        include_bytes!("../../../hooks/pi-channel.ts"),
+        include_bytes!("../../st-drivers/hooks/pi-channel.ts"),
     ),
     (
         "omp-channel.ts",
-        include_bytes!("../../../hooks/omp-channel.ts"),
+        include_bytes!("../../st-drivers/hooks/omp-channel.ts"),
     ),
 ];
 
 /// The file that makes a directory an st3 hook set. st2 skips an `$ST_HOOKS` that holds it.
-pub const MANIFEST: &str = st2::hooks::ST3_SET_MARKER;
+pub const MANIFEST: &str = st_drivers::hooks::ST3_SET_MARKER;
 const SETS_DIR: &str = "sets";
 
 fn sha256(bytes: &[u8]) -> String {
@@ -289,7 +289,7 @@ mod tests {
     fn st2_does_not_mistake_an_st3_set_for_its_hook_root() {
         let root = tempfile::tempdir().unwrap();
         let set = ensure_installed(root.path()).unwrap();
-        assert!(set.join(st2::hooks::ST3_SET_MARKER).is_file());
+        assert!(set.join(st_drivers::hooks::ST3_SET_MARKER).is_file());
         assert!(!set.join("manifest.json").exists());
     }
 

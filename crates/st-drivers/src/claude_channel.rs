@@ -21,13 +21,13 @@ pub const ST3_CHANNEL: &str = "plugin:st3-channel@st3";
 const PLUGINS: [&str; 2] = [PLUGIN, ST3_PLUGIN];
 
 const MARKETPLACE_MANIFEST: &[u8] =
-    include_bytes!("../claude-channel/.claude-plugin/marketplace.json");
+    include_bytes!("../../../claude-channel/.claude-plugin/marketplace.json");
 const PLUGIN_MANIFEST: &[u8] =
-    include_bytes!("../claude-channel/plugins/st2-channel/.claude-plugin/plugin.json");
-const MCP_CONFIG: &[u8] = include_bytes!("../claude-channel/plugins/st2-channel/.mcp.json");
+    include_bytes!("../../../claude-channel/plugins/st2-channel/.claude-plugin/plugin.json");
+const MCP_CONFIG: &[u8] = include_bytes!("../../../claude-channel/plugins/st2-channel/.mcp.json");
 const ST3_PLUGIN_MANIFEST: &[u8] =
-    include_bytes!("../claude-channel/plugins/st3-channel/.claude-plugin/plugin.json");
-const ST3_MCP_CONFIG: &[u8] = include_bytes!("../claude-channel/plugins/st3-channel/.mcp.json");
+    include_bytes!("../../../claude-channel/plugins/st3-channel/.claude-plugin/plugin.json");
+const ST3_MCP_CONFIG: &[u8] = include_bytes!("../../../claude-channel/plugins/st3-channel/.mcp.json");
 const ST3_MARKETPLACE_MANIFEST: &[u8] =
     include_bytes!("../st3-claude-channel/.claude-plugin/marketplace.json");
 const POLICY_FILE: &str = "50-st2-channel.json";

@@ -6,14 +6,14 @@ use std::fs;
 use std::path::Path;
 use std::time::Instant;
 
-use st2::message;
-use st2::reconcile::{
+use st_drivers::message;
+use st_drivers::reconcile::{
     Launch, PtyPresentation, ReconcilePlan, Session, TaskCompileContext, TaskLaunch, TaskTarget,
     Teardown, compile_generated_tasks,
 };
-use st2::run::Runner;
-use st2::run::{CrashLoop, surface_crash_loop, up_once_selected, up_once_selected_specs};
-use st2::spec::{AgentDesiredState, AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
+use st_drivers::run::Runner;
+use st_drivers::run::{CrashLoop, surface_crash_loop, up_once_selected, up_once_selected_specs};
+use st_drivers::spec::{AgentDesiredState, AgentSpec, JobType, Task, TaskKind, TaskLifecycle};
 
 fn selected_catalog_agent(identity: &str, workspace: &Path, render: &str) -> String {
     format!(
@@ -237,7 +237,7 @@ fn task_spec(identity: &str, host: Option<&str>, id: &str) -> AgentSpec {
         workspace: None,
         supervisor: None,
         desired_state: AgentDesiredState::Running,
-        residency_policy: st2::ResidencyPolicy::Always,
+        residency_policy: st_drivers::ResidencyPolicy::Always,
         keep: false,
         restart: None,
         delivery: None,
@@ -470,9 +470,9 @@ fn selected_one_shot_wrong_host_refuses_before_runner_list() {
     assert!(error.to_string().contains("did not resolve"));
     assert_refusal(&runner);
 }
-use st2::park::{DirParkObserver, ParkObserver, ParkProjection, ParkState};
-use st2::run::{grant_unpark_requests, publish_parks};
-use st2::{FlappingCap, UpReport, discover, down, execute, reconcile as reconcile_result, up_once};
+use st_drivers::park::{DirParkObserver, ParkObserver, ParkProjection, ParkState};
+use st_drivers::run::{grant_unpark_requests, publish_parks};
+use st_drivers::{FlappingCap, UpReport, discover, down, execute, reconcile as reconcile_result, up_once};
 
 fn reconcile<'a>(specs: &'a [AgentSpec], sessions: &[Session], host: &str) -> ReconcilePlan<'a> {
     reconcile_result(specs, sessions, host).unwrap()
@@ -1567,7 +1567,7 @@ fn an_operator_recovers_one_parked_task_without_disturbing_a_healthy_peer() {
     let ParkState::Parked(record) = batch.state("example-linux.demo") else {
         panic!("the parked task is not visible in the projection");
     };
-    assert_eq!(record.reason, st2::run::PARK_REASON);
+    assert_eq!(record.reason, st_drivers::run::PARK_REASON);
     assert_eq!(batch.state("example-linux.peer"), &ParkState::NotParked);
 
     assert_eq!(
@@ -1577,7 +1577,7 @@ fn an_operator_recovers_one_parked_task_without_disturbing_a_healthy_peer() {
     );
 
     // The operator fixes the cause and clears this one task.
-    st2::park::request_unpark(&requests, "example-linux.demo").unwrap();
+    st_drivers::park::request_unpark(&requests, "example-linux.demo").unwrap();
 
     // Phase 2 — same supervisor run, same cap. The fixed task now comes up and stays up.
     let recovered = FakeRunner {
@@ -1657,7 +1657,7 @@ fn lifecycle_ops(runner: &FakeRunner, id: &str) -> Vec<String> {
 #[test]
 fn an_unpark_request_for_a_task_that_is_not_parked_says_so() {
     let requests = tempfile::tempdir().unwrap();
-    st2::park::request_unpark(requests.path(), "example-linux.typo").unwrap();
+    st_drivers::park::request_unpark(requests.path(), "example-linux.typo").unwrap();
 
     let mut cap = FlappingCap::default();
     let mut report = UpReport::default();
@@ -1743,9 +1743,9 @@ fn a_structurally_unrecoverable_park_does_not_advise_unpark() {
     // merely short enough under this one. Asserting it with the shipped predicate keeps the
     // control from being contaminated by the very condition under test: a root long enough to
     // blow even this id would otherwise make the control silently structural.
-    let resolved_root = st2::run::effective_pty_root(tmp.path());
+    let resolved_root = st_drivers::run::effective_pty_root(tmp.path());
     assert!(
-        st2::run::session_socket_overage(&resolved_root, "example-linux.demo").is_none(),
+        st_drivers::run::session_socket_overage(&resolved_root, "example-linux.demo").is_none(),
         "fixture precondition: the recoverable task must be bindable under the resolved pty root \
          {}, or this test cannot tell the two notices apart",
         resolved_root.display()

@@ -40,7 +40,8 @@ pub(super) fn capability_dir_entries(dir: &File) -> Result<Vec<std::ffi::OsStrin
     Ok(names)
 }
 
-pub(crate) fn sync_dir(path: &Path) -> Result<()> {
+#[doc(hidden)]
+pub fn sync_dir(path: &Path) -> Result<()> {
     File::open(path)
         .with_context(|| format!("open directory {}", path.display()))?
         .sync_all()
@@ -54,7 +55,8 @@ fn open_dir_nofollow(path: &Path) -> std::io::Result<File> {
         .open(path)
 }
 
-pub(crate) fn open_dir_beneath(catalog: &Path, target: &Path) -> std::io::Result<File> {
+#[doc(hidden)]
+pub fn open_dir_beneath(catalog: &Path, target: &Path) -> std::io::Result<File> {
     let relative = target.strip_prefix(catalog).map_err(|_| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -107,7 +109,8 @@ pub(super) fn control_plane_rename_error(error: std::io::Error) -> anyhow::Error
     }
 }
 
-pub(crate) fn persist_tempfile_from_control(
+#[doc(hidden)]
+pub fn persist_tempfile_from_control(
     control: &File,
     catalog: &Path,
     temp: tempfile::NamedTempFile,
@@ -132,7 +135,8 @@ pub(crate) fn persist_tempfile_from_control(
     renameat(control, source_name, &target_parent, target_name)
 }
 
-pub(crate) fn link_tempfile_from_control(
+#[doc(hidden)]
+pub fn link_tempfile_from_control(
     control: &File,
     catalog: &Path,
     temp: &tempfile::NamedTempFile,
@@ -178,7 +182,8 @@ pub(crate) fn link_tempfile_from_control(
     }
 }
 
-pub(crate) fn rename_noreplace_between_dirs(
+#[doc(hidden)]
+pub fn rename_noreplace_between_dirs(
     control: &File,
     catalog: &Path,
     source: &Path,
