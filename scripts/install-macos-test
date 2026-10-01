@@ -1,0 +1,214 @@
+#!/usr/bin/env python3
+"""Isolated installer transactions; native signing/swap proof also runs on macOS."""
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import plistlib
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from unittest.mock import patch
+
+spec = importlib.util.spec_from_file_location('installer', Path(__file__).with_name('install-macos.py'))
+m = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(m)
+DER = b'invented signing certificate'
+CERT = hashlib.sha1(DER).hexdigest().upper()
+
+
+class Installer(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.job = self.home / 'job'
+        self.job.mkdir()
+        self.source = self.home / 'built'
+        self.source.mkdir()
+        self.built = {}
+        for name in ['st3', 'stui']:
+            p = self.source / name
+            p.write_bytes((name + '-one').encode())
+            p.chmod(0o755)
+            self.built[name] = p
+        self.calls = []
+        self.stack = patch.multiple(m, CERTIFICATE=None, TEAM=None, APP=None, BIN_DIR=None,
+                                    IDENTIFIER='com.example.smalltalk')
+        self.stack.start()
+        self.addCleanup(self.stack.stop)
+
+    def command(self, args):
+        args = list(map(str, args))
+        self.calls.append(args)
+        if 'find-identity' in args:
+            return '  1) ' + CERT + ' "Developer ID Application: Example Developer (EXAMPLE123)"\n'
+        if 'find-certificate' in args:
+            return 'invented PEM'
+        if '/usr/bin/openssl' == args[0]:
+            return 'subject=CN=Example Developer,OU=EXAMPLE123,O=Example\n'
+        if args[0] == '/usr/bin/ditto':
+            shutil.copytree(args[1], args[2])
+        for arg in args:
+            if arg.startswith('--extract-certificates='):
+                Path(arg.split('=', 1)[1] + '0').write_bytes(DER)
+        if '-r-' in args:
+            metadata = json.loads((Path(args[-1]) / 'Contents/Resources/deploy-payload.json').read_text())
+            req = 'identifier "' + metadata['identifier'] + '"'
+            req += ' and anchor apple generic' if metadata['certificate'] else ' and cdhash H"1234"'
+            return ('Identifier=' + metadata['identifier'] + '\nTeamIdentifier=' +
+                    (metadata['team'] or 'not set') + '\ndesignated => ' + req + '\n')
+        return ''
+
+    def exchange(self, staged, destination):
+        if destination.exists():
+            old = staged.parent / '.old-app'
+            os.replace(destination, old)
+            os.replace(staged, destination)
+            os.replace(old, staged)
+        else:
+            os.replace(staged, destination)
+
+    def test_unconfigured_never_searches_keychain_and_signs_ad_hoc(self):
+        with patch.object(m, 'command', side_effect=self.command):
+            app, identity, _ = m.prepare(self.home, self.job, self.built)
+        self.assertFalse(identity['persistent_identity'])
+        self.assertFalse(any('security' in call[0] for call in self.calls))
+        self.assertTrue(all(call[call.index('--sign') + 1] == '-' for call in self.calls if '--sign' in call))
+        self.assertTrue(app.is_dir())
+
+    def test_configured_missing_identity_fails_before_any_signing(self):
+        m.CERTIFICATE = 'missing explicitly configured certificate'
+        with patch.object(m, 'command', side_effect=self.command):
+            with self.assertRaisesRegex(RuntimeError, 'refusing ad-hoc fallback'):
+                m.prepare(self.home, self.job, self.built)
+        self.assertFalse(any('--sign' in call for call in self.calls))
+
+    def test_team_requires_explicit_identity(self):
+        m.TEAM = 'EXAMPLE123'
+        with patch.object(m, 'command', side_effect=self.command):
+            with self.assertRaisesRegex(RuntimeError, 'explicit signing identity'):
+                m.resolve_identity()
+        self.assertEqual(self.calls, [])
+
+    def test_configured_identity_team_and_certificate_are_verified(self):
+        m.CERTIFICATE = CERT
+        m.TEAM = 'EXAMPLE123'
+        def output(args):
+            if 'find-certificate' in args:
+                return '-----BEGIN CERTIFICATE-----\nZXhhbXBsZQ==\n-----END CERTIFICATE-----'
+            return self.command(args)
+        with patch.object(m, 'command', side_effect=output), patch.object(m.ssl, 'PEM_cert_to_DER_cert', return_value=DER):
+            _, identity, _ = m.prepare(self.home, self.job, self.built)
+        self.assertEqual(identity['certificate'], CERT)
+        self.assertTrue(identity['persistent_identity'])
+        self.assertTrue(all(call[call.index('--sign') + 1] == CERT for call in self.calls if '--sign' in call))
+
+    def test_wrong_team_fails_before_signing(self):
+        m.CERTIFICATE = CERT
+        m.TEAM = 'WRONGTEAM1'
+        def output(args):
+            if 'find-certificate' in args:
+                return '-----BEGIN CERTIFICATE-----\nZXhhbXBsZQ==\n-----END CERTIFICATE-----'
+            return self.command(args)
+        with patch.object(m, 'command', side_effect=output), patch.object(m.ssl, 'PEM_cert_to_DER_cert', return_value=DER):
+            with self.assertRaisesRegex(RuntimeError, 'configured signing team'):
+                m.prepare(self.home, self.job, self.built)
+        self.assertFalse(any('--sign' in call for call in self.calls))
+
+    def test_full_bundle_plists_cli_restore_and_unchanged_payload(self):
+        bin_dir = m.bin_dir(self.home)
+        bin_dir.mkdir(parents=True)
+        (bin_dir / 'st3').write_bytes(b'previous executable')
+        (bin_dir / 'st3').chmod(0o755)
+        (bin_dir / 'st').symlink_to('st3')
+        service = self.home / 'Library/LaunchAgents' / (m.SERVICES[0] + '.plist')
+        service.parent.mkdir(parents=True)
+        original = plistlib.dumps({'ProgramArguments': [str(bin_dir / 'st3'), 'daemon', '--socket', 'keep.sock']})
+        service.write_bytes(original)
+        with patch.object(m, 'command', side_effect=self.command), patch.object(m, 'exchange', side_effect=self.exchange):
+            app, _, _ = m.prepare(self.home, self.job, self.built)
+            had_app = m.backup(self.home, self.job)
+            m.install(app, self.home, self.job)
+            self.assertEqual(os.readlink(bin_dir / 'st3'), str(m.binaries(m.fixed(self.home))['st3']))
+            args = plistlib.loads(service.read_bytes())['ProgramArguments']
+            self.assertEqual(args, [str(m.binaries(m.fixed(self.home))['st3']), 'daemon', '--socket', 'keep.sock'])
+            self.calls.clear()
+            _, identity, _ = m.prepare(self.home, self.job, self.built)
+            self.assertTrue(identity['payload_unchanged'])
+            self.assertFalse(any('--sign' in call for call in self.calls))
+            m.restore(self.home, self.job, had_app)
+            self.assertEqual((bin_dir / 'st3').read_bytes(), b'previous executable')
+            self.assertEqual(os.readlink(bin_dir / 'st'), 'st3')
+            self.assertFalse((bin_dir / 'stui').exists())
+            self.assertEqual(service.read_bytes(), original)
+
+    def test_upgrade_restores_previous_whole_app(self):
+        with patch.object(m, 'command', side_effect=self.command), patch.object(m, 'exchange', side_effect=self.exchange):
+            app, _, _ = m.prepare(self.home, self.job, self.built)
+            m.install(app, self.home, self.job)
+            first = {name: m.sha(path) for name, path in m.binaries(m.fixed(self.home)).items()}
+            second_job = self.home / 'second'; second_job.mkdir()
+            had_app = m.backup(self.home, second_job)
+            self.built['stui'].write_bytes(b'stui-two')
+            app, _, _ = m.prepare(self.home, second_job, self.built)
+            m.install(app, self.home, second_job)
+            self.assertNotEqual(m.sha(m.binaries(m.fixed(self.home))['stui']), first['stui'])
+            m.restore(self.home, second_job, had_app)
+            self.assertEqual({name: m.sha(path) for name, path in m.binaries(m.fixed(self.home)).items()}, first)
+
+    def test_both_wrappers_delegate_macos_tools_without_replacing_the_links(self):
+        repo = Path(__file__).resolve().parent.parent
+        fakebin = self.home / 'fakebin'; fakebin.mkdir()
+        (fakebin / 'uname').write_text('#!/bin/sh\necho Darwin\n')
+        helper = fakebin / 'python3'
+        helper.write_text('#!' + sys.executable + '\n' +
+            'import os,pathlib,sys\n' +
+            'source=pathlib.Path(sys.argv[sys.argv.index("--from")+1])\n' +
+            'destination=pathlib.Path(sys.argv[sys.argv.index("--bin-dir")+1])\n' +
+            'for name in ["st3","stui"]:\n' +
+            '    (destination/name).symlink_to(source/name)\n')
+        for path in fakebin.iterdir():
+            path.chmod(0o755)
+        for name in ['st3', 'stui', 'st3-migrate', 'pty']:
+            path = self.source / name
+            path.write_text('#!/bin/sh\nexit 0\n'); path.chmod(0o755)
+        env = dict(os.environ, PATH=str(fakebin) + os.pathsep + os.environ['PATH'])
+        first = self.home / 'source-bin'
+        subprocess.run([str(repo / 'scripts/install'), '--from', str(self.source), '--bin-dir', str(first)],
+                       env=env, check=True, stdout=subprocess.PIPE)
+        package = self.home / 'package'; package.mkdir()
+        shutil.copy2(repo / 'scripts/install-release', package / 'install.sh')
+        shutil.copytree(self.source, package / 'bin')
+        second = self.home / 'release-bin'
+        subprocess.run([str(package / 'install.sh'), '--bin-dir', str(second)],
+                       env=env, check=True, stdout=subprocess.PIPE)
+        for destination in [first, second]:
+            self.assertTrue((destination / 'st3').is_symlink())
+            self.assertTrue((destination / 'stui').is_symlink())
+            self.assertEqual(os.readlink(destination / 'st'), 'st3')
+            self.assertFalse((destination / 'st3-migrate').is_symlink())
+
+    @unittest.skipUnless(sys.platform == 'darwin', 'native macOS signing and atomic directory exchange')
+    def test_native_ad_hoc_install_upgrade_and_rollback(self):
+        shutil.copyfile('/usr/bin/true', self.built['st3'])
+        shutil.copyfile('/bin/echo', self.built['stui'])
+        app, _, _ = m.prepare(self.home, self.job, self.built)
+        m.install(app, self.home, self.job)
+        first = m.sha(m.binaries(m.fixed(self.home))['st3'])
+        second_job = self.home / 'native-second'; second_job.mkdir()
+        had_app = m.backup(self.home, second_job)
+        shutil.copyfile('/bin/echo', self.built['st3'])
+        app, _, _ = m.prepare(self.home, second_job, self.built)
+        m.install(app, self.home, second_job)
+        self.assertNotEqual(m.sha(m.binaries(m.fixed(self.home))['st3']), first)
+        m.restore(self.home, second_job, had_app)
+        self.assertEqual(m.sha(m.binaries(m.fixed(self.home))['st3']), first)
+        m.verify(m.fixed(self.home))
+
+
+if __name__ == '__main__':
+    unittest.main()

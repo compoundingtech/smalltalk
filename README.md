@@ -44,7 +44,7 @@ scripts/install --bin-dir DIR    # or anywhere else
 ```
 
 The script builds and installs `st3`, `stui`, and `st3-migrate`, and makes `st` a symlink to
-the installed `st3`. `st` is never a separate build. A source install also needs [`pty`](https://github.com/compoundingtech/pty-rust) on `PATH`.
+the installed `st3`. `st` is never a separate build. On macOS, both tools live in a fixed app bundle; see [macOS installation and signing](docs/st3/macos-installation.md). A source install also needs [`pty`](https://github.com/compoundingtech/pty-rust) on `PATH`.
 
 Each seat runs a coding harness, so install and log in to at least one: Claude Code, Codex, omp,
 pi, or OpenCode. Log in as the same user that runs the daemon.

@@ -8,7 +8,7 @@
 #   --from DIR     install already-built binaries from DIR instead of running cargo
 set -Eeuo pipefail
 
-bin_dir="$HOME/.local/bin"
+bin_dir="${ST_MACOS_BIN_DIR:-$HOME/.local/bin}"
 from=""
 while (($#)); do
   case $1 in
@@ -43,9 +43,15 @@ for name in "${binaries[@]}" st; do
 done
 
 mkdir -p "$bin_dir"
+macos=false
+if [[ $(uname -s) == Darwin ]]; then
+  python3 "$(cd "$(dirname "$0")" && pwd)/install-macos.py" --from "$from" --bin-dir "$bin_dir"
+  macos=true
+fi
 # Each name is replaced by rename, so a running process keeps its old inode and a concurrent
 # caller sees either the old or the new file, never a partial copy.
 for binary in "${binaries[@]}"; do
+  if [[ $macos == true && ($binary == st3 || $binary == stui) ]]; then continue; fi
   staged=$(mktemp "$bin_dir/.$binary.install.XXXXXX")
   cp "$from/$binary" "$staged"
   chmod 0755 "$staged"
