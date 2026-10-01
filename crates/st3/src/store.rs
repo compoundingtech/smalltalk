@@ -210,6 +210,12 @@ CREATE TABLE IF NOT EXISTS blobs (
     bytes BLOB NOT NULL,
     size INTEGER NOT NULL
 );
+-- Uploaded bytes become shared authority only when a durable claim references them.
+CREATE TABLE IF NOT EXISTS local_blobs (
+    hash TEXT PRIMARY KEY,
+    bytes BLOB NOT NULL,
+    size INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS documents (
     name TEXT NOT NULL,
@@ -2691,6 +2697,7 @@ impl Store {
         connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(&connection)?;
         projection_digest::initialize(&connection)?;
+        separate_staged_blobs(&mut connection)?;
         {
             let transaction = connection.transaction()?;
             let upgraded: bool = transaction.query_row(
@@ -13679,7 +13686,8 @@ impl Store {
         let hash = hex::encode(Sha256::digest(bytes));
         let connection = self.connection.write();
         connection.execute(
-            "INSERT OR IGNORE INTO blobs(hash, bytes, size) VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO local_blobs(hash, bytes, size)
+             SELECT ?1, ?2, ?3 WHERE NOT EXISTS(SELECT 1 FROM blobs WHERE hash=?1)",
             params![hash, bytes, bytes.len() as u64],
         )?;
         Ok(hash)
@@ -13688,9 +13696,12 @@ impl Store {
     pub fn get_blob(&self, hash: &str) -> Result<Option<Vec<u8>>> {
         let connection = self.readers.get();
         connection
-            .query_row("SELECT bytes FROM blobs WHERE hash=?1", [hash], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT bytes FROM blobs WHERE hash=?1
+                        UNION ALL SELECT bytes FROM local_blobs WHERE hash=?1 LIMIT 1",
+                [hash],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(Into::into)
     }
@@ -13740,9 +13751,8 @@ impl Store {
         let latest_batch = max_batch_rowid(&connection)?;
         if latest_batch > seeded_through {
             let transaction = connection.transaction()?;
-            let envelopes_before = max_envelope_rowid(&transaction)?;
             seed_replica_envelopes_tx(&transaction, &self.origin, Some(seeded_through))?;
-            self.sign_own_envelopes_tx(&transaction, Some(envelopes_before))?;
+            self.sign_own_envelopes_tx(&transaction, Some(seeded_through))?;
             transaction.commit()?;
             self.seeded_batch_rowid
                 .store(latest_batch, Ordering::Release);
@@ -14794,6 +14804,9 @@ impl Store {
                     )?;
                 }
             }
+        }
+        if changed != 0 {
+            rebuild_operations_tx(&transaction)?;
         }
         transaction.commit()?;
         drop(connection);
@@ -18590,6 +18603,7 @@ fn expected_operations(
         "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
          FROM claims
          WHERE json_extract(body, '$._operation.id') IS NOT NULL
+           AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
          ORDER BY id",
     )?;
     let claims = statement
@@ -18652,7 +18666,7 @@ fn expected_operations(
 /// this rule has opened. Rebuilding it read every claim and held a start for seconds before the
 /// API could answer. The planning tables are small and rebuilt on every start, since a planning
 /// claim written through the generic claim path is projected only by a rebuild.
-const DERIVED_TABLES_VERSION: &str = "1";
+const DERIVED_TABLES_VERSION: &str = "2";
 
 fn rebuild_derived_tables_once_tx(transaction: &Transaction<'_>) -> Result<()> {
     rebuild_planning_tx(transaction)?;
@@ -19256,6 +19270,7 @@ fn insert_claim(
     predecessors: &[String],
     now: u128,
 ) -> Result<u64> {
+    promote_claim_blobs(transaction, body)?;
     transaction.execute(
         "INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -22590,11 +22605,12 @@ impl Store {
     }
 
     /// Sign every envelope of this node's writer that has no signature by its member key,
-    /// optionally only those added after one `replica_envelopes` row.
+    /// optionally only those whose batches follow the last processed batch. Another process
+    /// can seal a batch before this keyed worker sees it; an envelope-row frontier would skip it.
     fn sign_own_envelopes_tx(
         &self,
         transaction: &Transaction<'_>,
-        after_rowid: Option<i64>,
+        after_batch_rowid: Option<i64>,
     ) -> Result<usize> {
         let _timing = time_stage(&self.replication_timers.signing);
         let Some(key) = self
@@ -22608,9 +22624,14 @@ impl Store {
         let Some(fleet_id) = fleet_meta(transaction, "fleet_id")? else {
             return Ok(0);
         };
-        let mut statement = transaction.prepare(
-            "SELECT sequence, envelope_hash FROM replica_envelopes AS envelopes
-             WHERE writer=?1 AND rowid>?2
+        let from = if after_batch_rowid.is_some() {
+            "FROM batches CROSS JOIN replica_envelopes AS envelopes
+             ON envelopes.batch_id=batches.id WHERE batches.rowid>?2 AND envelopes.writer=?1"
+        } else {
+            "FROM replica_envelopes AS envelopes WHERE envelopes.writer=?1 AND envelopes.rowid>?2"
+        };
+        let mut statement = transaction.prepare(&format!(
+            "SELECT envelopes.sequence, envelopes.envelope_hash {from}
                AND NOT EXISTS (
                  SELECT 1 FROM replica_envelope_signatures AS signatures
                  WHERE signatures.writer=envelopes.writer
@@ -22618,11 +22639,15 @@ impl Store {
                    AND signatures.envelope_hash=envelopes.envelope_hash
                    AND signatures.member_key=?3
                )
-             ORDER BY sequence",
-        )?;
+             ORDER BY envelopes.sequence"
+        ))?;
         let unsigned = statement
             .query_map(
-                params![self.origin, after_rowid.unwrap_or(i64::MIN), key.public()],
+                params![
+                    self.origin,
+                    after_batch_rowid.unwrap_or(i64::MIN),
+                    key.public()
+                ],
                 |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
             )?
             .collect::<Result<Vec<_>, _>>()?;
@@ -23882,6 +23907,130 @@ mod fleet_admission_tests {
                 envelope.signature.as_deref().unwrap(),
             ));
         }
+    }
+
+    #[test]
+    fn worker_signs_batches_already_sealed_by_an_unkeyed_daemon() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("claims.sqlite3");
+        let worker = Store::open(&path, "alder").unwrap();
+        worker.bind_fleet(FLEET).unwrap();
+        let member = key();
+        worker.set_member_key(Some(member.clone())).unwrap();
+        let claim = note(&worker, "written while another process opens");
+        // Startup seeds envelopes without a member key; the keyed worker has not seen this
+        // batch yet. This is the main/replication-worker startup interleaving.
+        let daemon = Store::open(&path, "alder").unwrap();
+        let unsigned = daemon.replication_inventory().unwrap();
+        assert!(!unsigned.envelopes.is_empty());
+        let exchange = worker
+            .export_replication_exchange(FLEET, &ReplicationInventory::default())
+            .unwrap();
+        let envelope = exchange.envelopes.iter().find(|e| e.sequence == 1).unwrap();
+        assert!(verify_signature(
+            member.public(),
+            &envelope_signature_message(FLEET, "alder", envelope.sequence, &envelope.hash),
+            envelope
+                .signature
+                .as_deref()
+                .expect("already sealed batches must be signed")
+        ));
+        let receiver = node("birch", None, None);
+        sync(&worker, &receiver);
+        assert!(admitted(&receiver, &claim));
+    }
+
+    #[test]
+    fn staged_blobs_join_shared_authority_only_with_a_committed_claim() {
+        let source = node("alder", None, None);
+        let target = node("birch", None, None);
+        let baseline = source.replication_status(true, Some(FLEET), &[]).unwrap();
+        let hash = source.put_blob(b"staged upload").unwrap();
+        assert_eq!(source.get_blob(&hash).unwrap().unwrap(), b"staged upload");
+        assert_eq!(
+            source
+                .replication_status(true, Some(FLEET), &[])
+                .unwrap()
+                .graph_digest,
+            baseline.graph_digest
+        );
+        {
+            let mut connection = source.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            promote_claim_blobs(&transaction, &json!({"blob_hash":hash})).unwrap();
+            assert_ne!(
+                projection_digest::tables(&transaction).unwrap()["blobs"],
+                baseline.projection_digests["blobs"]
+            );
+            transaction.rollback().unwrap();
+        }
+        assert_eq!(
+            source
+                .replication_status(true, Some(FLEET), &[])
+                .unwrap()
+                .graph_digest,
+            baseline.graph_digest
+        );
+        append(
+            &source,
+            "file.observed",
+            "file/alder:/example/result",
+            json!({"status":"observed", "path":"/example/result", "blob_hash":hash}),
+        );
+        sync(&source, &target);
+        assert_eq!(target.get_blob(&hash).unwrap().unwrap(), b"staged upload");
+        assert_eq!(
+            source
+                .replication_status(true, Some(FLEET), &[])
+                .unwrap()
+                .projection_digests,
+            target
+                .replication_status(true, Some(FLEET), &[])
+                .unwrap()
+                .projection_digests
+        );
+    }
+
+    #[test]
+    fn legacy_unreferenced_blobs_are_staged_without_losing_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("claims.sqlite3");
+        let store = Store::open(&path, "alder").unwrap();
+        let bytes = b"unreferenced legacy upload";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let shared = store
+            .put_document("doc/example", b"shared document", &None, "shared")
+            .unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO blobs VALUES(?1,?2,?3)",
+                    params![hash, bytes.as_slice(), bytes.len()],
+                )
+                .unwrap();
+            connection
+                .execute("DELETE FROM meta WHERE key='staged_blob_scope'", [])
+                .unwrap();
+        }
+        drop(store);
+        let store = Store::open(&path, "alder").unwrap();
+        assert_eq!(store.get_blob(&hash).unwrap().unwrap(), bytes);
+        assert_eq!(
+            store.get_blob(&shared.hash).unwrap().unwrap(),
+            b"shared document"
+        );
+        let connection = store.readers.get();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            projection_digest::tables(&connection).unwrap(),
+            projection_digest::oracle(&connection).unwrap()
+        );
     }
 
     #[test]
@@ -25862,6 +26011,73 @@ fn collect_referenced_blobs(
             output.insert(hash, bytes);
         }
     }
+    Ok(())
+}
+
+/// Keep uncommitted uploads outside the shared graph. Promotion is part of the claim's
+/// transaction, so a failed write cannot change the shared blob digest.
+fn promote_claim_blobs(transaction: &Transaction<'_>, body: &Value) -> Result<()> {
+    let mut hashes = BTreeSet::new();
+    collect_hash_fields(body, &mut hashes);
+    for hash in hashes {
+        transaction.execute(
+            "INSERT OR IGNORE INTO blobs(hash,bytes,size)
+             SELECT hash,bytes,size FROM local_blobs WHERE hash=?1",
+            [&hash],
+        )?;
+        transaction.execute("DELETE FROM local_blobs WHERE hash=?1", [&hash])?;
+    }
+    Ok(())
+}
+
+/// Older put_blob calls mixed staged uploads with authority. Separate only bytes we can
+/// prove were never shared: retained claim references and received blob records stay shared.
+/// After a historical checkpoint removed those references, preserve all existing authority.
+fn separate_staged_blobs(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    let done: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key='staged_blob_scope')",
+        [],
+        |row| row.get(0),
+    )?;
+    if done {
+        return Ok(());
+    }
+    let trimmed: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM checkpoint_claims)",
+        [],
+        |row| row.get(0),
+    )?;
+    if !trimmed {
+        let mut hashes = BTreeSet::new();
+        let mut statement = transaction.prepare("SELECT body FROM claims")?;
+        for body in statement.query_map([], |row| row.get::<_, String>(0))? {
+            collect_hash_fields(&serde_json::from_str::<Value>(&body?)?, &mut hashes);
+        }
+        drop(statement);
+        transaction
+            .execute_batch("CREATE TEMP TABLE staged_blob_shared_hashes(hash TEXT PRIMARY KEY);")?;
+        let mut insert =
+            transaction.prepare("INSERT OR IGNORE INTO staged_blob_shared_hashes VALUES(?1)")?;
+        for hash in hashes {
+            insert.execute([hash])?;
+        }
+        drop(insert);
+        transaction.execute_batch(
+            "INSERT OR IGNORE INTO staged_blob_shared_hashes SELECT hash FROM documents;
+             INSERT OR IGNORE INTO staged_blob_shared_hashes
+                 SELECT substr(subject_hint,6) FROM replica_records WHERE kind_hint='blob' AND state='valid';
+             INSERT OR IGNORE INTO local_blobs SELECT * FROM blobs
+                 WHERE hash NOT IN (SELECT hash FROM staged_blob_shared_hashes);
+             DELETE FROM blobs WHERE hash NOT IN (SELECT hash FROM staged_blob_shared_hashes);
+             DROP TABLE staged_blob_shared_hashes;",
+        )?;
+    }
+    transaction.execute(
+        "INSERT INTO meta(key,value) VALUES('staged_blob_scope','1')",
+        [],
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -38580,6 +38796,14 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             target.selected_desired_token("exec/work").unwrap().unwrap(),
             replacement
         );
+        // A build that rejected the original never put it in claims. Keep the raw repaired
+        // record, but model that admission difference explicitly.
+        target
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM claims WHERE id=?1", [&repaired_claim])
+            .unwrap();
 
         receive_and_project(
             &source,
@@ -38613,6 +38837,143 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             target_status.authority_digest
         );
         assert_eq!(source_status.graph_digest, target_status.graph_digest);
+    }
+
+    #[test]
+    fn repaired_original_sources_and_operations_ignore_local_retention_and_roll_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("claims.sqlite3");
+        let source = Store::open(&path, "alder").unwrap();
+        let target = Store::open_memory("birch").unwrap();
+        let observation = |reason: &str, key: &str| {
+            source
+                .append_claim(&ClaimInput {
+                    subject: "daemon/alder".into(),
+                    kind: "daemon.diagnostic".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("severity".into(), json!("warning")),
+                        ("code".into(), json!("repair-test")),
+                        ("reason".into(), json!(reason)),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap()
+        };
+        let original = observation("original", "original");
+        let replacement = observation("replacement", "replacement");
+        receive_and_project(
+            &target,
+            "alder",
+            &exchange_from(&source, &ReplicationInventory::default()),
+        );
+        let record = target
+            .replica_records(false)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.claim_id.as_deref() == Some(&original.id))
+            .unwrap();
+        let before = projection_digest::tables(&source.readers.get()).unwrap();
+        {
+            let mut connection = source.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "UPDATE replica_records SET state='repaired' WHERE claim_id=?1",
+                    [&original.id],
+                )
+                .unwrap();
+            rebuild_operations_tx(&transaction).unwrap();
+            let current = projection_digest::tables(&transaction).unwrap();
+            assert_ne!(current["claim_sources"], before["claim_sources"]);
+            assert_ne!(current["operations"], before["operations"]);
+            assert_eq!(current, projection_digest::oracle(&transaction).unwrap());
+            transaction.rollback().unwrap();
+        }
+        assert_eq!(
+            projection_digest::tables(&source.readers.get()).unwrap(),
+            before
+        );
+        target
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE replica_records SET state='unknown' WHERE record_ref=?1",
+                [&record.record_ref],
+            )
+            .unwrap();
+        target
+            .repair_replica_record(
+                &record.record_ref,
+                &replacement.id,
+                "replace an unsupported original",
+                "person/robin",
+                "repair",
+            )
+            .unwrap();
+        target
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM claims WHERE id=?1", [&original.id])
+            .unwrap();
+        receive_and_project(
+            &source,
+            "birch",
+            &exchange_from(&target, &source.replication_inventory().unwrap()),
+        );
+        let expected = projection_digest::tables(&target.readers.get()).unwrap();
+        assert_eq!(
+            projection_digest::tables(&source.readers.get()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            expected,
+            projection_digest::oracle(&target.readers.get()).unwrap()
+        );
+        assert!(source.claim_by_id(&original.id).unwrap().is_some());
+        assert!(target.claim_by_id(&original.id).unwrap().is_none());
+        // Receipt cleanup must not make a repaired original a source again.
+        source
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM replica_records WHERE claim_id=?1",
+                [&original.id],
+            )
+            .unwrap();
+        assert_eq!(
+            projection_digest::tables(&source.readers.get()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            projection_digest::oracle(&source.readers.get()).unwrap(),
+            expected
+        );
+        // Registry rebuilds and restart retain the repair meaning after receipts were trimmed.
+        source
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value='old-registry' WHERE key='projection_digest_registry'",
+                [],
+            )
+            .unwrap();
+        drop(source);
+        let source = Store::open(&path, "alder").unwrap();
+        assert_eq!(
+            projection_digest::tables(&source.readers.get()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            projection_digest::oracle(&source.readers.get()).unwrap(),
+            expected
+        );
     }
 
     proptest! {
