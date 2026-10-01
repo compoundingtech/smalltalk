@@ -30,9 +30,10 @@ run_stage() {
   return "$status"
 }
 
-# The nextest --no-run stage already compiled the test executables. Clippy gets
-# a separate target directory so its Cargo lock cannot serialize the four lanes.
-run_stage test cargo nextest run --workspace --locked --profile ci -E "$ST2_FILTER" &
+# The nextest --no-run stage already compiled the test executables. The ci profile's
+# default filter selects the gate's tests (.config/nextest.toml). Clippy gets a separate
+# target directory so its Cargo lock cannot serialize the four lanes.
+run_stage test cargo nextest run --workspace --locked --profile ci &
 test_pid=$!
 run_stage clippy env CARGO_TARGET_DIR="$RUNNER_TEMP/clippy-target" cargo clippy --workspace --all-targets --locked &
 clippy_pid=$!

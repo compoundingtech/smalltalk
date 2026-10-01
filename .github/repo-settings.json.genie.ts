@@ -34,6 +34,7 @@ export default githubRepoSettings({
           do_not_enforce_on_create: false,
           required_status_checks: [
             { context: 'linux-gate', integration_id: 15368 },
+            { context: 'isolation-vm', integration_id: 15368 },
             { context: 'genie-freshness', integration_id: 15368 },
           ],
         },

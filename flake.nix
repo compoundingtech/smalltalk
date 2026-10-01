@@ -1037,6 +1037,9 @@
             # (`cargo test --test integration otel_export::`) need the same collector the
             # Nix check pins; `ST2_OTELITE_BIN` points at it.
             effect-utils.packages.${system}.otelite
+            # st3's messaging fault matrix runs the omp channel hook (TypeScript) under the
+            # provider stand-in with Node's built-in type stripping, which Node 24 enables.
+            pkgs.nodejs
           ];
           # Same collector the Nix gate pins, so a bare
           # `cargo test --test integration otel_export::` in this shell runs against it.
@@ -1050,6 +1053,13 @@
             mkdir -p repos
             ln -sfn ${effect-utils} repos/effect-utils
           '';
+        };
+        # The isolation-vm CI job's NixOS VM; see the file for how it runs.
+        legacyPackages = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          transport-isolation-vm = import ./nix/transport-isolation-vm.nix {
+            inherit pkgs;
+            pty = ptyPackage;
+          };
         };
       }
     ) // {

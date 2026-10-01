@@ -53,6 +53,10 @@
                 "integration_id": 15368
               },
               {
+                "context": "isolation-vm",
+                "integration_id": 15368
+              },
+              {
                 "context": "genie-freshness",
                 "integration_id": 15368
               }

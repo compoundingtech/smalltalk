@@ -6,9 +6,10 @@ The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) and `macOS
 (`.github/workflows/macos.yml`) replace the fleet's Linux `st/ci` and optional `st/ci-macos`
 execution. During the proving period both systems
 run in parallel, and the **live** merge rule remains `st/ci` until the coordinated switch below.
-The proposed required check names are `linux-gate` and `genie-freshness`.
+The proposed required check names are `linux-gate`, `isolation-vm` and `genie-freshness`.
 
-Every pull request, including a fork and a draft, gets the Linux gate and freshness check.
+Every pull request, including a fork and a draft, gets the Linux gate, the isolation VM and the
+freshness check.
 Checkout uses GitHub's default `pull_request` merge ref, not the contributor's unmerged
 head: it tests that head merged with the current base. Strict branch protection also requires
 that the head itself contain the latest `main`. No `pull_request_target` job runs PR code,
@@ -19,7 +20,8 @@ fixtures and installs matching rendered st2 hooks, then builds the workspace tes
 first, alone, with dev/test debug info and incremental compilation disabled. After that build,
 `scripts/ci-linux` starts four stages in parallel and fails if any stage fails:
 
-- `cargo nextest run --workspace --locked --profile ci`, eight tests at a time;
+- `cargo nextest run --workspace --locked --profile ci`, eight tests at a time, selected by the
+  profile's default filter (see [gate scope](#gate-scope));
 - `cargo clippy --workspace --all-targets --locked`;
 - `cargo run --locked -p st3-client-codegen -- --check`;
 - the fleet compatibility test against `.github/fleet-compat-baseline.json`'s pinned older st3.
@@ -28,31 +30,48 @@ first, alone, with dev/test debug info and incremental compilation disabled. Aft
 real multi-minute outages, first priority so their retries fit the CI test window. Failed tests
 retry twice with fixed 30-second delays; a retry pass is reported as flaky, not a gate failure.
 Clippy uses a separate target directory so its Cargo lock cannot serialize the parallel stages.
-Each run isolates test `HOME` and XDG state. The summary records the tested SHA, test selection,
+Each run isolates test `HOME` and XDG state. The summary records the tested SHA,
 each stage's elapsed time, result and exit code; `linux-ci-logs` contains logs and `.time` files.
 Nextest's final summary retains flaky outcomes.
 
 The workspace suite still covers the token-free two-node messaging fault matrix. Its historical
-channel build remains independently pinned in `.github/messaging-compat-baseline.json`.
-See [the eval contract](../evals/st3/messaging-faults/README.md).
+channel build remains independently pinned in `.github/messaging-compat-baseline.json`. Its
+provider stand-in runs the omp channel hook's TypeScript with Node 24's built-in type stripping;
+the default devShell supplies that `node`. See [the eval contract](../evals/st3/messaging-faults/README.md).
 
-### st2 catalog/supervisor selection
+### Gate scope
 
-`scripts/ci-st2-filter` uses the complete PR merge-base diff, retaining both deleted and added
-paths for renames. It skips st2's unrelated catalog/supervisor tests only when **every** changed
-path is st3 code, clients, documents, one of the st2 driver/channel/hook/message/harness-state/
-session modules st3 uses, or another individual st2 test file. The excluded st2 module families
-are `agent_author`, `catalog*`, `eval_run`, `resync` and `resource_profile_supervisor`; excluded
-test families are `catalog_*`, `nomad_survival`, `event_e2e`, `eval_run_e2e`, `resync*`,
-`supervisor_auto_archive` and `resource_profile_supervisor_e2e`.
+The gate covers st3 and the code st3 uses. The `ci` profile's `default-filter` in
+`.config/nextest.toml` selects it on every event, with no path filter or scheduled full run:
 
-An unknown or shared path enables the complete suite, including `Cargo.toml`, `Cargo.lock`,
-shared crates, `tests/support/` and the integration-test module manifest. A summary says
-"st2 catalog and supervisor tests not needed" when they are skipped. Main pushes run the
-st3/common suite; the daily 04:23 UTC schedule runs the complete workspace on `main`.
-Manual workflow dispatch also runs the complete suite. This replaces the mission's historical
-"first main run after a day without a passing complete run" policy with an explicit daily lane.
-Run `python3 scripts/ci-st2-filter-test` to check the selection boundaries.
+- every test of the other workspace crates: st3, st3-client, st3-client-codegen, st3-schema,
+  st3-migrate, stui, st-runtime, st-drivers (the harness drivers, channels, hooks, messages,
+  harness state and sessions st3 and st2 share) and the shared and resource-provider crates;
+- st2's integration test files, apart from those below.
+
+It leaves out st2-only tests: st2's own unit tests (none of its remaining modules is used by
+st3), the st-drivers `catalog*`, `resync` and `resource_profile_supervisor` modules, and st2's
+`catalog_*`, `nomad_survival`, `event_e2e`, `eval_run_e2e`, `resync*`, `supervisor_auto_archive`
+and `resource_profile_supervisor_e2e` tests. No CI job runs these. Clippy still checks the whole
+workspace. List the selection with `cargo nextest list --workspace --profile ci`.
+
+### Isolation VM
+
+`tests/transport_isolation.rs` proves that a task st2 starts in its own systemd user scope
+survives a SIGKILL of its supervisor's cgroup, for both exec and pty tasks. It needs a real
+systemd user manager, which Namespace's runner image does not boot, so `linux-gate` leaves it
+out and the `isolation-vm` job runs it in a NixOS VM (`nix/transport-isolation-vm.nix`):
+
+1. Probe `/dev/kvm`: the job fails unless KVM can create a VM. Namespace offers nested
+   virtualization on `linux/amd64`. QEMU is configured with `forceAccel`, and the test checks
+   `systemd-detect-virt` reports `kvm`, so it never falls back to emulation.
+2. `cargo nextest archive -p st2 --test integration` builds the integration test binary and st2.
+3. The job builds the VM test driver from the flake and runs it on the runner. The VM boots
+   NixOS with a lingering user, copies in the archive, extracts it at the checkout's path (the
+   test binary has st2's path compiled in) and runs both cascade tests with nextest as a
+   transient service of that user's systemd manager. The VM compiles nothing.
+
+The job summary records the KVM probe and each phase's elapsed time.
 
 ### macOS
 
@@ -68,11 +87,8 @@ Namespace runs these jobs through its GitHub App. If the app loses access to thi
 the profile has no capacity, jobs queue with no matching runner. A queued required check is not
 a pass. Do not silently fall back to hosted or fleet runners.
 
-Namespace's default Linux runner image does not boot systemd. The st2 transport-isolation and
-NO_COLOR scope tests need real systemd user scopes, so they fail on it rather than skip. Before
-`linux-gate` can become required, these tests need either a Namespace runner image with systemd
-or an agreed decision about where they run. `CI_RUN_ID` keeps the messaging-fault evidence under
-`target/messaging-faults/`, which is uploaded with the stage logs.
+`CI_RUN_ID` keeps the messaging-fault evidence under `target/messaging-faults/`, which is
+uploaded with the stage logs.
 
 ## Generated files and existing workflows
 
@@ -108,19 +124,21 @@ verification nor the tag-only Nix graph is made redundant by workspace nextest.
 
 ## Merge rule and switch-over
 
-The desired `main` ruleset requires `linux-gate` and `genie-freshness` from GitHub Actions,
-`strict_required_status_checks_policy=true`, and an empty bypass list. It preserves the live
-pull-request, deletion and force-push protections. Repository settings enable GitHub native
-auto-merge and branch deletion after merge; these settings do not enable auto-merge on a PR.
+The desired `main` ruleset requires `linux-gate`, `isolation-vm` and `genie-freshness` from
+GitHub Actions, `strict_required_status_checks_policy=true`, and an empty bypass list. It
+preserves the live pull-request, deletion and force-push protections. Repository settings enable
+GitHub native auto-merge and branch deletion after merge; these settings do not enable
+auto-merge on a PR.
 The ruleset is **not applied automatically by CI**.
 
 Nathan owns the branch updater and must approve the switch-over order before an administrator
 applies settings. The train driver is outside this public repository; this change does not edit it.
 
 1. Deploy the generated workflows while leaving `st/ci` required and its mission active. Prove
-   `linux-gate` and `genie-freshness` green alongside `st/ci` on several PRs, including a real
-   behind-main update and fork coverage. Confirm Namespace capacity and label-driven macOS.
-2. Nathan changes the train to wait for the two GHA check runs instead of the `st/ci` commit
+   `linux-gate`, `isolation-vm` and `genie-freshness` green alongside `st/ci` on several PRs,
+   including a real behind-main update and fork coverage. Confirm Namespace capacity and
+   label-driven macOS.
+2. Nathan changes the train to wait for the three GHA check runs instead of the `st/ci` commit
    status. The train still updates one branch at a time with latest `main`, retains lane approval
    and stale-head handling, and waits again after every update. It must require GitHub Actions
    check runs for the **current PR head SHA** to be completed with `success`; queued, missing,
