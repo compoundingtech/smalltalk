@@ -3,7 +3,7 @@
 //! the keys, so any view can be opened in any rectangle by its key alone.
 
 /// The lists the sidebar shows, in tab order.
-const LISTS: [&str; 5] = ["home", "agents", "missions", "fleet", "worktrees"];
+const LISTS: [&str; 6] = ["home", "agents", "missions", "fleet", "usage", "worktrees"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Pane {
@@ -21,6 +21,9 @@ pub enum Pane {
     /// A fleet machine, by its graph id (`machine/NAME`).
     Machine(Option<String>),
     Worktree(Option<String>),
+    /// Token spend: one group's (`agent/…`, `mission/…`, `model/…` as the Usage list names
+    /// them), or the whole period's.
+    Usage(Option<String>),
     /// The new mission form.
     NewMission,
     /// The new agent form.
@@ -41,6 +44,7 @@ impl Pane {
             Pane::Declaration(subject) => with("declaration", subject),
             Pane::Machine(subject) => with("machine", subject),
             Pane::Worktree(subject) => with("worktree", subject),
+            Pane::Usage(subject) => with("usage", subject),
             Pane::NewMission => "new-mission:".into(),
             Pane::NewAgent => "new-agent:".into(),
         }
@@ -63,6 +67,7 @@ impl Pane {
             "declaration" => Pane::Declaration(subject),
             "machine" => Pane::Machine(subject),
             "worktree" => Pane::Worktree(subject),
+            "usage" => Pane::Usage(subject),
             "new-mission" => Pane::NewMission,
             "new-agent" => Pane::NewAgent,
             _ => return None,
@@ -88,6 +93,8 @@ mod tests {
             Pane::Declaration(some("mission/example/harbor/audit")),
             Pane::Machine(some("machine/harbor")),
             Pane::Worktree(None),
+            Pane::Usage(some("mission/example/harbor/audit")),
+            Pane::Usage(None),
             Pane::NewMission,
             Pane::NewAgent,
         ] {

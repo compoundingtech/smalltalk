@@ -90,6 +90,7 @@ pub fn world() -> World {
         ]),
         conversations,
         quiet_missions: 6,
+        usage: Load::Ready(usage()),
     }
 }
 
@@ -108,7 +109,105 @@ pub fn loading() -> World {
         devices: Load::Loading,
         conversations: BTreeMap::new(),
         quiet_missions: 0,
+        usage: Load::Loading,
     }
+}
+
+/// A day of spend: the atlas store move's compare reruns lead, as Home's note says.
+fn usage() -> Vec<st3_client::UsageRow> {
+    let row = |agent: &str,
+               run: Option<&str>,
+               step: Option<&str>,
+               model: &str,
+               host: &str,
+               tokens: u64,
+               output: u64,
+               cost: u64| st3_client::UsageRow {
+        agent: s(agent),
+        mission_run: run.map(s),
+        step: step.map(s),
+        model: Some(s(model)),
+        account: Some(s(if model.starts_with("gpt") {
+            "openai"
+        } else {
+            "anthropic"
+        })),
+        host: Some(s(host)),
+        pricing: Some(s("list-2026-10-02")),
+        total_tokens: tokens,
+        input_tokens: tokens / 50,
+        output_tokens: output,
+        cache_write_tokens: tokens / 20,
+        cache_write_1h_tokens: 0,
+        cached_tokens: tokens - tokens / 50 - output - tokens / 20,
+        cost_microusd: cost,
+        reported_cost_microusd: 0,
+        unpriced_tokens: 0,
+    };
+    let atlas = Some("mission-run/fleet/atlas/store-move/2026-10-01");
+    let release = Some("mission-run/fleet/release/weekly/2026-10-01");
+    vec![
+        row(
+            "agent/example/atlas/builder",
+            atlas,
+            Some("step-run/atlas-1/compare"),
+            "claude-opus-5-5",
+            "lark",
+            182_000_000,
+            410_000,
+            41_800_000,
+        ),
+        row(
+            "agent/example/atlas/indexer",
+            atlas,
+            Some("step-run/atlas-1/index"),
+            "claude-sonnet-5-5",
+            "lark",
+            96_000_000,
+            220_000,
+            9_300_000,
+        ),
+        row(
+            "agent/example/atlas/builder",
+            atlas,
+            Some("step-run/atlas-1/cut-over"),
+            "claude-opus-5-5",
+            "lark",
+            31_000_000,
+            90_000,
+            7_100_000,
+        ),
+        row(
+            "agent/example/cos",
+            None,
+            None,
+            "claude-opus-5-5",
+            "lark",
+            64_000_000,
+            150_000,
+            14_600_000,
+        ),
+        row(
+            "agent/example/release/captain",
+            release,
+            Some("step-run/release-1/tag"),
+            "gpt-5.5",
+            "wren",
+            12_000_000,
+            60_000,
+            2_400_000,
+        ),
+        row(
+            "agent/example/harbor/reviewer",
+            None,
+            None,
+            "claude-sonnet-5-5",
+            "wren",
+            22_000_000,
+            70_000,
+            2_100_000,
+        ),
+    ]
 }
 
 fn attention() -> Vec<Attention> {

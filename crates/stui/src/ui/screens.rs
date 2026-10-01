@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 
 /// The tabs everyone sees. Worktrees stays hidden until the graph models worktrees: its screens
 /// only have invented data to show (Nathan, 2026-09-28).
-pub const TABS: [&str; 4] = ["Home", "Agents", "Missions", "Fleet"];
+pub const TABS: [&str; 5] = ["Home", "Agents", "Missions", "Fleet", "Usage"];
 
 pub enum Item {
     Header {
