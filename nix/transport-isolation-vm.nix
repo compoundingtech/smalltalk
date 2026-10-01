@@ -1,4 +1,4 @@
-# Runs st2's transport-isolation gate (tests/transport_isolation.rs) in a NixOS VM with a real
+# Runs st2's two transport-isolation cases and the managed-agent color contract in a VM with a real
 # systemd user manager for a lingering user, as on a fleet host. The isolation-vm CI job builds
 # this test's driver and runs it outside the Nix sandbox with its prebuilt nextest archive:
 #
@@ -21,7 +21,7 @@ let
       --extract-to "$1" \
       --extract-overwrite \
       --no-tests=fail \
-      -E 'package(=st2) and binary(=integration) and test(/^transport_isolation::/)'
+      -E 'package(=st2) and binary(=integration) and (test(/^transport_isolation::/) or test(/^nomad_survival::managed_agent_color_contract_crosses_systemd_scope$/))'
   '';
 in
 pkgs.testers.runNixOSTest {
@@ -72,7 +72,7 @@ pkgs.testers.runNixOSTest {
     )
     test_seconds = time.monotonic() - started
     print(output)
-    assert re.search(r"\b2 tests run: 2 passed\b", output), "both cascade cases must run and pass"
+    assert re.search(r"\b3 tests run: 3 passed\b", output), "all three systemd-scope cases must run and pass"
 
     with open(os.environ["ST_ISOLATION_TIMINGS"], "w") as timings:
         json.dump({"boot_seconds": round(boot_seconds, 1), "test_seconds": round(test_seconds, 1)}, timings)

@@ -177,7 +177,7 @@ pub fn world(model: &Model, person: &str, extras: &Extras) -> World {
 fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
     model
         .attention()
-        .map(|item| {
+        .filter_map(|item| {
             let step = item
                 .step_run_id
                 .as_ref()
@@ -228,32 +228,6 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                         changes: vec![],
                     },
                 ),
-                "unread-message" => (
-                    Tier::Later,
-                    match extras.bodies.get(&item.header.id) {
-                        Some((from, title, content)) => AttentionKind::Message {
-                            from: from.clone(),
-                            body: match title {
-                                Some(title) if !title.is_empty() => {
-                                    format!(
-                                        "**{}**\n\n{}",
-                                        clean_message_text(title),
-                                        clean_message_text(content)
-                                    )
-                                }
-                                _ => clean_message_text(content),
-                            },
-                        },
-                        None => AttentionKind::Message {
-                            from: item
-                                .detail
-                                .strip_prefix("Unread message from ")
-                                .map(|from| from.trim_end_matches('.').to_owned())
-                                .unwrap_or_else(|| item.source_id.clone()),
-                            body: "Loading the message…".into(),
-                        },
-                    },
-                ),
                 // An agent stopped on the person: a request to answer, not a fault to clear.
                 "person-step" | "agent-request" => (
                     Tier::Stopped,
@@ -273,27 +247,9 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                         question: clean_message_text(&item.detail),
                     },
                 ),
-                _ => (
-                    if matches!(item.priority.as_str(), "critical" | "high") {
-                        Tier::Alert
-                    } else {
-                        Tier::Today
-                    },
-                    AttentionKind::Fault {
-                        what: item.detail.clone(),
-                        because: match item.priority.as_str() {
-                            "critical" => "marked critical".into(),
-                            "high" => "marked high priority".into(),
-                            _ => "raised for you".into(),
-                        },
-                        fix: None,
-                        source: if item.source_id == item.header.id {
-                            String::new()
-                        } else {
-                            item.source_id.clone()
-                        },
-                    },
-                ),
+                // Home holds only requests and reviews. Messages stay in conversations, and st
+                // sends each fault to the agent that owns it.
+                _ => return None,
             };
             let agent = item
                 .step_run_id
@@ -367,7 +323,7 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                         format!("the {} mission", mission.trim_start_matches("mission/"))
                     })
                 });
-            Attention {
+            Some(Attention {
                 id: item.header.id.clone(),
                 agent,
                 related,
@@ -391,7 +347,7 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                 mission,
                 kind,
                 actions: item.actions.clone(),
-            }
+            })
         })
         .collect()
 }

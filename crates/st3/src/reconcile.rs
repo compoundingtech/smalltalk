@@ -18,11 +18,12 @@ use crate::mission::{
     CANDIDATE_INDEX_INPUT, LOOP_FEEDBACK_INPUT, LOOP_ITEM_INPUT, LOOP_ROUND_INPUT,
 };
 use crate::model::{
-    AttentionRequest, CalendarSchedule, ClaimInput, CurrentHarnessView, DependencySpec,
-    DesiredSubject, GateContext, GateSpec, LaunchSpec, LoopCandidateSelector, LoopExhaustionSpec,
-    LoopSpec, MemberKind, MemberLifecycle, MemberSpec, MessageView, MetricSource, MissionInputKind,
-    MissionRunRequest, MissionRunView, MissionSpec, MissionState, RestartIntensity, RestartType,
-    StepRunView, StepSpec, SubscriptionSpec, UsedMissionSpec, WorkSelector,
+    AttentionItemView, AttentionRequest, CalendarSchedule, ClaimInput, CurrentHarnessView,
+    DependencySpec, DesiredSubject, GateContext, GateSpec, LaunchSpec, LoopCandidateSelector,
+    LoopExhaustionSpec, LoopSpec, MemberKind, MemberLifecycle, MemberSpec, MessageView,
+    MetricSource, MissionInputKind, MissionRunRequest, MissionRunView, MissionSpec, MissionState,
+    RestartIntensity, RestartType, StepRunView, StepSpec, SubscriptionSpec, UsedMissionSpec,
+    WorkSelector,
 };
 use crate::resource::{
     ObservationRequest, ProviderForbidden, ProviderRateLimit, ProviderUnauthenticated,
@@ -521,6 +522,9 @@ pub struct Reconciler<R = NativeRuntime> {
     /// When the disk stage last read free space, and whether its episode raised an item.
     disk_check: Mutex<(Option<u128>, bool)>,
     disk_check_every_ms: u128,
+    /// When the fault stage last sent faults to their owning agents.
+    fault_delivery: Mutex<Option<u128>>,
+    fault_delivery_every_ms: u128,
     /// How long run cleanup waits for its runtimes to stop before the run ends without them.
     cleanup_deadline: Duration,
     /// Unit tests fail a pass that raises a fault unless they opt in, so an isolated error
@@ -612,6 +616,8 @@ impl Reconciler<NativeRuntime> {
             disk_paths: vec![state_dir.to_path_buf()],
             disk_check: Mutex::new((None, false)),
             disk_check_every_ms: DISK_CHECK_EVERY_MS,
+            fault_delivery: Mutex::new(None),
+            fault_delivery_every_ms: FAULT_DELIVERY_EVERY_MS,
             cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
             raised_faults: Mutex::new(Some(Vec::new())),
@@ -654,6 +660,8 @@ impl<R: RuntimeControl> Reconciler<R> {
             disk_paths: Vec::new(),
             disk_check: Mutex::new((None, false)),
             disk_check_every_ms: 0,
+            fault_delivery: Mutex::new(None),
+            fault_delivery_every_ms: 0,
             cleanup_deadline: CLEANUP_DEADLINE,
             #[cfg(test)]
             raised_faults: Mutex::new(Some(Vec::new())),
@@ -832,6 +840,55 @@ impl<R: RuntimeControl> Reconciler<R> {
     /// Raise one host item while a filesystem that this daemon or one of its workspaces writes to
     /// is low on space, and close it once every one of them has recovered. A person who closes
     /// the item early is not asked again until the space recovers.
+    /// Send each current fault once to its owning agent, from the host that runs that agent.
+    /// No fault waits on a person: the agent retries, revises or cancels, and asks a person
+    /// with `st work ask` only for what only a person can give.
+    fn deliver_faults(&self, desired: &[DesiredSubject]) -> Result<()> {
+        let local_agents = desired
+            .iter()
+            .filter(|subject| {
+                subject.kind == "agent"
+                    && subject
+                        .member
+                        .as_ref()
+                        .is_some_and(|member| member.host == self.host)
+            })
+            .map(|subject| subject.subject.as_str())
+            .collect::<BTreeSet<_>>();
+        if local_agents.is_empty() {
+            return Ok(());
+        }
+        let now = now_ms();
+        {
+            let mut last = self
+                .fault_delivery
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            if let Some(at) = *last
+                && now.saturating_sub(at) < self.fault_delivery_every_ms
+            {
+                // A fault raised since then still reaches its agent without another change.
+                self.arm_restart(
+                    "stage/faults",
+                    at.saturating_add(self.fault_delivery_every_ms),
+                );
+                return Ok(());
+            }
+            *last = Some(now);
+        }
+        for fault in self.store.fault_snapshot(now)? {
+            let Some(owner) = fault.owner.as_deref() else {
+                continue;
+            };
+            if local_agents.contains(owner) {
+                self.isolate("fault-delivery", owner, || {
+                    append_fault_message(&self.store, owner, &fault.item)
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn reconcile_disk_space(&self, desired: &[DesiredSubject]) -> Result<()> {
         let Some(probe) = &self.disk_probe else {
             return Ok(());
@@ -1463,6 +1520,14 @@ impl<R: RuntimeControl> Reconciler<R> {
                 } else {
                     self.runtime.observe_exec(&member.runtime_id)?
                 };
+                if self.reconcile_requested_restart(
+                    subject,
+                    member,
+                    observed.as_ref(),
+                    blocked.as_ref(),
+                )? {
+                    return Ok(());
+                }
                 match observed {
                     Some(observation) if observation.status == "running" => {
                         self.record_member(subject, &observation, true)?;
@@ -1658,6 +1723,7 @@ impl<R: RuntimeControl> Reconciler<R> {
         self.isolate("stage/disk-space", &daemon, || {
             self.reconcile_disk_space(&desired)
         });
+        self.isolate("stage/faults", &daemon, || self.deliver_faults(&desired));
         self.file_watchers_used
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
@@ -3376,6 +3442,119 @@ impl<R: RuntimeControl> Reconciler<R> {
         )?;
         self.signal_changed();
         Ok(())
+    }
+
+    /// A requester-authored action replicates to the runtime owner. The declaration and old
+    /// incarnation fence it, so a delayed request cannot stop a replacement or revive a stop.
+    fn reconcile_requested_restart(
+        &self,
+        subject: &DesiredSubject,
+        member: &MemberSpec,
+        observation: Option<&RuntimeObservation>,
+        blocked: Option<&anyhow::Error>,
+    ) -> Result<bool> {
+        if subject.kind != "agent" {
+            return Ok(false);
+        }
+        let Some(request) = self
+            .store
+            .claims_for(&subject.subject, Some("runtime.action.requested"))?
+            .into_iter()
+            .rev()
+            .find(|claim| {
+                claim.actor.is_some()
+                    && claim.body.pointer("/fields/action").and_then(Value::as_str)
+                        == Some("restart")
+            })
+        else {
+            return Ok(false);
+        };
+        if self
+            .store
+            .selected_desired_token(&subject.subject)?
+            .as_deref()
+            != request.body.pointer("/evidence/0").and_then(Value::as_str)
+        {
+            return Ok(false);
+        }
+        let completion = format!("agent-restart-completed:{}", request.id);
+        if self.store.operation_claim(&completion)?.is_some() {
+            return Ok(false);
+        }
+        let previous = request.body["fields"]["incarnation_id"]
+            .as_str()
+            .unwrap_or("");
+        if let Some(observation) = observation
+            && observation.status != "unknown"
+            && observation
+                .incarnation_id
+                .as_deref()
+                .is_some_and(|value| value != previous)
+        {
+            self.store.append_claim(&ClaimInput {
+                subject: subject.subject.clone(),
+                kind: "runtime.action.succeeded".into(),
+                actor: request.actor.clone(),
+                fields: BTreeMap::from([
+                    ("action".into(), Value::String("restart".into())),
+                    (
+                        "incarnation_id".into(),
+                        Value::String(observation.incarnation_id.clone().unwrap()),
+                    ),
+                ]),
+                evidence: vec![request.id],
+                expected_subject: None,
+                idempotency_key: Some(completion),
+            })?;
+            self.signal_changed();
+            return Ok(false);
+        }
+        if let Some(observation) = observation.filter(|item| item.status == "running") {
+            // Rendering must succeed before we shut down a still-running seat.
+            if let Some(error) = blocked {
+                anyhow::bail!("restart blocked: {error:#}");
+            }
+            self.record_member(subject, observation, true)?;
+            self.reconcile_runtime_stop(
+                &subject.subject,
+                &member.runtime_id,
+                member.terminal,
+                observation.incarnation_id.as_deref(),
+                member.shutdown_timeout_ms,
+                Some(observation),
+            )?;
+            return Ok(true);
+        }
+        if observation
+            .is_some_and(|item| !matches!(item.status.as_str(), "exited" | "vanished" | "stopped"))
+        {
+            return Ok(true);
+        }
+        if let Some(error) = blocked {
+            anyhow::bail!("restart blocked: {error:#}");
+        }
+        let before = self
+            .store
+            .latest_observation(&subject.subject, "runtime.action.succeeded")?
+            .map(|claim| claim.id);
+        self.perform_start(subject, member, "an explicit seat restart was requested")?;
+        let after = self
+            .store
+            .latest_observation(&subject.subject, "runtime.action.succeeded")?
+            .map(|claim| claim.id);
+        if after != before {
+            self.store.append_claim(&ClaimInput {
+                subject: subject.subject.clone(),
+                kind: "runtime.action.succeeded".into(),
+                actor: request.actor.clone(),
+                fields: BTreeMap::from([("action".into(), Value::String("restart".into()))]),
+                evidence: vec![request.id],
+                expected_subject: None,
+                idempotency_key: Some(completion),
+            })?;
+            self.signal_changed();
+        }
+        Ok(true)
     }
 
     fn reconcile_restart(
@@ -10001,6 +10180,8 @@ fn permanent_observation_error(code: &str) -> bool {
 
 /// How often the disk stage reads free space.
 const DISK_CHECK_EVERY_MS: u128 = 30_000;
+/// How often a host sends new faults to the agents it runs.
+const FAULT_DELIVERY_EVERY_MS: u128 = 30_000;
 
 type DiskProbe = Arc<dyn Fn(&Path) -> std::io::Result<crate::disk::DiskSpace> + Send + Sync>;
 const RECONCILER_FAILING_TITLE: &str = "The reconciler is failing";
@@ -10617,6 +10798,67 @@ pub(crate) fn append_work_wake_message(
             .map(|claim| claim.store_index)
             .unwrap_or_default(),
     })
+}
+
+/// Tell `agent` about a fault it owns, once per fault episode.
+pub(crate) fn append_fault_message(
+    store: &Store,
+    agent: &str,
+    fault: &AttentionItemView,
+) -> Result<()> {
+    let idempotency_key = format!("st3-fault:{agent}:{}:{}", fault.subject, fault.episode);
+    let message_id = &hex::encode(sha2::Sha256::digest(idempotency_key.as_bytes()))[..16];
+    let subject = format!("message/{message_id}");
+    if store
+        .latest_claim(&subject, Some("message.sent"))?
+        .is_some()
+    {
+        return Ok(());
+    }
+    let inspect = fault
+        .actions
+        .iter()
+        .map(|action| format!("`{}`", action.argv.join(" ")))
+        .collect::<Vec<_>>();
+    let mut content = format!("{}\n\n{}", fault.title, fault.detail);
+    if !inspect.is_empty() {
+        content.push_str(&format!("\n\nInspect: {}", inspect.join(", ")));
+    }
+    content.push_str(&format!(
+        "\n\nThis fault is yours: st sends it to the agent assigned to the failed step, else to the run's requester, else to the fleet's fault agent, and never to a person's now. Retry, revise or cancel the work. If you need something only a person can give, ask with `st work ask`.\n\nSource: {}",
+        fault.subject
+    ));
+    let mut tags = vec![
+        format!("st3-fault:{}", fault.episode),
+        format!("st3-fault-source:{}", fault.subject),
+    ];
+    if let Some(run) = &fault.mission_run {
+        tags.push(format!("mission-run:{run}"));
+    }
+    store.append_claim(&ClaimInput {
+        subject,
+        kind: "message.sent".into(),
+        actor: Some("daemon/runtime".into()),
+        fields: BTreeMap::from([
+            ("from".into(), Value::String("daemon/runtime".into())),
+            ("to".into(), Value::String(agent.into())),
+            ("content".into(), Value::String(content)),
+            ("status".into(), Value::String("sent".into())),
+            (
+                "title".into(),
+                Value::String(format!("Fault: {}", fault.title)),
+            ),
+            ("in_reply_to".into(), Value::Null),
+            (
+                "tags".into(),
+                Value::Array(tags.into_iter().map(Value::String).collect()),
+            ),
+        ]),
+        evidence: Vec::new(),
+        expected_subject: None,
+        idempotency_key: Some(idempotency_key),
+    })?;
+    Ok(())
 }
 
 fn message_sent_at(store: &Store, message: &MessageView) -> Option<u128> {
@@ -15468,7 +15710,7 @@ agent "worker" {
             .selected_desired_token("agent/node.worker")
             .unwrap()
             .unwrap();
-        let attention = store.attention_items(Some("person/alex")).unwrap();
+        let attention = store.fault_items(Some("person/alex")).unwrap();
         assert_eq!(attention.len(), 1);
         assert_eq!(attention[0].subject, "agent/node.worker");
         assert!(
@@ -15716,7 +15958,7 @@ agent "worker" {
         assert_eq!(runtime.starts.lock().unwrap().len(), 3);
         assert!(
             store
-                .attention_items(None)
+                .fault_items(None)
                 .unwrap()
                 .iter()
                 .any(|attention| { attention.targets.contains(&"agent/node.worker".to_owned()) })
@@ -18900,7 +19142,7 @@ mission "alert-exhaustion" state="ready" {
             store.mission_run(&run.id).unwrap().unwrap().status,
             "failed"
         );
-        let attention = store.attention_items(Some("person/alex")).unwrap();
+        let attention = store.fault_items(Some("person/alex")).unwrap();
         assert_eq!(attention.len(), 1);
         assert_eq!(attention[0].title, "Automatic review failed");
         assert_eq!(attention[0].kind, "fault");
@@ -18914,9 +19156,258 @@ mission "alert-exhaustion" state="ready" {
             reconciler.reconcile_once().unwrap();
         }
         assert_eq!(
-            store.attention_items(Some("person/alex")).unwrap().len(),
+            store.fault_items(Some("person/alex")).unwrap().len(),
             1
         );
+    }
+
+    /// A person's now holds only requests and reviews. A message stays in conversations, and
+    /// each fault, on a live run or a terminal one, goes once to the agent that owns it.
+    #[test]
+    fn faults_reach_their_owning_agent_and_never_a_persons_now() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        apply_source(
+            &store,
+            r#"
+version 2
+agent "node.ops" { workspace "/tmp"; command "true"; handles-faults }
+agent "node.lead" { workspace "/tmp"; command "true" }
+agent "node.builder" { workspace "/tmp"; command "true" }
+resource "result" { kind "custom.test.loop-result" }
+mission "exhausted" state="ready" {
+  goal "Fail a bounded loop."
+  completion { when "all-steps-exhausted" }
+  loop "review" {
+    max-rounds 1
+    until { gate "ready" { field "state" "resource/result" is "ready" } }
+    round { completion { when "all-steps-exhausted" } }
+    on-exhausted {
+      fail
+      attention "Automatic review failed" {
+        reviewer "person/alex"
+        severity "error"
+      }
+    }
+  }
+}
+mission "waiting" state="ready" {
+  goal "Wait on a person."
+  step "build" {
+    assigned-to "agent/node.builder"
+    goal "Build the draft."
+    gate "review" type="human" { reviewer "person/alex" }
+  }
+  step "approve" { assigned-to "person/alex"; goal "Approve the copy." }
+}
+"#,
+            "fault-owners",
+        );
+        let run = |mission: &str, requester: &str| {
+            store
+                .create_mission_run(&MissionRunRequest {
+                    mission: mission.into(),
+                    revision: None,
+                    workspace: "/tmp".into(),
+                    requester: Some(requester.into()),
+                    mode: Some("run".into()),
+                    inputs: BTreeMap::new(),
+                    idempotency_key: format!("{mission}-run"),
+                })
+                .unwrap()
+        };
+        let exhausted = run("exhausted", "person/alex");
+        let waiting = run("waiting", "agent/node.lead");
+        let build = waiting
+            .steps
+            .iter()
+            .find(|step| step.step == "build")
+            .unwrap()
+            .clone();
+        let reconciler = Reconciler::new(
+            store.clone(),
+            Arc::new(FakeRuntime::default()),
+            "node".into(),
+            Arc::new(Notify::new()),
+        );
+        for _ in 0..20 {
+            reconciler.reconcile_once().unwrap();
+        }
+        let work = |key: &str| crate::model::WorkRequest {
+            actor: Some("agent/node.builder".into()),
+            incarnation: Some("builder-one".into()),
+            summary: Some("Draft built".into()),
+            reason: None,
+            evidence: Vec::new(),
+            idempotency_key: key.into(),
+        };
+        store
+            .work_action(&build.subject, "claim", &work("build-claim"))
+            .unwrap();
+        store
+            .work_action(&build.subject, "complete", &work("build-submit"))
+            .unwrap();
+        store
+            .append_claim(&ClaimInput {
+                subject: "message/quiet-note".into(),
+                kind: "message.sent".into(),
+                actor: Some("agent/node.lead".into()),
+                fields: BTreeMap::from([
+                    ("from".into(), Value::String("agent/node.lead".into())),
+                    ("to".into(), Value::String("person/alex".into())),
+                    ("title".into(), Value::String("The draft is up".into())),
+                    ("content".into(), Value::String("No answer needed.".into())),
+                    ("status".into(), Value::String("sent".into())),
+                ]),
+                evidence: Vec::new(),
+                expected_subject: None,
+                idempotency_key: Some("quiet-note".into()),
+            })
+            .unwrap();
+        store
+            .record_operational_failure(
+                "waiting-live",
+                &AttentionRequest {
+                    reviewer: "person/alex".into(),
+                    title: "The waiting run cannot publish".into(),
+                    reason: "The publish target refused the run.".into(),
+                    severity: "error".into(),
+                    targets: vec![waiting.subject.clone()],
+                    actor: "daemon/runtime".into(),
+                    idempotency_key: "waiting-live".into(),
+                },
+            )
+            .unwrap();
+        for _ in 0..5 {
+            reconciler.reconcile_once().unwrap();
+        }
+        assert_eq!(
+            store.mission_run(&exhausted.id).unwrap().unwrap().status,
+            "failed"
+        );
+        assert_eq!(
+            store.mission_run(&waiting.id).unwrap().unwrap().status,
+            "running"
+        );
+
+        // Both faults are current, each with its owner: the live run's agent requester, and
+        // the fleet's fault agent for the terminal run that a person requested.
+        let owners = store
+            .fault_snapshot(now_ms())
+            .unwrap()
+            .into_iter()
+            .map(|fault| (fault.item.title, fault.owner))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(
+            owners,
+            BTreeMap::from([
+                (
+                    "Automatic review failed".to_owned(),
+                    Some("agent/node.ops".to_owned())
+                ),
+                (
+                    "The waiting run cannot publish".to_owned(),
+                    Some("agent/node.lead".to_owned())
+                ),
+            ])
+        );
+
+        // The person's now holds the review and the request, and nothing else.
+        for person in [Some("person/alex"), None] {
+            let kinds = store
+                .attention_items(person)
+                .unwrap()
+                .into_iter()
+                .map(|item| item.kind)
+                .collect::<BTreeSet<_>>();
+            assert_eq!(
+                kinds,
+                BTreeSet::from(["human-gate".to_owned(), "person-step".to_owned()]),
+                "{person:?}"
+            );
+        }
+
+        // Each owner heard about its fault once, however many passes ran.
+        let faults_for = |agent: &str| {
+            store
+                .messages(Some(agent), false)
+                .unwrap()
+                .into_iter()
+                .filter(|message| message.from == "daemon/runtime")
+                .filter_map(|message| message.title)
+                .filter(|title| title.starts_with("Fault: "))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            faults_for("agent/node.ops"),
+            ["Fault: Automatic review failed"]
+        );
+        assert_eq!(
+            faults_for("agent/node.lead"),
+            ["Fault: The waiting run cannot publish"]
+        );
+        assert!(faults_for("agent/node.builder").is_empty());
+        let note = store
+            .messages(Some("agent/node.ops"), false)
+            .unwrap()
+            .into_iter()
+            .find(|message| message.title.as_deref() == Some("Fault: Automatic review failed"))
+            .unwrap();
+        assert!(
+            note.content.contains("`st work retry step-run/"),
+            "{}",
+            note.content
+        );
+        assert!(note.content.contains("`st work ask`"), "{}", note.content);
+
+        // A fault st raises on the failed step goes to the agent assigned to it.
+        reconciler
+            .append_fault(&build.subject, "test", "faulted", "the step cannot settle")
+            .unwrap();
+        let step_fault = store
+            .fault_snapshot(now_ms() + 121_000)
+            .unwrap()
+            .into_iter()
+            .find(|fault| fault.item.subject == build.subject)
+            .unwrap();
+        assert_eq!(step_fault.owner.as_deref(), Some("agent/node.builder"));
+        assert!(
+            store
+                .attention_snapshot(Some("person/alex"), now_ms() + 121_000)
+                .unwrap()
+                .iter()
+                .all(|item| item.kind != "fault")
+        );
+    }
+
+    /// Without an agent requester or a fleet fault agent, a fault has no owner, and it still
+    /// never reaches a person's now.
+    #[test]
+    fn a_fault_without_an_owning_agent_stays_out_of_a_persons_now() {
+        let store = Arc::new(Store::open_memory("node").unwrap());
+        store
+            .record_operational_failure(
+                "disk",
+                &AttentionRequest {
+                    reviewer: "person/operator".into(),
+                    title: "Disk space is low".into(),
+                    reason: "The disk is nearly full.".into(),
+                    severity: "error".into(),
+                    targets: vec!["daemon/node".into()],
+                    actor: "daemon/runtime".into(),
+                    idempotency_key: "disk".into(),
+                },
+            )
+            .unwrap();
+        let faults = store.fault_snapshot(now_ms()).unwrap();
+        assert_eq!(faults.len(), 1);
+        assert_eq!(faults[0].owner, None);
+        assert!(
+            store
+                .attention_items(Some("person/operator"))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(store.attention_items(None).unwrap().is_empty());
     }
 
     fn stopping_loop_run(
@@ -18982,7 +19473,7 @@ mission "stopping" state="ready" {{
             "loop-run/{}/review",
             failed.generation.strip_prefix("run-generation/").unwrap()
         );
-        let items = store.attention_items(Some("person/lichen")).unwrap();
+        let items = store.fault_items(Some("person/lichen")).unwrap();
         assert_eq!(items.len(), 1, "{items:?}");
         let first = &items[0];
         assert_eq!(first.title, "Loop `review` stopped");
@@ -19000,7 +19491,7 @@ mission "stopping" state="ready" {{
             reconciler.reconcile_once().unwrap();
         }
         assert_eq!(
-            store.attention_items(Some("person/lichen")).unwrap().len(),
+            store.fault_items(Some("person/lichen")).unwrap().len(),
             1
         );
 
@@ -19012,7 +19503,7 @@ mission "stopping" state="ready" {{
         for _ in 0..30 {
             reconciler.reconcile_once().unwrap();
         }
-        let items = store.attention_items(Some("person/lichen")).unwrap();
+        let items = store.fault_items(Some("person/lichen")).unwrap();
         assert_eq!(items.len(), 1, "{items:?}");
         assert_ne!(items[0].subject, first.subject);
         assert!(!items[0].targets.contains(&loop_run));
@@ -19058,7 +19549,7 @@ mission "stopping" state="ready" {{
         let stopped = store.mission_run(&run.id).unwrap().unwrap();
         assert_eq!(stopped.steps[0].status, "cancelled");
         // The requester is not a person, so the operator is asked.
-        let items = store.attention_items(Some("person/operator")).unwrap();
+        let items = store.fault_items(Some("person/operator")).unwrap();
         assert_eq!(items.len(), 1, "{items:?}");
         for expected in [
             "stopped in round 1: the loop round mission had a structural failure.",
@@ -20400,7 +20891,7 @@ observer "repo" {
             .await
             .unwrap()
             .unwrap();
-        let attention = store.attention_items(None).unwrap();
+        let attention = store.fault_items(None).unwrap();
         assert_eq!(
             attention
                 .iter()
@@ -20419,7 +20910,7 @@ observer "repo" {
         reconciler.reconcile_once().unwrap();
         assert_eq!(
             store
-                .attention_items(None)
+                .fault_items(None)
                 .unwrap()
                 .iter()
                 .filter(|item| item.title == "An observer has failed for an hour")
@@ -20541,7 +21032,7 @@ observer "repo" {
 
     fn observer_items(store: &Store) -> Vec<crate::model::AttentionItemView> {
         store
-            .attention_items(None)
+            .fault_items(None)
             .unwrap()
             .into_iter()
             .filter(|item| item.targets == ["observer/repo"])
@@ -20710,7 +21201,7 @@ observer "repo" {
         };
         let items = || {
             store
-                .attention_items(None)
+                .fault_items(None)
                 .unwrap()
                 .into_iter()
                 .filter(|item| item.targets == ["daemon/node"])
@@ -20781,7 +21272,7 @@ observer "repo" {
         let set = |bytes: u64| *available.lock().unwrap() = bytes;
         let items = || {
             store
-                .attention_items(Some("person/operator"))
+                .fault_items(Some("person/operator"))
                 .unwrap()
                 .into_iter()
                 .filter(|item| item.title == "Disk space is low on node")
@@ -20845,14 +21336,14 @@ observer "repo" {
                 "The reconciler panicked and restarts: index out of bounds",
             )
             .unwrap();
-        let items = store.attention_items(None).unwrap();
+        let items = store.fault_items(None).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "The reconciler is failing");
         assert_eq!(items[0].targets, ["daemon/node"]);
         assert!(items[0].detail.contains("the store is locked"));
 
         reconciler.resolve_reconciler_attention().unwrap();
-        assert!(store.attention_items(None).unwrap().is_empty());
+        assert!(store.fault_items(None).unwrap().is_empty());
     }
 
     struct SharedDiscoveryProvider {
@@ -21150,13 +21641,13 @@ subscription "reviews" {{
         assert_eq!(starts[0].body["fields"]["request"], good.id);
         assert!(
             store
-                .attention_items(None)
+                .fault_items(None)
                 .unwrap()
                 .iter()
                 .any(|item| { item.kind == "fault" && item.targets == ["subscription/reviews"] })
         );
         let failure_attention = store
-            .attention_items(None)
+            .fault_items(None)
             .unwrap()
             .into_iter()
             .find(|item| item.kind == "fault" && item.targets == ["subscription/reviews"])
@@ -21170,7 +21661,7 @@ subscription "reviews" { stop }"#,
         );
         assert!(
             store
-                .attention_items(None)
+                .fault_items(None)
                 .unwrap()
                 .iter()
                 .all(|item| item.subject != failure_attention.subject)
@@ -21266,7 +21757,7 @@ subscription "reviews" {{
             .unwrap();
         let failures = || {
             store
-                .attention_items(None)
+                .fault_items(None)
                 .unwrap()
                 .into_iter()
                 .filter(|item| item.subject == "subscription/reviews")
@@ -23811,7 +24302,7 @@ version 2
         );
         let harness = store.current_harness("agent/node.seat-b").unwrap().unwrap();
         assert_eq!(harness.reason.as_deref(), Some("providerAuth"));
-        let attention = store.attention_items(Some("person/alex")).unwrap();
+        let attention = store.fault_items(Some("person/alex")).unwrap();
         assert_eq!(attention.len(), 1);
         assert_eq!(attention[0].targets, ["agent/node.seat-b"]);
     }
@@ -23852,7 +24343,7 @@ version 2
         reconciler.reconcile_once().unwrap();
         assert!(fenced());
         assert_eq!(
-            store.attention_items(Some("person/alex")).unwrap().len(),
+            store.fault_items(Some("person/alex")).unwrap().len(),
             1
         );
 
@@ -23862,7 +24353,7 @@ version 2
         assert!(!fenced());
         assert!(
             store
-                .attention_items(Some("person/alex"))
+                .fault_items(Some("person/alex"))
                 .unwrap()
                 .is_empty()
         );
@@ -23886,7 +24377,7 @@ version 2
         reconciler.reconcile_once().unwrap();
         assert!(fenced());
         assert_eq!(
-            store.attention_items(Some("person/alex")).unwrap().len(),
+            store.fault_items(Some("person/alex")).unwrap().len(),
             1
         );
     }
@@ -23927,7 +24418,7 @@ version 2
         );
         let harness = store.current_harness("agent/node.seat").unwrap().unwrap();
         assert_eq!(harness.reason.as_deref(), Some("providerTrustPrompt"));
-        let attention = store.attention_items(Some("person/operator")).unwrap();
+        let attention = store.fault_items(Some("person/operator")).unwrap();
         assert_eq!(attention.len(), 1);
         assert_eq!(
             attention[0].title,
@@ -24144,7 +24635,7 @@ version 2
             .unwrap();
         assert_eq!(
             store
-                .attention_items(Some("person/operator"))
+                .fault_items(Some("person/operator"))
                 .unwrap()
                 .len(),
             1
@@ -24160,7 +24651,7 @@ version 2
             .unwrap();
         assert!(
             store
-                .attention_items(Some("person/operator"))
+                .fault_items(Some("person/operator"))
                 .unwrap()
                 .is_empty()
         );
@@ -24281,7 +24772,7 @@ version 2
                 .is_empty(),
             "the deadline stays on this node; its attention request replicates"
         );
-        let attention = store.attention_items(Some("person/operator")).unwrap();
+        let attention = store.fault_items(Some("person/operator")).unwrap();
         assert_eq!(attention.len(), 1);
         assert!(runtime.stops.lock().unwrap().is_empty());
         assert!(runtime.kills.lock().unwrap().is_empty());
@@ -24307,7 +24798,7 @@ version 2
             .unwrap();
         assert!(
             store
-                .attention_items(Some("person/operator"))
+                .fault_items(Some("person/operator"))
                 .unwrap()
                 .is_empty()
         );
@@ -24423,7 +24914,7 @@ version 2
             .unwrap();
         assert_eq!(
             store
-                .attention_items(Some("person/operator"))
+                .fault_items(Some("person/operator"))
                 .unwrap()
                 .len(),
             1
@@ -24442,7 +24933,7 @@ version 2
 
         assert!(
             store
-                .attention_items(Some("person/operator"))
+                .fault_items(Some("person/operator"))
                 .unwrap()
                 .is_empty()
         );
@@ -24477,7 +24968,7 @@ version 2
         reconciler
             .raise_codex_crash_loop("agent/node.worker", &token_a, "the start failed")
             .unwrap();
-        assert_eq!(store.attention_items(Some("person/alex")).unwrap().len(), 1);
+        assert_eq!(store.fault_items(Some("person/alex")).unwrap().len(), 1);
 
         // A person revises the declaration, and the new revision's incarnation becomes ready.
         apply_source(&store, &source("gpt-5.6-sol"), "crash-loop-b");
@@ -24504,7 +24995,7 @@ version 2
 
         assert!(
             store
-                .attention_items(Some("person/alex"))
+                .fault_items(Some("person/alex"))
                 .unwrap()
                 .is_empty()
         );
@@ -24547,7 +25038,7 @@ agent "keeper" { workspace "/tmp"; command "true"; restart "never" }
             "version 2\nstop \"agent/node.worker\"\n",
             "retired-agent-stop",
         );
-        let current = store.attention_items(Some("person/operator")).unwrap();
+        let current = store.fault_items(Some("person/operator")).unwrap();
         assert_eq!(current.len(), 1);
         assert_eq!(current[0].subject, "agent/node.keeper");
         for episode in [&stopped, &gone, &kept] {
