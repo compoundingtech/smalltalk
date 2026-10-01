@@ -65,14 +65,16 @@ pub(crate) enum Durability {
 /// `dir` exists for exactly one caller pair: the `harness-state` record stages beside itself,
 /// while `harness-context` stages in the catalog control plane, because a staged name inside the
 /// replicated `agents` namespace becomes a durable replicated key (HC-R05).
-pub(crate) struct Staging<'a> {
+#[doc(hidden)]
+pub struct Staging<'a> {
     prefix: &'a str,
     dir: Option<&'a Path>,
 }
 
 impl<'a> Staging<'a> {
     /// Stage beside the target, under `{prefix}.tmp-{pid}-{counter}`.
-    pub(crate) const fn new(prefix: &'a str) -> Self {
+    #[doc(hidden)]
+    pub const fn new(prefix: &'a str) -> Self {
         Self { prefix, dir: None }
     }
 
@@ -125,7 +127,8 @@ pub(crate) fn replace(
 /// rather than a failure: both callers use the boolean to tell a replay from a first publication.
 /// One durability level, because both callers have one — an fsync arm here would have no caller
 /// and therefore no test.
-pub(crate) fn create_once(path: &Path, bytes: &[u8], staging: Staging<'_>) -> io::Result<bool> {
+#[doc(hidden)]
+pub fn create_once(path: &Path, bytes: &[u8], staging: Staging<'_>) -> io::Result<bool> {
     let parent = parent_of(path)?;
     let staged = prepare(parent, &staging)?;
     let mut file = create_staging(&staged)?;

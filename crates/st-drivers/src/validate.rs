@@ -63,7 +63,8 @@ pub struct Issue {
 }
 
 impl Issue {
-    pub(crate) fn error(
+    #[doc(hidden)]
+    pub fn error(
         code: &'static str,
         path: String,
         agent: Option<String>,
@@ -174,7 +175,8 @@ fn validate_scoped(
 
 /// Validate one caller-held immutable discovery result. Catalog graph readers use this to keep
 /// valid rows, conflicts, and attributed issues on exactly the same declaration observation.
-pub(crate) fn validate_discovered(
+#[doc(hidden)]
+pub fn validate_discovered(
     root: &Path,
     this_host: Option<&str>,
     runtime: RuntimeRoot<'_>,
