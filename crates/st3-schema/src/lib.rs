@@ -2607,6 +2607,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("last_compaction_trigger", string()),
             ("cost", number()),
             ("currency", string()),
+            ("account", string()),
+            ("cache_write_1h_tokens", integer()),
+            ("cost_microusd", integer()),
+            ("reported_cost_microusd", integer()),
+            ("unpriced_tokens", integer()),
+            ("pricing", string()),
             (
                 "semantics",
                 required_enum(&[

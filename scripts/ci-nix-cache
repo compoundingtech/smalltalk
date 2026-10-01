@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# A local Nix binary cache in a keyed Namespace-backed Actions cache, for Nix-built outputs and downloads.
+#
+# /nix itself cannot be cached: a restored /nix carries the Nix installer's receipt but not its
+# daemon, build users or nix.conf, so the installer skips setup and every Nix command then fails
+# with "cannot connect to socket". Instead each run installs Nix normally, `use` makes the cache
+# entry's file:// store a preferred substituter, and `save` copies what the run added back to it.
+set -euo pipefail
+cmd=${1:?usage: scripts/ci-nix-cache use|save}
+dir=${CI_CACHE_DIR:?CI_CACHE_DIR is not set}
+cache="$dir/nix-cache"
+key="$dir/nix-cache-key"
+
+case "$cmd" in
+  use)
+    mkdir -p "$cache"
+    # The Nix daemon runs as root and creates the store's directories when it first queries a
+    # substituter, which would leave `save` (the runner user) unable to write. Take ownership of
+    # anything an earlier run left behind, and create the layout as the runner before the daemon does.
+    sudo chown -R "$(id -un)" "$cache"
+    nix store info --store "file://$cache" > /dev/null
+    # One signing key per cache entry; Actions scopes entries to the repository and ref.
+    [ -s "$key.sec" ] || nix key generate-secret --key-name st-ci-cache-1 > "$key.sec"
+    nix key convert-secret-to-public < "$key.sec" > "$key.pub"
+    {
+      echo "NIX_CONFIG<<ST_CI_NIX_CONFIG"
+      echo "extra-substituters = file://$cache?priority=10"
+      echo "extra-trusted-public-keys = $(cat "$key.pub")"
+      echo "ST_CI_NIX_CONFIG"
+    } >> "$GITHUB_ENV"
+    printf 'Nix cache %s: %s store paths\n' "$cache" "$(find "$cache" -maxdepth 1 -name '*.narinfo' | wc -l)"
+    ;;
+  save)
+    start=$SECONDS
+    # Keep only what is cheap to store and slow to get again. A file store only accepts a path whose
+    # references are already in it, and a full closure (devShell, toolchain, glibc...) is gigabytes
+    # that cache.nixos.org and Cachix serve faster than a cache restores them. So save:
+    #  1. paths this run obtained itself (no upstream signature) that reference nothing: the fixed-output
+    #     crate and source downloads, hundreds of tiny fetches that otherwise run on every job;
+    #  2. the closures of the outputs that are expensive to build: the pinned fleet-compat baseline and
+    #     the provider components.
+    # Paths already in the cache are skipped.
+    nix path-info --all --json --json-format 1 2> /dev/null |
+      jq -r 'if type == "object"
+             then to_entries | map(select((.value.signatures // []) == [] and (.value.references // []) == []))
+                             | map(.key)
+             else map(select((.signatures // []) == [] and (.references // []) == [])) | map(.path) end
+             | .[] | select(endswith(".drv") | not)' > "$cache.paths"
+    printf 'Nix cache: %s reference-free downloads and sources to save\n' "$(wc -l < "$cache.paths")"
+    to="file://$cache?secret-key=$key.sec&compression=zstd"
+    xargs -a "$cache.paths" -r nix copy --to "$to" --no-check-sigs --no-recursive
+    roots=()
+    [ -e "$RUNNER_TEMP/baseline" ] && roots+=("$RUNNER_TEMP/baseline")
+    [ -n "${ST3_MESSAGING_COMPAT_BIN:-}" ] && roots+=("${ST3_MESSAGING_COMPAT_BIN%/bin/st3}")
+    [ -n "${ST2_VISTA_COMPONENT:-}" ] && roots+=("${ST2_VISTA_COMPONENT%%/share/*}")
+    if [ "${#roots[@]}" -gt 0 ]; then
+      printf 'Nix cache: closures of %s\n' "${roots[*]}"
+      nix copy --to "$to" --no-check-sigs "${roots[@]}"
+    fi
+    printf 'Nix cache %s: %s store paths after saving (%ss)\n' "$cache" \
+      "$(find "$cache" -maxdepth 1 -name '*.narinfo' | wc -l)" "$((SECONDS - start))"
+    ;;
+  *) echo "unknown command: $cmd" >&2; exit 2 ;;
+esac

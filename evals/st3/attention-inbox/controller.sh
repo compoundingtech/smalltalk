@@ -11,7 +11,6 @@ human_run=""
 revision_run=""
 planning_session=""
 message_subject=""
-fault_subject=""
 human_owner=""
 proposal_subject=""
 proposal_hash=""
@@ -26,10 +25,6 @@ cancel_run() {
 cleanup() {
   if [[ -n "$planning_session" ]]; then
     st3 launch cancel "$planning_session" --as "$REVIEWER" \
-      --reason "the attention inbox eval finished" >/dev/null 2>&1 || true
-  fi
-  if [[ -n "$fault_subject" ]]; then
-    st3 attention resolve "$fault_subject" --outcome dismissed --as "$REVIEWER" \
       --reason "the attention inbox eval finished" >/dev/null 2>&1 || true
   fi
   if [[ -n "$message_subject" ]]; then
@@ -114,54 +109,41 @@ st3 --json launch preview "$planning_session" >planning-preview.json
 st3 --json message send "$REVIEWER" \
   --from "$REQUESTER" \
   --subject "Read the attention inbox proof" \
-  -m "This message is one attention inbox item." >message.json
+  -m "This message stays in conversations, never in the attention inbox." >message.json
 message_subject=$(jq -er '.subject' message.json)
 
-st3 --json attention request \
-  --for "$REVIEWER" \
-  --title "The eval needs a fault decision" \
-  --reason "This synthetic fault proves explicit attention." \
-  --severity warning \
-  --target "$revision_run" \
-  --as "$REQUESTER" \
-  --idempotency-key "attention-inbox-${RUN_SUFFIX}" >fault.json
-fault_subject=$(jq -er '.subject' fault.json)
-
-await_kind_count 5 attention.json
+await_kind_count 3 attention.json
 st3 --json attention ls >all-attention.json
 jq -e \
   --arg person "$REVIEWER" \
   --arg human "$human_owner" \
   --arg revision "$proposal_subject" \
   --arg planning "$planning_subject" \
-  --arg message "$message_subject" \
-  --arg fault "$fault_subject" '
-    length == 5
+  --arg message "$message_subject" '
+    length == 3
     and all(.[]; .person == $person and (.actions | length > 0))
     and ([.[].kind] | sort) == [
-      "fault",
       "human-gate",
       "planning-approval",
-      "revision-approval",
-      "unread-message"
+      "revision-approval"
     ]
     and (map(select(.kind == "human-gate"))[0].subject == $human)
     and (map(select(.kind == "revision-approval"))[0].subject == $revision)
     and (map(select(.kind == "planning-approval"))[0].subject == $planning)
-    and (map(select(.kind == "unread-message"))[0].subject == $message)
-    and (map(select(.kind == "fault"))[0].subject == $fault)
+    and all(.[]; .subject != $message)
   ' attention.json >/dev/null
 jq -e --arg person "$REVIEWER" '
-  map(select(.person == $person)) | length == 5
+  map(select(.person == $person)) | length == 3
 ' all-attention.json >/dev/null
 
 st3 attention ls --as "$REVIEWER" >attention.txt
-grep -F '5 waiting' attention.txt >/dev/null
+grep -F '3 waiting' attention.txt >/dev/null
 grep -F '[human-gate]' attention.txt >/dev/null
 grep -F '[planning-approval]' attention.txt >/dev/null
 grep -F '[revision-approval]' attention.txt >/dev/null
-grep -F '[unread-message]' attention.txt >/dev/null
-grep -F '[fault]' attention.txt >/dev/null
+if grep -E '\[(unread-message|fault)\]' attention.txt >/dev/null; then
+  exit 1
+fi
 
 st3 review approve "$human_owner" --actor "$REVIEWER" \
   --reason "the model-free human gate is correct" >/dev/null
@@ -173,9 +155,6 @@ st3 launch cancel "$planning_session" --as "$REVIEWER" \
 planning_session=""
 
 st3 conversations read "$message_subject" --as "$REVIEWER" >/dev/null
-st3 attention resolve "$fault_subject" --outcome resolved --as "$REVIEWER" \
-  --reason "the explicit fault lifecycle is proved" >/dev/null
-fault_subject=""
 
 await_kind_count 0 empty-attention.json
 st3 review ls --as "$REVIEWER" --json \

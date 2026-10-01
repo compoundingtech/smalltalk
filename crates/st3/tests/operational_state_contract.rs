@@ -203,12 +203,19 @@ fn eval_message_keeps_its_explicit_person_identity() {
     let store = Store::open_memory("operational-fixture").unwrap();
     let value = fixture("eval-person-message.json");
     append_fixture_claims(&store, &value);
-    let items = store
-        .attention_items(Some("person/eval-requester"))
+    let messages = store
+        .messages(Some("person/eval-requester"), false)
         .unwrap();
-    assert_eq!(items.len(), 1);
-    assert_eq!(items[0].person, "person/eval-requester");
-    assert_eq!(items[0].subject, "message/eval/report");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].to, "person/eval-requester");
+    assert_eq!(messages[0].subject, "message/eval/report");
+    // A message stays in conversations: it never waits in a person's attention.
+    assert!(
+        store
+            .attention_items(Some("person/eval-requester"))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
@@ -295,12 +302,18 @@ fn only_the_selected_reminder_version_is_actionable() {
     let store = Store::open_memory("operational-fixture").unwrap();
     append_fixture_claims(&store, &fixture("versioned-reminders.json"));
     let subjects = store
-        .attention_items(Some("person/operator"))
+        .operational_messages(Some("person/operator"), false)
         .unwrap()
         .into_iter()
-        .map(|item| item.subject)
+        .map(|message| message.subject)
         .collect::<Vec<_>>();
     assert_eq!(subjects, ["message/reminder/v2"]);
+    assert!(
+        store
+            .attention_items(Some("person/operator"))
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
