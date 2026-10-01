@@ -242,6 +242,10 @@ pub struct Ui {
     find: Option<Find>,
     /// Images attached to each draft, by its key, until it is sent.
     attachments: HashMap<String, Vec<attach::Attachment>>,
+    /// How this terminal draws images (kitty, sixel, iTerm2, half blocks), asked once at start.
+    pub(crate) picker: Option<ratatui_image::picker::Picker>,
+    /// Each attachment's thumbnail, encoded once so a redraw never sends the image again.
+    thumbnails: RefCell<HashMap<std::path::PathBuf, Option<ratatui_image::protocol::Protocol>>>,
     /// When st last sent each conversation something, shown above its message box.
     updated: HashMap<String, Instant>,
     /// Why a conversation could not be brought up to date, until st sends it again.
@@ -286,6 +290,8 @@ impl Ui {
             details_here: false,
             find: None,
             attachments: HashMap::new(),
+            picker: None,
+            thumbnails: RefCell::new(HashMap::new()),
             updated: HashMap::new(),
             stalled: HashMap::new(),
         }
@@ -356,6 +362,38 @@ impl Ui {
     /// is the focused one.
     fn composing(&self, agent: &str) -> bool {
         self.tab == 1 && self.selected_id().as_deref() == Some(agent)
+    }
+
+    /// One attachment's thumbnail, encoded on first sight and kept.
+    fn draw_thumbnail(&self, buf: &mut Buffer, area: Rect, attachment: &attach::Attachment) {
+        let Some(picker) = &self.picker else { return };
+        let mut thumbnails = self.thumbnails.borrow_mut();
+        let thumbnail = thumbnails
+            .entry(attachment.path.clone())
+            .or_insert_with(|| {
+                let image = image::ImageReader::open(&attachment.path)
+                    .ok()?
+                    .with_guessed_format()
+                    .ok()?
+                    .decode()
+                    .ok()?;
+                picker
+                    .new_protocol(
+                        image,
+                        ratatui::layout::Size::new(area.width, area.height),
+                        ratatui_image::Resize::Fit(None),
+                    )
+                    .ok()
+            });
+        match thumbnail {
+            Some(protocol) => {
+                use ratatui::widgets::Widget as _;
+                ratatui_image::Image::new(protocol).render(area, buf);
+            }
+            None => {
+                buf.set_stringn(area.x, area.y, "▣", 1, theme::fg(theme::LAVENDER));
+            }
+        }
     }
 
     /// ` ● live · updated 12s ago `, or paused when st is not following it.
@@ -1422,10 +1460,16 @@ impl Ui {
         } else {
             self.composer_lines(agent, width)
         };
+        // Attached images show as small thumbnails above the box, where the terminal draws them.
+        let thumbnails = match (&self.picker, find, self.attachments.get(&agent.id)) {
+            (Some(_), None, Some(list)) if !list.is_empty() => list.clone(),
+            _ => Vec::new(),
+        };
+        let strip = if thumbnails.is_empty() { 0 } else { THUMBNAIL.height };
         let composer_height = if composer.is_empty() {
             0
         } else {
-            composer.len() as u16 + 2
+            composer.len() as u16 + 2 + strip
         };
         let body = Rect {
             y: area.y + header_height,
@@ -1504,8 +1548,24 @@ impl Ui {
                     );
                 }
             }
+            for (index, attachment) in thumbnails.iter().enumerate() {
+                let x = area.x + 2 + index as u16 * (THUMBNAIL.width + 1);
+                if x + THUMBNAIL.width > area.x + area.width {
+                    break;
+                }
+                self.draw_thumbnail(
+                    buf,
+                    Rect {
+                        x,
+                        y: y + 1,
+                        width: THUMBNAIL.width,
+                        height: THUMBNAIL.height,
+                    },
+                    attachment,
+                );
+            }
             for (offset, line) in composer.iter().enumerate() {
-                buf.set_line(area.x, y + 1 + offset as u16, line, area.width);
+                buf.set_line(area.x, y + 1 + strip + offset as u16, line, area.width);
             }
             self.hit(
                 Rect {
@@ -3237,6 +3297,12 @@ fn find_matches(doc: &Doc, query: &str) -> Vec<(usize, usize, usize)> {
     }
     found
 }
+
+/// The size of an attachment's thumbnail, in cells.
+const THUMBNAIL: ratatui::layout::Size = ratatui::layout::Size {
+    width: 10,
+    height: 4,
+};
 
 /// Readline's word delete: the blanks before the end, then the word before them.
 fn delete_word(text: &mut String) {

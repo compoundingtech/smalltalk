@@ -176,6 +176,8 @@ pub fn run(context: Context) -> Result<()> {
     ui.show_focused();
 
     let _guard = Guard::enter(ui.glasses.is_some())?;
+    // Asked once, inside the alternate screen and before any event is read.
+    ui.picker = ratatui_image::picker::Picker::from_query_stdio().ok();
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.hide_cursor()?;
     let started = Instant::now();

@@ -2434,6 +2434,35 @@ mod tests {
     }
 
     #[test]
+    fn an_attached_image_shows_a_thumbnail_where_the_terminal_can_draw_one() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ui.live = true;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("red.png");
+        // Stripes, so half blocks must draw both halves of a cell.
+        image::RgbImage::from_fn(32, 32, |_, y| {
+            if (y / 4) % 2 == 0 {
+                image::Rgb([243, 139, 168])
+            } else {
+                image::Rgb([137, 180, 250])
+            }
+        })
+        .save(&path)
+        .unwrap();
+        ui.paste(path.display().to_string());
+        let without = screen(&ui);
+        assert!(without.contains("▣ 1 image 32×32"), "{without}");
+        // Half blocks stand in for any terminal; kitty and sixel draw the real image.
+        ui.picker = Some(ratatui_image::picker::Picker::halfblocks());
+        let with = screen(&ui);
+        assert!(with.contains('▀') || with.contains('▄'), "{with}");
+    }
+
+    #[test]
     fn the_wheel_moves_the_palette_and_nothing_behind_it() {
         let mut ui = glass();
         ctrl(&mut ui, 'k');
