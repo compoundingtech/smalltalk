@@ -27,3 +27,7 @@ assert.equal(rows.find(row => row.item.id === 'attention/new-kind').kind, 'fault
 // Before the connection names its person, nothing is hidden for belonging to someone else.
 assert.equal(onHome(item('theirs', 'fault', { person_id: 'person/other' }), undefined), true);
 assert.equal(onHome(item('done', 'fault', { state: 'resolved' }), undefined), false);
+
+// A paired phone acts as person/NAME/session/ID: the person's items are still its own.
+assert.equal(onHome(item('mine', 'review', { person_id: 'person/alex' }), 'person/alex/session/0190abcd'), true);
+assert.equal(onHome(item('theirs', 'review', { person_id: 'person/robin' }), 'person/alex/session/0190abcd'), false);
