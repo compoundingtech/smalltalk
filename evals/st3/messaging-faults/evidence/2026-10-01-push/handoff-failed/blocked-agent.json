@@ -1,14 +1,14 @@
 {
   "kind": "agent",
   "id": "agent/eval/fault-probe",
-  "revision": "8df83cb585f680c8059de4fe678dd4bee3c370013bae3488f4474e11337f52f2",
-  "updated_at": "2026-10-01T09:11:44.133Z",
+  "revision": "2e4c949e8497c2726049b24743c71dc1b42c06b8a5376439f051043eb89e9cc9",
+  "updated_at": "2026-10-01T13:05:07.496Z",
   "operational": {
     "layer": "current",
     "actionable": true,
     "reasons": [],
     "owner_generation": null,
-    "runtime_incarnation": "2224300:2026-10-01T09:11:43.110Z",
+    "runtime_incarnation": "1362014:2026-10-01T13:05:06.016Z",
     "runtime_desired_revision": null
   },
   "name": "eval/fault-probe",
@@ -21,11 +21,11 @@
   "driver": "omp",
   "harness_state": "idle",
   "host_id": "host/cobalt",
-  "last_activity_at": "2026-10-01T09:11:46.197Z",
+  "last_activity_at": "2026-10-01T13:05:09.478Z",
   "silent_since": null,
   "fault": null,
-  "incarnation_id": "2224300:2026-10-01T09:11:43.110Z",
-  "current_session_id": "session/621909a4d6dd413a5d5ce24b",
+  "incarnation_id": "1362014:2026-10-01T13:05:06.016Z",
+  "current_session_id": "session/e1f08aea4fc1bb4a0051c510",
   "current_work_ids": [],
   "active_work_count": 0,
   "next_work_id": null,
@@ -39,7 +39,8 @@
     "source": "none",
     "publish": [],
     "start": [],
-    "revise": []
+    "revise": [],
+    "cancel": []
   },
   "under": [],
   "delivery": {

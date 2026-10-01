@@ -1,98 +1,98 @@
 [
   {
-    "at_unix_ms": 1790845838292,
-    "pid": 2204546,
+    "at_unix_ms": 1790859845844,
+    "pid": 1333751,
     "event": "started"
   },
   {
-    "at_unix_ms": 1790845838370,
-    "pid": 2204546,
+    "at_unix_ms": 1790859845930,
+    "pid": 1333751,
     "event": "ready"
   },
   {
-    "at_unix_ms": 1790845838393,
-    "pid": 2204546,
+    "at_unix_ms": 1790859845938,
+    "pid": 1333751,
     "event": "seat-title",
     "label": "eval/fault-probe"
   },
   {
-    "at_unix_ms": 1790845840381,
-    "pid": 2204546,
+    "at_unix_ms": 1790859846936,
+    "pid": 1333751,
     "event": "wire-frame",
-    "subject": "message/eb5520eaab796819"
+    "subject": "message/235c06559b4cf212"
   },
   {
-    "at_unix_ms": 1790845840382,
-    "pid": 2204546,
+    "at_unix_ms": 1790859846937,
+    "pid": 1333751,
     "event": "received",
-    "subject": "message/eb5520eaab796819",
-    "content": "<smalltalk-message id=\"eb5520eaab796819\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/eb5520eaab796819\">\nreceipt-token:warmup\n</smalltalk-message>"
+    "subject": "message/235c06559b4cf212",
+    "content": "<smalltalk-message id=\"235c06559b4cf212\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/235c06559b4cf212\">\nreceipt-token:warmup\n</smalltalk-message>"
   },
   {
-    "at_unix_ms": 1790845840408,
-    "pid": 2204546,
+    "at_unix_ms": 1790859846950,
+    "pid": 1333751,
     "event": "delivered",
-    "subject": "message/eb5520eaab796819",
-    "accepted_at_unix_ms": 1790845840395
+    "subject": "message/235c06559b4cf212",
+    "accepted_at_unix_ms": 1790859846945
   },
   {
-    "at_unix_ms": 1790845840430,
-    "pid": 2204546,
+    "at_unix_ms": 1790859846957,
+    "pid": 1333751,
     "event": "read",
-    "subject": "message/eb5520eaab796819",
-    "accepted_at_unix_ms": 1790845840411
+    "subject": "message/235c06559b4cf212",
+    "accepted_at_unix_ms": 1790859846954
   },
   {
-    "at_unix_ms": 1790845840441,
-    "pid": 2204546,
+    "at_unix_ms": 1790859846964,
+    "pid": 1333751,
     "event": "closed",
-    "subject": "message/eb5520eaab796819",
-    "accepted_at_unix_ms": 1790845840433
+    "subject": "message/235c06559b4cf212",
+    "accepted_at_unix_ms": 1790859846960
   },
   {
-    "at_unix_ms": 1790845841057,
-    "pid": 2204546,
+    "at_unix_ms": 1790859847550,
+    "pid": 1333751,
     "event": "seat-title",
     "label": "eval/fault-probe"
   },
   {
-    "at_unix_ms": 1790845841068,
-    "pid": 2204546,
+    "at_unix_ms": 1790859847562,
+    "pid": 1333751,
     "event": "seat-title",
     "label": "eval/fault-probe"
   },
   {
-    "at_unix_ms": 1790845842063,
-    "pid": 2204546,
+    "at_unix_ms": 1790859848559,
+    "pid": 1333751,
     "event": "wire-frame",
-    "subject": "message/466ee3d4cb804174"
+    "subject": "message/d92855adcbd685a6"
   },
   {
-    "at_unix_ms": 1790845842063,
-    "pid": 2204546,
+    "at_unix_ms": 1790859848560,
+    "pid": 1333751,
     "event": "received",
-    "subject": "message/466ee3d4cb804174",
-    "content": "<smalltalk-message id=\"466ee3d4cb804174\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: channel-killed\" sha256=\"ef42019cd45afb24abfadd35f7cd496ddc11ecfe4d1062a4df176c39222c0c6e\" graph=\"message/466ee3d4cb804174\">\nreceipt-token:channel-killed\n</smalltalk-message>"
+    "subject": "message/d92855adcbd685a6",
+    "content": "<smalltalk-message id=\"d92855adcbd685a6\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: channel-killed\" sha256=\"ef42019cd45afb24abfadd35f7cd496ddc11ecfe4d1062a4df176c39222c0c6e\" graph=\"message/d92855adcbd685a6\">\nreceipt-token:channel-killed\n</smalltalk-message>"
   },
   {
-    "at_unix_ms": 1790845842069,
-    "pid": 2204546,
+    "at_unix_ms": 1790859848568,
+    "pid": 1333751,
     "event": "delivered",
-    "subject": "message/466ee3d4cb804174",
-    "accepted_at_unix_ms": 1790845842065
+    "subject": "message/d92855adcbd685a6",
+    "accepted_at_unix_ms": 1790859848563
   },
   {
-    "at_unix_ms": 1790845842072,
-    "pid": 2204546,
+    "at_unix_ms": 1790859848573,
+    "pid": 1333751,
     "event": "read",
-    "subject": "message/466ee3d4cb804174",
-    "accepted_at_unix_ms": 1790845842070
+    "subject": "message/d92855adcbd685a6",
+    "accepted_at_unix_ms": 1790859848570
   },
   {
-    "at_unix_ms": 1790845842076,
-    "pid": 2204546,
+    "at_unix_ms": 1790859848580,
+    "pid": 1333751,
     "event": "closed",
-    "subject": "message/466ee3d4cb804174",
-    "accepted_at_unix_ms": 1790845842073
+    "subject": "message/d92855adcbd685a6",
+    "accepted_at_unix_ms": 1790859848577
   }
 ]

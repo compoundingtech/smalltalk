@@ -1,16 +1,16 @@
-{"at_unix_ms":1790845805641,"pid":2198071,"event":"started"}
-{"at_unix_ms":1790845805698,"pid":2198071,"event":"ready"}
-{"at_unix_ms":1790845805717,"pid":2198071,"event":"seat-title","label":"eval/fault-probe"}
-{"at_unix_ms":1790845806705,"pid":2198071,"event":"wire-frame","subject":"message/be3ff9b901f06318"}
-{"at_unix_ms":1790845806705,"pid":2198071,"event":"received","subject":"message/be3ff9b901f06318","content":"<smalltalk-message id=\"be3ff9b901f06318\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/be3ff9b901f06318\">\nreceipt-token:warmup\n</smalltalk-message>"}
-{"at_unix_ms":1790845806718,"pid":2198071,"event":"delivered","subject":"message/be3ff9b901f06318","accepted_at_unix_ms":1790845806713}
-{"at_unix_ms":1790845806722,"pid":2198071,"event":"read","subject":"message/be3ff9b901f06318","accepted_at_unix_ms":1790845806720}
-{"at_unix_ms":1790845806728,"pid":2198071,"event":"closed","subject":"message/be3ff9b901f06318","accepted_at_unix_ms":1790845806725}
-{"at_unix_ms":1790845808090,"pid":2198320,"event":"started"}
-{"at_unix_ms":1790845808146,"pid":2198320,"event":"ready"}
-{"at_unix_ms":1790845808151,"pid":2198320,"event":"seat-title","label":"eval/fault-probe"}
-{"at_unix_ms":1790845809151,"pid":2198320,"event":"wire-frame","subject":"message/9de3e09106e91a80"}
-{"at_unix_ms":1790845809151,"pid":2198320,"event":"received","subject":"message/9de3e09106e91a80","content":"<smalltalk-message id=\"9de3e09106e91a80\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: harness-restart\" sha256=\"7a7267b72d078410986fab79270c457615529ff591c877e89bdda4b4b34c84a8\" graph=\"message/9de3e09106e91a80\">\nreceipt-token:harness-restart\n</smalltalk-message>"}
-{"at_unix_ms":1790845809161,"pid":2198320,"event":"delivered","subject":"message/9de3e09106e91a80","accepted_at_unix_ms":1790845809157}
-{"at_unix_ms":1790845809165,"pid":2198320,"event":"read","subject":"message/9de3e09106e91a80","accepted_at_unix_ms":1790845809163}
-{"at_unix_ms":1790845809169,"pid":2198320,"event":"closed","subject":"message/9de3e09106e91a80","accepted_at_unix_ms":1790845809166}
+{"at_unix_ms":1790859757250,"pid":1300594,"event":"started"}
+{"at_unix_ms":1790859757630,"pid":1300594,"event":"ready"}
+{"at_unix_ms":1790859757644,"pid":1300594,"event":"seat-title","label":"eval/fault-probe"}
+{"at_unix_ms":1790859759677,"pid":1300594,"event":"wire-frame","subject":"message/d83ab8d5f5f257fb"}
+{"at_unix_ms":1790859759678,"pid":1300594,"event":"received","subject":"message/d83ab8d5f5f257fb","content":"<smalltalk-message id=\"d83ab8d5f5f257fb\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/d83ab8d5f5f257fb\">\nreceipt-token:warmup\n</smalltalk-message>"}
+{"at_unix_ms":1790859759709,"pid":1300594,"event":"delivered","subject":"message/d83ab8d5f5f257fb","accepted_at_unix_ms":1790859759689}
+{"at_unix_ms":1790859759728,"pid":1300594,"event":"read","subject":"message/d83ab8d5f5f257fb","accepted_at_unix_ms":1790859759717}
+{"at_unix_ms":1790859759835,"pid":1300594,"event":"closed","subject":"message/d83ab8d5f5f257fb","accepted_at_unix_ms":1790859759796}
+{"at_unix_ms":1790859816559,"pid":1320625,"event":"started"}
+{"at_unix_ms":1790859816637,"pid":1320625,"event":"ready"}
+{"at_unix_ms":1790859816651,"pid":1320625,"event":"seat-title","label":"eval/fault-probe"}
+{"at_unix_ms":1790859817648,"pid":1320625,"event":"wire-frame","subject":"message/4d1126413dfa0255"}
+{"at_unix_ms":1790859817648,"pid":1320625,"event":"received","subject":"message/4d1126413dfa0255","content":"<smalltalk-message id=\"4d1126413dfa0255\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: harness-restart\" sha256=\"7a7267b72d078410986fab79270c457615529ff591c877e89bdda4b4b34c84a8\" graph=\"message/4d1126413dfa0255\">\nreceipt-token:harness-restart\n</smalltalk-message>"}
+{"at_unix_ms":1790859817666,"pid":1320625,"event":"delivered","subject":"message/4d1126413dfa0255","accepted_at_unix_ms":1790859817658}
+{"at_unix_ms":1790859817673,"pid":1320625,"event":"read","subject":"message/4d1126413dfa0255","accepted_at_unix_ms":1790859817669}
+{"at_unix_ms":1790859817681,"pid":1320625,"event":"closed","subject":"message/4d1126413dfa0255","accepted_at_unix_ms":1790859817677}

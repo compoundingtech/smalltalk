@@ -1,13 +1,13 @@
-{"at_unix_ms":1790845619231,"pid":2138432,"event":"started"}
-{"at_unix_ms":1790845619492,"pid":2138432,"event":"ready"}
-{"at_unix_ms":1790845619537,"pid":2138432,"event":"seat-title","label":"eval/fault-probe"}
-{"at_unix_ms":1790845621506,"pid":2138432,"event":"wire-frame","subject":"message/ad8f282c081f53c1"}
-{"at_unix_ms":1790845621507,"pid":2138432,"event":"received","subject":"message/ad8f282c081f53c1","content":"<smalltalk-message id=\"ad8f282c081f53c1\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/ad8f282c081f53c1\">\nreceipt-token:warmup\n</smalltalk-message>"}
-{"at_unix_ms":1790845621553,"pid":2138432,"event":"delivered","subject":"message/ad8f282c081f53c1","accepted_at_unix_ms":1790845621524}
-{"at_unix_ms":1790845621569,"pid":2138432,"event":"read","subject":"message/ad8f282c081f53c1","accepted_at_unix_ms":1790845621562}
-{"at_unix_ms":1790845621612,"pid":2138432,"event":"closed","subject":"message/ad8f282c081f53c1","accepted_at_unix_ms":1790845621573}
-{"at_unix_ms":1790845742498,"pid":2138432,"event":"wire-frame","subject":"message/2bb434fff879b12c"}
-{"at_unix_ms":1790845742499,"pid":2138432,"event":"received","subject":"message/2bb434fff879b12c","content":"<smalltalk-message id=\"2bb434fff879b12c\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: link-minutes\" sha256=\"6f412fb3b2788b6dd15abc27ab0ddac1c2f54adbe55f481917269696c481bb14\" graph=\"message/2bb434fff879b12c\">\nreceipt-token:link-minutes\n</smalltalk-message>"}
-{"at_unix_ms":1790845742504,"pid":2138432,"event":"delivered","subject":"message/2bb434fff879b12c","accepted_at_unix_ms":1790845742501}
-{"at_unix_ms":1790845742507,"pid":2138432,"event":"read","subject":"message/2bb434fff879b12c","accepted_at_unix_ms":1790845742505}
-{"at_unix_ms":1790845742511,"pid":2138432,"event":"closed","subject":"message/2bb434fff879b12c","accepted_at_unix_ms":1790845742509}
+{"at_unix_ms":1790859564860,"pid":1235005,"event":"started"}
+{"at_unix_ms":1790859564923,"pid":1235005,"event":"ready"}
+{"at_unix_ms":1790859564930,"pid":1235005,"event":"seat-title","label":"eval/fault-probe"}
+{"at_unix_ms":1790859566931,"pid":1235005,"event":"wire-frame","subject":"message/20aba32a86fa2701"}
+{"at_unix_ms":1790859566932,"pid":1235005,"event":"received","subject":"message/20aba32a86fa2701","content":"<smalltalk-message id=\"20aba32a86fa2701\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/20aba32a86fa2701\">\nreceipt-token:warmup\n</smalltalk-message>"}
+{"at_unix_ms":1790859566945,"pid":1235005,"event":"delivered","subject":"message/20aba32a86fa2701","accepted_at_unix_ms":1790859566941}
+{"at_unix_ms":1790859566952,"pid":1235005,"event":"read","subject":"message/20aba32a86fa2701","accepted_at_unix_ms":1790859566948}
+{"at_unix_ms":1790859566957,"pid":1235005,"event":"closed","subject":"message/20aba32a86fa2701","accepted_at_unix_ms":1790859566954}
+{"at_unix_ms":1790859688996,"pid":1235005,"event":"wire-frame","subject":"message/560bc7b3dfdc64c3"}
+{"at_unix_ms":1790859688997,"pid":1235005,"event":"received","subject":"message/560bc7b3dfdc64c3","content":"<smalltalk-message id=\"560bc7b3dfdc64c3\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: link-minutes\" sha256=\"6f412fb3b2788b6dd15abc27ab0ddac1c2f54adbe55f481917269696c481bb14\" graph=\"message/560bc7b3dfdc64c3\">\nreceipt-token:link-minutes\n</smalltalk-message>"}
+{"at_unix_ms":1790859689028,"pid":1235005,"event":"delivered","subject":"message/560bc7b3dfdc64c3","accepted_at_unix_ms":1790859689015}
+{"at_unix_ms":1790859689043,"pid":1235005,"event":"read","subject":"message/560bc7b3dfdc64c3","accepted_at_unix_ms":1790859689036}
+{"at_unix_ms":1790859689058,"pid":1235005,"event":"closed","subject":"message/560bc7b3dfdc64c3","accepted_at_unix_ms":1790859689049}

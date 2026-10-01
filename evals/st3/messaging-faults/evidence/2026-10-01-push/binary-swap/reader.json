@@ -1,97 +1,97 @@
 [
   {
-    "at_unix_ms": 1790845524415,
-    "pid": 2112462,
+    "at_unix_ms": 1790859472183,
+    "pid": 1187109,
     "event": "started"
   },
   {
-    "at_unix_ms": 1790845524500,
-    "pid": 2112462,
+    "at_unix_ms": 1790859472257,
+    "pid": 1187109,
     "event": "ready"
   },
   {
-    "at_unix_ms": 1790845524538,
-    "pid": 2112462,
+    "at_unix_ms": 1790859472267,
+    "pid": 1187109,
     "event": "seat-title",
     "label": "eval/fault-probe"
   },
   {
-    "at_unix_ms": 1790845525505,
-    "pid": 2112462,
+    "at_unix_ms": 1790859501267,
+    "pid": 1187109,
     "event": "wire-frame",
-    "subject": "message/dbad5b5d8fe28b74"
+    "subject": "message/c78a5117e39c778b"
   },
   {
-    "at_unix_ms": 1790845525506,
-    "pid": 2112462,
+    "at_unix_ms": 1790859501267,
+    "pid": 1187109,
     "event": "received",
-    "subject": "message/dbad5b5d8fe28b74",
-    "content": "<smalltalk-message id=\"dbad5b5d8fe28b74\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/dbad5b5d8fe28b74\">\nreceipt-token:warmup\n</smalltalk-message>"
+    "subject": "message/c78a5117e39c778b",
+    "content": "<smalltalk-message id=\"c78a5117e39c778b\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/c78a5117e39c778b\">\nreceipt-token:warmup\n</smalltalk-message>"
   },
   {
-    "at_unix_ms": 1790845525516,
-    "pid": 2112462,
+    "at_unix_ms": 1790859501277,
+    "pid": 1187109,
     "event": "delivered",
-    "subject": "message/dbad5b5d8fe28b74",
-    "accepted_at_unix_ms": 1790845525512
+    "subject": "message/c78a5117e39c778b",
+    "accepted_at_unix_ms": 1790859501273
   },
   {
-    "at_unix_ms": 1790845525521,
-    "pid": 2112462,
+    "at_unix_ms": 1790859501281,
+    "pid": 1187109,
     "event": "read",
-    "subject": "message/dbad5b5d8fe28b74",
-    "accepted_at_unix_ms": 1790845525518
+    "subject": "message/c78a5117e39c778b",
+    "accepted_at_unix_ms": 1790859501279
   },
   {
-    "at_unix_ms": 1790845525525,
-    "pid": 2112462,
+    "at_unix_ms": 1790859501286,
+    "pid": 1187109,
     "event": "closed",
-    "subject": "message/dbad5b5d8fe28b74",
-    "accepted_at_unix_ms": 1790845525523
+    "subject": "message/c78a5117e39c778b",
+    "accepted_at_unix_ms": 1790859501283
   },
   {
-    "at_unix_ms": 1790845526760,
-    "pid": 2112462,
+    "at_unix_ms": 1790859502533,
+    "pid": 1187109,
     "event": "seat-title",
     "label": "eval/fault-probe"
   },
   {
-    "at_unix_ms": 1790845527514,
-    "pid": 2112462,
+    "at_unix_ms": 1790859503269,
+    "pid": 1187109,
     "event": "wire-frame",
-    "subject": "message/bc3dd6a38bdf8c1c"
+    "subject": "message/6d62d5bf1a4c91e6"
   },
   {
-    "at_unix_ms": 1790845527514,
-    "pid": 2112462,
+    "at_unix_ms": 1790859503269,
+    "pid": 1187109,
     "event": "received",
-    "subject": "message/bc3dd6a38bdf8c1c",
-    "content": "<smalltalk-message id=\"bc3dd6a38bdf8c1c\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: binary-swap\" sha256=\"feb19e5bfafb63450a7e1e38152d7cb49fa7ec3488a281694c35b38913c37564\" graph=\"message/bc3dd6a38bdf8c1c\">\nreceipt-token:binary-swap\n</smalltalk-message>"
+    "subject": "message/6d62d5bf1a4c91e6",
+    "content": "<smalltalk-message id=\"6d62d5bf1a4c91e6\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: binary-swap\" sha256=\"feb19e5bfafb63450a7e1e38152d7cb49fa7ec3488a281694c35b38913c37564\" graph=\"message/6d62d5bf1a4c91e6\">\nreceipt-token:binary-swap\n</smalltalk-message>"
   },
   {
-    "at_unix_ms": 1790845527539,
-    "pid": 2112462,
+    "at_unix_ms": 1790859503280,
+    "pid": 1187109,
     "event": "delivered",
-    "subject": "message/bc3dd6a38bdf8c1c",
-    "accepted_at_unix_ms": 1790845527524
+    "subject": "message/6d62d5bf1a4c91e6",
+    "accepted_at_unix_ms": 1790859503277
   },
   {
-    "at_unix_ms": 1790845527555,
-    "pid": 2112462,
+    "at_unix_ms": 1790859503288,
+    "pid": 1187109,
     "event": "read",
-    "subject": "message/bc3dd6a38bdf8c1c",
-    "accepted_at_unix_ms": 1790845527541
+    "subject": "message/6d62d5bf1a4c91e6",
+    "accepted_at_unix_ms": 1790859503286
   },
   {
-    "at_unix_ms": 1790845527573,
-    "pid": 2112462,
+    "at_unix_ms": 1790859503298,
+    "pid": 1187109,
     "event": "closed",
-    "subject": "message/bc3dd6a38bdf8c1c",
-    "accepted_at_unix_ms": 1790845527565
+    "subject": "message/6d62d5bf1a4c91e6",
+    "accepted_at_unix_ms": 1790859503295
   },
   {
-    "at_unix_ms": 1790845527772,
-    "pid": 2112462,
+    "at_unix_ms": 1790859503402,
+    "pid": 1187109,
     "event": "seat-title",
     "label": "eval/fault-probe"
   }

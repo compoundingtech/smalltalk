@@ -108,7 +108,8 @@ successful normalized evidence under its checkout's `target/messaging-faults/run
 
 The daemon push implementation's ten-case evidence is in
 [evidence/2026-10-01-push/result.json](evidence/2026-10-01-push/result.json).
-All cases passed with no projected inbox/archive messages. Native Codex/OpenCode ledger tests,
+All cases passed with no projected inbox/archive messages on the review-fix build `24bae034`,
+including daemon-allocated binding epochs and transient-error reconnect behavior. Native Codex/OpenCode ledger tests,
 Claude transcript/uncertainty tests, and both owned extension smoke tests cover the other no-files
 boundaries, current-session receipt fencing and replacement reconnects. The Unix stream test
 commits a native receipt then discards the HTTP acknowledgement; its retry returns the same claim.

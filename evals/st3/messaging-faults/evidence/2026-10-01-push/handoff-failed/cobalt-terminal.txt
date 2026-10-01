@@ -1,1 +1,2 @@
-
+st: st API returned 422 stale-mailbox-session: this is not the seat's live incar
+nation
