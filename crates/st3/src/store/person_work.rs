@@ -970,9 +970,7 @@ mission "writer-load" state="ready" {
                 target.apply_replication_repairs().unwrap();
                 target.project_replication_backlog().unwrap();
                 assert_eq!(FULL_REPLAYS.with(|count| count.get()), before);
-                let elapsed = start.elapsed();
-
-                elapsed
+                start.elapsed()
             });
             let writing = scope.spawn(|| {
                 gate.wait();
@@ -985,9 +983,7 @@ mission "writer-load" state="ready" {
                         evidence: vec![], expected_subject: None, idempotency_key: None,
                     }).unwrap();
                 }
-                let elapsed = start.elapsed();
-
-                elapsed
+                start.elapsed()
             });
             gate.wait();
 
