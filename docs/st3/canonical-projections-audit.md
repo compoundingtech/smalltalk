@@ -26,7 +26,8 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `batches` | Shared storage, with stated local fields | Shared log metadata: origin/sequence/hash/accepted time; primary ordering inputs. Storage rather than an outcome projection. |
 | `claims` | Shared storage, with stated local fields | Shared immutable logical claim bytes/id/subject/kind/actor/predecessors/time. store_index alone is local; system-local/legacy migrated claims must be excluded from logical replicated-source digests. |
 | `operations` | Shared projection | Shared operation identity, canonical claim, request digest and conflict state, derived from live claims plus tombstones. After trim, operations with no live claim are served by tombstones. |
-| `blobs` | Shared projection | Shared immutable document payload bytes/hash/size for bound documents. Compare reachable content; unbound upload leftovers are local garbage, not a selected document. |
+| `blobs` | Shared projection | Shared immutable bytes/hash/size carried by durable claims or admitted blob records; all columns remain digested, including content retained after checkpoint trimming. |
+| `local_blobs` | Local | Staged upload bytes awaiting a durable claim reference. Promotion into `blobs` commits with the referencing claim. |
 | `documents` | Shared projection | Shared immutable name/hash binding and binding_claim_id. created_index is a local arrival cursor; current latest selection must join the binding claim and use canonical order. |
 | `desired` | Shared projection | Shared selected declaration, ancestry/conflicts, ownership and full canonical body; existing ancestry/revision/id selection is deterministic and must be preserved. |
 | `idempotency` | Local | Local opaque HTTP/operation response cache with local indexes; shared operation identity is operations plus checkpoint_claims. |
@@ -59,6 +60,7 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `planning_candidates` | Shared projection | Shared immutable variant/revision/document references, mission revision and submission timestamp. |
 | `planning_previews` | Shared projection | Shared serialized preview claim fields, graph/diff/response/hash and candidate fence. store_index here is an originating claim payload field, not this replica’s admission cursor: identical claim payloads must compare identically. Future cross-node preview fencing should use stable claim/frontier identity. |
 | `graph_generation` | Local | Local cache invalidation counter; same graph can have different mutation counts. |
+| `projection_digest_repaired_claims` | Local | Repair exclusion cache over known original claim identities. Repair meaning and replacements are covered by shared claims; raw originals remain authenticated envelope history and do not contribute to source or operation projections. |
 | `replica_envelope_signatures` | Shared storage, with stated local fields | Shared signed envelope identity/member-key/signature; stored_at is local receipt time. Authority/signature inventory is distinct from outcome projection digests. |
 | `fleet_invite_tokens` | Local | Local invite secret/redemption attempt/authorization bookkeeping; fleet.invite-* lifecycle claims are shared. |
 | `replica_envelope_holds` | Local | Local validation/fencing hold state and observation time. |
