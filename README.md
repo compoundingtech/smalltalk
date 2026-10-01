@@ -2,11 +2,11 @@
 
 ## Continuous integration
 
-Small Talk runs pull request and main branch CI on our own Linux and macOS machines through
-`st`. The `st/ci` commit status reports the Linux debug workspace tests and Clippy;
-`st/ci-macos` reports the same checks on macOS. GitHub Actions handles tags and forked
-pull requests. A ready pull request merges through the merge train: `st lanes join smalltalk
-NUMBER`. See [CI operations](docs/ci.md) for the train and to inspect a failing run.
+Small Talk runs pull request CI on GitHub Actions with Namespace runners. `linux-gate`,
+`isolation-vm` and `genie-freshness` are the required checks; `macos-ci` is optional and runs
+when a pull request carries the `macos-ci` label. A ready pull request lands through GitHub's
+merge queue: `gh pr merge NUMBER --auto`. See [CI operations](docs/ci.md) for the queue and to
+inspect a failing run.
 
 Small Talk (`st`) runs coding agents as durable seats and hands them work as missions. The graph
 records every seat, mission, step, message, and decision, so the state of your agents survives
@@ -203,6 +203,9 @@ Claude and Codex seats, and applies it as the `person` in your st config (or `--
 `--workspace`, the agent gets a new directory below that host's home, `~/st/agents/site`, which the
 host creates. Its next-step commands name the agent's subject, here `agent/builder.site`. `--print-kdl` shows
 the declaration without applying it, and `--description` says what the agent is for.
+`--message "Inspect the failing tests"` supplies an explicit first message through the harness's
+native startup argument. With no message, the seat starts idle. The Rust `st3-client` crate exposes
+`agent_create` with the same creation options; TypeScript and Swift expose `agentCreate`.
 
 Ctrl+\\ detaches and leaves the agent running. `st terminals attach agent/builder.site` attaches
 again later, from any machine in the fleet. A terminal on another host is attached PTY to PTY over
@@ -215,6 +218,20 @@ commands to attach, send it a message, inspect it, and stop it. These commands a
 when startup times out or the agent needs your input. Attaching stays opt-in with `--attach`.
 Mission starts, launches, device pairing, and fleet creation or joining also finish with their
 next steps. JSON output keeps its existing shape.
+
+## Open a shell
+
+```sh
+st terminals new work --cwd /tmp
+st terminals attach terminal/pty/person/ada/UUID
+st terminals end terminal/pty/person/ada/UUID
+```
+
+`terminals new` prints the new terminal ID. It runs the host's preferred shell (`$SHELL`, falling
+back to `/bin/sh`) with no agent harness. Locally its directory defaults to your current directory;
+with a remote `--host`, pass an absolute `--cwd` or use that daemon's directory. The shell does not
+restart after exit. `end` publishes a durable stop. Only its creator may create or end its declaration.
+The client crates expose `terminal_create` and `terminal_end` (camel case in TypeScript and Swift).
 
 ## Declare a seat
 
@@ -287,8 +304,7 @@ agent/example/worker --as person/ada` stops a seat until you apply its file agai
 
 st records what an agent does; it does not tell the agent how to behave. Each harness driver
 reports what it can see: sessions, turns, plan mode, subagents, tool calls, token usage, and what
-the seat is blocked on. st never asks an agent to report on itself. A seat starts idle with no
-prompt. Besides the messages and step goals that carry work, st's only text for agents is the
+the seat is blocked on. st never asks an agent to report on itself. A seat starts idle unless its creator explicitly supplies `--message`. Besides the messages and step goals that carry work, st's only text for agents is the
 skill that `st skill` prints, which describes how to use st. Each harness driver installs that
 skill when its seat starts; `st skill install` writes the same files directly.
 

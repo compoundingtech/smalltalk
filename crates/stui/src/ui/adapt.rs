@@ -500,8 +500,8 @@ fn agents(model: &Model) -> Vec<Agent> {
         .map(|agent| {
             let state = match (agent.state.as_str(), agent.harness_state.as_deref()) {
                 _ if agent.fault.is_some() => AgentState::Fault,
-                // A seat whose message path runs a replaced binary or stopped polling takes no
-                // messages, however ready its harness looks.
+                // A seat whose message path stopped polling or cannot hand off takes no
+                // messages, however ready its harness looks. An `outdated` path still delivers.
                 _ if agent
                     .delivery
                     .as_ref()

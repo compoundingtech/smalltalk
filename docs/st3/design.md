@@ -30,6 +30,15 @@ defined precedence. An unresolved or invalid head makes only its affected subjec
 See [data authority](data-authority.md) for the authority classes. See [schema](schema.md) for the
 public subject and claim vocabulary.
 
+The graph is its own crate, `crates/smallclaims`: the claim log and its batches, envelopes and
+their admission, the canonical order, projection digests, replication and heals between members,
+fleet membership, checkpoints, documents and blobs. It depends on nothing of smalltalk's, so agents,
+missions, seats, delivery, drivers, the CLI and stui stay out of it. smalltalk's store wraps the
+graph's and plugs in through `smallclaims::store::Runtime`: its tables and their migration, claim
+kind validation, local writes, projection and replay, cache invalidation, the digested tables, and
+the checkpoint rules and proof answers. A runtime may call the graph freely; the graph reaches a
+runtime only through that trait.
+
 ## KDL publication
 
 Every document starts with `version 2`. Declarations follow that node directly. There is no wrapper

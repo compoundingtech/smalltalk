@@ -9,6 +9,7 @@ members = [
   "components/vista",
   "crates/agent-spec",
   "crates/demo-resolver-wasm",
+  "crates/smallclaims",
   "crates/st-drivers",
   "crates/st-runtime",
   "crates/st-resource-protocol",
@@ -26,6 +27,7 @@ members = [
 default-members = [
   ".",
   "crates/agent-spec",
+  "crates/smallclaims",
   "crates/st-drivers",
   "crates/st-runtime",
   "crates/st-resource-protocol",

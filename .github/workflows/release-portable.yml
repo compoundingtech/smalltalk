@@ -1,3 +1,6 @@
+# Generated file - DO NOT EDIT
+# Source: release-portable.yml.genie.ts
+
 name: Publish portable st2 source
 
 on:
@@ -17,7 +20,7 @@ permissions:
 
 jobs:
   linux-x86_64:
-    runs-on: ubuntu-latest
+    runs-on: namespace-profile-linux-x86-64
     timeout-minutes: 30
     env:
       SOURCE_SHA: ${{ inputs.source_sha }}
@@ -37,6 +40,7 @@ jobs:
           test -z "$(git status --porcelain)"
           SHORT_SHA="$(git rev-parse --short=7 HEAD)"
           echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_ENV"
+
       - name: Build and verify portable binary
         run: |
           set -euo pipefail
@@ -50,6 +54,7 @@ jobs:
           grep -E "Requesting program interpreter: /(lib64|lib/x86_64-linux-gnu)/" st2.program-headers.txt
           ldd target/release/st2 | tee st2.ldd.txt
           ! grep -F "not found" st2.ldd.txt
+
       - name: Package and checksum
         run: |
           set -euo pipefail
@@ -59,6 +64,7 @@ jobs:
           sha256sum "$ARCHIVE" > SHA256SUMS
           test "$(tar -tzf "$ARCHIVE")" = st2
           echo "ARCHIVE=$ARCHIVE" >> "$GITHUB_ENV"
+
       - name: Publish successor release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -75,6 +81,7 @@ jobs:
           fi
           printf 'Exact source: `%s`.\n\nPortable Linux x86_64 artifact with checksum and fresh-download execution proof.\n' "$SOURCE_SHA" > release-notes.md
           gh release create "$TAG" --verify-tag --target "$SOURCE_SHA" --prerelease --title "st2 $TAG" --notes-file release-notes.md -- "$ARCHIVE" SHA256SUMS
+
       - name: Verify fresh download and execution
         env:
           GH_TOKEN: ${{ github.token }}

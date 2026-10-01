@@ -3953,6 +3953,30 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0c790de23124f9ab44544d7ac05d60440adc586479ce501c1d6d7da3cd8c9cf5"
 
 [[package]]
+name = "smallclaims"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "base64",
+ "chrono",
+ "ciborium",
+ "data-encoding",
+ "getrandom 0.3.4",
+ "hex",
+ "hmac",
+ "libc",
+ "proptest",
+ "ring",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "smallvec"
 version = "1.15.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4176,6 +4200,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "smallclaims",
  "st-drivers",
  "st-runtime",
  "st3-client",

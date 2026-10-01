@@ -61,6 +61,11 @@ words under the agent it is bound to, such as `agent/example · st3 driver claud
 fabric or TCP peers count as `(tcp)`. Idle load is usually many cheap requests, so these rows are
 sorted by count.
 
+It also counts what woke the reconciler: each request that changed the graph, by client (and
+claim kind for `/v1/claims`), replication receives, the reconciler's own timers and deadlines.
+Every member runs a reconcile pass for each change in the fleet, so this table names the writes
+that keep an idle daemon busy. Wakes that arrive during a pass share the next one.
+
 This accounting writes no graph claims and requires no file profiling configuration. Samples
 are local to the daemon and disappear on restart. `--performance` requests the timing report
 without running dependency checks. File profiling remains available for deeper investigation.

@@ -7,6 +7,7 @@ pub(crate) mod checkout;
 pub mod claude_channel;
 pub mod client;
 pub mod config;
+pub mod creation;
 pub(crate) mod disk;
 /// Answers the hooks an st3 seat's harness runs: `st driver-hook NAME`.
 pub mod delivery_hold;
@@ -23,9 +24,7 @@ pub mod mission;
 pub mod model;
 pub mod otlp;
 pub mod peer;
-pub mod performance;
-/// Opt-in accounting of where the daemon's time goes, turned on by `ST3_PROFILE_DIR`.
-pub mod profile;
+pub use smallclaims::{performance, profile};
 pub mod projection;
 pub mod reconcile;
 /// Observes git and gh calls without changing their command behavior.

@@ -22,6 +22,8 @@ struct Bucket {
     /// Requests by the client that sent them, and by client and request kind.
     clients: BTreeMap<String, Sample>,
     client_requests: BTreeMap<String, Sample>,
+    /// Wakes of the reconciler by what caused them.
+    wakes: BTreeMap<String, Sample>,
 }
 #[derive(Clone, Copy, PartialEq)]
 enum Table {
@@ -29,6 +31,7 @@ enum Table {
     Queries,
     Clients,
     ClientRequests,
+    Wakes,
 }
 impl Bucket {
     fn table(&self, table: Table) -> &BTreeMap<String, Sample> {
@@ -37,6 +40,7 @@ impl Bucket {
             Table::Queries => &self.queries,
             Table::Clients => &self.clients,
             Table::ClientRequests => &self.client_requests,
+            Table::Wakes => &self.wakes,
         }
     }
     fn table_mut(&mut self, table: Table) -> &mut BTreeMap<String, Sample> {
@@ -45,6 +49,7 @@ impl Bucket {
             Table::Queries => &mut self.queries,
             Table::Clients => &mut self.clients,
             Table::ClientRequests => &mut self.client_requests,
+            Table::Wakes => &mut self.wakes,
         }
     }
 }
@@ -172,9 +177,17 @@ impl Meter {
             .front()
             .map(|(at, _)| now.duration_since(*at).as_secs().clamp(1, WINDOW.as_secs()))
             .unwrap_or(WINDOW.as_secs());
+        let mut wakes = self.totals(Table::Wakes);
+        wakes.sort_by(|a, b| b.1.count.cmp(&a.1.count).then_with(|| a.0.cmp(b.0)));
+        let wakes = wakes
+            .into_iter()
+            .take(20)
+            .map(|(cause, s)| json!({"cause": cause, "count": s.count}))
+            .collect::<Vec<_>>();
         json!({"window_seconds":300,"requests":by_time(Table::Requests),"queries":by_time(Table::Queries),
             "request_count":request_count,"sampled_seconds":window_seconds,
             "clients":by_count(Table::Clients),"client_requests":by_count(Table::ClientRequests),
+            "reconciler_wakes":wakes,
             "query_time_note":"Statement wall time includes row processing; concurrent times overlap."})
     }
 }
@@ -253,6 +266,28 @@ pub fn record_request(kind: &str, client: Option<&str>, duration: Duration) {
         .lock()
         .unwrap()
         .record_request(Instant::now(), kind, client, duration);
+}
+/// Count one wake of the reconciler under its cause: the request and client that changed the graph,
+/// with `detail` such as the claim kind it wrote, or `source` when no request was running.
+pub fn record_wake(source: &str, detail: Option<&str>) {
+    let mut label = match current() {
+        Some(Charged { kind, client }) => match client {
+            Some(client) => format!("{kind} · {client}"),
+            None => kind,
+        },
+        None => source.to_owned(),
+    };
+    if let Some(detail) = detail {
+        label.push_str(" · ");
+        label.push_str(detail);
+    }
+    METER.get_or_init(Mutex::default).lock().unwrap().record(
+        Instant::now(),
+        Table::Wakes,
+        label,
+        Duration::ZERO,
+        0,
+    );
 }
 pub fn snapshot() -> Value {
     METER
@@ -411,6 +446,29 @@ mod tests {
         assert_eq!(report["client_requests"][0]["kind"], "/v1/messages/page");
         assert_eq!(report["client_requests"][0]["count"], 30);
         assert_eq!(report["clients"].as_array().unwrap().len(), 2);
+    }
+    #[test]
+    fn reconciler_wakes_are_counted_by_the_request_that_caused_them() {
+        let before = snapshot();
+        let count = |report: &Value, cause: &str| {
+            report["reconciler_wakes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["cause"] == cause)
+                .map_or(0, |row| row["count"].as_u64().unwrap())
+        };
+        with_cpu(Some("/v1/claims"), Some("agent/a · st3 claim"), || {
+            record_wake("api", Some("message.read"));
+        });
+        record_wake("timer step-timeout", None);
+        let after = snapshot();
+        let cause = "/v1/claims · agent/a · st3 claim · message.read";
+        assert_eq!(count(&after, cause) - count(&before, cause), 1);
+        assert_eq!(
+            count(&after, "timer step-timeout") - count(&before, "timer step-timeout"),
+            1
+        );
     }
     #[test]
     fn queries_do_not_disclose_values() {

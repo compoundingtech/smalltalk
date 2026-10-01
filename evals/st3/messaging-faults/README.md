@@ -38,6 +38,7 @@ Fixture errors record the phase that timed out. The cases are:
 | baseline | No fault | Sender accepts the message |
 | daemon-restart | Queue remotely before stopping the receiving daemon and replication worker, using a temporary link gate to prevent a successful handoff race | Restarted API answers and worker is started |
 | binary-swap | Queue during a partition, atomically replace the receiver's executable at its watched path, restart its daemon/worker | API answers and peer link opens |
+| path-deploy | Queue during a partition, restart the receiver's daemon/worker from the replacement at a new path, as a new Nix store path does, leaving the old executable in place | API answers and peer link opens |
 | link-seconds | Drop both peer routes for three seconds with a message queued | Both routes open |
 | link-minutes | Drop both peer routes for two minutes with a message queued | Both routes open |
 | receiver-down | Receiving daemon and worker are down when the sender accepts the message | Restarted API answers and worker is started |
@@ -76,7 +77,8 @@ Duplicates after that bounded observation window are not covered.
 
 Delivery and reporting are separate results: a working old channel that st reports
 as stale fails the reporting gate even if the message arrives. `result.json` records
-both receipt timing and the delivery assessment. Modern paths must be `current`; the historical
+both receipt timing and the delivery assessment. Modern paths must be `current`, and every
+`st3 driver` process of the seat must run the daemon's executable; the historical
 path must be `legacy`, which exposes recent polling without inventing image/readiness evidence.
 The failed-handoff case also requires a visible blockage in the agent, doctor and sender views. Per-case evidence keeps graph
 traces, native receipts, process snapshots, agent cards, replication status and

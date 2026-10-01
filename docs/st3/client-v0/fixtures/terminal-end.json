@@ -1,0 +1,13 @@
+{
+  "api_version": "st3.client.v0",
+  "id": "action/terminal-end",
+  "type": "terminal.end",
+  "idempotency_key": "fixture-terminal-end-0001",
+  "fence": {
+    "snapshot_id": "snapshot/example/1/creation",
+    "subject_revisions": {}
+  },
+  "parameters": {
+    "target_id": "terminal/pty/person/ada/019a0000-0000-7000-8000-000000000001"
+  }
+}

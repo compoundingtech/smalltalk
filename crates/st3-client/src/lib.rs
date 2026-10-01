@@ -1171,6 +1171,17 @@ impl Client {
     pub async fn glasses_get(&self, id: &str) -> Result<Envelope<Resource>, ClientError> {
         self.resource_internal("glasses", id).await
     }
+    pub async fn agent_create(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: AgentCreateParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::agent_create(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
     pub async fn agent_queue_move(
         &self,
         id: impl Into<String>,
@@ -1514,6 +1525,17 @@ impl Client {
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }
+    pub async fn terminal_create(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: TerminalCreateParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::terminal_create(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
     pub async fn terminal_detach(
         &self,
         id: impl Into<String>,
@@ -1522,6 +1544,17 @@ impl Client {
         parameters: TargetParameters,
     ) -> Result<Envelope<ActionResult>, ClientError> {
         let request = ActionRequest::terminal_detach(id, idempotency_key, fence, parameters)
+            .map_err(|error| ClientError::Protocol(error.to_string()))?;
+        self.action_internal(&request).await
+    }
+    pub async fn terminal_end(
+        &self,
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: TargetParameters,
+    ) -> Result<Envelope<ActionResult>, ClientError> {
+        let request = ActionRequest::terminal_end(id, idempotency_key, fence, parameters)
             .map_err(|error| ClientError::Protocol(error.to_string()))?;
         self.action_internal(&request).await
     }
