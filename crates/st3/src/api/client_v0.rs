@@ -3349,8 +3349,14 @@ fn managed_transcript(
 }
 
 /// The timeline entry that says a managed seat's native transcript is not shown, and why.
+/// A timeline entry saying why the seat's transcript is not shown. When st3 bound the transcript
+/// but could not read it, the entry names the file, so the failure can be reported.
 fn transcript_notice(session_id: &str, managed: &ManagedTranscript, reason: &str) -> Value {
     let anchor = &managed.anchor;
+    let mut details = json!({ "driver": managed.driver, "claim_id": anchor.id });
+    if let Ok(external) = &managed.transcript {
+        details["transcript"] = Value::String(external.transcript.display().to_string());
+    }
     let fields = anchor.body.get("fields").unwrap_or(&anchor.body);
     let digest = hex::encode(Sha256::digest(
         format!("{}:transcript-not-bound", anchor.id).as_bytes(),
@@ -3374,7 +3380,7 @@ fn transcript_notice(session_id: &str, managed: &ManagedTranscript, reason: &str
             "code": "transcript-not-bound",
             "message": format!("transcript not bound: {reason}"),
             "retryable": true,
-            "details": { "driver": managed.driver, "claim_id": anchor.id }
+            "details": details
         }
     })
 }
@@ -10380,6 +10386,42 @@ mission "example/zero-run" state="ready" {
                 .iter()
                 .any(|item| item["body"]["text"] == "Native reply")
         );
+        // A transcript st3 binds but cannot read is named, so the failure can be reported.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Root reads anything; the check needs a file this user really cannot read.
+            if std::fs::read(&transcript).is_err() {
+                let unreadable = timeline_value(
+                    &state,
+                    &new_client_snapshot(&state),
+                    &session,
+                    &session_id,
+                    &ClientListQuery::default(),
+                )
+                .unwrap()
+                .0;
+                let notice = unreadable["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["body"]["code"] == "transcript-not-bound")
+                    .cloned()
+                    .expect("an unreadable transcript is named");
+                assert_eq!(
+                    notice["body"]["details"]["transcript"],
+                    transcript.display().to_string()
+                );
+                assert!(
+                    notice["body"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("transcript not bound: the transcript could not be read"),
+                    "{notice:#}"
+                );
+            }
+            std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         std::fs::write(
             directory.join("binding.json"),
             serde_json::to_vec(
