@@ -14,6 +14,11 @@ key="$dir/nix-cache-key"
 case "$cmd" in
   use)
     mkdir -p "$cache"
+    # The Nix daemon runs as root and creates the store's directories when it first queries a
+    # substituter, which would leave `save` (the runner user) unable to write. Take ownership of
+    # anything an earlier run left behind, and create the layout as the runner before the daemon does.
+    sudo chown -R "$(id -un)" "$cache"
+    nix store info --store "file://$cache" > /dev/null
     # One signing key per cache volume; the volume is private to this repository's runners.
     [ -s "$key.sec" ] || nix key generate-secret --key-name st-ci-cache-1 > "$key.sec"
     nix key convert-secret-to-public < "$key.sec" > "$key.pub"
