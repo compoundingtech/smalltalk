@@ -94,6 +94,22 @@ pub fn read_state(status_path: &Path) -> State {
     read_parsed_at(record, legacy_mtime_ms, crate::message::now_ms())
 }
 
+/// Remaining expiry of an effective DND record, for one-time native adoption only.
+/// It never refreshes, rewrites, or extends an abandoned hold.
+pub fn dnd_deadline_ms(status_path: &Path) -> Option<u64> {
+    let (record, legacy_mtime_ms) = read_record(status_path).ok()?;
+    let now = crate::message::now_ms();
+    if read_parsed_at(record, legacy_mtime_ms, now) != State::Dnd {
+        return None;
+    }
+    let written = match record {
+        ParsedRecord::Version1 { written_at_ms, .. } => written_at_ms,
+        ParsedRecord::Legacy(_) => legacy_mtime_ms?,
+        _ => return None,
+    };
+    Some(written.saturating_add(duration_ms(STATUS_STALE)))
+}
+
 /// Set an agent's presence to a version 1 record with the current timestamp. The write is atomic
 /// (temporary sibling + rename) and creates the agent directory when needed.
 pub fn set_state(status_path: &Path, state: State) -> anyhow::Result<()> {
@@ -320,6 +336,29 @@ mod tests {
     /// cannot catch is the prefix being renamed on BOTH sides at once — a staged status file would
     /// then still be skipped locally, but the fleet's existing records and any other reader of the
     /// old name would not. That is what this assertion is for.
+    #[test]
+    fn adoption_uses_only_the_remaining_dnd_expiry_without_refreshing() {
+        let root = tempfile::tempdir().unwrap();
+        let path = status_path(root.path());
+        let now = crate::message::now_ms();
+        let written = now - 60_000;
+        write_record(&path, State::Dnd, written).unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(
+            dnd_deadline_ms(&path),
+            Some(written + duration_ms(STATUS_STALE))
+        );
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        write_record(&path, State::Dnd, now - duration_ms(STATUS_STALE)).unwrap();
+        assert_eq!(dnd_deadline_ms(&path), None);
+        write_record(&path, State::Busy, now).unwrap();
+        assert_eq!(dnd_deadline_ms(&path), None);
+        fs::write(&path, "dnd\n").unwrap();
+        assert!(dnd_deadline_ms(&path).is_some());
+        fs::write(&path, "dnd\nv1 invalid\n").unwrap();
+        assert_eq!(dnd_deadline_ms(&path), None);
+    }
+
     #[test]
     fn the_staging_prefix_is_the_one_the_catalog_walkers_match() {
         assert_eq!(TMP_PREFIX, ".status");

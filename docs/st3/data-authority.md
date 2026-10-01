@@ -75,6 +75,39 @@ at least once: partial acceptance can repeat logs, delta points or spans on retr
 with backoff up to five minutes and never blocks a write. Observations trimmed before export are
 counted in the daemon log.
 
+Codex and OpenCode delivery holds are durable `delivery.hold` decisions on the seat, with
+an actor, reason, and explicit expiry. They are separate from reachability, observed activity,
+and the harness's own approval/compaction holds. Inspect, set, and release them with:
+
+```sh
+st agents hold agent/example/worker
+st agents hold agent/example/worker --for 15m --reason "Quiet interval" --as person/alex
+st agents hold agent/example/worker --release --reason "Resume delivery" --as person/alex
+```
+
+`GET /v1/delivery/hold?subject=agent/example/worker` returns the current decision and whether
+it is active. `POST /v1/delivery/hold` is the dedicated operation; ordinary claim submission
+cannot write it. A person may control a seat, and a seat may control itself. Setting a new hold
+requires a declared Codex or OpenCode seat, the harnesses whose former DND behavior this replaces.
+A release records expiry zero; a hold requires a future Unix-millisecond deadline. Decisions
+replicate and survive daemon/driver restart. Expiry enables delivery without another write.
+
+Native wrappers no longer create or refresh legacy `status` files. Their observed-record
+heartbeats remain session-owned. Codex/OpenCode pumps receive graph control explicitly, start
+closed, and refresh it once per second with a 250 ms request deadline and three-second permit.
+An unavailable, malformed, or mismatched response closes the gate; a stalled driver loop also
+loses its permit. Holds block new handoffs while providers, observations, and pending receipt
+reconciliation continue. Input already handed to a harness cannot be recalled.
+
+A replacement adopting an older Codex/OpenCode provider imports a still-fresh DND once with its
+original expiry. The store admits that import only when no graph hold decision exists, inside
+the writer transaction, so an explicit graph release cannot be overwritten by adoption. Fresh
+launches ignore historical status files. Old wrapper images retain their existing behavior
+until replacement/restart; the separately maintained catalog product keeps its own status/DND
+transport. Deploy the matching daemon API with the new driver binary: a new driver talking to
+an older daemon keeps the provider running and holds new Codex/OpenCode handoffs until that API
+is available. This change does not replace mailbox or harness-observation transport.
+
 Runtime observations and harness observations remain separate claims. The status projection puts
 runtime fields in `actual` and the current incarnation's harness fields in `harness`.
 

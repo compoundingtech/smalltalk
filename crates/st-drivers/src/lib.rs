@@ -73,6 +73,7 @@ pub mod resource_profile_supervisor;
 pub mod resync;
 pub mod run;
 
+pub mod session_control;
 pub mod status;
 pub mod supervisor_chain;
 pub mod task_inventory;
