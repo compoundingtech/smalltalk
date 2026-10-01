@@ -6,7 +6,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { TimelineEntry } from '../../../clients/typescript/st3-client';
 import { agentGlyph, agentName, agentState, agentWord, harnessColor, harnessName } from '../agentsView';
 import { Banners } from '../chrome';
-import { conversationEntries, shownToolLines, type ConversationEntry } from '../conversationView';
+import { conversationEntries, shownToolLines, unreadableTranscript, type ConversationEntry } from '../conversationView';
 import { rememberBounded } from '../boundedCache';
 import type { RootScreen } from '../navigation';
 import { applyConversation, isUnresolved, type Conversation } from '../sessionView';
@@ -84,7 +84,9 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     if (caps?.session_actor) map.set(caps.session_actor, 'you');
     return map;
   }, [data.agents, caps?.session_actor]);
-  const entries = useMemo(() => conversationEntries(timeline.entries, names), [timeline.entries, names]);
+  // Half a conversation is worse than none: when st could not read the transcript, say why.
+  const unreadable = useMemo(() => unreadableTranscript(timeline.entries), [timeline.entries]);
+  const entries = useMemo(() => unreadable ? [] : conversationEntries(timeline.entries, names), [unreadable, timeline.entries, names]);
   // A message st has taken shows up in the conversation; the pending copy then gives way.
   useEffect(() => {
     setPending(previous => previous.filter(item => item.failed || !entries.some(entry => entry.body.kind === 'mail' && entry.body.from === 'you' && entry.body.text.trim() === item.text.trim())));
@@ -121,7 +123,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       renderItem={({ item: row }) => row.kind === 'older'
         ? <View style={styles.entry}><T dim>older history is not shown here · `st conversations timeline` has all of it</T></View>
         : row.kind === 'pending' ? <PendingView pending={row.pending} /> : <EntryView entry={row.entry} open={open.has(row.entry.id)} onToggle={toggle} />}
-      ListEmptyComponent={<View style={[styles.entry, { transform: [{ scaleY: -1 }] }]}><T dim>{unresolved ? 'This process has no exact native session history.' : status === 'online' ? 'No conversation in the recent timeline.' : 'Offline; this conversation has not been loaded.'}</T></View>}
+      ListEmptyComponent={<View style={[styles.entry, { transform: [{ scaleY: -1 }] }]}>{unreadable ? <T color={theme.waiting} selectable>{unreadable}</T> : <T dim>{unresolved ? 'This process has no exact native session history.' : status === 'online' ? 'No conversation in the recent timeline.' : 'Offline; this conversation has not been loaded.'}</T>}</View>}
       maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 60 }}
       keyboardDismissMode="interactive"
       keyboardShouldPersistTaps="handled"

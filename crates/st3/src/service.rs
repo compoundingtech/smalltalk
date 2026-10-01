@@ -102,6 +102,9 @@ impl ServiceSpec {
         if let Some(peer_listen) = &self.config.peer_listen {
             arguments.extend(["--peer-listen".into(), peer_listen.clone()]);
         }
+        if self.config.peer_listen_allow_plain_http {
+            arguments.push("--peer-listen-allow-plain-http".into());
+        }
         for peer in &self.config.peers {
             arguments.extend(["--peer".into(), format!("{}={}", peer.name, peer.url)]);
         }
@@ -1025,7 +1028,8 @@ mod tests {
             pty_root: Some("/var/lib/pty".into()),
             socket: "/run/user/1000/st3.sock".into(),
             client_gateway_socket: "/run/user/1000/st3-client.sock".into(),
-            peer_listen: Some("127.0.0.1:31313".into()),
+            peer_listen: Some("0.0.0.0:31313".into()),
+            peer_listen_allow_plain_http: true,
             peers: vec![PeerConfig {
                 name: "node-b".into(),
                 url: "http://127.0.0.1:31314".into(),
@@ -1042,6 +1046,7 @@ mod tests {
         assert!(unit.contains("--pty-root /var/lib/pty"));
         assert!(unit.contains("--client-gateway-socket /run/user/1000/st3-client.sock"));
         assert!(unit.contains("--peer node-b=http://127.0.0.1:31314"));
+        assert!(unit.contains("--peer-listen 0.0.0.0:31313 --peer-listen-allow-plain-http"));
         assert!(unit.contains("MemoryMax=1024M"));
         assert!(unit.contains("Environment=MALLOC_ARENA_MAX=2"));
         assert!(unit.contains("Restart=on-failure"));
@@ -1050,6 +1055,7 @@ mod tests {
         assert!(unit.contains("KillMode=control-group"));
         let replication = render_systemd_replication_unit(&spec);
         assert!(replication.contains("replication-worker"));
+        assert!(replication.contains("--peer-listen 0.0.0.0:31313 --peer-listen-allow-plain-http"));
         assert!(replication.contains("Nice=0"));
         assert!(replication.contains("CPUWeight=100\n"));
         assert!(!replication.contains("IOWeight"));

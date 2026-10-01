@@ -7,7 +7,7 @@ clients consume the same JSON; no client parses CLI output, Markdown, KDL, claim
 harness transcript files.
 
 The reusable Rust package is [`crates/st3-client`](../../../crates/st3-client) and supports both the
-local Unix socket and authenticated Fabric-loopback HTTP. The Swift package is
+local Unix socket and authenticated paired HTTP over Tailscale or optional Fabric. The Swift package is
 [`clients/swift/St3Client`](../../../clients/swift/St3Client). The Expo TypeScript client is
 [`clients/typescript/st3-client`](../../../clients/typescript/st3-client). Regenerate all three
 clients' contract tables with `cargo run -p st3-client-codegen`;
@@ -17,8 +17,8 @@ CI and local verification use `cargo run -p st3-client-codegen -- --check` for b
 
 The client API is a projection and command gateway, not a graph replica. Its version is
 `st3.client.v0` and its routes live below `/v1/client`. A local client connects to the daemon's Unix
-socket. A remote client connects to a loopback-only gateway through authenticated Fabric. The
-daemon and gateway MUST NOT bind this API to a non-loopback TCP address.
+socket. A remote client connects to the paired-only gateway through a tailnet carrier or optional
+Fabric. Never expose the privileged local Unix API through a TCP forwarder.
 
 The gateway authenticates a paired device and derives the actor and scopes for the connection.
 Request bodies never select an actor. Device credentials are scoped, individually revocable, and
@@ -172,6 +172,40 @@ until the page omits the notice.
 IDs are stable opaque strings with a type prefix. Renames change labels, not IDs. A detail response
 uses the same representation as its list item plus its documented detail fields. Deletion is
 represented by an event tombstone; an ID is never reused.
+
+### Applied subject definitions
+
+`GET /v1/client/subject-definition?subject=agent%2Fexample%2Fworker` reads exactly one agent's
+applied desired declaration, including mission-owned and ad-hoc seats. It requires
+`read.projections`; the Rust method is
+`Client::subject_definition(subject, show_env_values)`, returning `Envelope<SubjectDefinition>`
+over either transport. Swift and TypeScript expose `subjectDefinition` with `showEnvValues`
+defaulting to `false`.
+
+Environment variable names are preserved, but their values are `"<redacted>"` by default in both
+`desired` and `kdl`. Request `&show_env_values=true` to include literal values; that also requires
+`read.declarations`, so a projection-only reader gets `forbidden` rather than secrets.
+
+The value contains `kind: "subject-definition"`, `subject`, the typed canonical node tree
+`desired` (`name`, optional positional `arguments`, sorted `properties`, ordered `children`),
+rendered canonical KDL `kdl`, `desired_revision`, the selected desired claim `desired_token`,
+and competing claim tokens in `conflicts`. The envelope snapshot's `store_index` fences all these
+fields to one SQLite read snapshot. The read never includes the subject's claim history or other
+subjects' definitions.
+
+The KDL document starts with `version 2` and reconstructs the applied AST. It is suitable for
+display without client-side KDL parsing. It is not original source: comments, whitespace, authored
+entry ordering, and source paths are not retained. Clients label it, for example,
+`applied · rev <desired_revision> · reconstructed`. A redacted document is not an applicable
+copy of the definition: re-publishing it would replace the environment values with `<redacted>`.
+
+Unknown agents and agents with observations but no applied desired declaration return typed
+`not-found`. Other subject kinds return `validation-failed`: a mission is published as a compiled
+revision (read it through `/missions/{id}`) and keeps no canonical declaration AST to render.
+A definition is never truncated:
+when its serialized value exceeds `max_response_bytes - 4096` (reserving room for the envelope),
+the server returns `validation-failed` rather than an incomplete AST or KDL document.
+
 
 `operations` is the client-safe operational view: daemon health, host reachability, transport
 health, resource observers, and diagnostics. Some diagnostics compare the whole projection with
@@ -452,9 +486,9 @@ offers the same bounded change read for clients that cannot open WebSockets.
 
 ## Terminal protocol
 
-Terminal access is a client protocol, not raw PTY ownership. The server sends screens, never PTY
-bytes: each screen is complete and replaces every earlier one, so nothing is replayed and a client
-that falls behind skips to the latest screen. Interactive attach from a terminal on the owning host
+The projected terminal protocol sends complete screens: each screen replaces every earlier one,
+so a client that falls behind skips to the latest screen. Full-fidelity applications use the raw
+PTY transport below instead. Interactive attach from a terminal on the owning host
 (`pty attach`, `st terminals attach`) is a different, privileged path that passes raw bytes. On that
 host, `st terminals attach` reads the PTY session from the local daemon
 (`GET /v1/sessions/local-terminal/{subject}`, which writes nothing) and connects to that session
@@ -537,6 +571,48 @@ carry fails with `remote-unavailable`.
 Read-only terminal scope permits screens but rejects input and resize. Screen payloads obey
 negotiated byte limits: at most 200 lines and 4096 bytes of text per line, with explicit
 `redacted` and `truncated` markers.
+
+### Raw PTY transport
+
+`POST /v1/client/terminals/{id}/raw-attachments` accepts
+`{"runtime_incarnation":"PID:CREATED_AT","mode":"attach"}` (or `"peek"`).
+The ordinary client response envelope carries `terminal_id`, `runtime_incarnation`,
+`owner_host_id`, `mode`, and `stream_capability` in `value`. A capability expires after 60 seconds
+and can open exactly one transport. It is bound to the gateway's authenticated session and person,
+terminal, owner host, runtime ID and incarnation, and access mode. Projected-screen capabilities
+cannot open raw streams, and raw capabilities cannot open projected streams.
+
+Open `/v1/client/terminals/{id}/raw-stream?incarnation=...&mode=attach` using WebSocket subprotocol
+`st3.client.pty.v0` and secondary `st3.cap.CAPABILITY`. The credential and capability never appear
+in the URL. Authentication, mode checking, single-use consumption, owner graph fencing and the
+owner's kernel/registry incarnation proof all precede upgrade. Both modes require a concrete
+person and `terminal.read`; `attach` also requires `terminal.control`.
+
+Binary WebSocket messages are consecutive bytes of the original PTY protocol, not JSON screens.
+Message boundaries have no PTY meaning. The client sends ATTACH (or PEEK) itself, and receives the
+PTY's atomic SCREEN replay followed by live DATA, GEOMETRY and EXIT unchanged. The owner holds
+one PTY connection for the transport lifetime. ATTACH and RESIZE therefore participate in normal
+per-axis min-wins geometry with other persistent writers; PEEK cannot send input, resize, upgrade
+to ATTACH, or contribute geometry. DETACH and closing the transport release the connection.
+Raw clients cannot issue PTY lifecycle/CAS or ancestry-management commands through this capability.
+Bounded chunks and socket backpressure preserve every byte; slow consumers do not skip output.
+
+`st3-client::Client::raw_terminal_attachment` obtains the capability and
+`raw_terminal_stream` returns a Tokio `UnixStream`. A terminal renderer can run its own PTY
+parser, mode-aware paste, and geometry negotiation over it without learning about the fleet.
+Each reconnect obtains a fresh capability for the same explicitly chosen incarnation; the
+transport does not silently reselect a replacement runtime or replay input.
+
+Remote raw transport chooses the owner's currently advertised direct member route, over signed
+HTTP/WebSocket replication transport or optional Fabric. Modern membership-only fleets do not need
+static config peers or Fabric. Every peer handshake verifies fleet authentication and current
+member signatures; the owner then rechecks person authority and the exact live incarnation.
+Unlike projected-screen reads, raw streams currently require a directly dialable owner endpoint;
+they fail with `remote-unavailable` rather than replacing the stream with synthetic screens.
+The owner's replication worker advertises its Tailscale endpoint, whether discovered or set with
+a Tailscale `peer_listen`; see [Tailscale setup](../tailscale.md).
+The client-facing carrier remains a forwarder to `st3-client.sock`, never `st3.sock`.
+
 
 ## Errors and evolution
 

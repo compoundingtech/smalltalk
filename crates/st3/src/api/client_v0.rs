@@ -3,6 +3,8 @@ use axum::http::HeaderMap;
 use axum::http::header::{AUTHORIZATION, SEC_WEBSOCKET_PROTOCOL};
 use std::collections::BTreeSet;
 
+pub(super) mod raw_terminal;
+
 const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
 const COLLECTION_SUBPROTOCOL: &str = "st3.client.collections.v0";
@@ -761,6 +763,81 @@ pub(super) async fn document_get(
         .await?
         .ok_or_else(|| ApiError::not_found(format!("document `{}` is not stored", query.name)))?;
     Ok(Json(json!({ "reference": query.name, "bytes": bytes })))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SubjectDefinitionQuery {
+    subject: String,
+    #[serde(default)]
+    show_env_values: bool,
+}
+
+/// One agent's applied definition, reconstructed from its selected desired claim, not authored
+/// source. Missions are published as compiled revisions and keep no canonical declaration AST.
+/// Environment values are redacted unless the caller asks for them and holds declaration scope.
+pub(super) async fn subject_definition(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<SubjectDefinitionQuery>,
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
+    require_scope(&session, "read.projections")?;
+    if query.show_env_values {
+        require_scope(&session, "read.declarations")?;
+    }
+    if !query.subject.starts_with("agent/") {
+        return Err(ApiError::bad(St3Error::new(
+            "validation-failed",
+            "a definition subject must start with `agent/`; missions are published revisions \
+             without a canonical declaration",
+        )));
+    }
+    let subject = query.subject.clone();
+    let show_env_values = query.show_env_values;
+    let result = blocking_store(move || {
+        let store = state.store.clone();
+        store.read_snapshot(|index| {
+            let status = store.status_at(Some(&subject), None, Some(index))?;
+            let Some(status) = status.subjects.into_iter().find(|item| item.subject == subject)
+            else {
+                return Ok(None);
+            };
+            let Some(mut desired) = status.desired else {
+                return Ok(None);
+            };
+            if !show_env_values {
+                crate::graph::redact_agent_env_values(&mut desired);
+            }
+            let kdl = crate::graph::render_agent_desired_kdl(&desired)?;
+            let revision = status.desired_revision
+                .ok_or_else(|| anyhow::anyhow!("an applied definition has no desired revision"))?;
+            let token = status.desired_token
+                .ok_or_else(|| anyhow::anyhow!("an applied definition has no desired token"))?;
+            let value = json!({
+                "kind": "subject-definition",
+                "subject": subject,
+                "desired": desired,
+                "kdl": kdl,
+                "desired_revision": revision,
+                "desired_token": token,
+                "conflicts": status.conflicts,
+            });
+            Ok(Some((client_snapshot_at(&state, index), value)))
+        })
+    }).await?;
+    let (snapshot, value) = result.ok_or_else(|| ApiError::not_found(
+        format!("subject `{}` has no applied definition", query.subject),
+    ))?;
+    // Reserve space for the snapshot and response envelope. Definitions are never truncated.
+    if serde_json::to_vec(&value).map_err(ApiError::internal)?.len()
+        > CLIENT_MAX_RESPONSE_BYTES - 4096
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "validation-failed",
+            "the applied definition exceeds the client response limit",
+        )));
+    }
+    Ok((Extension(snapshot), Json(value)))
 }
 
 const ALL_SCOPES: &[&str] = &[
@@ -3274,8 +3351,14 @@ fn managed_transcript(
 }
 
 /// The timeline entry that says a managed seat's native transcript is not shown, and why.
+/// A timeline entry saying why the seat's transcript is not shown. When st3 bound the transcript
+/// but could not read it, the entry names the file, so the failure can be reported.
 fn transcript_notice(session_id: &str, managed: &ManagedTranscript, reason: &str) -> Value {
     let anchor = &managed.anchor;
+    let mut details = json!({ "driver": managed.driver, "claim_id": anchor.id });
+    if let Ok(external) = &managed.transcript {
+        details["transcript"] = Value::String(external.transcript.display().to_string());
+    }
     let fields = anchor.body.get("fields").unwrap_or(&anchor.body);
     let digest = hex::encode(Sha256::digest(
         format!("{}:transcript-not-bound", anchor.id).as_bytes(),
@@ -3299,7 +3382,7 @@ fn transcript_notice(session_id: &str, managed: &ManagedTranscript, reason: &str
             "code": "transcript-not-bound",
             "message": format!("transcript not bound: {reason}"),
             "retryable": true,
-            "details": { "driver": managed.driver, "claim_id": anchor.id }
+            "details": details
         }
     })
 }
@@ -5851,6 +5934,17 @@ fn consume_terminal_attachment(
     incarnation: &str,
     capability: Option<&str>,
 ) -> Result<(), ApiError> {
+    consume_terminal_attachment_mode(state, session, terminal_id, incarnation, capability, None)
+}
+
+fn consume_terminal_attachment_mode(
+    state: &AppState,
+    session: &ClientSession,
+    terminal_id: &str,
+    incarnation: &str,
+    capability: Option<&str>,
+    raw_mode: Option<&str>,
+) -> Result<(), ApiError> {
     let capability = capability
         .filter(|value| !value.is_empty())
         .ok_or_else(|| forbidden("a terminal stream capability is required"))?;
@@ -5878,9 +5972,20 @@ fn consume_terminal_attachment(
         .max_by_key(|claim| claim.store_index)
         .ok_or_else(|| ApiError::internal("the terminal attachment has no head"))?;
     let field = |name: &str| attached.body.pointer(&format!("/fields/{name}"));
+    let raw_live = raw_mode.map(|_| {
+        remote_terminal_live_session(state, &terminal_subject(terminal_id), incarnation)
+    }).transpose()?;
     let valid = latest.id == attached.id
         && attached.origin == state.store.origin()
         && field("session_actor").and_then(Value::as_str) == Some(session.actor.as_str())
+        && field("raw_mode").and_then(Value::as_str) == raw_mode
+        && raw_mode.is_none_or(|_| {
+            field("person_id").and_then(Value::as_str) == Some(session.authority_actor.as_str())
+        })
+        && raw_live.as_ref().is_none_or(|live| {
+            field("owner_host_id").and_then(Value::as_str) == Some(live.owner_host_id.as_str())
+                && field("runtime_id").and_then(Value::as_str) == Some(live.runtime_id.as_str())
+        })
         && field("owner_host_id")
             .and_then(Value::as_str)
             .is_some_and(|owner| {
@@ -7594,6 +7699,44 @@ mod tests {
                 .contains("could not identify its saved session")
         );
         assert!(!error.message.contains("does not exist"));
+    }
+
+    #[test]
+    fn applied_definition_kdl_preserves_kdl_scalars_and_identifiers() {
+        let desired = json!({
+            "name": "agent",
+            "arguments": ["example/worker"],
+            "children": [{
+                "name": "name with spaces",
+                "arguments": ["λ \"quoted\"\\\n", i64::MIN, i64::MAX, 1.0, 1.25, true, false, null],
+                "properties": { "property with spaces": "\"\\\nλ" },
+                "children": [{ "name": "child", "arguments": [null] }],
+            }],
+        });
+        let rendered = crate::graph::render_agent_desired_kdl(&desired).unwrap();
+        let document = rendered.parse::<kdl::KdlDocument>().unwrap();
+        assert_eq!(document.nodes()[0].name().value(), "version");
+        assert_eq!(document.nodes()[1].name().value(), "agent");
+        let node = &document.nodes()[1].children().unwrap().nodes()[0];
+        assert_eq!(node.name().value(), "name with spaces");
+        let values = node.entries().iter().filter(|entry| entry.name().is_none())
+            .map(|entry| entry.value().clone()).collect::<Vec<_>>();
+        assert_eq!(values, vec![
+            kdl::KdlValue::String("λ \"quoted\"\\\n".into()),
+            kdl::KdlValue::Integer(i128::from(i64::MIN)),
+            kdl::KdlValue::Integer(i128::from(i64::MAX)),
+            kdl::KdlValue::Float(1.0),
+            kdl::KdlValue::Float(1.25),
+            kdl::KdlValue::Bool(true),
+            kdl::KdlValue::Bool(false),
+            kdl::KdlValue::Null,
+        ]);
+        let property = node.entries().iter().find(|entry| entry.name().is_some()).unwrap();
+        assert_eq!(property.name().unwrap().value(), "property with spaces");
+        assert_eq!(property.value(), &kdl::KdlValue::String("\"\\\nλ".into()));
+        let child = &node.children().unwrap().nodes()[0];
+        assert_eq!(child.name().value(), "child");
+        assert_eq!(child.entries()[0].value(), &kdl::KdlValue::Null);
     }
 
     fn test_state(root: &Path) -> AppState {
@@ -10299,6 +10442,42 @@ mission "example/zero-run" state="ready" {
                 .iter()
                 .any(|item| item["body"]["text"] == "Native reply")
         );
+        // A transcript st3 binds but cannot read is named, so the failure can be reported.
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o000)).unwrap();
+            // Root reads anything; the check needs a file this user really cannot read.
+            if std::fs::read(&transcript).is_err() {
+                let unreadable = timeline_value(
+                    &state,
+                    &new_client_snapshot(&state),
+                    &session,
+                    &session_id,
+                    &ClientListQuery::default(),
+                )
+                .unwrap()
+                .0;
+                let notice = unreadable["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["body"]["code"] == "transcript-not-bound")
+                    .cloned()
+                    .expect("an unreadable transcript is named");
+                assert_eq!(
+                    notice["body"]["details"]["transcript"],
+                    transcript.display().to_string()
+                );
+                assert!(
+                    notice["body"]["message"]
+                        .as_str()
+                        .unwrap()
+                        .starts_with("transcript not bound: the transcript could not be read"),
+                    "{notice:#}"
+                );
+            }
+            std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         std::fs::write(
             directory.join("binding.json"),
             serde_json::to_vec(

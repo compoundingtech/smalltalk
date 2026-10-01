@@ -210,6 +210,18 @@ st agents start example/worker --harness claude --model claude-sonnet-5 --effort
   --as person/ada --print-kdl > worker.kdl
 ```
 
+`agents start` accepts an identity or a complete agent subject: `example/worker` and
+`agent/example/worker` both declare `agent/example/worker`. A slash-qualified or dotted identity
+is exact; a simple name such as `worker` becomes `agent/HOST.worker` on its placement host.
+Use `agent/HOST.worker` to name that seat explicitly. A doubled `agent/agent/` prefix is rejected.
+
+Starting an existing seat preserves its declaration, including its restart policy and command.
+Only explicit `--host`, `--workspace`, `--harness`, `--model`, `--effort`, and `--arg` options patch
+it. `--model`, `--effort`, and `--arg` require an existing typed harness and are refused for
+`command`/`argv` seats. For a new seat, the defaults remain Claude, the current workspace, and
+`restart always`. `--print-kdl` queries the daemon to preview the effective declaration without
+publishing it.
+
 ```kdl
 version 2
 agent "example/worker" {
