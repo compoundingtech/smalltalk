@@ -1285,6 +1285,9 @@ st sends a cancellation message to each active claimant. The message tells the a
 A continuous mission stays open after its current steps are exhausted. It does not need a separate mission type.
 
 A recurring schedule creates a durable request for one exact finite mission revision.
+The schedule's work may name either a pinned `mission "fabric/cycle@REVISION"` or an
+unpinned `mission "fabric/cycle"`. Only scheduled work accepts the unpinned form;
+an explicit mission run still requires an exact revision.
 
 ```kdl
 schedule "cycle" {
@@ -1298,6 +1301,54 @@ schedule "cycle" {
   }
 }
 ```
+For one run per local calendar day, use an IANA timezone instead of a fixed-duration UTC interval:
+
+```kdl
+schedule "daily" {
+  calendar { at "08:00"; timezone "Europe/Berlin" }
+  catch-up "latest"
+  work {
+    mission "fabric/cycle@REVISION"
+    workspace "/work/fabric-cycles"
+  }
+}
+```
+
+For a weekly cycle, use `calendar { at "Mon 09:00"; timezone "Europe/Berlin" }`
+inside the same schedule shape. The supported weekday names are `Mon`, `Tue`, `Wed`,
+`Thu`, `Fri`, `Sat`, and `Sun`. `calendar` accepts daily `HH:MM` or weekly
+`DAY HH:MM` in 24-hour local time plus an IANA timezone. It cannot be combined
+with `at`, `every`, or `anchor`. Absolute UTC `at` still fires once; `every` with
+a UTC `anchor` still measures fixed elapsed intervals. Daily and weekly calendar
+occurrences use the matching local date (`YYYYMMDD`) as their durable key.
+A nonexistent wall time in a spring DST gap fires once at the first valid instant after
+the gap (02:30 Europe/Berlin on 2027-03-28
+fires at 03:00 local). A repeated time in an autumn fold fires once at the earlier instant
+(02:30 Europe/Berlin on 2026-10-25 fires at 02:30 CEST, not again at 02:30 CET).
+
+The timezone rules are bundled with the daemon's `chrono-tz` dependency. Upgrading the
+daemon with newer timezone data can change the resolved UTC instant of an occurrence not
+yet scheduled; once an occurrence is recorded as scheduled, its claimed UTC instant remains
+authoritative across restarts and upgrades. The local-date key does not change with the
+offset. On first publication, the earliest candidate is today's local date for
+daily rules or the next matching weekday for weekly rules; missed occurrences
+afterward follow the declared catch-up policy.
+
+
+Publication requires an unpinned mission's name to exist in the publication scope or
+the stored graph, in any state; an unknown name is refused before occurrences begin.
+
+When an unpinned occurrence reaches its request time, the schedule host resolves its
+authoritative local published head. It requests work only when that head is ready.
+If there is no published head or the current head is draft or retired, the occurrence
+records `schedule.work-failed` with `no-ready-mission-revision`; it never falls back
+to an older ready revision. The request records the selected exact `mission_revision`,
+which the child run uses even if another revision is published before it starts.
+Publishing a new revision does not change already-requested or active occurrences.
+Pinned schedules keep requesting their named exact revision, including when that
+revision has not yet replicated to the schedule host.
+Repeated failures of this condition keep one attention item open per schedule.
+The runtime withdraws it when a subsequent occurrence successfully starts work.
 
 The runtime gives each occurrence a deterministic mission run and a unique workspace below the declared root.
 

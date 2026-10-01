@@ -2099,31 +2099,7 @@ fn client_session_resources(
         }));
     }
     for unresolved in external.unresolved_processes {
-        sessions.push(json!({
-            "id": unresolved.id,
-            "kind": "session",
-            "revision": unresolved.revision,
-            "updated_at": crate::external_sessions::timestamp(snapshot_time_ms(at)),
-            "owner_id": format!("external-process/{}/{}", unresolved.driver.as_str(), unresolved.process.pid),
-            "state": "running",
-            "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
-            "ended_at": null,
-            "timeline_cursor": format!("timeline-cursor/process-{}/latest", unresolved.process.pid),
-            "usage": null,
-            "managed": false,
-            "driver": unresolved.driver.as_str(),
-            "native_session_id": null,
-            "workspace": unresolved.process.cwd.map(|path| path.display().to_string()),
-            "title": null,
-            "importable": false,
-            "import_reason": "a running harness in this workspace does not expose its exact native session ID; select a saved session and explicitly confirm this PID before takeover",
-            "process": {
-                "pid": unresolved.process.pid,
-                "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
-                "fingerprint": unresolved.process.fingerprint,
-                "exact_session": false
-            }
-        }));
+        sessions.push(unresolved_session_resource(unresolved, at));
     }
     sessions.sort_by(|left, right| {
         right["updated_at"]
@@ -2132,6 +2108,37 @@ fn client_session_resources(
             .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
     });
     Ok(sessions)
+}
+
+fn unresolved_session_resource(
+    unresolved: crate::external_sessions::UnresolvedProcess,
+    at: &str,
+) -> Value {
+    json!({
+        "id": unresolved.id,
+        "kind": "session",
+        "revision": unresolved.revision,
+        "updated_at": crate::external_sessions::timestamp(snapshot_time_ms(at)),
+        "owner_id": format!("external-process/{}/{}", unresolved.driver.as_str(), unresolved.process.pid),
+        "state": "running",
+        "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
+        "ended_at": null,
+        "timeline_cursor": format!("timeline-cursor/process-{}/latest", unresolved.process.pid),
+        "usage": null,
+        "managed": false,
+        "driver": unresolved.driver.as_str(),
+        "native_session_id": null,
+        "workspace": unresolved.process.cwd.map(|path| path.display().to_string()),
+        "title": null,
+        "importable": false,
+        "import_reason": "a running harness in this workspace does not expose its exact native session ID; select a saved session and explicitly confirm this PID before takeover",
+        "process": {
+            "pid": unresolved.process.pid,
+            "started_at": crate::external_sessions::timestamp(unresolved.process.started_at_unix_ms),
+            "fingerprint": unresolved.process.fingerprint,
+            "exact_session": false
+        }
+    })
 }
 
 fn managed_session_resources(
@@ -3998,17 +4005,23 @@ pub fn start_native_session_discovery(state: &AppState) {
 }
 
 /// The local daemon binds a Unix peer to the harness identity inherited by that peer or one of
-/// its parents. Test servers and the paired gateway use the ordinary unbound listener.
-pub async fn serve_unix_bound(socket: &Path, app: Router) -> anyhow::Result<()> {
-    serve_unix_inner(socket, app, true).await
+/// its parents. `state_socket` gives clients without the daemon's runtime environment a stable
+/// address for the same listener. Test servers and the paired gateway use the unbound listener.
+pub async fn serve_unix_bound(
+    socket: &Path,
+    state_socket: &Path,
+    app: Router,
+) -> anyhow::Result<()> {
+    serve_unix_with_ancestor(socket, Some(state_socket), app, true, harness_ancestor).await
 }
 
 async fn serve_unix_inner(socket: &Path, app: Router, bind_harness: bool) -> anyhow::Result<()> {
-    serve_unix_with_ancestor(socket, app, bind_harness, harness_ancestor).await
+    serve_unix_with_ancestor(socket, None, app, bind_harness, harness_ancestor).await
 }
 
 async fn serve_unix_with_ancestor(
     socket: &Path,
+    state_socket: Option<&Path>,
     app: Router,
     bind_harness: bool,
     ancestor: fn(u32) -> Option<String>,
@@ -4017,6 +4030,13 @@ async fn serve_unix_with_ancestor(
     if let Some(parent) = socket.parent() {
         fs::create_dir_all(parent)?;
     }
+    // A second daemon must never detach an active listener by unlinking its pathname.
+    if tokio::net::UnixStream::connect(socket).await.is_ok() {
+        anyhow::bail!(
+            "refusing to replace live Unix socket listener at {}",
+            socket.display()
+        );
+    }
     match fs::remove_file(socket) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -4024,6 +4044,9 @@ async fn serve_unix_with_ancestor(
     }
     let listener = UnixListener::bind(socket)?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
+    if let Some(state_socket) = state_socket {
+        publish_state_socket(socket, state_socket)?;
+    }
     loop {
         let stream = match listener.accept().await {
             Ok((stream, _)) => stream,
@@ -4083,6 +4106,48 @@ async fn serve_unix_with_ancestor(
                 .with_upgrades()
                 .await;
         });
+    }
+}
+/// Atomically replace only the discovery link, never the listener itself. On macOS (and when
+/// XDG_RUNTIME_DIR is absent) the default listener already lives at this state path.
+fn publish_state_socket(socket: &Path, state_socket: &Path) -> anyhow::Result<()> {
+    if socket == state_socket
+        || fs::canonicalize(state_socket).ok() == fs::canonicalize(socket).ok()
+    {
+        return Ok(());
+    }
+    let parent = state_socket
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("state socket has no parent directory"))?;
+    fs::create_dir_all(parent)?;
+    let temporary = state_socket.with_extension(format!("sock.{}.tmp", std::process::id()));
+    let _ = fs::remove_file(&temporary);
+    let target = fs::canonicalize(socket)?;
+    std::os::unix::fs::symlink(target, &temporary)?;
+    if let Err(error) = fs::rename(&temporary, state_socket) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod gateway_listener_tests {
+    #[tokio::test]
+    async fn live_listener_cannot_be_unlinked_by_another_daemon() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("gateway.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let error = super::serve_unix(&socket, axum::Router::new())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("refusing to replace live Unix socket listener"),
+            "{error}"
+        );
+        assert!(tokio::net::UnixStream::connect(&socket).await.is_ok());
+        drop(listener);
     }
 }
 
@@ -5099,7 +5164,12 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         Ok(replication) if !replication.configured => checks.push(DoctorCheck {
             name: "replication".into(),
             status: "pass".into(),
-            message: "this node is intentionally local-only".into(),
+            message: if state.state_dir.join("left-fleet.json").is_file() {
+                "this node is intentionally local-only after leaving its fleet".into()
+            } else {
+                "no fleet is configured; use st fleet create or st fleet join to connect this node"
+                    .into()
+            },
         }),
         Ok(replication) => {
             let unavailable = replication
@@ -5120,6 +5190,25 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
                 .filter(|peer| peer.sync.as_ref().is_some_and(|sync| sync.diverged))
                 .map(|peer| peer.peer.as_str())
                 .collect::<Vec<_>>();
+            let differing_tables = replication
+                .peers
+                .iter()
+                .flat_map(|peer| {
+                    peer.differing_tables
+                        .iter()
+                        .map(|table| format!("{}/{table}", peer.peer))
+                })
+                .collect::<Vec<_>>();
+            if !differing_tables.is_empty() {
+                checks.push(DoctorCheck {
+                    name: "shared-projections".into(),
+                    status: "fail".into(),
+                    message: format!(
+                        "shared tables differ at equal inventory: {}",
+                        differing_tables.join(", ")
+                    ),
+                });
+            }
             let first_sync_failed = replication
                 .first_sync
                 .as_ref()
@@ -11894,6 +11983,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn doctor_distinguishes_no_fleet_from_explicitly_leaving_a_fleet() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let replication_check = || {
+            doctor_report(&state)
+                .unwrap()
+                .0
+                .checks
+                .into_iter()
+                .find(|check| check.name == "replication")
+                .unwrap()
+        };
+        let check = replication_check();
+        assert_eq!(check.status, "pass");
+        assert!(check.message.contains("no fleet is configured"));
+        assert!(check.message.contains("st fleet create"));
+        assert!(check.message.contains("st fleet join"));
+        assert!(!check.message.contains("intentionally"));
+
+        fs::write(
+            root.path().join("left-fleet.json"),
+            r#"{"fleet_id":"previous-fleet","offline":true,"confirmed_by":null}"#,
+        )
+        .unwrap();
+        let check = replication_check();
+        assert_eq!(check.status, "pass");
+        assert!(check.message.contains("intentionally local-only"));
+        assert!(check.message.contains("after leaving its fleet"));
+    }
+
     #[tokio::test]
     async fn isolated_daemon_exposes_only_rollups_in_the_fleet_usage_endpoint() {
         let root = tempfile::tempdir().unwrap();
@@ -12496,7 +12616,7 @@ mod tests {
         let server_socket = socket.clone();
         let app = router(state(root.path()));
         let server = tokio::spawn(async move {
-            serve_unix_with_ancestor(&server_socket, app, true, slow_ancestor).await
+            serve_unix_with_ancestor(&server_socket, None, app, true, slow_ancestor).await
         });
         while !socket.exists() {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -13269,6 +13389,46 @@ agent "good" {{ workspace {:?}; command "true" }}
                 .as_str()
                 .unwrap()
                 .contains("cobalt: refused by that member's Fabric grants")
+        );
+    }
+
+    #[test]
+    fn doctor_names_shared_tables_that_differ_at_equal_inventory() {
+        let root = tempfile::tempdir().unwrap();
+        let mut state = state(root.path());
+        state.fleet_id = Some("fleet/audit".into());
+        state.configured_peers = vec!["alder".into()];
+        state.store.bind_fleet("fleet/audit").unwrap();
+        let source = Store::open_memory("alder").unwrap();
+        source.bind_fleet("fleet/audit").unwrap();
+        let original = source.export_replication_summary("fleet/audit").unwrap();
+        let mut different = original.clone();
+        different
+            .projection_digests
+            .insert("planning_sessions".into(), "different".into());
+        state
+            .store
+            .receive_replication_exchange("alder", "fleet/audit", &different)
+            .unwrap();
+        let report = doctor_report(&state).unwrap().0;
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.name == "shared-projections")
+            .unwrap();
+        assert_eq!(check.status, "fail");
+        assert!(check.message.contains("alder/planning_sessions"));
+        state
+            .store
+            .receive_replication_exchange("alder", "fleet/audit", &original)
+            .unwrap();
+        assert!(
+            !doctor_report(&state)
+                .unwrap()
+                .0
+                .checks
+                .iter()
+                .any(|check| check.name == "shared-projections")
         );
     }
 
