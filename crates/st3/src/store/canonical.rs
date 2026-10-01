@@ -83,6 +83,27 @@ pub(super) fn canonical_sql(query: &str) -> String {
 
 pub(super) type ClaimKey = (u128, String, u64, String, u64, String);
 
+/// SQLite BLOB ordering equivalent to ClaimKey's total order. Fixed-width numbers sort
+/// numerically; escaped zeroes and a double-zero terminator preserve string prefix ordering.
+pub(super) fn sortable_key(key: &ClaimKey) -> Vec<u8> {
+    fn string(output: &mut Vec<u8>, value: &str) {
+        for byte in value.bytes() {
+            output.push(byte);
+            if byte == 0 {
+                output.push(255);
+            }
+        }
+        output.extend_from_slice(&[0, 0]);
+    }
+    let mut output = key.0.to_be_bytes().to_vec();
+    string(&mut output, &key.1);
+    output.extend_from_slice(&key.2.to_be_bytes());
+    string(&mut output, &key.3);
+    output.extend_from_slice(&key.4.to_be_bytes());
+    string(&mut output, &key.5);
+    output
+}
+
 pub(super) fn claim_key(connection: &Connection, id: &str) -> Result<ClaimKey> {
     let position = position_sql("claims");
     let (time, writer, sequence, batch, position, id) = connection.query_row(

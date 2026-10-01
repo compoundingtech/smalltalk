@@ -24,7 +24,7 @@ use std::os::unix::fs::{PermissionsExt as _, symlink};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-const PAYLOAD: &str = include_str!("fixtures/harness-context/claude-statusline-mid-session.json");
+const PAYLOAD: &str = include_str!("../crates/st-drivers/tests/fixtures/harness-context/claude-statusline-mid-session.json");
 
 struct Seat {
     _tmp: tempfile::TempDir,
@@ -101,7 +101,7 @@ impl Seat {
     }
 
     fn tee_as(&self, identity: &str, overrides: &[(&str, &str)]) -> Output {
-        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("hooks/claude-statusline.sh");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/st-drivers/hooks/claude-statusline.sh");
         let path = format!(
             "{}:{}",
             self.bin.display(),
@@ -117,6 +117,7 @@ impl Seat {
             .env("ST_AGENT", identity)
             // The wrapper's token is deliberately absent: these seats are wrapperless, so the tee
             // falls back to Claude's own session id exactly as the hooks do.
+            .env_remove("ST_CLAUDE_SESSION")
             .env_remove("ST2_CLAUDE_SESSION")
             .env_remove("ST_CLAUDE_STATUSLINE_RENDERER")
             .stdin(Stdio::piped())
@@ -192,7 +193,7 @@ fn the_tee_records_the_reading_and_hands_the_same_payload_to_the_env_renderer() 
     );
 
     let record = seat.record().expect("the reading is recorded");
-    assert_eq!(record["schema"], "st2.harness-context.v1");
+    assert_eq!(record["schema"], "st.harness-context.v1");
     assert_eq!(record["harness"], "claude");
     assert_eq!(record["usedTokens"], 194_763);
     assert_eq!(record["windowTokens"], 1_000_000);
@@ -374,7 +375,7 @@ fn without_st2_on_path_the_script_drains_stdin_and_renders_nothing() {
     // seconds. The PATH keeps the shell's own utilities and drops only `st2`, which is the shape
     // of that failure; a PATH with nothing on it would be testing the harness, not the tee.
     let path = which_dirs(&["bash", "cat"]);
-    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("hooks/claude-statusline.sh");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/st-drivers/hooks/claude-statusline.sh");
     assert!(
         which("st2", &path).is_none(),
         "the fallback PATH must not carry an st2"

@@ -16,6 +16,7 @@ export default githubWorkflow({
         ".github/workflows/release-smalltalk.yml",
         "scripts/release-smalltalk*",
         "scripts/install-release*",
+        "scripts/install-macos*",
         "docs/st3/binary-releases.md",
         "flake.lock"
       ]
@@ -29,6 +30,32 @@ export default githubWorkflow({
     "cancel-in-progress": "${{ github.event_name == 'pull_request' }}"
   },
   "jobs": {
+    "installer": {
+      "name": "installer (${{ matrix.runner }})",
+      "strategy": {
+        "fail-fast": false,
+        "matrix": {
+          "runner": ["namespace-profile-linux-x86-64", "namespace-profile-macos-arm64"]
+        }
+      },
+      "runs-on": [
+        "${{ matrix.runner }}",
+        "namespace-features:github.run-id=${{ github.run_id }}"
+      ],
+      "timeout-minutes": 5,
+      "steps": [
+        {
+          "uses": "actions/checkout@v4",
+          "with": {
+            "persist-credentials": false
+          }
+        },
+        {
+          "name": "Test install entry points and isolated app transactions",
+          "run": "scripts/install-test\nscripts/install-release-test\npython3 scripts/install-macos-test\n"
+        }
+      ]
+    },
     "build": {
       "if": "${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.event.deleted == false) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}",
       "name": "release-build (${{ matrix.target }})",
@@ -74,7 +101,7 @@ export default githubWorkflow({
         },
         {
           "name": "Test installer",
-          "run": "scripts/install-release-test"
+          "run": "scripts/install-release-test\npython3 scripts/install-macos-test\n"
         },
         {
           "name": "Build, package, and test extracted tools",
@@ -92,7 +119,7 @@ export default githubWorkflow({
     },
     "assemble": {
       "name": "release-assemble",
-      "needs": "build",
+      "needs": ["build", "installer"],
       "runs-on": "namespace-profile-linux-x86-64",
       "steps": [
         {

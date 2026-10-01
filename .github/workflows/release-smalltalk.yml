@@ -9,13 +9,12 @@ on:
   workflow_dispatch: null
   pull_request:
     paths:
-      [
-        .github/workflows/release-smalltalk.yml,
-        scripts/release-smalltalk*,
-        scripts/install-release*,
-        docs/st3/binary-releases.md,
-        flake.lock,
-      ]
+      - .github/workflows/release-smalltalk.yml
+      - scripts/release-smalltalk*
+      - scripts/install-release*
+      - scripts/install-macos*
+      - docs/st3/binary-releases.md
+      - flake.lock
 
 permissions:
   contents: read
@@ -25,6 +24,24 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  installer:
+    name: "installer (${{ matrix.runner }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [namespace-profile-linux-x86-64, namespace-profile-macos-arm64]
+    runs-on: ["${{ matrix.runner }}", "namespace-features:github.run-id=${{ github.run_id }}"]
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Test install entry points and isolated app transactions
+        run: |
+          scripts/install-test
+          scripts/install-release-test
+          python3 scripts/install-macos-test
+
   build:
     if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.event.deleted == false) || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     name: "release-build (${{ matrix.target }})"
@@ -50,7 +67,10 @@ jobs:
         with:
           version: 0.15.2
       - name: Test installer
-        run: scripts/install-release-test
+        run: |
+          scripts/install-release-test
+          python3 scripts/install-macos-test
+
       - name: Build, package, and test extracted tools
         run: "scripts/release-smalltalk '${{ matrix.target }}' dist"
       - uses: actions/upload-artifact@v4
@@ -60,7 +80,7 @@ jobs:
           if-no-files-found: error
   assemble:
     name: release-assemble
-    needs: build
+    needs: [build, installer]
     runs-on: namespace-profile-linux-x86-64
     steps:
       - uses: actions/checkout@v4

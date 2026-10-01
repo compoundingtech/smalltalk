@@ -413,15 +413,22 @@ fn subject_references(
             let Some(schedule) = crate::graph::schedule_spec(&desired.desired, host) else {
                 return Ok(());
             };
-            if let Some(work) = schedule.work.filter(|_| !schedule.stopped)
-                && scope
-                    .revision(graph, &work.mission, &work.revision)?
-                    .is_none()
-            {
-                refusals.push(format!(
-                    "{owner}schedule `{subject}` runs a mission that is not stored: {}",
-                    graph.missing_revision(&work.mission, &work.revision)?
-                ));
+            if let Some(work) = schedule.work.filter(|_| !schedule.stopped) {
+                match work.revision.as_deref() {
+                    Some(revision) if scope.revision(graph, &work.mission, revision)?.is_none() => {
+                        refusals.push(format!(
+                            "{owner}schedule `{subject}` runs a mission that is not stored: {}",
+                            graph.missing_revision(&work.mission, revision)?
+                        ));
+                    }
+                    None if !scope.mission(graph, &work.mission)? => {
+                        refusals.push(format!(
+                            "{owner}schedule `{subject}` references unpublished mission `mission/{}`",
+                            work.mission
+                        ));
+                    }
+                    _ => {}
+                }
             }
         }
         _ => {}
@@ -482,6 +489,30 @@ mission "watch" state="ready" {{
             .missions["cycle"]
             .revision
             .clone()
+    }
+
+    #[test]
+    fn unpinned_schedule_refuses_unknown_mission_at_publish() {
+        let store = Store::open_memory("node").unwrap();
+        let source = watch(
+            r#"schedule "cycle" {
+  every "6h"
+  anchor "2026-01-01T00:00:00Z"
+  work { mission "unknown"; workspace "/tmp/cycles" }
+}"#,
+        );
+        assert_eq!(
+            refusals(&store, &source),
+            [
+                "mission `mission/watch` declares schedule `schedule/${ST_MISSION_RUN}/cycle` references unpublished mission `mission/unknown`"
+            ]
+        );
+        for state in ["draft", "ready", "retired"] {
+            let declared = format!(
+                "{source}\nmission \"unknown\" state=\"{state}\" {{ goal \"Cycle.\"; step \"work\" {{ agentless }} }}"
+            );
+            assert!(refusals(&store, &declared).is_empty());
+        }
     }
 
     #[test]

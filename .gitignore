@@ -14,7 +14,7 @@
 .ding-bus-quoting-note.md
 
 # Assembled by the `pi-extension-types` check from pinned tarballs; never committed.
-hooks/typecheck/node_modules/
+crates/st-drivers/hooks/typecheck/node_modules/
 
 # Pinned flake input made available to the CI generators by the devShell.
 /repos/

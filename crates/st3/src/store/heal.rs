@@ -122,7 +122,8 @@ impl Store {
             ReplicationHealQuery::Ranges => {
                 let ranges = claim_ranges(&self.readers.get())?;
                 ReplicationHealAnswer::Ranges {
-                    graph_digest: self.current_graph_digest()?,
+                    graph_digest: self.replication_snapshot()?.legacy_graph_digest.clone(),
+                    projection_digests: self.replication_snapshot()?.projection_digests.clone(),
                     ranges,
                 }
             }
@@ -166,14 +167,16 @@ impl Store {
                     admitted,
                     refused,
                     envelopes,
-                    graph_digest: self.current_graph_digest()?,
+                    graph_digest: self.replication_snapshot()?.legacy_graph_digest.clone(),
+                    projection_digests: self.replication_snapshot()?.projection_digests.clone(),
                 }
             }
             ReplicationHealQuery::Replay => {
                 let replayed = self.replay_graph_for_heal()?;
                 ReplicationHealAnswer::Replayed {
                     replayed,
-                    graph_digest: self.current_graph_digest()?,
+                    graph_digest: self.replication_snapshot()?.legacy_graph_digest.clone(),
+                    projection_digests: self.replication_snapshot()?.projection_digests.clone(),
                 }
             }
         })
@@ -192,10 +195,11 @@ impl Store {
             }
             ReplicationHealAnswer::Ranges {
                 graph_digest,
+                projection_digests,
                 ranges: peer_ranges,
             } => {
                 self.heal_session(peer, |_| {});
-                if self.current_graph_digest()? == graph_digest {
+                if self.heal_graph_equal(&graph_digest, &projection_digests)? {
                     return self.finish_heal(peer, true, None);
                 }
                 let differing = differing_ranges(&claim_ranges(&self.readers.get())?, &peer_ranges);
@@ -214,7 +218,7 @@ impl Store {
                 let replayed = self.heal_session(peer, |session| session.report.replayed);
                 if !replayed && self.replay_graph_for_heal()? {
                     self.heal_session(peer, |session| session.report.replayed = true);
-                    if self.current_graph_digest()? == graph_digest {
+                    if self.heal_graph_equal(&graph_digest, &projection_digests)? {
                         return self.finish_heal(peer, true, None);
                     }
                 }
@@ -331,6 +335,7 @@ impl Store {
                 refused,
                 envelopes,
                 graph_digest,
+                projection_digests,
             } => {
                 self.readmit_envelopes(peer, &envelopes)?;
                 let wanted = self.heal_session(peer, |session| std::mem::take(&mut session.wanted));
@@ -341,7 +346,7 @@ impl Store {
                     session.rounds += 1;
                     session.rounds
                 });
-                if self.current_graph_digest()? == graph_digest {
+                if self.heal_graph_equal(&graph_digest, &projection_digests)? {
                     return self.finish_heal(peer, true, None);
                 }
                 let mut reasons = Vec::new();
@@ -370,9 +375,10 @@ impl Store {
             ReplicationHealAnswer::Replayed {
                 replayed,
                 graph_digest,
+                projection_digests,
             } => {
                 self.heal_session(peer, |session| session.report.peer_replayed = replayed);
-                if self.current_graph_digest()? == graph_digest {
+                if self.heal_graph_equal(&graph_digest, &projection_digests)? {
                     return self.finish_heal(peer, true, None);
                 }
                 let reason = if replayed {
@@ -453,8 +459,17 @@ impl Store {
         }
     }
 
-    fn current_graph_digest(&self) -> Result<String> {
-        Ok(self.replication_snapshot()?.graph_digest.clone())
+    fn heal_graph_equal(
+        &self,
+        legacy: &str,
+        projections: &BTreeMap<String, String>,
+    ) -> Result<bool> {
+        let snapshot = self.replication_snapshot()?;
+        Ok(if projections.is_empty() {
+            snapshot.legacy_graph_digest == legacy
+        } else {
+            snapshot.projection_digests == *projections
+        })
     }
 
     /// Update the running report of the heal this node asks `peer`, starting one if none runs.

@@ -31,7 +31,7 @@ public actor St3Client {
         if history { query.append(.init(name: "history", value: "true")) }
         return try await get("v1/client/now", query: query)
     }
-    private func resource(_ collection: String, id: String) async throws -> Envelope<Resource> { let routedID = collection == "launches" ? id.replacingOccurrences(of: "launch/", with: "") : id; return try await get("v1/client/\(collection)/\(routedID)") }
+    private func resource(_ collection: String, id: String) async throws -> Envelope<Resource> { let routedID = collection == "glasses" ? (id.split(separator: "/").last.map(String.init) ?? id) : (collection == "launches" ? id.replacingOccurrences(of: "launch/", with: "") : id); return try await get("v1/client/\(collection)/\(routedID)") }
     public func timeline(sessionID: String, cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<TimelinePage> {
         var query: [URLQueryItem] = []
         if let cursor { query.append(.init(name: "cursor", value: cursor)) }
@@ -72,6 +72,33 @@ public actor St3Client {
         return try await get("v1/client/events", query: query)
     }
     private func submit(_ action: ActionRequest) async throws -> Envelope<ActionResult> { try await post("v1/client/actions", action) }
+    public func listGlasses(cursor: String? = nil, limit: Int? = nil) async throws -> Envelope<ResourcePage> { try await list("glasses", cursor: cursor, limit: limit) }
+    public func getGlass(id: String) async throws -> Envelope<Glass> { try await get("v1/client/glasses/\(Self.routedSessionID(id.split(separator: "/").last.map(String.init) ?? id))") }
+    public func putGlass(id: String, body: GlassPut, idempotencyKey: String) async throws -> Envelope<Glass> { try await request("v1/client/glasses/\(Self.routedSessionID(id.split(separator: "/").last.map(String.init) ?? id))", query: [], method: "PUT", body: try JSONEncoder().encode(body), idempotencyKey: idempotencyKey) }
+    public func deleteGlass(id: String, body: GlassDelete, idempotencyKey: String) async throws -> Envelope<Glass> { try await request("v1/client/glasses/\(Self.routedSessionID(id.split(separator: "/").last.map(String.init) ?? id))", query: [], method: "DELETE", body: try JSONEncoder().encode(body), idempotencyKey: idempotencyKey) }
+    public func glassesStream(subscriptionID: String = "glasses") -> AsyncThrowingStream<GlassCollectionFrame, Error> {
+        var components = URLComponents(url: baseURL.appending(path: "v1/client/collections/stream"), resolvingAgainstBaseURL: false)!
+        components.scheme = components.scheme == "https" ? "wss" : "ws"
+        var request = URLRequest(url: components.url!); request.setValue("st3.client.collections.v0", forHTTPHeaderField: "Sec-WebSocket-Protocol"); if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
+        let task = session.webSocketTask(with: request)
+        return AsyncThrowingStream { continuation in
+            continuation.onTermination = { _ in task.cancel(with: .normalClosure, reason: nil) }
+            task.resume()
+            Task {
+                do {
+                    let command = try JSONSerialization.data(withJSONObject: ["kind":"subscribe", "id":subscriptionID, "collection":"glasses", "limit":100])
+                    try await task.send(.string(String(decoding: command, as: UTF8.self)))
+                    while true {
+                        let data = try Self.websocketData(from: try await task.receive())
+                        let frame = try JSONDecoder().decode(GlassCollectionFrame.self, from: data)
+                        if frame.kind == "error" { throw NSError(domain: "St3Client", code: 0, userInfo: [NSLocalizedDescriptionKey: frame.message ?? "Glass subscription failed"]) }
+                        if frame.kind == "resync" { try await task.send(.string(String(decoding: command, as: UTF8.self))); continue }
+                        continuation.yield(frame)
+                    }
+                } catch { continuation.finish(throwing: task.closeCode == .normalClosure ? nil : error); task.cancel(with: .normalClosure, reason: nil) }
+            }
+        }
+    }
     public func documentGet(name: String) async throws -> Envelope<DocumentContent> { try await get("v1/client/documents/content", query: [.init(name: "name", value: name)]) }
     public func nowList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("now", cursor: cursor, limit: limit, history: history) }
     public func machinesList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("machines", cursor: cursor, limit: limit, history: history) }
@@ -91,6 +118,7 @@ public actor St3Client {
     public func workGet(id: String) async throws -> Envelope<Resource> { try await resource("work", id: id) }
     public func agentsList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("agents", cursor: cursor, limit: limit, history: history) }
     public func agentsGet(id: String) async throws -> Envelope<Resource> { try await resource("agents", id: id) }
+    public func agentDeclarationGet(id: String, revision: String? = nil, showEnvValues: Bool = false) async throws -> Envelope<AgentDeclaration> { var query: [URLQueryItem] = [.init(name: "show_env_values", value: showEnvValues ? "true" : "false")]; if let revision { query.append(.init(name: "revision", value: revision)) }; return try await get("v1/client/agent-declarations/\(id)", query: query) }
     public func runtimesList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("runtimes", cursor: cursor, limit: limit, history: history) }
     public func runtimesGet(id: String) async throws -> Envelope<Resource> { try await resource("runtimes", id: id) }
     public func observersList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("observers", cursor: cursor, limit: limit, history: history) }
@@ -106,6 +134,8 @@ public actor St3Client {
     public func historyGet(id: String) async throws -> Envelope<Resource> { try await resource("history", id: id) }
     public func sessionsList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("sessions", cursor: cursor, limit: limit, history: history) }
     public func sessionsGet(id: String) async throws -> Envelope<Resource> { try await resource("sessions", id: id) }
+    public func glassesList(cursor: String? = nil, limit: Int? = nil, history: Bool = false) async throws -> Envelope<ResourcePage> { try await list("glasses", cursor: cursor, limit: limit, history: history) }
+    public func glassesGet(id: String) async throws -> Envelope<Resource> { try await resource("glasses", id: id) }
     public func agentQueueMove(id: String, idempotencyKey: String, fence: Fence, parameters: AgentQueueMoveParameters) async throws -> Envelope<ActionResult> { try await submit(try .agentQueueMove(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func attentionResolve(id: String, idempotencyKey: String, fence: Fence, parameters: AttentionResolveParameters) async throws -> Envelope<ActionResult> { try await submit(try .attentionResolve(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func laneApprove(id: String, idempotencyKey: String, fence: Fence, parameters: LaneChangeParameters) async throws -> Envelope<ActionResult> { try await submit(try .laneApprove(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
@@ -140,8 +170,11 @@ public actor St3Client {
     public func terminalDetach(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) async throws -> Envelope<ActionResult> { try await submit(try .terminalDetach(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func terminalInput(id: String, idempotencyKey: String, fence: Fence, parameters: TerminalInputParameters) async throws -> Envelope<ActionResult> { try await submit(try .terminalInput(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func terminalResize(id: String, idempotencyKey: String, fence: Fence, parameters: TerminalResizeParameters) async throws -> Envelope<ActionResult> { try await submit(try .terminalResize(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
+    public func workAsk(id: String, idempotencyKey: String, fence: Fence, parameters: PersonAskParameters) async throws -> Envelope<ActionResult> { try await submit(try .workAsk(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
+    public func workCancelAsk(id: String, idempotencyKey: String, fence: Fence, parameters: PersonStepParameters) async throws -> Envelope<ActionResult> { try await submit(try .workCancelAsk(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func workClaim(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) async throws -> Envelope<ActionResult> { try await submit(try .workClaim(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func workComplete(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) async throws -> Envelope<ActionResult> { try await submit(try .workComplete(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
+    public func workDone(id: String, idempotencyKey: String, fence: Fence, parameters: PersonStepParameters) async throws -> Envelope<ActionResult> { try await submit(try .workDone(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func workFail(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) async throws -> Envelope<ActionResult> { try await submit(try .workFail(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func workProgress(id: String, idempotencyKey: String, fence: Fence, parameters: TargetParameters) async throws -> Envelope<ActionResult> { try await submit(try .workProgress(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
     public func workPublishMission(id: String, idempotencyKey: String, fence: Fence, parameters: WorkPublishMissionParameters) async throws -> Envelope<ActionResult> { try await submit(try .workPublishMission(id: id, idempotencyKey: idempotencyKey, fence: fence, parameters: parameters)) }
@@ -186,10 +219,11 @@ public actor St3Client {
 
     private func get<T: Decodable & Sendable>(_ path: String, query: [URLQueryItem] = []) async throws -> T { try await request(path, query: query, method: "GET", body: Optional<Data>.none) }
     private func post<T: Decodable & Sendable, Body: Encodable>(_ path: String, _ body: Body) async throws -> T { try await request(path, query: [], method: "POST", body: try JSONEncoder().encode(body)) }
-    private func request<T: Decodable & Sendable>(_ path: String, query: [URLQueryItem], method: String, body: Data?) async throws -> T {
+    private func request<T: Decodable & Sendable>(_ path: String, query: [URLQueryItem], method: String, body: Data?, idempotencyKey: String? = nil) async throws -> T {
         var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false)!; let basePath = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/")); components.percentEncodedPath = "/" + ([basePath, path].filter { !$0.isEmpty }.joined(separator: "/")); if !query.isEmpty { components.queryItems = query }
         var request = URLRequest(url: components.url!); request.httpMethod = method; request.httpBody = body; request.setValue("application/json", forHTTPHeaderField: "Accept")
         if body != nil { request.setValue("application/json", forHTTPHeaderField: "Content-Type") }; if let credential { request.setValue("Bearer \(credential)", forHTTPHeaderField: "Authorization") }
+        if let idempotencyKey { request.setValue(idempotencyKey, forHTTPHeaderField: "Idempotency-Key") }
         let (data, response) = try await session.data(for: request); let status = (response as? HTTPURLResponse)?.statusCode ?? 0
         if !(200..<300).contains(status) { throw try JSONDecoder().decode(ErrorEnvelope.self, from: data) }
         return try JSONDecoder().decode(T.self, from: data)

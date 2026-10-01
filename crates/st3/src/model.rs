@@ -522,6 +522,8 @@ pub struct MissionAuthority {
     pub start: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub revise: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub cancel: Vec<String>,
 }
 
 impl MissionAuthority {
@@ -530,6 +532,7 @@ impl MissionAuthority {
             "publish" => &self.publish,
             "start" => &self.start,
             "revise" => &self.revise,
+            "cancel" => &self.cancel,
             _ => return false,
         };
         patterns
@@ -595,6 +598,29 @@ impl SeatAuthority {
     }
 }
 
+/// Agent declarations a seat may apply (including starting and stopping them).
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct AgentAuthority {
+    pub apply: Vec<String>,
+}
+
+impl AgentAuthority {
+    pub fn allows_apply(&self, agent: &str) -> bool {
+        let agent = agent.strip_prefix("agent/").unwrap_or(agent);
+        self.apply
+            .iter()
+            .any(|pattern| authority_pattern_matches(pattern, agent))
+    }
+}
+
+/// Whether every ID covered by `requested` is also covered by `held`.
+pub fn authority_pattern_contains(held: &str, requested: &str) -> bool {
+    held == requested
+        || held
+            .strip_suffix("/*")
+            .is_some_and(|prefix| requested.starts_with(&format!("{prefix}/")))
+}
+
 /// An authority pattern is an exact ID or a terminal `/*` namespace.
 fn authority_pattern_matches(pattern: &str, id: &str) -> bool {
     pattern == id
@@ -628,7 +654,7 @@ pub struct CalendarSchedule {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ScheduledWork {
     pub mission: String,
-    pub revision: String,
+    pub revision: Option<String>,
     pub workspace: String,
     #[serde(default)]
     pub inputs: BTreeMap<String, String>,
@@ -1584,6 +1610,10 @@ pub struct AttentionActionView {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttentionItemView {
+    #[serde(default)]
+    pub episode: String,
+    #[serde(default)]
+    pub priority: String,
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub review_mode: Option<String>,
@@ -1935,6 +1965,8 @@ pub struct DoctorCheck {
 pub struct DoctorReport {
     pub status: String,
     pub checks: Vec<DoctorCheck>,
+    #[serde(default)]
+    pub performance: Value,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -2342,6 +2374,36 @@ pub struct WorkRequest {
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PersonAskRequest {
+    #[serde(skip)]
+    #[doc(hidden)]
+    pub legacy_request: Option<String>,
+    pub person: String,
+    pub title: String,
+    pub reason: String,
+    pub actor: String,
+    #[serde(default)]
+    pub step: Option<String>,
+    #[serde(default)]
+    pub new_run: Option<String>,
+    #[serde(default)]
+    pub incarnation: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PersonStepResponse {
+    pub subject: String,
+    pub actor: String,
+    pub summary: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub episode: Option<String>,
+    pub idempotency_key: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WorkWakeRequest {
     pub actor: String,
     pub reason: String,
@@ -2538,7 +2600,10 @@ pub struct ReplicationExchange {
     pub fleet_id: String,
     pub schema_digest: String,
     pub authority_digest: String,
+    /// Six-table compatibility digest for older peers. Modern peers compare projection_digests.
     pub graph_digest: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub projection_digests: BTreeMap<String, String>,
     pub inventory: ReplicationInventory,
     #[serde(default)]
     pub envelopes: Vec<ReplicaEnvelope>,
@@ -2637,6 +2702,8 @@ pub enum ReplicationHealQuery {
 pub enum ReplicationHealAnswer {
     Ranges {
         graph_digest: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        projection_digests: BTreeMap<String, String>,
         ranges: Vec<ClaimRangeDigest>,
     },
     Subjects {
@@ -2656,11 +2723,15 @@ pub enum ReplicationHealAnswer {
         refused: Option<String>,
         envelopes: Vec<ReplicaEnvelope>,
         graph_digest: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        projection_digests: BTreeMap<String, String>,
     },
     Replayed {
         /// False while this node's replay backoff has not passed.
         replayed: bool,
         graph_digest: String,
+        #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+        projection_digests: BTreeMap<String, String>,
     },
     /// The asking node could not reach the peer or the peer could not answer. The worker
     /// hands it to the main daemon, which ends the heal with it.
@@ -2811,7 +2882,10 @@ pub struct ReplicationStatus {
     pub configured: bool,
     pub fleet_id: Option<String>,
     pub authority_digest: String,
+    /// Aggregate of every shared projection table and admitted immutable claim sources.
     pub graph_digest: String,
+    #[serde(default)]
+    pub projection_digests: BTreeMap<String, String>,
     pub received_envelopes: u64,
     pub pending_records: u64,
     pub valid_records: u64,
@@ -2895,6 +2969,11 @@ pub struct ReplicationPeerStatus {
     pub schema_digest: Option<String>,
     pub authority_digest: Option<String>,
     pub graph_digest: Option<String>,
+    #[serde(default)]
+    pub projection_digests: BTreeMap<String, String>,
+    /// Comparable shared tables that differ at the last inventory-aligned comparison.
+    #[serde(default)]
+    pub differing_tables: Vec<String>,
     /// How far apart the two envelope sets were at the last exchange that measured them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<ReplicationPeerSync>,

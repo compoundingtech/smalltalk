@@ -108,6 +108,12 @@
       "glyph": "⊘",
       "id": "cancelled",
       "name": "cancelled"
+    },
+    {
+      "explain": "published, and never started",
+      "glyph": "○",
+      "id": "not_started",
+      "name": "not started"
     }
   ],
   "tabs": [

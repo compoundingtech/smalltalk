@@ -1,6 +1,9 @@
 # st fleet replication
 
 Fleet replication is optional. A node outside a fleet is a complete local-only st system.
+`st doctor` reports this default as `pass` with “no fleet is configured” and points to
+`st fleet create` or `st fleet join`. It reports “intentionally local-only after leaving its
+fleet” only when `st fleet leave` has recorded that explicit decision in `left-fleet.json`.
 
 A laptop running only stui can instead be a [paired client device](client-only.md), with no daemon
 or replica. Devices read and act through a member's client gateway and are not sync peers.
@@ -21,6 +24,18 @@ its own digest so a mismatch names the source. Local receipt metadata, physical 
 lease overlays and live reachability are excluded explicitly. Retained history and checkpoint
 tombstones represent the same logical source identity.
 
+Uploaded bytes in `local_blobs` are staged locally until a durable claim references them.
+Claim admission promotes those bytes into `blobs` in the claim's transaction; every column of
+`blobs` remains in the shared digest. Unreferenced uploads never enter envelopes and cannot be
+compared as shared authority. On upgrade, retained claim references, document bindings and valid
+received blob records identify existing shared bytes. Other bytes move to local staging without
+being deleted. If checkpoint tombstones already removed historical references, the upgrade
+conservatively keeps all existing shared blobs.
+
+A keyed worker signs batches beyond its last processed batch, including envelopes another
+unkeyed process already sealed at startup. Signature requests recover missing signatures after
+an upgrade. Equal envelope inventories alone cannot prove equal claim admission.
+
 `store::tests::canonical_audit::every_shared_projection_agrees_after_shuffle_restart_and_checkpoint`
 checks both invariants by comparing shared rows, selected readers and per-table digest oracles
 across isolated stores. `shared_folds_never_order_by_local_arrival` rejects raw shared arrival
@@ -29,16 +44,92 @@ shared table must join the shuffle test's inventory and history fixture,
 the canonical ordering guard, and the production digest registry in the same change. A new
 shared claim-derived view must compare its answer at the same explicit time and recipients.
 
-The [canonical projections audit](canonical-projections-audit.md) records the current gaps and
-local exceptions. Its regression intentionally fails on the audited baseline: the current graph
-digest covers only selected columns of six tables. A matching legacy graph digest is therefore
-not yet proof that these invariants hold for every shared outcome.
+The [canonical projections audit](canonical-projections-audit.md) records the original gaps and
+local exceptions. Modern status reports a graph digest over the complete projection registry,
+plus one digest for every table. The original six-table hash remains a compatibility field on
+the peer protocol; it cannot prove that every shared outcome agrees.
 
 Shared reducers use `store/canonical.rs`. `canonical_sql` expands `CANONICAL_ASC(ALIAS)` and
 `CANONICAL_DESC(ALIAS)` in a query; `CANONICAL_ORDER` and its descending counterpart format the
 same order for existing claim queries. In-memory comparisons use `claim_key` or
 `key_from_record`, and claim-to-claim predicates use `after_sql`. Legacy batch position is its
 relative position within the batch. A global arrival index never chooses a shared winner.
+
+Document version rows retain the earliest canonical binding for repeated name/hash pairs;
+mission revision rows do the same for repeated identical revisions. Document latest flags,
+history order and cursor boundaries use binding claim keys. Complete mailbox readers and
+selected unread reminders use canonical sent-claim keys; bounded mailbox cursors remain local.
+The shuffle fixture compares paged document answers and the existing person attention view,
+including unread messages, reminder selection and episode onset. Proposal lifecycle tests
+compare all shared rows and digests through creation, review, draining, cancellation and apply.
+
+Documents record a sortable encoding of the complete binding claim key at admission.
+`document_canonical_latest(name,binding_key DESC)` serves latest selection and history order;
+readers never sort a name's entire claim history for each returned version. Schema 15 backfills
+the keys once, choosing the earliest canonical binding for each repeated name/hash. The key is
+a shared derived column and is digested with the document row. The fleet-size regression builds
+260,000 claims and 10,000 document versions, then requires latest listings, history pages,
+lookup and cursor reads to finish within two seconds and verifies the indexed latest query plan.
+
+## Projection digest coverage and cost
+
+`store/projection_digest.rs::TABLES` lists the shared tables: operations, blobs, documents,
+desired, message_index, mission_revisions, mission_definitions, mission_runs,
+mission_run_deadlines, mission_run_after, run_generations, step_runs, revision_proposals,
+planning_sessions, planning_candidates and planning_previews. Every column joins the digest
+by default. Only document/message/mission-revision arrival indexes and the effective step lease
+expiry/change timestamps are excluded. Those step timestamps include member-local renewals;
+the original durable lease facts remain covered through their authenticated claim identity.
+`planning_previews.store_index` is an originating preview input and is covered.
+
+The `claim_sources` digest covers admitted claim identities and immutable acceptance times,
+including claims represented by checkpoint tombstones. Claim identities commit bodies,
+predecessors, actors and batch identity; authenticated envelope inventory commits complete wire
+payloads and ordering metadata. This covers the sources of on-demand views such as ownership,
+subscriptions, fleet membership, usage, observer/fault episodes, and attention. A timed view's
+answer must still be tested at the same explicit time and recipients. Host-local liveness,
+leases, receipts, cursors, secrets and notification bookkeeping stay outside shared digests.
+
+A repaired original is no longer an admitted projection source. One member may retain its
+old claim row while another rejected it before admission; both exclude it from claim-source
+and operation projections. The original wire bytes remain committed by authenticated envelope
+inventory, and the repair and replacement remain shared claim sources. A local
+`projection_digest_repaired_claims` cache retains the exclusion after receipt cleanup; repair
+record updates and cached source digests commit or roll back together. Registry version 5
+backfills existing repairs once, and operation rules version 2 rebuilds older operation rows.
+
+Operations are logical rows over the hot operation table and operation facts retained in
+checkpoint tombstones. Trimming a claim changes its storage representation, preserving its
+logical operation and claim-source digests. The shuffle test compares that logical union.
+
+SQLite triggers update per-table row counts and 512-bit modular sums of domain-separated
+SHA-512 row hashes in the row's own transaction. Insert, update, delete, replacement, savepoint
+rollback and commit therefore change rows and cached digest state together. SHA-256 commits the
+table name, column schema, count and sum; a sorted map of those table digests commits the graph.
+Shared columns are encoded in sorted name order, including the logical operation row. A fresh
+schema and an additive migration can place the same column at different physical positions;
+that layout does not change the digest. Registry version 6 rebuilds older physical-order caches.
+These are diagnostic digests; authenticated envelopes and signatures remain the replication
+integrity boundary. Work scales with changed row bytes, plus the fixed-size accumulator.
+Reading all table digests reads one small cache, independent of retained history size. Operations
+keep a local row cache to update their hot/tombstone union by operation identity. The first open
+of a registry/schema version backfills these caches; routine reads and subsequent opens never
+rescan projection histories to compute digests.
+
+`incremental_digests_cover_each_shared_column_and_roll_back_with_rows` changes every shared
+column and compares cached digests with a full-scan oracle, including local exclusions, no-op
+updates, replacement and rollback. The shuffle/restart/checkpoint regression compares every
+cached table digest with that oracle in every phase. The table classification guard requires
+the test inventory and production registry to agree, and the fixture exercises every table.
+
+`st replication status` prints `table-digest` entries and names differing tables under each
+peer. `st replication diff PEER` and `st doctor` also name them. Table differences are meaningful
+only when inventories agree, projection is current and local committed batches are sealed. Old peers omit `projection_digests`;
+exchanges and heals then compare their unchanged six-table compatibility hash. Old peers cannot
+verify full projection coverage. Modern peers compare complete maps. SQLite schema 14 adds the
+transactional digest machinery and rebuilds shared projections once, correcting older stored
+creation/change dates from claim facts. New writer connections must register the projection
+functions, including isolated checkpoint proof connections.
 
 ## Add any machine
 
@@ -153,8 +244,11 @@ The worker coalesces wake bursts for one second, so new authority, such as a mis
 The worker also runs a 30-second anti-entropy exchange. A recent inbound exchange suppresses
 a redundant connection in the opposite direction; local graph changes still request a prompt
 push. Failed attempts back off exponentially from one second through minutes to one hour, with 20 percent
-jitter. Graph wakes do not reset failure backoff. A successful inbound exchange or a change to
-the member's routes interrupts it immediately. A returning outbound-only member starts its own
+jitter. Graph wakes do not reset failure backoff. An authenticated inbound request, a successful
+peer request, a change to the member's routes, or a local connectivity change interrupts it
+immediately, including activity received while an outbound request is still failing. Peer
+activity has a separate notification channel used only by failure waits, so ordinary
+authenticated traffic does not start redundant healthy exchanges. A returning outbound-only member starts its own
 push and pull without waiting for the other members' retry timers. Fabric tunnels are obtained
 again on each attempt, so a restarted Fabric does not leave a stale cached tunnel. With Fabric
 0.2.21 or later, the worker also consumes its passive `peer-events --watch` stream: an online
@@ -163,6 +257,14 @@ node. Offline transport events create no fault. Older Fabric keeps using address
 suspend-gap, and anti-entropy recovery. Tailnet listeners and advertised endpoints also
 refresh on local connectivity changes, without waiting for their minute timer; disappeared
 interface addresses stop being advertised.
+
+An HTTP link can return silently without changing either machine's addresses. For five minutes
+after a successful outbound exchange, a failed dialer's retry wait probes that same HTTP route
+every three seconds, with a one-second timeout. The probe uses `HEAD` on the existing exchange
+route: any HTTP response, including an older build's `405`, wakes a signed exchange at once.
+It neither exports an inventory nor records a failure. A route that has never worked, a replaced
+route, or a peer absent for more than five minutes keeps the long retry schedule. Transport life
+only schedules an exchange; the exchange still authenticates every claim and peer.
 
 The same recovery applies to every member. A server may be absent for hours just as a laptop
 may be asleep. On daemon start, wake from sleep, network change or Fabric recovery, a member

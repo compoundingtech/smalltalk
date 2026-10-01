@@ -61,7 +61,7 @@ fn presence() -> &'static Presence {
     static PRESENCE: OnceLock<Presence> = OnceLock::new();
     PRESENCE.get_or_init(|| Presence {
         started: Instant::now(),
-        image: st2::reexec::running_identity().map(|identity| identity.token()),
+        image: st_drivers::reexec::running_identity().map(|identity| identity.token()),
         beats: Mutex::new(HashMap::new()),
     })
 }

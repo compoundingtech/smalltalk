@@ -1,0 +1,44 @@
+{
+  "api_version": "st3.client.v0",
+  "request_id": "req/glass",
+  "snapshot": {
+    "id": "snapshot/host-a/1842/2fc9",
+    "host_id": "host/host-a",
+    "store_index": 1842,
+    "projection_version": "client-projection.v0",
+    "created_at": "2026-09-20T12:00:00Z"
+  },
+  "value": {
+    "id": "glass/person/ada/019a0000-0000-7000-8000-000000000001",
+    "kind": "glass",
+    "revision": "claim/glass-created",
+    "updated_at": "2026-10-01T00:00:00.000Z",
+    "body": {
+      "name": "Main workspace",
+      "tabs": [
+        {
+          "title": "Home",
+          "layout": {
+            "pane": "home:"
+          }
+        },
+        {
+          "layout": {
+            "split": "right",
+            "children": [
+              {
+                "pane": "agent:agent/example/worker"
+              },
+              {
+                "pane": "mission:mission/example/review"
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "deleted": false,
+    "base_revision": null,
+    "replaced_revision": null
+  }
+}

@@ -44,7 +44,7 @@ scripts/install --bin-dir DIR    # or anywhere else
 ```
 
 The script builds and installs `st3`, `stui`, and `st3-migrate`, and makes `st` a symlink to
-the installed `st3`. `st` is never a separate build. A source install also needs [`pty`](https://github.com/compoundingtech/pty-rust) on `PATH`.
+the installed `st3`. `st` is never a separate build. On macOS, both tools live in a fixed app bundle; see [macOS installation and signing](docs/st3/macos-installation.md). A source install also needs [`pty`](https://github.com/compoundingtech/pty-rust) on `PATH`.
 
 Each seat runs a coding harness, so install and log in to at least one: Claude Code, Codex, omp,
 pi, or OpenCode. Log in as the same user that runs the daemon.
@@ -116,6 +116,11 @@ for it (`--daemon-wait SECONDS` or `ST3_DAEMON_WAIT` changes that) and then exit
 Seat drivers wait as long as the restart takes, keep their notes out of the seat's terminal in
 `~/.local/state/st3/driver-api-warnings.log`, and resume from the graph. To run the daemon in the
 foreground instead, use `st up`.
+
+On Linux, the daemon normally listens in `XDG_RUNTIME_DIR`; it also publishes
+`STATE/run/st3.sock` as a link to that socket, so commands without the daemon's
+runtime environment can reach it. On macOS the socket already lives at that state path.
+An explicit `--endpoint` or `ST3_ENDPOINT` still takes precedence.
 
 st records every `git` and `gh` call it starts, including its own, in
 `~/.local/state/st3/recorder/commands.jsonl`, then runs the real program unchanged. A call by

@@ -32,18 +32,20 @@ pty-client = { git = "https://github.com/compoundingtech/pty-rust", rev = "06c30
 pty-core = { git = "https://github.com/compoundingtech/pty-rust", rev = "06c303f708a49a8110a5eb640194deab0561fa3a" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 ring = "0.17"
-rusqlite = { version = "0.32", features = ["bundled", "trace"] }
+rusqlite = { version = "0.32", features = ["bundled", "trace", "functions"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 st-runtime = { path = "../st-runtime" }
 st3-client = { path = "../st3-client" }
 st3-schema = { path = "../st3-schema" }
-st2 = { path = "../.." }
+st-drivers = { path = "../st-drivers" }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.27"
 toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["ansi", "env-filter", "fmt", "registry", "std"] }
 tower = { version = "0.5", features = ["util"] }
 alacritty_terminal = { version = "0.26", default-features = false }
 tar = "0.4"

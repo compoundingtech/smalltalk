@@ -1,3 +1,5 @@
+mod glasses;
+
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
@@ -41,8 +43,12 @@ use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
 use crate::model::{SeatQueueMoveRequest, SeatQueueMoveView, SeatQueueRunView, SeatQueueView};
 use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
+mod attention_snapshot;
 mod canonical;
 mod checkpoint;
+mod document_index;
+mod person_work;
+mod projection_digest;
 use canonical::{CANONICAL_ORDER, CANONICAL_ORDER_DESC, canonical_sql};
 mod checkpoint_agreement;
 mod checkpoint_trim;
@@ -50,6 +56,7 @@ mod checkpoint_trim;
 mod convergence;
 mod heal;
 mod lanes;
+mod operations;
 
 pub use checkpoint::{
     CHECKPOINT_MANIFEST_PAGE_LIMIT, CheckpointManifest, CheckpointManifestCursor,
@@ -119,6 +126,9 @@ CREATE TABLE IF NOT EXISTS claims (
 );
 CREATE INDEX IF NOT EXISTS claims_subject_index ON claims(subject, store_index);
 CREATE INDEX IF NOT EXISTS claims_kind_index ON claims(kind, store_index);
+CREATE INDEX IF NOT EXISTS claims_terminal_history_index ON claims(store_index)
+WHERE kind IN ('mission-run.state','step-run.state','work.failed')
+  AND json_extract(body,'$.fields.status') IN ('failed','cancelled','completed');
 CREATE INDEX IF NOT EXISTS claims_subject_kind_index ON claims(subject, kind, store_index);
 CREATE INDEX IF NOT EXISTS claims_subject_kind_accepted_index
 ON claims(subject, kind, length(accepted_at_unix_ms), accepted_at_unix_ms);
@@ -209,12 +219,19 @@ CREATE TABLE IF NOT EXISTS blobs (
     bytes BLOB NOT NULL,
     size INTEGER NOT NULL
 );
+-- Uploaded bytes become shared authority only when a durable claim references them.
+CREATE TABLE IF NOT EXISTS local_blobs (
+    hash TEXT PRIMARY KEY,
+    bytes BLOB NOT NULL,
+    size INTEGER NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS documents (
     name TEXT NOT NULL,
     hash TEXT NOT NULL REFERENCES blobs(hash),
     created_index INTEGER NOT NULL,
     binding_claim_id TEXT NOT NULL DEFAULT '',
+    binding_key BLOB NOT NULL DEFAULT x'',
     PRIMARY KEY(name, hash)
 );
 CREATE INDEX IF NOT EXISTS document_latest ON documents(name, created_index DESC);
@@ -690,7 +707,7 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);
 CREATE INDEX IF NOT EXISTS checkpoint_claims_operation
 ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
-PRAGMA user_version = 13;
+PRAGMA user_version = 15;
 "#;
 
 /// The writer connection's clock offset. Only a simulation sets it; see `write_time`.
@@ -1574,6 +1591,13 @@ pub struct MissionRunStateMoment {
 /// whether it includes history, and the status.
 type AgentStatusEntry = (u64, u64, bool, Arc<StatusResponse>);
 
+pub(crate) struct MissionGateRunner {
+    pub subject: String,
+    pub host: String,
+    pub owner_run: String,
+    pub retired: bool,
+}
+
 pub struct Store {
     connection: WriterConnection,
     readers: ReadPool,
@@ -1624,6 +1648,7 @@ const TERMINAL_OWNED_RUNTIME_SUBJECTS: &str = "SELECT desired.subject
      LEFT JOIN run_generations generation
        ON substr(desired.owner_generation, 1, 15)='run-generation/'
       AND generation.id=substr(desired.owner_generation, 16)
+     LEFT JOIN step_runs step ON step.subject=desired.owner_step
      WHERE desired.member IS NOT NULL
        AND (
          owner.status IN ('completed','failed','cancelled')
@@ -1631,6 +1656,9 @@ const TERMINAL_OWNED_RUNTIME_SUBJECTS: &str = "SELECT desired.subject
          OR root.status IN ('completed','failed','cancelled')
          OR root.phase='terminal'
          OR generation.status IN ('completed','failed','cancelled')
+         OR step.status='cancelled'
+         OR (owner.phase='final-cancelled' AND desired.kind IN ('exec','pty')
+             AND (desired.owner_step IS NULL OR step.status IN ('completed','failed')))
        )
      ORDER BY desired.subject";
 const RETIRED_OWNED_INTAKE_SUBJECTS: &str = "SELECT desired.subject
@@ -1721,7 +1749,10 @@ struct ReplicationSnapshot {
     digest_prefixes: Vec<Sha256>,
     authority_digest: String,
     graph_generation: i64,
+    projection_generation: i64,
     graph_digest: String,
+    legacy_graph_digest: String,
+    projection_digests: BTreeMap<String, String>,
 }
 
 /// Nanoseconds every SQLite statement in this process has taken, from SQLite's profile hook.
@@ -1734,6 +1765,7 @@ fn record_sqlite_time(statement: &str, duration: std::time::Duration) {
     #[cfg(test)]
     STATEMENTS_RUN.with(|run| run.set(run.get() + 1));
     crate::profile::sql(statement, duration);
+    crate::performance::record_query(statement, duration);
     SQLITE_NANOS.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
     if statement == "COMMIT" {
         SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);
@@ -2195,11 +2227,11 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || matches!(version, 10..=13),
+        table_count == 0 || matches!(version, 10..=15),
         "this database uses an unsupported st schema; start with a new state directory"
     );
     anyhow::ensure!(
-        matches!(version, 0 | 10 | 11 | 12 | 13),
+        matches!(version, 0 | 10 | 11 | 12 | 13 | 14 | 15),
         "this database uses unsupported st schema version {version}"
     );
     Ok(())
@@ -2207,7 +2239,7 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
 
 fn migrate_schema(connection: &Connection) -> Result<()> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version == 0 || version == 13 {
+    if version == 0 || version == 13 || version == 14 || version == 15 {
         return Ok(());
     }
     if version == 12 {
@@ -2653,9 +2685,16 @@ fn claims_page_query(subject: bool, descending: bool) -> String {
     let order = if descending { "DESC" } else { "ASC" };
     format!(
         "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
-         FROM claims WHERE {subject_filter}store_index>?1 AND (?2 IS NULL OR store_index<?2)
+         FROM claims WHERE subject NOT LIKE 'glass/%' AND {subject_filter}store_index>?1 AND (?2 IS NULL OR store_index<?2)
          ORDER BY store_index {order} LIMIT ?4"
     )
+}
+
+/// Configure a separately opened writer that changes shared projection rows, such as an
+/// offline maintenance or fault-injection connection. Store's own writers configure this
+/// automatically; readers do not need the SQL functions.
+pub fn configure_projection_writer(connection: &Connection) -> Result<()> {
+    projection_digest::register(connection)
 }
 
 impl Store {
@@ -2666,6 +2705,7 @@ impl Store {
         }
         let mut connection = Connection::open(path)
             .with_context(|| format!("open st database {}", path.display()))?;
+        projection_digest::register(&connection)?;
         connection.profile(Some(record_sqlite_time));
         connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         // Keep the hot graph and replication index pages in SQLite's bounded
@@ -2675,12 +2715,32 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        document_index::initialize(&connection)?;
         backfill_message_index(&connection)?;
         connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(&connection)?;
+        projection_digest::initialize(&connection)?;
+        separate_staged_blobs(&mut connection)?;
         {
             let transaction = connection.transaction()?;
-            rebuild_derived_tables_once_tx(&transaction)?;
+            let upgraded: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM meta WHERE key='canonical_shared_projection_rules' AND value='2')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !upgraded {
+                replay_graph_from_nothing_tx(&transaction)?;
+                transaction.execute(
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES('derived_tables_version',?1)",
+                    [DERIVED_TABLES_VERSION],
+                )?;
+                transaction.execute(
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES('canonical_shared_projection_rules','2')",
+                    [],
+                )?;
+            } else {
+                rebuild_derived_tables_once_tx(&transaction)?;
+            }
             seed_replica_envelopes_tx(&transaction, &origin, None)?;
             transaction.commit()?;
         }
@@ -2726,14 +2786,17 @@ impl Store {
                 | OpenFlags::SQLITE_OPEN_CREATE
                 | OpenFlags::SQLITE_OPEN_URI,
         )?;
+        projection_digest::register(&connection)?;
         connection.profile(Some(record_sqlite_time));
         connection.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        document_index::initialize(&connection)?;
         backfill_message_index(&connection)?;
         connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(&connection)?;
+        projection_digest::initialize(&connection)?;
         {
             let transaction = connection.transaction()?;
             rebuild_operations_tx(&transaction)?;
@@ -4102,11 +4165,15 @@ impl Store {
         let connection = self.readers.get();
         let id = connection
             .query_row(
-                "SELECT p.id FROM revision_proposals p
+                &canonical_sql(
+                    "SELECT p.id FROM revision_proposals p
                  JOIN mission_runs r ON r.id=p.run_id
+                     JOIN claims created ON created.subject='revision-proposal/' || p.id
+                       AND created.kind='revision-proposal.created'
                  WHERE p.run_id=?1 AND p.source_generation_id=r.current_generation_id
                    AND p.status IN ('pending-approval','draining')
-                 ORDER BY p.created_at_unix_ms DESC LIMIT 1",
+                 ORDER BY CANONICAL_DESC(created) LIMIT 1",
+                ),
                 [run],
                 |row| row.get::<_, String>(0),
             )
@@ -4276,7 +4343,7 @@ impl Store {
                 .map_err(internal)?;
         }
         let subject = format!("revision-proposal/{proposal_id}");
-        append_claim_tx(
+        let record = append_claim_tx(
             &transaction,
             &self.origin,
             &subject,
@@ -4297,6 +4364,15 @@ impl Store {
             None,
         )
         .map_err(internal)?;
+        if status == "draining" {
+            transaction
+                .execute(
+                    "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE id=?1",
+                    params![run_id, record.accepted_at_unix_ms.to_string()],
+                )
+                .map_err(internal)?;
+        }
+
         let view = revision_proposal_view_tx(&transaction, &proposal_id).map_err(internal)?;
         transaction
             .execute(
@@ -4432,7 +4508,7 @@ impl Store {
                 )
                 .map_err(internal)?;
         }
-        append_claim_tx(
+        let record = append_claim_tx(
             &transaction,
             &self.origin,
             &proposal.subject,
@@ -4443,6 +4519,21 @@ impl Store {
             None,
         )
         .map_err(internal)?;
+        if status == "draining" {
+            transaction
+                .execute(
+                    "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE id=?1",
+                    params![
+                        proposal
+                            .run
+                            .strip_prefix("mission-run/")
+                            .unwrap_or(&proposal.run),
+                        record.accepted_at_unix_ms.to_string()
+                    ],
+                )
+                .map_err(internal)?;
+        }
+
         transaction.commit().map_err(internal)?;
         drop(connection);
 
@@ -4559,13 +4650,13 @@ impl Store {
                 params![proposal_id, now.to_string()],
             )
             .map_err(internal)?;
-        transaction
+        let phase_changed = transaction
             .execute(
                 "UPDATE mission_runs SET phase='normal', updated_at_unix_ms=?2 WHERE id=?1 AND phase='revision-draining'",
                 params![run_id, now.to_string()],
             )
             .map_err(internal)?;
-        append_claim_tx(
+        let record = append_claim_tx(
             &transaction,
             &self.origin,
             &current.subject,
@@ -4576,6 +4667,15 @@ impl Store {
             None,
         )
         .map_err(internal)?;
+        if phase_changed > 0 {
+            transaction
+                .execute(
+                    "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE id=?1",
+                    params![run_id, record.accepted_at_unix_ms.to_string()],
+                )
+                .map_err(internal)?;
+        }
+
         let view = revision_proposal_view_tx(&transaction, proposal_id).map_err(internal)?;
         transaction
             .execute(
@@ -4635,11 +4735,15 @@ impl Store {
             }
             let proposal_id = connection
                 .query_row(
-                    "SELECT p.id FROM revision_proposals p
+                    &canonical_sql(
+                        "SELECT p.id FROM revision_proposals p
                      JOIN mission_runs r ON r.id=p.run_id
+                     JOIN claims created ON created.subject='revision-proposal/' || p.id
+                       AND created.kind='revision-proposal.created'
                      WHERE p.run_id=?1 AND p.source_generation_id=r.current_generation_id
                        AND p.status='draining'
-                     ORDER BY p.created_at_unix_ms LIMIT 1",
+                     ORDER BY CANONICAL_ASC(created) LIMIT 1",
+                    ),
                     [run_id],
                     |row| row.get::<_, String>(0),
                 )
@@ -7501,7 +7605,7 @@ impl Store {
             }
             let latest: Option<String> = connection
                 .query_row(
-                    &canonical_sql("SELECT documents.hash FROM documents JOIN claims ON claims.id=documents.binding_claim_id WHERE documents.name = ?1 AND documents.created_index<=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                    &canonical_sql("SELECT documents.hash FROM documents WHERE documents.name = ?1 AND documents.created_index<=?2 ORDER BY binding_key DESC LIMIT 1"),
                     params![name, store_index],
                     |row| row.get(0),
                 )
@@ -8766,7 +8870,7 @@ impl Store {
                 }
                 let current: Option<String> = transaction
                     .query_row(
-                        &canonical_sql("SELECT documents.binding_claim_id FROM documents JOIN claims ON claims.id=documents.binding_claim_id WHERE documents.name=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                        &canonical_sql("SELECT documents.binding_claim_id FROM documents WHERE documents.name=?1 ORDER BY binding_key DESC LIMIT 1"),
                         [name],
                         |row| row.get(0),
                     )
@@ -8799,12 +8903,7 @@ impl Store {
                     None,
                 )
                 .map_err(internal)?;
-                transaction
-                    .execute(
-                        "INSERT INTO documents(name, hash, created_index, binding_claim_id) VALUES (?1, ?2, ?3, ?4)",
-                        params![name, hash, record.store_index, record.id],
-                    )
-                    .map_err(internal)?;
+                select_replicated_document(transaction, &record, record.store_index)?;
                 let version = DocumentVersion {
                     name: name.into(),
                     hash,
@@ -8860,15 +8959,20 @@ impl Store {
     ) -> Result<Vec<DocumentVersion>> {
         let connection = self.readers.get();
         let query = "SELECT d.name, d.hash, b.size, d.created_index,
-                     d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name)
+                     d.hash=(SELECT n.hash FROM documents n
+                 WHERE n.name=d.name ORDER BY n.binding_key DESC LIMIT 1)
                      ,d.binding_claim_id, c.accepted_at_unix_ms, c.actor, c.origin
                      FROM documents d JOIN blobs b ON b.hash=d.hash
                      JOIN claims c ON c.id=d.binding_claim_id
                      WHERE (?1 IS NULL OR d.name=?1)
-                       AND (?2 OR d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name))
+                       AND (?2 OR d.hash=(SELECT n.hash FROM documents n
+                 WHERE n.name=d.name ORDER BY n.binding_key DESC LIMIT 1))
                        AND (?3 IS NULL OR substr(d.name,1,length(?3))=?3)
-                       AND (?4 IS NULL OR d.name>?4 OR (d.name=?4 AND d.created_index<?5))
-                     ORDER BY d.name, d.created_index DESC LIMIT ?6";
+                       AND (?4 IS NULL OR d.name>?4 OR (d.name=?4 AND EXISTS (
+                           SELECT 1 FROM documents cursor_document
+                           WHERE cursor_document.name=?4 AND cursor_document.created_index=?5
+                             AND cursor_document.binding_key>d.binding_key)))
+                     ORDER BY d.name, d.binding_key DESC LIMIT ?6";
         let mut statement = connection.prepare(query)?;
         let rows = statement.query_map(
             params![
@@ -8978,6 +9082,9 @@ impl Store {
                     }
                 }
                 let mut stored_fields = normalize_resource_observation(transaction, input)?;
+                if let Some(fields) = glasses::prepare(transaction, input)? {
+                    stored_fields = Some(fields);
+                }
                 // A leave names its own batch as the last sequence of its window. The sequence is only
                 // known here, under the writer lock, so a zero high water stands for "this batch".
                 if input.kind == "fleet.member-left"
@@ -9054,6 +9161,8 @@ impl Store {
             validate_actor(actor)?;
         }
         validate_claim_fields(input)?;
+        st3_schema::glasses::validate_owner(&input.subject, input.actor.as_deref())
+            .map_err(|e| St3Error::new(e.code, e.message))?;
         claim_operation(input)?;
         Ok(())
     }
@@ -9469,24 +9578,6 @@ impl Store {
                     )? {
                         claim_ids.push(claim);
                     }
-                }
-                "superseded-attention" => {
-                    let claim = append_claim_tx(
-                        &transaction,
-                        &self.origin,
-                        &item.subject,
-                        "attention.resolved",
-                        Some("daemon/runtime"),
-                        &json!({"fields": {
-                            "request": item.subject,
-                            "outcome": "resolved",
-                            "reason": item.reason,
-                        }}),
-                        &[],
-                        None,
-                    )
-                    .map_err(internal)?;
-                    claim_ids.push(claim.id);
                 }
                 "wake-contradiction" => {
                     let incarnation_id = item
@@ -10028,6 +10119,9 @@ impl Store {
         let mut subjects = Vec::new();
         let mut pending_actions = Vec::new();
         for subject in subject_names {
+            if subject.starts_with("glass/") {
+                continue;
+            }
             let reduced = match newest {
                 Some(newest) => {
                     Some(self.cached_subject_status(&connection, &subject, store_index, newest)?)
@@ -10174,6 +10268,43 @@ impl Store {
         )?;
         let rows = statement.query_map([], desired_from_row)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+    }
+
+    /// Read an exact immutable declaration, or the revision selected by the desired projection.
+    pub fn agent_declaration(
+        &self,
+        subject: &str,
+        revision: Option<&str>,
+    ) -> Result<Option<(String, Value)>> {
+        let connection = self.readers.get();
+        let row: Option<(String, String)> = connection
+            .query_row(
+                "SELECT c.id, c.body FROM claims c
+                 WHERE c.subject=?1 AND c.kind='intent.desired'
+                   AND c.id=COALESCE(?2, (SELECT d.claim_id FROM desired d WHERE d.subject=?1))",
+                params![subject, revision],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        row.map(|(id, body)| {
+            let desired: DesiredSubject = serde_json::from_str(&body)?;
+            if desired.kind != "agent" {
+                anyhow::bail!("declaration `{subject}` is not an agent");
+            }
+            Ok((id, desired.desired))
+        })
+        .transpose()
+    }
+
+    pub fn agent_declaration_revisions(&self, subject: &str) -> Result<Vec<String>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(&format!(
+            "SELECT claims.id FROM claims WHERE claims.subject=?1 AND claims.kind='intent.desired'
+             ORDER BY {CANONICAL_ORDER_DESC}"
+        ))?;
+        let rows = statement.query_map([subject], |row| row.get(0))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
     }
 
     /// The current desired declaration of `subject` and the actor its claim records. A
@@ -10324,6 +10455,81 @@ impl Store {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<BTreeSet<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Gate runners are launched directly rather than through desired declarations. Their
+    /// owner is durable in the request; older mechanical/LLM requests encode it in the subject.
+    pub(crate) fn mission_gate_runners(&self) -> Result<Vec<MissionGateRunner>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT subject, origin,
+                    COALESCE(json_extract(body, '$.fields.owner'),
+                      'legacy:' || substr(subject, 16, instr(substr(subject, 16), '/')-1))
+             FROM claims request WHERE kind='gate.requested'
+               AND (json_extract(body, '$.fields.runner') IN ('exec','loop-metric')
+                    OR json_extract(body, '$.fields.model') IS NOT NULL)
+               AND NOT EXISTS (
+                 SELECT 1 FROM claims stopped
+                 WHERE stopped.subject=request.subject AND stopped.kind='runtime.observed'
+                   AND json_extract(stopped.body, '$.fields.status')='stopped'
+               )",
+        )?;
+        let mut requests = BTreeMap::<String, Vec<(String, String)>>::new();
+        for row in statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (subject, host, owner) = row?;
+            requests.entry(owner).or_default().push((subject, host));
+        }
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Match by a map rather than an OR/prefix SQL join. That join visits every step
+        // for every historical gate request and stalls reconciliation as runs accumulate.
+        let mut owners = connection.prepare(
+            "SELECT step.subject, 'mission-run/' || run.id,
+                    step.status IN ('completed','failed','cancelled')
+                    OR generation.status IN ('completed','failed','cancelled','superseded')
+                    OR run.phase='terminal' OR run.phase LIKE 'cleanup-%'
+                    OR root.phase='terminal' OR root.phase LIKE 'cleanup-%'
+             FROM step_runs step
+             JOIN mission_runs run ON run.id=step.run_id
+             JOIN mission_runs root ON root.id=run.root_run_id
+             JOIN run_generations generation ON generation.id=step.generation_id
+             UNION ALL
+             SELECT 'mission-run/' || run.id, 'mission-run/' || run.id,
+                    run.phase IN ('final-cancelled','terminal') OR run.phase LIKE 'cleanup-%'
+                    OR run.status IN ('completed','failed','cancelled')
+                    OR root.phase='terminal' OR root.phase LIKE 'cleanup-%'
+             FROM mission_runs run
+             JOIN mission_runs root ON root.id=run.root_run_id",
+        )?;
+        let mut runners = Vec::new();
+        for row in owners.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })? {
+            let (owner, owner_run, retired) = row?;
+            for key in [owner.clone(), format!("legacy:{}", owner.replace('/', "."))] {
+                if let Some(requests) = requests.get(&key) {
+                    runners.extend(requests.iter().map(|(subject, host)| MissionGateRunner {
+                        subject: subject.clone(),
+                        host: host.clone(),
+                        owner_run: owner_run.clone(),
+                        retired,
+                    }));
+                }
+            }
+        }
+        runners.sort_by(|left, right| left.subject.cmp(&right.subject));
+        Ok(runners)
     }
 
     /// Observers, subscriptions, and schedules whose owner run is terminal or whose owner
@@ -10523,7 +10729,10 @@ impl Store {
             all.extend(items);
             match next {
                 Some(cursor) => after = Some(cursor),
-                None => return Ok(all),
+                None => {
+                    sort_messages_canonically(&self.readers.get(), &mut all)?;
+                    return Ok(all);
+                }
             }
         }
     }
@@ -10564,6 +10773,7 @@ impl Store {
                 messages.push(message);
             }
         }
+        sort_messages_canonically(&connection, &mut messages)?;
         Ok(messages)
     }
 
@@ -10749,7 +10959,7 @@ impl Store {
         Ok(if include_history {
             messages
         } else {
-            selected_actionable_messages(messages)
+            selected_actionable_messages(&self.readers.get(), messages)?
         })
     }
 
@@ -10923,6 +11133,7 @@ impl Store {
 
     /// Request attention for a condition the daemon watches itself. The daemon closes it once
     /// that condition clears.
+    /// Retained for historical import and audit fixtures. Current requests use `ask_person`.
     pub fn request_attention(
         &self,
         subject: &str,
@@ -11034,6 +11245,7 @@ impl Store {
             .ok_or_else(|| St3Error::new("internal", "the attention request was not stored"))
     }
 
+    /// Historical audit closure; current attention has no independent resolution.
     pub fn resolve_attention(
         &self,
         subject: &str,
@@ -11061,62 +11273,6 @@ impl Store {
                     "only a person resolves or dismisses attention request `{subject}`; its requester can withdraw it"
                 ),
             ));
-        }
-        if self
-            .attention_request(&subject)
-            .map_err(internal)?
-            .is_none()
-            && let Some(claim_id) = subject.strip_prefix("attention/subscription-failure-")
-        {
-            let failure = self
-                .claim_by_id(claim_id)
-                .map_err(internal)?
-                .filter(|claim| claim.kind == "subscription.mission-failed")
-                .ok_or_else(|| {
-                    St3Error::new(
-                        "missing-attention-request",
-                        format!("attention request `{subject}` does not exist"),
-                    )
-                })?;
-            let fields = failure.body.get("fields").unwrap_or(&failure.body);
-            let original_request = fields
-                .get("request")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let requester = self
-                .claim_by_id(original_request)
-                .map_err(internal)?
-                .and_then(|claim| {
-                    claim
-                        .body
-                        .pointer("/fields/requester")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                })
-                .unwrap_or_default();
-            // The failure is routed to the person who requested the delivery. A subscription
-            // that requests as an agent routes it to no person, so it goes to whoever closes it.
-            let reviewer = if requester.starts_with("person/") {
-                requester
-            } else {
-                actor.clone()
-            };
-            self.request_attention(
-                &subject,
-                &AttentionRequest {
-                    reviewer,
-                    title: "Subscription mission failed".into(),
-                    reason: fields
-                        .get("reason")
-                        .and_then(Value::as_str)
-                        .unwrap_or("Subscription mission failed")
-                        .into(),
-                    severity: "error".into(),
-                    targets: vec![failure.subject],
-                    actor: "agent/reconciler".into(),
-                    idempotency_key: format!("subscription-failure-attention:{claim_id}"),
-                },
-            )?;
         }
         let current = self
             .attention_request(&subject)
@@ -11203,44 +11359,6 @@ impl Store {
         self.attention_request(&subject)
             .map_err(internal)?
             .ok_or_else(|| St3Error::new("internal", "the attention withdrawal was not stored"))
-    }
-
-    /// Pending requests from `origin` that declared an `until` condition.
-    /// Open requests accepted on `origin` that the daemon closes on its own: those with an
-    /// `until` condition or a step whose end closes them.
-    pub fn pending_attention_closed_by_condition(
-        &self,
-        origin: &str,
-    ) -> Result<Vec<AttentionRequestView>> {
-        let connection = self.readers.get();
-        let mut statement = connection.prepare(&canonical_sql(
-            "SELECT request.subject FROM claims request
-             WHERE request.kind='attention.requested'
-               AND request.origin=?1
-               AND (json_extract(request.body, '$.fields.until') IS NOT NULL
-                    OR json_extract(request.body, '$.fields.step') IS NOT NULL)
-               AND NOT EXISTS (
-                 SELECT 1 FROM claims resolution
-                 WHERE resolution.subject=request.subject
-                   AND resolution.kind='attention.resolved'
-               )
-             ORDER BY CANONICAL_ASC(request)",
-        ))?;
-        let subjects = statement
-            .query_map([origin], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()?;
-        subjects
-            .iter()
-            .filter_map(|subject| attention_request_view_tx(&connection, subject).transpose())
-            .collect()
-    }
-
-    /// Why the step whose end closes `request` has ended, or `None` while it runs.
-    pub fn attention_step_ended(&self, request: &AttentionRequestView) -> Result<Option<String>> {
-        let (Some(step), Some(attempt)) = (&request.step, request.step_attempt) else {
-            return Ok(None);
-        };
-        attention_step_ended_tx(&self.readers.get(), step, attempt)
     }
 
     pub(crate) fn resolve_attention_automatically(
@@ -11364,15 +11482,11 @@ impl Store {
             .collect()
     }
 
-    /// The runs a person's attention waits on: those with a gate review, a launch approval or a
-    /// revision approval pending, which `attention_items` lists with their mission run. Messages
-    /// and attention requests name no run, so a mission view reads none of them.
+    /// Current runs waiting on person steps, human gates or approvals.
     pub fn human_attention_runs(&self) -> Result<BTreeSet<String>> {
-        Ok(self
-            .mission_run_attention_items(None)?
-            .into_iter()
-            .filter_map(|item| item.mission_run)
-            .collect())
+        let mut items = self.mission_run_attention_items(None)?;
+        items.extend(self.person_attention_items(None, now_ms())?);
+        Ok(items.into_iter().filter_map(|item| item.mission_run).collect())
     }
 
     /// The attention items that belong to a mission run: gate reviews, launch approvals and
@@ -11466,6 +11580,14 @@ impl Store {
     }
 
     pub fn attention_items(&self, person: Option<&str>) -> Result<Vec<AttentionItemView>> {
+        self.attention_snapshot(person, now_ms())
+    }
+
+    pub fn attention_snapshot(
+        &self,
+        person: Option<&str>,
+        as_of: u128,
+    ) -> Result<Vec<AttentionItemView>> {
         let mut items = self.mission_run_attention_items(person)?;
 
         // Only a person's messages need attention. Without a person, read each person's
@@ -11493,7 +11615,7 @@ impl Store {
                 messages
             }
         };
-        let messages = selected_actionable_messages(messages);
+        let messages = selected_actionable_messages(&self.readers.get(), messages)?;
         if !messages.is_empty() {
             let connection = self.readers.get();
             for message in messages.into_iter().filter(|message| {
@@ -11521,20 +11643,6 @@ impl Store {
 
         {
             let connection = self.readers.get();
-            for request in pending_attention_requests_tx(&connection, person)? {
-                if request
-                    .subject
-                    .starts_with("attention/subscription-failure-")
-                {
-                    continue;
-                }
-                if attention_request_is_current_tx(&connection, &request)? {
-                    items.push(attention_item_from_request(request));
-                }
-            }
-        }
-        {
-            let connection = self.readers.get();
             let mut statement = connection.prepare(
                 &canonical_sql("SELECT id, store_index, batch_id, subject, kind, origin, actor, body,
                         predecessors, accepted_at_unix_ms
@@ -11544,9 +11652,8 @@ impl Store {
                 .query_map([], claim_from_row)?
                 .collect::<Result<Vec<_>, _>>()?;
             for failure in failures {
-                let attention_subject = subscription_failure_attention_subject(&failure.id);
-                if attention_request_view_tx(&connection, &attention_subject)?
-                    .is_some_and(|request| request.status != "pending")
+                if failure.accepted_at_unix_ms > as_of
+                    || !person_work::declaration_live(&connection, &failure.subject)?
                     || !subscription_failure_is_current_tx(&connection, &failure)?
                 {
                     continue;
@@ -11566,7 +11673,7 @@ impl Store {
                     .flatten();
                 let reviewer = requester
                     .filter(|value| value.starts_with("person/"))
-                    .unwrap_or_default();
+                    .unwrap_or_else(|| "person/operator".into());
                 if person.is_some_and(|person| !reviewer.is_empty() && person != reviewer) {
                     continue;
                 }
@@ -11579,9 +11686,11 @@ impl Store {
                     .and_then(Value::as_str)
                     .unwrap_or_default();
                 items.push(AttentionItemView {
+                    episode: failure.id.clone(),
+                    priority: "high".into(),
                     kind: "fault".into(),
                     review_mode: None,
-                    subject: attention_subject,
+                    subject: failure.subject.clone(),
                     person: reviewer,
                     // st's subscription observer raised it.
                     requester_id: Some(
@@ -11607,13 +11716,48 @@ impl Store {
                 });
             }
         }
-        items.sort_by(|left, right| {
-            left.requested_at_unix_ms
-                .cmp(&right.requested_at_unix_ms)
-                .then_with(|| left.kind.cmp(&right.kind))
+        items.extend(self.person_attention_items(person, as_of)?);
+        items.extend(self.operational_attention_items(person, as_of)?);
+        items.extend(self.checkpoint_attention_items(person, as_of)?);
+        let connection = self.readers.get();
+        items.retain(|item| item.requested_at_unix_ms <= as_of);
+        let mut live = Vec::new();
+        for mut item in items {
+            if let Some(run) = item.mission_run.as_deref() {
+                if !person_work::run_live(&connection, run, None, item.kind == "fault")? {
+                    continue;
+                }
+            }
+            if item.episode.is_empty() {
+                item.episode = connection
+                    .query_row(
+                        &canonical_sql(
+                            "SELECT id FROM claims WHERE subject=?1
+                    ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+                        ),
+                        [&item.subject],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?
+                    .unwrap_or_else(|| item.subject.clone());
+            }
+            live.push(item);
+        }
+        let priority = |item: &AttentionItemView| match item.priority.as_str() {
+            "critical" => 0,
+            "high" => 1,
+            "normal" => 2,
+            _ => 3,
+        };
+        live.sort_by(|left, right| {
+            priority(left)
+                .cmp(&priority(right))
+                .then_with(|| left.requested_at_unix_ms.cmp(&right.requested_at_unix_ms))
                 .then_with(|| left.subject.cmp(&right.subject))
                 .then_with(|| left.person.cmp(&right.person))
+                .then_with(|| left.episode.cmp(&right.episode))
         });
+        let items = live;
         Ok(items)
     }
 
@@ -13466,7 +13610,7 @@ impl Store {
         let connection = self.readers.get();
         connection
             .query_row(
-                &canonical_sql("SELECT documents.hash FROM documents JOIN claims ON claims.id=documents.binding_claim_id WHERE documents.name=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                &canonical_sql("SELECT documents.hash FROM documents WHERE documents.name=?1 ORDER BY binding_key DESC LIMIT 1"),
                 [name],
                 |row| row.get(0),
             )
@@ -13496,7 +13640,7 @@ impl Store {
         {
             if let Some(hash) = connection
                 .query_row(
-                    &canonical_sql("SELECT documents.hash FROM documents JOIN claims ON claims.id=documents.binding_claim_id WHERE documents.name=?1 AND documents.created_index<=?2 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                    &canonical_sql("SELECT documents.hash FROM documents WHERE documents.name=?1 AND documents.created_index<=?2 ORDER BY binding_key DESC LIMIT 1"),
                     params![reference, selected],
                     |row| row.get(0),
                 )
@@ -13512,7 +13656,7 @@ impl Store {
         let connection = self.readers.get();
         connection
             .query_row(
-                &canonical_sql("SELECT documents.binding_claim_id FROM documents JOIN claims ON claims.id=documents.binding_claim_id WHERE documents.name=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1"),
+                &canonical_sql("SELECT documents.binding_claim_id FROM documents WHERE documents.name=?1 ORDER BY binding_key DESC LIMIT 1"),
                 [name],
                 |row| row.get(0),
             )
@@ -13610,7 +13754,8 @@ impl Store {
         let hash = hex::encode(Sha256::digest(bytes));
         let connection = self.connection.write();
         connection.execute(
-            "INSERT OR IGNORE INTO blobs(hash, bytes, size) VALUES (?1, ?2, ?3)",
+            "INSERT OR IGNORE INTO local_blobs(hash, bytes, size)
+             SELECT ?1, ?2, ?3 WHERE NOT EXISTS(SELECT 1 FROM blobs WHERE hash=?1)",
             params![hash, bytes, bytes.len() as u64],
         )?;
         Ok(hash)
@@ -13619,9 +13764,12 @@ impl Store {
     pub fn get_blob(&self, hash: &str) -> Result<Option<Vec<u8>>> {
         let connection = self.readers.get();
         connection
-            .query_row("SELECT bytes FROM blobs WHERE hash=?1", [hash], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT bytes FROM blobs WHERE hash=?1
+                        UNION ALL SELECT bytes FROM local_blobs WHERE hash=?1 LIMIT 1",
+                [hash],
+                |row| row.get(0),
+            )
             .optional()
             .map_err(Into::into)
     }
@@ -13671,9 +13819,8 @@ impl Store {
         let latest_batch = max_batch_rowid(&connection)?;
         if latest_batch > seeded_through {
             let transaction = connection.transaction()?;
-            let envelopes_before = max_envelope_rowid(&transaction)?;
             seed_replica_envelopes_tx(&transaction, &self.origin, Some(seeded_through))?;
-            self.sign_own_envelopes_tx(&transaction, Some(envelopes_before))?;
+            self.sign_own_envelopes_tx(&transaction, Some(seeded_through))?;
             transaction.commit()?;
             self.seeded_batch_rowid
                 .store(latest_batch, Ordering::Release);
@@ -13694,6 +13841,7 @@ impl Store {
             // an envelope row.
             let reader = store.readers.get();
             let current_graph_generation = graph_generation(&reader)?;
+            let current_projection_generation = projection_digest::generation(&reader)?;
             let envelope_rowid = max_envelope_rowid(&reader)?;
             Ok(store
                 .replication_snapshot
@@ -13704,6 +13852,7 @@ impl Store {
                     snapshot.store_index == store_index
                         && snapshot.replica_generation == replica_generation
                         && snapshot.graph_generation == current_graph_generation
+                        && snapshot.projection_generation == current_projection_generation
                         && snapshot.max_envelope_rowid == envelope_rowid
                 })
                 .cloned())
@@ -13734,13 +13883,13 @@ impl Store {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .take();
-        // Harness observations, timelines, usage and lease renewals change none of the digested
-        // tables, so their writes leave the generation, and the graph digest, unchanged.
+        // The six-table digest stays on the legacy peer wire format. Its generation lets us
+        // retain compatibility without rescanning those tables for unrelated source changes.
         let graph_generation = graph_generation(connection)?;
         let reusable_graph_digest = previous
             .as_ref()
             .filter(|previous| previous.graph_generation == graph_generation)
-            .map(|previous| previous.graph_digest.clone());
+            .map(|previous| previous.legacy_graph_digest.clone());
         let envelope_count: usize =
             connection.query_row("SELECT COUNT(*) FROM replica_envelopes", [], |row| {
                 row.get(0)
@@ -13837,10 +13986,13 @@ impl Store {
         // inventory digest therefore commits the authority log without hex-encoding and hashing
         // every payload again on each graph change.
         let authority_digest = inventory.digest.clone();
-        let graph_digest = match reusable_graph_digest {
+        let legacy_graph_digest = match reusable_graph_digest {
             Some(digest) => digest,
-            None => graph_digest(connection)?,
+            None => legacy_graph_digest(connection)?,
         };
+        let projection_generation = projection_digest::generation(connection)?;
+        let projection_digests = projection_digest::tables(connection)?;
+        let graph_digest = projection_digest::root(&projection_digests);
         let snapshot = Arc::new(ReplicationSnapshot {
             store_index: current_index(connection)?,
             replica_generation: self.replica_generation.load(Ordering::Acquire),
@@ -13852,7 +14004,10 @@ impl Store {
             digest_prefixes,
             authority_digest,
             graph_generation,
+            projection_generation,
             graph_digest,
+            legacy_graph_digest,
+            projection_digests,
         });
         *self
             .replication_snapshot
@@ -13870,7 +14025,8 @@ impl Store {
             fleet_id: fleet_id.to_owned(),
             schema_digest: st3_schema::registry().digest(),
             authority_digest: snapshot.authority_digest.clone(),
-            graph_digest: snapshot.graph_digest.clone(),
+            graph_digest: snapshot.legacy_graph_digest.clone(),
+            projection_digests: snapshot.projection_digests.clone(),
             inventory: ReplicationInventory {
                 digest: snapshot.inventory.digest.clone(),
                 envelopes: Vec::new(),
@@ -13928,7 +14084,8 @@ impl Store {
                 fleet_id: fleet_id.to_owned(),
                 schema_digest: st3_schema::registry().digest(),
                 authority_digest: snapshot.authority_digest.clone(),
-                graph_digest: snapshot.graph_digest.clone(),
+                graph_digest: snapshot.legacy_graph_digest.clone(),
+                projection_digests: snapshot.projection_digests.clone(),
                 inventory: ReplicationInventory {
                     digest: snapshot.inventory.digest.clone(),
                     envelopes: listed,
@@ -13969,7 +14126,8 @@ impl Store {
             fleet_id: fleet_id.to_owned(),
             schema_digest: st3_schema::registry().digest(),
             authority_digest: snapshot.authority_digest.clone(),
-            graph_digest: snapshot.graph_digest.clone(),
+            graph_digest: snapshot.legacy_graph_digest.clone(),
+            projection_digests: snapshot.projection_digests.clone(),
             inventory: ReplicationInventory {
                 accepts: Some(REPLICATION_PAGE_LIMIT),
                 checkpoint: self.trimmed_checkpoint()?,
@@ -14159,6 +14317,15 @@ impl Store {
                         params![relay, now, input.schema_digest, input.authority_digest, input.graph_digest],
                     )
                     .map_err(internal)?;
+                transaction.execute(
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
+                    params![format!("peer_projection_digests:{relay}"),
+                        serde_json::to_string(&input.projection_digests).map_err(internal)?],
+                ).map_err(internal)?;
+                transaction.execute(
+                    "INSERT OR REPLACE INTO meta(key,value) VALUES(?1,?2)",
+                    params![format!("peer_projection_inventory:{relay}"), input.inventory.digest],
+                ).map_err(internal)?;
                 // A response to our own dial proves the outbound grants now permit it.
                 // Incoming exchanges only prove the reverse route.
                 if asks {
@@ -14186,13 +14353,24 @@ impl Store {
         // Each graph projects the envelopes its node holds, so the digests are comparable only
         // while both nodes hold the same ones, and only once this node has projected them all:
         // nothing new arrived that still waits for admission, and no projection is deferred.
+        let (local_graph, remote_graph) = if input.projection_digests.is_empty() {
+            (
+                snapshot.legacy_graph_digest.clone(),
+                input.graph_digest.clone(),
+            )
+        } else {
+            (
+                snapshot.graph_digest.clone(),
+                projection_digest::root(&input.projection_digests),
+            )
+        };
         let graph_equal = (!input.inventory.digest.is_empty()
             && input.inventory.digest == snapshot.inventory.digest
             && !input.graph_digest.is_empty()
             && received == 0
             && signatures == 0
             && !self.replication_projection_deferred())
-        .then(|| input.graph_digest == snapshot.graph_digest);
+        .then(|| remote_graph == local_graph);
         // A first sync ends at its first comparison, and a difference there heals at once.
         let first_sync_differs = match graph_equal {
             Some(equal) => self
@@ -14200,8 +14378,8 @@ impl Store {
                     relay,
                     equal,
                     snapshot.inventory.envelopes.len() as u64,
-                    &snapshot.graph_digest,
-                    &input.graph_digest,
+                    &local_graph,
+                    &remote_graph,
                 )
                 .map_err(internal)?,
             None => false,
@@ -14695,6 +14873,9 @@ impl Store {
                 }
             }
         }
+        if changed != 0 {
+            rebuild_operations_tx(&transaction)?;
+        }
         transaction.commit()?;
         drop(connection);
         if changed != 0 {
@@ -15101,6 +15282,13 @@ impl Store {
     ) -> Result<ReplicationStatus> {
         let snapshot = self.sealed_replication_snapshot()?;
         let connection = self.readers.get();
+        // Projection caches include committed local batches before their envelopes are sealed.
+        // Equal sealed inventories cannot diagnose those pending writes as peer divergence.
+        let unsealed_local: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM batches WHERE rowid>?1 AND origin=?2)",
+            params![self.seeded_batch_rowid.load(Ordering::Acquire), self.origin],
+            |row| row.get(0),
+        )?;
         let count = |state: &str| -> Result<u64> {
             Ok(connection.query_row(
                 "SELECT COUNT(*) FROM replica_records WHERE state=?1",
@@ -15129,6 +15317,8 @@ impl Store {
                             schema_digest: row.get(3)?,
                             authority_digest: row.get(4)?,
                             graph_digest: row.get(5)?,
+                            projection_digests: BTreeMap::new(),
+                            differing_tables: Vec::new(),
                             sync: None,
                         })
                     },
@@ -15143,6 +15333,8 @@ impl Store {
                     schema_digest: None,
                     authority_digest: None,
                     graph_digest: None,
+                    projection_digests: BTreeMap::new(),
+                    differing_tables: Vec::new(),
                     sync: None,
                 });
             if matches!(
@@ -15173,6 +15365,36 @@ impl Store {
                 status.last_error = None;
             }
             status.sync = sync.get(peer).cloned();
+            let encoded: Option<String> = connection
+                .query_row(
+                    "SELECT value FROM meta WHERE key=?1",
+                    [format!("peer_projection_digests:{peer}")],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            status.projection_digests = encoded
+                .map(|value| serde_json::from_str(&value))
+                .transpose()?
+                .unwrap_or_default();
+            if !status.projection_digests.is_empty() {
+                status.graph_digest = Some(projection_digest::root(&status.projection_digests));
+                let peer_inventory: Option<String> = connection
+                    .query_row(
+                        "SELECT value FROM meta WHERE key=?1",
+                        [format!("peer_projection_inventory:{peer}")],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
+                if peer_inventory.as_deref() == Some(snapshot.inventory.digest.as_str())
+                    && !self.replication_projection_deferred()
+                    && !unsealed_local
+                {
+                    status.differing_tables = projection_digest::differing(
+                        &snapshot.projection_digests,
+                        &status.projection_digests,
+                    );
+                }
+            }
             peers.push(status);
         }
         Ok(ReplicationStatus {
@@ -15180,6 +15402,7 @@ impl Store {
             fleet_id: fleet_id.map(str::to_owned),
             authority_digest: snapshot.authority_digest.clone(),
             graph_digest: snapshot.graph_digest.clone(),
+            projection_digests: snapshot.projection_digests.clone(),
             received_envelopes: connection.query_row(
                 "SELECT COUNT(*) FROM replica_envelopes",
                 [],
@@ -17429,7 +17652,8 @@ fn find_document(
     connection
         .query_row(
             "SELECT d.name, d.hash, b.size, d.created_index,
-             d.created_index=(SELECT MAX(n.created_index) FROM documents n WHERE n.name=d.name),
+             d.hash=(SELECT n.hash FROM documents n
+                 WHERE n.name=d.name ORDER BY n.binding_key DESC LIMIT 1),
              d.binding_claim_id, c.accepted_at_unix_ms, c.actor, c.origin
              FROM documents d JOIN blobs b ON b.hash=d.hash
              JOIN claims c ON c.id=d.binding_claim_id
@@ -18456,6 +18680,7 @@ fn expected_operations(
         "SELECT id, store_index, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms
          FROM claims
          WHERE json_extract(body, '$._operation.id') IS NOT NULL
+           AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=claims.id)
          ORDER BY id",
     )?;
     let claims = statement
@@ -18518,7 +18743,7 @@ fn expected_operations(
 /// this rule has opened. Rebuilding it read every claim and held a start for seconds before the
 /// API could answer. The planning tables are small and rebuilt on every start, since a planning
 /// claim written through the generic claim path is projected only by a rebuild.
-const DERIVED_TABLES_VERSION: &str = "1";
+const DERIVED_TABLES_VERSION: &str = "2";
 
 fn rebuild_derived_tables_once_tx(transaction: &Transaction<'_>) -> Result<()> {
     rebuild_planning_tx(transaction)?;
@@ -18911,6 +19136,7 @@ fn append_claim_tx(
     predecessors: &[String],
     forced_batch: Option<&str>,
 ) -> Result<ClaimRecord> {
+    st3_schema::glasses::validate_owner(subject, actor).map_err(anyhow::Error::new)?;
     let fields = schema_fields_for_body(kind, body)?;
     let claim_spec = st3_schema::registry()
         .validate_claim(subject, kind, &fields)
@@ -18952,6 +19178,7 @@ fn append_claim_tx(
         now,
     )?;
     insert_event(transaction, store_index, kind, subject, body)?;
+    normalize_local_projection_timestamps_tx(transaction, subject, kind, body, now)?;
     Ok(ClaimRecord {
         id,
         store_index,
@@ -18966,6 +19193,115 @@ fn append_claim_tx(
         predecessors: predecessors.to_vec(),
         accepted_at_unix_ms: now,
     })
+}
+
+fn mission_run_creation_time(fields: &Value, accepted_at: u128) -> u128 {
+    fields
+        .get("deadline_at_unix_ms")
+        .and_then(Value::as_u64)
+        .zip(fields.get("timeout_ms").and_then(Value::as_u64))
+        .and_then(|(deadline, timeout)| deadline.checked_sub(timeout))
+        .map(u128::from)
+        .unwrap_or(accepted_at)
+}
+
+/// Local writers often prepare rows before appending their claim. Use the resulting claim's
+/// immutable acceptance timestamp, exactly as replay does, for shared creation/change dates.
+/// Local lease renewal dates remain separate overlays.
+fn normalize_local_projection_timestamps_tx(
+    transaction: &Transaction<'_>,
+    subject: &str,
+    kind: &str,
+    body: &Value,
+    at: u128,
+) -> Result<()> {
+    let fields = body.get("fields").unwrap_or(body);
+    let at = at.to_string();
+    match kind {
+        "mission-run.created" => {
+            let at = mission_run_creation_time(fields, at.parse()?).to_string();
+            transaction.execute(
+                "UPDATE mission_runs SET created_at_unix_ms=?2,updated_at_unix_ms=?2 WHERE id=?1",
+                params![subject.strip_prefix("mission-run/").unwrap_or(subject), at],
+            )?;
+            if let Some(generation) = fields.get("current_generation").and_then(Value::as_str) {
+                let generation = generation_id_from_subject(generation);
+                transaction.execute("UPDATE run_generations SET created_at_unix_ms=?2,updated_at_unix_ms=?2 WHERE id=?1",params![generation,at])?;
+                transaction.execute("UPDATE step_runs SET created_at_unix_ms=?2,updated_at_unix_ms=?2 WHERE generation_id=?1",params![generation,at])?;
+            }
+        }
+        "mission-run.state" => {
+            transaction.execute(
+                "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE id=?1",
+                params![subject.strip_prefix("mission-run/").unwrap_or(subject), at],
+            )?;
+        }
+        "run-generation.created" if fields.get("predecessor").and_then(Value::as_str).is_some() => {
+            let generation = generation_id_from_subject(subject);
+            transaction.execute("UPDATE run_generations SET created_at_unix_ms=?2,updated_at_unix_ms=?2 WHERE id=?1",params![generation,at])?;
+            transaction.execute("UPDATE step_runs SET created_at_unix_ms=?2,updated_at_unix_ms=?2 WHERE generation_id=?1",params![generation,at])?;
+            transaction.execute(
+                "UPDATE mission_runs SET updated_at_unix_ms=?2 WHERE current_generation_id=?1",
+                params![generation, at],
+            )?;
+        }
+        "run-generation.state" | "run-generation.superseded" => {
+            transaction.execute(
+                "UPDATE run_generations SET updated_at_unix_ms=?2 WHERE id=?1",
+                params![generation_id_from_subject(subject), at],
+            )?;
+        }
+        "revision-proposal.created" => {
+            transaction.execute("UPDATE revision_proposals SET created_at_unix_ms=?2,updated_at_unix_ms=?2 WHERE id=?1",
+                params![subject.strip_prefix("revision-proposal/").unwrap_or(subject),at])?;
+        }
+        "revision-proposal.approved"
+        | "revision-proposal.cancelled"
+        | "revision-proposal.applied" => {
+            transaction.execute(
+                "UPDATE revision_proposals SET updated_at_unix_ms=?2 WHERE id=?1",
+                params![
+                    subject
+                        .strip_prefix("revision-proposal/")
+                        .unwrap_or(subject),
+                    at
+                ],
+            )?;
+        }
+        "step-run.state" if fields.get("status").and_then(Value::as_str) == Some("ready") => {
+            transaction.execute(
+                "UPDATE step_runs SET activated_at_unix_ms=?2 WHERE subject=?1",
+                params![subject, at],
+            )?;
+        }
+        "planning-session.started" => {
+            transaction.execute("UPDATE planning_sessions SET created_at_unix_ms=?2,updated_at_unix_ms=?2 WHERE id=?1",
+                params![subject.trim_start_matches("planning-session/"),at])?;
+        }
+        "planning-session.candidate" => {
+            let id = subject.trim_start_matches("planning-session/");
+            transaction.execute(
+                "UPDATE planning_sessions SET updated_at_unix_ms=?2 WHERE id=?1",
+                params![id, at],
+            )?;
+            transaction.execute("UPDATE planning_candidates SET submitted_at_unix_ms=?4 WHERE session_id=?1 AND variant=?2 AND revision=?3",
+                params![id,fields.get("variant").and_then(Value::as_str).unwrap_or("default"),fields.get("candidate_revision").or_else(||fields.get("revision")).and_then(Value::as_u64),at])?;
+        }
+        "planning-session.previewed" => {
+            transaction.execute("UPDATE planning_previews SET created_at_unix_ms=?3 WHERE session_id=?1 AND variant=?2",
+                params![subject.trim_start_matches("planning-session/"),fields.get("variant").and_then(Value::as_str).unwrap_or("default"),at])?;
+        }
+        "planning-session.approved"
+        | "planning-session.cancelled"
+        | "planning-session.revision-requested" => {
+            transaction.execute(
+                "UPDATE planning_sessions SET updated_at_unix_ms=?2 WHERE id=?1",
+                params![subject.trim_start_matches("planning-session/"), at],
+            )?;
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn schema_fields_for_body(kind: &str, body: &Value) -> Result<BTreeMap<String, Value>> {
@@ -19012,6 +19348,7 @@ fn insert_claim(
     predecessors: &[String],
     now: u128,
 ) -> Result<u64> {
+    promote_claim_blobs(transaction, body)?;
     transaction.execute(
         "INSERT INTO claims(id, batch_id, subject, kind, origin, actor, body, predecessors, accepted_at_unix_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -19037,6 +19374,9 @@ fn insert_event(
     subject: &str,
     body: &Value,
 ) -> Result<()> {
+    if subject.starts_with("glass/") {
+        return Ok(());
+    }
     transaction.execute(
         "INSERT OR IGNORE INTO events(store_index, kind, subject, body) VALUES (?1, ?2, ?3, ?4)",
         params![store_index, kind, subject, canonical_json_text(body)?],
@@ -20051,7 +20391,26 @@ fn pending_attention_requests_tx(
         .collect()
 }
 
-fn selected_actionable_messages(messages: Vec<MessageView>) -> Vec<MessageView> {
+fn sort_messages_canonically(connection: &Connection, messages: &mut [MessageView]) -> Result<()> {
+    let mut keys = BTreeMap::new();
+    let mut statement = connection.prepare(&canonical_sql(
+        "SELECT id FROM claims WHERE subject=?1 AND kind IN ('message.sent','intent.desired') ORDER BY CANONICAL_ASC(claims) LIMIT 1"
+    ))?;
+    for message in messages.iter() {
+        let id: String = statement.query_row([&message.subject], |row| row.get(0))?;
+        keys.insert(
+            message.subject.clone(),
+            canonical::claim_key(connection, &id)?,
+        );
+    }
+    messages.sort_by(|left, right| keys[&left.subject].cmp(&keys[&right.subject]));
+    Ok(())
+}
+
+fn selected_actionable_messages(
+    connection: &Connection,
+    messages: Vec<MessageView>,
+) -> Result<Vec<MessageView>> {
     let mut selected_reminders = BTreeMap::<String, (u64, MessageView)>::new();
     let mut selected = Vec::new();
     for message in messages {
@@ -20079,12 +20438,12 @@ fn selected_actionable_messages(messages: Vec<MessageView>) -> Vec<MessageView> 
         }
     }
     selected.extend(selected_reminders.into_values().map(|(_, message)| message));
-    selected.sort_by_key(|message| message.created_index);
-    selected
+    sort_messages_canonically(connection, &mut selected)?;
+    Ok(selected)
 }
 
 /// Target kinds whose own state can end an attention request; see
-/// `attention_request_is_current_tx` and `attention_target_moved_on_tx`. A pull request resource
+/// the retained legacy request metadata. A pull request resource
 /// can end one too, once st has observed it.
 const ATTENTION_ENDING_TARGETS: &[&str] = &[
     "step-run/",
@@ -20181,127 +20540,6 @@ fn attention_closing_step(
 
 /// Why the step whose end closes an attention request has ended since `attempt`, or `None`
 /// while that attempt still runs. A step st no longer knows has not ended.
-fn attention_step_ended_tx(
-    connection: &Connection,
-    step: &str,
-    attempt: u64,
-) -> Result<Option<String>> {
-    let row = connection
-        .query_row(
-            "SELECT step_runs.status, step_runs.attempt,
-                    step_runs.generation_id=mission_runs.current_generation_id,
-                    mission_runs.status
-             FROM step_runs
-             JOIN mission_runs ON mission_runs.id=step_runs.run_id
-             WHERE step_runs.subject=?1",
-            [step],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, u64>(1)?,
-                    row.get::<_, bool>(2)?,
-                    row.get::<_, String>(3)?,
-                ))
-            },
-        )
-        .optional()?;
-    let Some((status, current_attempt, current_generation, run_status)) = row else {
-        return Ok(None);
-    };
-    let terminal = |status: &str| matches!(status, "completed" | "failed" | "cancelled");
-    Ok(if current_attempt != attempt {
-        Some(format!("`{step}` started attempt {current_attempt}"))
-    } else if terminal(&status) {
-        Some(format!("`{step}` {status}"))
-    } else if !current_generation {
-        Some(format!("`{step}` left its run's current generation"))
-    } else if terminal(&run_status) {
-        Some(format!("the run of `{step}` {run_status}"))
-    } else {
-        None
-    })
-}
-
-/// A fault request stays current until a target that owns its lifecycle ends it. A stale
-/// `run-generation/` or `step-run/` target ends it at once, and so does a pull request that is
-/// merged or closed. Otherwise it ends once every target that is not context has moved on after
-/// the request was accepted. Other `resource/` targets and `doc/` targets are context. A target
-/// that had already moved on when the request was made keeps it current, because the request is
-/// then about that outcome.
-fn attention_request_is_current_tx(
-    connection: &Connection,
-    request: &AttentionRequestView,
-) -> Result<bool> {
-    if request.reason.to_ascii_lowercase().contains("superseded") {
-        return Ok(false);
-    }
-    if let (Some(step), Some(attempt)) = (&request.step, request.step_attempt)
-        && attention_step_ended_tx(connection, step, attempt)?.is_some()
-    {
-        return Ok(false);
-    }
-    // A decision about a pull request has nothing left to decide once it is merged or closed,
-    // even when that happened before the request.
-    for target in &request.targets {
-        if pull_request_closed_tx(connection, target)? {
-            return Ok(false);
-        }
-    }
-    let mut runtime_targets = false;
-    for target in &request.targets {
-        if let Some(generation) = target.strip_prefix("run-generation/") {
-            runtime_targets = true;
-            let current = connection
-                .query_row(
-                    "SELECT mission_runs.current_generation_id=run_generations.id
-                     FROM run_generations
-                     JOIN mission_runs ON mission_runs.id=run_generations.run_id
-                     WHERE run_generations.id=?1
-                       AND mission_runs.status NOT IN ('completed','failed','cancelled')",
-                    [generation],
-                    |row| row.get::<_, bool>(0),
-                )
-                .optional()?;
-            if current != Some(true) {
-                return Ok(false);
-            }
-        } else if target.starts_with("step-run/") {
-            runtime_targets = true;
-            let current = connection
-                .query_row(
-                    "SELECT step_runs.generation_id=mission_runs.current_generation_id
-                            AND mission_runs.status NOT IN ('completed','failed','cancelled')
-                     FROM step_runs
-                     JOIN mission_runs ON mission_runs.id=step_runs.run_id
-                     WHERE step_runs.subject=?1",
-                    [target],
-                    |row| row.get::<_, bool>(0),
-                )
-                .optional()?;
-            if current != Some(true) {
-                return Ok(false);
-            }
-        }
-    }
-    if runtime_targets {
-        return Ok(true);
-    }
-    let since = connection.query_row(
-        "SELECT accepted_at_unix_ms, id FROM claims WHERE id=?1",
-        [&request.request],
-        |row| claim_moment(connection, row),
-    )?;
-    let mut moved_on = false;
-    for target in &request.targets {
-        match attention_target_moved_on_tx(connection, target, since.clone())? {
-            Some(true) => moved_on = true,
-            Some(false) => return Ok(true),
-            None => {}
-        }
-    }
-    Ok(!moved_on)
-}
-
 /// The same canonical total-order key used by shared SQL folds, including equal-time episodes.
 type ClaimMoment = canonical::ClaimKey;
 
@@ -20311,220 +20549,6 @@ fn claim_moment(connection: &Connection, row: &rusqlite::Row<'_>) -> rusqlite::R
     })
 }
 
-/// Whether `target` reached an ending state after `since`: `None` when the target is context
-/// that could never end a request.
-fn attention_target_moved_on_tx(
-    connection: &Connection,
-    target: &str,
-    since: ClaimMoment,
-) -> Result<Option<bool>> {
-    let after = |moment: Option<ClaimMoment>| Some(moment.is_some_and(|moment| moment > since));
-    if let Some(mission) = target.strip_prefix("mission/") {
-        let retired = connection
-            .query_row(
-                "SELECT claims.accepted_at_unix_ms, claims.id
-                 FROM mission_definitions
-                 JOIN claims ON claims.id=mission_definitions.claim_id
-                 WHERE mission_definitions.mission_id=?1
-                   AND mission_definitions.state='retired'",
-                [mission],
-                |row| claim_moment(connection, row),
-            )
-            .optional()?;
-        if retired.is_some() {
-            return Ok(after(retired));
-        }
-        // A mission is cancelled when no run is active and its latest run was cancelled.
-        let mut statement = connection.prepare(
-            "SELECT id, status FROM mission_runs WHERE mission_id=?1
-             ORDER BY CAST(created_at_unix_ms AS INTEGER) DESC, id DESC",
-        )?;
-        let runs = statement
-            .query_map([mission], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        if runs
-            .iter()
-            .any(|(_, status)| !is_terminal_run_state(status))
-        {
-            return Ok(Some(false));
-        }
-        return match runs.first() {
-            Some((run, status)) if status == "cancelled" => {
-                Ok(after(mission_run_ended_tx(connection, run)?))
-            }
-            _ => Ok(Some(false)),
-        };
-    }
-    if let Some(run) = target.strip_prefix("mission-run/") {
-        return Ok(after(mission_run_ended_tx(connection, run)?));
-    }
-    if target.starts_with("attention/") {
-        if attention_request_view_tx(connection, target)?.is_some() {
-            let resolved = connection
-                .query_row(
-                    &canonical_sql(
-                        "SELECT accepted_at_unix_ms, id FROM claims
-                     WHERE subject=?1 AND kind='attention.resolved'
-                     ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-                    ),
-                    [target],
-                    |row| claim_moment(connection, row),
-                )
-                .optional()?;
-            return Ok(after(resolved));
-        }
-        // Otherwise the target is a client attention ID, a digest of a human gate's owner
-        // (`attention_resource_id` in the API). It moved on when that gate, requested before
-        // this request, is no longer pending.
-        let gate_id = |owner: &str| {
-            let digest = hex::encode(Sha256::digest(owner.as_bytes()));
-            format!("attention/{}", &digest[..24])
-        };
-        if pending_human_reviews_tx(connection, None)?
-            .iter()
-            .any(|review| gate_id(&review.owner) == target)
-        {
-            return Ok(Some(false));
-        }
-        let mut statement = connection.prepare(
-            "SELECT json_extract(body, '$.fields.owner'), accepted_at_unix_ms, id
-             FROM claims
-             WHERE kind='gate.requested'
-               AND json_extract(body, '$.fields.reviewer') IS NOT NULL",
-        )?;
-        let requested_before = statement
-            .query_map([], |row| {
-                let owner = row.get::<_, Option<String>>(0)?;
-                let _accepted_at = row.get::<_, String>(1)?;
-                Ok((
-                    owner,
-                    canonical::claim_key(connection, &row.get::<_, String>(2)?).map_err(
-                        |error| {
-                            rusqlite::Error::FromSqlConversionFailure(
-                                2,
-                                rusqlite::types::Type::Text,
-                                error.into(),
-                            )
-                        },
-                    )?,
-                ))
-            })?
-            .collect::<Result<Vec<(Option<String>, ClaimMoment)>, _>>()?
-            .into_iter()
-            .any(|(owner, moment)| {
-                moment < since && owner.is_some_and(|owner| gate_id(&owner) == target)
-            });
-        return Ok(Some(requested_before));
-    }
-    if target.starts_with("agent/") {
-        let stopped = connection
-            .query_row(
-                "SELECT claims.accepted_at_unix_ms, claims.id
-                 FROM desired JOIN claims ON claims.id=desired.claim_id
-                 WHERE desired.subject=?1 AND desired.kind='stop'",
-                [target],
-                |row| claim_moment(connection, row),
-            )
-            .optional()?;
-        if stopped.is_some() {
-            return Ok(after(stopped));
-        }
-        // An agent that is ready on an incarnation that started after the request has
-        // recovered from whatever the request described.
-        let Some(harness) = current_harness_at(connection, target, None)? else {
-            return Ok(Some(false));
-        };
-        if !harness.is_ready() {
-            return Ok(Some(false));
-        }
-        let started = connection
-            .query_row(
-                &canonical_sql(
-                    "SELECT accepted_at_unix_ms, id FROM claims
-                 WHERE subject=?1 AND kind='runtime.observed'
-                   AND json_extract(body, '$.fields.incarnation_id')=?2
-                 ORDER BY CANONICAL_ASC(claims) LIMIT 1",
-                ),
-                params![target, harness.incarnation_id],
-                |row| claim_moment(connection, row),
-            )
-            .optional()?;
-        return Ok(after(started));
-    }
-    if target.starts_with("observer/") {
-        // A stopped observer has nothing left to observe. One that observes successfully again
-        // has recovered from what the request described.
-        if let Some(stopped) = declaration_stopped_tx(connection, target)? {
-            return Ok(after(Some(stopped)));
-        }
-        let state = connection
-            .query_row(
-                &canonical_sql(
-                    "SELECT json_extract(body, '$.fields.state'), accepted_at_unix_ms, id
-                 FROM claims WHERE subject=?1 AND kind='observer.state'
-                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-                ),
-                [target],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        canonical::claim_key(connection, &row.get::<_, String>(2)?).map_err(
-                            |error| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    2,
-                                    rusqlite::types::Type::Text,
-                                    error.into(),
-                                )
-                            },
-                        )?,
-                    ))
-                },
-            )
-            .optional()?;
-        return Ok(match state {
-            Some((Some(state), moment)) if state == "healthy" => after(Some(moment)),
-            _ => Some(false),
-        });
-    }
-    if target.starts_with("subscription/") {
-        return Ok(after(declaration_stopped_tx(connection, target)?));
-    }
-    if let Some(path) = target.strip_prefix("loop-run/") {
-        return loop_run_moved_on_tx(connection, target, path, since);
-    }
-    if target.starts_with("message/") {
-        let closed = connection
-            .query_row(
-                &canonical_sql(
-                    "SELECT accepted_at_unix_ms, id FROM claims
-                 WHERE subject=?1 AND kind='message.closed'
-                 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-                ),
-                [target],
-                |row| claim_moment(connection, row),
-            )
-            .optional()?;
-        return Ok(after(closed));
-    }
-    // Resources and documents are context. A target of any other kind has no rule here, so it
-    // keeps the request current.
-    if target.starts_with("resource/") || target.starts_with("doc/") {
-        return Ok(None);
-    }
-    Ok(Some(false))
-}
-
-/// Whether `target`, with or without a pinned observation, names a pull request whose latest
-/// observation shows it merged or closed.
-fn pull_request_closed_tx(connection: &Connection, target: &str) -> Result<bool> {
-    Ok(pull_request_state_tx(connection, target)?.is_some_and(|(state, _)| state != "open"))
-}
-
-/// The state of the pull request that `target` names, with or without a pinned observation, from
-/// its latest observation: `open`, `closed` or `merged`. An open listing records a pull request
-/// that left it as `closed`; the pull request provider records `state.state` and `state.merged`.
 fn pull_request_state_tx(connection: &Connection, target: &str) -> Result<Option<(String, u128)>> {
     let subject = target
         .split_once('@')
@@ -20596,89 +20620,6 @@ fn declaration_stopped_tx(connection: &Connection, subject: &str) -> Result<Opti
             |row| claim_moment(connection, row),
         )
         .optional()?)
-}
-
-/// A loop that stopped moved on once it runs again after a retry, once a revision replaced its
-/// run generation, or once its run was cancelled. Its run failing because it stopped does not
-/// end it: that failure is what the request reports.
-fn loop_run_moved_on_tx(
-    connection: &Connection,
-    target: &str,
-    path: &str,
-    since: ClaimMoment,
-) -> Result<Option<bool>> {
-    let after = |moment: Option<ClaimMoment>| Some(moment.is_some_and(|moment| moment > since));
-    let running_again = connection
-        .query_row(
-            &canonical_sql(
-                "SELECT accepted_at_unix_ms, id FROM claims
-             WHERE subject=?1 AND kind='loop.state'
-               AND json_extract(body, '$.fields.status')!='failed'
-             ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-            ),
-            [target],
-            |row| claim_moment(connection, row),
-        )
-        .optional()?;
-    if after(running_again) == Some(true) {
-        return Ok(Some(true));
-    }
-    let Some((generation, _)) = path.split_once('/') else {
-        return Ok(Some(false));
-    };
-    let run = connection
-        .query_row(
-            "SELECT mission_runs.id, mission_runs.status,
-                    mission_runs.current_generation_id=run_generations.id
-             FROM run_generations
-             JOIN mission_runs ON mission_runs.id=run_generations.run_id
-             WHERE run_generations.id=?1",
-            [generation],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, bool>(2)?,
-                ))
-            },
-        )
-        .optional()?;
-    Ok(match run {
-        Some((_, _, false)) => Some(true),
-        Some((run, status, true)) if status == "cancelled" => {
-            after(mission_run_ended_tx(connection, &run)?)
-        }
-        _ => Some(false),
-    })
-}
-
-/// When a terminal run first reached a terminal status, from its own state history.
-fn mission_run_ended_tx(connection: &Connection, run: &str) -> Result<Option<ClaimMoment>> {
-    let run = run.strip_prefix("mission-run/").unwrap_or(run);
-    let terminal = connection
-        .query_row(
-            "SELECT status FROM mission_runs WHERE id=?1",
-            [run],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?
-        .is_some_and(|status| is_terminal_run_state(&status));
-    if !terminal {
-        return Ok(None);
-    }
-    connection
-        .query_row(
-            &canonical_sql(
-                "SELECT accepted_at_unix_ms, id FROM claims
-             WHERE subject=?1 AND kind='mission-run.state'
-               AND json_extract(body, '$.fields.status') IN ('completed','failed','cancelled')
-             ORDER BY CANONICAL_ASC(claims) LIMIT 1",
-            ),
-            [format!("mission-run/{run}")],
-            |row| claim_moment(connection, row),
-        )
-        .optional()
-        .map_err(Into::into)
 }
 
 type TargetState = (String, Option<u128>);
@@ -20829,15 +20770,10 @@ fn subscription_failure_is_current_tx(
     Ok(declaration_stopped_tx(connection, &failure.subject)?.is_none())
 }
 
-fn subscription_failure_attention_subject(claim_id: &str) -> String {
-    format!(
-        "attention/subscription-failure-{}",
-        claim_id.strip_prefix("claim/").unwrap_or(claim_id)
-    )
-}
-
 fn attention_item_from_review(review: HumanReviewView) -> AttentionItemView {
     AttentionItemView {
+        episode: review.request.clone(),
+        priority: "normal".into(),
         kind: "human-gate".into(),
         review_mode: Some(review.mode.clone()),
         subject: review.owner.clone(),
@@ -20898,6 +20834,8 @@ fn attention_item_from_planning(
     preview: &PlanningPreviewView,
 ) -> AttentionItemView {
     AttentionItemView {
+        episode: preview.hash.clone(),
+        priority: "normal".into(),
         kind: "launch-approval".into(),
         review_mode: None,
         subject: session.subject.clone(),
@@ -20956,6 +20894,8 @@ fn attention_item_from_revision(
 ) -> AttentionItemView {
     let preview_hash = proposal.preview_hash.as_deref().unwrap_or_default();
     AttentionItemView {
+        episode: format!("{}:{}", proposal.source_generation, preview_hash),
+        priority: "normal".into(),
         kind: "revision-approval".into(),
         review_mode: None,
         subject: proposal.subject.clone(),
@@ -21007,6 +20947,8 @@ fn attention_item_from_message(
     requested_at_unix_ms: u128,
 ) -> AttentionItemView {
     AttentionItemView {
+        episode: message.subject.clone(),
+        priority: "normal".into(),
         kind: "unread-message".into(),
         review_mode: None,
         subject: message.subject.clone(),
@@ -21042,19 +20984,20 @@ pub(crate) fn agent_attention_requester(actor: &str) -> bool {
     actor.starts_with("agent/") && actor != "agent/st3/reconciler"
 }
 
-fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemView {
-    let agent_request = agent_attention_requester(&request.actor);
+fn attention_item_from_failure(request: AttentionRequestView) -> AttentionItemView {
     AttentionItemView {
-        kind: if agent_request {
-            "agent-request"
+        episode: request.request.clone(),
+        priority: if request.severity == "warning" {
+            "normal"
         } else {
-            "fault"
+            "high"
         }
         .into(),
+        kind: "fault".into(),
         review_mode: None,
         subject: request.subject.clone(),
-        person: request.reviewer.clone(),
-        requester_id: Some(request.actor.clone()),
+        person: request.reviewer,
+        requester_id: Some(request.actor),
         launch_id: None,
         variant_id: None,
         message_id: None,
@@ -21065,34 +21008,10 @@ fn attention_item_from_request(request: AttentionRequestView) -> AttentionItemVi
         step: None,
         targets: request.targets,
         requested_at_unix_ms: request.requested_at_unix_ms,
-        actions: vec![
-            attention_action(
-                if agent_request { "answer" } else { "resolve" },
-                &[
-                    "st",
-                    "attention",
-                    "resolve",
-                    &request.subject,
-                    "--outcome",
-                    "resolved",
-                    "--as",
-                    &request.reviewer,
-                ],
-            ),
-            attention_action(
-                "dismiss",
-                &[
-                    "st",
-                    "attention",
-                    "resolve",
-                    &request.subject,
-                    "--outcome",
-                    "dismissed",
-                    "--as",
-                    &request.reviewer,
-                ],
-            ),
-        ],
+        actions: vec![attention_action(
+            "inspect source",
+            &["st", "subject", &request.subject],
+        )],
     }
 }
 
@@ -21251,20 +21170,6 @@ fn operational_repair_plan_tx(
                 "lease_expires_at_unix_ms".into(),
                 Value::String(expiry.to_string()),
             )]),
-        )?;
-    }
-
-    for request in pending_attention_requests_tx(connection, None)? {
-        if attention_request_is_current_tx(connection, &request)? {
-            continue;
-        }
-        push_operational_repair_item(
-            &mut items,
-            "superseded-attention",
-            &request.subject,
-            vec![request.subject.clone()],
-            "the attention target is terminal, superseded, or otherwise no longer current",
-            BTreeMap::new(),
         )?;
     }
 
@@ -22346,11 +22251,12 @@ impl Store {
     }
 
     /// Sign every envelope of this node's writer that has no signature by its member key,
-    /// optionally only those added after one `replica_envelopes` row.
+    /// optionally only those whose batches follow the last processed batch. Another process
+    /// can seal a batch before this keyed worker sees it; an envelope-row frontier would skip it.
     fn sign_own_envelopes_tx(
         &self,
         transaction: &Transaction<'_>,
-        after_rowid: Option<i64>,
+        after_batch_rowid: Option<i64>,
     ) -> Result<usize> {
         let _timing = time_stage(&self.replication_timers.signing);
         let Some(key) = self
@@ -22364,9 +22270,14 @@ impl Store {
         let Some(fleet_id) = fleet_meta(transaction, "fleet_id")? else {
             return Ok(0);
         };
-        let mut statement = transaction.prepare(
-            "SELECT sequence, envelope_hash FROM replica_envelopes AS envelopes
-             WHERE writer=?1 AND rowid>?2
+        let from = if after_batch_rowid.is_some() {
+            "FROM batches CROSS JOIN replica_envelopes AS envelopes
+             ON envelopes.batch_id=batches.id WHERE batches.rowid>?2 AND envelopes.writer=?1"
+        } else {
+            "FROM replica_envelopes AS envelopes WHERE envelopes.writer=?1 AND envelopes.rowid>?2"
+        };
+        let mut statement = transaction.prepare(&format!(
+            "SELECT envelopes.sequence, envelopes.envelope_hash {from}
                AND NOT EXISTS (
                  SELECT 1 FROM replica_envelope_signatures AS signatures
                  WHERE signatures.writer=envelopes.writer
@@ -22374,11 +22285,15 @@ impl Store {
                    AND signatures.envelope_hash=envelopes.envelope_hash
                    AND signatures.member_key=?3
                )
-             ORDER BY sequence",
-        )?;
+             ORDER BY envelopes.sequence"
+        ))?;
         let unsigned = statement
             .query_map(
-                params![self.origin, after_rowid.unwrap_or(i64::MIN), key.public()],
+                params![
+                    self.origin,
+                    after_batch_rowid.unwrap_or(i64::MIN),
+                    key.public()
+                ],
                 |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
             )?
             .collect::<Result<Vec<_>, _>>()?;
@@ -23641,6 +23556,130 @@ mod fleet_admission_tests {
     }
 
     #[test]
+    fn worker_signs_batches_already_sealed_by_an_unkeyed_daemon() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("claims.sqlite3");
+        let worker = Store::open(&path, "alder").unwrap();
+        worker.bind_fleet(FLEET).unwrap();
+        let member = key();
+        worker.set_member_key(Some(member.clone())).unwrap();
+        let claim = note(&worker, "written while another process opens");
+        // Startup seeds envelopes without a member key; the keyed worker has not seen this
+        // batch yet. This is the main/replication-worker startup interleaving.
+        let daemon = Store::open(&path, "alder").unwrap();
+        let unsigned = daemon.replication_inventory().unwrap();
+        assert!(!unsigned.envelopes.is_empty());
+        let exchange = worker
+            .export_replication_exchange(FLEET, &ReplicationInventory::default())
+            .unwrap();
+        let envelope = exchange.envelopes.iter().find(|e| e.sequence == 1).unwrap();
+        assert!(verify_signature(
+            member.public(),
+            &envelope_signature_message(FLEET, "alder", envelope.sequence, &envelope.hash),
+            envelope
+                .signature
+                .as_deref()
+                .expect("already sealed batches must be signed")
+        ));
+        let receiver = node("birch", None, None);
+        sync(&worker, &receiver);
+        assert!(admitted(&receiver, &claim));
+    }
+
+    #[test]
+    fn staged_blobs_join_shared_authority_only_with_a_committed_claim() {
+        let source = node("alder", None, None);
+        let target = node("birch", None, None);
+        let baseline = source.replication_status(true, Some(FLEET), &[]).unwrap();
+        let hash = source.put_blob(b"staged upload").unwrap();
+        assert_eq!(source.get_blob(&hash).unwrap().unwrap(), b"staged upload");
+        assert_eq!(
+            source
+                .replication_status(true, Some(FLEET), &[])
+                .unwrap()
+                .graph_digest,
+            baseline.graph_digest
+        );
+        {
+            let mut connection = source.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            promote_claim_blobs(&transaction, &json!({"blob_hash":hash})).unwrap();
+            assert_ne!(
+                projection_digest::tables(&transaction).unwrap()["blobs"],
+                baseline.projection_digests["blobs"]
+            );
+            transaction.rollback().unwrap();
+        }
+        assert_eq!(
+            source
+                .replication_status(true, Some(FLEET), &[])
+                .unwrap()
+                .graph_digest,
+            baseline.graph_digest
+        );
+        append(
+            &source,
+            "file.observed",
+            "file/alder:/example/result",
+            json!({"status":"observed", "path":"/example/result", "blob_hash":hash}),
+        );
+        sync(&source, &target);
+        assert_eq!(target.get_blob(&hash).unwrap().unwrap(), b"staged upload");
+        assert_eq!(
+            source
+                .replication_status(true, Some(FLEET), &[])
+                .unwrap()
+                .projection_digests,
+            target
+                .replication_status(true, Some(FLEET), &[])
+                .unwrap()
+                .projection_digests
+        );
+    }
+
+    #[test]
+    fn legacy_unreferenced_blobs_are_staged_without_losing_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("claims.sqlite3");
+        let store = Store::open(&path, "alder").unwrap();
+        let bytes = b"unreferenced legacy upload";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let shared = store
+            .put_document("doc/example", b"shared document", &None, "shared")
+            .unwrap();
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute(
+                    "INSERT INTO blobs VALUES(?1,?2,?3)",
+                    params![hash, bytes.as_slice(), bytes.len()],
+                )
+                .unwrap();
+            connection
+                .execute("DELETE FROM meta WHERE key='staged_blob_scope'", [])
+                .unwrap();
+        }
+        drop(store);
+        let store = Store::open(&path, "alder").unwrap();
+        assert_eq!(store.get_blob(&hash).unwrap().unwrap(), bytes);
+        assert_eq!(
+            store.get_blob(&shared.hash).unwrap().unwrap(),
+            b"shared document"
+        );
+        let connection = store.readers.get();
+        assert_eq!(
+            connection
+                .query_row("SELECT COUNT(*) FROM blobs", [], |row| row.get::<_, u64>(0))
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            projection_digest::tables(&connection).unwrap(),
+            projection_digest::oracle(&connection).unwrap()
+        );
+    }
+
+    #[test]
     fn a_store_without_an_anchor_admits_every_writer_as_before() {
         let b_key = key();
         let b = node("b", Some(&b_key), None);
@@ -24526,6 +24565,12 @@ const GRAPH_DIGEST_TABLES: [(&str, &str, &[&str], &str); 6] = [
 ];
 
 fn graph_digest(connection: &Connection) -> Result<String> {
+    Ok(projection_digest::root(&projection_digest::tables(
+        connection,
+    )?))
+}
+
+fn legacy_graph_digest(connection: &Connection) -> Result<String> {
     #[cfg(test)]
     GRAPH_DIGESTS_COMPUTED.with(|computed| computed.set(computed.get() + 1));
     let queries = GRAPH_DIGEST_TABLES
@@ -25056,9 +25101,11 @@ fn compact_replication_exchange_lists_only_ranges_that_differ() {
     // at one writer sequence all fall inside ranges both peers already hold.
     left.0
         .extend(test_envelope_ids("example-mac-like", [20_001], "a"));
-    right
-        .0
-        .extend(test_envelope_ids("example-linux-like", 20_001..=20_003, "a"));
+    right.0.extend(test_envelope_ids(
+        "example-linux-like",
+        20_001..=20_003,
+        "a",
+    ));
     left.0
         .remove(&test_envelope_ids("example-linux-like", [19_990], "a")[0]);
     right
@@ -25563,6 +25610,7 @@ fn batches_accepted_in_one_millisecond_extend_the_projection_without_a_replay() 
             .filter(|claim| claim.kind == "doc.bound")
             .collect::<Vec<_>>()
     };
+    source.set_write_clock_at(now_ms()).unwrap();
     let mut index = 1;
     loop {
         put(index);
@@ -25611,6 +25659,73 @@ fn collect_referenced_blobs(
             output.insert(hash, bytes);
         }
     }
+    Ok(())
+}
+
+/// Keep uncommitted uploads outside the shared graph. Promotion is part of the claim's
+/// transaction, so a failed write cannot change the shared blob digest.
+fn promote_claim_blobs(transaction: &Transaction<'_>, body: &Value) -> Result<()> {
+    let mut hashes = BTreeSet::new();
+    collect_hash_fields(body, &mut hashes);
+    for hash in hashes {
+        transaction.execute(
+            "INSERT OR IGNORE INTO blobs(hash,bytes,size)
+             SELECT hash,bytes,size FROM local_blobs WHERE hash=?1",
+            [&hash],
+        )?;
+        transaction.execute("DELETE FROM local_blobs WHERE hash=?1", [&hash])?;
+    }
+    Ok(())
+}
+
+/// Older put_blob calls mixed staged uploads with authority. Separate only bytes we can
+/// prove were never shared: retained claim references and received blob records stay shared.
+/// After a historical checkpoint removed those references, preserve all existing authority.
+fn separate_staged_blobs(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    let done: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM meta WHERE key='staged_blob_scope')",
+        [],
+        |row| row.get(0),
+    )?;
+    if done {
+        return Ok(());
+    }
+    let trimmed: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM checkpoint_claims)",
+        [],
+        |row| row.get(0),
+    )?;
+    if !trimmed {
+        let mut hashes = BTreeSet::new();
+        let mut statement = transaction.prepare("SELECT body FROM claims")?;
+        for body in statement.query_map([], |row| row.get::<_, String>(0))? {
+            collect_hash_fields(&serde_json::from_str::<Value>(&body?)?, &mut hashes);
+        }
+        drop(statement);
+        transaction
+            .execute_batch("CREATE TEMP TABLE staged_blob_shared_hashes(hash TEXT PRIMARY KEY);")?;
+        let mut insert =
+            transaction.prepare("INSERT OR IGNORE INTO staged_blob_shared_hashes VALUES(?1)")?;
+        for hash in hashes {
+            insert.execute([hash])?;
+        }
+        drop(insert);
+        transaction.execute_batch(
+            "INSERT OR IGNORE INTO staged_blob_shared_hashes SELECT hash FROM documents;
+             INSERT OR IGNORE INTO staged_blob_shared_hashes
+                 SELECT substr(subject_hint,6) FROM replica_records WHERE kind_hint='blob' AND state='valid';
+             INSERT OR IGNORE INTO local_blobs SELECT * FROM blobs
+                 WHERE hash NOT IN (SELECT hash FROM staged_blob_shared_hashes);
+             DELETE FROM blobs WHERE hash NOT IN (SELECT hash FROM staged_blob_shared_hashes);
+             DROP TABLE staged_blob_shared_hashes;",
+        )?;
+    }
+    transaction.execute(
+        "INSERT INTO meta(key,value) VALUES('staged_blob_scope','1')",
+        [],
+    )?;
+    transaction.commit()?;
     Ok(())
 }
 
@@ -26074,6 +26189,16 @@ fn validate_replicated_claim(
                 "replicated claim `{}` violates {}: {}",
                 claim.id, error.code, error.message
             ),
+        ));
+    }
+    st3_schema::glasses::validate_owner(&claim.subject, claim.actor.as_deref())
+        .map_err(|e| St3Error::new(e.code, e.message))?;
+    if claim.subject.starts_with("glass/")
+        && (!fields.contains_key("base_revision") || !fields.contains_key("replaced_revision"))
+    {
+        return Err(St3Error::new(
+            "invalid-replicated-claim",
+            "glass claims must record base_revision and replaced_revision",
         ));
     }
     ensure_claim_blobs(transaction, claim)?;
@@ -27423,7 +27548,7 @@ fn project_replicated_mission_runs(transaction: &Transaction<'_>) -> Result<(), 
             1 => "claims.kind IN ('mission-run.state','run-generation.created','run-generation.state','run-generation.superseded',
                   'revision-proposal.created','revision-proposal.approved','revision-proposal.cancelled','revision-proposal.applied',
                   'step-run.carried','step-run.state','step-run.retried',
-                  'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released')",
+                  'work.claimed','work.renewed','work.progress','work.submitted','work.failed','work.released','work.person-asked','work.person-done','work.person-cancelled')",
             _ => "claims.kind='step-run.carried'",
         };
         let mut statement = transaction
@@ -27609,7 +27734,7 @@ fn project_mission_run_created(
         .execute(
             "INSERT OR IGNORE INTO mission_runs(id, mission_id, initial_revision, current_generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, inputs, mode, status, phase, created_at_unix_ms, updated_at_unix_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 'running', 'normal', ?12, ?12)",
-            params![run_id, mission_id, revision, generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, serde_json::to_string(&inputs).map_err(internal)?, mode, claim.accepted_at_unix_ms.to_string()],
+            params![run_id, mission_id, revision, generation_id, root_revision, root_run_id, parent_step_run, workspace, requester, serde_json::to_string(&inputs).map_err(internal)?, mode, mission_run_creation_time(fields, claim.accepted_at_unix_ms).to_string()],
         )
         .map_err(internal)?;
     if let Some(after) = after {
@@ -27636,7 +27761,7 @@ fn project_mission_run_created(
         .execute(
             "INSERT OR IGNORE INTO run_generations(id, run_id, revision, predecessor_id, status, actor, reason, created_at_unix_ms, updated_at_unix_ms)
              VALUES (?1, ?2, ?3, NULL, 'running', ?4, 'initial mission run', ?5, ?5)",
-            params![generation_id, run_id, revision, requester, claim.accepted_at_unix_ms.to_string()],
+            params![generation_id, run_id, revision, requester, mission_run_creation_time(fields, claim.accepted_at_unix_ms).to_string()],
         )
         .map_err(internal)?;
     let view = mission_run_view_tx(transaction, run_id).map_err(internal)?;
@@ -27669,7 +27794,7 @@ fn project_mission_run_created(
             .execute(
                 "INSERT OR IGNORE INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, created_at_unix_ms, updated_at_unix_ms, constraints)
                  VALUES (?1, ?2, ?3, ?4, ?5, 'pending', 1, ?6, ?7, ?8, ?9, ?10, ?11, ?11, ?12)",
-                params![subject, run_id, generation_id, step.path, step.definition_hash, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, claim.accepted_at_unix_ms.to_string(), constraints],
+                params![subject, run_id, generation_id, step.path, step.definition_hash, assignee, serde_json::to_string(&available_to).map_err(internal)?, agentless, title, goals, mission_run_creation_time(fields, claim.accepted_at_unix_ms).to_string(), constraints],
             )
             .map_err(internal)?;
     }
@@ -27698,6 +27823,9 @@ fn project_mission_run_update(
     claim: &ClaimRecord,
 ) -> Result<(), St3Error> {
     let fields = claim.body.get("fields").unwrap_or(&claim.body);
+    if person_work::project(transaction, claim)? {
+        return Ok(());
+    }
     if claim.kind.starts_with("revision-proposal.") {
         project_revision_proposal(transaction, claim, fields)?;
         return Ok(());
@@ -28311,10 +28439,33 @@ fn select_replicated_document(
             )
         })?;
     validate_document_name(name)?;
+    let binding_key =
+        canonical::sortable_key(&canonical::claim_key(transaction, &claim.id).map_err(internal)?);
+    let previous: Option<String> = transaction
+        .query_row(
+            "SELECT binding_claim_id FROM documents WHERE name=?1 AND hash=?2",
+            params![name, hash],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(internal)?;
+    if let Some(previous) = previous {
+        if canonical::claim_key(transaction, &claim.id).map_err(internal)?
+            < canonical::claim_key(transaction, &previous).map_err(internal)?
+        {
+            transaction
+                .execute(
+                    "UPDATE documents SET binding_claim_id=?3,binding_key=?4 WHERE name=?1 AND hash=?2",
+                    params![name, hash, claim.id, binding_key],
+                )
+                .map_err(internal)?;
+        }
+        return Ok(());
+    }
     transaction
         .execute(
-            "INSERT OR IGNORE INTO documents(name, hash, created_index, binding_claim_id) VALUES (?1, ?2, ?3, ?4)",
-            params![name, hash, created_index, claim.id],
+            "INSERT OR IGNORE INTO documents(name, hash, created_index, binding_claim_id, binding_key) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, hash, created_index, claim.id, binding_key],
         )
         .map_err(internal)?;
     Ok(())
@@ -28363,6 +28514,23 @@ fn select_replicated_mission(
             params![mission.id, mission.revision, mission_state_name(&mission.state), serde_json::to_string(&mission).map_err(internal)?, claim.id, created_index],
         )
         .map_err(internal)?;
+    let previous: String = transaction
+        .query_row(
+            "SELECT claim_id FROM mission_revisions WHERE mission_id=?1 AND revision=?2",
+            params![mission.id, mission.revision],
+            |row| row.get(0),
+        )
+        .map_err(internal)?;
+    if canonical::claim_key(transaction, &claim.id).map_err(internal)?
+        < canonical::claim_key(transaction, &previous).map_err(internal)?
+    {
+        transaction
+            .execute(
+                "UPDATE mission_revisions SET claim_id=?3 WHERE mission_id=?1 AND revision=?2",
+                params![mission.id, mission.revision, claim.id],
+            )
+            .map_err(internal)?;
+    }
     let current: Option<(String, String)> = transaction
         .query_row(
             "SELECT revision, claim_id FROM mission_definitions WHERE mission_id=?1",
@@ -29586,7 +29754,29 @@ fn enrich_step_queue_at(
     view.execution_elapsed_ms = execution_elapsed_ms;
     enrich_step_summaries_at(connection, view, snapshot_unix_ms)?;
     enrich_step_wake_at(connection, view, snapshot_unix_ms)?;
-    enrich_step_definition(connection, view)
+    enrich_step_definition(connection, view)?;
+    let mut query = connection.prepare(&canonical_sql(
+        "SELECT resolution.body FROM claims resolution JOIN claims request
+        ON request.subject=resolution.subject AND request.kind='work.person-asked'
+        WHERE resolution.kind IN ('work.person-done','work.person-cancelled')
+          AND json_extract(request.body,'$.fields.origin_step')=?1
+          AND json_extract(request.body,'$.fields.origin_attempt')=?2
+        ORDER BY CANONICAL_ASC(resolution)",
+    ))?;
+    // Aliases other than the fixed marker aliases use the same helper directly.
+    let responses = query
+        .query_map(params![view.subject, view.attempt], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for response in responses {
+        if let Ok(response) = serde_json::from_str::<Value>(&response) {
+            if let Some(summary) = response["fields"]["summary"].as_str() {
+                view.constraints.push(format!("Person response: {summary}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Copies the worker's latest progress summary and its completion summary for the
@@ -29647,7 +29837,29 @@ fn enrich_step_queue_for_reconcile_at(
     snapshot_unix_ms: u128,
 ) -> rusqlite::Result<()> {
     apply_effective_step_state(connection, view, snapshot_unix_ms)?;
-    enrich_step_definition(connection, view)
+    enrich_step_definition(connection, view)?;
+    let mut query = connection.prepare(&canonical_sql(
+        "SELECT resolution.body FROM claims resolution JOIN claims request
+        ON request.subject=resolution.subject AND request.kind='work.person-asked'
+        WHERE resolution.kind IN ('work.person-done','work.person-cancelled')
+          AND json_extract(request.body,'$.fields.origin_step')=?1
+          AND json_extract(request.body,'$.fields.origin_attempt')=?2
+        ORDER BY CANONICAL_ASC(resolution)",
+    ))?;
+    // Aliases other than the fixed marker aliases use the same helper directly.
+    let responses = query
+        .query_map(params![view.subject, view.attempt], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for response in responses {
+        if let Ok(response) = serde_json::from_str::<Value>(&response) {
+            if let Some(summary) = response["fields"]["summary"].as_str() {
+                view.constraints.push(format!("Person response: {summary}"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn enrich_step_definition(connection: &Connection, view: &mut StepRunView) -> rusqlite::Result<()> {
@@ -29992,7 +30204,7 @@ fn step_execution_timing_at(
          FROM claims JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1
            AND claims.kind IN ('step-run.state','step-run.carried','work.claimed','work.renewed',
-                               'work.progress','work.submitted','work.failed','work.released')
+                               'work.progress','work.submitted','work.failed','work.released','work.person-asked','work.person-done','work.person-cancelled')
          ORDER BY CANONICAL_ASC(claims)",
     ))?;
     let events = statement
@@ -30186,6 +30398,24 @@ fn apply_effective_step_state(
     else {
         return Ok(());
     };
+    if view
+        .assigned_to
+        .as_deref()
+        .is_some_and(|person| person.starts_with("person/"))
+    {
+        if let Some(ask) = person_work::request(connection, &view.subject)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?
+        {
+            if matches!(view.status.as_str(), "ready" | "pending")
+                && !person_work::current(connection, &ask, snapshot_unix_ms)
+                    .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?
+            {
+                view.status = "cancelled".into();
+                view.blocked_reason =
+                    Some("the requester, originating attempt or owning run ended".into());
+            }
+        }
+    }
     let generation_id = generation_id_from_subject(&view.generation);
     if is_terminal_run_state(&run_status)
         || run_phase == "terminal"
@@ -30216,6 +30446,14 @@ fn apply_effective_step_state(
         view.claim_incarnation = None;
         view.claim_expires_at_unix_ms = None;
     }
+    if view.status == "waiting-person" {
+        view.blockers = active_step_blockers_tx(connection, &view.subject, snapshot_unix_ms)?;
+        if view.blockers.is_empty() {
+            view.status = "ready".into();
+            view.blocked_reason = None;
+            view.readiness_epoch += 1;
+        }
+    }
     if view.status == "ready" && view.blocked_reason.is_some() {
         view.blockers = active_step_blockers_tx(connection, &view.subject, snapshot_unix_ms)?;
         if view.blockers.is_empty() {
@@ -30235,28 +30473,20 @@ fn active_step_blockers_tx(
     subject: &str,
     snapshot_unix_ms: u128,
 ) -> rusqlite::Result<Vec<String>> {
-    let snapshot = snapshot_unix_ms.to_string();
-    let mut statement = connection.prepare(&canonical_sql(
-        "SELECT DISTINCT request.subject
-         FROM claims request, json_each(json_extract(request.body, '$.fields.targets')) target
-         WHERE request.kind='attention.requested'
-           AND target.value=?1
-           AND (length(request.accepted_at_unix_ms)<length(?2)
-                OR (length(request.accepted_at_unix_ms)=length(?2)
-                    AND request.accepted_at_unix_ms<=?2))
-           AND NOT EXISTS (
-             SELECT 1 FROM claims resolution
-             WHERE resolution.subject=request.subject
-               AND resolution.kind='attention.resolved'
-               AND (length(resolution.accepted_at_unix_ms)<length(?2)
-                    OR (length(resolution.accepted_at_unix_ms)=length(?2)
-                        AND resolution.accepted_at_unix_ms<=?2))
-           )
-         ORDER BY CANONICAL_ASC(request), request.subject",
-    ))?;
-    statement
-        .query_map(params![subject, snapshot], |row| row.get::<_, String>(0))?
-        .collect()
+    let mut query = connection.prepare(&canonical_sql("SELECT id,store_index,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms
+        FROM claims WHERE kind='work.person-asked' AND json_extract(body,'$.fields.origin_step')=?1 ORDER BY CANONICAL_ASC(claims)"))?;
+    let asks = query
+        .query_map([subject], claim_from_row)?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut blockers = Vec::new();
+    for ask in asks {
+        if person_work::current(connection, &ask, snapshot_unix_ms)
+            .map_err(|e| rusqlite::Error::ToSqlConversionFailure(e.into()))?
+        {
+            blockers.push(ask.subject);
+        }
+    }
+    Ok(blockers)
 }
 
 fn planning_session_view_tx(
@@ -32051,6 +32281,7 @@ mod tests {
         drop(Store::open(&path, "node").unwrap());
         {
             let connection = Connection::open(&path).unwrap();
+            projection_digest::register(&connection).unwrap();
             connection
                 .execute_batch("PRAGMA foreign_keys = OFF")
                 .unwrap();
@@ -32929,7 +33160,7 @@ mod tests {
         }
     }
 
-    fn receive_and_project(
+    pub(super) fn receive_and_project(
         target: &Store,
         relay: &str,
         exchange: &ReplicationExchange,
@@ -32952,7 +33183,10 @@ mod tests {
         admission
     }
 
-    fn exchange_from(source: &Store, remote: &ReplicationInventory) -> ReplicationExchange {
+    pub(super) fn exchange_from(
+        source: &Store,
+        remote: &ReplicationInventory,
+    ) -> ReplicationExchange {
         source.bind_fleet(TEST_FLEET).expect("source fleet");
         source
             .export_replication_exchange(TEST_FLEET, remote)
@@ -37342,6 +37576,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                 .insert("0".repeat(64), b"wrong bytes".to_vec());
         });
         let input = ReplicationExchange {
+            projection_digests: Default::default(),
             peer: "source".into(),
             fleet_id: TEST_FLEET.into(),
             schema_digest: st3_schema::registry().digest(),
@@ -37412,6 +37647,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             .unwrap();
         });
         let make_exchange = |envelopes: Vec<ReplicaEnvelope>| ReplicationExchange {
+            projection_digests: Default::default(),
             peer: "source".into(),
             fleet_id: TEST_FLEET.into(),
             schema_digest: st3_schema::registry().digest(),
@@ -37457,8 +37693,9 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     }
 
     /// One exchange carrying exactly `envelopes`, as a peer that holds only those would send it.
-    fn exchange_of(peer: &str, envelopes: Vec<ReplicaEnvelope>) -> ReplicationExchange {
+    pub(super) fn exchange_of(peer: &str, envelopes: Vec<ReplicaEnvelope>) -> ReplicationExchange {
         ReplicationExchange {
+            projection_digests: Default::default(),
             peer: peer.into(),
             fleet_id: TEST_FLEET.into(),
             schema_digest: st3_schema::registry().digest(),
@@ -37937,6 +38174,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
         let unmatched = "f".repeat(64);
         let mut summary = source.export_replication_summary(TEST_FLEET).unwrap();
         summary.graph_digest = unmatched.clone();
+        summary.projection_digests.clear();
         let receipt = newcomer
             .receive_replication_exchange_asking("source", TEST_FLEET, &summary, true)
             .unwrap();
@@ -37945,12 +38183,14 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             match source.heal_answer("newcomer", query).unwrap() {
                 ReplicationHealAnswer::Ranges { ranges, .. } => ReplicationHealAnswer::Ranges {
                     graph_digest: unmatched.clone(),
+                    projection_digests: Default::default(),
                     ranges,
                 },
                 ReplicationHealAnswer::Replayed { replayed, .. } => {
                     ReplicationHealAnswer::Replayed {
                         replayed,
                         graph_digest: unmatched.clone(),
+                        projection_digests: Default::default(),
                     }
                 }
                 other => other,
@@ -38322,6 +38562,14 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             target.selected_desired_token("exec/work").unwrap().unwrap(),
             replacement
         );
+        // A build that rejected the original never put it in claims. Keep the raw repaired
+        // record, but model that admission difference explicitly.
+        target
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM claims WHERE id=?1", [&repaired_claim])
+            .unwrap();
 
         receive_and_project(
             &source,
@@ -38355,6 +38603,143 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
             target_status.authority_digest
         );
         assert_eq!(source_status.graph_digest, target_status.graph_digest);
+    }
+
+    #[test]
+    fn repaired_original_sources_and_operations_ignore_local_retention_and_roll_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("claims.sqlite3");
+        let source = Store::open(&path, "alder").unwrap();
+        let target = Store::open_memory("birch").unwrap();
+        let observation = |reason: &str, key: &str| {
+            source
+                .append_claim(&ClaimInput {
+                    subject: "daemon/alder".into(),
+                    kind: "daemon.diagnostic".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("severity".into(), json!("warning")),
+                        ("code".into(), json!("repair-test")),
+                        ("reason".into(), json!(reason)),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap()
+        };
+        let original = observation("original", "original");
+        let replacement = observation("replacement", "replacement");
+        receive_and_project(
+            &target,
+            "alder",
+            &exchange_from(&source, &ReplicationInventory::default()),
+        );
+        let record = target
+            .replica_records(false)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.claim_id.as_deref() == Some(&original.id))
+            .unwrap();
+        let before = projection_digest::tables(&source.readers.get()).unwrap();
+        {
+            let mut connection = source.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            transaction
+                .execute(
+                    "UPDATE replica_records SET state='repaired' WHERE claim_id=?1",
+                    [&original.id],
+                )
+                .unwrap();
+            rebuild_operations_tx(&transaction).unwrap();
+            let current = projection_digest::tables(&transaction).unwrap();
+            assert_ne!(current["claim_sources"], before["claim_sources"]);
+            assert_ne!(current["operations"], before["operations"]);
+            assert_eq!(current, projection_digest::oracle(&transaction).unwrap());
+            transaction.rollback().unwrap();
+        }
+        assert_eq!(
+            projection_digest::tables(&source.readers.get()).unwrap(),
+            before
+        );
+        target
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE replica_records SET state='unknown' WHERE record_ref=?1",
+                [&record.record_ref],
+            )
+            .unwrap();
+        target
+            .repair_replica_record(
+                &record.record_ref,
+                &replacement.id,
+                "replace an unsupported original",
+                "person/robin",
+                "repair",
+            )
+            .unwrap();
+        target
+            .connection
+            .lock()
+            .unwrap()
+            .execute("DELETE FROM claims WHERE id=?1", [&original.id])
+            .unwrap();
+        receive_and_project(
+            &source,
+            "birch",
+            &exchange_from(&target, &source.replication_inventory().unwrap()),
+        );
+        let expected = projection_digest::tables(&target.readers.get()).unwrap();
+        assert_eq!(
+            projection_digest::tables(&source.readers.get()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            expected,
+            projection_digest::oracle(&target.readers.get()).unwrap()
+        );
+        assert!(source.claim_by_id(&original.id).unwrap().is_some());
+        assert!(target.claim_by_id(&original.id).unwrap().is_none());
+        // Receipt cleanup must not make a repaired original a source again.
+        source
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "DELETE FROM replica_records WHERE claim_id=?1",
+                [&original.id],
+            )
+            .unwrap();
+        assert_eq!(
+            projection_digest::tables(&source.readers.get()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            projection_digest::oracle(&source.readers.get()).unwrap(),
+            expected
+        );
+        // Registry rebuilds and restart retain the repair meaning after receipts were trimmed.
+        source
+            .connection
+            .lock()
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value='old-registry' WHERE key='projection_digest_registry'",
+                [],
+            )
+            .unwrap();
+        drop(source);
+        let source = Store::open(&path, "alder").unwrap();
+        assert_eq!(
+            projection_digest::tables(&source.readers.get()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            projection_digest::oracle(&source.readers.get()).unwrap(),
+            expected
+        );
     }
 
     proptest! {
@@ -38550,6 +38935,7 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
                     "source",
                     FLEET,
                     &ReplicationExchange {
+                        projection_digests: Default::default(),
                         peer: "source".into(),
                         fleet_id: FLEET.into(),
                         schema_digest: String::new(),
@@ -39334,7 +39720,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            13
+            15
         );
         assert_eq!(
             connection
@@ -39408,7 +39794,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            13
+            15
         );
     }
 
@@ -39420,7 +39806,10 @@ version 2
         let connection = Connection::open(&path).unwrap();
         connection
             .execute_batch(
-                "ALTER TABLE planning_sessions DROP COLUMN planner_spec_json;
+                "DROP TRIGGER projection_digest_planning_sessions_insert;
+                 DROP TRIGGER projection_digest_planning_sessions_update;
+                 DROP TRIGGER projection_digest_planning_sessions_delete;
+                 ALTER TABLE planning_sessions DROP COLUMN planner_spec_json;
                  PRAGMA user_version = 12;",
             )
             .unwrap();
@@ -39438,7 +39827,7 @@ version 2
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 13);
+        assert_eq!(version, 15);
         assert_eq!(planner_column, 1);
     }
 
@@ -39977,7 +40366,7 @@ version 2
     }
 
     #[test]
-    fn replication_reuses_the_graph_digest_until_a_digested_column_changes() {
+    fn replication_reuses_legacy_digest_while_complete_source_digest_changes() {
         let store = Store::open_memory("example-linux").unwrap();
         observe_harness(&store, 0);
         let first = store.replication_snapshot().unwrap();
@@ -39990,7 +40379,12 @@ version 2
             0,
             "a harness observation must not recompute the graph digest"
         );
-        assert_eq!(second.graph_digest, first.graph_digest);
+        assert_eq!(second.legacy_graph_digest, first.legacy_graph_digest);
+        assert_ne!(second.graph_digest, first.graph_digest);
+        assert_ne!(
+            second.projection_digests["claim_sources"],
+            first.projection_digests["claim_sources"]
+        );
 
         let generation =
             |store: &Store| graph_generation(&store.connection.lock().unwrap()).unwrap();
@@ -40513,182 +40907,7 @@ version 2
     }
 
     #[test]
-    fn an_attention_request_names_what_closes_it_and_an_agents_closes_with_its_step() {
-        let store = Store::open_memory("source").unwrap();
-        let source = r#"
-version 2
-
-mission "asks" state="ready" {
-  goal "Ask a person for a decision while working."
-  step "work" { assigned-to "agent/asker" }
-}
-"#;
-        let intent = crate::graph::parse_test_intent(source, "source").unwrap();
-        let planned = store
-            .mission(
-                &intent,
-                IntentInput {
-                    kdl: source.into(),
-                    source_name: None,
-                },
-            )
-            .unwrap();
-        store
-            .apply(&intent, &planned.subject_tokens, "asks-mission")
-            .unwrap();
-        let run = store
-            .create_mission_run(&MissionRunRequest {
-                mission: "asks".into(),
-                revision: None,
-                workspace: "/tmp".into(),
-                requester: Some("person/alex".into()),
-                mode: Some("run".into()),
-                inputs: BTreeMap::new(),
-                idempotency_key: "asks-run".into(),
-            })
-            .unwrap();
-        let step = run.steps[0].subject.clone();
-        store.set_step_state(&step, "ready", None).unwrap();
-        let agent = "agent/source.asker";
-        let ask = |key: &str, actor: &str, targets: &[&str], closing: AttentionClosing| {
-            store.request_attention_closing(
-                &format!("attention/{key}"),
-                &AttentionRequest {
-                    reviewer: "person/alex".into(),
-                    title: format!("Decide {key}"),
-                    reason: "A person needs to decide before the work goes on.".into(),
-                    severity: "warning".into(),
-                    targets: targets.iter().map(|target| (*target).to_owned()).collect(),
-                    actor: actor.into(),
-                    idempotency_key: key.into(),
-                },
-                &closing,
-            )
-        };
-        let open = |subject: &str| {
-            store
-                .attention_items(Some("person/alex"))
-                .unwrap()
-                .iter()
-                .any(|item| item.subject == subject)
-        };
-        let context = ["resource/fabric/queue", "host/ExampleMac"];
-
-        // Context and hosts never end an item, so a request naming only those is refused.
-        for (key, actor) in [("agent-unclaimed", agent), ("person", "person/alex")] {
-            assert_eq!(
-                ask(key, actor, &context, AttentionClosing::default())
-                    .unwrap_err()
-                    .code,
-                "attention-closes-never",
-                "{key}"
-            );
-        }
-        assert_eq!(
-            ask(
-                "someone",
-                agent,
-                &context,
-                AttentionClosing {
-                    closed_by: Some("someone".into()),
-                    ..AttentionClosing::default()
-                },
-            )
-            .unwrap_err()
-            .code,
-            "invalid-attention-closed-by"
-        );
-        assert_eq!(
-            ask(
-                "nowhere",
-                agent,
-                &context,
-                AttentionClosing {
-                    step: Some("step-run/missing/work".into()),
-                    ..AttentionClosing::default()
-                },
-            )
-            .unwrap_err()
-            .code,
-            "invalid-attention-step"
-        );
-        let person = ask(
-            "person-closes",
-            agent,
-            &context,
-            AttentionClosing {
-                closed_by: Some("person".into()),
-                ..AttentionClosing::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(person.closed_by.as_deref(), Some("person"));
-        assert_eq!(person.step, None);
-        let targeted = ask(
-            "targeted",
-            agent,
-            &[run.subject.as_str()],
-            AttentionClosing::default(),
-        )
-        .unwrap();
-        assert_eq!(targeted.step, None, "a run target that can end closes it");
-
-        // Once the agent has claimed a step, a request that names nothing else closes with it.
-        store
-            .work_action(
-                &step,
-                "claim",
-                &WorkRequest {
-                    actor: Some(agent.into()),
-                    incarnation: Some("asker-one".into()),
-                    summary: None,
-                    reason: None,
-                    evidence: Vec::new(),
-                    idempotency_key: "asks-claim".into(),
-                },
-            )
-            .unwrap();
-        let attempt = store.step_run(&step).unwrap().unwrap().attempt;
-        let asked = ask("asked", agent, &context, AttentionClosing::default()).unwrap();
-        assert_eq!(asked.step.as_deref(), Some(step.as_str()));
-        assert_eq!(asked.step_attempt, Some(u64::from(attempt)));
-        assert!(open(&asked.subject));
-        assert_eq!(store.attention_step_ended(&asked).unwrap(), None);
-        assert_eq!(
-            store
-                .pending_attention_closed_by_condition("source")
-                .unwrap()
-                .iter()
-                .map(|request| request.subject.as_str())
-                .collect::<Vec<_>>(),
-            [asked.subject.as_str()]
-        );
-
-        store.set_step_state(&step, "completed", None).unwrap();
-        assert_eq!(
-            store.attention_step_ended(&asked).unwrap().as_deref(),
-            Some(format!("`{step}` completed").as_str())
-        );
-        assert!(!open(&asked.subject), "the step that raised it ended");
-        assert!(open(&person.subject), "only a person closes this one");
-        assert_eq!(
-            ask(
-                "late",
-                "person/alex",
-                &context,
-                AttentionClosing {
-                    step: Some(step.clone()),
-                    ..AttentionClosing::default()
-                },
-            )
-            .unwrap_err()
-            .code,
-            "attention-step-ended"
-        );
-    }
-
-    #[test]
-    fn released_work_with_open_external_attention_is_blocked_until_resolution() {
+    fn legacy_attention_does_not_block_released_work_across_restart_and_replication() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("external-blocker.sqlite3");
         let store = Store::open(&path, "source").unwrap();
@@ -40760,35 +40979,13 @@ mission "external-blocker" state="ready" {
             )
             .unwrap();
 
-        let blocked = store.step_run(&subject).unwrap().unwrap();
-        assert_eq!(blocked.status, "blocked");
-        assert_eq!(blocked.blocked_reason.as_deref(), Some(reason));
-        assert_eq!(
-            blocked.blockers.as_slice(),
-            std::slice::from_ref(&attention.subject)
-        );
-        let listed = store.work(Some("agent/source.ios-owner"), false).unwrap();
-        assert_eq!(listed.len(), 1);
-        assert_eq!(listed[0].status, "blocked");
-        let annotation = store.work_annotation(&blocked).unwrap();
-        let batched = store.work_annotations(&[blocked.clone()]).unwrap();
-        assert_eq!(
-            serde_json::to_value(&annotation).unwrap(),
-            serde_json::to_value(&batched[&blocked.subject]).unwrap()
-        );
-        assert!(!annotation.actionable);
-        assert!(annotation.reasons.contains(&"external-blocker".into()));
-        assert_eq!(
-            store
-                .work_action(&subject, "claim", &request("blocked-reclaim", None),)
-                .unwrap_err()
-                .code,
-            "work-not-ready"
-        );
+        let ready = store.step_run(&subject).unwrap().unwrap();
+        assert_eq!(ready.status, "ready");
+        assert!(ready.blockers.is_empty());
         drop(store);
 
         let store = Store::open(&path, "source").unwrap();
-        assert_eq!(store.step_run(&subject).unwrap().unwrap().status, "blocked");
+        assert_eq!(store.step_run(&subject).unwrap().unwrap().status, "ready");
         let replica = Store::open_memory("replica").unwrap();
         let exchange = exchange_from(&store, &ReplicationInventory::default());
         assert_eq!(
@@ -40796,11 +40993,8 @@ mission "external-blocker" state="ready" {
             0
         );
         let replicated = replica.step_run(&subject).unwrap().unwrap();
-        assert_eq!(replicated.status, "blocked");
-        assert_eq!(
-            replicated.blockers.as_slice(),
-            std::slice::from_ref(&attention.subject)
-        );
+        assert_eq!(replicated.status, "ready");
+        assert!(replicated.blockers.is_empty());
 
         store
             .resolve_attention(
@@ -41180,7 +41374,7 @@ version 2
     }
 
     #[test]
-    fn operational_repair_closes_expired_attention_and_wake_contradictions() {
+    fn operational_repair_closes_expired_claims_and_wake_contradictions() {
         let store = Store::open_memory("node").unwrap();
         let source = r#"version 2
  agent "worker" { workspace "/tmp"; command "true" }
@@ -41317,14 +41511,8 @@ version 2
             .map(|item| item.class.as_str())
             .collect::<BTreeSet<_>>();
         assert!(classes.contains("expired-claim"));
-        assert!(classes.contains("superseded-attention"));
         assert!(classes.contains("wake-contradiction"));
-        assert!(plan.items.iter().any(|item| {
-            item.class == "superseded-attention"
-                && item
-                    .affected_subjects
-                    .contains(&"attention/typecase".to_owned())
-        }));
+        assert!(!classes.contains("superseded-attention"));
         let wake = plan
             .items
             .iter()
@@ -43321,6 +43509,11 @@ mission "takeover" state="ready" {
             ("reversed", &reversed),
             ("late", &late),
         ] {
+            assert_eq!(
+                canonical_audit::shared_rows(target),
+                canonical_audit::shared_rows(&source),
+                "{name}: every shared column"
+            );
             assert_eq!(graph(target), expected, "{name}");
         }
     }
@@ -46587,14 +46780,6 @@ mission "asked-again" state="ready" {
             .unwrap();
     }
 
-    fn fault_is_current(store: &Store, subject: &str) -> bool {
-        store
-            .attention_items(Some("person/alex"))
-            .unwrap()
-            .iter()
-            .any(|item| item.kind == "fault" && item.subject == subject)
-    }
-
     fn start_agentless_run(store: &Store, mission: &str) -> MissionRunView {
         publish_mission(
             store,
@@ -46618,355 +46803,6 @@ mission "{mission}" state="ready" {{
                 idempotency_key: format!("{mission}-run"),
             })
             .unwrap()
-    }
-
-    #[test]
-    fn attention_whose_mission_target_is_cancelled_after_the_request_is_not_current() {
-        let store = Store::open_memory("node").unwrap();
-        let run = start_agentless_run(&store, "typecase");
-        request_fault(&store, "attention/typecase", &["mission/typecase"]);
-        assert!(fault_is_current(&store, "attention/typecase"));
-
-        store
-            .set_mission_run_state(&run.id, "cancelled", "terminal", Some("moved to a seat"))
-            .unwrap();
-
-        assert!(!fault_is_current(&store, "attention/typecase"));
-        assert_eq!(
-            store
-                .attention_request("attention/typecase")
-                .unwrap()
-                .unwrap()
-                .status,
-            "pending",
-            "a request that is no longer current is not resolved on its own"
-        );
-    }
-
-    #[test]
-    fn attention_whose_attention_targets_are_all_closed_is_not_current() {
-        let store = Store::open_memory("node").unwrap();
-        let run = start_agentless_run(&store, "pull-request-review");
-        let step = run.steps[0].clone();
-        store
-            .append_claim(&ClaimInput {
-                subject: "gate-operation/pull-request-review/approval".into(),
-                kind: "gate.requested".into(),
-                actor: None,
-                fields: BTreeMap::from([
-                    ("owner".into(), Value::String(step.subject.clone())),
-                    ("reviewer".into(), Value::String("person/alex".into())),
-                    ("question".into(), Value::String("Approve it?".into())),
-                    ("review_targets".into(), Value::Array(Vec::new())),
-                    (
-                        "operation".into(),
-                        Value::String("gate-operation/pull-request-review/approval".into()),
-                    ),
-                    (
-                        "mission_revision".into(),
-                        Value::String(run.revision.clone()),
-                    ),
-                    (
-                        "step_definition".into(),
-                        Value::String(step.definition_hash.clone()),
-                    ),
-                    ("attempt".into(), Value::from(step.attempt)),
-                ]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some("pull-request-review-gate".into()),
-            })
-            .unwrap();
-        // The client names a human gate by a digest of its owner.
-        let gate = format!(
-            "attention/{}",
-            &hex::encode(Sha256::digest(step.subject.as_bytes()))[..24]
-        );
-        request_fault(&store, "attention/other-review", &["resource/review"]);
-        request_fault(
-            &store,
-            "attention/shared-review",
-            &[&gate, "attention/other-review", "resource/review"],
-        );
-        assert!(fault_is_current(&store, "attention/shared-review"));
-
-        store
-            .resolve_attention(
-                "attention/other-review",
-                &AttentionResolveRequest {
-                    outcome: "resolved".into(),
-                    reason: None,
-                    actor: "person/alex".into(),
-                    idempotency_key: "other-review-resolved".into(),
-                },
-            )
-            .unwrap();
-        assert!(
-            fault_is_current(&store, "attention/shared-review"),
-            "the gate it names is still pending"
-        );
-
-        store
-            .set_step_state(&step.subject, "completed", None)
-            .unwrap();
-        assert!(!fault_is_current(&store, "attention/shared-review"));
-    }
-
-    #[test]
-    fn attention_raised_after_its_run_failed_stays_current() {
-        let store = Store::open_memory("node").unwrap();
-        let run = start_agentless_run(&store, "crate-experiments");
-        store
-            .set_mission_run_state(&run.id, "failed", "terminal", Some("the gate failed"))
-            .unwrap();
-        request_fault(&store, "attention/post-mortem", &[&run.subject]);
-
-        assert!(fault_is_current(&store, "attention/post-mortem"));
-        assert!(
-            !store
-                .operational_repair_plan()
-                .unwrap()
-                .items
-                .iter()
-                .any(|item| item.class == "superseded-attention")
-        );
-    }
-
-    #[test]
-    fn a_decision_about_a_pull_request_ends_when_it_merges_or_closes() {
-        let store = Store::open_memory("node").unwrap();
-        let observe = |number: u64, state: &str, merged: Option<bool>| {
-            let mut facts = json!({
-                "repository": "resource/github/acme/demo",
-                "number": number,
-                "state": state,
-                "draft": false,
-                "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            });
-            if let Some(merged) = merged {
-                facts["merged"] = Value::Bool(merged);
-            }
-            store
-                .append_claim(&ClaimInput {
-                    subject: format!("resource/github/acme/demo/pull-request/{number}"),
-                    kind: "resource.observed".into(),
-                    actor: None,
-                    fields: BTreeMap::from([
-                        ("kind".into(), Value::String("vcs.pull-request".into())),
-                        ("facts".into(), facts),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: None,
-                })
-                .unwrap()
-        };
-        let snapshot = observe(7, "open", Some(false));
-        request_fault(
-            &store,
-            "attention/review-7",
-            &[
-                &format!("resource/github/acme/demo/pull-request/7@{}", snapshot.id),
-                "doc/mission-run/example/review@abc",
-            ],
-        );
-        request_fault(
-            &store,
-            "attention/gate-8",
-            &["resource/github/acme/demo/pull-request/8"],
-        );
-        observe(8, "open", Some(false));
-        request_fault(&store, "attention/queue", &["resource/fabric/queue"]);
-        assert!(fault_is_current(&store, "attention/review-7"));
-        assert!(fault_is_current(&store, "attention/gate-8"));
-
-        // An open listing records a pull request that left it as closed.
-        observe(7, "closed", None);
-        assert!(!fault_is_current(&store, "attention/review-7"));
-        // The pull request provider records a merge.
-        observe(8, "closed", Some(true));
-        assert!(!fault_is_current(&store, "attention/gate-8"));
-
-        // A review raised after its pull request already merged has nothing to decide either.
-        request_fault(
-            &store,
-            "attention/late-review",
-            &["resource/github/acme/demo/pull-request/8"],
-        );
-        assert!(!fault_is_current(&store, "attention/late-review"));
-        // Other resources are still context.
-        assert!(fault_is_current(&store, "attention/queue"));
-        let states = store
-            .attention_target_states(&[
-                format!("resource/github/acme/demo/pull-request/7@{}", snapshot.id),
-                "resource/github/acme/demo/pull-request/8".into(),
-                "resource/fabric/queue".into(),
-            ])
-            .unwrap()
-            .into_iter()
-            .map(|state| state.state)
-            .collect::<Vec<_>>();
-        assert_eq!(states, ["closed", "merged"]);
-    }
-
-    #[test]
-    fn attention_about_an_observer_ends_when_it_observes_again() {
-        let store = Store::open_memory("node").unwrap();
-        let state = |state: &str, key: &str| {
-            store
-                .append_claim(&ClaimInput {
-                    subject: "observer/demo".into(),
-                    kind: "observer.state".into(),
-                    actor: None,
-                    fields: BTreeMap::from([
-                        ("state".into(), Value::String(state.into())),
-                        ("revision".into(), Value::String("r1".into())),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some(key.into()),
-                })
-                .unwrap();
-        };
-        state("healthy", "healthy-before");
-        state("unreachable", "unreachable");
-        request_fault(&store, "attention/observer", &["observer/demo"]);
-        assert!(
-            fault_is_current(&store, "attention/observer"),
-            "a healthy state from before the request is not a recovery"
-        );
-        assert_eq!(
-            store
-                .attention_target_states(&["observer/demo".into()])
-                .unwrap()[0]
-                .state,
-            "unreachable"
-        );
-        state("healthy", "healthy-after");
-        assert!(!fault_is_current(&store, "attention/observer"));
-    }
-
-    #[test]
-    fn attention_about_a_stopped_loop_ends_when_the_loop_runs_again() {
-        let store = Store::open_memory("node").unwrap();
-        let run = start_agentless_run(&store, "looping");
-        let generation = run.generation.strip_prefix("run-generation/").unwrap();
-        let loop_run = format!("loop-run/{generation}/review");
-        let loop_state = |status: &str, round: u64| {
-            store
-                .append_claim(&ClaimInput {
-                    subject: loop_run.clone(),
-                    kind: "loop.state".into(),
-                    actor: None,
-                    fields: BTreeMap::from([
-                        ("status".into(), Value::String(status.into())),
-                        ("round".into(), Value::from(round)),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some(format!("{status}-{round}")),
-                })
-                .unwrap();
-        };
-        loop_state("running", 3);
-        request_fault(&store, "attention/loop", &[&loop_run, &run.subject]);
-        loop_state("failed", 3);
-        store
-            .set_mission_run_state(&run.id, "failed", "terminal", Some("the loop stopped"))
-            .unwrap();
-        assert!(
-            fault_is_current(&store, "attention/loop"),
-            "the run failing because its loop stopped is what the request reports"
-        );
-
-        loop_state("running", 4);
-        assert!(!fault_is_current(&store, "attention/loop"));
-    }
-
-    #[test]
-    fn attention_about_a_message_ends_when_the_message_is_closed() {
-        let store = Store::open_memory("node").unwrap();
-        let append = |kind: &str, status: &str| {
-            store
-                .append_claim(&ClaimInput {
-                    subject: "message/0123456789abcdef".into(),
-                    kind: kind.into(),
-                    actor: Some("agent/example".into()),
-                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some(format!("anchor-{status}")),
-                })
-                .unwrap();
-        };
-        append("message.sent", "sent");
-        request_fault(&store, "attention/anchor", &["message/0123456789abcdef"]);
-        append("message.delivered", "delivered");
-        append("message.read", "read");
-        assert!(fault_is_current(&store, "attention/anchor"));
-        append("message.closed", "closed");
-        assert!(!fault_is_current(&store, "attention/anchor"));
-    }
-
-    #[test]
-    fn attention_whose_agent_target_moved_on_is_not_current() {
-        let store = Store::open_memory("node").unwrap();
-        let observe = |agent: &str, incarnation: &str| {
-            store
-                .append_claim(&ClaimInput {
-                    subject: agent.into(),
-                    kind: "runtime.observed".into(),
-                    actor: None,
-                    fields: BTreeMap::from([
-                        ("status".into(), Value::String("running".into())),
-                        ("incarnation_id".into(), Value::String(incarnation.into())),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some(format!("{incarnation}-running")),
-                })
-                .unwrap();
-            store
-                .append_claim(&ClaimInput {
-                    subject: agent.into(),
-                    kind: "harness.observed".into(),
-                    actor: Some(agent.into()),
-                    fields: BTreeMap::from([
-                        ("state".into(), Value::String("idle".into())),
-                        ("incarnation_id".into(), Value::String(incarnation.into())),
-                    ]),
-                    evidence: Vec::new(),
-                    expected_subject: None,
-                    idempotency_key: Some(format!("{incarnation}-idle")),
-                })
-                .unwrap();
-        };
-        observe("agent/node.seat", "seat-one");
-        request_fault(&store, "attention/seat", &["agent/node.seat"]);
-        request_fault(&store, "attention/retired", &["agent/node.retired"]);
-        assert!(
-            fault_is_current(&store, "attention/seat"),
-            "the incarnation that was ready at the request is not a recovery"
-        );
-
-        observe("agent/node.seat", "seat-two");
-        let source = "version 2\nstop \"agent/node.retired\"\n";
-        let intent = crate::graph::parse_intent(source, "node").unwrap();
-        let planned = store
-            .mission(
-                &intent,
-                IntentInput {
-                    kdl: source.into(),
-                    source_name: None,
-                },
-            )
-            .unwrap();
-        store
-            .apply(&intent, &planned.subject_tokens, "retired-stop")
-            .unwrap();
-
-        assert!(!fault_is_current(&store, "attention/seat"));
-        assert!(!fault_is_current(&store, "attention/retired"));
     }
 
     #[test]
@@ -47097,10 +46933,10 @@ mission "typecase" state="ready" {
         assert_eq!(first.reviewer, "person/alex");
         assert_eq!(first.status, "pending");
         let items = store.attention_items(Some("person/alex")).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, "agent-request");
-        assert_eq!(items[0].actions[0].label, "answer");
-        assert_eq!(items[0].actions.len(), 2);
+        assert!(
+            items.is_empty(),
+            "historical legacy records do not enter current attention"
+        );
         assert!(
             store
                 .attention_items(Some("person/someone-else"))
@@ -47147,65 +46983,6 @@ mission "typecase" state="ready" {
             .resolve_attention(&first.subject, &resolution)
             .unwrap();
         assert_eq!(retry.resolved_at_unix_ms, closed.resolved_at_unix_ms);
-    }
-
-    #[test]
-    fn attention_until_needs_a_known_condition_and_a_target() {
-        let store = Store::open_memory("node").unwrap();
-        let request = |targets: Vec<String>, key: &str| AttentionRequest {
-            reviewer: "person/alex".into(),
-            title: "Publish this revision".into(),
-            reason: "Publish the prepared revision as a person.".into(),
-            severity: "warning".into(),
-            targets,
-            actor: "agent/node.requester".into(),
-            idempotency_key: key.into(),
-        };
-        let target = vec!["mission-run/release".to_owned()];
-        let unknown = store
-            .request_attention_closing(
-                "attention/unknown",
-                &request(target.clone(), "unknown"),
-                &crate::model::AttentionClosing {
-                    until: Some("published".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap_err();
-        assert_eq!(unknown.code, "invalid-attention-until");
-        let untargeted = store
-            .request_attention_closing(
-                "attention/untargeted",
-                &request(Vec::new(), "untargeted"),
-                &crate::model::AttentionClosing {
-                    until: Some("completed".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap_err();
-        assert_eq!(untargeted.code, "invalid-attention-until");
-
-        let stored = store
-            .request_attention_closing(
-                "attention/until",
-                &request(target, "until"),
-                &crate::model::AttentionClosing {
-                    until: Some("completed".into()),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(stored.until.as_deref(), Some("completed"));
-        assert_eq!(
-            store.pending_attention_closed_by_condition("node").unwrap()[0].subject,
-            "attention/until"
-        );
-        assert!(
-            store
-                .pending_attention_closed_by_condition("other-host")
-                .unwrap()
-                .is_empty()
-        );
     }
 
     #[test]

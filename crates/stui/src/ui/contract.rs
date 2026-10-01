@@ -81,6 +81,7 @@ pub fn words() -> Value {
         Word::Done,
         Word::Failed,
         Word::Cancelled,
+        Word::NotStarted,
     ]
     .iter()
     .map(|word| {
