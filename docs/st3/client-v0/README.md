@@ -561,8 +561,9 @@ transaction. Both are null on a first creation. A deletion response has a null b
 
 The structure is `{name, tabs:[{title?, layout}]}`. A layout is `{pane: "opaque key"}` or
 `{split: "right" | "below", children: [layout, layout]}`. Pane keys convey no authority. No
-focus, scroll, selection, ratios, or last-used glass is stored. There must be at least one tab,
-a nonempty name and pane key, exactly two children per split, and no unknown structure fields.
+focus, scroll, selection, ratios, or last-used glass is stored. Empty `tabs: []` is valid:
+clients supply their implicit Home locally. Names and pane keys must be nonempty; splits have
+exactly two children, and no unknown structure fields are accepted.
 The daemon advertises limits: 65,536 bytes of compact UTF-8 JSON per body, 32 layout levels,
 1,024 layout nodes across all tabs, and 100 live glasses per person. The response ceiling is
 8 MiB, allowing a complete 100-glass subscription window at these bounds.

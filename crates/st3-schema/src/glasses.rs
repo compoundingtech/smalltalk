@@ -65,7 +65,7 @@ pub fn validate_body(body: &Value) -> Result<(), ValidationError> {
         .get("tabs")
         .and_then(Value::as_array)
         .ok_or_else(invalid)?;
-    if tabs.is_empty() || tabs.len() > MAX_NODES {
+    if tabs.len() > MAX_NODES {
         return Err(invalid());
     }
     let mut stack = Vec::new();
@@ -121,6 +121,8 @@ mod tests {
     fn glass_body_rejects_size_depth_and_invalid_structure() {
         let body = json!({"name":"A workspace","tabs":[{"title":"Home","layout":{"pane":"opaque:anything"}}]});
         validate_body(&body).unwrap();
+        validate_body(&json!({"name":"Home only", "tabs":[]})).unwrap();
+        assert!(validate_body(&json!({"name":"", "tabs":[]})).is_err());
         let mut exact = body.clone();
         exact["name"] = json!("");
         let overhead = serde_json::to_vec(&exact).unwrap().len();

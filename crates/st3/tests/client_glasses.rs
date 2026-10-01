@@ -219,6 +219,28 @@ async fn glasses_routes_enforce_owner_and_mutation_contract_and_hide_raw_history
             .iter()
             .any(|c| c["id"] == "glasses" && c["state"] == "granted")
     );
+    let empty_body = json!({"name":"Home only","tabs":[]});
+    let (empty_status, empty) = request(
+        app.clone(),
+        "PUT",
+        &path,
+        Some("person/ada"),
+        Some("close-last-tab"),
+        json!({"body":empty_body,"base_revision":revision}),
+    )
+    .await;
+    assert_eq!(empty_status, StatusCode::OK);
+    assert_eq!(empty["value"]["body"], empty_body);
+    let (_, empty_read) = request(
+        app.clone(),
+        "GET",
+        &path,
+        Some("person/ada"),
+        None,
+        Value::Null,
+    )
+    .await;
+    assert_eq!(empty_read["value"]["body"], empty_body);
     let (_, deleted) = request(
         app.clone(),
         "DELETE",
@@ -386,12 +408,7 @@ async fn glasses_rust_client_and_collection_stream_deliver_upserts_and_removes()
     let id = "019a0000-0000-7000-8000-000000000003";
     let body = GlassBody {
         name: "Phone workspace".into(),
-        tabs: vec![GlassTab {
-            title: None,
-            layout: GlassLayout::Pane {
-                pane: "home:".into(),
-            },
-        }],
+        tabs: vec![],
     };
     phone
         .put_glass(
