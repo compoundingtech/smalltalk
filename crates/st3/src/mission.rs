@@ -3789,7 +3789,7 @@ mission "bad" state="ready" { goal "Reject a conflicting queue dependency."; que
     }
 
     #[test]
-    fn agent_mission_authority_uses_exact_and_terminal_namespace_rules() {
+    fn mission_authority_still_parses_and_free_mode_names_it_as_ignored() {
         let intent = crate::graph::parse_intent(
             r#"version 2
 mission "standing" state="ready" {
@@ -3818,13 +3818,18 @@ mission "standing" state="ready" {
         )
         .unwrap();
         let desired = &runtime.subjects["agent/standing/planner"].desired;
-        let authority = crate::graph::agent_mission_authority(desired);
-        assert!(authority.allows("publish", "project/generated"));
-        assert!(authority.allows("publish", "example/fabric/cycle"));
-        assert!(!authority.allows("publish", "example/fabrics/cycle"));
-        assert!(authority.allows("start", "example/fabric/cycle"));
-        assert!(authority.allows("revise", "example/fabric/queue"));
-        assert!(!authority.allows("revise", "example/fabric/other"));
+        assert_eq!(
+            crate::graph::declared_authority_blocks(desired),
+            ["mission-authority"]
+        );
+        assert_eq!(
+            crate::graph::mission_declared_authority_blocks(&intent.missions["standing"], "node")
+                .unwrap(),
+            std::collections::BTreeMap::from([(
+                "agent/migration-proof/planner".to_owned(),
+                vec!["mission-authority"]
+            )])
+        );
 
         for source in [
             r#"version 2
@@ -3862,88 +3867,26 @@ mission "bad" state="ready" { goal "Reject a duplicate rule."; agent "bad" { wor
     }
 
     #[test]
-    fn a_top_level_project_seat_holds_its_namespace_unless_its_declaration_says_otherwise() {
-        use crate::model::MissionAuthoritySource::{Declared, Default, None};
-
+    fn mission_authority_none_still_parses_and_other_values_are_refused() {
         let intent = crate::graph::parse_intent(
             r#"version 2
-agent "fleet/fixture-website/standing/website" { workspace "."; command "true"; }
-agent "fleet/fixture-website" { workspace "."; command "true"; }
-agent "fleet/fixture-docs/standing/docs" {
-  workspace "."
-  command "true"
-  mission-authority { publish "fleet/fixture-docs/guides/*" }
-}
 agent "fleet/fixture-quiet/standing/quiet" { workspace "."; command "true"; mission-authority "none"; }
-agent "planner" { workspace "."; command "true"; }
-mission "fleet/fixture-crew/host" state="ready" {
-  goal "Hold one mission-scoped seat."
-  agent "helper" { workspace "."; command "true"; }
-}"#,
+agent "fleet/fixture-website/standing/website" { workspace "."; command "true"; }"#,
             "node",
         )
         .unwrap();
-        let effective = |subject: &str, declared_by_agent: bool| {
-            crate::graph::effective_agent_mission_authority(
-                &intent.subjects[subject],
-                declared_by_agent,
-            )
-        };
-
-        let website = effective("agent/fleet/fixture-website/standing/website", false);
-        assert_eq!(website.source, Default);
-        for verb in ["publish", "start", "revise"] {
-            assert!(website.authority.allows(verb, "fleet/fixture-website/refresh"));
-            assert!(
-                website
-                    .authority
-                    .allows(verb, "fleet/fixture-website/refresh/nightly")
-            );
-            assert!(!website.authority.allows(verb, "fleet/fixture-website"));
-            assert!(!website.authority.allows(verb, "fleet/fixture-websites/refresh"));
-            assert!(!website.authority.allows(verb, "fleet/fixture-other/refresh"));
-        }
-        let project = effective("agent/fleet/fixture-website", false);
-        assert_eq!(project.source, Default);
-        assert_eq!(project.authority, website.authority);
-
-        let docs = effective("agent/fleet/fixture-docs/standing/docs", false);
-        assert_eq!(docs.source, Declared);
-        assert!(docs.authority.allows("publish", "fleet/fixture-docs/guides/intro"));
-        assert!(!docs.authority.allows("publish", "fleet/fixture-docs/release"));
-        assert!(!docs.authority.allows("start", "fleet/fixture-docs/guides/intro"));
-        let quiet = effective("agent/fleet/fixture-quiet/standing/quiet", false);
-        assert_eq!(quiet.source, Declared);
-        assert_eq!(quiet.authority, crate::model::MissionAuthority::default());
-
-        for (source, declared_by_agent) in [
-            ("agent/fleet/fixture-website/standing/website", true),
-            ("agent/node.planner", false),
-        ] {
-            let effective = effective(source, declared_by_agent);
-            assert_eq!(effective.source, None, "{source}");
-            assert_eq!(
-                effective.authority,
-                crate::model::MissionAuthority::default()
-            );
-        }
-
-        // A run's seat is named under the run, here a project namespace, and still holds nothing.
-        let runtime = crate::graph::parse_execution_intent(
-            intent.missions["fleet/fixture-crew/host"]
-                .declarations_kdl
-                .as_deref()
-                .unwrap(),
-            "node",
-            "fleet/fixture-crew/host/one",
-        )
-        .unwrap();
-        let helper = crate::graph::effective_agent_mission_authority(
-            &runtime.subjects["agent/fleet/fixture-crew/host/one/helper"],
-            false,
+        assert_eq!(
+            crate::graph::declared_authority_blocks(
+                &intent.subjects["agent/fleet/fixture-quiet/standing/quiet"].desired
+            ),
+            ["mission-authority"]
         );
-        assert_eq!(helper.source, None);
-        assert_eq!(helper.authority, crate::model::MissionAuthority::default());
+        assert!(
+            crate::graph::declared_authority_blocks(
+                &intent.subjects["agent/fleet/fixture-website/standing/website"].desired
+            )
+            .is_empty()
+        );
 
         for source in [
             r#"version 2
@@ -3963,7 +3906,7 @@ agent "fleet/fixture-bad/seat" { workspace "."; command "true"; mission-authorit
     }
 
     #[test]
-    fn agent_queue_authority_uses_exact_and_terminal_seat_rules() {
+    fn queue_authority_still_parses_and_rejects_invalid_rules() {
         let intent = crate::graph::parse_intent(
             r#"version 2
 mission "standing" state="ready" {
@@ -3993,19 +3936,9 @@ mission "standing" state="ready" {
         let runtime =
             crate::graph::parse_execution_intent(&declarations, "node", "standing").unwrap();
         let desired = &runtime.subjects["agent/standing/chief"].desired;
-        let authority = crate::graph::agent_queue_authority(desired);
-        assert!(authority.allows_move("agent/example/fabric/builder"));
-        assert!(authority.allows_move("example/fabric/builder"));
-        assert!(!authority.allows_move("agent/example/fabric/builder-two"));
-        assert!(authority.allows_move("agent/example/review/one"));
-        assert!(!authority.allows_move("agent/example/reviews/one"));
-        assert!(!authority.allows_move("agent/example/review"));
-        assert!(authority.allows_move("agent/standing/worker"));
-        assert!(!authority.allows_move("agent/standing/chief"));
         assert_eq!(
-            crate::graph::agent_mission_authority(desired),
-            crate::model::MissionAuthority::default(),
-            "queue authority grants no mission authority"
+            crate::graph::declared_authority_blocks(desired),
+            ["queue-authority"]
         );
 
         for source in [

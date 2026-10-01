@@ -1864,10 +1864,12 @@ async fn receive_client_read(
             "the client read request exceeds its bound"
         );
         let request: ClientReadRequest = serde_json::from_slice(&body)?;
+        // Free mode: a member relays a read for a person or for one of the fleet's agents.
         anyhow::ensure!(
             request.authority_actor.starts_with("person/")
-                && request.authority_actor.matches('/').count() == 1,
-            "a fleet client read needs one concrete person"
+                && request.authority_actor.matches('/').count() == 1
+                || request.authority_actor.starts_with("agent/"),
+            "a fleet client read needs one concrete person or agent"
         );
         if let Some(route) = &request.relay {
             // The path names the member that sent it last, and never this node again.

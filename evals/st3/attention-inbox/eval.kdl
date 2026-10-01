@@ -7,10 +7,6 @@ mission "eval/attention-inbox/standing" state="ready" {
   agent "owner" {
     workspace "${ST_WORKSPACE}"
     command "sleep 1200"
-    mission-authority {
-      start "eval/attention-inbox/revision"
-      revise "eval/attention-inbox/revision"
-    }
     restart "never"
   }
 }

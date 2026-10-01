@@ -1543,7 +1543,7 @@ enum MissionViewCommand {
     },
     /// Explain one mission run, its goals, state, work, and usage.
     Show(MissionShowArgs),
-    /// Publish exact authored mission KDL after preview and authority checks.
+    /// Publish exact authored mission KDL after preview.
     Publish(MissionPublishArgs),
     /// Start one run from the current ready mission revision.
     Start(MissionRunStartArgs),
@@ -1662,7 +1662,7 @@ struct PlanningStartArgs {
     request: Option<PathBuf>,
     #[arg(long, default_value = ".")]
     workspace: PathBuf,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     requester: String,
     #[arg(long, value_parser = ["codex", "claude", "pi", "omp", "opencode"])]
     provider: Option<String>,
@@ -1721,7 +1721,7 @@ struct PlanningProposeArgs {
 struct PlanningReviseArgs {
     session: String,
     feedback: PathBuf,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
     /// Print the feedback KDL without storing the feedback or publishing it.
     #[arg(long)]
@@ -1732,7 +1732,7 @@ struct PlanningReviseArgs {
 struct PlanningApproveArgs {
     session: String,
     preview_hash: String,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
@@ -1744,7 +1744,7 @@ struct LaunchApproveAndStartArgs {
     workspace: PathBuf,
     #[arg(long = "input", value_parser = parse_input)]
     inputs: Vec<(String, String)>,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
@@ -1755,7 +1755,7 @@ struct LaunchRunArgs {
     workspace: PathBuf,
     #[arg(long = "input", value_parser = parse_input)]
     inputs: Vec<(String, String)>,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
@@ -1783,14 +1783,14 @@ struct LaunchAnswerArgs {
     explanation: Option<String>,
     #[arg(long, default_value_t = 1)]
     expected_revision: u32,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
 #[derive(Args)]
 struct PlanningCancelArgs {
     session: String,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
     #[arg(long)]
     reason: Option<String>,
@@ -1855,14 +1855,14 @@ struct PtySubjectArgs {
 struct PtyScreenArgs {
     subject: String,
     /// Use this concrete person instead of the person configured for trusted local commands.
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
 }
 
 #[derive(Args)]
 struct PtyStreamArgs {
     subject: String,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
     /// The stream capability from `terminals attach-info`; can be set through the environment.
     #[arg(long, env = "ST3_TERMINAL_CAPABILITY")]
@@ -1878,7 +1878,7 @@ struct PtyStreamArgs {
 struct PtyClientInputArgs {
     subject: String,
     value: String,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
     #[arg(long, conflicts_with = "key")]
     raw: bool,
@@ -1892,7 +1892,7 @@ struct PtyClientDetachArgs {
     /// Runtime incarnation returned by `terminals attach-info`.
     #[arg(long)]
     incarnation: String,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
 }
 
@@ -1904,7 +1904,7 @@ struct PtyAttachArgs {
     force: bool,
     /// The person attaching to a terminal another fleet host owns; defaults to `person` in the st
     /// config. A terminal on this host needs no person.
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     person: Option<String>,
 }
 
@@ -2291,7 +2291,7 @@ enum ImportCommand {
     /// Stop an exactly identified running harness and resume it in a durable st mission.
     Run {
         session: String,
-        #[arg(long = "as", value_parser = parse_person_subject)]
+        #[arg(long = "as", value_parser = parse_actor_subject)]
         person: String,
     },
 }
@@ -2387,8 +2387,8 @@ struct AgentQueueMoveArgs {
     /// Why the order changed; recorded with the move.
     #[arg(long)]
     reason: Option<String>,
-    /// Person or agent making the move; defaults to `person` in the st config. An agent needs
-    /// `queue-authority { move "SEAT" }` for this seat in its declaration.
+    /// Person or agent making the move; defaults to `person` in the st config. Any agent may move
+    /// any seat's queue, its own included.
     #[arg(long = "as", value_parser = parse_queue_move_actor)]
     actor: Option<String>,
 }
@@ -2615,7 +2615,7 @@ enum SchemaCommand {
 #[derive(Args)]
 struct SubscriptionRequestArgs {
     request: String,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
     #[arg(long)]
     reason: String,
@@ -2696,7 +2696,7 @@ struct AttentionResolveArgs {
     outcome: String,
     #[arg(long)]
     reason: Option<String>,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
@@ -2904,7 +2904,7 @@ enum MessageCommand {
     Thread(MessageReferenceArgs),
     /// List normalized harness sessions available for native conversation views.
     Sessions {
-        #[arg(long = "as", value_parser = parse_person_subject)]
+        #[arg(long = "as", value_parser = parse_actor_subject)]
         actor: Option<String>,
         #[arg(long)]
         all: bool,
@@ -2916,7 +2916,7 @@ enum MessageCommand {
     /// Render one normalized session timeline, including tools and usage.
     Timeline {
         session: String,
-        #[arg(long = "as", value_parser = parse_person_subject)]
+        #[arg(long = "as", value_parser = parse_actor_subject)]
         actor: Option<String>,
         #[arg(long, default_value_t = 100)]
         limit: usize,
@@ -2927,7 +2927,7 @@ enum MessageCommand {
     /// Follow the visible normalized conversation; JSON output is one entry per line.
     Follow {
         session: String,
-        #[arg(long = "as", value_parser = parse_person_subject)]
+        #[arg(long = "as", value_parser = parse_actor_subject)]
         actor: Option<String>,
         #[arg(long, default_value_t = 100)]
         limit: usize,
@@ -3015,7 +3015,7 @@ struct ReviewArgs {
     target: String,
     #[arg(long)]
     reason: Option<String>,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
@@ -3024,7 +3024,7 @@ struct FeedbackReviewArgs {
     target: String,
     #[arg(long)]
     reason: String,
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    #[arg(long = "as", value_parser = parse_actor_subject)]
     actor: String,
 }
 
@@ -3391,6 +3391,17 @@ fn guard_mutating_cli_actor(
             MissionViewCommand::Cancel(args) => Some(args.actor.as_str()),
             MissionViewCommand::Outcome(args) => Some(args.actor.as_str()),
             MissionViewCommand::Retire(args) => Some(args.actor.as_str()),
+            MissionViewCommand::Release(args) | MissionViewCommand::CancelRequest(args) => {
+                Some(args.actor.as_str())
+            }
+            _ => None,
+        },
+        Command::Import {
+            command: ImportCommand::Run { person, .. },
+        } => Some(person.as_str()),
+        Command::Terminals { command } => match command {
+            PtyCommand::InputClient(args) => args.person.as_deref(),
+            PtyCommand::DetachClient(args) => args.person.as_deref(),
             _ => None,
         },
         Command::Agents { command } => match command {
@@ -4428,6 +4439,7 @@ async fn publish_mission_file(
         "{}",
         mission.blockers.join("; ")
     );
+    warn_ignored_authority(&mission);
     let resolved = mission.resolved_intent;
     let response: ApplyResponse = client
         .post(
@@ -4906,6 +4918,15 @@ fn publication_document(node: KdlNode) -> String {
     document.to_string()
 }
 
+/// Free mode ignores authority blocks; say so on stderr when a publication still carries them.
+fn warn_ignored_authority(preview: &MissionResponse) {
+    for warning in &preview.warnings {
+        if let Some(warning) = warning.strip_prefix("free-mode: ") {
+            eprintln!("st: {warning}");
+        }
+    }
+}
+
 async fn publish_text(
     client: &Client,
     kdl: String,
@@ -4930,6 +4951,7 @@ async fn publish_text(
         "{}",
         mission.blockers.join("; ")
     );
+    warn_ignored_authority(&mission);
     let resolved = mission.resolved_intent;
     client
         .post(
@@ -4993,7 +5015,7 @@ async fn run_pty(
             }
         }
         PtyCommand::Screen(args) => {
-            let person = configured_human(
+            let person = configured_actor(
                 args.person.as_deref(),
                 configured_person,
                 "terminals screen",
@@ -5009,7 +5031,7 @@ async fn run_pty(
             }
         }
         PtyCommand::AttachInfo(args) => {
-            let person = configured_human(
+            let person = configured_actor(
                 args.person.as_deref(),
                 configured_person,
                 "terminals attach-info",
@@ -5037,7 +5059,7 @@ async fn run_pty(
             print_client_value(&response, json_output)
         }
         PtyCommand::Stream(args) => {
-            let person = configured_human(
+            let person = configured_actor(
                 args.person.as_deref(),
                 configured_person,
                 "terminals stream",
@@ -5064,7 +5086,7 @@ async fn run_pty(
             Ok(())
         }
         PtyCommand::InputClient(args) => {
-            let person = configured_human(
+            let person = configured_actor(
                 args.person.as_deref(),
                 configured_person,
                 "terminals input-client",
@@ -5105,7 +5127,7 @@ async fn run_pty(
             print_client_value(&response, json_output)
         }
         PtyCommand::DetachClient(args) => {
-            let person = configured_human(
+            let person = configured_actor(
                 args.person.as_deref(),
                 configured_person,
                 "terminals detach-client",
@@ -5310,7 +5332,7 @@ async fn attach_remote_terminal(
             "{not_local:#}. Attaching to it from this host needs `--as person/NAME` or `person = \"person/NAME\"` in the st config"
         )
     })?;
-    let person = parse_person_subject(person).map_err(anyhow::Error::msg)?;
+    let person = parse_actor_subject(person).map_err(anyhow::Error::msg)?;
     let gateway = generated_client(endpoint, Some(&person))?;
     let unreached = match fabric_route(client, &gateway, subject).await {
         Ok((target, request)) => match st3::terminal_fabric::attach(&target, &request).await? {
@@ -5867,6 +5889,25 @@ async fn run_devices(
             print_client_value(&response, json_output)
         }
     }
+}
+
+/// The actor of a terminal or client-v0 command: an explicit person or agent, else the harness's
+/// own seat, else the configured person. Free mode lets an agent act, always as itself.
+fn configured_actor(
+    explicit: Option<&str>,
+    configured: Option<&str>,
+    command: &str,
+) -> Result<String> {
+    if let Some(explicit) = explicit {
+        return parse_actor_subject(explicit).map_err(anyhow::Error::msg);
+    }
+    if let Some(own) = std::env::var("ST_AGENT")
+        .ok()
+        .filter(|own| own.starts_with("agent/"))
+    {
+        return Ok(own);
+    }
+    configured_human(None, configured, command)
 }
 
 fn configured_human(
@@ -9543,13 +9584,6 @@ fn render_client_agent(
     if let Some(owner) = &agent.owner_run_id {
         let _ = writeln!(output, "MISSION      {owner}");
     }
-    if let Some(authority) = &agent.mission_authority {
-        let _ = writeln!(
-            output,
-            "AUTHORITY    {}",
-            render_mission_authority(authority)
-        );
-    }
     if let Some(usage) = &agent.usage {
         let _ = writeln!(output, "USAGE        {}", render_usage(usage));
         if usage.incarnation_count > 0 {
@@ -9603,37 +9637,6 @@ fn render_client_agent(
         let _ = writeln!(output, "RUNTIME      {runtime}");
     }
     output
-}
-
-/// Each mission pattern with the verbs it allows, then where the authority comes from.
-fn render_mission_authority(authority: &st3_client::AgentMissionAuthority) -> String {
-    let mut patterns: Vec<(&str, Vec<&str>)> = Vec::new();
-    for (verb, rules) in [
-        ("publish", &authority.publish),
-        ("start", &authority.start),
-        ("revise", &authority.revise),
-        ("cancel", &authority.cancel),
-    ] {
-        for pattern in rules {
-            match patterns.iter_mut().find(|(known, _)| known == pattern) {
-                Some((_, verbs)) => verbs.push(verb),
-                None => patterns.push((pattern, vec![verb])),
-            }
-        }
-    }
-    let rules = if patterns.is_empty() {
-        "no missions".to_owned()
-    } else {
-        patterns
-            .iter()
-            .map(|(pattern, verbs)| format!("{} mission/{pattern}", verbs.join(", ")))
-            .collect::<Vec<_>>()
-            .join("; ")
-    };
-    match authority.source.as_str() {
-        "none" => rules,
-        source => format!("{rules} ({source})"),
-    }
 }
 
 fn render_client_agents(
@@ -11531,6 +11534,15 @@ fn planning_cancellation_intent(session_id: &str, operation_id: &str, reason: &s
     format!(
         "version 2\nplanning-session {session_id:?} {{\n  cancellation {operation_id:?} {{\n    reason {reason:?}\n  }}\n}}\n"
     )
+}
+
+/// A complete `person/NAME` or an agent. Free mode lets an agent do what its person may do, and
+/// the daemon still records the agent itself as the actor.
+fn parse_actor_subject(actor: &str) -> std::result::Result<String, String> {
+    if actor.starts_with("agent/") && actor.len() > "agent/".len() {
+        return Ok(actor.to_owned());
+    }
+    parse_person_subject(actor)
 }
 
 fn parse_person_subject(actor: &str) -> std::result::Result<String, String> {
@@ -15140,42 +15152,6 @@ mod tests {
     }
 
     #[test]
-    fn agent_card_shows_mission_authority_and_its_source() {
-        let card = |authority: serde_json::Value| {
-            let agent: st3_client::Agent = serde_json::from_value(serde_json::json!({
-                "kind": "agent", "id": "agent/example/website/standing/website", "revision": "one",
-                "updated_at": "2026-09-29T12:00:00Z", "name": "Website",
-                "state": "running", "reachability": "local", "runtime_ids": [],
-                "mission_authority": authority
-            }))
-            .unwrap();
-            render_client_agent(&agent, &[], 0)
-        };
-        let namespace = serde_json::json!(["fleet/website/*"]);
-        assert!(
-            card(serde_json::json!({
-                "source": "default",
-                "publish": namespace, "start": namespace, "revise": namespace
-            }))
-            .contains("AUTHORITY    publish, start, revise mission/fleet/website/* (default)")
-        );
-        assert!(
-            card(serde_json::json!({
-                "source": "declared",
-                "publish": ["fleet/website/docs/*"], "start": ["fleet/website/docs/*", "fleet/website/deploy"], "cancel": ["fleet/website/deploy"]
-            }))
-            .contains(
-                "AUTHORITY    publish, start mission/fleet/website/docs/*; start, cancel mission/fleet/website/deploy (declared)"
-            )
-        );
-        assert!(
-            card(serde_json::json!({"source": "declared"}))
-                .contains("AUTHORITY    no missions (declared)")
-        );
-        assert!(card(serde_json::json!({"source": "none"})).contains("AUTHORITY    no missions\n"));
-    }
-
-    #[test]
     fn agent_card_shows_current_and_next_work_ids() {
         let resource: st3_client::Resource = serde_json::from_value(serde_json::json!({
             "kind": "agent", "id": "agent/worker", "revision": "one",
@@ -17613,7 +17589,7 @@ mod tests {
     }
 
     #[test]
-    fn subscription_request_decisions_need_a_person() {
+    fn subscription_request_decisions_take_a_person_or_agent() {
         let cli = Cli::try_parse_from([
             "st3",
             "missions",
@@ -17632,6 +17608,7 @@ mod tests {
             panic!("the missions release command did not parse");
         };
         assert_eq!(args.actor, "person/operator");
+        // Free mode: an agent decides as itself; a bare name is still refused.
         assert!(
             Cli::try_parse_from([
                 "st3",
@@ -17641,7 +17618,20 @@ mod tests {
                 "--as",
                 "agent/node.triage",
                 "--reason",
-                "an agent cannot decide",
+                "an agent decides too",
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "missions",
+                "cancel-request",
+                "request-id",
+                "--as",
+                "operator",
+                "--reason",
+                "a bare name is not an actor",
             ])
             .is_err()
         );

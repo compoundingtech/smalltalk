@@ -158,10 +158,8 @@ Use `st agents apply`, or `st agents start ... --print-kdl` followed by the same
 the preview flag. Stop a seat explicitly with `st agents stop`. Mission revisions change mission
 work and generations without changing the seat's identity.
 
-A seat named `fleet/PROJECT/...` that a person declares may publish, start, and revise its
-project's missions under `fleet/PROJECT/*`, so it can put person-authorized work in the graph
-itself. [Agent mission authority](#agent-mission-authority) describes the default and how a
-declaration narrows or withholds it.
+Any seat may publish, start, revise, and cancel missions, and apply, start, and stop seats,
+including itself; see [free mode](#free-mode).
 
 ## Ordered queue authoring
 
@@ -224,55 +222,40 @@ A human-protected revision creates a durable revision proposal. The named operat
 
 `--print-kdl` prints only the declarative operation. It tells the operator which candidate file to publish first.
 
-## Agent mission authority
+## Free mode
 
-A top-level seat named `fleet/PROJECT` or `fleet/PROJECT/...` that a person declared may publish,
-start, and revise missions under `fleet/PROJECT/*` by default. The seat
-`fleet/website/standing/website` may publish `fleet/website/refresh` and start and revise its runs,
-and no mission of another project. `st agents show` prints the authority and its source:
+Within a fleet, an agent may do anything the person who runs the fleet may do. This is free mode,
+and it is the rule within a fleet until principals and grants land
+([#867](https://github.com/compoundingtech/smalltalk/issues/867),
+[#882](https://github.com/compoundingtech/smalltalk/issues/882)). Every seat in a fleet runs as
+that person's Unix user, so per-agent checks were never a security boundary there.
 
-```text
-AUTHORITY    publish, start, revise mission/fleet/website/* (default)
-```
+An agent publishes, starts, revises, cancels, and retires missions in any namespace, sets a run's
+outcome, retries and wakes any step, applies, starts, and stops any seat (including its own), moves
+any seat's queue, releases and cancels subscription requests, imports a native session, starts and
+reviews its own launches, and invokes every client-v0 action through its local socket.
 
-No other agent holds mission authority by default. An agent declared inside a mission stays bounded
-by that mission, even when its run ID puts it under `fleet/PROJECT/`. A seat whose current
-declaration an agent wrote with `seat-authority` holds nothing by default, so an agent never lends
-a seat authority it lacks; the seat regains the default when a person declares it again. st records
-the writer on each declaration; a declaration from before st recorded writers counts as a person's.
+Free mode keeps three things:
 
-A `mission-authority` block in the declaration replaces the default:
+- **The actor.** Every write records its real actor. An agent acts as itself and never as a person.
+  A harness with `ST_AGENT` can mutate only as its own seat. On Linux, the local Unix API also binds
+  a connection from a harness process or its descendants to that seat and refuses a different
+  actor, including `--as person/NAME`.
+- **Workflow.** Human review gates, lane approvers, steps assigned to a person (only that person
+  completes them with `st work done`), and attention for a person work as before.
+- **The fleet boundary.** Only members sync, and clients and paired apps keep their pairing.
 
-```kdl
-mission-authority {
-  publish "project/generated/*"
-  start "project/generated/*"
-  revise "project/generated/*"
-  cancel "project/generated/*"
-}
-```
+`mission-authority`, `queue-authority`, `seat-authority`, and `agent-authority` blocks still
+parse, so existing declarations stay valid, but st ignores them. The publication preview warns
+about each agent, declared directly or inside a mission, that carries one, and `st agents apply`
+and `st missions publish` print that warning.
 
-Use exact mission IDs or terminal `/*` namespaces without the `mission/` prefix. Name narrower
-rules than the default, such as `publish "fleet/website/docs/*"`, or withhold all mission authority
-with `mission-authority "none"`. Cancellation needs an explicit `cancel` rule; the project default
-continues to grant only `publish`, `start`, and `revise`. Use `st missions cancel RUN --as agent/PATH
---reason TEXT` to cancel a run of a mission under a granted path. The daemon checks the current
-grant and the run generation before cancellation.
-
-An agent publishing a generated nested mission needs `publish` authority, a claimed producing step,
-and an exact `produces-mission` match. Use `st work publish-mission` for that case.
-
-Starting requires separate `start` authority. Revising requires separate `revise` authority and structural authority in the current generation.
-
-Use `st missions publish FILE --as ACTOR` for exact authored KDL. Agent actors still need matching
-authority in their current desired declaration; a candidate definition cannot grant authority to
-its own publisher. Explicit person actors remain the trusted local-operator boundary.
+Publishing a generated nested mission still needs a claimed producing step and an exact
+`produces-mission` match, because that is the step's lease rather than a grant. Use
+`st work publish-mission` for that case.
 
 Mission starts require an explicit `--as`; the placeholder `person/requester` is not a valid run
-requester. A harness with `ST_AGENT` can mutate only as its own seat. On Linux, the local Unix API
-also binds a connection from a harness process or its descendants to that seat and refuses a
-different actor in mutation requests. Persons and internal system actions remain on the trusted
-local runtime boundary.
+requester.
 
 ### Runtime reset
 
@@ -307,51 +290,6 @@ current public CLI does not expose a standalone resource-refresh shortcut. An un
 is a successful refresh. A refresh always asks the provider again, even inside the window in which
 a GitHub observer reuses its last responses; GitHub answers an unchanged conditional request
 without spending rate limit.
-
-## Agent queue authority
-
-An agent cannot reorder a seat's queue by default. A person grants that in the agent's declaration:
-
-```kdl
-queue-authority {
-  move "fleet/fabric/builder"
-  move "fleet/review/*"
-}
-```
-
-Each rule names an exact seat identity or a terminal `/*` namespace, without the `agent/` prefix.
-The agent then moves runs with `st agents queue move SEAT RUN --top --as agent/PATH`. The move is
-recorded with the agent as its actor. The daemon reads the grant from the agent's current desired
-declaration when the move arrives, as it does for mission authority. [Agent seat
-queues](seat-queue.md) describes the queue and the move.
-
-## Agent declaration authority
-
-A person can authorize a seat to apply, start, and stop agent declarations under named paths:
-
-```kdl
-agent-authority {
-  apply "fleet/example/operations/*"
-  apply "fleet/example/ci/*"
-}
-```
-
-Each `apply` rule names an exact agent identity or a terminal `/*` namespace without `agent/`.
-The seat uses its own identity with `st agents apply FILE --as agent/PATH`, `st agents start`,
-and `st agents stop`. Existing `seat-authority { declare PATH; stop PATH }` rules still work.
-
-An agent with `agent-authority` may also delegate authority in a top-level declaration it applies.
-Every proposed rule must have the same authority kind and verb as a rule the caller currently
-holds, over the same or a narrower path. This covers `mission-authority`, `queue-authority`,
-`seat-authority`, and `agent-authority` itself. An exact rule cannot delegate a namespace, and
-`project/*` does not cover `project` or `project-other/*`. A wider path, extra verb, or different
-kind is refused with `agent-authority-grant-denied`, which names the refused rule. The candidate
-cannot grant itself permission: checks read the caller's current declaration before applying it.
-Delegated seats have no implicit project mission authority; their explicit rules are the grant.
-
-Mission publication and revision retain their existing guard: authority in agents declared
-inside a mission, step, or nested mission must match authority already published for that agent.
-This includes `agent-authority`; publishing a mission cannot bypass declaration grants.
 
 ## Planning a new mission
 

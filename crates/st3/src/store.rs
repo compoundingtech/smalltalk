@@ -4254,9 +4254,7 @@ impl Store {
         let actor = normalize_actor(actor, "agent");
         let old = crate::mission::run_mission(old, current.after.as_deref())?;
         let mission = &crate::mission::run_mission(mission.clone(), current.after.as_deref())?;
-        let variables = mission_run_variables(&current, &mission.revision);
-        let (compatible, reviewers) =
-            analyze_mission_revision(&old, mission, &actor, &current.requester, &variables)?;
+        let (compatible, reviewers) = analyze_mission_revision(&old, mission, &current.requester)?;
         let compatible = carried_revision_step_paths(&old, mission, &current.steps, compatible);
         let cutover = old.revision_cutover.clone();
         let status = if reviewers.is_empty() {
@@ -5329,7 +5327,7 @@ impl Store {
         let (compatible, reviewers) = if protected_approved || retry {
             (compatible_step_paths(&old, mission), BTreeSet::new())
         } else {
-            analyze_mission_revision(&old, mission, &actor, &current.requester, &variables)?
+            analyze_mission_revision(&old, mission, &current.requester)?
         };
         let mut compatible = carried_revision_step_paths(&old, mission, &current.steps, compatible);
         if reopening {
@@ -8428,8 +8426,7 @@ impl Store {
                     }
                     let predecessors = intent_leaves_tx(transaction, subject).map_err(internal)?;
                     let body = serde_json::to_value(desired).map_err(internal)?;
-                    // The writer decides whether a top-level project seat holds default mission
-                    // authority; see `graph::effective_agent_mission_authority`.
+                    // The claim records its writer as its actor.
                     let claim_id = claim_hash(
                         &batch_id,
                         subject,
@@ -8500,12 +8497,13 @@ impl Store {
                     let predecessors =
                         mission_definition_token_tx(transaction, &mission.id).map_err(internal)?;
                     let body = serde_json::to_value(mission).map_err(internal)?;
+                    // The publication records its publisher, as a declaration records its writer.
                     let claim_id = claim_hash(
                         &batch_id,
                         &mission.subject,
                         "mission.published",
                         &self.origin,
-                        None,
+                        actor,
                         &body,
                         &predecessors,
                     )
@@ -8517,7 +8515,7 @@ impl Store {
                         &mission.subject,
                         "mission.published",
                         &self.origin,
-                        None,
+                        actor,
                         &body,
                         &predecessors,
                         now,
@@ -10307,45 +10305,6 @@ impl Store {
             .map_err(Into::into)
     }
 
-    /// The current desired declaration of `subject` and the actor its claim records. A
-    /// declaration from before claims recorded their writer, or the daemon's own, has none.
-    pub fn desired_subject_with_writer(
-        &self,
-        subject: &str,
-    ) -> Result<Option<(DesiredSubject, Option<String>)>> {
-        let connection = self.readers.get();
-        connection
-            .query_row(
-                "SELECT desired.subject, desired.kind, desired.body, desired.member,
-                        desired.owner_run, desired.owner_generation, desired.owner_step,
-                        claims.actor
-                 FROM desired LEFT JOIN claims ON claims.id = desired.claim_id
-                 WHERE desired.subject = ?1",
-                [subject],
-                |row| Ok((desired_from_row(row)?, row.get::<_, Option<String>>(7)?)),
-            )
-            .optional()
-            .map_err(Into::into)
-    }
-
-    /// Each current agent declaration with the actor its claim records, as
-    /// `desired_subject_with_writer` reads one.
-    pub fn agent_declarations_with_writers(&self) -> Result<Vec<(DesiredSubject, Option<String>)>> {
-        let connection = self.readers.get();
-        let mut statement = connection.prepare(
-            "SELECT desired.subject, desired.kind, desired.body, desired.member,
-                    desired.owner_run, desired.owner_generation, desired.owner_step,
-                    claims.actor
-             FROM desired LEFT JOIN claims ON claims.id = desired.claim_id
-             WHERE desired.kind = 'agent'
-             ORDER BY desired.subject",
-        )?;
-        let rows = statement.query_map([], |row| {
-            Ok((desired_from_row(row)?, row.get::<_, Option<String>>(7)?))
-        })?;
-        rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-    }
-
     /// Among `subjects`, each declaration whose member this build cannot read, with the reason.
     /// `desired_subjects` gives such a declaration no member at all.
     pub fn unreadable_members(&self, subjects: &[&str]) -> Result<Vec<(String, String)>> {
@@ -11262,16 +11221,13 @@ impl Store {
         } else {
             format!("attention/{subject}")
         };
-        // Any person can close any item, whoever it was routed to, so an item routed to an agent
-        // or to another person never outlives everyone who could close it. The resolution
-        // records who closed it. An agent withdraws its own requests instead.
+        // Any person or agent can close any item, whoever it was routed to, so an item never
+        // outlives everyone who could close it. The resolution records who closed it.
         let actor = normalize_actor(&request.actor, "person");
-        if !actor.starts_with("person/") {
+        if !(actor.starts_with("person/") || actor.starts_with("agent/")) {
             return Err(St3Error::new(
-                "attention-resolver-not-person",
-                format!(
-                    "only a person resolves or dismisses attention request `{subject}`; its requester can withdraw it"
-                ),
+                "invalid-attention-resolver",
+                format!("`{actor}` is neither a person nor an agent"),
             ));
         }
         let current = self
@@ -12427,17 +12383,18 @@ impl Store {
             .collect())
     }
 
-    /// Release a held subscription request, or cancel a pending or held one, as a person.
+    /// Release a held subscription request, or cancel a pending or held one, as a person or an
+    /// agent.
     pub fn decide_subscription_request(
         &self,
         request: &str,
         decision: &str,
         input: &SubscriptionRequestDecision,
     ) -> Result<SubscriptionRequestView, St3Error> {
-        if !input.actor.starts_with("person/") {
+        if !(input.actor.starts_with("person/") || input.actor.starts_with("agent/")) {
             return Err(St3Error::new(
-                "subscription-request-person-only",
-                "only a person may release or cancel a subscription request",
+                "invalid-subscription-request-actor",
+                "a subscription request decision needs a person or agent actor",
             ));
         }
         if input.reason.trim().is_empty() {
@@ -16446,8 +16403,7 @@ fn adopt_declared_mission_revision_tx(
     let old = crate::mission::run_mission(old, current.after.as_deref())?;
     let next = crate::mission::run_mission(next, current.after.as_deref())?;
     let variables = mission_run_variables(&current, &next.revision);
-    let (compatible, reviewers) =
-        analyze_mission_revision(&old, &next, &actor, &current.requester, &variables)?;
+    let (compatible, reviewers) = analyze_mission_revision(&old, &next, &current.requester)?;
     let compatible = carried_revision_step_paths(&old, &next, &current.steps, compatible);
     if !reviewers.is_empty() || matches!(old.revision_cutover, RevisionCutover::WhenIdle) {
         if operation.cancellation.is_some() {
@@ -29194,9 +29150,7 @@ fn interpolate_goals(
 pub(crate) fn analyze_mission_revision(
     old: &MissionSpec,
     new: &MissionSpec,
-    actor: &str,
     requester: &str,
-    variables: &BTreeMap<String, String>,
 ) -> Result<(BTreeSet<String>, BTreeSet<String>), St3Error> {
     let old_hashes = step_hashes(old);
     let new_hashes = step_hashes(new);
@@ -29216,73 +29170,31 @@ pub(crate) fn analyze_mission_revision(
         ));
     }
 
-    let actor = normalize_actor(
-        actor,
-        if actor.starts_with("person/") {
-            "person"
-        } else {
-            "agent"
-        },
-    );
     let requester = normalize_actor(requester, "person");
-    let metadata = revision_metadata(old, &requester, variables)?;
-    // A person may revise any part of a run. Human-only protection still selects its reviewers.
-    if actor != requester && !actor.starts_with("person/") {
-        for path in &changed {
-            let meta = metadata_for_changed_path(&metadata, path);
-            if !meta.owners.contains(&actor) {
-                return Err(St3Error::new(
-                    "revision-outside-graph-location",
-                    format!(
-                        "`{actor}` cannot revise `{}` from its current graph location",
-                        if path.is_empty() {
-                            old.id.as_str()
-                        } else {
-                            path
-                        }
-                    ),
-                ));
-            }
-        }
-    }
+    let metadata = revision_reviewers(old, &requester);
+    // Free mode: a person or an agent may revise any part of a run. Human-only protection still
+    // selects its reviewers.
     let mut reviewers = BTreeSet::new();
     for path in &changed {
-        reviewers.extend(
-            metadata_for_changed_path(&metadata, path)
-                .reviewers
-                .iter()
-                .cloned(),
-        );
+        reviewers.extend(reviewers_for_changed_path(&metadata, path).iter().cloned());
     }
     Ok((compatible_step_paths(old, new), reviewers))
 }
 
-#[derive(Clone, Default)]
-struct RevisionMetadata {
-    owners: BTreeSet<String>,
-    reviewers: BTreeSet<String>,
-}
-
-fn revision_metadata(
+/// The reviewers each mission or step path's human-only revision protection selects.
+fn revision_reviewers(
     mission: &MissionSpec,
     requester: &str,
-    variables: &BTreeMap<String, String>,
-) -> Result<BTreeMap<String, RevisionMetadata>, St3Error> {
+) -> BTreeMap<String, BTreeSet<String>> {
     fn collect(
         mission: &MissionSpec,
         requester: &str,
-        variables: &BTreeMap<String, String>,
-        inherited: RevisionMetadata,
-        output: &mut BTreeMap<String, RevisionMetadata>,
-    ) -> Result<(), St3Error> {
-        let mut mission_meta = inherited;
-        for owner in &mission.revision_owners {
-            mission_meta
-                .owners
-                .insert(crate::mission::interpolate(owner, variables)?);
-        }
+        inherited: BTreeSet<String>,
+        output: &mut BTreeMap<String, BTreeSet<String>>,
+    ) {
+        let mut mission_reviewers = inherited;
         if mission.revisions_human_only {
-            mission_meta.reviewers.insert(
+            mission_reviewers.insert(
                 mission
                     .revision_reviewer
                     .as_deref()
@@ -29290,51 +29202,39 @@ fn revision_metadata(
                     .to_owned(),
             );
         }
-        output.insert(String::new(), mission_meta.clone());
+        output.insert(String::new(), mission_reviewers.clone());
         for id in &mission.display_order {
             let step = &mission.steps[id];
-            let mut step_meta = mission_meta.clone();
-            for owner in &step.revision_owners {
-                step_meta
-                    .owners
-                    .insert(crate::mission::interpolate(owner, variables)?);
-            }
+            let mut step_reviewers = mission_reviewers.clone();
             if step.revisions_human_only {
-                step_meta.reviewers.insert(
+                step_reviewers.insert(
                     step.revision_reviewer
                         .as_deref()
                         .unwrap_or(requester)
                         .to_owned(),
                 );
             }
-            output.insert(step.path.clone(), step_meta.clone());
+            output.insert(step.path.clone(), step_reviewers.clone());
             if let Some(nested) = &step.nested_mission {
-                let mut nested_meta = BTreeMap::new();
-                collect(nested, requester, variables, step_meta, &mut nested_meta)?;
-                for (path, meta) in nested_meta {
+                let mut nested_reviewers = BTreeMap::new();
+                collect(nested, requester, step_reviewers, &mut nested_reviewers);
+                for (path, reviewers) in nested_reviewers {
                     if !path.is_empty() {
-                        output.insert(path, meta);
+                        output.insert(path, reviewers);
                     }
                 }
             }
         }
-        Ok(())
     }
     let mut output = BTreeMap::new();
-    collect(
-        mission,
-        requester,
-        variables,
-        RevisionMetadata::default(),
-        &mut output,
-    )?;
-    Ok(output)
+    collect(mission, requester, BTreeSet::new(), &mut output);
+    output
 }
 
-fn metadata_for_changed_path<'a>(
-    metadata: &'a BTreeMap<String, RevisionMetadata>,
+fn reviewers_for_changed_path<'a>(
+    metadata: &'a BTreeMap<String, BTreeSet<String>>,
     path: &str,
-) -> &'a RevisionMetadata {
+) -> &'a BTreeSet<String> {
     metadata
         .iter()
         .filter(|(candidate, _)| {
@@ -44626,7 +44526,7 @@ version 2
     }
 
     #[test]
-    fn assigned_work_does_not_grant_revision_authority() {
+    fn an_agent_revises_outside_its_graph_location_as_itself() {
         let store = Store::open_memory("node").unwrap();
         let publish = |source: &str, key: &str| {
             let intent = crate::graph::parse_test_intent(source, "node").unwrap();
@@ -44682,16 +44582,19 @@ version 2
 "#,
             "authority-two",
         );
-        let error = store
+        // Free mode: an agent revises any part of a run, and the revision records it as actor.
+        let revised = store
             .adopt_mission_revision(
                 &run.id,
                 &escalated,
                 &worker,
-                "grant authority in the candidate graph",
+                "declare a seat in the candidate graph",
                 "authority-cutover",
             )
-            .unwrap_err();
-        assert_eq!(error.code, "revision-outside-graph-location");
+            .unwrap();
+        assert_ne!(revised.generation, run.generation);
+        let generation = store.run_generation(&revised.generation).unwrap().unwrap();
+        assert_eq!(generation.actor, worker);
     }
 
     const CARRY_SOURCE: &str = r#"
@@ -44732,7 +44635,7 @@ version 2
     }
 
     #[test]
-    fn a_person_can_revise_a_run_from_outside_its_graph_location() {
+    fn a_person_revises_a_run_from_outside_its_graph_location() {
         let store = Store::open_memory("node").unwrap();
         publish_carry(&store, CARRY_SOURCE, "carry-one");
         let run = store
@@ -44752,16 +44655,6 @@ version 2
             "carry-two",
         );
 
-        let agent = store
-            .adopt_mission_revision(
-                &run.id,
-                &revised,
-                "agent/node.worker",
-                "an assigned agent does not own the mission",
-                "agent-revision",
-            )
-            .unwrap_err();
-        assert_eq!(agent.code, "revision-outside-graph-location");
         let adopted = store
             .adopt_mission_revision(
                 &run.id,
@@ -44895,16 +44788,9 @@ version 2
             "assigned-to \"agent/node.one\"",
             "completion { depends-on { step \"work\" completed } }",
         );
-        let variables = BTreeMap::new();
         for candidate in [&selector_changed, &completion_changed] {
-            let (compatible, _) = analyze_mission_revision(
-                &old,
-                candidate,
-                "person/requester",
-                "person/requester",
-                &variables,
-            )
-            .unwrap();
+            let (compatible, _) =
+                analyze_mission_revision(&old, candidate, "person/requester").unwrap();
             if std::ptr::eq(candidate, &selector_changed) {
                 assert!(compatible.is_empty());
             } else {
@@ -46944,24 +46830,24 @@ mission "typecase" state="ready" {
                 .is_empty()
         );
 
-        let agent = AttentionResolveRequest {
+        let unknown = AttentionResolveRequest {
             outcome: "resolved".into(),
             reason: None,
-            actor: "agent/fabric/worker".into(),
-            idempotency_key: "resolve-fabric-agent".into(),
+            actor: "client/unknown".into(),
+            idempotency_key: "resolve-fabric-unknown".into(),
         };
         assert_eq!(
             store
-                .resolve_attention(&first.subject, &agent)
+                .resolve_attention(&first.subject, &unknown)
                 .unwrap_err()
                 .code,
-            "attention-resolver-not-person"
+            "invalid-attention-resolver"
         );
-        // Any person can close an item routed to another person.
+        // Any agent can close an item routed to a person, and is recorded as the resolver.
         let resolution = AttentionResolveRequest {
             outcome: "dismissed".into(),
             reason: Some("The fault is expected during maintenance.".into()),
-            actor: "someone-else".into(),
+            actor: "agent/fabric/other".into(),
             idempotency_key: "resolve-fabric".into(),
         };
         let closed = store
@@ -46975,7 +46861,7 @@ mission "typecase" state="ready" {
                 .unwrap()
                 .actor
                 .as_deref(),
-            Some("person/someone-else")
+            Some("agent/fabric/other")
         );
         assert_eq!(closed.outcome.as_deref(), Some("dismissed"));
         assert!(store.attention_items(None).unwrap().is_empty());

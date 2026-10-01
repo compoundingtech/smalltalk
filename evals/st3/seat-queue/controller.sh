@@ -187,17 +187,6 @@ queue_snapshot started
 [[ "$(queue_runs started)" == "$(jq -cn --arg a "$alpha" --arg b "$bravo" --arg c "$charlie" '[$a, $b, $c]')" ]] \
   || fail "the seat queue did not keep start order: $(queue_runs started)"
 
-# An agent without queue authority for the seat cannot reorder it, not even the
-# seat itself.
-if st3 agents queue move "$WORKER" "$charlie" --before "$bravo" \
-  --reason "the seat tries to reorder its own queue" \
-  --as "$WORKER" --json >"$GENERATED/refused-move.json" 2>"$GENERATED/refused-move.err"; then
-  fail "the seat moved a run in its own queue without queue authority"
-fi
-grep -q 'queue-authority-denied' "$GENERATED/refused-move.err" \
-  || fail "the unauthorized move failed for another reason: $(cat "$GENERATED/refused-move.err")"
-checkpoint unauthorized-move-refused
-
 # The seat takes the head run's ready step first.
 expect_next_claim "$alpha_draft"
 checkpoint alpha-draft-claimed
@@ -206,13 +195,13 @@ queue_snapshot before-move
 [[ "$(queue_next before-move)" == "$bravo_work" ]] \
   || fail "before the move the next work was $(queue_next before-move), not $bravo_work"
 
-# The authorized agent moves the last run ahead of bravo while the seat holds
+# Another agent moves the last run ahead of bravo while the seat holds
 # alpha's draft.
 st3 agents queue move "$WORKER" "$charlie" --before "$bravo" \
   --reason "charlie's notes are needed before bravo's" \
   --as "$MOVER" --json >"$GENERATED/move.json"
 jq -e --arg mover "$MOVER" '.actor == $mover and .kind == "agent.queue.moved"' "$GENERATED/move.json" >/dev/null \
-  || fail "the move was not recorded as the authorized agent's"
+  || fail "the move was not recorded as the chief's"
 checkpoint queue-moved
 held_during_move="$(step_state "$alpha_draft")"
 [[ "$held_during_move" =~ ^(claimed|working)$ ]] \
