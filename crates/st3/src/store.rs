@@ -51,6 +51,7 @@ mod checkpoint_trim;
 mod convergence;
 mod heal;
 mod lanes;
+mod operations;
 
 pub use checkpoint::{
     CHECKPOINT_MANIFEST_PAGE_LIMIT, CheckpointManifest, CheckpointManifestCursor,
@@ -120,6 +121,9 @@ CREATE TABLE IF NOT EXISTS claims (
 );
 CREATE INDEX IF NOT EXISTS claims_subject_index ON claims(subject, store_index);
 CREATE INDEX IF NOT EXISTS claims_kind_index ON claims(kind, store_index);
+CREATE INDEX IF NOT EXISTS claims_terminal_history_index ON claims(store_index)
+WHERE kind IN ('mission-run.state','step-run.state','work.failed')
+  AND json_extract(body,'$.fields.status') IN ('failed','cancelled','completed');
 CREATE INDEX IF NOT EXISTS claims_subject_kind_index ON claims(subject, kind, store_index);
 CREATE INDEX IF NOT EXISTS claims_subject_kind_accepted_index
 ON claims(subject, kind, length(accepted_at_unix_ms), accepted_at_unix_ms);
@@ -1744,6 +1748,7 @@ fn record_sqlite_time(statement: &str, duration: std::time::Duration) {
     #[cfg(test)]
     STATEMENTS_RUN.with(|run| run.set(run.get() + 1));
     crate::profile::sql(statement, duration);
+    crate::performance::record_query(statement, duration);
     SQLITE_NANOS.fetch_add(duration.as_nanos() as u64, Ordering::Relaxed);
     if statement == "COMMIT" {
         SQLITE_COMMITS.fetch_add(1, Ordering::Relaxed);

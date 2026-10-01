@@ -502,6 +502,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/evals", post(start_eval))
         .route("/v1/evals/{*run}", get(get_eval))
         .route("/v1/mission-runs", get(list_mission_runs))
+        .route("/v1/mission-overview", get(mission_overview))
+        .route("/v1/outcome-history", get(outcome_history))
+        .route("/v1/performance", get(performance_report))
         .route(
             "/v1/mission-runs/{run}/generations",
             get(list_run_generations),
@@ -662,12 +665,15 @@ async fn response_envelope(
         (None, Ok(_)) => {
             let runtime = tokio::runtime::Handle::current();
             let handler_profile = profile.clone();
+            let cpu_kind = request_route.clone();
             match tokio::task::spawn_blocking(move || {
                 if let Some(profile) = &handler_profile {
                     profile.queued();
                 }
                 let _entered = crate::profile::enter(handler_profile.as_ref());
-                runtime.block_on(next.run(request))
+                crate::performance::with_cpu(Some(&cpu_kind), || {
+                    runtime.block_on(next.run(request))
+                })
             })
             .await
             {
@@ -815,6 +821,7 @@ fn request_latency_snapshot() -> Vec<Value> {
 
 fn record_request_latency(route: &str, path: &str, started: Instant) {
     let elapsed = started.elapsed();
+    crate::performance::record_request(route, elapsed);
     {
         let mut routes = request_latency().lock().unwrap();
         if routes.len() < 256 || routes.contains_key(route) {
@@ -3944,9 +3951,10 @@ where
     F: FnOnce() -> anyhow::Result<T> + Send + 'static,
 {
     let profile = crate::profile::current();
+    let cpu_kind = crate::performance::current();
     tokio::task::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
-        operation()
+        crate::performance::with_cpu(cpu_kind.as_deref(), operation)
     })
     .await
     .map_err(ApiError::internal)?
@@ -3959,9 +3967,10 @@ where
     F: FnOnce() -> Result<T, St3Error> + Send + 'static,
 {
     let profile = crate::profile::current();
+    let cpu_kind = crate::performance::current();
     tokio::task::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
-        operation()
+        crate::performance::with_cpu(cpu_kind.as_deref(), operation)
     })
     .await
     .map_err(ApiError::internal)?
@@ -3976,9 +3985,10 @@ where
     F: FnOnce() -> Result<T, ApiError> + Send + 'static,
 {
     let profile = crate::profile::current();
+    let cpu_kind = crate::performance::current();
     tokio::task::spawn_blocking(move || {
         let _entered = crate::profile::enter(profile.as_ref());
-        operation()
+        crate::performance::with_cpu(cpu_kind.as_deref(), operation)
     })
     .await
     .map_err(ApiError::internal)?
@@ -5422,6 +5432,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
     Ok(Json(DoctorReport {
         status: report_status.into(),
         checks,
+        performance: crate::performance::snapshot(),
     }))
 }
 
@@ -9401,6 +9412,73 @@ async fn start_mission_run_action(
 struct MissionRunQuery {
     root: Option<String>,
     mission: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct MissionOverviewQuery {
+    mission: String,
+}
+async fn mission_overview(
+    State(state): State<AppState>,
+    Query(query): Query<MissionOverviewQuery>,
+) -> Result<Json<Value>, ApiError> {
+    blocking_store(move || {
+        state
+            .store
+            .read_snapshot(|_| state.store.mission_overview(&query.mission, 10))
+    })
+    .await
+    .map(Json)
+}
+
+#[derive(Deserialize)]
+struct OutcomeHistoryQuery {
+    collection: String,
+    #[serde(default)]
+    since: u64,
+    until: Option<u64>,
+    status: Option<String>,
+    actor: Option<String>,
+    before: Option<u64>,
+    limit: Option<usize>,
+}
+async fn outcome_history(
+    State(state): State<AppState>,
+    Query(query): Query<OutcomeHistoryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if !matches!(query.collection.as_str(), "missions" | "work")
+        || query
+            .status
+            .as_deref()
+            .is_some_and(|s| !matches!(s, "failed" | "cancelled" | "timed-out" | "completed"))
+        || query.limit.is_some_and(|limit| !(1..=200).contains(&limit))
+        || query.until.is_some_and(|until| until < query.since)
+        || query.since > i64::MAX as u64
+        || query.until.is_some_and(|until| until > i64::MAX as u64)
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "invalid-history-filter",
+            "select missions or work, a terminal status, a valid time window, and a limit of 1 through 200",
+        )));
+    }
+    blocking_store(move || {
+        state.store.read_snapshot(|index| {
+            state.store.outcome_history(
+                &query.collection,
+                u128::from(query.since),
+                query.until.map(u128::from).unwrap_or_else(client_now_ms),
+                query.status.as_deref(),
+                query.actor.as_deref(),
+                query.before.unwrap_or(index.saturating_add(1)),
+                query.limit.unwrap_or(50),
+            )
+        })
+    })
+    .await
+    .map(Json)
+}
+async fn performance_report() -> Json<Value> {
+    Json(crate::performance::snapshot())
 }
 
 async fn list_mission_runs(
