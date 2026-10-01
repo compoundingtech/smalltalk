@@ -18,6 +18,7 @@ members = [
   "crates/st3",
   "crates/st3-client",
   "crates/st3-client-codegen",
+  "crates/st3-conversation-ui",
   "crates/st3-migrate",
   "crates/st3-schema",
   "crates/stui",
@@ -31,10 +32,14 @@ default-members = [
   "crates/st-wire",
   "crates/st3",
   "crates/st3-client",
+  "crates/st3-conversation-ui",
   "crates/st3-migrate",
   "crates/st3-schema",
   "crates/stui",
 ]
+
+[workspace.dependencies]
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 
 [profile.dev]
 debug = 1

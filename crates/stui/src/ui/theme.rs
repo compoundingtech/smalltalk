@@ -68,3 +68,28 @@ pub fn strong(color: Color) -> Style {
 pub fn label() -> Style {
     Style::default().fg(OVERLAY1).add_modifier(Modifier::BOLD)
 }
+
+/// The conversation library never chooses application colors.
+pub fn conversation() -> st3_conversation_ui::Theme {
+    st3_conversation_ui::Theme {
+        user_bg: USER_BG,
+        tool_bg: TOOL_BG,
+        tool_ok_bg: TOOL_OK_BG,
+        tool_err_bg: TOOL_ERR_BG,
+        overlay0: OVERLAY0,
+        overlay1: OVERLAY1,
+        text: TEXT,
+        subtext0: SUBTEXT0,
+        subtext1: SUBTEXT1,
+        working: WORKING,
+        green: GREEN,
+        red: RED,
+        sapphire: SAPPHIRE,
+        surface1: SURFACE1,
+        surface2: SURFACE2,
+        teal: TEAL,
+        blue: BLUE,
+        peach: PEACH,
+        lavender: LAVENDER,
+    }
+}

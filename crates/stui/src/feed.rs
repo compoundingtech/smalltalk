@@ -96,6 +96,7 @@ pub enum Update {
     Conversation {
         target: String,
         replace: bool,
+        has_more: bool,
         items: Vec<TimelineEntry>,
     },
     /// st could not show the open conversation; the feed asks again after a backoff.
@@ -373,10 +374,10 @@ async fn connected(
                             return Ended::Dropped(error.to_string());
                         }
                     }
-                    CollectionEvent::Conversation { id, replace, items, .. } => {
+                    CollectionEvent::Conversation { id, replace, items, has_more, .. } => {
                         let Some(current) = conversing.as_mut().filter(|_| id == CONVERSATION) else { continue };
                         current.failures = 0;
-                        if updates.send(Update::Conversation { target: current.target.clone(), replace, items }).is_err() {
+                        if updates.send(Update::Conversation { target: current.target.clone(), replace, has_more, items }).is_err() {
                             return Ended::Closed;
                         }
                     }
