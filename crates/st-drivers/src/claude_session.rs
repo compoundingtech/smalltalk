@@ -1257,6 +1257,12 @@ fn observe_payload(
             edge,
         );
     }
+    // The turn axis, applied for the same reason and on the same events. It is what stops a seat
+    // whose provider refused its turn reading as an ordinary idle one: that record's healthy
+    // steady state is `absent`, so a failure nobody publishes is indistinguishable from health.
+    if let Some(edge) = turn_failure_edge(event, &payload) {
+        driver_diagnostic::publish_turn_failure(agent_dir, driver_diagnostic::Driver::Claude, edge);
+    }
     let Some(observation) = observe_hook_event(event, &payload) else {
         return Ok(());
     };
@@ -1668,7 +1674,11 @@ pub fn observe_hook_event(event: &str, payload: &serde_json::Value) -> Option<Ob
             Observation::new(Activity::Idle, BlockedOn::None, InputBuffer::Unknown).with_reason(
                 match stop_failure_error(payload) {
                     Some(CLAUDE_AUTH_REJECTED_ERROR) => "providerAuth",
-                    _ => "apiError",
+                    // Every other word in that closed vocabulary used to arrive here as the single
+                    // word `apiError`, on a record that also says `idle` and `blockedOn: none` —
+                    // a seat whose account is on hold read exactly like one waiting for work. The
+                    // class names what a person does about it instead.
+                    other => claude_turn_failure_class(other).1,
                 },
             ),
         ),
@@ -1709,6 +1719,61 @@ const CLAUDE_AUTH_REJECTED_ERROR: &str = "authentication_failed";
 /// `last_assistant_message` ride the same payload and are deliberately untouched: they are prose.
 fn stop_failure_error(payload: &serde_json::Value) -> Option<&str> {
     payload.get("error").and_then(serde_json::Value::as_str)
+}
+
+/// Classify one `StopFailure` error word.
+///
+/// Claude Code's `StopFailure` fires INSTEAD of `Stop` when an API error ended the turn, and its
+/// `error` field is a closed vocabulary. `authentication_failed` is handled on its own credential
+/// stage and never reaches here. Everything else is classified by WHAT A PERSON DOES about it, in
+/// the same words the Codex driver publishes, so one roster consumer reads both harnesses.
+///
+/// A word this build does not know is `turnUnclassified` — a real failure whose cause this version
+/// cannot name — rather than a class it might not belong to.
+fn claude_turn_failure_class(error: Option<&str>) -> (driver_diagnostic::Reason, &'static str) {
+    use driver_diagnostic::Reason;
+    match error {
+        Some("rate_limit") => (Reason::TurnUsageLimit, "usageLimit"),
+        Some("overloaded") => (Reason::TurnServerOverloaded, "serverOverloaded"),
+        // The response hit its own length cap. Different mechanism from a full context window,
+        // same thing to do about it: the work has to be made smaller.
+        Some("max_output_tokens") => (Reason::TurnContextWindow, "contextWindow"),
+        // An org policy no re-login can satisfy. Naming it a credential rejection would send an
+        // operator to re-login forever.
+        Some("oauth_org_not_allowed") => (Reason::TurnPolicy, "policy"),
+        // The account cannot pay or is suspended. Distinct from a spent allowance, which waiting
+        // fixes, and from a refused credential, which a re-login fixes.
+        Some("account_on_hold") | Some("billing_error") => (Reason::TurnAccount, "account"),
+        Some("invalid_request") | Some("model_not_found") => (Reason::TurnRejected, "rejected"),
+        Some("server_error") => (Reason::TurnInternal, "internal"),
+        // Claude's own catch-all, a missing word, and every word added after this build land
+        // together: a real failure this version cannot name.
+        _ => (Reason::TurnUnclassified, "unclassified"),
+    }
+}
+
+/// Read the turn-failure edge out of one hook event, or `None` when the event proves nothing about
+/// it.
+///
+/// `StopFailure` is Claude's typed statement that a turn FAILED, and the only signal carrying a
+/// cause. `Stop` is a turn that reached its ordinary end, and it is the one thing that clears a
+/// standing failure — the same positive-recovery rule the credential axis already follows, and for
+/// the same reason: a seat that has stopped emits nothing, so silence must never read as recovery.
+///
+/// The credential word is deliberately absent. It has its own stage, which outranks this one.
+fn turn_failure_edge(
+    event: &str,
+    payload: &serde_json::Value,
+) -> Option<driver_diagnostic::TurnFailureEdge> {
+    use driver_diagnostic::TurnFailureEdge;
+    match event {
+        "StopFailure" => match stop_failure_error(payload) {
+            Some(CLAUDE_AUTH_REJECTED_ERROR) => None,
+            other => Some(TurnFailureEdge::Failed(claude_turn_failure_class(other).0)),
+        },
+        "Stop" => Some(TurnFailureEdge::Recovered),
+        _ => None,
+    }
 }
 
 /// Read the credential edge out of one hook event, or `None` when the event proves nothing about
@@ -2012,6 +2077,11 @@ mod tests {
     /// INSTEAD of `Stop`, so the turn is over whatever the word is — but only the
     /// credential class earns the `providerAuth` reason, and neither quota nor an org policy may
     /// borrow it: a re-login fixes exactly one of the three.
+    ///
+    /// Every other word used to arrive as the single reason `apiError`, on a record that also
+    /// says `idle` and `blockedOn: none`. That is what a seat waiting for work looks like, so an
+    /// account on hold and a finished turn read the same. The words below are what a person does
+    /// about it, and they are the same words the Codex driver publishes.
     #[test]
     fn stop_failure_classifies_only_the_credential_class_as_provider_auth() {
         let rejected = serde_json::json!({
@@ -2029,15 +2099,56 @@ mod tests {
             "error": "oauth_org_not_allowed",
         });
 
+        let on_hold = serde_json::json!({
+            "hook_event_name": "StopFailure",
+            "error": "account_on_hold",
+        });
+        let future = serde_json::json!({
+            "hook_event_name": "StopFailure",
+            "error": "a_word_this_build_has_never_seen",
+        });
+
         for (payload, reason) in [
             (&rejected, "providerAuth"),
-            (&rate_limited, "apiError"),
-            (&org_policy, "apiError"),
+            (&rate_limited, "usageLimit"),
+            (&org_policy, "policy"),
+            (&on_hold, "account"),
+            (&future, "unclassified"),
         ] {
             let observed = observe_hook_event("StopFailure", payload).unwrap();
             assert_eq!(observed.state, Activity::Idle, "the turn ended: {reason}");
             assert_eq!(observed.blocked_on, BlockedOn::None);
             assert_eq!(observed.reason.as_deref(), Some(reason));
+        }
+
+        // The classes must stay distinguishable: a build collapsing them back onto one word is
+        // the defect this test exists to catch, and it would pass every assertion above if they
+        // all read the same.
+        let distinct = [&rate_limited, &org_policy, &on_hold, &future]
+            .into_iter()
+            .map(|payload| claude_turn_failure_class(stop_failure_error(payload)).1)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(distinct.len(), 4);
+
+        // The turn axis takes every non-credential word and nothing else, and only a turn that
+        // reached its ordinary end clears it.
+        assert_eq!(turn_failure_edge("StopFailure", &rejected), None);
+        assert_eq!(
+            turn_failure_edge("StopFailure", &rate_limited),
+            Some(driver_diagnostic::TurnFailureEdge::Failed(
+                driver_diagnostic::Reason::TurnUsageLimit
+            ))
+        );
+        assert_eq!(
+            turn_failure_edge("Stop", &serde_json::Value::Null),
+            Some(driver_diagnostic::TurnFailureEdge::Recovered)
+        );
+        for quiet in ["SessionStart", "PreToolUse", "Notification", "SubagentStop"] {
+            assert_eq!(
+                turn_failure_edge(quiet, &serde_json::Value::Null),
+                None,
+                "{quiet} proves nothing about the turn and must not clear a standing failure"
+            );
         }
 
         assert_eq!(
@@ -2063,6 +2174,131 @@ mod tests {
             provider_auth_edge("SessionStart", &serde_json::Value::Null),
             None,
             "a fresh session has made no provider call to prove anything with"
+        );
+    }
+
+    #[test]
+    fn claude_reports_each_typed_turn_failure_cause() {
+        use driver_diagnostic::Reason;
+        for (word, reason, observed_word) in [
+            ("rate_limit", Reason::TurnUsageLimit, "usageLimit"),
+            (
+                "overloaded",
+                Reason::TurnServerOverloaded,
+                "serverOverloaded",
+            ),
+            (
+                "max_output_tokens",
+                Reason::TurnContextWindow,
+                "contextWindow",
+            ),
+            ("oauth_org_not_allowed", Reason::TurnPolicy, "policy"),
+            ("account_on_hold", Reason::TurnAccount, "account"),
+            ("billing_error", Reason::TurnAccount, "account"),
+            ("invalid_request", Reason::TurnRejected, "rejected"),
+            ("model_not_found", Reason::TurnRejected, "rejected"),
+            ("server_error", Reason::TurnInternal, "internal"),
+            ("unknown", Reason::TurnUnclassified, "unclassified"),
+        ] {
+            let payload = serde_json::json!({"hook_event_name": "StopFailure", "error": word});
+            let observation = observe_hook_event("StopFailure", &payload).unwrap();
+            assert_eq!(observation.state, Activity::Idle);
+            assert_eq!(observation.blocked_on, BlockedOn::None);
+            assert_eq!(observation.reason.as_deref(), Some(observed_word), "{word}");
+            let tmp = tempfile::tempdir().unwrap();
+            driver_diagnostic::publish_turn_failure(
+                tmp.path(),
+                driver_diagnostic::Driver::Claude,
+                turn_failure_edge("StopFailure", &payload).unwrap(),
+            );
+            let driver_diagnostic::Observed::Failure(failure) =
+                driver_diagnostic::read(&driver_diagnostic::path(tmp.path()))
+            else {
+                panic!("{word} must publish a turn diagnostic");
+            };
+            assert_eq!(failure.stage, driver_diagnostic::Stage::Turn);
+            assert_eq!(failure.reason, reason, "{word}");
+        }
+    }
+
+    /// A refused turn reaches the diagnostic from a hook process of its own, and it must not hide
+    /// the credential rejection a DIFFERENT hook process published — each Claude hook is its own
+    /// process, so stage priority has to survive the process boundary or it holds nowhere.
+    #[test]
+    fn a_claude_turn_failure_publishes_without_hiding_a_credential_rejection() {
+        let tmp = tempfile::tempdir().unwrap();
+        let record = driver_diagnostic::path(tmp.path());
+        // One hook invocation, as `observe_hook` runs it: both axes, from one payload.
+        let hook = |event: &str, payload: &serde_json::Value| {
+            if let Some(edge) = provider_auth_edge(event, payload) {
+                driver_diagnostic::publish_provider_auth(
+                    tmp.path(),
+                    driver_diagnostic::Driver::Claude,
+                    edge,
+                );
+            }
+            if let Some(edge) = turn_failure_edge(event, payload) {
+                driver_diagnostic::publish_turn_failure(
+                    tmp.path(),
+                    driver_diagnostic::Driver::Claude,
+                    edge,
+                );
+            }
+        };
+
+        let on_hold = serde_json::json!({
+            "hook_event_name": "StopFailure",
+            "error": "account_on_hold",
+        });
+        hook("StopFailure", &on_hold);
+        let driver_diagnostic::Observed::Failure(failure) = driver_diagnostic::read(&record) else {
+            panic!("a suspended account must publish a native-driver diagnostic")
+        };
+        assert_eq!(failure.stage, driver_diagnostic::Stage::Turn);
+        assert_eq!(failure.reason, driver_diagnostic::Reason::TurnAccount);
+        assert_eq!(failure.source, driver_diagnostic::Source::TurnError);
+
+        // A later hook process publishes the credential rejection. It is the more specific cause
+        // and must be what a reader sees.
+        let rejected = serde_json::json!({
+            "hook_event_name": "StopFailure",
+            "error": "authentication_failed",
+        });
+        hook("StopFailure", &rejected);
+        let driver_diagnostic::Observed::Failure(failure) = driver_diagnostic::read(&record) else {
+            panic!("the credential rejection must be readable")
+        };
+        assert_eq!(failure.stage, driver_diagnostic::Stage::ProviderAuth);
+
+        // The direction that costs something if it is wrong: a turn failure published by a THIRD
+        // process must not overwrite the standing credential rejection with its own symptom. That
+        // is what the publisher's on-disk seeding buys — without it an operator would stop being
+        // told to re-login the moment the next turn failed for any other reason.
+        let rate_limited = serde_json::json!({
+            "hook_event_name": "StopFailure",
+            "error": "rate_limit",
+        });
+        hook("StopFailure", &rate_limited);
+        let driver_diagnostic::Observed::Failure(failure) = driver_diagnostic::read(&record) else {
+            panic!("the credential rejection must still be readable")
+        };
+        assert_eq!(
+            failure.stage,
+            driver_diagnostic::Stage::ProviderAuth,
+            "a refused credential outranks the turn failures it produces"
+        );
+
+        // Only a turn that reached its ordinary end clears either. A session boundary does not: a
+        // fresh session has made no provider call to prove anything with.
+        hook("SessionStart", &serde_json::Value::Null);
+        assert!(matches!(
+            driver_diagnostic::read(&record),
+            driver_diagnostic::Observed::Failure(_)
+        ));
+        hook("Stop", &serde_json::Value::Null);
+        assert_eq!(
+            driver_diagnostic::read(&record),
+            driver_diagnostic::Observed::Absent
         );
     }
 
