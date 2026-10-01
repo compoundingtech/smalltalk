@@ -8,7 +8,7 @@ import { agentGlyph, agentName, agentState, agentWord, harnessColor, harnessName
 import { Banners } from '../chrome';
 import rules from '../../../fixtures/clients/conversation-style.json';
 import { tokenColor, type ConversationRules } from '../conversationStyle';
-import { COLLAPSED_TOOL_LINES, conversationEntries, entryMatches, folds, shownToolLines, unreadableTranscript, type ConversationEntry } from '../conversationView';
+import { COLLAPSED_TOOL_LINES, conversationEntries, entryMatches, entryText, folds, shownToolLines, unreadableTranscript, type ConversationEntry } from '../conversationView';
 import { rememberBounded } from '../boundedCache';
 import { sessionPerson } from '../homeView';
 import type { RootScreen } from '../navigation';
@@ -149,7 +149,9 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       keyExtractor={row => row.kind === 'entry' ? row.entry.id : row.kind === 'pending' ? row.pending.id : 'older'}
       renderItem={({ item: row }) => row.kind === 'older'
         ? <View style={styles.entry}><T dim>older history is not shown here · `st conversations timeline` has all of it</T></View>
-        : row.kind === 'pending' ? <PendingView pending={row.pending} /> : <EntryView entry={row.entry} open={open.has(row.entry.id)} onToggle={toggle} />}
+        : row.kind === 'pending' ? <PendingView pending={row.pending} />
+        // A long press opens the entry's text to select any part of it; iOS text selects only whole.
+        : <Pressable onLongPress={() => navigation.navigate('SelectText', { text: entryText(row.entry), title })} delayLongPress={350}><EntryView entry={row.entry} open={open.has(row.entry.id)} onToggle={toggle} /></Pressable>}
       ListEmptyComponent={<View style={[styles.entry, { transform: [{ scaleY: -1 }] }]}>{unreadable ? <T color={theme.waiting} selectable>{unreadable}</T> : <T dim>{unresolved ? 'This process has no exact native session history.' : !loaded ? (status === 'online' ? 'Loading the conversation…' : 'Offline; this conversation has not been loaded yet.') : 'No conversation in the recent timeline.'}</T>}</View>}
       maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 60 }}
       keyboardDismissMode="interactive"
@@ -195,7 +197,7 @@ const PendingView = memo(function PendingView({ pending }: { pending: Pending })
   const rule = RULES.pending;
   return <View style={[styles.entry, styles.barred, { borderLeftColor: c(pending.failed ? rule.failed : rule.sending_edge) }]}>
     <T color={c(pending.failed ? rule.failed : rule.sending.color)}>{pending.failed ? `you · not sent: ${pending.failed}` : rule.sending.text}<T dim>  {pending.at}</T></T>
-    <Markdown text={pending.text} color={c(rule.text)} />
+    <Markdown selectable={false} text={pending.text} color={c(rule.text)} />
   </View>;
 });
 
@@ -205,10 +207,10 @@ const EntryView = memo(function EntryView({ entry, open, onToggle }: { entry: Co
     case 'user':
       return <View style={[styles.user, { backgroundColor: c(RULES.user.fill) }]}>
         <T color={c(RULES.user.time)} style={{ alignSelf: 'flex-end' }}>{entry.at}</T>
-        <T selectable color={c(RULES.user.text)}>{body.text}</T>
+        <T color={c(RULES.user.text)}>{body.text}</T>
       </View>;
     case 'assistant':
-      return <View style={styles.entry}><Markdown text={body.text} color={c(RULES.assistant)} /></View>;
+      return <View style={styles.entry}><Markdown selectable={false} text={body.text} color={c(RULES.assistant)} /></View>;
     case 'mail': return <MailView entry={entry} body={body} open={open} onToggle={onToggle} />;
     case 'event': {
       const color = body.tone === 'fault' ? theme.red : body.tone === 'warning' ? theme.yellow : c(RULES.event.label);
@@ -229,7 +231,7 @@ const EntryView = memo(function EntryView({ entry, open, onToggle }: { entry: Co
         <T numberOfLines={1}><T bold color={color}>{glyph} </T><T bold={look.title_bold} color={c(look.title)}>{body.title}</T></T>
         {shown.hidden ? <T color={c(rule.collapse.color)}>  … {shown.hidden} more lines · tap to show</T> : null}
         {open && expandable ? <T color={c(rule.collapse.color)}>  {rule.collapse.text}</T> : null}
-        {shown.lines.map((line, index) => <T key={index} selectable={!quiet} numberOfLines={quiet ? 1 : undefined} style={[styles.toolLine, quiet && { opacity: 0.7 }]} color={c(line.startsWith('+') ? rule.added : line.startsWith('-') || line.includes('error') ? rule.removed : look.rows)}>{line || ' '}</T>)}
+        {shown.lines.map((line, index) => <T key={index} numberOfLines={quiet ? 1 : undefined} style={[styles.toolLine, quiet && { opacity: 0.7 }]} color={c(line.startsWith('+') ? rule.added : line.startsWith('-') || line.includes('error') ? rule.removed : look.rows)}>{line || ' '}</T>)}
         {open && expandable ? <T color={c(rule.collapse.color)}>  {rule.collapse.text}</T> : null}
       </Pressable>;
     }
@@ -253,7 +255,9 @@ const MailView = memo(function MailView({ entry, body, open, onToggle }: { entry
     style={[styles.entry, styles.barred, { borderLeftColor: c(look.edge) }, toYou ? { backgroundColor: c(rule.to_you_fill) } : null]}>
     <T><T bold={look.from_bold} color={c(look.from)}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold={look.from_bold} color={look.from_bold ? undefined : c(look.text)}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{mark ? <T color={c(mark.color)}>  {mark.text}</T> : null}</T>
     <View style={long && !open ? { maxHeight: limit, overflow: 'hidden' } : null}>
-      <View onLayout={event => setHeight(event.nativeEvent.layout.height)}><Markdown text={body.text} color={c(look.text)} /></View>
+      {/* Measured at its full height and never shrunk by the fold: a measurement the fold could
+          change would fold and unfold the mail in a loop. */}
+      <View style={{ flexShrink: 0 }} onLayout={event => { const next = event.nativeEvent.layout.height; setHeight(previous => Math.max(previous, next)); }}><Markdown selectable={false} text={body.text} color={c(look.text)} /></View>
     </View>
     {long ? <T color={c(RULES.tool.collapse.color)}>{open ? `  ${RULES.tool.collapse.text}` : '  … more · tap to show'}</T> : null}
   </Pressable>;

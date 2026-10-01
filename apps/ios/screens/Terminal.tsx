@@ -177,7 +177,8 @@ export function TerminalScreen({ route, navigation }: RootScreen<'Terminal'>) {
     {canControlTerminal ? <TextInput
       ref={keyboard}
       style={styles.hidden}
-      editable={canType}
+      // Stays editable while the terminal reconnects, so the keyboard does not drop.
+      editable={canControlTerminal}
       autoCapitalize="none"
       autoCorrect={false}
       autoComplete="off"

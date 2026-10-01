@@ -319,14 +319,25 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
 }
 
 /** Whether an entry says `query` anywhere a person reads, case aside: for finding in a conversation. */
+function said(entry: ConversationEntry): string[] {
+  const body = entry.body;
+  return body.kind === 'tool' ? [body.title, ...body.output]
+    : body.kind === 'mail' ? [body.from, body.to, body.subject, body.text]
+    : [body.text];
+}
+
 export function entryMatches(entry: ConversationEntry, query: string): boolean {
   const wanted = query.trim().toLowerCase();
   if (!wanted) return true;
+  return said(entry).some(text => text.toLowerCase().includes(wanted));
+}
+
+/** An entry as plain text, for selecting and copying. */
+export function entryText(entry: ConversationEntry): string {
   const body = entry.body;
-  const said = body.kind === 'tool' ? [body.title, ...body.output]
-    : body.kind === 'mail' ? [body.from, body.to, body.subject, body.text]
-    : [body.text];
-  return said.some(text => text.toLowerCase().includes(wanted));
+  if (body.kind === 'tool') return [body.title, ...body.output].join('\n');
+  if (body.kind === 'mail') return [`${body.to ? `${body.from} → ${body.to}` : body.from}${body.subject ? `  ${body.subject}` : ''}`, '', body.text].join('\n');
+  return body.text;
 }
 
 /**
