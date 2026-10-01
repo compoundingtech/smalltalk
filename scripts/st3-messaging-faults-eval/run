@@ -433,6 +433,10 @@ agent "fault-probe" {{
             shutil.copy2(candidate if case == "old-channel" else replacement, next_binary)
             os.replace(next_binary, target.binary)
             await target.down()
+            if case == "old-channel":
+                # Ensure the historical poller observes the daemon outage instead of racing
+                # between one-second polls. The real extension owns channel recovery.
+                await asyncio.sleep(args.short_seconds)
             await target.start()
             link.enabled = True
         elif case in ("link-seconds", "link-minutes"):

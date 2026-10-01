@@ -339,6 +339,28 @@ pub(crate) mod tests {
         );
     }
     #[test]
+    fn legacy_recipient_receipt_replay_after_close_settles_without_backward_claims() {
+        let store = Store::open_memory("node").unwrap();
+        store.append_claim(&claim("message/native", "message.sent",
+            json!({"status":"sent","from":"person/eval","to":"agent/eval.worker","content":"QUARTZ SIGNAL"}), "sent")).unwrap();
+        for status in ["delivered", "read"] {
+            store.append_claim(&claim("message/native", &format!("message.{status}"), json!({"status":status}), status)).unwrap();
+        }
+        let closed = store.append_claim(&claim("message/native", "message.closed", json!({"status":"closed"}), "closed")).unwrap();
+        let before = store.claims_for("message/native", None).unwrap().len();
+        for status in ["staged", "delivered", "read"] {
+            let input = claim("message/native", &format!("message.{status}"), json!({"status":status}), &format!("legacy-replay-{status}"));
+            assert_eq!(store.append_claim(&input).unwrap().id, closed.id);
+            let mut foreign = input;
+            foreign.actor = Some("agent/eval.other".into());
+            foreign.idempotency_key = Some(format!("foreign-{status}"));
+            assert_eq!(store.append_claim(&foreign).unwrap_err().code, "invalid-message-transition");
+        }
+        assert_eq!(store.claims_for("message/native", None).unwrap().len(), before);
+        assert_eq!(store.message("message/native").unwrap().unwrap().status, "closed");
+    }
+
+    #[test]
     fn staged_replay_after_delivered_is_settled_without_a_backward_claim() {
         let store = Store::open_memory("node").unwrap();
         ready(&store, "session-1");

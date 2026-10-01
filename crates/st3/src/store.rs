@@ -19228,6 +19228,25 @@ fn validate_message_transition(
     if requested != "sent" && current == Some(requested) {
         return Ok(true);
     }
+    if matches!(
+        (current, requested),
+        (Some("delivered" | "read" | "closed"), "staged")
+            | (Some("read" | "closed"), "delivered")
+            | (Some("closed"), "read")
+    ) && input.actor.is_some()
+    {
+        let index: Option<u64> = transaction
+            .query_row("SELECT created_index FROM message_index WHERE subject=?1", [&input.subject], |row| row.get(0))
+            .optional().map_err(internal)?;
+        if let Some(index) = index {
+            let message = message_view_tx(transaction, &input.subject, index).map_err(internal)?;
+            if !message.to.is_empty() && input.actor.as_deref() == Some(message.to.as_str()) {
+                // Legacy channels also replay receipts after a lost response/reconnect.
+                // Settle to existing evidence without admitting a backward lifecycle claim.
+                return Ok(true);
+            }
+        }
+    }
     let valid = matches!(
         (current, requested),
         (None, "sent")

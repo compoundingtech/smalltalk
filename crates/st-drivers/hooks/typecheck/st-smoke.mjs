@@ -42,7 +42,7 @@ const api = {
   },
 };
 const ctx = { isIdle:()=>true,sessionManager:{getSessionId:()=>nativeSession,getEntries:()=>[]},ui:{notify:()=>{}} };
-const read = ()=>fs.existsSync(frames)?fs.readFileSync(frames,"utf8").trim().split("\n").filter(Boolean).map(JSON.parse):[];
+const read = ()=>fs.existsSync(frames)?fs.readFileSync(frames,"utf8").trim().split("\n").filter(Boolean).map(JSON.parse).filter(frame=>frame.type!=="keepalive"):[];
 const send = (frame)=>fs.appendFileSync(outgoing,JSON.stringify(frame)+"\n");
 const until = async(predicate)=>{for(let i=0;i<200;i++){if(predicate())return;await new Promise(r=>setTimeout(r,20));}throw new Error("smoke deadline");};
 const {default:extension}=await import(pathToFileURL(path.resolve(asset)));

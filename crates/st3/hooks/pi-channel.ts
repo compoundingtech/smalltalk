@@ -236,7 +236,10 @@ export default function (pi: ExtensionAPI) {
       };
       const timer = setTimeout(() => settle(""), HELLO_TIMEOUT_MS);
       timer.unref?.();
+      let legacyChannel = false;
+      let keepalive: ReturnType<typeof setInterval> | undefined;
       const retire = () => {
+        if (keepalive !== undefined) clearInterval(keepalive);
         if (state.child !== child) return;
         state.child = undefined;
         settle("");
@@ -253,6 +256,18 @@ export default function (pi: ExtensionAPI) {
         if (child.stdin.destroyed) return;
         child.stdin.write(JSON.stringify(frame) + "\n");
       };
+
+      // Historical channels can fail their API request while Tokio still waits on a
+      // blocking stdin read during shutdown. Wake that read so exit reaches the existing
+      // reconnect handler. This frame carries no state, handoff or receipt authority.
+      keepalive = setInterval(() => {
+        if (state.child !== child || state.shuttingDown || child.stdin.destroyed) {
+          if (keepalive !== undefined) clearInterval(keepalive);
+          return;
+        }
+        if (legacyChannel) send({ type: "keepalive" });
+      }, 1000);
+      keepalive.unref?.();
 
       const handle = async (line: string) => {
         let frame: Frame;
@@ -289,6 +304,7 @@ export default function (pi: ExtensionAPI) {
             settle("");
             return;
           }
+          legacyChannel = frame.protocol === 1;
           state.reconnectAttempt = 0;
           await applyLabel(ctx);
           for (const accepted of state.accepted?.values() ?? []) {

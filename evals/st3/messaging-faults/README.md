@@ -40,7 +40,7 @@ fault. The cases are:
 | receiver-down | Receiving daemon and worker are down when the sender accepts the message | Restarted API answers and worker is started |
 | harness-restart | Kill the provider, queue a message, let the daemon restart its seat | New provider process exists |
 | channel-killed | Kill the live channel and send a message | Kill completes and sender accepts the message; recovery belongs to the real extension |
-| old-channel | Start a real historical channel under the candidate's driver and extension, then deploy the candidate while queueing remotely | New daemon answers and peer link opens |
+| old-channel | Start a real historical channel under the candidate's driver and extension, then deploy the candidate with a short API outage while queueing remotely | New daemon answers and peer link opens |
 | handoff-failed | Refuse native handoffs past the third failure; check agent, doctor and sender visibility | The provider API accepts handoffs again |
 
 Receiver-down models an unavailable receiving node's messaging services with its
@@ -49,7 +49,12 @@ permits the one injected provider replacement; every other case requires the sam
 provider PID and runtime incarnation. No case permits an additional provider start.
 The old binary must actually predate reexec; the runner records its hash, checks
 that it does not support `resume-probe`, and starts its actual channel process
-rather than simulating legacy requests. The candidate's driver and extension remain
+rather than simulating legacy requests. The old-channel case holds the receiving API down for
+at least three seconds so its one-second poll cannot race past the outage. The owned extension
+sends authority-free protocol-1 keepalives: an old channel whose API request failed can otherwise
+remain stuck in Tokio shutdown waiting for its stdin reader, never notifying the extension to
+reconnect. Replayed recipient receipts settle to existing later evidence without moving the
+message backward or creating another lifecycle claim. The candidate's driver and extension remain
 current, so the case isolates compatibility with an old channel. It does not prove
 an old driver's recovery or compatibility between arbitrary historical releases:
 failure of that case's warmup is a fixture error, not a fault verdict.
