@@ -67,11 +67,19 @@ export function TerminalScreen({ route, navigation }: RootScreen<'Terminal'>) {
     if (!feed) return;
     incarnation.current = '';
     const follow = feed.followTerminal(terminalId, {
-      onScreen: next => { if (!incarnation.current) incarnation.current = next.runtime_incarnation; setScreen(next); },
+      onScreen: next => {
+        if (!incarnation.current) {
+          incarnation.current = next.runtime_incarnation;
+          // Debug builds type these once, for headless checks: the simulator has no keyboard to drive.
+          const keys = __DEV__ ? process.env.EXPO_PUBLIC_ST3_TEST_TERMINAL_KEYS : undefined;
+          if (keys) setTimeout(() => queue.push(JSON.parse(`"${keys}"`)), 1500);
+        }
+        setScreen(next);
+      },
       onIssue: setIssue,
     });
     return () => follow.close();
-  }, [feed, terminalId]));
+  }, [feed, terminalId, queue]));
 
   // Fit the terminal's columns to the phone's width; a very wide terminal scrolls sideways.
   const columns = screen?.columns ?? 80;
@@ -134,7 +142,7 @@ export function TerminalScreen({ route, navigation }: RootScreen<'Terminal'>) {
     },
   }), [lineHeight, canControlTerminal, send]);
 
-  const cursor = screen?.cursor.visible && typing ? screen.cursor : undefined;
+  const cursor = screen?.cursor.visible ? screen.cursor : undefined;
   const lines = screen?.lines.map(line => {
     const runs = cursor?.row === line.row ? withCursor(line.runs, cursor.column) : line.runs;
     return <Text key={line.row} style={[styles.line, { fontSize, lineHeight, height: lineHeight }]} numberOfLines={1}>
@@ -160,6 +168,7 @@ export function TerminalScreen({ route, navigation }: RootScreen<'Terminal'>) {
         {status !== 'online' ? 'offline · the last frame' : !canControlTerminal ? 'read-only' : typing ? 'typing into the terminal' : 'tap the screen to type'}
         {screen ? ` · ${screen.columns}×${screen.rows}` : ''}
       </T>
+      {canType && screen && contentHeight < area.height * 0.8 ? <Pressable onPress={fitToPhone} hitSlop={8}><T style={styles.stripText} color={theme.accent}>fit to phone</T></Pressable> : null}
     </View>
     {canControlTerminal ? <TextInput
       ref={keyboard}
@@ -204,7 +213,7 @@ export function TerminalScreen({ route, navigation }: RootScreen<'Terminal'>) {
 
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: theme.crust },
-  strip: { paddingHorizontal: 12, paddingVertical: 4, backgroundColor: theme.base },
+  strip: { flexDirection: 'row', justifyContent: 'space-between', paddingHorizontal: 12, paddingVertical: 4, backgroundColor: theme.base },
   stripText: { fontSize: 11 },
   line: { color: COLORS.fg, fontFamily: fonts.regular },
   hidden: { position: 'absolute', width: 1, height: 1, opacity: 0, left: -10, top: 0 },
