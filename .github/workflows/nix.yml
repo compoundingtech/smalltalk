@@ -59,6 +59,7 @@ jobs:
           .#checks.x86_64-linux.help
           .#checks.x86_64-linux.completions
           .#checks.x86_64-linux.hooks-replacement
+          .#checks.x86_64-linux.st3-hook-build-stamp
           .#checks.x86_64-linux.pty-fleet-contract
           .#checks.x86_64-linux.st3-help
           .#checks.x86_64-linux.install-layout

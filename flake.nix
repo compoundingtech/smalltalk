@@ -323,6 +323,9 @@
           pname = "st3";
           inherit version;
           src = self;
+          # st3 links st2's lifecycle hooks, whose receipt reads the same compile-time stamp.
+          # Without it, every Nix-built st3 binary reports an unknown source at time zero.
+          CLI_BUILD_STAMP = buildStamp;
           cargoLock = {
             lockFile = ./Cargo.lock;
             outputHashes = {
@@ -960,6 +963,53 @@
           grep -q 'complete -c st2' fish.out \
             || { echo "fish completions do not bind to \`st2\`" >&2; exit 1; }
 
+          touch $out
+        '';
+
+        # The st3 package compiles st2's hooks as a dependency, not through the st2
+        # derivation. Boot the shipped daemon to prove its own receipt carries the
+        # flake's source order rather than build.rs's missing-git fallback.
+        checks.st3-hook-build-stamp =
+          let
+            # The ordinary st3 package retains its complete check suite. This focused
+            # packaging probe needs only the shipped binary, not a second suite run.
+            st3Probe = st3.overrideAttrs (_: { doCheck = false; });
+          in
+          pkgs.runCommand "st3-hook-build-stamp-${version}" {
+            nativeBuildInputs = [ pkgs.curl pkgs.jq st3Probe ];
+          } ''
+          export HOME=$(mktemp -d)
+          export XDG_CONFIG_HOME="$HOME/config"
+          export XDG_STATE_HOME="$HOME/state"
+          export ST_HOOKS="$HOME/hooks"
+          ${st3Probe}/bin/st up --node hook-stamp-check \
+            --state-dir "$HOME/state/st3" \
+            --socket "$HOME/st.sock" \
+            --client-gateway-socket "$HOME/client.sock" > daemon.log 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true; wait "$pid" 2>/dev/null || true' EXIT
+          ready=0
+          for attempt in $(seq 1 100); do
+            if curl -fsS --unix-socket "$HOME/st.sock" http://localhost/v1/health >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$pid" 2>/dev/null; then
+              cat daemon.log >&2
+              exit 1
+            fi
+            sleep 0.1
+          done
+          if test "$ready" != 1; then
+            cat daemon.log >&2
+            exit 1
+          fi
+          jq -e \
+            --arg rev ${pkgs.lib.escapeShellArg sourceRev} \
+            --argjson commit ${toString sourceCommitUnix} \
+            --argjson dirty ${builtins.toJSON sourceDirty} \
+            '.st2GitSha == $rev and .sourceCommitUnix == $commit and .sourceDirty == $dirty' \
+            "$ST_HOOKS/current.json" >/dev/null
           touch $out
         '';
 
