@@ -268,6 +268,54 @@ fn st3_notification_wraps_one_bounded_message_with_its_hash_and_graph_address() 
     );
 }
 
+#[test]
+fn person_messages_describe_where_replies_are_read_in_both_native_notices() {
+    let note = "The person reads replies in st, not in the agent's session.";
+    for from in ["person/ada", "agent/example/worker", "daemon/runtime"] {
+        for body in [
+            "".to_owned(),
+            "A < B\nC & D".to_owned(),
+            "x".repeat(ST3_BODY_MAX_CHARS + 1),
+        ] {
+            let hash = st3_body_sha256(&body);
+            let ping = st3_ping_text("message/abc123", from, Some("Question"), &body);
+            let envelope = st3_notification_text(
+                "message/abc123",
+                from,
+                "agent/example/worker",
+                Some("Question"),
+                &body,
+                &hash,
+            );
+            for notice in [&ping, &envelope] {
+                assert_eq!(
+                    notice.matches(note).count(),
+                    usize::from(from.starts_with("person/"))
+                );
+                if from.starts_with("person/") {
+                    assert!(notice.ends_with(note));
+                }
+            }
+            // The delivery note is outside the sender's preview and does not change its hash.
+            assert!(envelope.contains(&format!(" sha256=\"{hash}\" ")));
+            let (_, rest) = envelope.split_once('\n').unwrap();
+            let (preview, _) = rest.split_once("</smalltalk-message>").unwrap();
+            let expected = if body.is_empty() {
+                String::new()
+            } else if body.len() > ST3_BODY_MAX_CHARS {
+                format!("{}…\n", "x".repeat(ST3_BODY_MAX_CHARS))
+            } else {
+                format!("{}\n", normalize_line(&body))
+            };
+            assert_eq!(xml_unescape(preview), expected);
+            if body.len() > ST3_BODY_MAX_CHARS {
+                assert!(ping.contains("… [read the full message in st3]"));
+                assert!(envelope.contains("[preview truncated; read the full message in st3]"));
+            }
+        }
+    }
+}
+
 /// Undo `xml_escape`, as a reader of the envelope would.
 fn xml_unescape(text: &str) -> String {
     text.replace("&lt;", "<")

@@ -384,9 +384,24 @@ async fn operational_cli_lists_outcomes_summarizes_runs_and_reports_performance(
     assert_eq!(report["window_seconds"], 300);
     assert!(!report["requests"].as_array().unwrap().is_empty());
     assert!(!report["queries"].as_array().unwrap().is_empty());
+    // Each request is counted under the command that sent it.
+    assert!(report["request_count"].as_u64().unwrap() > 0);
+    assert!(
+        report["client_requests"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(
+                |row| row["client"].as_str().unwrap().contains("st3 missions")
+                    && row["count"].as_u64().unwrap() > 0
+            ),
+        "{report:#}"
+    );
     let shown = run_cli_human(&socket, &["doctor", "--performance"]).await;
     assert!(shown.status.success());
-    assert!(String::from_utf8_lossy(&shown.stdout).contains("REQUESTS AND TASKS"));
+    let shown = String::from_utf8_lossy(&shown.stdout);
+    assert!(shown.contains("REQUESTS AND TASKS"));
+    assert!(shown.contains("REQUESTS BY CLIENT"), "{shown}");
     server.abort();
 }
 

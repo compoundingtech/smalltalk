@@ -352,7 +352,7 @@ impl Registry {
                 ));
             }
             if kind == "glass.upserted" {
-                glasses::validate_body(fields.get("body").unwrap_or(&Value::Null))?;
+                glasses::body_for_read(fields.get("body").unwrap_or(&Value::Null))?;
             }
         }
         Ok(spec)

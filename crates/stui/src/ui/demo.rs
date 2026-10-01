@@ -1050,6 +1050,7 @@ fn cos_conversation() -> Vec<Entry> {
                 body: s(
                     "Robin asked for the remaining two keys today. Claim `rotate` when you are free.",
                 ),
+                delivered: false,
             },
         ),
         e(
@@ -1074,6 +1075,7 @@ fn cos_conversation() -> Vec<Entry> {
                 body: s(
                     "release-captain on harbor exited 4 times in 10 minutes. Restarts are paused until a person acts.",
                 ),
+                delivered: false,
             },
         ),
         e(
@@ -1248,6 +1250,7 @@ pub fn late_mail() -> Entry {
             body: s(
                 "Every signing key is rotated and nothing reads the old ones. The report step is next.",
             ),
+            delivered: false,
         },
     )
 }
