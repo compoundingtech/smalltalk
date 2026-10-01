@@ -44,6 +44,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "capabilities",
         "local_work_lease_renewals",
         "local_observations",
+        "local_blobs",
         "local_subscription_mission_deferrals",
         "local_usage_totals",
         "local_usage_seen",

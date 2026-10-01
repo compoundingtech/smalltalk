@@ -26,7 +26,8 @@ Mixed storage tables below are classified by their logical shared fields; local 
 | `batches` | Shared storage, with stated local fields | Shared log metadata: origin/sequence/hash/accepted time; primary ordering inputs. Storage rather than an outcome projection. |
 | `claims` | Shared storage, with stated local fields | Shared immutable logical claim bytes/id/subject/kind/actor/predecessors/time. store_index alone is local; system-local/legacy migrated claims must be excluded from logical replicated-source digests. |
 | `operations` | Shared projection | Shared operation identity, canonical claim, request digest and conflict state, derived from live claims plus tombstones. After trim, operations with no live claim are served by tombstones. |
-| `blobs` | Shared projection | Shared immutable document payload bytes/hash/size for bound documents. Compare reachable content; unbound upload leftovers are local garbage, not a selected document. |
+| `blobs` | Shared projection | Shared immutable bytes/hash/size carried by durable claims or admitted blob records; all columns remain digested, including content retained after checkpoint trimming. |
+| `local_blobs` | Local | Staged upload bytes awaiting a durable claim reference. Promotion into `blobs` commits with the referencing claim. |
 | `documents` | Shared projection | Shared immutable name/hash binding and binding_claim_id. created_index is a local arrival cursor; current latest selection must join the binding claim and use canonical order. |
 | `desired` | Shared projection | Shared selected declaration, ancestry/conflicts, ownership and full canonical body; existing ancestry/revision/id selection is deterministic and must be preserved. |
 | `idempotency` | Local | Local opaque HTTP/operation response cache with local indexes; shared operation identity is operations plus checkpoint_claims. |

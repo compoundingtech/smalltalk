@@ -24,6 +24,18 @@ its own digest so a mismatch names the source. Local receipt metadata, physical 
 lease overlays and live reachability are excluded explicitly. Retained history and checkpoint
 tombstones represent the same logical source identity.
 
+Uploaded bytes in `local_blobs` are staged locally until a durable claim references them.
+Claim admission promotes those bytes into `blobs` in the claim's transaction; every column of
+`blobs` remains in the shared digest. Unreferenced uploads never enter envelopes and cannot be
+compared as shared authority. On upgrade, retained claim references, document bindings and valid
+received blob records identify existing shared bytes. Other bytes move to local staging without
+being deleted. If checkpoint tombstones already removed historical references, the upgrade
+conservatively keeps all existing shared blobs.
+
+A keyed worker signs batches beyond its last processed batch, including envelopes another
+unkeyed process already sealed at startup. Signature requests recover missing signatures after
+an upgrade. Equal envelope inventories alone cannot prove equal claim admission.
+
 `store::tests::canonical_audit::every_shared_projection_agrees_after_shuffle_restart_and_checkpoint`
 checks both invariants by comparing shared rows, selected readers and per-table digest oracles
 across isolated stores. `shared_folds_never_order_by_local_arrival` rejects raw shared arrival
