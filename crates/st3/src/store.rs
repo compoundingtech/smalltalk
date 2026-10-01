@@ -232,6 +232,21 @@ ON claims(
 WHERE json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
     THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END) IS NOT NULL;
 
+-- Mailbox admission needs the newest state for one incarnation, never optional display fields
+-- from its entire history. Include legacy reports without an incarnation in a separate seek.
+CREATE INDEX IF NOT EXISTS claims_harness_state_incarnation_accepted_index
+ON claims(
+    subject,
+    CASE WHEN json_type(body, CASE WHEN json_type(body, '$.fields') IS NULL
+        THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END)='text'
+        THEN json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+            THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END) END,
+    length(accepted_at_unix_ms), accepted_at_unix_ms
+)
+WHERE kind='harness.observed'
+    AND json_type(body, CASE WHEN json_type(body, '$.fields') IS NULL
+        THEN '$.state' ELSE '$.fields.state' END)='text';
+
 CREATE TABLE IF NOT EXISTS desired (
     subject TEXT PRIMARY KEY,
     kind TEXT NOT NULL,
@@ -15978,14 +15993,8 @@ fn check_mailbox_incarnation(
         })
         .optional()
         .map_err(internal)?;
-    let runtime_claim = runtime.as_ref().map(|(claim, _)| claim.as_str());
-    let runtime: Value = serde_json::from_str(
-        runtime
-            .as_ref()
-            .map(|(_, body)| body.as_str())
-            .unwrap_or_default(),
-    )
-    .unwrap_or(Value::Null);
+    let (runtime_claim, runtime_body) = runtime.unwrap_or_default();
+    let runtime: Value = serde_json::from_str(&runtime_body).unwrap_or(Value::Null);
     let fields = runtime.get("fields").unwrap_or(&runtime);
     let live = fields.get("status").and_then(Value::as_str) == Some("running")
         && fields.get("incarnation_id").and_then(Value::as_str) == Some(&fence.incarnation);
@@ -16026,9 +16035,10 @@ fn check_mailbox_incarnation(
             }
         }
     }
-    let ended = live
-        && mailbox_harness_ended(connection, fence, runtime_claim.unwrap()).map_err(internal)?;
-    if !live || ended {
+    if !live
+        || mailbox_harness_ended(connection, &fence.subject, &fence.incarnation, &runtime_claim)
+            .map_err(internal)?
+    {
         return Err(St3Error::new(
             "stale-mailbox-session",
             "this is not the seat's live incarnation",
@@ -16038,49 +16048,89 @@ fn check_mailbox_incarnation(
     Ok(())
 }
 
-/// Mailbox authorization needs the state, not the optional display fields accumulated by
-/// `current_harness_at`. Sparse observations can leave those fields unknown forever, making
-/// a display fold walk every prior incarnation on every graph wake.
+/// State-only counterpart of the current harness display fold. Keep canonical order, legacy
+/// epoch bounds, prompt diagnostics and newer worker activity, without folding display fields.
+fn newest_mailbox_harness_state_query() -> String {
+    format!(
+        "SELECT claims.id, json_extract(body, CASE WHEN json_type(body, '$.fields') IS NULL
+            THEN '$.state' ELSE '$.fields.state' END)
+         FROM claims INDEXED BY claims_harness_state_incarnation_accepted_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE subject=?1 AND kind='harness.observed'
+           AND json_type(body, CASE WHEN json_type(body, '$.fields') IS NULL
+               THEN '$.state' ELSE '$.fields.state' END)='text'
+           AND CASE WHEN json_type(body, CASE WHEN json_type(body, '$.fields') IS NULL
+               THEN '$.incarnation_id' ELSE '$.fields.incarnation_id' END)='text'
+               THEN {INCARNATION_OF_CLAIM} END IS ?2
+         ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+    )
+}
+
 fn mailbox_harness_ended(
     connection: &Connection,
-    fence: &crate::mailbox::Fence,
+    subject: &str,
+    incarnation: &str,
     runtime_claim: &str,
 ) -> Result<bool> {
-    let mut statement = connection.prepare_cached(&newest_claims_of_kind_query(
-        "claims.id, claims.body",
-        "harness.observed",
-    ))?;
-    let mut rows = statement.query(params![fence.subject, i64::MAX])?;
-    let mut runtime_key = None;
-    while let Some(row) = rows.next()? {
-        let claim: String = row.get(0)?;
-        let body: String = row.get(1)?;
-        let body: Value = serde_json::from_str(&body)?;
-        let fields = body.get("fields").unwrap_or(&body);
-        let belongs = match fields.get("incarnation_id").and_then(Value::as_str) {
-            Some(incarnation) => incarnation == fence.incarnation,
-            None => {
-                let key = match &runtime_key {
-                    Some(key) => key,
-                    None => runtime_key.insert(canonical::claim_key(connection, runtime_claim)?),
-                };
-                canonical::claim_key(connection, &claim)? > *key
+    let runtime_key = canonical::claim_key(connection, runtime_claim)?;
+    let mut latest = None;
+    for observed_incarnation in [Some(incarnation), None] {
+        let observation: Option<(String, String)> = connection
+            .prepare_cached(&newest_mailbox_harness_state_query())?
+            .query_row(params![subject, observed_incarnation], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .optional()?;
+        if let Some((claim, state)) = observation {
+            let key = canonical::claim_key(connection, &claim)?;
+            if (observed_incarnation.is_some() || key > runtime_key)
+                && latest.as_ref().is_none_or(|(_, current)| key > *current)
+            {
+                latest = Some((state, key));
             }
-        };
-        if !belongs {
-            continue;
-        }
-        if let Some(state) = fields.get("state").and_then(Value::as_str) {
-            if state != "ended" {
-                return Ok(false);
-            }
-            // Diagnostics or newer work activity can override an ended observation. Keep
-            // exactly the existing reduction for that exceptional case.
-            return Ok(current_harness_at(connection, &fence.subject, None)?
-                .is_some_and(|harness| harness.state == "ended"));
         }
     }
-    Ok(false)
+    let Some((state, harness_key)) = latest else {
+        return Ok(false);
+    };
+    if state != "ended" {
+        return Ok(false);
+    }
+
+    // These positive prompt fences precede the harness state in the display fold. A restored
+    // login removes the override. Read them only when they can change an ended decision.
+    let diagnostic: Option<String> = connection
+        .prepare_cached(&format!(
+            "SELECT json_extract(claims.body, '$.fields.code')
+         FROM claims JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind='harness.diagnostic'
+           AND json_extract(claims.body, '$.fields.incarnation_id')=?2
+           AND json_extract(claims.body, '$.fields.code')
+               IN ('provider-auth-expired','provider-auth-restored','provider-trust-prompt')
+         ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+        ))?
+        .query_row(params![subject, incarnation], |row| row.get(0))
+        .optional()?;
+    if diagnostic.is_some_and(|code| code != "provider-auth-restored") {
+        return Ok(false);
+    }
+
+    let work: Option<String> = connection
+        .prepare_cached(&canonical_sql(
+            "SELECT id FROM claims WHERE actor=?1
+           AND kind IN ('work.claimed','work.progress')
+           AND json_extract(body, '$.fields.claim_incarnation')=?2
+         ORDER BY CANONICAL_DESC(claims) LIMIT 1",
+        ))?
+        .query_row(params![subject, incarnation], |row| row.get(0))
+        .optional()?;
+    if let Some(claim) = work {
+        let key = canonical::claim_key(connection, &claim)?;
+        if key > runtime_key && key > harness_key {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 fn check_mailbox_fence(
@@ -24870,6 +24920,11 @@ mod tests {
 
     const TEST_FLEET: &str = "018f6f0d-4a5d-7b8c-9d0e-123456789abc";
 
+    mod mailbox_fence_tests {
+        use super::*;
+        include!("store/mailbox_fence_tests.rs");
+    }
+
     mod canonical_audit {
         use super::*;
         include!("store/canonical_audit.rs");
@@ -33415,6 +33470,7 @@ version 2
         // Count the actual statements used by the fence, including the previous display fold.
         // Cached statement reset does not reset SQLite's VM step counter.
         let queries = [
+            newest_mailbox_harness_state_query(),
             newest_claims_of_kind_query("claims.id, claims.body", "harness.observed"),
             newest_claims_of_kind_query(
                 "claims.id, claims.store_index, claims.body, claims.accepted_at_unix_ms",
@@ -33450,7 +33506,7 @@ version 2
             }
         }
         assert!(
-            costs[1] <= costs[0] * 2 && costs[1] < 1_000,
+            costs[0] > 0 && costs[1] <= costs[0] * 2 && costs[1] < 1_000,
             "a live fence must read its state, not its optional display history: {costs:?}"
         );
     }
