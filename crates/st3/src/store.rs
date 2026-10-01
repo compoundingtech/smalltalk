@@ -15989,11 +15989,16 @@ fn check_mailbox_incarnation(
     let fields = runtime.get("fields").unwrap_or(&runtime);
     let live = fields.get("status").and_then(Value::as_str) == Some("running")
         && fields.get("incarnation_id").and_then(Value::as_str) == Some(&fence.incarnation);
+    let predecessor = fields
+        .get("incarnation_id")
+        .and_then(Value::as_str)
+        .is_some_and(|incarnation| incarnation != fence.incarnation);
     if !live
-        && matches!(
-            fields.get("status").and_then(Value::as_str),
-            None | Some("starting")
-        )
+        && (predecessor
+            || matches!(
+                fields.get("status").and_then(Value::as_str),
+                None | Some("starting")
+            ))
     {
         let harness: Option<String> = connection
             .prepare_cached(&format!(
@@ -16010,8 +16015,10 @@ fn check_mailbox_incarnation(
             if fields.get("state").and_then(Value::as_str) == Some("starting")
                 && fields.get("incarnation_id").and_then(Value::as_str) == Some(&fence.incarnation)
             {
-                // The provider can start before reconciliation publishes runtime.running.
+                // The new driver can start while the graph still describes its predecessor,
+                // before reconciliation publishes this incarnation's runtime.running.
                 // Retry without allocating ownership or authorizing any mailbox reads/receipts.
+                // An exited observation for this same incarnation remains terminal.
                 return Err(St3Error::new(
                     "mailbox-session-starting",
                     "waiting for the seat's running incarnation",

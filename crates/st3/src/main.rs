@@ -16328,6 +16328,7 @@ mod tests {
         let back: DriverResume =
             serde_json::from_slice(&serde_json::to_vec(&resume).unwrap()).unwrap();
         assert_eq!(back.session, resume.session);
+        assert_eq!(back.incarnation, resume.incarnation);
         assert!(back.loop_state.ready);
         assert_eq!(back.loop_state.delivery_episode, 2);
         assert_eq!(
