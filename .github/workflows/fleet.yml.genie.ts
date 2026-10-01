@@ -71,6 +71,9 @@ export default githubWorkflow({
   name: 'Workspace CI',
   on: {
     pull_request: {},
+    // GitHub's merge queue runs the required checks on each queued entry; without this trigger the
+    // queue never receives them and merges freeze.
+    merge_group: {},
     // Main CI is off until Nathan says to turn it back on: restore `push: { branches: ['main'] },` here.
     workflow_dispatch: {},
   },

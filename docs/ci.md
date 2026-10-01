@@ -13,7 +13,8 @@ run in parallel, and the **live** merge rule remains `st/ci` until the coordinat
 The proposed required check names are `linux-gate`, `isolation-vm` and `genie-freshness`.
 
 Every pull request, including a fork and a draft, gets the Linux gate, the isolation VM and the
-freshness check.
+freshness check. `Workspace CI` also runs on the `merge_group` event, so GitHub's merge queue receives
+the three required checks for each queued entry.
 Checkout uses GitHub's default `pull_request` merge ref, not the contributor's unmerged
 head: it tests that head merged with the current base. Strict branch protection also requires
 that the head itself contain the latest `main`. No `pull_request_target` job runs PR code,

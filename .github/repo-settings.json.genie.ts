@@ -1,7 +1,8 @@
 import { githubRepoSettings, githubRuleset } from '../repos/effect-utils/genie/external.ts'
 
-// Do not apply before the parallel proving runs and the train-driver cutover.
-// Keep the live main ruleset's other protections; only replace the CI check API.
+// Landing goes through GitHub's merge queue, gated on the three Namespace checks. Apply only after the
+// `merge_group` trigger is on main (without it the queue never receives its checks and merges freeze).
+// Keep the live main ruleset's other protections; only replace the CI check and add the queue.
 export default githubRepoSettings({
   repository: { allow_auto_merge: true, delete_branch_on_merge: true },
   rulesets: [githubRuleset({
@@ -30,13 +31,31 @@ export default githubRepoSettings({
       {
         type: 'required_status_checks',
         parameters: {
-          strict_required_status_checks_policy: true,
+          // The merge queue tests every entry on top of the current main and the entries ahead of it,
+          // so a pull request no longer has to be rebased onto the latest main before it can be queued.
+          strict_required_status_checks_policy: false,
           do_not_enforce_on_create: false,
           required_status_checks: [
             { context: 'linux-gate', integration_id: 15368 },
             { context: 'isolation-vm', integration_id: 15368 },
             { context: 'genie-freshness', integration_id: 15368 },
           ],
+        },
+      },
+      {
+        type: 'merge_queue',
+        parameters: {
+          // The repository merges with merge commits today (the st train did).
+          merge_method: 'MERGE',
+          grouping_strategy: 'ALLGREEN',
+          // More than one entry builds at a time, so entries test ahead of the one being merged.
+          max_entries_to_build: 5,
+          max_entries_to_merge: 5,
+          min_entries_to_merge: 1,
+          min_entries_to_merge_wait_minutes: 5,
+          // A required check that never reports (a lost Namespace job) fails the entry after this
+          // long instead of blocking the queue for the default hour.
+          check_response_timeout_minutes: 30,
         },
       },
     ],
