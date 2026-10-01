@@ -57,6 +57,7 @@ use crate::store::Store;
 mod client_v0;
 mod delivery_presence;
 mod delivery_probes;
+mod mailbox;
 mod terminal_view;
 
 #[derive(Clone)]
@@ -424,6 +425,8 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         )
         .route("/v1/messages", get(list_messages).post(send_message))
         .route("/v1/messages/page", get(list_messages_page))
+        .route("/v1/mailbox", get(mailbox::subscribe))
+        .route("/v1/mailbox/receipts", post(mailbox::receipt))
         .route("/v1/messages/{message_id}/claims", post(post_message_claim))
         .route("/v1/messages/read/{*subject}", get(read_message))
         .route("/v1/messages/delivery/{*subject}", get(message_delivery))
@@ -12048,7 +12051,7 @@ mod tests {
         );
     }
 
-    fn state(root: &Path) -> AppState {
+    pub(super) fn state(root: &Path) -> AppState {
         AppState {
             store: Arc::new(Store::open_memory("node").unwrap()),
             notify: Arc::new(Notify::new()),

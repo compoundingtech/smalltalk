@@ -12,10 +12,28 @@ the provider. Several st processes carry the seat's messages for the whole provi
 
 | Harness | Driver | Channel |
 | --- | --- | --- |
-| Claude | polls the mailbox, writes each message to the seat's native inbox, publishes harness state | `st3 driver claude-mcp`, which Claude starts, hands inbox files to the TUI |
-| Codex | polls the mailbox and submits each message over its control connection to the app-server that the TUI also uses | none |
-| OpenCode | polls the mailbox and posts each message to the loopback server in the OpenCode TUI | none |
-| pi, omp | keeps presence and the terminal record | `st3 driver pi-channel` or `omp-channel`, which the extension starts, polls the mailbox and hands each message to the provider |
+| Claude | publishes harness state and subscribes to the seat record for PTY titles | `st driver claude-mcp`, started by the owned `st-channel@st` plugin, subscribes to the durable mailbox and proves native consumption from the bound user transcript |
+| Codex | subscribes to the mailbox and submits messages over its control connection to the app-server that the TUI also uses | none |
+| OpenCode | subscribes to the mailbox and posts messages to the loopback server in the OpenCode TUI | none |
+| pi, omp | keeps presence, the terminal record, and live PTY titles | `st driver pi-channel` or `omp-channel` subscribes to the mailbox; the managed extension preserves first-idle gating and reports native acceptance separately from turn-context consumption |
+
+New seats receive `ST3_MAILBOX_TRANSPORT=push`. Each delivery component connects to `/v1/mailbox`
+over the local daemon Unix socket. The stream first replays the durable graph mailbox and full seat
+record, then pushes changes. SQLite fences both subscriptions and receipts to the live runtime
+incarnation and replacement owner; reconnecting an older channel cannot retake ownership, including
+after a daemon restart. Socket loss creates no delivered or read receipt. Native ledgers retain
+uncertain handoffs, and successful handoffs retry lost receipt acknowledgements with stable IDs.
+No push component projects message bodies into `resources/inbox` or `resources/archive`.
+
+Already-running seats keep the legacy delivery path when their binary follows a deploy. The new
+transport starts at the next ordinary seat restart; deploys do not force providers to restart.
+The compatibility paths and legacy marketplace entry remain until operations has switched the
+seat declarations. New Claude declarations use `plugin:st-channel@st`, from `plugins/claude`.
+
+Seat updates carry `desired.display_name` and the member record, including the persona suffix.
+They update the PTY title and pi/omp session name on reconnect, `session_start`, and `session_switch`.
+Claude's status line reads the same graph authority on each render and chains the existing renderer.
+Native `/rename` is temporary: the next authority update restores the declared name.
 
 A long-lived process keeps executing the file it started from. Linux names that image
 `PATH (deleted)` once the file is replaced. Before this change the processes above kept talking to
@@ -59,8 +77,8 @@ session instead of ending it, and writes no terminal record. The next image adop
   running TUI. A Codex driver follows a replacement only once its thread is bound.
 
 The driver also carries its published timeline, its ready flag, and its delivery episode number, so
-the new image republishes nothing. The Claude channel carries the MCP handshake, the inbox files it
-already handed to Claude, and any partial request line. The pi-family channel carries its delivered
+the new image republishes nothing. The Claude channel carries the MCP handshake, stable identities
+for uncertain native handoffs, and any partial request line. The pi-family channel carries its delivered
 and failed messages, its unsent reports, and any partial frame; it skips the hello, because the
 extension already has its session context. Both channels read stdin on a thread that polls with a
 short timeout and is joined before the exec, so no byte they took from the pipe is lost.
@@ -70,7 +88,7 @@ and delivery runs before every other publish on each tick, so no observation can
 
 ## Reporting a stale path
 
-Every mailbox poll from a seat's delivery process carries a small report: the transport, the
+Each push subscription renews a small report, and legacy mailbox polls carry the same report: the transport, the
 process's PID, its running image, and for Claude the channel's PID, image, and the age of its last
 presence write. The daemon keeps the latest report for each recipient in memory. It is not graph
 state; a restarted daemon learns every live path again within a second.
@@ -78,19 +96,19 @@ state; a restarted daemon learns every live path again within a second.
 `st agents ls` and `st agents show` add a `delivery` object to each local native seat whose harness
 can take work:
 
-- `current`: a poll arrived in the last 45 seconds from a process running the daemon's own image,
+- `current`: a report arrived in the last 45 seconds from a process running the daemon's own image,
   and for Claude the channel reported in the last ten seconds from that image too. Pi-family
   channels must also have received the provider's idle proof and have no rejected handoff waiting;
 - `legacy`: a recent metadata-free mailbox poll came from this seat's native delivery process.
   The daemon identifies the Unix peer PID, native driver command and inherited seat identity;
   ordinary mailbox reads do not count. This proves polling, while binary version and readiness
   remain unverified;
-- `unknown`: the daemon started less than 20 seconds ago and the seat has not polled yet;
-- `stale`, with the reason: no poll since then, a poll from a replaced or unidentified binary, or a
+- `unknown`: the daemon started less than 20 seconds ago and the seat has not reported yet;
+- `stale`, with the reason: no report since then, a report from a replaced or unidentified binary, or a
   silent or replaced Claude channel.
 
 A stale seat shows as `waiting` instead of `running`, and `st agents show` prints the reason on its
-`DELIVERY` line. Remote seats carry no `delivery` object; only their own daemon can see their polls.
+`DELIVERY` line. Remote seats carry no `delivery` object; only their own daemon can see their reports.
 
 ## Deploys
 

@@ -1,0 +1,362 @@
+{
+  "started": "2026-10-01T09:04:16.758542+00:00",
+  "candidate_sha256": "2f49b98701f8e554220275cea350b27c2e6f62e8d788a8c0510b56fd008aa440",
+  "old_binary_sha256": "c594658a3b08daf82ca83da605a32bcc23f444414594b1b01ba8385f1d60180a",
+  "replacement_sha256": "2c79cdcbbdc8c70b4d1b18b0ad571f0548d9efae476fe90ddbb83348368a67a6",
+  "old_binary_resume_probe_exit_code": 2,
+  "old_binary_resume_probe_stdout": "",
+  "read_deadline_ms": 10000,
+  "observe_seconds": 25,
+  "short_seconds": 3,
+  "long_seconds": 120,
+  "agent_tokens": 0,
+  "judge_tokens": 0,
+  "cases": [
+    {
+      "case": "baseline",
+      "verdict": "pass",
+      "failures": [],
+      "message": "message/e93385ffc1f42c9a",
+      "fault_started_at_unix_ms": 1790845459953,
+      "fault_cleared_at_unix_ms": 1790845459968,
+      "fault_duration_ms": 15,
+      "first_request_after_clear_ms": 245,
+      "read_after_first_request_ms": 624,
+      "projected_message_files": 0,
+      "read_after_clear_ms": 869,
+      "received_copies": 1,
+      "graph_read_claims": 1,
+      "provider_starts": 1,
+      "expected_provider_starts": 1,
+      "provider_pids_before": [
+        2090714
+      ],
+      "provider_pids_after": [
+        2090714
+      ],
+      "incarnation_before": "2090592:2026-10-01T09:04:18.221Z",
+      "incarnation_after": "2090592:2026-10-01T09:04:18.221Z",
+      "delivery_after": {
+        "state": "current",
+        "reason": null,
+        "polled_seconds_ago": 0,
+        "transport": "omp-channel"
+      },
+      "sender_message_status": "closed",
+      "delivered_during_outage": false,
+      "read_receipt_matches_graph": true
+    },
+    {
+      "case": "daemon-restart",
+      "verdict": "pass",
+      "failures": [],
+      "message": "message/0313071323618f71",
+      "fault_started_at_unix_ms": 1790845490737,
+      "fault_cleared_at_unix_ms": 1790845493961,
+      "fault_duration_ms": 3224,
+      "first_request_after_clear_ms": 1679,
+      "read_after_first_request_ms": -9,
+      "projected_message_files": 0,
+      "read_after_clear_ms": 1670,
+      "received_copies": 1,
+      "graph_read_claims": 1,
+      "provider_starts": 1,
+      "expected_provider_starts": 1,
+      "provider_pids_before": [
+        2104470
+      ],
+      "provider_pids_after": [
+        2104470
+      ],
+      "incarnation_before": "2104143:2026-10-01T09:04:49.003Z",
+      "incarnation_after": "2104143:2026-10-01T09:04:49.003Z",
+      "delivery_after": {
+        "state": "current",
+        "reason": null,
+        "polled_seconds_ago": 0,
+        "transport": "omp-channel"
+      },
+      "sender_message_status": "closed",
+      "delivered_during_outage": false,
+      "read_receipt_matches_graph": true
+    },
+    {
+      "case": "binary-swap",
+      "verdict": "pass",
+      "failures": [],
+      "message": "message/bc3dd6a38bdf8c1c",
+      "fault_started_at_unix_ms": 1790845525568,
+      "fault_cleared_at_unix_ms": 1790845525971,
+      "fault_duration_ms": 403,
+      "first_request_after_clear_ms": 861,
+      "read_after_first_request_ms": 709,
+      "projected_message_files": 0,
+      "read_after_clear_ms": 1570,
+      "received_copies": 1,
+      "graph_read_claims": 1,
+      "provider_starts": 1,
+      "expected_provider_starts": 1,
+      "provider_pids_before": [
+        2112462
+      ],
+      "provider_pids_after": [
+        2112462
+      ],
+      "incarnation_before": "2111993:2026-10-01T09:05:23.731Z",
+      "incarnation_after": "2111993:2026-10-01T09:05:23.731Z",
+      "delivery_after": {
+        "state": "current",
+        "reason": null,
+        "polled_seconds_ago": 0,
+        "transport": "omp-channel"
+      },
+      "sender_message_status": "closed",
+      "delivered_during_outage": false,
+      "read_receipt_matches_graph": true
+    },
+    {
+      "case": "link-seconds",
+      "verdict": "pass",
+      "failures": [],
+      "message": "message/2805dccaf9d6075f",
+      "fault_started_at_unix_ms": 1790845585863,
+      "fault_cleared_at_unix_ms": 1790845588910,
+      "fault_duration_ms": 3047,
+      "first_request_after_clear_ms": 445,
+      "read_after_first_request_ms": 257,
+      "projected_message_files": 0,
+      "read_after_clear_ms": 702,
+      "received_copies": 1,
+      "graph_read_claims": 1,
+      "provider_starts": 1,
+      "expected_provider_starts": 1,
+      "provider_pids_before": [
+        2123124
+      ],
+      "provider_pids_after": [
+        2123124
+      ],
+      "incarnation_before": "2122879:2026-10-01T09:05:55.362Z",
+      "incarnation_after": "2122879:2026-10-01T09:05:55.362Z",
+      "delivery_after": {
+        "state": "current",
+        "reason": null,
+        "polled_seconds_ago": 0,
+        "transport": "omp-channel"
+      },
+      "sender_message_status": "closed",
+      "delivered_during_outage": false,
+      "read_receipt_matches_graph": true
+    },
+    {
+      "case": "link-minutes",
+      "verdict": "pass",
+      "failures": [],
+      "message": "message/2bb434fff879b12c",
+      "fault_started_at_unix_ms": 1790845621697,
+      "fault_cleared_at_unix_ms": 1790845741791,
+      "fault_duration_ms": 120094,
+      "first_request_after_clear_ms": 552,
+      "read_after_first_request_ms": 162,
+      "projected_message_files": 0,
+      "read_after_clear_ms": 714,
+      "received_copies": 1,
+      "graph_read_claims": 1,
+      "provider_starts": 1,
+      "expected_provider_starts": 1,
+      "provider_pids_before": [
+        2138432
+      ],
+      "provider_pids_after": [
+        2138432
+      ],
+      "incarnation_before": "2138195:2026-10-01T09:06:58.209Z",
+      "incarnation_after": "2138195:2026-10-01T09:06:58.209Z",
+      "delivery_after": {
+        "state": "current",
+        "reason": null,
+        "polled_seconds_ago": 0,
+        "transport": "omp-channel"
+      },
+      "sender_message_status": "closed",
+      "delivered_during_outage": false,
+      "read_receipt_matches_graph": true
+    },
+    {
+      "case": "receiver-down",
+      "verdict": "pass",
+      "failures": [],
+      "message": "message/72fecd2f9a06599d",
+      "fault_started_at_unix_ms": 1790845772658,
+      "fault_cleared_at_unix_ms": 1790845775998,
+      "fault_duration_ms": 3340,
+      "first_request_after_clear_ms": 1557,
+      "read_after_first_request_ms": -12,
+      "projected_message_files": 0,
+      "read_after_clear_ms": 1545,
+      "received_copies": 1,
+      "graph_read_claims": 1,
+      "provider_starts": 1,
+      "expected_provider_starts": 1,
+      "provider_pids_before": [
+        2184670
+      ],
+      "provider_pids_after": [
+        2184670
+      ],
+      "incarnation_before": "2184555:2026-10-01T09:09:30.923Z",
+      "incarnation_after": "2184555:2026-10-01T09:09:30.923Z",
+      "delivery_after": {
+        "state": "current",
+        "reason": null,
+        "polled_seconds_ago": 0,
+        "transport": "omp-channel"
+      },
+      "sender_message_status": "closed",
+      "delivered_during_outage": false,
+      "read_receipt_matches_graph": true
+    },
+    {
+      "case": "harness-restart",
+      "verdict": "pass",
+      "failures": [],
+      "message": "message/9de3e09106e91a80",
+      "fault_started_at_unix_ms": 1790845806795,
+      "fault_cleared_at_unix_ms": 1790845808111,
+      "fault_duration_ms": 1316,
+      "first_request_after_clear_ms": 16,
+      "read_after_first_request_ms": 1036,
+      "projected_message_files": 0,
+      "read_after_clear_ms": 1052,
+      "received_copies": 1,
+      "graph_read_claims": 1,
+      "provider_starts": 2,
+      "expected_provider_starts": 2,
+      "provider_pids_before": [
+        2198071
+      ],
+      "provider_pids_after": [
+        2198320
+      ],
+      "incarnation_before": "2197951:2026-10-01T09:10:05.040Z",
+      "incarnation_after": "2198277:2026-10-01T09:10:07.505Z",
+      "delivery_after": {
+        "state": "current",
+        "reason": null,
+        "polled_seconds_ago": 0,
+        "transport": "omp-channel"
+      },
+      "sender_message_status": "closed",
+      "delivered_during_outage": false,
+      "read_receipt_matches_graph": true
+    },
+    {
+      "case": "channel-killed",
+      "verdict": "pass",
+      "failures": [],
+      "message": "message/466ee3d4cb804174",
+      "fault_started_at_unix_ms": 1790845840500,
+      "fault_cleared_at_unix_ms": 1790845840580,
+      "fault_duration_ms": 80,
+      "first_request_after_clear_ms": 47,
+      "read_after_first_request_ms": 1443,
+      "projected_message_files": 0,
+      "read_after_clear_ms": 1490,
+      "received_copies": 1,
+      "graph_read_claims": 1,
+      "provider_starts": 1,
+      "expected_provider_starts": 1,
+      "provider_pids_before": [
+        2204546
+      ],
+      "provider_pids_after": [
+        2204546
+      ],
+      "incarnation_before": "2204303:2026-10-01T09:10:37.507Z",
+      "incarnation_after": "2204303:2026-10-01T09:10:37.507Z",
+      "delivery_after": {
+        "state": "current",
+        "reason": null,
+        "polled_seconds_ago": 0,
+        "transport": "omp-channel"
+      },
+      "sender_message_status": "closed",
+      "delivered_during_outage": false,
+      "read_receipt_matches_graph": true
+    },
+    {
+      "case": "old-channel",
+      "verdict": "pass",
+      "failures": [],
+      "message": "message/2e4cfb014332a962",
+      "fault_started_at_unix_ms": 1790845873270,
+      "fault_cleared_at_unix_ms": 1790845873802,
+      "fault_duration_ms": 532,
+      "first_request_after_clear_ms": 817,
+      "read_after_first_request_ms": 1308,
+      "projected_message_files": 0,
+      "read_after_clear_ms": 2125,
+      "received_copies": 1,
+      "graph_read_claims": 1,
+      "provider_starts": 1,
+      "expected_provider_starts": 1,
+      "provider_pids_before": [
+        2216353
+      ],
+      "provider_pids_after": [
+        2216353
+      ],
+      "incarnation_before": "2216125:2026-10-01T09:11:10.111Z",
+      "incarnation_after": "2216125:2026-10-01T09:11:10.111Z",
+      "delivery_after": {
+        "state": "legacy",
+        "reason": "a legacy delivery process (pid 2219930) is polling; its binary and readiness are not reported",
+        "polled_seconds_ago": 14,
+        "transport": "omp-channel"
+      },
+      "sender_message_status": "closed",
+      "delivered_during_outage": false,
+      "read_receipt_matches_graph": true
+    },
+    {
+      "case": "handoff-failed",
+      "verdict": "pass",
+      "failures": [],
+      "failed_path_visible": true,
+      "failed_doctor_visible": true,
+      "failed_sender_visible": true,
+      "message": "message/fbea8040e9847add",
+      "fault_started_at_unix_ms": 1790845906183,
+      "fault_cleared_at_unix_ms": 1790845917317,
+      "fault_duration_ms": 11134,
+      "first_request_after_clear_ms": 5739,
+      "read_after_first_request_ms": -17,
+      "projected_message_files": 0,
+      "read_after_clear_ms": 5722,
+      "received_copies": 1,
+      "graph_read_claims": 1,
+      "provider_starts": 1,
+      "expected_provider_starts": 1,
+      "provider_pids_before": [
+        2224535
+      ],
+      "provider_pids_after": [
+        2224535
+      ],
+      "incarnation_before": "2224300:2026-10-01T09:11:43.110Z",
+      "incarnation_after": "2224300:2026-10-01T09:11:43.110Z",
+      "delivery_after": {
+        "state": "current",
+        "reason": null,
+        "polled_seconds_ago": 0,
+        "transport": "omp-channel"
+      },
+      "sender_message_status": "closed",
+      "delivered_during_outage": false,
+      "read_receipt_matches_graph": true
+    }
+  ],
+  "verdict": "pass",
+  "ended": "2026-10-01T09:12:25.487345+00:00",
+  "duration_seconds": 488.728803
+}

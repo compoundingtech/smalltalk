@@ -61,7 +61,8 @@ wire frames alone never count as consumption. It writes every native handoff bef
 an API outage using stable idempotency keys. The oracle requires exactly one native
 handoff, one authoritative graph read within ten seconds of clearing, convergence
 of the read receipt back to the sender, and no unexpected provider replacement.
-It observes a fixed 25-second tail after clearing, even when the first read is fast,
+The runner also counts message files below inbox/archive directories in the private receiver state;
+any projection fails the no-files gate. It observes a fixed 25-second tail after clearing, even when the first read is fast,
 to catch duplicates and to outlast the delivery report's 20-second startup grace.
 Duplicates after that bounded observation window are not covered.
 
@@ -104,3 +105,23 @@ Set `ST3_MESSAGING_COMPAT_BIN` to use an already built historical executable.
 `ST3_MESSAGING_FAULTS_EVIDENCE` can select a new evidence directory for a local run;
 on failure the default temporary evidence directory is retained. CI also retains
 successful normalized evidence under its checkout's `target/messaging-faults/run-*/evidence/`.
+
+The daemon push implementation's ten-case evidence is in
+[evidence/2026-10-01-push/result.json](evidence/2026-10-01-push/result.json).
+All cases passed with no projected inbox/archive messages. Native Codex/OpenCode ledger tests,
+Claude transcript/uncertainty tests, and both owned extension smoke tests cover the other no-files
+boundaries, current-session receipt fencing and replacement reconnects. The Unix stream test
+commits a native receipt then discards the HTTP acknowledgement; its retry returns the same claim.
+
+The real OMP 18.4.4 title bakeoff is reproducible without prompts, credentials or model calls:
+
+```sh
+python3 scripts/st3-omp-labels-eval/run /path/to/omp-18.4.4 \
+  crates/st3/hooks/omp-channel.ts /tmp/omp-labels-result.json
+```
+
+It uses an isolated profile and a loopback-only dummy model. The actual extension receives full
+seat-record frames from a fixture channel, while the real provider exercises new-session,
+in-process resume and cold resume. It also verifies a temporary native rename is replaced by the
+next authority update, including the seat's persona suffix. Results are in
+[evidence/2026-10-01-push/omp-18.4.4-labels.json](evidence/2026-10-01-push/omp-18.4.4-labels.json).

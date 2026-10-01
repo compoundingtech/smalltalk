@@ -834,6 +834,8 @@
           } ''
             cp -R ${self}/crates/st-drivers/hooks hooks
             chmod -R u+w hooks
+            cp ${self}/crates/st3/hooks/pi-channel.ts hooks/st-pi-channel.ts
+            cp ${self}/crates/st3/hooks/omp-channel.ts hooks/st-omp-channel.ts
 
             modules=hooks/typecheck/node_modules
             mkdir -p "$modules/@earendil-works/pi-coding-agent" "$modules/@types/node"
@@ -847,6 +849,8 @@
             test -f hooks/omp-channel.ts
             grep -q '@earendil-works/pi-coding-agent' hooks/omp-channel.ts
 
+            tsc --noEmit -p hooks/typecheck/tsconfig.json
+            sed -i 's#"../omp-channel.ts"#"../omp-channel.ts", "../st-pi-channel.ts", "../st-omp-channel.ts"#' hooks/typecheck/tsconfig.json
             tsc --noEmit -p hooks/typecheck/tsconfig.json
 
             # Runtime smoke: the type gate is provably blind to execution-order defects (a TDZ
@@ -870,6 +874,12 @@
               --format=esm --platform=node --target=es2022 \
               --outfile=hooks/typecheck/smoke-out/omp-channel.mjs
             ${pkgs.nodejs}/bin/node hooks/typecheck/omp-smoke.mjs
+            for harness in pi omp; do
+              ${pkgs.esbuild}/bin/esbuild hooks/st-$harness-channel.ts \
+                --format=esm --platform=node --target=es2022 \
+                --outfile=hooks/typecheck/smoke-out/st-$harness-channel.mjs
+              ${pkgs.nodejs}/bin/node hooks/typecheck/st-smoke.mjs $harness hooks/typecheck/smoke-out/st-$harness-channel.mjs
+            done
             touch $out
           '';
 

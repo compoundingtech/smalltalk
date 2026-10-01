@@ -1,0 +1,160 @@
+{
+  "status": "warn",
+  "checks": [
+    {
+      "name": "claim-store",
+      "status": "pass",
+      "message": "the claim store is readable at index 20"
+    },
+    {
+      "name": "operation-projection",
+      "status": "pass",
+      "message": "the operation projection matches the claim log"
+    },
+    {
+      "name": "operational-repair",
+      "status": "pass",
+      "message": "the graph has no repairable operational contradictions"
+    },
+    {
+      "name": "state-directory",
+      "status": "pass",
+      "message": "<eval-root>/cobalt/state is a writable directory"
+    },
+    {
+      "name": "disk-space",
+      "status": "pass",
+      "message": "6.8 GiB of 31.2 GiB free (21.9%) on the filesystem of <eval-root>/cobalt/state"
+    },
+    {
+      "name": "pty-runtime",
+      "status": "pass",
+      "message": "the PTY runtime returned 1 sessions"
+    },
+    {
+      "name": "process-isolation",
+      "status": "pass",
+      "message": "Linux tasks use transient systemd user scopes"
+    },
+    {
+      "name": "runtime-ownership",
+      "status": "pass",
+      "message": "each desired member has a unique runtime ID"
+    },
+    {
+      "name": "claude-hooks",
+      "status": "pass",
+      "message": "no Claude seat runs on this host"
+    },
+    {
+      "name": "graph-references",
+      "status": "pass",
+      "message": "every reference in the ready missions, declarations and active runs resolves"
+    },
+    {
+      "name": "runtime-drift",
+      "status": "pass",
+      "message": "the runtime has no unowned live sessions or indeterminate records"
+    },
+    {
+      "name": "driver-readiness",
+      "status": "pass",
+      "message": "all desired native drivers have a ready current harness incarnation"
+    },
+    {
+      "name": "replication",
+      "status": "pass",
+      "message": "20 envelopes; 0 unresolved records; 0 unhealthy projections; peers amber=up"
+    },
+    {
+      "name": "command-recorder",
+      "status": "pass",
+      "message": "git and gh calls are recorded in <eval-root>/cobalt/state/recorder/commands.jsonl; a call by absolute path is not"
+    },
+    {
+      "name": "message-delivery",
+      "status": "warn",
+      "message": "agent/eval/fault-probe: the provider rejected a native handoff; the channel keeps retrying; 1 current-seat messages older than 10s lack a recipient graph read receipt (0 accepted native handoffs); this does not prove that a legacy channel failed to consume them. Inspect `st conversations status MESSAGE`"
+    },
+    {
+      "name": "attention-age",
+      "status": "pass",
+      "message": "no attention item has been open for more than a day"
+    },
+    {
+      "name": "build-tools",
+      "status": "warn",
+      "message": "a small crate did not link: cargo build exit status: 1: error: rustup could not choose a version of cargo to run, because one wasn't specified explicitly, and no default is configured. | help: run 'rustup default stable' to download the latest stable release of Rust and set it as your default toolchain.; install what is missing, or export its directory from the account's shell startup files"
+    },
+    {
+      "name": "daemon-environment",
+      "status": "pass",
+      "message": "account interactive login shell; refreshed on use every 60 seconds; PATH=<eval-root>/cobalt/bin:<home>/.local/bin:<home>/bin:<home>/.cargo/bin:/usr/local/go/bin:<home>/go/bin:<home>/.nvm/versions/node/v24.18.0/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-path:<home>/.codex/tmp/arg0/codex-arg0JJpo7a:<home>/.local/state/st3/recorder/bin:<home>/.local/bin:<home>/bin:<home>/.nvm/versions/node/v24.18.0/bin:<home>/.deno/bin:<home>/.cargo/bin:/usr/local/go/bin:<home>/go/bin:<home>/.nix-profile/bin:/nix/var/nix/profiles/default/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/usr/games:/usr/local/games:/snap/bin:/snap/bin:<home>/.local/bin"
+    },
+    {
+      "name": "priority",
+      "status": "warn",
+      "message": "the daemon runs in st3-fleet.smalltalk.daemon-deli.4a1f55fb67a22a8e3c97-3649545-1.scope, outside a service unit; `st service install` runs it at weight 1000"
+    },
+    {
+      "name": "github-observer-auth",
+      "status": "warn",
+      "message": "GitHub observers have no token; run `gh auth login` as the daemon account or export GH_TOKEN/GITHUB_TOKEN in that account's login-shell startup files. Check the daemon PATH with `st doctor`. No anonymous request was sent; authentication is checked again on the next poll."
+    },
+    {
+      "name": "request-latency//v1/internal/fleet/membership",
+      "status": "pass",
+      "message": "18 requests; recent p50 0 ms, p99 23 ms, max 23 ms"
+    },
+    {
+      "name": "request-latency//v1/messages/{message_id}/claims",
+      "status": "pass",
+      "message": "3 requests; recent p50 7 ms, p99 22 ms, max 22 ms"
+    },
+    {
+      "name": "request-latency//v1/status",
+      "status": "pass",
+      "message": "2 requests; recent p50 3 ms, p99 15 ms, max 15 ms"
+    },
+    {
+      "name": "request-latency//v1/internal/replication/export",
+      "status": "pass",
+      "message": "31 requests; recent p50 8 ms, p99 14 ms, max 14 ms"
+    },
+    {
+      "name": "request-latency//v1/internal/replication/receive",
+      "status": "pass",
+      "message": "14 requests; recent p50 2 ms, p99 11 ms, max 11 ms"
+    },
+    {
+      "name": "request-latency//v1/internal/replication-wake",
+      "status": "pass",
+      "message": "4 requests; recent p50 2 ms, p99 10 ms, max 10 ms"
+    },
+    {
+      "name": "request-latency//v1/mailbox/receipts",
+      "status": "pass",
+      "message": "3 requests; recent p50 4 ms, p99 10 ms, max 10 ms"
+    },
+    {
+      "name": "request-latency//v1/claims",
+      "status": "pass",
+      "message": "3 requests; recent p50 4 ms, p99 8 ms, max 8 ms"
+    },
+    {
+      "name": "request-latency//v1/intent/apply",
+      "status": "pass",
+      "message": "1 requests; recent p50 7 ms, p99 7 ms, max 7 ms"
+    },
+    {
+      "name": "request-latency//v1/client/agents/{*id}",
+      "status": "pass",
+      "message": "12 requests; recent p50 1 ms, p99 6 ms, max 6 ms"
+    },
+    {
+      "name": "github-budget",
+      "status": "pass",
+      "message": "this daemon has sent no GitHub request since it started"
+    }
+  ]
+}

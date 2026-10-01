@@ -493,6 +493,14 @@ WHERE lease_owner IS NOT NULL;
 -- The steps that have not finished, a few of every step a fleet has run.
 CREATE INDEX IF NOT EXISTS step_runs_open_index ON step_runs(created_at_unix_ms, step_path)
 WHERE status NOT IN ('completed','failed','cancelled');
+-- This daemon's native subscription ownership is transport state, outside shared projections.
+CREATE TABLE IF NOT EXISTS local_mailbox_owners (
+    subject TEXT NOT NULL,
+    component TEXT NOT NULL,
+    incarnation TEXT NOT NULL,
+    epoch INTEGER NOT NULL,
+    PRIMARY KEY(subject, component)
+);
 CREATE TABLE IF NOT EXISTS local_work_lease_renewals (
     subject TEXT PRIMARY KEY,
     attempt INTEGER NOT NULL,
@@ -8953,6 +8961,23 @@ impl Store {
         &self,
         input: &ClaimInput,
     ) -> Result<(ClaimRecord, bool), St3Error> {
+        self.append_claim_fenced_outcome(input, None)
+    }
+
+    pub(crate) fn append_mailbox_receipt(
+        &self,
+        input: &ClaimInput,
+        fence: &crate::mailbox::Fence,
+    ) -> Result<ClaimRecord, St3Error> {
+        self.append_claim_fenced_outcome(input, Some(fence))
+            .map(|(claim, _)| claim)
+    }
+
+    fn append_claim_fenced_outcome(
+        &self,
+        input: &ClaimInput,
+        fence: Option<&crate::mailbox::Fence>,
+    ) -> Result<(ClaimRecord, bool), St3Error> {
         self.validate_claim_input(input)?;
         if local_retention(&input.kind)
             || (input.actor.is_none() && system_local_retention(&input.kind))
@@ -8967,6 +8992,19 @@ impl Store {
         // batch commits.
         self.connection
             .batched(|transaction| -> Result<(ClaimRecord, bool), St3Error> {
+                let settled_receipt = if let Some(fence) = fence {
+                    check_mailbox_fence(transaction, fence)?;
+                    let index = transaction.query_row(
+                        "SELECT MIN(store_index) FROM claims WHERE subject=?1 AND subject LIKE 'message/%'",
+                        [&input.subject], |row| row.get::<_, Option<u64>>(0),
+                    ).map_err(internal)?.ok_or_else(|| St3Error::new("missing-message", "message does not exist"))?;
+                    let message = message_view_tx(transaction, &input.subject, index).map_err(internal)?;
+                    if message.to != fence.subject || input.actor.as_deref() != Some(&fence.subject) {
+                        return Err(St3Error::new("wrong-message-recipient", "receipt belongs to another seat"));
+                    }
+                    matches!((input.kind.as_str(), message.status.as_str()),
+                        ("message.delivered", "read" | "closed") | ("message.read", "closed"))
+                } else { false };
                 if let Some((operation_id, request_digest)) = &operation
                     && let Some((stored_digest, canonical_claim, state)) =
                         operation_tx(transaction, operation_id).map_err(internal)?
@@ -9038,7 +9076,7 @@ impl Store {
                     );
                     stored_fields = Some(fields);
                 }
-                if validate_message_transition(transaction, input)? {
+                if settled_receipt || validate_message_transition(transaction, input)? {
                     let latest_id = latest_claim_id_tx(transaction, &input.subject)
                         .map_err(internal)?
                         .ok_or_else(|| {
@@ -13486,6 +13524,33 @@ impl Store {
         }
         cache.insert(subject.to_owned(), (newest, value.clone()));
         Ok(value)
+    }
+
+    /// Local subscription ownership survives a daemon outage; an older channel cannot retake it.
+    pub(crate) fn bind_mailbox(&self, fence: &crate::mailbox::Fence) -> Result<(), St3Error> {
+        let mut connection = self.connection.write();
+        let tx = connection.transaction().map_err(internal)?;
+        check_mailbox_incarnation(&tx, fence)?;
+        let existing: Option<(String, u64)> = tx.query_row(
+            "SELECT incarnation, epoch FROM local_mailbox_owners WHERE subject=?1 AND component=?2",
+            params![fence.subject, fence.component], |r| Ok((r.get(0)?, r.get(1)?)),
+        ).optional().map_err(internal)?;
+        if existing.is_some_and(|(incarnation, epoch)| {
+            incarnation == fence.incarnation && epoch > fence.epoch
+        }) {
+            return Err(St3Error::new(
+                "stale-mailbox-session",
+                "a newer channel owns this seat",
+            ));
+        }
+        tx.execute("INSERT INTO local_mailbox_owners VALUES (?1,?2,?3,?4)
+            ON CONFLICT(subject,component) DO UPDATE SET incarnation=excluded.incarnation, epoch=excluded.epoch",
+            params![fence.subject, fence.component, fence.incarnation, fence.epoch]).map_err(internal)?;
+        tx.commit().map_err(internal)
+    }
+
+    pub(crate) fn check_mailbox(&self, fence: &crate::mailbox::Fence) -> Result<(), St3Error> {
+        check_mailbox_fence(&self.readers.get(), fence)
     }
 
     pub fn current_harness(
@@ -19651,6 +19716,42 @@ fn newest_claims_of_kind_query(columns: &str, kind: &str) -> String {
          WHERE claims.subject=?1 AND claims.kind='{kind}' AND +claims.store_index<=?2
          ORDER BY {CANONICAL_ORDER_DESC}"
     )
+}
+
+fn check_mailbox_incarnation(
+    connection: &Connection,
+    fence: &crate::mailbox::Fence,
+) -> Result<(), St3Error> {
+    let harness = current_harness_at(connection, &fence.subject, None).map_err(internal)?;
+    if !harness.is_some_and(|h| h.incarnation_id == fence.incarnation && h.state != "ended") {
+        return Err(St3Error::new(
+            "stale-mailbox-session",
+            "this is not the seat's live incarnation",
+        ));
+    }
+    Ok(())
+}
+
+fn check_mailbox_fence(
+    connection: &Connection,
+    fence: &crate::mailbox::Fence,
+) -> Result<(), St3Error> {
+    check_mailbox_incarnation(connection, fence)?;
+    let owner: Option<(String, u64)> = connection
+        .query_row(
+            "SELECT incarnation, epoch FROM local_mailbox_owners WHERE subject=?1 AND component=?2",
+            params![fence.subject, fence.component],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()
+        .map_err(internal)?;
+    if owner != Some((fence.incarnation.clone(), fence.epoch)) {
+        return Err(St3Error::new(
+            "stale-mailbox-session",
+            "a newer channel owns this seat",
+        ));
+    }
+    Ok(())
 }
 
 fn current_harness_at(

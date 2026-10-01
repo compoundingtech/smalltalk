@@ -422,6 +422,29 @@ impl Client {
         proxy_stream_with_io(&name, initial, Some(reconnect), io).await
     }
 
+    pub async fn open_mailbox(
+        &self,
+        fence: &crate::mailbox::Fence,
+    ) -> Result<tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>> {
+        let Endpoint::Unix(path) = &self.endpoint else {
+            anyhow::bail!("native mailbox subscriptions require a local Unix socket");
+        };
+        let stream = tokio::net::UnixStream::connect(path).await?;
+        let url = format!(
+            "ws://localhost/v1/mailbox?subject={}&incarnation={}&component={}&epoch={}",
+            urlencoding::encode(&fence.subject),
+            urlencoding::encode(&fence.incarnation),
+            urlencoding::encode(&fence.component),
+            fence.epoch
+        );
+        let (socket, _) = tokio::time::timeout(
+            self.deadlines.terminal_handshake,
+            tokio_tungstenite::client_async(url, stream),
+        )
+        .await??;
+        Ok(socket)
+    }
+
     async fn open_terminal_bridge(&self, path: &str) -> Result<StdUnixStream> {
         match &self.endpoint {
             Endpoint::Unix(socket) => {

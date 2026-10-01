@@ -1,0 +1,86 @@
+[
+  {
+    "at_unix_ms": 1790845556416,
+    "pid": 2123124,
+    "event": "started"
+  },
+  {
+    "at_unix_ms": 1790845556518,
+    "pid": 2123124,
+    "event": "ready"
+  },
+  {
+    "at_unix_ms": 1790845556557,
+    "pid": 2123124,
+    "event": "seat-title",
+    "label": "eval/fault-probe"
+  },
+  {
+    "at_unix_ms": 1790845585536,
+    "pid": 2123124,
+    "event": "wire-frame",
+    "subject": "message/b0e9568205fe5cb4"
+  },
+  {
+    "at_unix_ms": 1790845585537,
+    "pid": 2123124,
+    "event": "received",
+    "subject": "message/b0e9568205fe5cb4",
+    "content": "<smalltalk-message id=\"b0e9568205fe5cb4\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: warmup\" sha256=\"e85b9de3409462372d2932f39e5d0e5008c84c2215203596c80b74bb20ebb9ca\" graph=\"message/b0e9568205fe5cb4\">\nreceipt-token:warmup\n</smalltalk-message>"
+  },
+  {
+    "at_unix_ms": 1790845585695,
+    "pid": 2123124,
+    "event": "delivered",
+    "subject": "message/b0e9568205fe5cb4",
+    "accepted_at_unix_ms": 1790845585566
+  },
+  {
+    "at_unix_ms": 1790845585722,
+    "pid": 2123124,
+    "event": "read",
+    "subject": "message/b0e9568205fe5cb4",
+    "accepted_at_unix_ms": 1790845585713
+  },
+  {
+    "at_unix_ms": 1790845585732,
+    "pid": 2123124,
+    "event": "closed",
+    "subject": "message/b0e9568205fe5cb4",
+    "accepted_at_unix_ms": 1790845585724
+  },
+  {
+    "at_unix_ms": 1790845589537,
+    "pid": 2123124,
+    "event": "wire-frame",
+    "subject": "message/2805dccaf9d6075f"
+  },
+  {
+    "at_unix_ms": 1790845589537,
+    "pid": 2123124,
+    "event": "received",
+    "subject": "message/2805dccaf9d6075f",
+    "content": "<smalltalk-message id=\"2805dccaf9d6075f\" from=\"person/eval\" to=\"agent/eval/fault-probe\" subject=\"Fault probe: link-seconds\" sha256=\"6bb75282de05b047fb03a965b364ce486e3286f9daf406fe508945d786acd0c5\" graph=\"message/2805dccaf9d6075f\">\nreceipt-token:link-seconds\n</smalltalk-message>"
+  },
+  {
+    "at_unix_ms": 1790845589594,
+    "pid": 2123124,
+    "event": "delivered",
+    "subject": "message/2805dccaf9d6075f",
+    "accepted_at_unix_ms": 1790845589590
+  },
+  {
+    "at_unix_ms": 1790845589618,
+    "pid": 2123124,
+    "event": "read",
+    "subject": "message/2805dccaf9d6075f",
+    "accepted_at_unix_ms": 1790845589612
+  },
+  {
+    "at_unix_ms": 1790845589628,
+    "pid": 2123124,
+    "event": "closed",
+    "subject": "message/2805dccaf9d6075f",
+    "accepted_at_unix_ms": 1790845589621
+  }
+]

@@ -8369,7 +8369,7 @@ fn agent_start_document(args: &AgentStartArgs) -> Result<String> {
 
 /// The Claude settings the fleet's Claude seats run with: st's own channel plugin on, and the
 /// plugins st2's marketplace shipped off.
-const CLAUDE_SEAT_SETTINGS: &str = r#"{"enabledPlugins":{"st2-channel@st2":false,"st3-channel@st2":false,"st3-channel@st3":true}}"#;
+const CLAUDE_SEAT_SETTINGS: &str = r#"{"enabledPlugins":{"st2-channel@st2":false,"st3-channel@st2":false,"st3-channel@st3":false,"st-channel@st":true}}"#;
 
 /// The declaration `st agents new` publishes: what a person writes by hand for a fleet seat.
 /// Claude and Codex seats get the harness defaults the fleet's existing seats run with.
@@ -11519,7 +11519,20 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
             .subject
             .as_deref()
             .context("the Claude channel has no subject")?;
-        let (catalog, _agent_dir, identity, _runtime_id) = prepare_native_driver(subject)?;
+        let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
+        if push_mailbox_enabled() {
+            let incarnation = wait_for_agent_incarnation(client, subject).await?;
+            return st3::claude_channel::run(
+                client,
+                subject,
+                &incarnation,
+                &catalog,
+                &agent_dir,
+                &identity,
+                &runtime_id,
+            )
+            .await;
+        }
         return st_drivers::claude_mcp::run_st3(&catalog, &identity);
     }
     if matches!(args.driver.as_str(), "pi-channel" | "omp-channel") {
@@ -11706,6 +11719,9 @@ fn spawn_st2_provider(
     use st_drivers::provider_session::DetachedSession;
     let paths = paths.clone();
     let driver = driver.to_owned();
+    if push_mailbox_enabled() && driver == "opencode" {
+        st_drivers::push_mailbox::register(&paths.agent_dir);
+    }
     tokio::task::spawn_blocking(move || match start {
         ProviderStart::Launch(argv) => match driver.as_str() {
             "claude" => st_drivers::claude_session::run_controlled_paths(
@@ -11791,6 +11807,8 @@ struct NativeLoopState {
     predecessor_harness_record: Option<Vec<u8>>,
     published_timeline: BTreeSet<String>,
     delivery_episode: u64,
+    #[serde(default)]
+    mailbox_fence: Option<st3::mailbox::Fence>,
 }
 
 /// What a native driver hands its next image across `execve`.
@@ -11974,12 +11992,12 @@ async fn drive_st2_native(
         identity,
         runtime_id,
     } = paths.clone();
+    let mut mailbox = NativeMailbox::start(client, subject, &incarnation, driver, &mut loop_state);
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
-    // Mailbox projection reads the durable message history. A one-second poll
-    // bounds delivery latency without repeatedly walking it four times a
-    // second for every native harness during idle periods.
+    // This tick retries receipts and native handoffs. Push delivery reads its cached mailbox;
+    // only an already-running legacy seat still polls durable history.
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut work_interval = tokio::time::interval(std::time::Duration::from_secs(1));
@@ -11994,6 +12012,9 @@ async fn drive_st2_native(
     let mut binding_watch = ClaudeBindingWatch::default();
     loop {
         tokio::select! {
+            frame = mailbox.recv() => {
+                mailbox.accept(frame, &runtime_id)?;
+            }
             result = &mut task => {
                 let outcome = result?;
                 if let Some(session) = detached_session(&outcome) {
@@ -12084,6 +12105,14 @@ async fn drive_st2_native(
                 }
                 // Delivery runs first and on its own: a failing observation publish must never
                 // hold back a message.
+                if mailbox.subscription.is_some() {
+                    if driver == "opencode" {
+                        if let Err(error) = mailbox.pump(client, &agent_dir,
+                            NativeDeliveryReceipts::OpenCode { catalog_root: &catalog, identity: &identity, runtime_id: &runtime_id }).await {
+                            note_driver_tick_failure(subject, error, &mut last_control_warning);
+                        }
+                    }
+                } else {
                 if driver == "claude" {
                     delivery.report = Some(native_delivery_report("claude-channel", Some(&agent_dir)));
                     supervise_native_delivery(
@@ -12117,6 +12146,7 @@ async fn drive_st2_native(
                         &mut delivery,
                     )
                     .await;
+                }
                 }
                 let tick: Result<()> = async {
                     if native_file_may_override_channel(driver)
@@ -12849,7 +12879,7 @@ async fn run_pi_channel(
                         "{}\n",
                         serde_json::to_string(&json!({
                             "type": "hello",
-                            "protocol": 1,
+                            "protocol": if push_mailbox_enabled() { 2 } else { 1 },
                             "identity": identity,
                             "sessionContext": session_context,
                         }))?
@@ -12860,8 +12890,16 @@ async fn run_pi_channel(
             stdout.flush().await?;
             PiChannelResume {
                 incarnation,
-                session: std::env::var("ST2_PI_CHANNEL_SESSION")
-                    .unwrap_or_else(|_| "unknown".into()),
+                session: std::env::var(if push_mailbox_enabled() {
+                    if driver == "omp" {
+                        "ST_OMP_CHANNEL_SESSION"
+                    } else {
+                        "ST_PI_CHANNEL_SESSION"
+                    }
+                } else {
+                    "ST2_PI_CHANNEL_SESSION"
+                })
+                .unwrap_or_else(|_| "unknown".into()),
                 ..PiChannelResume::default()
             }
         }
@@ -12869,6 +12907,16 @@ async fn run_pi_channel(
     let incarnation = state.incarnation.clone();
     let session = state.session.clone();
     let transport = format!("{driver}-channel");
+    if push_mailbox_enabled() && state.pending.fence.is_none() {
+        state.pending.fence = Some(st3::mailbox::Fence::new(subject, &incarnation, "delivery"));
+    }
+    let mut subscription = state.pending.fence.as_ref().map(|fence| {
+        let mut report: Value =
+            serde_json::from_str(&native_delivery_report(&transport, None)).unwrap_or_default();
+        report["ready"] = json!(state.first_idle_seen && state.failed_handoffs.is_empty());
+        st3::mailbox::Subscription::start(client.clone(), fence.clone(), report)
+    });
+    let mut pushed_messages: Vec<MessageView> = Vec::new();
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
     let spawn_reader = |sender: tokio::sync::mpsc::UnboundedSender<st_drivers::reexec::StdinChunk>| {
         st_drivers::reexec::StdinReader::spawn(move |chunk| sender.send(chunk).is_ok())
@@ -12883,6 +12931,28 @@ async fn run_pi_channel(
     let mut renewed_minute = None;
     loop {
         tokio::select! {
+            frame = async { match &mut subscription {
+                Some(subscription) => subscription.receiver.recv().await,
+                None => std::future::pending().await,
+            }} => {
+                match frame {
+                    Some(st3::mailbox::Frame::Mailbox { messages }) => {
+                        let active: BTreeSet<_> = messages.iter().map(|message| message.subject.clone()).collect();
+                        state.delivered.retain(|message| active.contains(message));
+                        state.failed_handoffs.retain(|message, _| active.contains(message));
+                        state.retry_after_ms.retain(|message, _| active.contains(message));
+                        state.failed_diagnostics.retain(|message| active.contains(message));
+                        pushed_messages = messages;
+                    },
+                    Some(st3::mailbox::Frame::Seat { seat }) => {
+                        let frame = json!({"type":"seat", "seat":seat});
+                        stdout.write_all(format!("{}\n", serde_json::to_string(&frame)?).as_bytes()).await?;
+                        stdout.flush().await?;
+                    },
+                    Some(st3::mailbox::Frame::Fenced { reason }) => anyhow::bail!("{reason}"),
+                    None => return Ok(()),
+                }
+            }
             chunk = input_rx.recv() => {
                 let mut publish = false;
                 match chunk {
@@ -12949,16 +13019,17 @@ async fn run_pi_channel(
                 // A recipient can read or close a failed handoff through another native
                 // path. Its authoritative receipt settles that retry and its health warning.
                 for message in state.failed_handoffs.keys().cloned().collect::<Vec<_>>() {
-                    if let Ok(view) = read_message(client, &message).await
-                        && matches!(view.status.as_str(), "delivered" | "read" | "closed") {
+                    let view = if subscription.is_some() {
+                        pushed_messages.iter().find(|view| view.subject == message).cloned()
+                    } else { read_message(client, &message).await.ok() };
+                    if view.is_some_and(|view| matches!(view.status.as_str(), "delivered" | "read" | "closed")) {
                         state.failed_handoffs.remove(&message);
                         state.retry_after_ms.remove(&message);
                         state.failed_diagnostics.remove(&message);
                     }
                 }
-                // The first page is polled on every tick, before the first idle too: the poll
-                // carries this channel's delivery report, which is how the daemon knows the
-                // seat's delivery path is live and current.
+                // A push report renews over the subscription even before the first idle proof.
+                // Legacy channels attach the same report to their first mailbox page.
                 let mut report: Value = serde_json::from_str(&native_delivery_report(&transport, None))?;
                 report["ready"] = json!(state.first_idle_seen && state.failed_handoffs.is_empty());
                 if !state.first_idle_seen {
@@ -12967,9 +13038,15 @@ async fn run_pi_channel(
                     report["reason"] = json!("the provider rejected a native handoff; the channel keeps retrying");
                 }
                 let report = report.to_string();
+                if let Some(subscription) = &subscription {
+                    subscription.report(serde_json::from_str(&report)?);
+                }
                 let mut cursor = None;
                 loop {
-                    let page = match message_page_reporting(
+                    let page = if subscription.is_some() {
+                        MessagePage { items: pushed_messages.clone(), has_more: false, next_cursor: None, limit: pushed_messages.len() }
+                    } else {
+                    match message_page_reporting(
                         client,
                         Some(subject),
                         false,
@@ -12980,6 +13057,7 @@ async fn run_pi_channel(
                     {
                         Ok(page) => page,
                         Err(error) => { warn_pi_channel(subject, &error, &mut last_warning); break; }
+                    }
                     };
                     if !state.first_idle_seen {
                         break;
@@ -13001,7 +13079,11 @@ async fn run_pi_channel(
                         }
                     };
                     if message.status == "sent" {
-                        match stage_pi_family_message(client, &message.subject, subject, driver).await {
+                        let staged = match &state.pending.fence {
+                            Some(fence) => mailbox_receipt(client, fence, &message.subject, "staged").await.map(|_| true),
+                            None => stage_pi_family_message(client, &message.subject, subject, driver).await,
+                        };
+                        match staged {
                             Ok(true) => {},
                             Ok(false) => { state.delivered.remove(&message.subject); continue; },
                             Err(error) => {
@@ -13147,6 +13229,14 @@ impl PiChannelResume {
                 self.pending.acknowledgements.insert(message.to_owned());
                 true
             }
+            Some("read") => {
+                let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else {
+                    return false;
+                };
+                self.pending.acknowledgements.insert(message.into());
+                self.pending.reads.insert(message.into());
+                true
+            }
             Some("failed") => {
                 let Some(message) = frame.pointer("/meta/messageId").and_then(Value::as_str) else {
                     return false;
@@ -13198,6 +13288,10 @@ struct PiFamilyReports {
     /// Only the latest state matters; a newer frame replaces an unsent older one.
     state: Option<(String, u64)>,
     acknowledgements: BTreeSet<String>,
+    #[serde(default)]
+    reads: BTreeSet<String>,
+    #[serde(default)]
+    fence: Option<st3::mailbox::Fence>,
 }
 
 impl PiFamilyReports {
@@ -13237,8 +13331,21 @@ impl PiFamilyReports {
             self.state = None;
         }
         while let Some(message) = self.acknowledgements.first().cloned() {
-            acknowledge_pi_family_delivery(client, subject, &message).await?;
+            match &self.fence {
+                Some(fence) => mailbox_receipt(client, fence, &message, "delivered").await?,
+                None => acknowledge_pi_family_delivery(client, subject, &message).await?,
+            }
             self.acknowledgements.remove(&message);
+        }
+        while let Some(message) = self.reads.first().cloned() {
+            if let Some(fence) = &self.fence {
+                mailbox_receipt(client, fence, &message, "read").await?;
+                use tokio::io::AsyncWriteExt as _;
+                let mut stdout = tokio::io::stdout();
+                stdout.write_all(format!("{}\n", json!({"type":"settled","meta":{"messageId":message}})).as_bytes()).await?;
+                stdout.flush().await?;
+            }
+            self.reads.remove(&message);
         }
         Ok(())
     }
@@ -13410,6 +13517,10 @@ async fn drive_codex_native(
     let prior_binding = std::fs::read(state_dir.join("binding.json")).ok();
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
+    let mut mailbox = NativeMailbox::start(client, subject, &incarnation, "codex", &mut loop_state);
+    if push_mailbox_enabled() {
+        st_drivers::push_mailbox::register(&agent_dir);
+    }
     let mut task = spawn_codex_provider(&paths, &state_dir, &argv, start);
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -13424,6 +13535,8 @@ async fn drive_codex_native(
     let mut replacement = DriverReplacement::new();
     loop {
         tokio::select! {
+            frame = mailbox.recv() => { mailbox.accept(frame, &runtime_id)?; }
+
             result = &mut task => {
                 let outcome = result.context("joining the Codex driver")?;
                 if let Some(session) = detached_session(&outcome) {
@@ -13463,6 +13576,12 @@ async fn drive_codex_native(
             _ = interval.tick() => {
                 // Delivery runs first and on its own: a failing observation publish must never
                 // hold back a message.
+                if mailbox.subscription.is_some() {
+                    if let Err(error) = mailbox.pump(client, &agent_dir,
+                        NativeDeliveryReceipts::Codex { state_dir: &state_dir, identity: &identity, runtime_id: &runtime_id }).await {
+                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    }
+                } else {
                 delivery.report = Some(native_delivery_report("app-server", None));
                 supervise_native_delivery(
                     client,
@@ -13479,6 +13598,7 @@ async fn drive_codex_native(
                     &mut delivery,
                 )
                 .await;
+                }
                 let tick: Result<()> = async {
                     if !loop_state.ready && std::fs::read(state_dir.join("binding.json"))
                         .ok()
@@ -14054,6 +14174,209 @@ async fn report_unforwarded_message(
             },
         )
         .await?;
+    Ok(())
+}
+
+fn push_mailbox_enabled() -> bool {
+    std::env::var("ST3_MAILBOX_TRANSPORT").as_deref() == Ok("push")
+}
+
+struct NativeMailbox {
+    subscription: Option<st3::mailbox::Subscription>,
+    fence: st3::mailbox::Fence,
+    messages: Vec<MessageView>,
+    queued: BTreeMap<String, st_drivers::message::Message>,
+    replayed: bool,
+}
+impl NativeMailbox {
+    fn start(
+        client: &Client,
+        subject: &str,
+        incarnation: &str,
+        driver: &str,
+        state: &mut NativeLoopState,
+    ) -> Self {
+        let component = if matches!(driver, "codex" | "opencode") {
+            "delivery"
+        } else {
+            "title"
+        };
+        let fence = state
+            .mailbox_fence
+            .get_or_insert_with(|| st3::mailbox::Fence::new(subject, incarnation, component))
+            .clone();
+        let transport = if driver == "codex" {
+            "app-server"
+        } else {
+            "opencode-server"
+        };
+        let report: Value =
+            serde_json::from_str(&native_delivery_report(transport, None)).unwrap_or_default();
+        let subscription = push_mailbox_enabled()
+            .then(|| st3::mailbox::Subscription::start(client.clone(), fence.clone(), report));
+        Self {
+            subscription,
+            fence,
+            messages: Vec::new(),
+            queued: BTreeMap::new(),
+            replayed: false,
+        }
+    }
+    async fn recv(&mut self) -> Option<st3::mailbox::Frame> {
+        match &mut self.subscription {
+            Some(subscription) => subscription.receiver.recv().await,
+            None => std::future::pending().await,
+        }
+    }
+    fn accept(&mut self, frame: Option<st3::mailbox::Frame>, runtime_id: &str) -> Result<()> {
+        match frame {
+            Some(st3::mailbox::Frame::Seat { seat }) => {
+                if let Err(error) = update_native_title(&seat, runtime_id) {
+                    eprintln!("st: could not update seat title: {error:#}");
+                }
+                Ok(())
+            }
+            Some(st3::mailbox::Frame::Mailbox { messages }) => {
+                self.messages = messages;
+                self.replayed = true;
+                Ok(())
+            }
+            Some(st3::mailbox::Frame::Fenced { reason }) => anyhow::bail!("{reason}"),
+            None => anyhow::bail!("native mailbox subscription ended"),
+        }
+    }
+    async fn pump(
+        &mut self,
+        client: &Client,
+        agent_dir: &Path,
+        receipts: NativeDeliveryReceipts<'_>,
+    ) -> Result<()> {
+        if !self.replayed {
+            return Ok(());
+        }
+        let consumed = match receipts {
+            NativeDeliveryReceipts::Codex {
+                state_dir,
+                identity,
+                runtime_id,
+            } => st_drivers::codex_app_server::consumed_delivery_filenames(
+                state_dir, identity, runtime_id,
+            )?,
+            NativeDeliveryReceipts::OpenCode {
+                catalog_root,
+                identity,
+                runtime_id,
+            } => st_drivers::opencode_session::consumed_delivery_filenames(
+                catalog_root,
+                identity,
+                runtime_id,
+            )?,
+            _ => BTreeSet::new(),
+        };
+        let active: BTreeSet<_> = self
+            .messages
+            .iter()
+            .filter(|view| matches!(view.status.as_str(), "sent" | "staged" | "delivered"))
+            .map(|view| view.subject.clone())
+            .collect();
+        self.queued.retain(|key, _| active.contains(key));
+        let mut first_error = None;
+        for view in &self.messages {
+            if !active.contains(&view.subject) {
+                continue;
+            }
+            let result: Result<()> = async {
+                if consumed.contains(&view.subject) {
+                    if view.status != "delivered" {
+                        mailbox_receipt(client, &self.fence, &view.subject, "delivered").await?;
+                    }
+                    mailbox_receipt(client, &self.fence, &view.subject, "read").await?;
+                    return Ok(());
+                }
+                if view.status == "sent" {
+                    mailbox_receipt(client, &self.fence, &view.subject, "staged").await?;
+                }
+                if !self.queued.contains_key(&view.subject) {
+                    let body = message_content(client, view).await?;
+                    self.queued
+                        .insert(view.subject.clone(), native_queued_message(view, body));
+                }
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                first_error.get_or_insert(error);
+            }
+        }
+        // Keep uncertain handoffs in the native ledger until their read acknowledgement lands.
+        let mut queued: Vec<_> = self.queued.values().cloned().collect();
+        queued.sort_by(|left, right| (left.ts_ms, &left.filename).cmp(&(right.ts_ms, &right.filename)));
+        st_drivers::push_mailbox::replace_active(agent_dir, queued, active);
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+fn native_queued_message(view: &MessageView, body: String) -> st_drivers::message::Message {
+    let tags = vec![
+        format!("st3-message:{}", view.subject),
+        format!("{}{}", st_drivers::ding::ST3_TO_TAG, view.to),
+        format!(
+            "{}{}",
+            st_drivers::ding::ST3_SHA256_TAG,
+            st_drivers::ding::st3_body_sha256(&body)
+        ),
+    ];
+    st_drivers::message::Message {
+        filename: view.subject.clone(),
+        ts_ms: view.created_index,
+        from: Some(view.from.clone()),
+        subject: view.title.clone(),
+        in_reply_to: view.in_reply_to.clone(),
+        tags,
+        priority: None,
+        idempotency_key: None,
+        stream: None,
+        event_id: None,
+        event_key: None,
+        body,
+    }
+}
+
+async fn mailbox_receipt(
+    client: &Client,
+    fence: &st3::mailbox::Fence,
+    message: &str,
+    lifecycle: &str,
+) -> Result<()> {
+    let _: ClaimRecord = client
+        .post(
+            "/v1/mailbox/receipts",
+            &st3::mailbox::Receipt {
+                fence: fence.clone(),
+                message: message.into(),
+                lifecycle: lifecycle.into(),
+            },
+        )
+        .await?;
+    Ok(())
+}
+
+fn seat_label(seat: &st3::model::DesiredSubject) -> String {
+    st3::mailbox::seat_label(seat)
+}
+fn update_native_title(seat: &st3::model::DesiredSubject, runtime_id: &str) -> Result<()> {
+    let label = seat_label(seat);
+    let result = std::process::Command::new("pty")
+        .args(["rename", runtime_id, &label])
+        .output()?;
+    anyhow::ensure!(
+        result.status.success(),
+        "updating the PTY title failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
     Ok(())
 }
 
@@ -15018,6 +15341,7 @@ mod tests {
                 seq: 3,
             },
             loop_state: NativeLoopState {
+                mailbox_fence: None,
                 ready: true,
                 harness_record_started: true,
                 predecessor_harness_record: Some(b"ignored".to_vec()),
@@ -17298,7 +17622,7 @@ mod tests {
         };
         let joined = argv.join(" ");
         for expected in [
-            "--channels plugin:st3-channel@st3",
+            "--channels plugin:st-channel@st",
             "--model claude-opus-5-5",
             "--effort high",
             "--dangerously-skip-permissions",

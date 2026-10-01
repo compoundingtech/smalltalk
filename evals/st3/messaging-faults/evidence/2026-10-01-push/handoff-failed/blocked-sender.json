@@ -1,0 +1,12 @@
+{
+  "id": "message/fbea8040e9847add",
+  "from": "person/eval",
+  "to": "agent/eval/fault-probe",
+  "delivery": {
+    "state": "waiting",
+    "phase": "staged",
+    "reason": "waiting for native handoff; failed handoffs retry automatically",
+    "age_ms": 11119,
+    "recipient_delivery": null
+  }
+}

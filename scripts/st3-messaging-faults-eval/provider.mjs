@@ -6,13 +6,16 @@ import childProcess from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 if (process.argv.includes('--version')) {
-  console.log('omp v18.0.9');
+  console.log('omp v18.4.4');
   process.exit(0);
 }
 const directory = process.cwd();
 // Exercise an actual historical channel with today's daemon/driver/extension,
 // avoiding unrelated historical daemon startup and prompt contracts.
-if (process.env.FAULT_OLD_CHANNEL_BIN) process.env.ST2_OMP_CHANNEL_BIN = process.env.FAULT_OLD_CHANNEL_BIN;
+if (process.env.FAULT_OLD_CHANNEL_BIN) {
+  process.env.ST2_OMP_CHANNEL_BIN = process.env.FAULT_OLD_CHANNEL_BIN;
+  process.env.ST_OMP_CHANNEL_BIN = process.env.FAULT_OLD_CHANNEL_BIN;
+}
 const actor = process.env.ST_AGENT;
 const endpoint = process.env.ST3_ENDPOINT;
 const events = new Map();
@@ -69,6 +72,7 @@ let acknowledgements = Promise.resolve();
 const api = {
   on: (event, callback) => events.set(event, callback),
   sendMessage: () => {},
+  setSessionName: (label) => record({ event: 'seat-title', label }),
   sendUserMessage: async (content) => {
     // Join consumed provider text to the real channel's immutable metadata.
     const matched = pendingFrames.filter(frame => content.includes(frame.content));

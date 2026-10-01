@@ -83,6 +83,14 @@ pub fn run(
             };
             let root = PathBuf::from(&root);
             let root = root.canonicalize().unwrap_or(root);
+            if env.var("ST3_MAILBOX_TRANSPORT").as_deref() == Some("push") {
+                // Every render reads graph authority; no display-name environment snapshot.
+                if let Ok(label) = live_claude_label(env, &identity) {
+                    use std::io::Write as _;
+                    let _ = write!(std::io::stdout(), "{label} | ");
+                    let _ = std::io::stdout().flush();
+                }
+            }
             // The tee records fail-open and chains to the operator's renderer itself.
             match st_drivers::claude_session::run_statusline(&root, &identity) {
                 Ok(()) => 0,
@@ -118,6 +126,48 @@ pub fn run(
             1
         }
     }
+}
+
+fn live_claude_label(env: &dyn HookEnv, identity: &str) -> Result<String> {
+    let endpoint = match env.var("ST3_ENDPOINT") {
+        Some(endpoint) => crate::client::Endpoint::parse(endpoint),
+        None => {
+            crate::client::Endpoint::Unix(crate::config::Config::load_unvalidated(None)?.socket)
+        }
+    };
+    let subject = env
+        .var("ST3_SUBJECT")
+        .or_else(|| env.var("ST_AGENT"))
+        .unwrap_or_else(|| format!("agent/{identity}"));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let status: crate::model::StatusResponse = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::client::Client::new(endpoint).get(&format!(
+                "/v1/status?subject={}",
+                urlencoding::encode(&subject)
+            )),
+        )
+        .await??;
+        let desired = status
+            .subjects
+            .into_iter()
+            .find(|seat| seat.subject == subject)
+            .and_then(|seat| seat.desired)
+            .context("seat has no desired record")?;
+        let member = serde_json::from_value::<crate::model::MemberSpec>(desired.clone()).ok();
+        Ok(crate::mailbox::seat_label(&crate::model::DesiredSubject {
+            subject,
+            kind: "agent".into(),
+            desired,
+            member,
+            owner_run: None,
+            owner_generation: None,
+            owner_step: None,
+        }))
+    })
 }
 
 fn claude_observe(

@@ -1,0 +1,5 @@
+st: recording git and gh calls in <eval-root>/cobalt/state/recorder/commands.jsonl
+st: local API listening at <eval-root>/cobalt/run/st3.sock
+st: paired client gateway listening at <eval-root>/cobalt/run/client.sock
+st3: checkpoint {"action":"sealed","checkpoint":"checkpoint/2026-09-29","sealed_digest":"bdcab2ad51b8ae09a7d321bf97bc7699221c2fd168e9befdaaa8b8b6d95f2aa9","participants":["amber","cobalt"]}
+st3: PTY server 2138195 of eval.fault-probe runs in st3-pty-server-eval.fault-probe-2138195.scope

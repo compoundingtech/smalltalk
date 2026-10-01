@@ -306,6 +306,8 @@ async def send(node, case):
 def judge(proof):
     """Require independent native, graph, runtime, and sender evidence."""
     failures = []
+    if proof.get("projected_message_files", 0):
+        failures.append("delivery created file-mailbox messages")
     delay = proof["read_after_clear_ms"]
     if delay is None:
         failures.append("message was not read")
@@ -507,6 +509,8 @@ agent "fault-probe" {{
         graph_reads = [claim for claim in claims if claim.get("kind") == "message.read"]
         source_view = await source.api("/v1/messages/read/" + subject)
         result.update(
+            projected_message_files=sum(1 for path in (target.root / "state").rglob("*")
+                if path.is_file() and any(part in ("inbox", "archive") for part in path.parts)),
             read_after_clear_ms=delay, received_copies=len(received), graph_read_claims=len(graph_reads),
             provider_starts=len(starts), expected_provider_starts=expected_starts,
             provider_pids_before=initial, provider_pids_after=provider_pids(after),
