@@ -2,8 +2,9 @@
 
 ## Continuous integration
 
-Small Talk runs pull request CI on GitHub Actions with Namespace runners. `linux-gate`,
-`isolation-vm` and `genie-freshness` are the required checks; `macos-ci` is optional and runs
+Small Talk runs pull request CI and every push to `main` on GitHub Actions with Namespace runners.
+Main pushes each run Workspace CI and macOS CI independently. `linux-gate`, `isolation-vm` and
+`genie-freshness` are the required checks; `macos-ci` is optional on pull requests and runs
 when a pull request carries the `macos-ci` label. A ready pull request lands through GitHub's
 merge queue: `gh pr merge NUMBER --auto`. See [CI operations](docs/ci.md) for the queue and to
 inspect a failing run.
