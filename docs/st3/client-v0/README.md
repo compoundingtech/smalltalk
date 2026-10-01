@@ -137,8 +137,9 @@ version. All items in a response are computed in one read transaction. A page cu
 bound to the collection, filter, page size, and final sort tuple, with an advertised
 `cursor_expires_at`. Unrelated commits do not invalidate a page. Cached collections continue from
 the original snapshot; missions and work history seek after the last timestamp and ID in a fresh
-read transaction and explicitly name that page's snapshot. Rows updated ahead of that position
-arrive through the live collection subscription. Real retention expiry still returns
+read transaction and explicitly name that page's snapshot. A fresh page sequence observes rows
+that move ahead of the continuation position; current collection subscriptions supply live
+updates. Real retention expiry still returns
 `page-cursor-expired`, so clients restart the page sequence.
 
 ## Discovery, lists, and details
