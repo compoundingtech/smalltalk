@@ -232,6 +232,74 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn replacement_mailbox_waits_while_the_graph_still_describes_its_predecessor() {
+        for status in ["running", "exited", "vanished"] {
+            let store = Store::open_memory("node").unwrap();
+            ready(&store, "previous");
+            let previous = store
+                .bind_mailbox(&Fence::new("agent/eval.worker", "previous", "delivery"))
+                .unwrap();
+            store
+                .append_claim(&claim(
+                    "agent/eval.worker",
+                    "runtime.observed",
+                    json!({"status":status,"runtime_id":"eval.worker","incarnation_id":"previous"}),
+                    "previous-runtime",
+                ))
+                .unwrap();
+            store
+                .append_claim(&claim(
+                    "agent/eval.worker",
+                    "harness.observed",
+                    json!({"state":"starting","driver":"claude","incarnation_id":"replacement"}),
+                    "replacement-starting",
+                ))
+                .unwrap();
+            let replacement = Fence::new("agent/eval.worker", "replacement", "delivery");
+            assert_eq!(
+                store.bind_mailbox(&replacement).unwrap_err().code,
+                "mailbox-session-starting",
+                "{status}"
+            );
+            assert_eq!(
+                store
+                    .bind_mailbox(&Fence::new("agent/eval.worker", "foreign", "delivery"))
+                    .unwrap_err()
+                    .code,
+                "stale-mailbox-session"
+            );
+            // Even a matching starting harness cannot revive its own exited incarnation.
+            if status != "running" {
+                assert_eq!(
+                    store.bind_mailbox(&previous).unwrap_err().code,
+                    "stale-mailbox-session"
+                );
+            }
+            ready(&store, "replacement");
+            let bound = store.bind_mailbox(&replacement).unwrap();
+            assert_eq!(bound.epoch, 2, "waiting never allocates ownership");
+            assert_eq!(
+                store.check_mailbox(&previous).unwrap_err().code,
+                "stale-mailbox-session"
+            );
+            store.append_claim(&claim("agent/eval.worker", "runtime.observed",
+                json!({"status":"exited","runtime_id":"eval.worker","incarnation_id":"replacement"}), "replacement-exited")).unwrap();
+            store
+                .append_claim(&claim(
+                    "agent/eval.worker",
+                    "harness.observed",
+                    json!({"state":"starting","driver":"claude","incarnation_id":"replacement"}),
+                    "replacement-still-starting",
+                ))
+                .unwrap();
+            assert_eq!(
+                store.bind_mailbox(&bound).unwrap_err().code,
+                "stale-mailbox-session"
+            );
+        }
+    }
+
+    #[test]
     fn mailbox_can_bind_before_the_native_provider_reports_ready() {
         let store = Store::open_memory("node").unwrap();
         store

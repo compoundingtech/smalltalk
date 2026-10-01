@@ -1793,7 +1793,8 @@ fn runtime_resources(
             "desired_revision": desired_revision,
             "owner_run_id": selected.owner_run,
             "terminal_id": terminal_id,
-            "terminal_sequence": terminal.then_some(snapshot.store_index),
+            // Screen fences come from terminal.screen, never from a graph projection.
+            "terminal_sequence": null,
             "terminal_access": terminal.then(|| json!({
                 "read": if local && session.allows("terminal.read") { "granted" } else { "unavailable" },
                 "input": if local && session.allows("terminal.control") { "granted" } else { "unavailable" },
@@ -5311,11 +5312,7 @@ async fn terminal_screen_value(
             screen = changed;
         }
     }
-    Ok(screen.value(
-        &client_detail_id("terminal", id),
-        &live.incarnation_id,
-        state.store.index().map_err(ApiError::internal)?,
-    ))
+    Ok(screen.value(&client_detail_id("terminal", id), &live.incarnation_id))
 }
 
 #[derive(Default, Deserialize)]
@@ -6279,12 +6276,7 @@ async fn terminal_stream_socket(
         if sent.as_deref() == Some(screen.revision()) {
             continue;
         }
-        let Ok(next_sequence) = state.store.index() else {
-            sink.fail(&ApiError::internal("the store index is unavailable"))
-                .await;
-            return;
-        };
-        let value = screen.value(&terminal_id, &live.incarnation_id, next_sequence);
+        let value = screen.value(&terminal_id, &live.incarnation_id);
         if !sink.send(&terminal_stream_envelope(&state, value)).await {
             sink.close(1009, "terminal screen exceeds the client limit")
                 .await;
@@ -6643,6 +6635,7 @@ fn validate_fence(
     state: &AppState,
     _snapshot: &ClientSnapshot,
     fence: &Fence,
+    terminal_view_action: bool,
 ) -> Result<(), ApiError> {
     let parsed = fence
         .snapshot_id
@@ -6652,7 +6645,14 @@ fn validate_fence(
     let current_index = state.store.index().map_err(ApiError::internal)?;
     let expected_host = state.node.replace(char::is_whitespace, "-");
     if !parsed.is_some_and(|(host, index)| {
-        host == expected_host && index.parse::<u64>().ok() == Some(current_index)
+        host == expected_host
+            && index.parse::<u64>().ok().is_some_and(|index| {
+                if terminal_view_action {
+                    index <= current_index
+                } else {
+                    index == current_index
+                }
+            })
     }) {
         return Err(stale(
             "the client snapshot changed before the action was submitted",
@@ -7736,6 +7736,12 @@ pub(super) async fn action(
     let scope = action_scope(&request.action_type)
         .ok_or_else(|| validation("the action type is unknown"))?;
     require_scope(&session, scope)?;
+    // Terminal views/control are fenced by their own screen and incarnation, not unrelated
+    // graph writes. Keep declaration mutations on the strict whole-snapshot fence.
+    let terminal_view_action = matches!(
+        request.action_type.as_str(),
+        "terminal.attach" | "terminal.detach" | "terminal.input" | "terminal.resize"
+    );
     let read_only_terminal_lifecycle = matches!(
         request.action_type.as_str(),
         "terminal.attach" | "terminal.detach"
@@ -7799,7 +7805,7 @@ pub(super) async fn action(
         let live =
             remote_terminal_live_session(&state, &terminal_subject(&terminal_id), incarnation)?;
         if live.owner_host_id != client_host_id(&state.node) {
-            validate_fence(&state, &snapshot, &request.fence)?;
+            validate_fence(&state, &snapshot, &request.fence, terminal_view_action)?;
             let expected_sequence = request
                 .fence
                 .terminal_sequence
@@ -7831,21 +7837,34 @@ pub(super) async fn action(
             return Ok(Json(value));
         }
     }
-    let mut reconciled_attachment = None;
-    let fence_result = (|| {
-        validate_fence(&state, &snapshot, &request.fence)?;
-        if request.action_type.starts_with("terminal.")
-            && !matches!(
-                request.action_type.as_str(),
-                "terminal.detach" | "terminal.create" | "terminal.end"
-            )
-            && request.fence.terminal_sequence
-                != Some(state.store.index().map_err(ApiError::internal)?)
-        {
+    if matches!(
+        request.action_type.as_str(),
+        "terminal.input" | "terminal.resize"
+    ) {
+        let terminal_id = parameter_string(&request.parameters, "terminal_id")?;
+        let incarnation = request
+            .fence
+            .runtime_incarnation
+            .as_deref()
+            .ok_or_else(|| validation("terminal control requires an incarnation fence"))?;
+        let expected = request
+            .fence
+            .terminal_sequence
+            .ok_or_else(|| validation("terminal control requires a sequence fence"))?;
+        let screen = terminal_screen_value(
+            &state,
+            &terminal_id,
+            Some(incarnation),
+            None,
+            Duration::ZERO,
+        )
+        .await?;
+        if screen["next_sequence"].as_u64() != Some(expected) {
             return Err(stale("the terminal sequence fence is stale"));
         }
-        Ok(())
-    })();
+    }
+    let mut reconciled_attachment = None;
+    let fence_result = validate_fence(&state, &snapshot, &request.fence, terminal_view_action);
     if let Err(error) = fence_result {
         if request.action_type == "terminal.attach" {
             reconciled_attachment =
@@ -11923,6 +11942,196 @@ mission "example/zero-run" state="ready" {
                 claim.kind
             );
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn terminal_actions_survive_unrelated_writes_but_reject_changed_screens() {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let Some(pty) = std::env::split_paths(&path)
+            .map(|dir| dir.join("pty"))
+            .find(|p| p.is_file())
+        else {
+            assert!(std::env::var_os("CI").is_none(), "CI must provide pty");
+            return;
+        };
+        let root = tempfile::tempdir().unwrap();
+        let mut state = test_state(root.path());
+        state.pty_binary = pty.clone();
+        let runtime = st_runtime::PtyRuntime::new(state.pty_root.clone())
+            .with_binary(pty.to_string_lossy());
+        struct Cleanup(st_runtime::PtyRuntime);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.stop("fence-test");
+                let _ = self.0.remove("fence-test");
+            }
+        }
+        let _cleanup = Cleanup(runtime.clone());
+        let pty_root = state.pty_root.clone();
+        let output = tokio::task::spawn_blocking(move || std::process::Command::new(pty)
+            .env("PTY_ROOT", pty_root)
+            .args(["run", "-d", "--force", "--id", "fence-test", "--tag", "keep=true", "--", "/bin/sh", "-c", "stty -echo; printf ready; while IFS= read -r line; do printf '\\r\\naccepted:%s' \"$line\"; done"])
+            .output().unwrap()).await.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let live = runtime
+            .snapshot()
+            .unwrap()
+            .into_iter()
+            .find(|live| live.name == "fence-test")
+            .unwrap();
+        let incarnation = format!("{}:{}", live.pid.unwrap(), live.created_at.unwrap());
+        let observe = |incarnation: &str| {
+            state
+                .store
+                .append_claim(&ClaimInput {
+                    subject: "agent/fence-test".into(),
+                    kind: "runtime.observed".into(),
+                    actor: None,
+                    fields: BTreeMap::from([
+                        ("runtime_id".into(), json!("fence-test")),
+                        ("incarnation_id".into(), json!(incarnation)),
+                        ("status".into(), json!("running")),
+                        ("terminal".into(), json!(true)),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap()
+        };
+        observe(&incarnation);
+        let screen = terminal_screen_value(
+            &state,
+            "agent/fence-test",
+            Some(&incarnation),
+            None,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        let snapshot = new_client_snapshot(&state);
+        let fence = Fence {
+            snapshot_id: snapshot.id.clone(),
+            runtime_incarnation: Some(incarnation.clone()),
+            terminal_sequence: Some(screen["next_sequence"].as_u64().unwrap()),
+            ..Default::default()
+        };
+        let session = ClientSession::local(Some("person/alex")).unwrap();
+        let request =
+            |action_type: &str, key: &str, fence: Fence, parameters: Value| ActionRequest {
+                api_version: CLIENT_API_VERSION.into(),
+                id: format!("action/{key}"),
+                action_type: action_type.into(),
+                idempotency_key: format!("terminal-fence-test-{key}"),
+                fence,
+                parameters,
+            };
+        // A graph update after the client read must not invalidate this terminal's view.
+        state
+            .store
+            .append_claim(&ClaimInput {
+                subject: "agent/unrelated".into(),
+                kind: "runtime.observed".into(),
+                actor: None,
+                fields: BTreeMap::from([("status".into(), json!("vanished"))]),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            })
+            .unwrap();
+        assert!(
+            validate_fence(&state, &snapshot, &fence, false).is_err(),
+            "declaration mutations remain strict"
+        );
+        let mut attach_fence = fence.clone();
+        attach_fence.terminal_sequence = None;
+        let _ = action(
+            State(state.clone()),
+            Extension(snapshot.clone()),
+            Extension(session.clone()),
+            Json(request(
+                "terminal.attach",
+                "fence-attach",
+                attach_fence,
+                json!({"target_id":"terminal/agent/fence-test"}),
+            )),
+        )
+        .await
+        .unwrap();
+        let _ = action(
+            State(state.clone()),
+            Extension(snapshot.clone()),
+            Extension(session.clone()),
+            Json(request(
+                "terminal.input",
+                "fence-input",
+                fence.clone(),
+                json!({"terminal_id":"terminal/agent/fence-test","mode":"line","value":"hello"}),
+            )),
+        )
+        .await
+        .unwrap();
+        let changed = terminal_screen_value(
+            &state,
+            "agent/fence-test",
+            Some(&incarnation),
+            screen["revision"].as_str(),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+        assert_ne!(screen["next_sequence"], changed["next_sequence"]);
+        assert!(changed.to_string().contains("accepted:hello"));
+        for action_type in ["terminal.input", "terminal.resize"] {
+            let parameters = if action_type == "terminal.input" {
+                json!({"terminal_id":"terminal/agent/fence-test","mode":"line","value":"must-not-land"})
+            } else {
+                json!({"terminal_id":"terminal/agent/fence-test","rows":20,"columns":80})
+            };
+            let error = action(
+                State(state.clone()),
+                Extension(snapshot.clone()),
+                Extension(session.clone()),
+                Json(request(action_type, action_type, fence.clone(), parameters)),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, "stale-fence");
+        }
+        let mut foreign = fence.clone();
+        foreign.snapshot_id = foreign.snapshot_id.replacen(&state.node, "another-host", 1);
+        assert!(validate_fence(&state, &snapshot, &foreign, true).is_err());
+        let mut future = fence.clone();
+        future.snapshot_id = format!(
+            "snapshot/{}/{}/digest",
+            state.node,
+            state.store.index().unwrap() + 1
+        );
+        assert!(validate_fence(&state, &snapshot, &future, true).is_err());
+        let mut revision = fence.clone();
+        revision
+            .subject_revisions
+            .insert("agent/unrelated".into(), "old-revision".into());
+        assert!(validate_fence(&state, &snapshot, &revision, true).is_err());
+        observe("replacement-incarnation");
+        let error = action(
+            State(state.clone()),
+            Extension(snapshot),
+            Extension(session),
+            Json(request(
+                "terminal.attach",
+                "fence-replaced",
+                fence,
+                json!({"target_id":"terminal/agent/fence-test"}),
+            )),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, "stale-fence");
     }
 
     #[test]
