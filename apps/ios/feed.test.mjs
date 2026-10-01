@@ -141,7 +141,18 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
   sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: false, items: [{ id: 'entry/2' }] });
   assert.deepEqual(frames.map(frame => [frame.replace, frame.items.map(item => item.id), frame.hasMore]), [[true, ['entry/1'], true], [false, ['entry/2'], false]]);
   sockets[0].frame({ kind: 'error', id: 'conversation', collection: 'conversation', code: 'remote-unavailable', message: 'owner host/two is temporarily unavailable' });
-  assert.equal(issues.at(-1), 'remote-unavailable: owner host/two is temporarily unavailable');
+  assert.equal(issues.at(-1), 'remote-unavailable: owner host/two is temporarily unavailable · trying again');
+  // An ended subscription is asked for again after the backoff.
+  const before = sockets[0].sent.length;
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.deepEqual(sockets[0].sent.slice(before), [{ kind: 'subscribe', id: 'conversation', collection: 'conversation', conversation: 'agent/example/worker' }]);
+  // A page that expired under a busy store retries quietly at first.
+  const quiet = issues.length;
+  sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: true, items: [{ id: 'entry/1' }] });
+  sockets[0].frame({ kind: 'error', id: 'conversation', collection: 'conversation', code: 'page-cursor-expired', message: 'the snapshot moved' });
+  assert.equal(issues.length, quiet + 1, 'only the clearing of the old issue');
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.equal(sockets[0].sent.at(-1).collection, 'conversation');
   sockets[0].drop(new Error('lost'));
   await settle();
   assert.ok(subscribed(sockets[1]).includes('conversation'), 'a reconnect follows the conversation again');

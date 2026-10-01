@@ -39,3 +39,24 @@ export function terminalRunStyle(run: TerminalRun, defaults: { fg: string; bg: s
     ...(run.dim ? { opacity: 0.6 } : {}),
   };
 }
+
+/** A line's runs with the cell at `column` drawn as the cursor (inverse), padding a short line. */
+export function withCursor(runs: TerminalRun[], column: number): TerminalRun[] {
+  const out: TerminalRun[] = [];
+  let at = 0, placed = false;
+  for (const run of runs) {
+    const chars = Array.from(run.text);
+    if (placed || column < at || column >= at + chars.length) { out.push(run); at += chars.length; continue; }
+    const offset = column - at;
+    if (offset) out.push({ ...run, text: chars.slice(0, offset).join('') });
+    out.push({ ...run, text: chars[offset], inverse: run.inverse ? undefined : true });
+    if (offset + 1 < chars.length) out.push({ ...run, text: chars.slice(offset + 1).join('') });
+    at += chars.length;
+    placed = true;
+  }
+  if (!placed) {
+    if (column > at) out.push({ text: ' '.repeat(column - at) });
+    out.push({ text: ' ', inverse: true });
+  }
+  return out;
+}

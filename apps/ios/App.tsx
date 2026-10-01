@@ -20,6 +20,7 @@ import { ConversationScreen } from './screens/Conversation';
 import { FleetScreen, PairScreen } from './screens/Fleet';
 import { AttentionScreen, HomeScreen } from './screens/Home';
 import { LaunchScreen, MissionScreen, MissionsScreen, NewMissionScreen } from './screens/Missions';
+import { SelectTextScreen } from './screens/SelectText';
 import { TerminalScreen } from './screens/Terminal';
 import { GlassesScreen } from './screens/Glasses';
 
@@ -55,6 +56,7 @@ function TabStack({ tab }: { tab: Tab | 'Glasses' }) {
       ? <Stack.Screen name="GlassesRoot" component={GlassesScreen} options={{ title: 'Glasses' }} />
       : <Stack.Screen name={ROOTS[tab] as keyof typeof ROOT_SCREENS} component={ROOT_SCREENS[ROOTS[tab] as keyof typeof ROOT_SCREENS]} options={{ title: tab }} />}
     <Stack.Screen name="Conversation" component={ConversationScreen} options={{ title: 'Conversation' }} />
+    <Stack.Screen name="SelectText" component={SelectTextScreen} options={{ title: 'Select text', presentation: 'formSheet', sheetAllowedDetents: [0.6, 1], sheetGrabberVisible: true }} />
     <Stack.Screen name="Terminal" component={TerminalScreen} options={{ title: 'Terminal', contentStyle: { backgroundColor: theme.crust } }} />
     <Stack.Screen name="Mission" component={MissionScreen} options={{ title: 'Mission' }} />
     <Stack.Screen name="Attention" component={AttentionScreen} options={{ title: 'Needs you' }} />
@@ -96,6 +98,7 @@ function Main() {
       if (parsed.kind === 'tab') navigationRef.navigate(parsed.tab, { screen: ROOTS[parsed.tab] } as never);
       else if (parsed.kind === 'mission') navigationRef.navigate('Missions', { screen: 'Mission', params: { id: parsed.id }, initial: false });
       else if (parsed.kind === 'agent') navigationRef.navigate('Agents', { screen: 'Conversation', params: { target: parsed.id }, initial: false });
+      else if (parsed.kind === 'terminal') navigationRef.navigate('Agents', { screen: 'Terminal', params: { terminalId: parsed.id }, initial: false });
       else if (parsed.kind === 'session') {
         navigationRef.navigate('Agents', { screen: 'Conversation', params: { target: parsed.id, sessionId: parsed.id }, initial: false });
         if (parsed.terminal) setTimeout(() => navigationRef.navigate('Agents', { screen: 'Terminal', params: { terminalId: parsed.terminal! }, initial: false }), 300);

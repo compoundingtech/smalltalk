@@ -61,10 +61,10 @@ assert.equal(conversationEntries([e('content', 'assistant', null), e('content', 
 
 // Long tool output collapses to its last five lines unless open or failed.
 const tool = { kind: 'tool', title: 't', state: 'ok', output: Array.from({ length: 20 }, (_, n) => `line ${n}`) };
-assert.equal(shownToolLines(tool, false).hidden, 15);
+assert.equal(shownToolLines(tool, false).hidden, 14);
 assert.equal(shownToolLines(tool, false).lines.at(-1), 'line 19');
 assert.equal(shownToolLines(tool, true).lines.length, 20);
-assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 0);
+assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 14, 'failed calls fold too, as in stui');
 
 // Half a conversation is not shown: st's notice that it could not read the transcript becomes
 // one reason, with the transcript's path.

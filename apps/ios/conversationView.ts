@@ -319,14 +319,25 @@ export function conversationEntries(timeline: Entry[], names: Names): Conversati
 }
 
 /** Whether an entry says `query` anywhere a person reads, case aside: for finding in a conversation. */
+function said(entry: ConversationEntry): string[] {
+  const body = entry.body;
+  return body.kind === 'tool' ? [body.title, ...body.output]
+    : body.kind === 'mail' ? [body.from, body.to, body.subject, body.text]
+    : [body.text];
+}
+
 export function entryMatches(entry: ConversationEntry, query: string): boolean {
   const wanted = query.trim().toLowerCase();
   if (!wanted) return true;
+  return said(entry).some(text => text.toLowerCase().includes(wanted));
+}
+
+/** An entry as plain text, for selecting and copying. */
+export function entryText(entry: ConversationEntry): string {
   const body = entry.body;
-  const said = body.kind === 'tool' ? [body.title, ...body.output]
-    : body.kind === 'mail' ? [body.from, body.to, body.subject, body.text]
-    : [body.text];
-  return said.some(text => text.toLowerCase().includes(wanted));
+  if (body.kind === 'tool') return [body.title, ...body.output].join('\n');
+  if (body.kind === 'mail') return [`${body.to ? `${body.from} → ${body.to}` : body.from}${body.subject ? `  ${body.subject}` : ''}`, '', body.text].join('\n');
+  return body.text;
 }
 
 /**
@@ -349,9 +360,16 @@ export function foldDeliveryFlaps(entries: ConversationEntry[]): ConversationEnt
   return out;
 }
 
-export const COLLAPSED_TOOL_LINES = 5;
+/** The most lines a tool call shows until opened, failed ones too, as in stui. */
+/** As in stui's conversation-style rules (`tool.collapsed_rows`); a test holds them equal. */
+export const COLLAPSED_TOOL_LINES = 6;
+
+/** Whether an entry folds until opened: tool calls, and mail the person is not part of. */
+export function folds(body: Body): boolean {
+  return body.kind === 'tool' || (body.kind === 'mail' && body.from !== 'you' && body.to !== 'you');
+}
 /** The lines a tool box shows: all when open, failed, or short; otherwise its last five. */
 export function shownToolLines(body: Extract<Body, { kind: 'tool' }>, open: boolean): { hidden: number; lines: string[] } {
-  if (open || body.state === 'failed' || body.output.length <= COLLAPSED_TOOL_LINES) return { hidden: 0, lines: body.output };
+  if (open || body.output.length <= COLLAPSED_TOOL_LINES) return { hidden: 0, lines: body.output };
   return { hidden: body.output.length - COLLAPSED_TOOL_LINES, lines: body.output.slice(-COLLAPSED_TOOL_LINES) };
 }

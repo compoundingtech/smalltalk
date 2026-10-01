@@ -22,4 +22,6 @@ assert.deepEqual(parseDevLink(`${scheme}mission?id=mission/x`), { kind: 'mission
 assert.deepEqual(parseDevLink(`${scheme}scroll?y=800`), { kind: 'scroll', y: 800 });
 assert.deepEqual(parseDevLink(`${scheme}tree?on=0`), { kind: 'tree', on: false });
 assert.equal(parseDevLink(`${scheme}session?id=agent/x`), null);
+assert.deepEqual(parseDevLink(`${scheme}terminal?id=terminal/pty/x`), { kind: 'terminal', id: 'terminal/pty/x' });
+assert.equal(parseDevLink(`${scheme}terminal?id=agent/x`), null);
 assert.equal(parseDevLink('not a url'), null);

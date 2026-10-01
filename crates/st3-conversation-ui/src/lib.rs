@@ -11,6 +11,7 @@ pub mod conversation;
 pub mod doc;
 mod entry;
 pub mod pane;
+pub mod style;
 pub mod text;
 pub mod theme;
 pub mod timeline;

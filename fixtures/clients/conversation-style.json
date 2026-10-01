@@ -1,0 +1,79 @@
+{
+  "assistant": "text",
+  "event": {
+    "label": "overlay0",
+    "rule": "surface1"
+  },
+  "mail": {
+    "between_others": {
+      "edge": "surface2",
+      "from": "overlay1",
+      "from_bold": false,
+      "text": "overlay1"
+    },
+    "delivered": {
+      "color": "green",
+      "text": "✓✓ delivered"
+    },
+    "involving_you": {
+      "edge": "sapphire",
+      "from": "sapphire",
+      "from_bold": true,
+      "text": "text"
+    },
+    "sent": {
+      "color": "overlay0",
+      "text": "✓ sent"
+    },
+    "to_you_fill": "tool_bg"
+  },
+  "pending": {
+    "failed": "red",
+    "sending": {
+      "color": "overlay0",
+      "text": "you · sending…"
+    },
+    "sending_edge": "surface2",
+    "text": "overlay0",
+    "unconfirmed": "peach"
+  },
+  "thinking": {
+    "color": "overlay1",
+    "italic": true,
+    "mark": "∴"
+  },
+  "tool": {
+    "added": "green",
+    "collapse": {
+      "color": "overlay0",
+      "text": "▴ collapse"
+    },
+    "collapsed_rows": 6,
+    "failed": {
+      "color": "red",
+      "text": "✕"
+    },
+    "fill": null,
+    "ok": {
+      "color": "green",
+      "text": "✓"
+    },
+    "open": {
+      "rows": "subtext0",
+      "title": "text",
+      "title_bold": true
+    },
+    "quiet": {
+      "rows": "overlay0",
+      "title": "overlay1",
+      "title_bold": false
+    },
+    "removed": "red",
+    "running": "working"
+  },
+  "user": {
+    "fill": "user_bg",
+    "text": "text",
+    "time": "overlay0"
+  }
+}

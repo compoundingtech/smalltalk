@@ -266,11 +266,19 @@ function useAppStore() {
       } catch (e) { setError(errorText(e)); return null; }
     },
     /** Each input takes a fresh terminal fence and refuses a changed runtime incarnation. */
-    async terminalInput(terminalId: string, incarnation: string, mode: 'line' | 'key', value: string) {
+    async terminalInput(terminalId: string, incarnation: string, mode: 'line' | 'key' | 'raw', value: string) {
       if (!client) throw new Error('not connected');
       await withFreshTerminalFence(client, terminalId, incarnation, terminalFence => {
         const id = actionId();
         return client.terminalInput({ id, idempotency_key: id, fence: terminalFence, parameters: { terminal_id: terminalId, mode, value } });
+      });
+    },
+    /** Sizes the terminal to the phone; whoever attaches next may size it again. */
+    async terminalResize(terminalId: string, incarnation: string, rows: number, columns: number) {
+      if (!client) throw new Error('not connected');
+      await withFreshTerminalFence(client, terminalId, incarnation, terminalFence => {
+        const id = actionId();
+        return client.terminalResize({ id, idempotency_key: id, fence: terminalFence, parameters: { terminal_id: terminalId, rows, columns } });
       });
     },
     async mission(id: string): Promise<Mission | null> {
