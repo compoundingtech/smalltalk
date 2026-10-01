@@ -1142,6 +1142,27 @@ mod tests {
     }
 
     #[test]
+    fn a_seat_that_has_said_nothing_since_it_started_shows_its_small_talk() {
+        let timeline: Vec<TimelineEntry> = serde_json::from_value(json!([
+            {"id":"m","sequence":1,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"message","final":true,
+             "body":{"message_id":"message/one","from":"person/avery","to":"agent/example/harbor/keeper","title":"Status?"}},
+            {"id":"c","sequence":2,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"content","final":true,
+             "body":{"media_type":"text/plain","text":"How is the audit going?"}},
+            {"id":"n","sequence":3,"revision":1,"timestamp":"2026-10-01T10:00:01Z","role":"system","type":"error","final":true,
+             "body":{"code":"transcript-not-bound","message":"transcript not bound: Claude session 0190 has no transcript file yet","retryable":true,
+                     "details":{"driver":"claude","not_yet":true}}},
+        ]))
+        .unwrap();
+        assert_eq!(unreadable_transcript(&timeline), None, "nothing is wrong");
+        let entries = conversation(&timeline, &BTreeMap::new());
+        assert!(matches!(&entries[0].body, Body::Mail { subject, .. } if subject == "Status?"));
+        assert!(
+            matches!(&entries[1].body, Body::Event(line) if line == "nothing in the harness yet since this seat started"),
+            "{entries:?}"
+        );
+    }
+
+    #[test]
     fn half_a_conversation_is_not_shown_and_says_why() {
         let entries = |notice: Option<Value>| -> Vec<TimelineEntry> {
             let mut rows = vec![

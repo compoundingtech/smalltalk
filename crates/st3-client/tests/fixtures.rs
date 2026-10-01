@@ -13,6 +13,41 @@ fn decode<T: serde::de::DeserializeOwned>(name: &str) -> T {
 }
 
 #[test]
+fn glass_groups_preserve_nested_tabs_and_empty_groups_on_round_trip() {
+    let put: GlassPut = decode("glass-put.json");
+    let GlassLayout::Split {
+        split: GlassSplit::Right,
+        children,
+    } = &put.body.layout
+    else {
+        panic!("expected right split");
+    };
+    let GlassLayout::Group { tabs } = &*children[0] else {
+        panic!("expected tab group");
+    };
+    assert_eq!(tabs.len(), 2);
+    assert_eq!(tabs[0].title.as_deref(), Some("Work"));
+    assert_eq!(tabs[0].pane, "agent:agent/example/worker");
+    let GlassLayout::Split {
+        split: GlassSplit::Below,
+        children,
+    } = &*children[1]
+    else {
+        panic!("expected nested below split");
+    };
+    assert!(matches!(&*children[1], GlassLayout::Group { tabs } if tabs.is_empty()));
+    assert_eq!(
+        serde_json::to_value(&put).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(&fixture("glass-put.json")).unwrap()
+    );
+    let empty: GlassPut = decode("glass-put-empty.json");
+    assert!(matches!(empty.body.layout, GlassLayout::Group { tabs } if tabs.is_empty()));
+    assert!(
+        serde_json::from_value::<GlassBody>(serde_json::json!({"name":"Old", "tabs":[]})).is_err()
+    );
+}
+
+#[test]
 fn generated_models_decode_every_stream_fixture() {
     assert!(
         std::mem::size_of::<TimelineBody>() <= 128,

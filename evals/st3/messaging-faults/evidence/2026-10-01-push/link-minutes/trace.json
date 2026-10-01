@@ -1,0 +1,133 @@
+[
+  {
+    "id": "563db260972fd2873ce2869fd9cd0cb56f1b290087774c1057fe5a5599e0b010",
+    "store_index": 18,
+    "batch_id": "batch/amber/6/7bc968f057a61c4ad15e90dc28fdadb4813cbc87290da1e16ce0ff72deca5ee3",
+    "subject": "message/a64154a9358ac749",
+    "kind": "message.sent",
+    "origin": "amber",
+    "actor": "person/eval",
+    "operation_id": "op/4133c3b52cc7d294f7725c7d3517cffce028e3df2930d0067ce949821f49bffe",
+    "request_digest": "1f5d04783fc1e0bc1ad2becf58f3a0505143bf4359ef9163d6163e31b3773f0a",
+    "body": {
+      "_operation": {
+        "id": "op/4133c3b52cc7d294f7725c7d3517cffce028e3df2930d0067ce949821f49bffe",
+        "request_digest": "1f5d04783fc1e0bc1ad2becf58f3a0505143bf4359ef9163d6163e31b3773f0a"
+      },
+      "evidence": [],
+      "fields": {
+        "content": "receipt-token:link-minutes",
+        "from": "person/eval",
+        "in_reply_to": null,
+        "status": "sent",
+        "tags": [],
+        "title": "Fault probe: link-minutes",
+        "to": "agent/eval/fault-probe"
+      }
+    },
+    "predecessors": [],
+    "accepted_at_unix_ms": 1790866299999
+  },
+  {
+    "id": "f8eb711a23921f0ac7a125a69f180f8da22cdc230a436e1eed97809bc172a0c2",
+    "store_index": 19,
+    "batch_id": "batch/cobalt/13/4e02344dbea5e1be877f8ff113112882fb88cd9ce6a98b1283250c56d1f4d6e8",
+    "subject": "message/a64154a9358ac749",
+    "kind": "message.staged",
+    "origin": "cobalt",
+    "actor": "agent/eval/fault-probe",
+    "operation_id": "op/0a84d787a674f655549eb04479e9e36a5110c2c27504f67393d5829a85e793f0",
+    "request_digest": "da50a63fce9d26c0554dd870f3c3f59e49bee73b29313bf0b404da97da71005b",
+    "body": {
+      "_operation": {
+        "id": "op/0a84d787a674f655549eb04479e9e36a5110c2c27504f67393d5829a85e793f0",
+        "request_digest": "da50a63fce9d26c0554dd870f3c3f59e49bee73b29313bf0b404da97da71005b"
+      },
+      "evidence": [],
+      "fields": {
+        "recipient": "agent/eval/fault-probe",
+        "status": "staged",
+        "transport": "omp-channel"
+      }
+    },
+    "predecessors": [
+      "563db260972fd2873ce2869fd9cd0cb56f1b290087774c1057fe5a5599e0b010"
+    ],
+    "accepted_at_unix_ms": 1790866420847
+  },
+  {
+    "id": "20b0114a43e3aac755b5edaf75ad89a94b8990c8e32d72e4430478453d4f18f7",
+    "store_index": 20,
+    "batch_id": "batch/cobalt/14/6464eb8b047f578bba9b2c8f9b23c8ffb3e5bfeac5ef7108244cb658a607aca9",
+    "subject": "message/a64154a9358ac749",
+    "kind": "message.delivered",
+    "origin": "cobalt",
+    "actor": "agent/eval/fault-probe",
+    "operation_id": "op/80046248037c224a25ed446c3fb4dfbd3099353c70f80ede099b50ce33fe6afd",
+    "request_digest": "8404b890d6e219c0922768f1f218c43c49fa602f0e4631c317730e80a2bced61",
+    "body": {
+      "_operation": {
+        "id": "op/80046248037c224a25ed446c3fb4dfbd3099353c70f80ede099b50ce33fe6afd",
+        "request_digest": "8404b890d6e219c0922768f1f218c43c49fa602f0e4631c317730e80a2bced61"
+      },
+      "evidence": [],
+      "fields": {
+        "status": "delivered"
+      }
+    },
+    "predecessors": [
+      "f8eb711a23921f0ac7a125a69f180f8da22cdc230a436e1eed97809bc172a0c2"
+    ],
+    "accepted_at_unix_ms": 1790866420861
+  },
+  {
+    "id": "7bc5591c3707c3bbf73433c43e80761d6652c3c183df326202e073953eaeea44",
+    "store_index": 21,
+    "batch_id": "batch/cobalt/15/767ce2447f26309c1be8d4f31453d6b553af4c9888e951fa2f798bee05d38d6d",
+    "subject": "message/a64154a9358ac749",
+    "kind": "message.read",
+    "origin": "cobalt",
+    "actor": "agent/eval/fault-probe",
+    "operation_id": "op/43f7b841934aa89f91d8d27099f04369401f68d37f0ffa15364a54f5e8797148",
+    "request_digest": "9ef5d1f9aea2494d9a74d458cadf83fe50953ce06de0c76d3e38d1e860bab2e2",
+    "body": {
+      "_operation": {
+        "id": "op/43f7b841934aa89f91d8d27099f04369401f68d37f0ffa15364a54f5e8797148",
+        "request_digest": "9ef5d1f9aea2494d9a74d458cadf83fe50953ce06de0c76d3e38d1e860bab2e2"
+      },
+      "evidence": [],
+      "fields": {
+        "status": "read"
+      }
+    },
+    "predecessors": [
+      "20b0114a43e3aac755b5edaf75ad89a94b8990c8e32d72e4430478453d4f18f7"
+    ],
+    "accepted_at_unix_ms": 1790866420874
+  },
+  {
+    "id": "7cecdb1cb7b99393f82554ffa8ef44533674d21dabb7b2de5a5febaae06fcf43",
+    "store_index": 22,
+    "batch_id": "batch/cobalt/16/7642fd84f76bc17fa7b9213e07918feb6fe7eae833aeac70b97d61f042080f50",
+    "subject": "message/a64154a9358ac749",
+    "kind": "message.closed",
+    "origin": "cobalt",
+    "actor": "agent/eval/fault-probe",
+    "operation_id": "op/6ad298087a36ab2416a6e0eca04ee613f78f9a42d69d2421015043e6f172ee2d",
+    "request_digest": "3ab88dea2ea4415f41c0ddd2e519d5347a7572c73a022936ac1f07c6af5658dd",
+    "body": {
+      "_operation": {
+        "id": "op/6ad298087a36ab2416a6e0eca04ee613f78f9a42d69d2421015043e6f172ee2d",
+        "request_digest": "3ab88dea2ea4415f41c0ddd2e519d5347a7572c73a022936ac1f07c6af5658dd"
+      },
+      "evidence": [],
+      "fields": {
+        "status": "closed"
+      }
+    },
+    "predecessors": [
+      "7bc5591c3707c3bbf73433c43e80761d6652c3c183df326202e073953eaeea44"
+    ],
+    "accepted_at_unix_ms": 1790866420886
+  }
+]

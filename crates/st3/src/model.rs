@@ -514,121 +514,6 @@ pub struct UnderSpec {
     pub reason: Option<String>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-pub struct MissionAuthority {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub publish: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub start: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub revise: Vec<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub cancel: Vec<String>,
-}
-
-impl MissionAuthority {
-    pub fn allows(&self, action: &str, mission: &str) -> bool {
-        let patterns = match action {
-            "publish" => &self.publish,
-            "start" => &self.start,
-            "revise" => &self.revise,
-            "cancel" => &self.cancel,
-            _ => return false,
-        };
-        patterns
-            .iter()
-            .any(|pattern| authority_pattern_matches(pattern, mission))
-    }
-}
-
-/// Where an agent's mission authority comes from.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "lowercase")]
-pub enum MissionAuthoritySource {
-    /// The declaration's `mission-authority` block, or `mission-authority "none"`.
-    Declared,
-    /// A person-declared top-level seat `fleet/PROJECT/...` holds `fleet/PROJECT/*`.
-    Default,
-    /// Neither: a mission-scoped seat, a seat an agent declared, or a name outside `fleet/`.
-    None,
-}
-
-/// The mission authority an agent holds under its current declaration.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct EffectiveMissionAuthority {
-    pub source: MissionAuthoritySource,
-    #[serde(flatten)]
-    pub authority: MissionAuthority,
-}
-
-/// Seats whose queues an agent may reorder, granted by `queue-authority` in its declaration.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct QueueAuthority {
-    pub moves: Vec<String>,
-}
-
-impl QueueAuthority {
-    /// `seat` may carry the `agent/` prefix; patterns never do.
-    pub fn allows_move(&self, seat: &str) -> bool {
-        let seat = seat.strip_prefix("agent/").unwrap_or(seat);
-        self.moves
-            .iter()
-            .any(|pattern| authority_pattern_matches(pattern, seat))
-    }
-}
-
-/// Top-level seats an agent may declare or stop, granted by a person.
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct SeatAuthority {
-    pub declare: Vec<String>,
-    pub stop: Vec<String>,
-}
-
-impl SeatAuthority {
-    pub fn allows(&self, action: &str, seat: &str) -> bool {
-        let seat = seat.strip_prefix("agent/").unwrap_or(seat);
-        let patterns = match action {
-            "declare" => &self.declare,
-            "stop" => &self.stop,
-            _ => return false,
-        };
-        patterns
-            .iter()
-            .any(|pattern| authority_pattern_matches(pattern, seat))
-    }
-}
-
-/// Agent declarations a seat may apply (including starting and stopping them).
-#[derive(Clone, Debug, Default, Eq, PartialEq)]
-pub struct AgentAuthority {
-    pub apply: Vec<String>,
-}
-
-impl AgentAuthority {
-    pub fn allows_apply(&self, agent: &str) -> bool {
-        let agent = agent.strip_prefix("agent/").unwrap_or(agent);
-        self.apply
-            .iter()
-            .any(|pattern| authority_pattern_matches(pattern, agent))
-    }
-}
-
-/// Whether every ID covered by `requested` is also covered by `held`.
-pub fn authority_pattern_contains(held: &str, requested: &str) -> bool {
-    held == requested
-        || held
-            .strip_suffix("/*")
-            .is_some_and(|prefix| requested.starts_with(&format!("{prefix}/")))
-}
-
-/// An authority pattern is an exact ID or a terminal `/*` namespace.
-fn authority_pattern_matches(pattern: &str, id: &str) -> bool {
-    pattern == id
-        || pattern
-            .strip_suffix("/*")
-            .is_some_and(|prefix| id.starts_with(&format!("{prefix}/")))
-}
-
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ScheduleSpec {
     pub stopped: bool,
@@ -2796,7 +2681,7 @@ pub struct ReplicationHealReport {
 }
 
 /// A node's first sync after it joins: it ends once the node holds the same envelopes as a
-/// peer, and it checks that both project the same graph.
+/// peer. Matching registries also check the graph; mixed builds verify the wire log.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ReplicationFirstSync {
     /// `syncing`, `verified`, or `failed`.
@@ -2813,6 +2698,9 @@ pub struct ReplicationFirstSync {
     pub graph_digest: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub peer_graph_digest: Option<String>,
+    /// Mixed builds verify the complete wire log while their projections wait for an upgrade.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_digest: Option<String>,
     /// The graphs matched only after a heal.
     #[serde(default)]
     pub healed: bool,
@@ -2889,7 +2777,11 @@ pub struct ReplicationStatus {
     pub received_envelopes: u64,
     pub pending_records: u64,
     pub valid_records: u64,
+    /// Compatibility name for claims waiting for a newer build.
     pub unknown_records: u64,
+    /// Authenticated claims retained without a projection until this build knows their schema.
+    #[serde(default)]
+    pub waiting_claims: u64,
     pub invalid_records: u64,
     pub repaired_records: u64,
     /// Envelopes of keyed writers held until their writer's signature arrives.
@@ -2974,6 +2866,9 @@ pub struct ReplicationPeerStatus {
     /// Comparable shared tables that differ at the last inventory-aligned comparison.
     #[serde(default)]
     pub differing_tables: Vec<String>,
+    /// Different registries or locally waiting claims make projection comparisons premature.
+    #[serde(default)]
+    pub projection_comparison_waiting: bool,
     /// How far apart the two envelope sets were at the last exchange that measured them.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sync: Option<ReplicationPeerSync>,

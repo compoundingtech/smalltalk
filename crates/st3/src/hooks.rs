@@ -14,25 +14,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use sha2::{Digest as _, Sha256};
 
-/// Each file in the set, by name. The pi and omp channel extensions are the same assets st2
-/// embeds, so the library's pi-family launcher finds its exact extension here.
+/// Each file in the set, by name. The pi and omp extensions belong to st's
+/// daemon channel; historical seats retain the shared driver's original assets.
 pub const FILES: [(&str, &[u8]); 4] = [
-    (
-        "claude-observe.sh",
-        include_bytes!("../hooks/claude-observe.sh"),
-    ),
-    (
-        "claude-statusline.sh",
-        include_bytes!("../hooks/claude-statusline.sh"),
-    ),
-    (
-        "pi-channel.ts",
-        include_bytes!("../../st-drivers/hooks/pi-channel.ts"),
-    ),
-    (
-        "omp-channel.ts",
-        include_bytes!("../../st-drivers/hooks/omp-channel.ts"),
-    ),
+    ("claude-observe.sh", include_bytes!("../hooks/claude-observe.sh")),
+    ("claude-statusline.sh", include_bytes!("../hooks/claude-statusline.sh")),
+    ("pi-channel.ts", include_bytes!("../hooks/pi-channel.ts")),
+    ("omp-channel.ts", include_bytes!("../hooks/omp-channel.ts")),
 ];
 
 /// The file that makes a directory an st3 hook set. st2 skips an `$ST_HOOKS` that holds it.

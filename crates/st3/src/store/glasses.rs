@@ -46,12 +46,15 @@ fn live_claims(claims: Vec<ClaimRecord>) -> Vec<ClaimRecord> {
         .collect()
 }
 
-fn resource(claim: &ClaimRecord) -> Value {
-    json!({"id":claim.subject, "kind":"glass", "revision":claim.id,
-        "body":claim.body["fields"]["body"], "deleted":false,
+fn resource(claim: &ClaimRecord) -> Result<Value> {
+    let body = st3_schema::glasses::body_for_read(&claim.body["fields"]["body"])?;
+    Ok(
+        json!({"id":claim.subject, "kind":"glass", "revision":claim.id,
+        "body":body, "deleted":false,
         "base_revision":claim.body["fields"]["base_revision"],
         "replaced_revision":claim.body["fields"]["replaced_revision"],
-        "updated_at":chrono::DateTime::from_timestamp_millis(i64::try_from(claim.accepted_at_unix_ms).unwrap_or(i64::MAX)).unwrap_or(chrono::DateTime::UNIX_EPOCH).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)})
+        "updated_at":chrono::DateTime::from_timestamp_millis(i64::try_from(claim.accepted_at_unix_ms).unwrap_or(i64::MAX)).unwrap_or(chrono::DateTime::UNIX_EPOCH).to_rfc3339_opts(chrono::SecondsFormat::Millis, true)}),
+    )
 }
 
 pub(super) fn glasses_at(
@@ -62,7 +65,7 @@ pub(super) fn glasses_at(
     let mut result: Vec<_> = live_claims(glass_claims(connection, person, through)?)
         .iter()
         .map(resource)
-        .collect();
+        .collect::<Result<_>>()?;
     result.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
     Ok(result)
 }
@@ -133,11 +136,56 @@ mod tests {
 
     fn input(id: usize, name: &str) -> ClaimInput {
         ClaimInput { subject:format!("glass/person/ada/019a0000-0000-7000-8000-{id:012x}"), kind:"glass.upserted".into(), actor:Some("person/ada".into()),
-            fields:serde_json::from_value(json!({"body":{"name":name,"tabs":[{"layout":{"pane":"home:"}}]},"base_revision":null})).unwrap(), evidence:vec![], expected_subject:None, idempotency_key:None }
+            fields:serde_json::from_value(json!({"body":{"name":name,"layout":{"tabs":[{"pane":"opaque:anything"}]}},"base_revision":null})).unwrap(), evidence:vec![], expected_subject:None, idempotency_key:None }
     }
     fn sync(source: &Store, target: &Store) {
         let exchange = exchange_from(source, &ReplicationInventory::default());
         receive_and_project(target, &source.origin, &exchange);
+    }
+    #[test]
+    fn legacy_glasses_survive_reopen_replication_and_replacement_with_their_revision() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("claims.sqlite");
+        let a = Store::open(&path, "alder").unwrap();
+        let mut legacy = input(1, "Main");
+        let old = json!({"name":"Main","tabs":[{"title":"Work","layout":{
+            "split":"right","children":[{"pane":"opaque:a"},{"pane":"opaque:b"}]
+        }}]});
+        legacy.fields.insert("body".into(), old.clone());
+        let original = a.append_claim(&legacy).unwrap();
+        drop(a);
+        let a = Store::open(&path, "alder").unwrap();
+        let b = Store::open_memory("birch").unwrap();
+        sync(&a, &b);
+        let live = a.glasses("person/ada", u64::MAX).unwrap();
+        assert_eq!(live, b.glasses("person/ada", u64::MAX).unwrap());
+        assert_eq!(live[0]["revision"], original.id);
+        assert_eq!(
+            live[0]["body"],
+            json!({"name":"Main","layout":{"tabs":[
+                {"title":"Work","pane":"opaque:a"},{"pane":"opaque:b"}
+            ]}})
+        );
+        a.rebuild_claim_projections().unwrap();
+        assert_eq!(live, a.glasses("person/ada", u64::MAX).unwrap());
+        let mut replace = input(1, "Renamed");
+        replace
+            .fields
+            .insert("body".into(), live[0]["body"].clone());
+        replace
+            .fields
+            .insert("base_revision".into(), json!(original.id));
+        let replaced = a.append_claim(&replace).unwrap();
+        assert_eq!(replaced.body["fields"]["replaced_revision"], original.id);
+        assert_eq!(
+            a.claims_for(&original.subject, None).unwrap()[0].body["fields"]["body"],
+            old
+        );
+        sync(&a, &b);
+        assert_eq!(
+            a.glasses("person/ada", u64::MAX).unwrap(),
+            b.glasses("person/ada", u64::MAX).unwrap()
+        );
     }
     #[test]
     fn glass_stale_revisions_idempotency_and_retirement() {
