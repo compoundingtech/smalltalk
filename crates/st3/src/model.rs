@@ -1465,6 +1465,18 @@ pub struct AttentionActionView {
     pub argv: Vec<String>,
 }
 
+/// A current fault and the agent that owns it. No fault waits on a person.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct FaultView {
+    /// The agent assigned to the failed step, else the run's requester when that is an agent,
+    /// else the fleet's fault agent: a live agent declared with `handles-faults`. None when no
+    /// agent can take it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(flatten)]
+    pub item: AttentionItemView,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct AttentionItemView {
     #[serde(default)]

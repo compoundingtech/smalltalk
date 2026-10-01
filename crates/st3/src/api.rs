@@ -4617,6 +4617,22 @@ fn github_usage_checks(usage: &crate::resource::GithubUsageReport, now: u128) ->
 }
 
 /// Every person's open attention items that have waited more than a day, oldest first.
+/// Every person's attention, then every fault under the agent that owns it, so an old fault
+/// that no agent took up still shows in doctor.
+fn doctor_attention_items(
+    store: &Store,
+    now: u128,
+) -> anyhow::Result<Vec<crate::model::AttentionItemView>> {
+    let mut items = store.attention_snapshot(None, now)?;
+    items.extend(store.fault_snapshot(now)?.into_iter().map(|fault| {
+        crate::model::AttentionItemView {
+            person: fault.owner.unwrap_or_else(|| "no owning agent".into()),
+            ..fault.item
+        }
+    }));
+    Ok(items)
+}
+
 fn stale_attention_check(items: &[crate::model::AttentionItemView], now: u128) -> DoctorCheck {
     const DAY_MS: u128 = 86_400_000;
     const LISTED: usize = 20;
@@ -4657,7 +4673,7 @@ fn stale_attention_check(items: &[crate::model::AttentionItemView], now: u128) -
         name: "attention-age".into(),
         status: "warn".into(),
         message: format!(
-            "{} attention items have been open for more than a day; `st attention ls --as PERSON` shows how to close each: {}",
+            "{} attention items have been open for more than a day; `st attention ls --as PERSON` shows how to close a person's item, and a fault closes at its source: {}",
             stale.len(),
             listed.join("; ")
         ),
@@ -5420,10 +5436,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         }),
     }
     checks.push(stale_attention_check(
-        &state
-            .store
-            .attention_items(None)
-            .map_err(ApiError::internal)?,
+        &doctor_attention_items(&state.store, client_now_ms()).map_err(ApiError::internal)?,
         client_now_ms(),
     ));
     let report_status = if checks.iter().any(|check| check.status == "fail") {
@@ -13811,7 +13824,8 @@ agent "good" {{ workspace {:?}; command "true" }}
                 )
                 .unwrap();
         }
-        let items = state.store.attention_items(None).unwrap();
+        assert!(state.store.attention_items(None).unwrap().is_empty());
+        let items = doctor_attention_items(&state.store, client_now_ms()).unwrap();
         assert_eq!(items.len(), 2);
         let requested = items
             .iter()
@@ -13836,7 +13850,7 @@ agent "good" {{ workspace {:?}; command "true" }}
         assert!(
             stale
                 .message
-                .contains("daemon/first for person/alex, open 2d 3h: Renew the signing key"),
+                .contains("daemon/first for no owning agent, open 2d 3h: Renew the signing key"),
             "{}",
             stale.message
         );
@@ -18474,37 +18488,31 @@ version 2
     }
 
     #[tokio::test]
-    async fn client_now_keeps_attention_priority_order_and_fault_details() {
+    async fn client_now_never_lists_a_fault() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let store = state.store.clone();
-        for (subject, severity) in [("daemon/low", "warning"), ("daemon/high", "error")] {
-            store
-                .record_operational_failure(
-                    subject,
-                    &AttentionRequest {
-                        reviewer: "person/alex".into(),
-                        title: format!("Fault {severity}"),
-                        reason: "The subscription needs a correction.".into(),
-                        severity: severity.into(),
-                        targets: vec![subject.into()],
-                        actor: "daemon/runtime".into(),
-                        idempotency_key: subject.into(),
-                    },
-                )
-                .unwrap();
-        }
+        store
+            .record_operational_failure(
+                "daemon/high",
+                &AttentionRequest {
+                    reviewer: "person/alex".into(),
+                    title: "Fault error".into(),
+                    reason: "The subscription needs a correction.".into(),
+                    severity: "error".into(),
+                    targets: vec!["daemon/high".into()],
+                    actor: "daemon/runtime".into(),
+                    idempotency_key: "daemon/high".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(store.fault_snapshot(client_now_ms()).unwrap().len(), 1);
         let app = router(state);
-        let (status, page) = get_request(app, "/v1/client/now?person=person%2Falex").await;
-        assert_eq!(status, StatusCode::OK, "{page}");
-        assert_eq!(page["items"][0]["source_id"], "daemon/high");
-        assert_eq!(page["items"][1]["source_id"], "daemon/low");
-        assert_eq!(page["items"][0]["what"], "Fault error");
-        assert_eq!(
-            page["items"][0]["because"],
-            "The subscription needs a correction."
-        );
-        assert!(page["items"][0]["actions"].as_array().unwrap().is_empty());
+        for path in ["/v1/client/now?person=person%2Falex", "/v1/client/now"] {
+            let (status, page) = get_request(app.clone(), path).await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            assert_eq!(page["items"], json!([]), "{path}");
+        }
     }
 
     #[test]
@@ -18608,7 +18616,7 @@ agent "seat" { workspace "/tmp"; command "true" }
     }
 
     #[test]
-    fn source_failure_priorities_are_shared_across_readers() {
+    fn source_failure_priorities_order_faults_and_never_reach_attention() {
         let store = Store::open_memory("alder").unwrap();
         for severity in ["warning", "error"] {
             store
@@ -18626,11 +18634,15 @@ agent "seat" { workspace "/tmp"; command "true" }
                 )
                 .unwrap();
         }
+        let faults = store.fault_snapshot(client_now_ms()).unwrap();
+        assert_eq!(faults[0].item.priority, "high");
+        assert_eq!(faults[1].item.priority, "normal");
         for history in [false, true] {
-            let resources =
-                client_attention_resources(&store, Some("person/avery"), history).unwrap();
-            assert_eq!(resources[0]["priority"], "high");
-            assert_eq!(resources[1]["priority"], "normal");
+            assert!(
+                client_attention_resources(&store, Some("person/avery"), history)
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 

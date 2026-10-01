@@ -1455,27 +1455,24 @@ mod tests {
             status["delivery"]["state"], "read",
             "the sender sees the read receipt"
         );
-        let attention = client
-            .attention_list(None, Some(50), false)
-            .await
-            .unwrap()
-            .value
-            .items
-            .into_iter()
-            .find_map(|item| match item {
-                Resource::Attention(item) if item.source_id == "message/hidden" => {
-                    Some(item.header.id)
-                }
-                _ => None,
-            })
-            .unwrap();
-        crate::attention_action(&client, "person/avery", &attention, "message.read", None)
-            .await
-            .unwrap();
+        // Messages stay in conversations: Home never lists the unread one.
+        assert!(
+            client
+                .attention_list(None, Some(50), false)
+                .await
+                .unwrap()
+                .value
+                .items
+                .iter()
+                .all(|item| match item {
+                    Resource::Attention(item) => item.source_id != "message/hidden",
+                    _ => true,
+                })
+        );
         assert_eq!(
             store.message("message/hidden").unwrap().unwrap().status,
-            "read",
-            "explicit Home mark-read works too"
+            "sent",
+            "an unread message stays unread"
         );
         ui.help = true;
         terminal.draw(|frame| ui.render(frame)).unwrap();

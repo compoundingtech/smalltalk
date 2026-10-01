@@ -48,7 +48,8 @@ export default githubRepoSettings({
           // The repository merges with merge commits today (the st train did).
           merge_method: 'MERGE',
           grouping_strategy: 'ALLGREEN',
-          // More than one entry builds at a time, so entries test ahead of the one being merged.
+          // Namespace's measured Linux limit is 320 vCPU / 640 GiB. Each full Workspace CI group
+          // initially requests 64 vCPU / 128 GiB, so five groups fit; PR and main jobs share capacity.
           max_entries_to_build: 5,
           max_entries_to_merge: 5,
           min_entries_to_merge: 1,

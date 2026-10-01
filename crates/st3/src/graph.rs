@@ -2383,6 +2383,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "render",
         "harness",
         "fresh-context",
+        "handles-faults",
         "mission-authority",
         "queue-authority",
         "seat-authority",
@@ -2420,12 +2421,16 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "render",
         "harness",
         "fresh-context",
+        "handles-faults",
         "mission-authority",
         "queue-authority",
         "seat-authority",
         "agent-authority",
     ] {
         unique_child(document, child)?;
+    }
+    if let Some(flag) = unique_child(document, "handles-faults")? {
+        ensure_bare(flag)?;
     }
     if let Some(tags) = unique_child(document, "tags")? {
         validate_tags(tags)?;

@@ -20,8 +20,8 @@ use crate::model::{
     ApplyResponse, AttentionActionView, AttentionClosing, AttentionItemView, AttentionRequest,
     AttentionRequestView, AttentionResolveRequest, AttentionWithdrawRequest, Capability,
     ClaimInput, ClaimRecord, ClaimsPage, ContextUsage, DependencySpec, DesiredSubject, EventRecord,
-    HumanReviewView, IntentInput, LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS, MessageView,
-    MissionDefinitionView, MissionInputKind, MissionOutputView, MissionResponse,
+    FaultView, HumanReviewView, IntentInput, LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS,
+    MessageView, MissionDefinitionView, MissionInputKind, MissionOutputView, MissionResponse,
     MissionRevisionOperation, MissionRunDeclaration, MissionRunInput, MissionRunOutcomeView,
     MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent,
     OperationalAnnotation, OperationalRepairItem, OperationalRepairPlan, OperationalRepairResult,
@@ -10034,64 +10034,52 @@ impl Store {
         self.attention_snapshot(person, now_ms())
     }
 
+    /// The current faults raised for `person` under the reviewer each one names, owners aside.
+    #[cfg(test)]
+    pub(crate) fn fault_items(&self, person: Option<&str>) -> Result<Vec<AttentionItemView>> {
+        Ok(self
+            .fault_snapshot(now_ms())?
+            .into_iter()
+            .map(|fault| fault.item)
+            .filter(|item| person.is_none_or(|person| item.person == person))
+            .collect())
+    }
+
+    /// What waits on `person` and no agent can resolve: requests (person steps and agents'
+    /// asks) and reviews (human gates, launch and revision approvals). Messages stay in
+    /// conversations, and a fault goes to the agent that owns it, see `fault_snapshot`.
     pub fn attention_snapshot(
         &self,
         person: Option<&str>,
         as_of: u128,
     ) -> Result<Vec<AttentionItemView>> {
         let mut items = self.mission_run_attention_items(person)?;
+        items.extend(self.person_attention_items(person, as_of)?);
+        self.current_attention(items, as_of)
+    }
 
-        // Only a person's messages need attention. Without a person, read each person's
-        // mailbox through the recipient index instead of every open message in the fleet.
-        let messages = match person {
-            Some(person) => self.messages(Some(person), false)?,
-            None => {
-                let people = {
-                    let connection = self.readers.get();
-                    let mut statement = connection.prepare(
-                        "SELECT DISTINCT json_extract(body, '$.fields.to')
-                         FROM claims INDEXED BY claims_message_to_index
-                         WHERE kind='message.sent'
-                           AND json_extract(body, '$.fields.to') >= 'person/'
-                           AND json_extract(body, '$.fields.to') < 'person0'",
-                    )?;
-                    statement
-                        .query_map([], |row| row.get::<_, String>(0))?
-                        .collect::<Result<Vec<_>, _>>()?
-                };
-                let mut messages = Vec::new();
-                for person in people {
-                    messages.extend(self.messages(Some(&person), false)?);
-                }
-                messages
-            }
-        };
-        let messages = selected_actionable_messages(&self.readers.get(), messages)?;
-        if !messages.is_empty() {
-            let connection = self.readers.get();
-            for message in messages.into_iter().filter(|message| {
-                message.to.starts_with("person/")
-                    && matches!(message.status.as_str(), "sent" | "delivered")
-            }) {
-                // The message's first claim in canonical order, so every node that holds it
-                // shows the same wait.
-                let requested_at_unix_ms = connection.query_row(
-                    &canonical_sql(
-                        "SELECT accepted_at_unix_ms FROM claims
-                     WHERE subject=?1
-                     ORDER BY CANONICAL_ASC(claims)
-                     LIMIT 1",
-                    ),
-                    [&message.subject],
-                    |row| row.get::<_, String>(0),
-                )?;
-                items.push(attention_item_from_message(
-                    message,
-                    requested_at_unix_ms.parse().unwrap_or(0),
-                ));
-            }
-        }
+    /// Every current fault, each with the agent that owns it: the agent assigned to the failed
+    /// step, else the run's requester when that is an agent, else the fleet's fault agent. No
+    /// fault is a person's: the owning agent retries, revises or cancels, and asks a person
+    /// only for what only a person can give.
+    pub fn fault_snapshot(&self, as_of: u128) -> Result<Vec<FaultView>> {
+        let mut items = self.subscription_fault_items(as_of)?;
+        items.extend(self.operational_attention_items(None, as_of)?);
+        items.extend(self.checkpoint_attention_items(None, as_of)?);
+        let fallback = self.fleet_fault_agent()?;
+        self.current_attention(items, as_of)?
+            .into_iter()
+            .map(|item| {
+                Ok(FaultView {
+                    owner: self.fault_owner(&item, fallback.as_deref())?,
+                    item,
+                })
+            })
+            .collect()
+    }
 
+    fn subscription_fault_items(&self, as_of: u128) -> Result<Vec<AttentionItemView>> {
+        let mut items = Vec::new();
         {
             let connection = self.readers.get();
             let mut statement = connection.prepare(
@@ -10125,9 +10113,6 @@ impl Store {
                 let reviewer = requester
                     .filter(|value| value.starts_with("person/"))
                     .unwrap_or_else(|| "person/operator".into());
-                if person.is_some_and(|person| !reviewer.is_empty() && person != reviewer) {
-                    continue;
-                }
                 let code = fields
                     .get("code")
                     .and_then(Value::as_str)
@@ -10167,9 +10152,15 @@ impl Store {
                 });
             }
         }
-        items.extend(self.person_attention_items(person, as_of)?);
-        items.extend(self.operational_attention_items(person, as_of)?);
-        items.extend(self.checkpoint_attention_items(person, as_of)?);
+        Ok(items)
+    }
+
+    /// Keep the items requested by `as_of` whose run is still current, then order them.
+    fn current_attention(
+        &self,
+        mut items: Vec<AttentionItemView>,
+        as_of: u128,
+    ) -> Result<Vec<AttentionItemView>> {
         let connection = self.readers.get();
         items.retain(|item| item.requested_at_unix_ms <= as_of);
         let mut live = Vec::new();
@@ -16028,16 +16019,25 @@ fn check_mailbox_incarnation(
     connection: &Connection,
     fence: &crate::mailbox::Fence,
 ) -> Result<(), St3Error> {
-    let runtime: Option<String> = connection
+    let runtime: Option<(String, String)> = connection
         .prepare_cached(&format!(
             "{} LIMIT 1",
-            newest_claims_of_kind_query("claims.body", "runtime.observed")
+            newest_claims_of_kind_query("claims.id, claims.body", "runtime.observed")
         ))
         .map_err(internal)?
-        .query_row(params![fence.subject, i64::MAX], |row| row.get(0))
+        .query_row(params![fence.subject, i64::MAX], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .optional()
         .map_err(internal)?;
-    let runtime: Value = serde_json::from_str(&runtime.unwrap_or_default()).unwrap_or(Value::Null);
+    let runtime_claim = runtime.as_ref().map(|(claim, _)| claim.as_str());
+    let runtime: Value = serde_json::from_str(
+        runtime
+            .as_ref()
+            .map(|(_, body)| body.as_str())
+            .unwrap_or_default(),
+    )
+    .unwrap_or(Value::Null);
     let fields = runtime.get("fields").unwrap_or(&runtime);
     let live = fields.get("status").and_then(Value::as_str) == Some("running")
         && fields.get("incarnation_id").and_then(Value::as_str) == Some(&fence.incarnation);
@@ -16078,9 +16078,8 @@ fn check_mailbox_incarnation(
             }
         }
     }
-    let ended = current_harness_at(connection, &fence.subject, None)
-        .map_err(internal)?
-        .is_some_and(|harness| harness.state == "ended");
+    let ended = live
+        && mailbox_harness_ended(connection, fence, runtime_claim.unwrap()).map_err(internal)?;
     if !live || ended {
         return Err(St3Error::new(
             "stale-mailbox-session",
@@ -16089,6 +16088,51 @@ fn check_mailbox_incarnation(
     }
 
     Ok(())
+}
+
+/// Mailbox authorization needs the state, not the optional display fields accumulated by
+/// `current_harness_at`. Sparse observations can leave those fields unknown forever, making
+/// a display fold walk every prior incarnation on every graph wake.
+fn mailbox_harness_ended(
+    connection: &Connection,
+    fence: &crate::mailbox::Fence,
+    runtime_claim: &str,
+) -> Result<bool> {
+    let mut statement = connection.prepare_cached(&newest_claims_of_kind_query(
+        "claims.id, claims.body",
+        "harness.observed",
+    ))?;
+    let mut rows = statement.query(params![fence.subject, i64::MAX])?;
+    let mut runtime_key = None;
+    while let Some(row) = rows.next()? {
+        let claim: String = row.get(0)?;
+        let body: String = row.get(1)?;
+        let body: Value = serde_json::from_str(&body)?;
+        let fields = body.get("fields").unwrap_or(&body);
+        let belongs = match fields.get("incarnation_id").and_then(Value::as_str) {
+            Some(incarnation) => incarnation == fence.incarnation,
+            None => {
+                let key = match &runtime_key {
+                    Some(key) => key,
+                    None => runtime_key.insert(canonical::claim_key(connection, runtime_claim)?),
+                };
+                canonical::claim_key(connection, &claim)? > *key
+            }
+        };
+        if !belongs {
+            continue;
+        }
+        if let Some(state) = fields.get("state").and_then(Value::as_str) {
+            if state != "ended" {
+                return Ok(false);
+            }
+            // Diagnostics or newer work activity can override an ended observation. Keep
+            // exactly the existing reduction for that exceptional case.
+            return Ok(current_harness_at(connection, &fence.subject, None)?
+                .is_some_and(|harness| harness.state == "ended"));
+        }
+    }
+    Ok(false)
 }
 
 fn check_mailbox_fence(
@@ -17306,44 +17350,6 @@ fn attention_item_from_revision(
                 ],
             ),
         ],
-    }
-}
-
-fn attention_item_from_message(
-    message: MessageView,
-    requested_at_unix_ms: u128,
-) -> AttentionItemView {
-    AttentionItemView {
-        episode: message.subject.clone(),
-        priority: "normal".into(),
-        kind: "unread-message".into(),
-        review_mode: None,
-        subject: message.subject.clone(),
-        person: message.to.clone(),
-        requester_id: Some(message.from.clone()),
-        launch_id: None,
-        variant_id: None,
-        message_id: Some(message.subject.clone()),
-        title: message
-            .title
-            .unwrap_or_else(|| format!("Message from {}", message.from)),
-        detail: format!("Unread message from {}.", message.from),
-        mission: None,
-        mission_run: None,
-        step: None,
-        targets: Vec::new(),
-        requested_at_unix_ms,
-        actions: vec![attention_action(
-            "read",
-            &[
-                "st",
-                "conversations",
-                "read",
-                &message.subject,
-                "--as",
-                &message.to,
-            ],
-        )],
     }
 }
 
@@ -33345,6 +33351,162 @@ version 2
         assert_eq!(store.claims_for("agent/example", None).unwrap().len(), 21);
     }
 
+    #[test]
+    fn mailbox_state_read_preserves_ended_diagnostic_work_and_legacy_semantics() {
+        let store = Store::open_memory("alder").unwrap();
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        let subject = "agent/example";
+        let fence = crate::mailbox::Fence::new(subject, "current", "delivery");
+        let mut sequence = 0;
+        let mut insert = |kind: &str, fields: Value| {
+            sequence += 1;
+            let id = format!("claim-{sequence}");
+            let time = sequence.to_string();
+            transaction
+                .execute(
+                    "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+                 VALUES(?1,'alder',?2,?1,?3)",
+                    params![id, sequence, time],
+                )
+                .unwrap();
+            transaction.execute(
+                "INSERT INTO claims(id,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms)
+                 VALUES(?1,?1,?2,?3,'alder',?2,?4,'[]',?5)",
+                params![id, subject, kind, json!({"fields": fields}).to_string(), time],
+            ).unwrap();
+        };
+        insert(
+            "runtime.observed",
+            json!({"status":"running","incarnation_id":"current"}),
+        );
+        for (kind, fields, expected_ended) in [
+            (
+                "harness.observed",
+                json!({"state":"ended","incarnation_id":"prior"}),
+                false,
+            ),
+            (
+                "harness.observed",
+                json!({"state":"idle","incarnation_id":"current"}),
+                false,
+            ),
+            (
+                "harness.observed",
+                json!({"state":"ended","incarnation_id":"current"}),
+                true,
+            ),
+            (
+                "harness.observed",
+                json!({"driver":"claude","incarnation_id":"current"}),
+                true,
+            ),
+            (
+                "harness.diagnostic",
+                json!({"code":"provider-auth-expired","incarnation_id":"current"}),
+                false,
+            ),
+            (
+                "harness.diagnostic",
+                json!({"code":"provider-auth-restored","incarnation_id":"current"}),
+                true,
+            ),
+            (
+                "work.progress",
+                json!({"claim_incarnation":"current"}),
+                false,
+            ),
+            ("harness.observed", json!({"state":"ended"}), true),
+            ("harness.observed", json!({"state":"idle"}), false),
+        ] {
+            insert(kind, fields);
+            let ended = current_harness_at(&transaction, subject, None)
+                .unwrap()
+                .is_some_and(|harness| harness.state == "ended");
+            assert_eq!(ended, expected_ended, "{kind}");
+            assert_eq!(
+                check_mailbox_incarnation(&transaction, &fence).is_err(),
+                ended,
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn mailbox_fence_cost_does_not_grow_with_sparse_prior_incarnations() {
+        let store = Store::open_memory("alder").unwrap();
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        let insert = |id: &str, kind: &str, fields: Value, time: &str| {
+            transaction
+                .execute(
+                    "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+                 VALUES(?1,'alder',1,?1,?2)",
+                    params![id, time],
+                )
+                .unwrap();
+            transaction.execute(
+                "INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+                 VALUES(?1,?1,'agent/example',?2,'alder',?3,'[]',?4)",
+                params![id, kind, json!({"fields": fields}).to_string(), time],
+            ).unwrap();
+        };
+        insert(
+            "runtime",
+            "runtime.observed",
+            json!({"status":"running", "incarnation_id":"current"}),
+            "20000",
+        );
+        insert(
+            "current",
+            "harness.observed",
+            json!({"state":"idle", "incarnation_id":"current"}),
+            "20001",
+        );
+        let fence = crate::mailbox::Fence::new("agent/example", "current", "delivery");
+        // Count the actual statements used by the fence, including the previous display fold.
+        // Cached statement reset does not reset SQLite's VM step counter.
+        let queries = [
+            newest_claims_of_kind_query("claims.id, claims.body", "harness.observed"),
+            newest_claims_of_kind_query(
+                "claims.id, claims.store_index, claims.body, claims.accepted_at_unix_ms",
+                "harness.observed",
+            ),
+        ];
+        let mut costs = Vec::new();
+        for n in 1..=10_000 {
+            insert(
+                &format!("old-{n}"),
+                "harness.observed",
+                json!({"state":"working", "incarnation_id":"prior"}),
+                &n.to_string(),
+            );
+            if n == 100 || n == 10_000 {
+                for query in &queries {
+                    transaction
+                        .prepare_cached(query)
+                        .unwrap()
+                        .reset_status(rusqlite::StatementStatus::VmStep);
+                }
+                check_mailbox_incarnation(&transaction, &fence).unwrap();
+                let cost: i32 = queries
+                    .iter()
+                    .map(|query| {
+                        transaction
+                            .prepare_cached(query)
+                            .unwrap()
+                            .get_status(rusqlite::StatementStatus::VmStep)
+                    })
+                    .sum();
+                costs.push(cost);
+            }
+        }
+        assert!(
+            costs[1] <= costs[0] * 2 && costs[1] < 1_000,
+            "a live fence must read its state, not its optional display history: {costs:?}"
+        );
+    }
+
     /// The reads behind the session list, a mission detail and the missions tree seek or walk an
     /// index whose part they read is what they show: one incarnation's claims, the newest
     /// observations, the open runs and steps. None reads or sorts every claim of a kind, every
@@ -40407,7 +40569,7 @@ mission "typecase" state="ready" {
     }
 
     #[test]
-    fn desired_person_messages_appear_in_attention_without_a_sent_claim() {
+    fn a_declared_person_message_stays_in_conversations_and_out_of_attention() {
         let store = Store::open_memory("node").unwrap();
         let source = r#"
 version 2
@@ -40432,32 +40594,20 @@ message "human-attention" {
             .apply(&intent, &preview.subject_tokens, "desired-human-attention")
             .unwrap();
 
-        let items = store.attention_items(Some("person/alex")).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, "unread-message");
-        assert_eq!(items[0].title, "Please review");
-        assert!(items[0].requested_at_unix_ms > 0);
-        assert_eq!(
-            items[0].actions[0].argv,
-            [
-                "st",
-                "conversations",
-                "read",
-                "message/human-attention",
-                "--as",
-                "person/alex",
-            ]
-        );
+        let mailbox = store.messages(Some("person/alex"), false).unwrap();
+        assert_eq!(mailbox.len(), 1);
+        assert_eq!(mailbox[0].title.as_deref(), Some("Please review"));
         assert!(
             store
-                .claims_for("message/human-attention", Some("message.sent"))
+                .attention_items(Some("person/alex"))
                 .unwrap()
                 .is_empty()
         );
+        assert!(store.attention_items(None).unwrap().is_empty());
     }
 
     #[test]
-    fn unread_person_messages_leave_attention_after_read() {
+    fn an_unread_person_message_never_enters_attention() {
         let store = Store::open_memory("node").unwrap();
         let message = store
             .append_claim(&ClaimInput {
@@ -40467,6 +40617,7 @@ message "human-attention" {
                 fields: BTreeMap::from([
                     ("from".into(), Value::String("agent/demo/worker".into())),
                     ("to".into(), Value::String("person/alex".into())),
+                    ("title".into(), Value::String("Can you look?".into())),
                     ("content".into(), Value::String("Please read this.".into())),
                     ("status".into(), Value::String("sent".into())),
                 ]),
@@ -40475,10 +40626,14 @@ message "human-attention" {
                 idempotency_key: Some("human-attention-message".into()),
             })
             .unwrap();
-        let items = store.attention_items(Some("person/alex")).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, "unread-message");
-        assert_eq!(items[0].actions[0].label, "read");
+        let quiet = |store: &Store| {
+            store
+                .attention_items(Some("person/alex"))
+                .unwrap()
+                .is_empty()
+                && store.attention_items(None).unwrap().is_empty()
+        };
+        assert!(quiet(&store));
 
         store
             .append_claim(&ClaimInput {
@@ -40494,26 +40649,10 @@ message "human-attention" {
                 idempotency_key: Some("deliver-human-attention-message".into()),
             })
             .unwrap();
+        assert!(quiet(&store));
         assert_eq!(
-            store.attention_items(Some("person/alex")).unwrap()[0].kind,
-            "unread-message"
-        );
-        store
-            .append_claim(&ClaimInput {
-                subject: message.subject,
-                kind: "message.read".into(),
-                actor: Some("person/alex".into()),
-                fields: BTreeMap::from([("status".into(), Value::String("read".into()))]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some("read-human-attention-message".into()),
-            })
-            .unwrap();
-        assert!(
-            store
-                .attention_items(Some("person/alex"))
-                .unwrap()
-                .is_empty()
+            store.messages(Some("person/alex"), false).unwrap()[0].status,
+            "delivered"
         );
     }
 

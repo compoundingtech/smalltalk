@@ -111,6 +111,9 @@ enum Command {
         command: LaunchCommand,
     },
     /// Show and manage work that needs a person.
+    #[command(
+        after_help = "Messages never appear here; read them with `st conversations`.\nFaults never appear here; st sends each one to the agent that owns it, which asks a person with `st work ask` only if it needs to."
+    )]
     Attention {
         #[command(subcommand)]
         command: AttentionCommand,
