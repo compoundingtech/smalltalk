@@ -171,6 +171,23 @@ fn signal_changed(state: &AppState) {
     signal_visible_change(state);
 }
 
+/// The reconciler reads a message only when it is a work wake, tagged `st3-work:`.
+pub(crate) fn is_work_wake(tags: &[String]) -> bool {
+    tags.iter().any(|tag| tag.starts_with("st3-work:"))
+}
+
+/// A message write wakes the reconciler only for a work wake, since the reconciler reads no other
+/// message. Agents' and people's conversations and the delivery probes write five claims for each
+/// message, and each woke a reconcile pass on every member. Clients, mailboxes and peers still
+/// hear of every message.
+pub(crate) fn signal_message_changed(state: &AppState, kind: &str, work_wake: bool) {
+    if work_wake {
+        signal_claim_changed(state, kind);
+    } else {
+        signal_visible_change(state);
+    }
+}
+
 /// [`signal_changed`] for a claim, counting the wake under the claim's kind.
 fn signal_claim_changed(state: &AppState, kind: &str) {
     crate::performance::record_wake("api", Some(kind));
@@ -8058,6 +8075,16 @@ async fn post_claim(
             signal_local_change(&state);
         } else if kind == "harness.usage" {
             signal_visible_change(&state);
+        } else if kind.starts_with("message.") {
+            let store = state.store.clone();
+            let subject = response.subject.clone();
+            // A message this store cannot read is treated as a work wake.
+            let work_wake = blocking_store(move || store.message(&subject))
+                .await
+                .ok()
+                .flatten()
+                .is_none_or(|message| is_work_wake(&message.tags));
+            signal_message_changed(&state, &kind, work_wake);
         } else {
             signal_claim_changed(&state, &kind);
         }
@@ -8650,10 +8677,17 @@ fn accept_message(
             idempotency_key: Some(request.idempotency_key),
         })
         .map_err(ApiError::bad)?;
+    let mut work_wake = is_work_wake(&request.tags);
     if let Some(parent) = request.in_reply_to.as_deref() {
+        // Settling the parent writes its lifecycle claims too.
+        work_wake |= state
+            .store
+            .message(&message_subject(parent))
+            .map_err(ApiError::internal)?
+            .is_none_or(|message| is_work_wake(&message.tags));
         settle_answered_message(&state.store, parent, &from, &to, &subject, &record.id)?;
     }
-    signal_changed(state);
+    signal_message_changed(state, "message.sent", work_wake);
     Ok(Json(MessageView {
         subject,
         from,
@@ -8916,10 +8950,11 @@ async fn post_message_claim(
                 idempotency_key: Some(request.idempotency_key),
             })
             .map_err(ApiError::bad)?;
-        Ok(record)
+        Ok((record, is_work_wake(&message.tags)))
     })
     .await?;
-    signal_changed(&state);
+    let (record, work_wake) = record;
+    signal_message_changed(&state, kind, work_wake);
     Ok(Json(record))
 }
 
@@ -13048,6 +13083,69 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn only_work_wake_messages_wake_the_reconciler() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        let woke = || {
+            let notify = state.notify.clone();
+            async move {
+                tokio::time::timeout(Duration::from_millis(50), notify.notified())
+                    .await
+                    .is_ok()
+            }
+        };
+        let _ = woke().await;
+        let mut events = state.event_notify.subscribe();
+        let send = |key: &str, tags: &[&str]| {
+            serde_json::to_value(MessageSendRequest {
+                idempotency_key: key.into(),
+                from: "person/example".into(),
+                to: "agent/receiver".into(),
+                content: "A note.".into(),
+                title: None,
+                in_reply_to: None,
+                tags: tags.iter().map(|tag| (*tag).to_owned()).collect(),
+            })
+            .unwrap()
+        };
+        // A conversation and its lifecycle reach clients but never wake the reconciler.
+        let (status, sent) =
+            json_request(app.clone(), "/v1/messages", send("talk", &["chat"])).await;
+        assert_eq!(status, StatusCode::OK, "{sent}");
+        assert!(!woke().await, "a conversation message woke the reconciler");
+        assert!(events.has_changed().unwrap());
+        events.borrow_and_update();
+        let id = sent["value"]["subject"]
+            .as_str()
+            .or(sent["subject"].as_str())
+            .unwrap()
+            .trim_start_matches("message/")
+            .to_owned();
+        let (status, claim) = json_request(
+            app.clone(),
+            &format!("/v1/messages/{id}/claims"),
+            json!({"lifecycle": "delivered", "actor": "agent/receiver", "idempotency_key": "talk-delivered"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{claim}");
+        assert!(
+            !woke().await,
+            "a conversation message's lifecycle woke the reconciler"
+        );
+        assert!(events.has_changed().unwrap());
+        // A work wake does.
+        let (status, sent) = json_request(
+            app.clone(),
+            "/v1/messages",
+            send("wake", &["st3-work:step-run/example/work"]),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{sent}");
+        assert!(woke().await, "a work wake did not wake the reconciler");
     }
 
     #[tokio::test]

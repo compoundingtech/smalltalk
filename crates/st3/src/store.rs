@@ -1133,6 +1133,15 @@ fn subject_status_at(
     )))
 }
 
+/// Subject `?1`'s newest claim of kind `?2` in canonical order. See [`Store::latest_claim`].
+fn latest_claim_of_kind_query() -> String {
+    format!(
+        "SELECT {CLAIM_COLUMNS} FROM claims INDEXED BY claims_subject_kind_accepted_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind=?2 ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+    )
+}
+
 fn claims_for_subject_query(kind: bool) -> String {
     let kind = if kind { " AND claims.kind=?2" } else { "" };
     format!(
@@ -11090,15 +11099,17 @@ impl Store {
     /// The latest claim of a subject, or of one kind of it, in canonical order.
     pub fn latest_claim(&self, subject: &str, kind: Option<&str>) -> Result<Option<ClaimRecord>> {
         let connection = self.readers.get();
-        let filter = if kind.is_some() {
-            " AND claims.kind=?2"
+        // With a kind, walk the accepted-time index newest first and sort only claims accepted in
+        // the same millisecond, as `newest_claims_of_kind_query` does. Sorting every claim of the
+        // kind made the reconciler's once-per-pass checks of every settled stop cost a pass 70 ms.
+        let query = if kind.is_some() {
+            latest_claim_of_kind_query()
         } else {
-            " AND ?2 IS NULL"
+            format!(
+                "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
+                 WHERE claims.subject=?1 AND ?2 IS NULL ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+            )
         };
-        let query = format!(
-            "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
-             WHERE claims.subject=?1{filter} ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
-        );
         connection
             .prepare_cached(&query)?
             .query_row(params![subject, kind], claim_from_row)
@@ -15006,12 +15017,28 @@ impl Store {
     }
 
     /// True only when at least one new claim was projected and every new claim
-    /// is a usage sample or a lease renewal. Other projection changes must
+    /// is a usage sample, a lease renewal, or a lifecycle claim of a message that is not a
+    /// work wake (the reconciler reads no other message). Other projection changes must
     /// still run the reconciler, including a recovered stale projection.
     pub fn claims_since_only_quiet_notifications(&self, after_index: u64) -> Result<bool> {
         let connection = self.readers.get();
         let (total, other): (u64, u64) = connection.query_row(
-            "SELECT COUNT(*), COUNT(*) FILTER (WHERE kind NOT IN ('harness.usage', 'work.renewed'))
+            "SELECT COUNT(*), COUNT(*) FILTER (
+                 WHERE kind NOT IN ('harness.usage', 'work.renewed')
+                   AND NOT (
+                     kind IN ('message.sent', 'message.staged', 'message.delivered',
+                              'message.read', 'message.closed')
+                     AND EXISTS (
+                       SELECT 1 FROM claims sent
+                       WHERE sent.subject=claims.subject AND sent.kind='message.sent'
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1 FROM claims sent
+                       WHERE sent.subject=claims.subject AND sent.kind='message.sent'
+                         AND instr(sent.body, 'st3-work:')>0
+                     )
+                   )
+             )
              FROM claims WHERE store_index > ?1",
             [after_index],
             |row| Ok((row.get(0)?, row.get(1)?)),
@@ -33433,6 +33460,56 @@ mod tests {
     }
 
     #[test]
+    fn only_work_wake_messages_count_as_reconciler_changes() {
+        let store = Store::open_memory("node").unwrap();
+        let append = |subject: &str, kind: &str, fields: Value| {
+            let mut connection = store.connection.lock().unwrap();
+            let transaction = connection.transaction().unwrap();
+            append_claim_tx(
+                &transaction,
+                &store.origin,
+                subject,
+                kind,
+                Some("agent/node.test"),
+                &json!({"fields": fields}),
+                &[],
+                None,
+            )
+            .unwrap();
+            transaction.commit().unwrap();
+        };
+        let sent = |tags: Value| {
+            json!({"from": "person/example", "to": "agent/node.test", "content": "A note.",
+                   "status": "sent", "tags": tags})
+        };
+        // A conversation message and its lifecycle never change what the reconciler decides.
+        let before = store.index().unwrap();
+        append("message/talk", "message.sent", sent(json!(["chat"])));
+        for status in ["delivered", "read", "closed"] {
+            append(
+                "message/talk",
+                &format!("message.{status}"),
+                json!({"status": status}),
+            );
+        }
+        assert!(store.claims_since_only_quiet_notifications(before).unwrap());
+        // A work wake does, and so does the lifecycle of a message this store has not seen sent.
+        let before = store.index().unwrap();
+        append(
+            "message/wake",
+            "message.sent",
+            sent(json!(["st3-work:step-run/test/work"])),
+        );
+        assert!(!store.claims_since_only_quiet_notifications(before).unwrap());
+        let before = store.index().unwrap();
+        append("message/wake", "message.read", json!({"status": "read"}));
+        assert!(!store.claims_since_only_quiet_notifications(before).unwrap());
+        let before = store.index().unwrap();
+        append("message/unseen", "message.read", json!({"status": "read"}));
+        assert!(!store.claims_since_only_quiet_notifications(before).unwrap());
+    }
+
+    #[test]
     fn simple_replication_rejects_structural_and_malformed_operation_claims() {
         assert!(Store::simple_replication_kind("harness.observed"));
         assert!(Store::simple_replication_kind("work.renewed"));
@@ -40429,6 +40506,12 @@ version 2
             harness.contains("claims_subject_kind_accepted_index (subject=? AND kind=?)")
                 && !harness.contains("TEMP B-TREE FOR ORDER BY"),
             "a seat's newest observation must not sort every observation it made:\n{harness}"
+        );
+        let latest = plan(&latest_claim_of_kind_query());
+        assert!(
+            latest.contains("claims_subject_kind_accepted_index (subject=? AND kind=?)")
+                && !latest.contains("TEMP B-TREE FOR ORDER BY"),
+            "a subject's newest claim of a kind must not sort every claim of the kind:\n{latest}"
         );
         let open_steps = plan(&work_at_snapshot_query(true));
         assert!(
