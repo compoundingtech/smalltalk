@@ -38,6 +38,8 @@ struct CollectionSubscribe {
     capability: Option<String>,
     /// A conversation subscription names an agent or a session.
     conversation: Option<String>,
+    /// Parents the first collection read; falls back to the socket URL's traceparent.
+    traceparent: Option<String>,
 }
 
 struct CollectionSubscription {
@@ -49,7 +51,6 @@ struct CollectionSubscription {
     has_more: bool,
 }
 
-const COLLECTION_MAX_SUBSCRIPTIONS: usize = 8;
 /// The least time between two rereads of a socket's held windows. A window read can take a
 /// few hundred milliseconds and the fleet commits about once a second, so rereading on every
 /// commit kept a daemon busy for as long as a client stayed connected. Commits in between are
@@ -60,7 +61,9 @@ const ATTENTION_CLOCK_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
-    if collection == "glasses" { return !kind.starts_with("glass."); }
+    if collection == "glasses" {
+        return !kind.starts_with("glass.");
+    }
     matches!(kind, "daemon.diagnostic" | "transport.observed")
         || (kind == "harness.usage" && collection != "agents")
 }
@@ -70,7 +73,14 @@ pub(super) async fn collection_stream(
     State(state): State<AppState>,
     Extension(session): Extension<ClientSession>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
+    web: Option<Extension<Arc<super::client_web::ClientWeb>>>,
+    limit: Option<Extension<super::ClientSubscriptionLimit>>,
 ) -> Result<Response, ApiError> {
+    let started = super::client_web::unix_nanos();
+    let web = web.map(|Extension(web)| web);
+    let trace = super::client_web::traceparent_query(uri.query());
+    let limit = limit.map(|Extension(limit)| limit).unwrap_or_default().0;
     require_scope(&session, "read.projections")?;
     let protocols = headers
         .get_all(SEC_WEBSOCKET_PROTOCOL)
@@ -85,9 +95,20 @@ pub(super) async fn collection_stream(
             "the collection WebSocket requires exactly st3.client.collections.v0",
         ));
     }
+    if let Some(trace) = &trace {
+        super::client_web::record_span(
+            web.as_ref(),
+            trace,
+            "st3.client.collections.upgrade",
+            started,
+            &[("st3.client.actor", session.actor.as_str())],
+        );
+    }
     Ok(websocket
         .protocols([COLLECTION_SUBPROTOCOL])
-        .on_upgrade(move |socket| collection_stream_socket(socket, state, session)))
+        .on_upgrade(move |socket| {
+            collection_stream_socket(socket, state, session, web, trace, limit)
+        }))
 }
 
 /// Read one bounded window. The whole read sees one SQLite snapshot, and the fence names
@@ -554,11 +575,19 @@ impl Drop for ConversationFollowers {
     }
 }
 
-async fn collection_stream_socket(socket: WebSocket, state: AppState, session: ClientSession) {
+async fn collection_stream_socket(
+    socket: WebSocket,
+    state: AppState,
+    session: ClientSession,
+    web: Option<Arc<super::client_web::ClientWeb>>,
+    socket_trace: Option<super::client_web::TraceParent>,
+    max_subscriptions: usize,
+) {
     collection_stream_socket_with_reader(
         socket,
         state,
         session,
+        (web, socket_trace, max_subscriptions),
         |state, session, request| async move { collection_items(&state, &session, &request).await },
     )
     .await;
@@ -568,11 +597,17 @@ async fn collection_stream_socket_with_reader<F, Fut>(
     mut socket: WebSocket,
     state: AppState,
     session: ClientSession,
+    (web, socket_trace, max_subscriptions): (
+        Option<Arc<super::client_web::ClientWeb>>,
+        Option<super::client_web::TraceParent>,
+        usize,
+    ),
     read: F,
 ) where
     F: Fn(AppState, ClientSession, CollectionSubscribe) -> Fut + Clone + Send + 'static,
-    Fut: std::future::Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
+    Fut: Future<Output = Result<(ClientSnapshot, Vec<Value>, bool), ApiError>> + Send,
 {
+    let mut traced = BTreeMap::<String, (super::client_web::TraceParent, u128)>::new();
     // Subscribe before the first snapshot, so a commit while building it wakes
     // the next loop and is reflected in a following change frame.
     let mut changed = state.event_notify.subscribe();
@@ -615,17 +650,23 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                             subscriptions.remove(&request.id);
                             terminals.remove(&request.id);
                             conversations.stop(&request.id);
+                            traced.remove(&request.id);
                             break 'command;
                         }
                         let held = subscriptions.contains_key(&request.id) || terminals.contains_key(&request.id) || conversations.0.contains_key(&request.id);
-                        if request.kind != "subscribe" || request.id.is_empty() || request.id.len() > 128 || subscriptions.len() + terminals.len() + conversations.0.len() >= COLLECTION_MAX_SUBSCRIPTIONS && !held {
-                            if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "message":"invalid subscription or subscription limit exceeded"})).await { return; }
+                        if request.kind != "subscribe" || request.id.is_empty() || request.id.len() > 128 {
+                            if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "code":"validation-failed", "message":"invalid subscription"})).await { return; }
+                            break 'command;
+                        }
+                        if subscriptions.len() + terminals.len() + conversations.0.len() >= max_subscriptions && !held {
+                            if !send_collection(&mut socket, json!({"kind":"error", "id":request.id, "code":"subscription-limit", "message":"collection subscription limit exceeded"})).await { return; }
                             break 'command;
                         }
                         // A subscription with a held ID replaces it.
                         subscriptions.remove(&request.id);
                         terminals.remove(&request.id);
                         conversations.stop(&request.id);
+                        traced.remove(&request.id);
                         if request.collection == "conversation" {
                             let target = request.conversation.as_deref().unwrap_or_default();
                             let opened = conversation_session_id(&state, target).and_then(|session_id| {
@@ -655,6 +696,12 @@ async fn collection_stream_socket_with_reader<F, Fut>(
                             break 'command;
                         }
                         refresh.push(request.id.clone());
+                        let trace = request.traceparent.as_deref()
+                            .and_then(super::client_web::parse_traceparent)
+                            .or_else(|| socket_trace.clone());
+                        if let Some(trace) = trace {
+                            traced.insert(request.id.clone(), (trace, super::client_web::unix_nanos()));
+                        }
                         subscriptions.insert(request.id.clone(), CollectionSubscription { request, delivered: false, previous: BTreeMap::new(), order: Vec::new(), has_more: false });
 
                     }
@@ -726,7 +773,29 @@ async fn collection_stream_socket_with_reader<F, Fut>(
             let Some(subscription) = subscriptions.get_mut(&id) else {
                 continue;
             };
-            match deliver_collection(&mut socket, subscription, read).await {
+            let outcome = deliver_collection(&mut socket, subscription, read).await;
+            if let Some((trace, started)) = traced.remove(&id) {
+                let result = match outcome {
+                    Refreshed::Current => "delivered",
+                    Refreshed::Dropped => "dropped",
+                    Refreshed::Closed => "closed",
+                };
+                super::client_web::record_span(
+                    web.as_ref(),
+                    &trace,
+                    "st3.client.collections.subscribe",
+                    started,
+                    &[
+                        (
+                            "st3.client.collection",
+                            subscription.request.collection.as_str(),
+                        ),
+                        ("st3.client.subscription", id.as_str()),
+                        ("st3.client.result", result),
+                    ],
+                );
+            }
+            match outcome {
                 Refreshed::Current => {}
                 Refreshed::Retry => {
                     reread_due = true;
@@ -1212,7 +1281,26 @@ pub(super) fn authenticate(
     request: &Request<Body>,
     transport: &'static str,
 ) -> Result<ClientSession, ApiError> {
-    let Some(value) = request.headers().get(AUTHORIZATION) else {
+    // Native bearers take precedence over browser cookies, including malformed bearers.
+    // Ignore a stale cookie while completing a new pairing, and on the Unix transport.
+    let pairing_completion = request.method() == axum::http::Method::POST
+        && request.uri().path().starts_with("/v1/client/pairings/")
+        && request.uri().path().ends_with("/complete");
+    let cookie = (transport != "unix"
+        && !pairing_completion
+        && !request.headers().contains_key(AUTHORIZATION))
+    .then(|| super::client_web::device_cookie(request.headers()))
+    .flatten();
+    let credential = if let Some(value) = request.headers().get(AUTHORIZATION) {
+        value
+            .to_str()
+            .map_err(|_| forbidden("the client authorization header is malformed"))?
+            .strip_prefix("Bearer ")
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| forbidden("the client authorization scheme must be Bearer"))?
+    } else if let Some(cookie) = cookie.as_deref() {
+        cookie
+    } else {
         if transport == "unix" {
             let person = request
                 .headers()
@@ -1220,20 +1308,10 @@ pub(super) fn authenticate(
                 .and_then(|value| value.to_str().ok());
             return ClientSession::local(person);
         }
-        let pairing_completion = request.method() == axum::http::Method::POST
-            && request.uri().path().starts_with("/v1/client/pairings/")
-            && request.uri().path().ends_with("/complete");
         return pairing_completion
             .then(ClientSession::pairing)
             .ok_or_else(|| forbidden("the Fabric-loopback client credential is required"));
     };
-    let value = value
-        .to_str()
-        .map_err(|_| forbidden("the client authorization header is malformed"))?;
-    let credential = value
-        .strip_prefix("Bearer ")
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| forbidden("the client authorization scheme must be Bearer"))?;
     let digest = credential_digest(credential);
     let pairings = state
         .store
@@ -4641,7 +4719,10 @@ pub(super) async fn conversation_stream(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<ConversationQuery>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
+    web: Option<Extension<Arc<super::client_web::ClientWeb>>>,
 ) -> Result<Response, ApiError> {
+    let started = super::client_web::unix_nanos();
     require_scope(&session, "read.projections")?;
     let protocols = headers
         .get_all(SEC_WEBSOCKET_PROTOCOL)
@@ -4678,6 +4759,15 @@ pub(super) async fn conversation_stream(
         }
     } else {
         conversation_read_now(&state, &session, &session_id, query.after.as_deref())?;
+    }
+    if let Some(trace) = super::client_web::traceparent_query(uri.query()) {
+        super::client_web::record_span(
+            web.as_ref().map(|Extension(web)| web),
+            &trace,
+            "st3.client.conversation.upgrade",
+            started,
+            &[("st3.client.actor", session.actor.as_str())],
+        );
     }
     Ok(websocket
         .protocols([CONVERSATION_SUBPROTOCOL])
@@ -5188,14 +5278,30 @@ pub(super) struct PairingComplete {
     api_version: String,
     code: String,
     device_public_key: String,
+    /// Browser delivery keeps the device credential out of the JSON body.
+    #[serde(default)]
+    credential_delivery: CredentialDelivery,
+}
+
+#[derive(Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CredentialDelivery {
+    #[default]
+    Body,
+    Cookie,
 }
 
 pub(super) async fn pairing_complete(
     State(state): State<AppState>,
-    Extension(_session): Extension<ClientSession>,
+    Extension(session): Extension<ClientSession>,
     AxumPath(id): AxumPath<String>,
     Json(request): Json<PairingComplete>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
+    if request.credential_delivery == CredentialDelivery::Cookie && session.transport == "unix" {
+        return Err(validation(
+            "cookie credential delivery requires the Fabric gateway",
+        ));
+    }
     if request.api_version != CLIENT_API_VERSION || request.device_public_key.len() < 32 {
         return Err(validation(
             "the pairing completion has an invalid version or public key",
@@ -5300,9 +5406,21 @@ pub(super) async fn pairing_complete(
         return Err(ApiError::bad(error));
     }
     signal_changed(&state);
-    Ok(Json(
-        json!({ "kind": "paired-session", "device_id": device_id, "person_id": person_id, "session_actor": session_actor, "credential": credential, "scopes": scopes, "expires_at": client_timestamp(expires_at) }),
-    ))
+    let mut body = json!({ "kind": "paired-session", "device_id": device_id, "person_id": person_id, "session_actor": session_actor, "scopes": scopes, "expires_at": client_timestamp(expires_at) });
+    if request.credential_delivery == CredentialDelivery::Cookie {
+        body["credential_delivery"] = json!("cookie");
+        let mut response = Json(body).into_response();
+        let max_age = u64::try_from(expires_at.saturating_sub(client_now_ms()) / 1_000)
+            .map_err(ApiError::internal)?;
+        let cookie = super::client_web::device_cookie_header(&credential, max_age);
+        response.headers_mut().insert(
+            axum::http::header::SET_COOKIE,
+            axum::http::HeaderValue::from_str(&cookie).map_err(ApiError::internal)?,
+        );
+        return Ok(response);
+    }
+    body["credential"] = json!(credential);
+    Ok(Json(body).into_response())
 }
 
 fn terminal_subject(id: &str) -> String {
@@ -5536,7 +5654,10 @@ pub(super) async fn terminal_stream(
     AxumPath(id): AxumPath<String>,
     Query(query): Query<TerminalStreamQuery>,
     headers: HeaderMap,
+    uri: axum::http::Uri,
+    web: Option<Extension<Arc<super::client_web::ClientWeb>>>,
 ) -> Result<Response, ApiError> {
+    let started = super::client_web::unix_nanos();
     require_scope(&session, "terminal.read")?;
     let protocols = headers
         .get_all(SEC_WEBSOCKET_PROTOCOL)
@@ -5576,6 +5697,15 @@ pub(super) async fn terminal_stream(
         query.incarnation.as_deref(),
         stream_capability,
     )?;
+    if let Some(trace) = super::client_web::traceparent_query(uri.query()) {
+        super::client_web::record_span(
+            web.as_ref().map(|Extension(web)| web),
+            &trace,
+            "st3.client.terminal.upgrade",
+            started,
+            &[("st3.client.actor", session.actor.as_str())],
+        );
+    }
     Ok(websocket
         .protocols([TERMINAL_SUBPROTOCOL])
         .on_upgrade(move |socket| follow.run(state, TerminalSink::Socket(Box::new(socket)))))
@@ -5586,19 +5716,26 @@ enum TerminalFollow {
     Local {
         id: String,
         incarnation: String,
+        viewer: TerminalViewer,
     },
     Remote {
         id: String,
         owner: String,
         authority_actor: String,
         incarnation: String,
+        viewer: TerminalViewer,
     },
 }
 
 impl TerminalFollow {
     async fn run(self, state: AppState, sink: TerminalSink) {
         match self {
-            Self::Local { id, incarnation } => {
+            Self::Local {
+                id,
+                incarnation,
+                viewer,
+            } => {
+                let _viewer = viewer;
                 terminal_stream_socket(sink, state, id, incarnation).await;
             }
             Self::Remote {
@@ -5606,7 +5743,9 @@ impl TerminalFollow {
                 owner,
                 authority_actor,
                 incarnation,
+                viewer,
             } => {
+                let _viewer = viewer;
                 remote_terminal_stream_socket(sink, state, id, owner, authority_actor, incarnation)
                     .await;
             }
@@ -5638,7 +5777,7 @@ fn prepare_terminal_follow(
             "remote terminal stream requires a concrete person or agent",
         ));
     }
-    consume_terminal_attachment(
+    let viewer = consume_terminal_attachment(
         state,
         session,
         &client_detail_id("terminal", id),
@@ -5651,11 +5790,13 @@ fn prepare_terminal_follow(
             owner: live.owner_host_id,
             authority_actor: session.authority_actor.clone(),
             incarnation: live.incarnation_id,
+            viewer,
         }
     } else {
         TerminalFollow::Local {
             id: id.to_owned(),
             incarnation: live.incarnation_id,
+            viewer,
         }
     })
 }
@@ -5681,7 +5822,30 @@ enum TerminalSink {
 impl TerminalSink {
     async fn send(&mut self, value: &Value) -> bool {
         match self {
-            Self::Socket(socket) => send_terminal_stream_value(socket, value).await,
+            Self::Socket(socket) => {
+                let Ok(bytes) = serde_json::to_vec(value) else {
+                    return false;
+                };
+                if bytes.len() > CLIENT_MAX_RESPONSE_BYTES {
+                    return false;
+                }
+                let (mut outgoing, mut incoming) = (&mut **socket).split();
+                let send = outgoing.send(WsMessage::Text(
+                    String::from_utf8(bytes).expect("JSON is UTF-8").into(),
+                ));
+                tokio::pin!(send);
+                loop {
+                    tokio::select! {
+                        biased;
+                        message = incoming.next() => {
+                            if matches!(message, None | Some(Err(_)) | Some(Ok(WsMessage::Close(_)))) {
+                                return false;
+                            }
+                        }
+                        result = &mut send => return result.is_ok(),
+                    }
+                }
+            }
             Self::Subscription(sender) => {
                 serde_json::to_vec(value)
                     .is_ok_and(|bytes| bytes.len() <= CLIENT_MAX_RESPONSE_BYTES)
@@ -5772,7 +5936,10 @@ async fn remote_terminal_stream_socket(
                 let error = remote_read_error(&owner, error);
                 if error.code == "remote-unavailable" && failures < 3 {
                     failures += 1;
-                    tokio::time::sleep(Duration::from_millis(500 * u64::from(failures))).await;
+                    tokio::select! {
+                        () = tokio::time::sleep(Duration::from_millis(500 * u64::from(failures))) => {}
+                        () = sink.gone() => return,
+                    }
                     continue;
                 }
                 sink.fail(&error).await;
@@ -6118,7 +6285,7 @@ fn consume_terminal_attachment(
     terminal_id: &str,
     incarnation: &str,
     capability: Option<&str>,
-) -> Result<(), ApiError> {
+) -> Result<TerminalViewer, ApiError> {
     consume_terminal_attachment_mode(state, session, terminal_id, incarnation, capability, None)
 }
 
@@ -6129,7 +6296,7 @@ fn consume_terminal_attachment_mode(
     incarnation: &str,
     capability: Option<&str>,
     raw_mode: Option<&str>,
-) -> Result<(), ApiError> {
+) -> Result<TerminalViewer, ApiError> {
     let capability = capability
         .filter(|value| !value.is_empty())
         .ok_or_else(|| forbidden("a terminal stream capability is required"))?;
@@ -6191,7 +6358,7 @@ fn consume_terminal_attachment_mode(
             "the terminal stream capability is expired, consumed, detached, or belongs to another session",
         ));
     }
-    state
+    let consumed = state
         .store
         .append_claim(&ClaimInput {
             subject: attached.subject.clone(),
@@ -6209,7 +6376,52 @@ fn consume_terminal_attachment_mode(
         })
         .map_err(|_| forbidden("the terminal stream capability was already consumed"))?;
     signal_changed(state);
-    Ok(())
+    Ok(TerminalViewer {
+        state: state.clone(),
+        subject: attached.subject.clone(),
+        consumed_id: consumed.id,
+        actor: session_claim_actor(session),
+        attachment_id: field("attachment_id")
+            .cloned()
+            .ok_or_else(|| ApiError::internal("terminal attachment ID is missing"))?,
+    })
+}
+
+/// A consumed capability belongs to exactly one live viewer, including failed upgrades.
+/// Explicit detach wins the same subject CAS; dropping an ended viewer never revives it.
+struct TerminalViewer {
+    state: AppState,
+    subject: String,
+    consumed_id: String,
+    actor: String,
+    attachment_id: Value,
+}
+
+impl std::fmt::Debug for TerminalViewer {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("TerminalViewer")
+            .field("attachment_id", &self.attachment_id)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for TerminalViewer {
+    fn drop(&mut self) {
+        match self.state.store.append_claim(&ClaimInput {
+            subject: self.subject.clone(),
+            kind: "custom.client.terminal-detached".into(),
+            actor: Some(self.actor.clone()),
+            fields: BTreeMap::from([("attachment_id".into(), self.attachment_id.clone())]),
+            evidence: vec![self.consumed_id.clone()],
+            expected_subject: Some(Some(self.consumed_id.clone())),
+            idempotency_key: None,
+        }) {
+            Ok(_) => signal_changed(&self.state),
+            Err(error) if error.code == "stale-subject" => {}
+            Err(error) => tracing::warn!(%error, "could not end terminal viewer"),
+        }
+    }
 }
 
 fn detach_terminal_attachment(
@@ -6351,7 +6563,11 @@ async fn terminal_stream_socket(
     let mut screens =
         terminal_view::subscribe(&state.pty_root, &live.runtime_id, &live.incarnation_id);
     let first = tokio::time::Instant::now() + TERMINAL_FIRST_SCREEN_TIMEOUT;
-    let mut screen = match terminal_view::next_screen(&mut screens, None, first).await {
+    let initial = tokio::select! {
+        initial = terminal_view::next_screen(&mut screens, None, first) => initial,
+        () = sink.gone() => return,
+    };
+    let mut screen = match initial {
         Ok(Some(screen)) => Some(screen),
         Ok(None) => {
             sink.fail(&terminal_unavailable("the terminal screen did not arrive"))
@@ -8294,6 +8510,7 @@ mod tests {
                             socket,
                             state,
                             ClientSession::local(None).unwrap(),
+                            (None, None, super::super::ClientSubscriptionLimit::default().0),
                             move |state, session, request| {
                                 let reads = reads.clone();
                                 async move {
@@ -8341,6 +8558,7 @@ mod tests {
         socket.close(None).await.unwrap();
         server.abort();
     }
+    include!("client_v0/gateway_tests.rs");
 
     #[test]
     fn listed_unresolved_process_opens_into_explanatory_no_conversation_state() {
@@ -12645,7 +12863,7 @@ mission "example/zero-run" state="ready" {
             1
         );
 
-        consume_terminal_attachment(
+        let viewer = consume_terminal_attachment(
             &restarted,
             &session,
             "terminal/agent/terminal-owner",
@@ -12676,6 +12894,7 @@ mission "example/zero-run" state="ready" {
             parameters: json!({ "target_id": attachment_id }),
         };
         detach_terminal_attachment(&restarted, &session, &detach).unwrap();
+        drop(viewer);
         let lifecycle = restarted
             .store
             .claims_for(
@@ -13222,7 +13441,7 @@ mission "example/zero-run" state="ready" {
             .code,
             "forbidden"
         );
-        consume_terminal_attachment(
+        let _viewer = consume_terminal_attachment(
             &follower,
             &paired,
             "terminal/agent/fleet-terminal",
