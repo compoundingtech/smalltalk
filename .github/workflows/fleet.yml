@@ -7,8 +7,6 @@ on:
   pull_request: {}
   push:
     branches: [main]
-  schedule:
-    - cron: 23 4 * * *
   workflow_dispatch: {}
 
 permissions:
@@ -95,15 +93,6 @@ jobs:
           home="$RUNNER_TEMP/test-home"
           mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
-      - name: Test st2 path-filter boundaries
-        run: python3 scripts/ci-st2-filter-test
-      - name: Select st2 catalog and supervisor tests
-        id: st2
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
-        run: python3 scripts/ci-st2-filter --event "$EVENT" --base "$BASE" --head "$HEAD" --github-output "$GITHUB_OUTPUT"
       - name: Prepare provider component fixtures
         run: |
           system=$(nix eval --impure --raw --expr builtins.currentSystem)
@@ -118,15 +107,11 @@ jobs:
       - name: Build workspace tests first (no debug info)
         shell: bash
         run: nix develop -c cargo nextest run --workspace --locked --profile ci --no-run
-      - name: Summarize tested revision and selection
-        env:
-          REASON: ${{ steps.st2.outputs.reason }}
-        run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n%s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" \"$REASON\" >> \"$GITHUB_STEP_SUMMARY\""
+      - name: Summarize tested revision
+        run: "printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' \"$(git rev-parse HEAD)\" \"$(nproc)\" \"$(free -h | awk '/^Mem:/ {print $2 \" memory\"}')\" >> \"$GITHUB_STEP_SUMMARY\""
       - name: Run nextest, clippy, generated clients and fleet compatibility in parallel
         shell: bash
         run: nix develop -c bash scripts/ci-linux
-        env:
-          ST2_FILTER: ${{ steps.st2.outputs.filter }}
       - name: Retain stage logs, timings and messaging-fault evidence
         uses: actions/upload-artifact@v4
         if: always()
@@ -136,3 +121,68 @@ jobs:
             ${{ runner.temp }}/ci-logs/
             target/messaging-faults/
           if-no-files-found: ignore
+  isolation-vm:
+    name: isolation-vm
+    runs-on:
+      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Probe KVM
+        run: |
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm is missing: this runner profile offers no nested virtualization"
+            exit 1
+          fi
+          if [ ! -r /dev/kvm ] || [ ! -w /dev/kvm ]; then sudo chmod 0666 /dev/kvm; fi
+          python3 - <<'EOF'
+          import fcntl, os
+          fd = os.open("/dev/kvm", os.O_RDWR | os.O_CLOEXEC)
+          version = fcntl.ioctl(fd, 0xAE00)  # KVM_GET_API_VERSION
+          vm = fcntl.ioctl(fd, 0xAE01, 0)  # KVM_CREATE_VM
+          assert version == 12, f"unexpected KVM API version {version}"
+          os.close(vm)
+          print(f"KVM API {version}: created a VM")
+          EOF
+          printf 'KVM: \x60%s\x60, CPU virtualization flag %s, VM creation succeeded\n\n| Phase | Elapsed |\n| --- | --- |\n' "$(ls -l /dev/kvm)" "$(grep -m1 -oE 'vmx|svm' /proc/cpuinfo || echo none)" >> "$GITHUB_STEP_SUMMARY"
+      - name: Install Nix
+        uses: DeterminateSystems/determinate-nix-action@v3
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          extra-conf: |
+            experimental-features = nix-command flakes
+            accept-flake-config = true
+            extra-substituters = https://overeng-effect-utils.cachix.org
+            extra-trusted-public-keys = overeng-effect-utils.cachix.org-1:KFmqYNF6Q7ZzVYPl2znpJYZGEolage9YNCA9res6vKc=
+            access-tokens = github.com=${{ github.token }}
+          summarize: true
+      - name: Archive the st2 integration test binary
+        run: |
+          start=$SECONDS
+          nix develop -c cargo nextest archive --locked -p st2 --test integration --archive-file "$RUNNER_TEMP/isolation.tar.zst"
+          printf '| test archive build | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"
+      - name: Build the NixOS VM test driver
+        run: |
+          start=$SECONDS
+          nix build --print-build-logs --out-link "$RUNNER_TEMP/vm-driver" .#legacyPackages.x86_64-linux.transport-isolation-vm.driver
+          printf '| VM driver build | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"
+      - name: Run the exec and pty cascade tests in the VM
+        env:
+          ST_ISOLATION_ARCHIVE: "${{ runner.temp }}/isolation.tar.zst"
+          ST_ISOLATION_WORKSPACE: ${{ github.workspace }}
+          ST_ISOLATION_TIMINGS: "${{ runner.temp }}/vm-timings.json"
+        run: |
+          start=$SECONDS
+          "$RUNNER_TEMP/vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/vm-out"
+          jq -r '"| VM boot | \(.boot_seconds)s |\n| cascade tests in VM (extract and run) | \(.test_seconds)s |"' "$ST_ISOLATION_TIMINGS" >> "$GITHUB_STEP_SUMMARY"
+          printf '| VM test driver total | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"

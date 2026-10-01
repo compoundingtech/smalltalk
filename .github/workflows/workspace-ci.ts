@@ -15,7 +15,7 @@ export const readOnlyBinaryCaches = Object.values(effectUtilsBinaryCaches)
 export const buildEnv = { CARGO_PROFILE_DEV_DEBUG: '0', CARGO_PROFILE_TEST_DEBUG: '0', CARGO_INCREMENTAL: '0' }
 
 /**
- * Checkout, Nix with the read-only effect-utils cache, isolated HOME/XDG, test selection,
+ * Checkout, Nix with the read-only effect-utils cache, isolated HOME/XDG,
  * provider fixtures, rendered hooks, and the standalone workspace test build.
  * `pull_request` checks out GitHub's merge ref: the PR head merged with the latest base.
  */
@@ -41,17 +41,6 @@ printf 'CARGO_HOME=%s\\nCI_CLIPPY_TARGET=%s\\n' "\${CARGO_HOME:-$HOME/.cargo}" "
 home="$RUNNER_TEMP/test-home"
 mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
 printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_STATE_HOME=%s/.local/state\\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"`,
-  },
-  { name: 'Test st2 path-filter boundaries', run: 'python3 scripts/ci-st2-filter-test' },
-  {
-    name: 'Select st2 catalog and supervisor tests',
-    id: 'st2',
-    env: {
-      EVENT: '${{ github.event_name }}',
-      BASE: '${{ github.event.pull_request.base.sha }}',
-      HEAD: '${{ github.event.pull_request.head.sha }}',
-    },
-    run: 'python3 scripts/ci-st2-filter --event "$EVENT" --base "$BASE" --head "$HEAD" --github-output "$GITHUB_OUTPUT"',
   },
   {
     name: 'Prepare provider component fixtures',

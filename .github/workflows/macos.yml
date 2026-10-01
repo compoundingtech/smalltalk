@@ -64,15 +64,6 @@ jobs:
           home="$RUNNER_TEMP/test-home"
           mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
-      - name: Test st2 path-filter boundaries
-        run: python3 scripts/ci-st2-filter-test
-      - name: Select st2 catalog and supervisor tests
-        id: st2
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
-        run: python3 scripts/ci-st2-filter --event "$EVENT" --base "$BASE" --head "$HEAD" --github-output "$GITHUB_OUTPUT"
       - name: Prepare provider component fixtures
         run: |
           system=$(nix eval --impure --raw --expr builtins.currentSystem)
@@ -89,7 +80,7 @@ jobs:
         run: nix develop -c cargo nextest run --workspace --locked --profile ci --no-run
       - name: Run macOS workspace tests (25 minute limit)
         shell: bash
-        run: "nix develop -c cargo nextest run --workspace --locked --profile ci -E '${{ steps.st2.outputs.filter }}'"
+        run: nix develop -c cargo nextest run --workspace --locked --profile ci
         timeout-minutes: 25
       - name: Cargo clippy
         shell: bash

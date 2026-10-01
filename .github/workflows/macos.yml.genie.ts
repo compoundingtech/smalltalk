@@ -30,7 +30,7 @@ export default githubWorkflow({
       steps: [
         ...workspacePreparationSteps,
         {
-          ...nixDevelopStep({ name: 'Run macOS workspace tests (25 minute limit)', command: ['cargo', 'nextest', 'run', '--workspace', '--locked', '--profile', 'ci', '-E', '${{ steps.st2.outputs.filter }}'] }),
+          ...nixDevelopStep({ name: 'Run macOS workspace tests (25 minute limit)', command: ['cargo', 'nextest', 'run', '--workspace', '--locked', '--profile', 'ci'] }),
           'timeout-minutes': 25,
         },
         nixDevelopStep({ name: 'Cargo clippy', command: ['cargo', 'clippy', '--workspace', '--all-targets', '--locked'] }),
