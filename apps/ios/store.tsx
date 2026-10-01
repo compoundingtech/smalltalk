@@ -132,7 +132,8 @@ function useAppStore() {
 
   // Glasses: followed on the feed's socket while the experiment is on and the gateway grants them.
   useEffect(() => { void AsyncStorage.getItem(GLASSES_KEY).then(value => setGlassesOn(value === '1')).catch(() => {}); }, []);
-  const glassesGranted = caps?.capabilities.some(capability => capability.id === 'glasses' && capability.state === 'granted') ?? false;
+  // Version 1 glasses are splits of tab groups; an earlier member's glasses are a shape this app no longer reads.
+  const glassesGranted = caps?.capabilities.some(capability => capability.id === 'glasses' && capability.version >= 1 && capability.state === 'granted') ?? false;
   useEffect(() => {
     if (!feed || !glassesOn || !glassesGranted) { setGlasses([]); return; }
     const follow = feed.followGlasses({ onGlasses: setGlasses, onIssue: setGlassesIssue });

@@ -133,7 +133,7 @@ mod tests {
 
     fn input(id: usize, name: &str) -> ClaimInput {
         ClaimInput { subject:format!("glass/person/ada/019a0000-0000-7000-8000-{id:012x}"), kind:"glass.upserted".into(), actor:Some("person/ada".into()),
-            fields:serde_json::from_value(json!({"body":{"name":name,"tabs":[{"layout":{"pane":"home:"}}]},"base_revision":null})).unwrap(), evidence:vec![], expected_subject:None, idempotency_key:None }
+            fields:serde_json::from_value(json!({"body":{"name":name,"layout":{"tabs":[{"pane":"opaque:anything"}]}},"base_revision":null})).unwrap(), evidence:vec![], expected_subject:None, idempotency_key:None }
     }
     fn sync(source: &Store, target: &Store) {
         let exchange = exchange_from(source, &ReplicationInventory::default());

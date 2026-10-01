@@ -15,27 +15,37 @@
     "updated_at": "2026-10-01T00:00:00.000Z",
     "body": {
       "name": "Main workspace",
-      "tabs": [
-        {
-          "title": "Home",
-          "layout": {
-            "pane": "home:"
-          }
-        },
-        {
-          "layout": {
-            "split": "right",
-            "children": [
+      "layout": {
+        "split": "right",
+        "children": [
+          {
+            "tabs": [
               {
+                "title": "Work",
                 "pane": "agent:agent/example/worker"
               },
               {
                 "pane": "mission:mission/example/review"
               }
             ]
+          },
+          {
+            "split": "below",
+            "children": [
+              {
+                "tabs": [
+                  {
+                    "pane": "opaque:another"
+                  }
+                ]
+              },
+              {
+                "tabs": []
+              }
+            ]
           }
-        }
-      ]
+        ]
+      }
     },
     "deleted": false,
     "base_revision": null,

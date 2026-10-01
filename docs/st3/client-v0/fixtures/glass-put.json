@@ -1,27 +1,37 @@
 {
   "body": {
     "name": "Main workspace",
-    "tabs": [
-      {
-        "title": "Home",
-        "layout": {
-          "pane": "home:"
-        }
-      },
-      {
-        "layout": {
-          "split": "right",
-          "children": [
+    "layout": {
+      "split": "right",
+      "children": [
+        {
+          "tabs": [
             {
+              "title": "Work",
               "pane": "agent:agent/example/worker"
             },
             {
               "pane": "mission:mission/example/review"
             }
           ]
+        },
+        {
+          "split": "below",
+          "children": [
+            {
+              "tabs": [
+                {
+                  "pane": "opaque:another"
+                }
+              ]
+            },
+            {
+              "tabs": []
+            }
+          ]
         }
-      }
-    ]
+      ]
+    }
   },
   "base_revision": null
 }
