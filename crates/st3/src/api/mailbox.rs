@@ -233,7 +233,10 @@ mod tests {
             "opencode-server",
         ] {
             let root = tempfile::tempdir().unwrap();
-            let state = super::super::tests::state(root.path());
+            let mut state = super::super::tests::state(root.path());
+            // Exercise the daemon's WAL database, rather than SQLite's shared-cache
+            // in-memory fixture, whose concurrent reads can reject a writer immediately.
+            state.store = Arc::new(Store::open(&root.path().join("graph.db"), "node").unwrap());
             crate::mailbox::tests::ready(&state.store, "session-1");
             let kdl = "version 2\nagent \"eval.worker\" { workspace \"/work\"; command \"sleep 60\"; name \"Quartz\"; }\n";
             let intent = crate::graph::parse_test_intent(kdl, "node").unwrap();
