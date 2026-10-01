@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Isolated installer transactions; native signing/swap proof also runs on macOS."""
 import hashlib
+import contextlib
+import io
 import importlib.util
 import json
 import os
@@ -106,6 +108,23 @@ class Installer(unittest.TestCase):
         self.assertEqual(identity['certificate'], CERT)
         self.assertTrue(identity['persistent_identity'])
         self.assertTrue(all(call[call.index('--sign') + 1] == CERT for call in self.calls if '--sign' in call))
+
+    def test_staged_artifact_verification_needs_no_signing_private_key(self):
+        app = self.job / 'prepared.app'
+        metadata = app / 'Contents/Resources/deploy-payload.json'
+        metadata.parent.mkdir(parents=True)
+        metadata.write_text(json.dumps({'certificate': CERT, 'team': 'EXAMPLE123',
+                                        'identifier': 'com.example.smalltalk'}))
+        argv = ['install-macos', '--identity', CERT, '--team-id', 'EXAMPLE123',
+                '--identifier', 'com.example.smalltalk', '--verify-app', str(app)]
+        with patch.object(sys, 'argv', argv), patch.object(Path, 'home', return_value=self.home), \
+                patch.object(m, 'command', side_effect=self.command), \
+                patch.object(m, 'resolve_identity', side_effect=AssertionError('must not ask for a private key')), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            m.main()
+        identity = json.loads(output.getvalue())
+        self.assertEqual(identity['certificate'], CERT)
+        self.assertTrue(identity['persistent_identity'])
 
     def test_wrong_team_fails_before_signing(self):
         m.CERTIFICATE = CERT
