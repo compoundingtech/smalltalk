@@ -401,7 +401,9 @@ pub fn run(context: Context) -> Result<()> {
                     }
                 });
             }
-            if tab == 3 {
+            // Glasses show the fleet in the status line and the palette, so they need the
+            // machines from the start rather than when a Fleet tab opens.
+            if tab == 3 || (ui.glasses.is_some() && model.machines.snapshot.is_none()) {
                 let client = client.clone();
                 let tx = fetched_tx.clone();
                 runtime.spawn(async move {

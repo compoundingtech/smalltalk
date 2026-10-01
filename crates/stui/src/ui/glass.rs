@@ -28,6 +28,10 @@ pub(crate) struct Glasses {
     graph: bool,
     /// Changes st has not confirmed, newest per glass id, each with the key a retry reuses.
     pending: BTreeMap<String, GlassWrite>,
+    /// The glass made at start only because this device had none by the name asked for. If it
+    /// is still empty when st first sends the person's glasses, st's glass of that name is
+    /// shown instead of keeping both.
+    placeholder: Option<String>,
 }
 
 /// A change for st to keep. The body travels as JSON text and the idempotency key goes with
@@ -184,10 +188,13 @@ impl Glasses {
             })
             .collect::<Vec<_>>();
         let name = wanted.or(stored.last).unwrap_or_else(|| "main".to_owned());
+        let mut placeholder = None;
         let shown = match all.iter().position(|glass| glass.name == name) {
             Some(index) => index,
             None => {
-                all.push(Glass::new(name));
+                let glass = Glass::new(name);
+                placeholder = Some(glass.id.clone());
+                all.push(glass);
                 all.len() - 1
             }
         };
@@ -198,6 +205,7 @@ impl Glasses {
             store,
             graph: false,
             pending: BTreeMap::new(),
+            placeholder,
         }
     }
 
@@ -1225,6 +1233,31 @@ impl Ui {
         };
         let first = !glasses.graph;
         glasses.graph = true;
+        // A glass made only because this device had none by that name gives way to st's.
+        if let Some(placeholder) = glasses.placeholder.take()
+            && let Some(index) = glasses
+                .all
+                .iter()
+                .position(|glass| glass.id == placeholder && glass.tabs.is_empty())
+        {
+            let name = glasses.all[index].name.clone();
+            let theirs = remote.iter().find(|item| {
+                !item.deleted && item.body.as_ref().is_some_and(|body| body.name == name)
+            });
+            if let Some(theirs) = theirs {
+                let id = theirs
+                    .header
+                    .id
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or_default()
+                    .to_owned();
+                glasses.all.remove(index);
+                let mut glass = Glass::new(name);
+                glass.id = id;
+                glasses.all.insert(index, glass);
+            }
+        }
         let shown = glasses.glass().id.clone();
         let mut present = BTreeSet::new();
         for item in remote {
@@ -1943,6 +1976,18 @@ mod tests {
         // A failure keeps it for the next try.
         ui.glass_saved(&local, sent[0].key(), Err("member restarting".into()));
         assert_eq!(ui.unsent_glass_writes(), sent);
+    }
+
+    #[test]
+    fn a_device_with_no_glasses_shows_sts_glass_of_that_name_instead_of_making_another() {
+        let mut ui = glass();
+        assert_eq!(ui.glasses.as_ref().unwrap().glass().name, "main");
+        ui.glasses_from_graph(vec![graph_glass("0190-m", "r4", "main", &[ATLAS])]);
+        assert!(writes(&mut ui).is_empty(), "nothing new goes to st");
+        let glasses = ui.glasses.as_ref().unwrap();
+        assert_eq!(glasses.all.len(), 1);
+        assert_eq!(glasses.glass().id, "0190-m");
+        assert_eq!(tabs(&ui).1, vec![vec![ATLAS.to_owned()]]);
     }
 
     #[test]
