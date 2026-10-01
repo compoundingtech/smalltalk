@@ -38,8 +38,20 @@ them succeeded (a skipped or cancelled stage fails it). The stage jobs use the N
 
 Each stage restores a job-keyed `actions/cache` entry (Namespace serves it from its accelerated
 backend) holding Cargo's registry and the workspace `target/` directory, keyed on `Cargo.lock` and
-`flake.lock`. Namespace cache volumes are not used: they are per node and replicate in the
-background, so a job landing on another node starts empty.
+`flake.lock`. A second keyed entry (`nix4-<job>-...`) holds a signed local Nix binary cache in
+`$RUNNER_TEMP/st-ci-cache`. Its key includes `flake.lock` and both compatibility baseline pins.
+`scripts/ci-nix-cache use` makes it a preferred substituter. After a successful stage, `save`
+copies reference-free downloads and sources fetched by the run, plus the closures of the fleet
+baseline, historical messaging channel and provider components. It leaves the installer-managed
+`/nix` directory intact. Cache failures emit a warning and let the job build normally.
+
+The [original trial measurements](https://github.com/compoundingtech/smalltalk/pull/849#issuecomment-5936374396)
+recorded a warm run of 6m59s with this design, versus 8m49s to 9m30s with only the Cargo cache.
+That trial excluded the messaging matrix; current CI includes it. Caching the entire Nix store
+instead took 90–105 seconds to restore 4.4 GB, which cost more than it saved. The selected
+outputs keep the cache focused on repeated downloads and expensive immutable builds.
+Namespace cache volumes are not used: they are per node and replicate in the background, so a
+job landing on another node can start empty.
 
 The messaging fault matrix runs as eleven independent `messaging_faults::*` tests in
 `linux-tests`. Nextest schedules the cases in parallel and retries each failing case separately.
