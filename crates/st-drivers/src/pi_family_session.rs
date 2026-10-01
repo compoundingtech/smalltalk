@@ -149,9 +149,24 @@ pub(crate) fn run_for_with_environment(
                 std::env::var_os(key).is_some()
             }));
         }
+        let managed_push = std::env::var("ST3_MAILBOX_TRANSPORT").as_deref() == Ok("push");
+        if managed_push {
+            for (key, _) in &mut env {
+                *key = key.replacen("ST2_", "ST_", 1);
+            }
+        }
         // An exported set that holds this binary's exact extension (st3 publishes its own) wins;
         // otherwise the extension comes from st2's verified hook root.
-        let set = match hooks::exported_set_holding(kind.extension) {
+        let exported = if managed_push {
+            std::env::var_os("ST_HOOKS")
+                .map(std::path::PathBuf::from)
+                .filter(|dir| {
+                    dir.join(hooks::ST3_SET_MARKER).is_file() && dir.join(kind.extension).is_file()
+                })
+        } else {
+            hooks::exported_set_holding(kind.extension)
+        };
+        let set = match exported {
             Some(set) => set,
             None => hooks::verify_required_set().with_context(|| {
                 format!(

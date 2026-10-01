@@ -1,0 +1,15 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "st",
+  "description": "Provider integration shipped with st",
+  "owner": {
+    "name": "Compounding"
+  },
+  "plugins": [
+    {
+      "name": "st-channel",
+      "description": "Deliver st messages and work through the local daemon subscription",
+      "source": "./st-channel"
+    }
+  ]
+}
