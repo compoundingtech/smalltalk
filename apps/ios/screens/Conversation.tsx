@@ -39,6 +39,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
   const [pending, setPending] = useState<Pending[]>([]);
   const [find, setFind] = useState('');
+  const [findOpen, setFinding] = useState(false);
   const [draft, setDraft] = useState(() => draftCache.current.get(target) ?? '');
   const [away, setAway] = useState(false);
   const list = useRef<FlatList<Row>>(null);
@@ -57,24 +58,16 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     const runtime = agent && agent.runtime_ids.length && !['stopped', 'failed'].includes(agent.state) ? agent.runtime_ids[0] : undefined;
     navigation.setOptions({
       title,
-      // Finding in the conversation: only the entries that say it stay, newest first.
-      headerSearchBarOptions: {
-        placeholder: 'Find in this conversation',
-        // The conversation stays readable and touchable while finding: the default dims and
-        // blocks it, which made a freshly opened conversation look frozen.
-        obscureBackground: false,
-        hideWhenScrolling: false,
-        // A button in the bar, not a field over the conversation, until it is wanted.
-        placement: 'integratedButton',
-        autoCapitalize: 'none',
-        onChangeText: event => setFind(event.nativeEvent.text),
-        onCancelButtonPress: () => setFind(''),
-      },
       // A native bar button: the agent's live terminal, while it has one.
-      unstable_headerRightItems: () => runtime ? [{
-        type: 'button', label: 'Terminal', icon: { type: 'sfSymbol', name: 'terminal' }, disabled: status !== 'online',
-        onPress: () => void actions.runtimeTerminal(runtime).then(terminalId => { if (terminalId) navigation.navigate('Terminal', { terminalId, title }); }),
-      }] : [],
+      // Find opens a field above the conversation. A native header search bar blurred an
+      // inverted conversation and took its taps.
+      unstable_headerRightItems: () => [
+        { type: 'button' as const, label: 'Find', icon: { type: 'sfSymbol' as const, name: 'magnifyingglass' as const }, onPress: () => setFinding(open => !open) },
+        ...(runtime ? [{
+          type: 'button' as const, label: 'Terminal', icon: { type: 'sfSymbol' as const, name: 'terminal' as const }, disabled: status !== 'online',
+          onPress: () => void actions.runtimeTerminal(runtime).then(terminalId => { if (terminalId) navigation.navigate('Terminal', { terminalId, title }); }),
+        }] : []),
+      ],
     });
   }, [navigation, title, agent, status, actions]);
 
@@ -105,7 +98,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   useEffect(() => {
     setPending(previous => previous.filter(item => item.failed || !entries.some(entry => entry.body.kind === 'mail' && entry.body.from === 'you' && entry.body.text.trim() === item.text.trim())));
   }, [entries]);
-  const finding = find.trim() !== '';
+  const finding = findOpen && find.trim() !== '';
   const found = useMemo(() => finding ? entries.filter(entry => entryMatches(entry, find)) : entries, [entries, find, finding]);
   const rows: Row[] = useMemo(() => [
     ...(finding ? [] : [...pending].reverse().map(item => ({ kind: 'pending' as const, pending: item }))),
@@ -131,6 +124,10 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     <Banners />
     {agent ? <AgentStrip agent={agent} onMission={(id, missionTitle) => navigation.navigate('Mission', { id, title: missionTitle })} /> : session ? <View style={styles.strip}><T dim numberOfLines={1}>{session.driver ?? 'harness'} · {session.state} · {session.id}</T></View> : null}
     {issue ? <View style={styles.strip}><T color={theme.waiting}>{issue}</T></View> : null}
+    {findOpen ? <View style={[styles.strip, { flexDirection: 'row', alignItems: 'center', gap: 8 }]}>
+      <Field value={find} onChangeText={setFind} placeholder="Find in this conversation" autoFocus autoCapitalize="none" returnKeyType="search" style={{ flex: 1 }} />
+      <Pressable accessibilityRole="button" onPress={() => { setFinding(false); setFind(''); }}><T color={theme.accent}>Done</T></Pressable>
+    </View> : null}
     {finding ? <View style={styles.strip}><T color={theme.yellow}>{found.length === 0 ? `Nothing here says “${find.trim()}”` : `${found.length} ${found.length === 1 ? 'entry says' : 'entries say'} “${find.trim()}”`}</T></View> : null}
     <FlatList
       ref={list}
