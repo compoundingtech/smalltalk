@@ -10,6 +10,8 @@ mkdir -p "$logs"
 fleet_compat() {
   local baseline
   baseline=$(jq -er .commit .github/fleet-compat-baseline.json) || return
+  # The pinned baseline never changes: after the first run its Nix output is substituted from the
+  # cache volume's local binary cache (scripts/ci-nix-cache) instead of being built again.
   # Building the baseline also runs the pinned pty's own unit tests, and two of its process-table
   # tests are timing-sensitive on a loaded runner (different ones failed on different runs). A
   # failed build leaves nothing behind, so a retry rebuilds only what failed.

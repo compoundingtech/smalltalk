@@ -44,6 +44,14 @@ jobs:
             ${{ runner.temp }}/cargo-home/git
           key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}"
           restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
+      - name: Restore the local Nix cache
+        id: nix-cache
+        if: runner.os == 'Linux'
+        uses: actions/cache@v4
+        with:
+          path: "${{ runner.temp }}/st-ci-cache"
+          key: "nix3-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}"
+          restore-keys: "nix3-${{ github.job }}-${{ runner.os }}-"
       - name: Install Nix
         uses: DeterminateSystems/determinate-nix-action@v3
         env:
@@ -58,12 +66,15 @@ jobs:
           summarize: true
       - name: Isolate test home and XDG state
         run: |
-          # Cargo's home lives under RUNNER_TEMP, not HOME: tests get an isolated HOME,
+          # Cargo's home and the CI cache directory live under RUNNER_TEMP, not HOME: tests get an isolated HOME,
           # and actions/cache expands a leading tilde against the HOME of the step that runs it.
-          printf 'CARGO_HOME=%s\n' "$RUNNER_TEMP/cargo-home" >> "$GITHUB_ENV"
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "$RUNNER_TEMP/cargo-home" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
           home="$RUNNER_TEMP/test-home"
           mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
+      - name: Use the cached Nix outputs
+        if: runner.os == 'Linux'
+        run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"'
       - name: Prepare provider component fixtures
         run: |
           system=$(nix eval --impure --raw --expr builtins.currentSystem)

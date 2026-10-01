@@ -37,7 +37,13 @@ them succeeded (a skipped or cancelled stage fails it). The stage jobs use the N
 
 Each stage restores a job-keyed `actions/cache` entry (Namespace serves it from its accelerated
 backend) holding Cargo's registry and the workspace `target/` directory, keyed on `Cargo.lock` and
-`flake.lock`. Namespace cache volumes are not used: they are per node and replicate in the
+`flake.lock`. A second keyed entry (`nix3-<job>-...`) holds a local Nix binary cache in
+`$RUNNER_TEMP/st-ci-cache`: `scripts/ci-nix-cache use` makes it a preferred substituter and, after a
+successful stage, `save` copies back the reference-free downloads and sources the run fetched itself
+plus the closures of the pinned fleet-compat baseline and the provider components. (`/nix` itself
+cannot be cached: a restored `/nix` has the Determinate installer's receipt but not its daemon, users
+or config, so Nix then fails with "cannot connect to socket".) With it, a warm run was 6m59s against
+about 9m, because the baseline is substituted instead of rebuilt. Namespace cache volumes are not used: they are per node and replicate in the
 background, so a job landing on another node starts empty.
 
 For the trial, `linux-tests` skips the messaging fault matrix exactly as `st/ci` does this week
