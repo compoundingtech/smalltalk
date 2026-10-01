@@ -32,8 +32,17 @@ case "$cmd" in
     ;;
   save)
     start=$SECONDS
-    # Paths already in the cache are skipped, so only the first run copies the whole store.
-    nix copy --to "file://$cache?secret-key=$key.sec&compression=none" --all --no-check-sigs
+    # Keep only what is expensive to obtain again: paths this run built or fetched itself (compiled
+    # outputs, fixed-output downloads such as crate tarballs), which carry no upstream signature.
+    # Anything cache.nixos.org or Cachix serves is quicker to fetch than a 4 GB cache is to restore.
+    # Paths already in the cache are skipped.
+    nix path-info --all --json |
+      jq -r 'if type == "object"
+             then to_entries | map(select((.value.signatures // []) | length == 0)) | map(.key)
+             else map(select((.signatures // []) | length == 0)) | map(.path) end | .[]' > "$cache.paths"
+    printf 'Nix cache: %s locally obtained store paths to save\n' "$(wc -l < "$cache.paths")"
+    xargs -a "$cache.paths" -r nix copy --to "file://$cache?secret-key=$key.sec&compression=zstd" \
+      --no-check-sigs --no-recursive
     printf 'Nix cache %s: %s store paths after saving (%ss)\n' "$cache" \
       "$(find "$cache" -maxdepth 1 -name '*.narinfo' | wc -l)" "$((SECONDS - start))"
     ;;

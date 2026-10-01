@@ -47,8 +47,8 @@ export const commonSetupSteps = [
     uses: 'actions/cache@v4',
     with: {
       path: '${{ runner.temp }}/st-ci-cache',
-      key: "nix-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}",
-      'restore-keys': 'nix-${{ github.job }}-${{ runner.os }}-',
+      key: "nix2-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}",
+      'restore-keys': 'nix2-${{ github.job }}-${{ runner.os }}-',
     },
   },
   ...plainFlakeSetupSteps({ nix: { binaryCaches: readOnlyBinaryCaches } }),
