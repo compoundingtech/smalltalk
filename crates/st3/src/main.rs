@@ -8191,6 +8191,13 @@ async fn session_incarnation(client: &Client, subject: &str) -> Result<String> {
 }
 
 fn normalize_member_subject(subject: &str, namespace: &str) -> String {
+    // Product terminal IDs include the resource prefix; the private PTY routes and registry
+    // tags name their underlying member. `terminals new` returns the public form.
+    let subject = if namespace == "pty" {
+        subject.strip_prefix("terminal/").unwrap_or(subject)
+    } else {
+        subject
+    };
     if subject.contains('/') {
         subject.into()
     } else {
@@ -18391,6 +18398,17 @@ mod tests {
             "--literal first message",
         ]);
         assert_eq!(args.message.as_deref(), Some("--literal first message"));
+        assert_eq!(
+            normalize_member_subject(
+                "terminal/pty/person/ada/019a0000-0000-7000-8000-000000000001",
+                "pty"
+            ),
+            "pty/person/ada/019a0000-0000-7000-8000-000000000001"
+        );
+        assert_eq!(
+            normalize_member_subject("terminal/agent/test.worker", "pty"),
+            "agent/test.worker"
+        );
         let source = agent_new_document(&args, "/tmp", false);
         let intent = st3::graph::parse_intent(&source, "test").unwrap();
         assert!(intent.subjects.values().next().unwrap().member.is_some());
