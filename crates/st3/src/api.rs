@@ -27,8 +27,10 @@ use tower::ServiceExt as _;
 
 use crate::archive::hydrate_eval;
 use crate::graph::{parse_intent, resolve_document_references};
+#[cfg(test)]
+use crate::model::AttentionRequest;
 use crate::model::{
-    ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView, AttentionRequest,
+    ApplyRequest, ApplyResponse, AttachRequest, Attachment, AttentionItemView,
     AttentionRequestView, AttentionResolveRequest, AttentionWithdrawRequest, ClaimInput,
     ClaimRecord, ClaimsPage, ClientPageInfo, ClientResourcePage, ClientSyncNotice, ClientSyncPeer,
     ContextClearRequest, DoctorCheck, DoctorReport, DocumentListResponse, DocumentPutRequest,
@@ -52,6 +54,7 @@ use crate::model::{
     SessionLogChunk, SessionScreen, SessionSignalRequest, St3Error, StatusResponse, StepRunView,
     WorkRequest, WorkRetryRequest, WorkWakeRequest,
 };
+use crate::model::{PersonAskRequest, PersonStepResponse};
 use crate::store::Store;
 
 mod client_v0;
@@ -201,11 +204,14 @@ impl ApiError {
             | "stale-document-token"
             | "stale-incarnation"
             | "stale-launch-preview"
-            | "fleet-leaving" => StatusCode::CONFLICT,
-            "launch-review-not-authorized" | "wrong-message-recipient" | "lane-approval-denied" => {
-                StatusCode::FORBIDDEN
-            }
-            "lane-not-found" => StatusCode::NOT_FOUND,
+            | "fleet-leaving"
+            | "glass-deleted"
+            | "glass-limit" => StatusCode::CONFLICT,
+            "launch-review-not-authorized"
+            | "wrong-message-recipient"
+            | "lane-approval-denied"
+            | "glass-owner-forbidden" => StatusCode::FORBIDDEN,
+            "lane-not-found" | "not-found" => StatusCode::NOT_FOUND,
             "internal" => StatusCode::INTERNAL_SERVER_ERROR,
             _ => StatusCode::UNPROCESSABLE_ENTITY,
         };
@@ -261,6 +267,13 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
     let app = Router::new()
         .route("/v1/health", get(health))
         .route("/v1/client/capabilities", get(client_capabilities))
+        .route("/v1/client/glasses", get(client_v0::glasses_list))
+        .route(
+            "/v1/client/glasses/{id}",
+            get(client_v0::glass_get)
+                .put(client_v0::glass_put)
+                .delete(client_v0::glass_delete),
+        )
         .route(
             "/v1/client/request-latency",
             get(client_v0::request_latency),
@@ -532,6 +545,9 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             "/v1/revision-proposals/{proposal}/cancel",
             post(cancel_revision_proposal),
         )
+        .route("/v1/work/ask", post(ask_person))
+        .route("/v1/work/done", post(done_person_step))
+        .route("/v1/work/cancel-ask", post(cancel_person_ask))
         .route("/v1/work", get(list_work))
         .route("/v1/work-items/{*subject}", get(get_work))
         .route("/v1/work/mission/{*subject}", post(publish_work_mission))
@@ -939,6 +955,7 @@ fn client_error_code(code: Option<&str>) -> String {
     match code.unwrap_or("internal") {
         "not-found"
         | "forbidden"
+        | "attention-migrated"
         | "unsupported-capability"
         | "validation-failed"
         | "idempotency-conflict"
@@ -950,10 +967,15 @@ fn client_error_code(code: Option<&str>) -> String {
         | "runtime-authority-indeterminate"
         | "remote-unavailable"
         | "internal" => code.unwrap_or("internal").to_owned(),
-        "launch-review-not-authorized" | "wrong-message-recipient" | "lane-approval-denied" => {
+        "launch-review-not-authorized" | "wrong-message-recipient" | "lane-approval-denied" | "glass-owner-forbidden" => {
             "forbidden".into()
         }
         "lane-not-found" => "not-found".into(),
+        "invalid-person-ask"
+        | "invalid-person-response"
+        | "missing-ask-owner"
+        | "ambiguous-ask-owner" => "validation-failed".into(),
+        "stale-work-ask" => "stale-fence".into(),
         "run-not-queued"
         | "missing-queue-anchor"
         | "unexpected-queue-anchor"
@@ -970,7 +992,7 @@ fn client_error_code(code: Option<&str>) -> String {
         | "unexpected-lane-anchor"
         | "invalid-lane-anchor"
         | "invalid-lane-state"
-        | "invalid-lane-change" => "validation-failed".into(),
+        | "invalid-lane-change" | "glass-limit" | "glass-deleted" | "invalid-glass-base" => "validation-failed".into(),
         // A retry of a request whose claim a checkpoint dropped cannot be answered again.
         "claim-checkpointed" => "idempotency-conflict".into(),
         _ => "internal".into(),
@@ -1313,7 +1335,11 @@ async fn client_capabilities(
             "max_page_items": CLIENT_MAX_PAGE_ITEMS,
             "max_event_items": 500,
             "max_response_bytes": CLIENT_MAX_RESPONSE_BYTES,
-            "max_wait_ms": 30_000
+            "max_wait_ms": 30_000,
+            "max_glass_body_bytes": st3_schema::glasses::MAX_BODY_BYTES,
+            "max_glasses": st3_schema::glasses::MAX_GLASSES,
+            "max_glass_depth": st3_schema::glasses::MAX_DEPTH,
+            "max_glass_nodes": st3_schema::glasses::MAX_NODES
         },
         "event_cursor": cursor,
         "oldest_event_cursor": format!("event-cursor/{}/{oldest}", state.node),
@@ -2285,15 +2311,6 @@ fn snapshot_time_ms(timestamp: &str) -> u128 {
         .unwrap_or_default()
 }
 
-fn attention_resource_id(subject: &str) -> String {
-    if subject.starts_with("attention/") {
-        subject.to_owned()
-    } else {
-        let digest = hex::encode(Sha256::digest(subject.as_bytes()));
-        format!("attention/{}", &digest[..24])
-    }
-}
-
 fn client_attention_actions(kind: &str, review_mode: Option<&str>) -> Vec<&'static str> {
     match kind {
         "human-gate" if review_mode == Some("feedback") => {
@@ -2305,23 +2322,13 @@ fn client_attention_actions(kind: &str, review_mode: Option<&str>) -> Vec<&'stat
             vec!["mission.approve-revision", "mission.cancel-revision"]
         }
         "unread-message" => vec!["message.read"],
-        "fault" | "agent-request" => vec!["attention.resolve"],
+        "person-step" => vec!["work.done"],
+        "fault" | "agent-request" => Vec::new(),
         _ => Vec::new(),
     }
 }
 
-/// Both the default and the history view rank a request by the severity its requester gave.
-fn attention_priority(severity: &str) -> &'static str {
-    match severity {
-        "critical" => "critical",
-        "error" => "high",
-        "warning" => "normal",
-        _ => "low",
-    }
-}
-
-/// Beside each request target, what that target is doing now, so a leftover request is
-/// recognizable without opening every target.
+/// Describe the current source targets beside a failure.
 fn insert_attention_target_states(
     store: &Store,
     resource: &mut serde_json::Map<String, Value>,
@@ -2347,158 +2354,51 @@ fn insert_attention_target_states(
 fn client_attention_resources(
     store: &Store,
     person: Option<&str>,
-    history: bool,
+    _history: bool,
 ) -> anyhow::Result<Vec<Value>> {
-    let current = store.attention_items(person)?;
-    let current_subjects = current
-        .iter()
-        .map(|item| item.subject.as_str())
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut retired_seats = None;
-    let mut resources = BTreeMap::new();
-    for item in &current {
-        let id = attention_resource_id(&item.subject);
-        let priority = if matches!(item.kind.as_str(), "fault" | "agent-request") {
-            store
-                .attention_request(&item.subject)?
-                .map_or("high", |request| attention_priority(&request.severity))
-        } else {
-            "normal"
-        };
-        let revision = store
-            .claims_for(&item.subject, None)?
-            .last()
-            .map(|claim| claim.id.clone())
-            .or_else(|| {
-                item.subject
-                    .strip_prefix("attention/subscription-failure-")
-                    .map(str::to_owned)
-            })
-            .ok_or_else(|| anyhow::anyhow!("attention `{}` has no accepted claim", item.subject))?;
+    let current = store.attention_snapshot(person, client_now_ms())?;
+    let mut resources = Vec::new();
+    for item in current {
+        let identity = serde_json::to_vec(&(&item.subject, &item.person, &item.episode))?;
+        let id = format!("attention/{}", &hex::encode(Sha256::digest(identity))[..32]);
         let mut resource = json!({
-            "id": id,
-            "kind": "attention",
-            "attention_kind": item.kind,
-            "source_id": item.subject,
-            "person_id": if item.person.is_empty() { "person/any" } else { &item.person },
-            "revision": revision,
+            "id": id, "kind": "attention", "attention_kind": item.kind,
+            "source_id": item.subject, "source_kind": item.kind, "episode": item.episode,
+            "person_id": item.person, "revision": item.episode,
             "updated_at": client_timestamp(item.requested_at_unix_ms),
-            "title": item.title,
-            "detail": item.detail,
-            "priority": priority,
-            "state": "open",
-            "requested_at": client_timestamp(item.requested_at_unix_ms),
-            "targets": item.targets,
-            "actions": client_attention_actions(&item.kind, item.review_mode.as_deref()),
-            "operational": { "layer": "current", "actionable": true, "reasons": [] }
+            "title": item.title, "detail": item.detail, "priority": item.priority,
+            "state": "open", "requested_at": client_timestamp(item.requested_at_unix_ms),
+            "targets": item.targets, "actions": client_attention_actions(&item.kind, item.review_mode.as_deref()),
+            "operational": {"layer": "current", "actionable": true, "reasons": []}
         });
-        let object = resource
-            .as_object_mut()
-            .expect("an attention resource is an object");
-        if let Some(requester) = &item.requester_id {
-            object.insert("requester_id".into(), Value::String(requester.clone()));
-        }
         for (name, value) in [
-            ("launch_id", &item.launch_id),
-            ("variant_id", &item.variant_id),
-            ("message_id", &item.message_id),
+            ("requester_id", item.requester_id),
+            ("launch_id", item.launch_id),
+            ("variant_id", item.variant_id),
+            ("message_id", item.message_id),
+            ("mission_id", item.mission),
+            ("mission_run_id", item.mission_run),
+            ("step_run_id", item.step),
         ] {
             if let Some(value) = value {
-                object.insert(name.into(), Value::String(value.clone()));
+                resource[name] = json!(value);
             }
         }
-        if let Some(mode) = &item.review_mode {
-            object.insert("review_mode".into(), Value::String(mode.clone()));
+        if let Some(mode) = item.review_mode {
+            resource["review_mode"] = json!(mode);
         }
-        if matches!(item.kind.as_str(), "fault" | "agent-request")
-            && attention_requester_retired(store, item, &mut retired_seats)?
-        {
-            object["operational"]["reasons"] = json!(["requester-retired"]);
-        }
-        if let Some(mission) = &item.mission {
-            object.insert("mission_id".into(), Value::String(mission.clone()));
-        }
-        if let Some(run) = &item.mission_run {
-            object.insert("mission_run_id".into(), Value::String(run.clone()));
-        }
-        if let Some(step) = &item.step {
-            object.insert("step_run_id".into(), Value::String(step.clone()));
-        }
-        if matches!(item.kind.as_str(), "fault" | "agent-request") {
-            insert_attention_target_states(store, object, &item.targets)?;
+        if item.kind == "person-step" {
+            resource["action_parameters"] =
+                json!({"work.done": {"target_id": item.subject, "episode": item.episode}});
         }
         if item.kind == "fault" {
-            object.insert("what".into(), Value::String(item.title.clone()));
-            object.insert("because".into(), Value::String(item.detail.clone()));
-            object.insert("fix".into(), json!({"action": "attention.resolve", "parameters": {"attention_id": item.subject, "outcome": "resolved"}}));
+            resource["what"] = json!(item.title);
+            resource["because"] = json!(item.detail);
+            let targets = vec![item.subject.clone()];
+            insert_attention_target_states(store, resource.as_object_mut().unwrap(), &targets)?;
         }
-        resources.insert(id, resource);
+        resources.push(resource);
     }
-    if history {
-        for request in store.attention_requests(person, true)? {
-            let current = current_subjects.contains(request.subject.as_str());
-            let mut reasons = Vec::new();
-            if request.status != "pending" {
-                reasons.push(request.status.as_str());
-            } else if !current {
-                reasons.push("superseded");
-            }
-            let id = attention_resource_id(&request.subject);
-            let kind = if crate::store::agent_attention_requester(&request.actor) {
-                "agent-request"
-            } else {
-                "fault"
-            };
-            let mut resource = json!({
-                    "id": id,
-                    "kind": "attention",
-                    "attention_kind": kind,
-                    "source_id": request.subject,
-                    "person_id": request.reviewer,
-                    "requester_id": request.actor,
-                    "revision": request.request,
-                    "updated_at": client_timestamp(request.resolved_at_unix_ms.unwrap_or(request.requested_at_unix_ms)),
-                    "title": request.title,
-                    "detail": request.reason,
-                    "priority": attention_priority(&request.severity),
-                    "state": if request.status == "pending" { "open" } else { "resolved" },
-                    "requested_at": client_timestamp(request.requested_at_unix_ms),
-                    "targets": request.targets,
-                    "actions": if current { client_attention_actions(kind, None) } else { Vec::<&str>::new() },
-                    "operational": { "layer": if current { "current" } else { "history" }, "actionable": current, "reasons": reasons }
-            });
-            if kind == "fault" {
-                resource["what"] = Value::String(request.title.clone());
-                resource["because"] = Value::String(request.reason.clone());
-                resource["fix"] = json!({"action": "attention.resolve", "parameters": {"attention_id": request.subject, "outcome": "resolved"}});
-            }
-            insert_attention_target_states(
-                store,
-                resource
-                    .as_object_mut()
-                    .expect("an attention resource is an object"),
-                &request.targets,
-            )?;
-            resources.insert(id, resource);
-        }
-    }
-    let mut resources = resources.into_values().collect::<Vec<_>>();
-    let priority = |value: &Value| match value["priority"].as_str() {
-        Some("critical") => 0,
-        Some("high") => 1,
-        Some("normal") => 2,
-        _ => 3,
-    };
-    resources.sort_by(|left, right| {
-        priority(left)
-            .cmp(&priority(right))
-            .then_with(|| {
-                left["requested_at"]
-                    .as_str()
-                    .cmp(&right["requested_at"].as_str())
-            })
-            .then_with(|| left["id"].as_str().cmp(&right["id"].as_str()))
-    });
     Ok(resources)
 }
 
@@ -2533,30 +2433,6 @@ fn client_attention_resources_with_previews(
         }
     }
     Ok(items)
-}
-
-/// A fault whose requesting seat was stopped, or whose owning run or generation ended, has no
-/// one left to withdraw it. Only its reviewer can close it now.
-fn attention_requester_retired(
-    store: &Store,
-    item: &crate::model::AttentionItemView,
-    retired_seats: &mut Option<std::collections::BTreeSet<String>>,
-) -> anyhow::Result<bool> {
-    let Some(request) = store.attention_request(&item.subject)? else {
-        return Ok(false);
-    };
-    if !request.actor.starts_with("agent/") {
-        return Ok(false);
-    }
-    if store.selected_desired_kind(&request.actor)?.as_deref() == Some("stop") {
-        return Ok(true);
-    }
-    if retired_seats.is_none() {
-        *retired_seats = Some(store.terminal_owned_runtime_subjects()?);
-    }
-    Ok(retired_seats
-        .as_ref()
-        .is_some_and(|seats| seats.contains(&request.actor)))
 }
 
 fn client_message_resources(
@@ -8211,6 +8087,7 @@ async fn get_claim(
     let id_for_read = id.clone();
     blocking_store(move || store.claim_by_id(&id_for_read))
         .await?
+        .filter(|claim| !claim.subject.starts_with("glass/"))
         .map(Json)
         .ok_or_else(|| ApiError::not_found(format!("claim `{id}` does not exist")))
 }
@@ -8286,6 +8163,39 @@ struct AttentionQuery {
     person: Option<String>,
 }
 
+async fn ask_person(
+    State(state): State<AppState>,
+    Json(request): Json<PersonAskRequest>,
+) -> Result<Json<StepRunView>, ApiError> {
+    let result = state.store.ask_person(&request).map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(result))
+}
+
+async fn done_person_step(
+    State(state): State<AppState>,
+    Json(request): Json<PersonStepResponse>,
+) -> Result<Json<StepRunView>, ApiError> {
+    let result = state
+        .store
+        .finish_person_step(&request, false)
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(result))
+}
+
+async fn cancel_person_ask(
+    State(state): State<AppState>,
+    Json(request): Json<PersonStepResponse>,
+) -> Result<Json<StepRunView>, ApiError> {
+    let result = state
+        .store
+        .finish_person_step(&request, true)
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(result))
+}
+
 async fn list_attention(
     State(state): State<AppState>,
     Query(query): Query<AttentionQuery>,
@@ -8313,60 +8223,24 @@ async fn list_attention(
 }
 
 async fn request_attention(
-    State(state): State<AppState>,
-    Json(post): Json<crate::model::AttentionRequestPost>,
+    State(_state): State<AppState>,
+    Json(_post): Json<crate::model::AttentionRequestPost>,
 ) -> Result<Json<AttentionRequestView>, ApiError> {
-    let request: &AttentionRequest = &post.request;
-    if post.closing.closed_by.as_deref() == Some("st") {
-        return Err(ApiError::bad(St3Error::new(
-            "invalid-attention-closed-by",
-            "only st closes the requests it raises for conditions it watches; name a target, --until, --step or --person-closes",
-        )));
-    }
-    let id = hex::encode(Sha256::digest(request.idempotency_key.as_bytes()));
-    let subject = format!("attention/{}", &id[..32]);
-    let response = state
-        .store
-        .request_attention_closing(&subject, request, &post.closing)
-        .map_err(ApiError::bad)?;
-    signal_changed(&state);
-    Ok(Json(response))
+    Err(ApiError::bad(St3Error::new(
+        "attention-migrated",
+        "attention is a derived view; use work ask/done/cancel-ask or act on its source",
+    )))
 }
 
 async fn resolve_attention(
-    State(state): State<AppState>,
-    AxumPath(subject): AxumPath<String>,
-    Json(request): Json<AttentionResolveRequest>,
+    State(_state): State<AppState>,
+    AxumPath(_subject): AxumPath<String>,
+    Json(_request): Json<AttentionResolveRequest>,
 ) -> Result<Json<AttentionRequestView>, ApiError> {
-    let response = state
-        .store
-        .resolve_attention(&subject, &request)
-        .map_err(ApiError::bad)?;
-    if crate::store::agent_attention_requester(&response.actor) {
-        let content = match response.resolution_reason.as_deref() {
-            Some(reason) if !reason.trim().is_empty() => format!(
-                "Your attention request `{}` was {}. Reason: {}",
-                response.subject, request.outcome, reason
-            ),
-            _ => format!(
-                "Your attention request `{}` was {}.",
-                response.subject, request.outcome
-            ),
-        };
-        send_planning_message(
-            &state,
-            &format!(
-                "attention-resolution:{}:{}",
-                response.request, request.idempotency_key
-            ),
-            &request.actor,
-            &response.actor,
-            &content,
-            "Attention request answered",
-        )?;
-    }
-    signal_changed(&state);
-    Ok(Json(response))
+    Err(ApiError::bad(St3Error::new(
+        "attention-migrated",
+        "attention is a derived view; use work ask/done/cancel-ask or act on its source",
+    )))
 }
 
 #[derive(Deserialize)]
@@ -8404,16 +8278,14 @@ async fn decide_subscription_request(
 }
 
 async fn withdraw_attention(
-    State(state): State<AppState>,
-    AxumPath(subject): AxumPath<String>,
-    Json(request): Json<AttentionWithdrawRequest>,
+    State(_state): State<AppState>,
+    AxumPath(_subject): AxumPath<String>,
+    Json(_request): Json<AttentionWithdrawRequest>,
 ) -> Result<Json<AttentionRequestView>, ApiError> {
-    let response = state
-        .store
-        .withdraw_attention(&subject, &request)
-        .map_err(ApiError::bad)?;
-    signal_changed(&state);
-    Ok(Json(response))
+    Err(ApiError::bad(St3Error::new(
+        "attention-migrated",
+        "attention is a derived view; use work ask/done/cancel-ask or act on its source",
+    )))
 }
 
 async fn post_review(
@@ -13524,15 +13396,15 @@ agent "good" {{ workspace {:?}; command "true" }}
         ] {
             state
                 .store
-                .request_attention(
-                    &format!("attention/{key}"),
+                .record_operational_failure(
+                    &format!("disk-{key}"),
                     &AttentionRequest {
                         reviewer: "person/alex".into(),
                         title: title.into(),
                         reason: "A person needs to decide.".into(),
                         severity: "warning".into(),
-                        targets: Vec::new(),
-                        actor: "agent/example/worker".into(),
+                        targets: vec![format!("daemon/{key}")],
+                        actor: "daemon/runtime".into(),
                         idempotency_key: key.into(),
                     },
                 )
@@ -13563,7 +13435,7 @@ agent "good" {{ workspace {:?}; command "true" }}
         assert!(
             stale
                 .message
-                .contains("attention/first for person/alex, open 2d 3h: Renew the signing key"),
+                .contains("daemon/first for person/alex, open 2d 3h: Renew the signing key"),
             "{}",
             stale.message
         );
@@ -17396,7 +17268,10 @@ mission "fleet/fixture-website/refresh" state="ready" {
             app.clone(),
             "/v1/intent/apply",
             apply(
-                &run("fleet/fixture-website/refresh/one", "fleet/fixture-website/refresh"),
+                &run(
+                    "fleet/fixture-website/refresh/one",
+                    "fleet/fixture-website/refresh",
+                ),
                 SEAT,
                 "website-starts-own",
             ),
@@ -17446,7 +17321,10 @@ mission "fleet/fixture-other/deploy" state="ready" {
             app.clone(),
             "/v1/intent/apply",
             apply(
-                &run("fleet/fixture-other/deploy/one", "fleet/fixture-other/deploy"),
+                &run(
+                    "fleet/fixture-other/deploy/one",
+                    "fleet/fixture-other/deploy",
+                ),
                 SEAT,
                 "website-starts-other",
             ),
@@ -17602,7 +17480,12 @@ mission "fleet/fixture-crew/host" state="ready" {
                 false,
                 "none",
             ),
-            ("agent/fleet/fixture-builder", "fleet/fixture-builder/job", true, "default"),
+            (
+                "agent/fleet/fixture-builder",
+                "fleet/fixture-builder/job",
+                true,
+                "default",
+            ),
             (helper.as_str(), "fleet/fixture-crew/job", false, "none"),
         ] {
             let (status, body) = json_request(
@@ -18799,94 +18682,31 @@ version 2
     }
 
     #[tokio::test]
-    async fn attention_routes_show_agent_request_and_deliver_resolution_reason() {
+    async fn legacy_attention_mutations_report_migration_without_writes() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let store = state.store.clone();
         let app = router(state);
-        let request = serde_json::to_value(AttentionRequest {
-            reviewer: "alex".into(),
-            title: "Fabric needs review".into(),
-            reason: "The queue did not recover.".into(),
-            severity: "error".into(),
-            targets: vec!["resource/fabric/queue".into()],
-            actor: "agent/fabric/worker".into(),
-            idempotency_key: "api-attention-fabric".into(),
-        })
-        .unwrap();
-        let mut refused = request.clone();
-        refused["closed_by"] = json!("st");
-        let (status, error) = json_request(app.clone(), "/v1/attention", refused).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
-        assert_eq!(error["code"], "invalid-attention-closed-by");
-        let (status, error) = json_request(app.clone(), "/v1/attention", request.clone()).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
-        assert_eq!(error["code"], "attention-closes-never");
-        let mut request = request;
-        request["closed_by"] = json!("person");
-        let (status, created) = json_request(app.clone(), "/v1/attention", request).await;
-        assert_eq!(status, StatusCode::OK, "{created}");
-        assert_eq!(created["reviewer"], "person/alex");
-        assert_eq!(created["status"], "pending");
-
-        let (status, selected) = get_request(app.clone(), "/v1/attention?person=alex").await;
-        assert_eq!(status, StatusCode::OK, "{selected}");
-        assert_eq!(selected.as_array().unwrap().len(), 1);
-        assert_eq!(selected[0]["kind"], "agent-request");
-        assert_eq!(selected[0]["requester_id"], "agent/fabric/worker");
-        assert_eq!(selected[0]["actions"][0]["label"], "answer");
-        let client = client_attention_resources(&store, Some("person/alex"), false).unwrap();
-        assert_eq!(client[0]["attention_kind"], "agent-request");
-        assert_eq!(client[0]["requester_id"], "agent/fabric/worker");
-        let (_, filtered) =
-            get_request(app.clone(), "/v1/attention?person=person%2Fsomeone-else").await;
-        assert_eq!(filtered, json!([]));
-
-        let subject = created["subject"].as_str().unwrap();
-        let agent = serde_json::to_value(AttentionResolveRequest {
-            outcome: "resolved".into(),
-            reason: None,
-            actor: "agent/fabric/other".into(),
-            idempotency_key: "api-attention-agent".into(),
-        })
-        .unwrap();
-        let (status, rejected) = json_request(
-            app.clone(),
-            &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
-            agent,
-        )
-        .await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
-        assert_eq!(rejected["code"], "attention-resolver-not-person");
-
-        let resolution = serde_json::to_value(AttentionResolveRequest {
-            outcome: "resolved".into(),
-            reason: Some("The queue recovered.".into()),
-            actor: "person/alex".into(),
-            idempotency_key: "api-attention-resolve".into(),
-        })
-        .unwrap();
-        let (status, resolved) = json_request(
-            app.clone(),
-            &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
-            resolution.clone(),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{resolved}");
-        assert_eq!(resolved["status"], "resolved");
-        let (status, replayed) = json_request(
-            app.clone(),
-            &format!("/v1/attention/resolve/{}", urlencoding::encode(subject)),
-            resolution,
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK, "{replayed}");
-        let messages = store.messages(Some("agent/fabric/worker"), false).unwrap();
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0].content.contains("The queue recovered."));
-        assert!(messages[0].content.contains("resolved"));
-        let (_, empty) = get_request(app, "/v1/attention?person=alex").await;
-        assert_eq!(empty, json!([]));
+        for (path, body) in [
+            (
+                "/v1/attention",
+                json!({"reviewer":"person/avery","title":"Decide","reason":"Choose a date","severity":"warning","targets":[],"actor":"agent/alder.asker","idempotency_key":"legacy-ask"}),
+            ),
+            (
+                "/v1/attention/resolve/attention%2Flegacy",
+                json!({"outcome":"resolved","actor":"person/avery","idempotency_key":"legacy-done"}),
+            ),
+            (
+                "/v1/attention/withdraw/attention%2Flegacy",
+                json!({"reason":"Ended","actor":"agent/alder.asker","idempotency_key":"legacy-cancel"}),
+            ),
+        ] {
+            let (status, error) = json_request(app.clone(), path, body).await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{error}");
+            assert_eq!(error["code"], "attention-migrated");
+        }
+        assert!(store.attention_requests(None, true).unwrap().is_empty());
+        assert!(store.messages(None, true).unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -18894,20 +18714,17 @@ version 2
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let store = state.store.clone();
-        for (subject, severity) in [
-            ("attention/a-low", "warning"),
-            ("attention/z-high", "error"),
-        ] {
+        for (subject, severity) in [("daemon/low", "warning"), ("daemon/high", "error")] {
             store
-                .request_attention(
+                .record_operational_failure(
                     subject,
                     &AttentionRequest {
                         reviewer: "person/alex".into(),
                         title: format!("Fault {severity}"),
                         reason: "The subscription needs a correction.".into(),
                         severity: severity.into(),
-                        targets: vec![],
-                        actor: "person/system".into(),
+                        targets: vec![subject.into()],
+                        actor: "daemon/runtime".into(),
                         idempotency_key: subject.into(),
                     },
                 )
@@ -18916,18 +18733,18 @@ version 2
         let app = router(state);
         let (status, page) = get_request(app, "/v1/client/now?person=person%2Falex").await;
         assert_eq!(status, StatusCode::OK, "{page}");
-        assert_eq!(page["items"][0]["source_id"], "attention/z-high");
-        assert_eq!(page["items"][1]["source_id"], "attention/a-low");
+        assert_eq!(page["items"][0]["source_id"], "daemon/high");
+        assert_eq!(page["items"][1]["source_id"], "daemon/low");
         assert_eq!(page["items"][0]["what"], "Fault error");
         assert_eq!(
             page["items"][0]["because"],
             "The subscription needs a correction."
         );
-        assert_eq!(page["items"][0]["fix"]["action"], "attention.resolve");
+        assert!(page["items"][0]["actions"].as_array().unwrap().is_empty());
     }
 
     #[test]
-    fn a_fault_from_a_retired_requester_seat_is_labelled() {
+    fn legacy_attention_from_live_and_retired_requesters_is_not_current() {
         let store = Store::open_memory("node").unwrap();
         let apply = |intent: &crate::model::NormalizedIntent, key: &str| {
             let planned = store
@@ -19023,105 +18840,78 @@ agent "seat" { workspace "/tmp"; command "true" }
             .set_mission_run_state(&run.id, "cancelled", "terminal", Some("moved to a seat"))
             .unwrap();
 
-        let reasons = reasons(&store);
-        assert_eq!(
-            reasons["attention/from-stopped"],
-            json!(["requester-retired"])
-        );
-        assert_eq!(reasons["attention/from-seat"], json!(["requester-retired"]));
-        assert_eq!(reasons["attention/from-live"], json!([]));
+        assert!(reasons(&store).is_empty(), "legacy rows are audit data");
     }
 
-    #[tokio::test]
-    async fn attention_priority_follows_severity_with_and_without_history() {
-        let root = tempfile::tempdir().unwrap();
-        let state = state(root.path());
-        let app = router(state.clone());
-        for (severity, key) in [
-            ("warning", "api-attention-warning"),
-            ("error", "api-attention-error"),
-        ] {
-            let request = serde_json::to_value(AttentionRequest {
-                reviewer: "person/alex".into(),
-                title: format!("{severity} fault"),
-                reason: "The queue did not recover.".into(),
-                severity: severity.into(),
-                targets: vec!["resource/fabric/queue".into()],
-                actor: "agent/fabric/worker".into(),
-                idempotency_key: key.into(),
-            })
-            .unwrap();
-            let mut request = request;
-            request["closed_by"] = json!("person");
-            let (status, created) = json_request(app.clone(), "/v1/attention", request).await;
-            assert_eq!(status, StatusCode::OK, "{created}");
+    #[test]
+    fn source_failure_priorities_are_shared_across_readers() {
+        let store = Store::open_memory("alder").unwrap();
+        for severity in ["warning", "error"] {
+            store
+                .record_operational_failure(
+                    severity,
+                    &AttentionRequest {
+                        reviewer: "person/avery".into(),
+                        title: format!("{severity} fault"),
+                        reason: "The disk needs attention.".into(),
+                        severity: severity.into(),
+                        targets: vec![format!("daemon/{severity}")],
+                        actor: "daemon/runtime".into(),
+                        idempotency_key: severity.into(),
+                    },
+                )
+                .unwrap();
         }
         for history in [false, true] {
             let resources =
-                client_attention_resources(&state.store, Some("person/alex"), history).unwrap();
-            let priority = |title: &str| {
-                resources
-                    .iter()
-                    .find(|resource| resource["title"] == title)
-                    .map(|resource| resource["priority"].clone())
-            };
-            assert_eq!(
-                priority("warning fault"),
-                Some(json!("normal")),
-                "history={history}"
-            );
-            assert_eq!(
-                priority("error fault"),
-                Some(json!("high")),
-                "history={history}"
-            );
+                client_attention_resources(&store, Some("person/avery"), history).unwrap();
+            assert_eq!(resources[0]["priority"], "high");
+            assert_eq!(resources[1]["priority"], "normal");
         }
     }
 
     #[tokio::test]
-    async fn requester_can_withdraw_obsolete_attention_without_person_impersonation() {
+    async fn person_work_routes_share_snapshot_and_reject_stale_or_wrong_responses() {
         let root = tempfile::tempdir().unwrap();
-        let app = router(state(root.path()));
-        let request = serde_json::to_value(AttentionRequest {
-            reviewer: "person/alex".into(),
-            title: "Old blocker".into(),
-            reason: "A logout might eventually help, but no action is needed now.".into(),
-            severity: "error".into(),
-            targets: vec![],
-            actor: "agent/typecase/worker".into(),
-            idempotency_key: "withdraw-old-blocker".into(),
-        })
+        let state = state(root.path());
+        let intent = crate::graph::parse_internal_intent(
+            "version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }",
+            state.store.origin(),
+        )
         .unwrap();
-        let mut request = request;
-        request["closed_by"] = json!("person");
-        let (_, created) = json_request(app.clone(), "/v1/attention", request).await;
-        let subject = created["subject"].as_str().unwrap();
-        let path = format!("/v1/attention/withdraw/{}", urlencoding::encode(subject));
-        let wrong = serde_json::to_value(AttentionWithdrawRequest {
-            reason: "No action needed".into(),
-            actor: "agent/other".into(),
-            idempotency_key: "withdraw-wrong".into(),
-        })
-        .unwrap();
-        let (status, rejected) = json_request(app.clone(), &path, wrong).await;
-        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{rejected}");
-        let request = serde_json::to_value(AttentionWithdrawRequest {
-            reason: "The milestone continued; no action is needed now.".into(),
-            actor: "agent/typecase/worker".into(),
-            idempotency_key: "withdraw-right".into(),
-        })
-        .unwrap();
-        let (status, withdrawn) = json_request(app.clone(), &path, request.clone()).await;
-        assert_eq!(status, StatusCode::OK, "{withdrawn}");
-        assert_eq!(withdrawn["status"], "withdrawn");
-        let (status, repeated) = json_request(app.clone(), &path, request).await;
-        assert_eq!(status, StatusCode::OK, "{repeated}");
-        assert_eq!(
-            withdrawn["resolved_at_unix_ms"],
-            repeated["resolved_at_unix_ms"]
-        );
-        let (_, current) = get_request(app, "/v1/attention?person=person%2Falex").await;
-        assert_eq!(current, json!([]));
+        state
+            .store
+            .apply_internal(&intent, "api-person-asker")
+            .unwrap();
+        let actor = format!("agent/{}.asker", state.store.origin());
+        let app = router(state.clone());
+        let body = json!({"person":"person/avery","title":"Choose a date","reason":"Reply with a date","actor":actor,"new_run":"release-date","idempotency_key":"api-ask"});
+        let (status, ask) = json_request(app.clone(), "/v1/work/ask", body.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{ask}");
+        let (_, duplicate) = json_request(app.clone(), "/v1/work/ask", body).await;
+        assert_eq!(ask["subject"], duplicate["subject"]);
+        let (_, attention) = get_request(app.clone(), "/v1/attention?person=person%2Favery").await;
+        assert_eq!(attention[0]["subject"], ask["subject"]);
+        let (_, now) = get_request(app.clone(), "/v1/client/now?person=person%2Favery").await;
+        assert_eq!(now["items"][0]["source_id"], ask["subject"]);
+        assert_eq!(now["items"][0]["actions"], json!(["work.done"]));
+        let episode = attention[0]["episode"].clone();
+        let mut done = json!({"subject":ask["subject"],"actor":"person/robin","summary":"Friday","episode":episode,"evidence":[],"idempotency_key":"api-done"});
+        let (_, refused) = json_request(app.clone(), "/v1/work/done", done.clone()).await;
+        assert_eq!(refused["code"], "forbidden");
+        done["actor"] = json!("person/avery");
+        done["episode"] = json!("old");
+        let (_, stale) = json_request(app.clone(), "/v1/work/done", done.clone()).await;
+        assert_eq!(stale["code"], "stale-fence");
+        done["episode"] = episode;
+        let (status, completed) = json_request(app.clone(), "/v1/work/done", done.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{completed}");
+        assert_eq!(completed["status"], "completed");
+        let (_, again) = json_request(app.clone(), "/v1/work/done", done).await;
+        assert_eq!(again["status"], "completed");
+        let (_, empty) = get_request(app, "/v1/client/now?person=person%2Favery").await;
+        assert_eq!(empty["items"], json!([]));
+        assert!(state.store.messages(Some(&actor), true).unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -562,7 +562,8 @@ pub fn run(context: Context) -> Result<()> {
         terminal.draw(|frame| ui.render(frame))?;
         execute!(io::stdout(), EndSynchronizedUpdate)?;
         if event::poll(Duration::from_millis(80))? {
-            loop {
+            // crossterm's read never returns on a closed terminal, so check for one before each.
+            while !stopping.load(std::sync::atomic::Ordering::Relaxed) && !crate::stdin_hung_up() {
                 match event::read()? {
                     Event::Key(key)
                         if !extras.live

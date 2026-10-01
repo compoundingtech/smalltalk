@@ -45,7 +45,9 @@ cargo build --release --locked --manifest-path "$work/pty/Cargo.toml" \
 install -m 0755 "$work/pty-target/$target/release/pty" "$work/$package/bin/pty"
 ln -s st3 "$work/$package/bin/st"
 install -m 0755 scripts/install-release "$work/$package/install.sh"
+install -m 0755 scripts/install-macos.py "$work/$package/install-macos.py"
 cp docs/st3/binary-releases.md "$work/$package/README.md"
+cp docs/st3/macos-installation.md "$work/$package/macos-installation.md"
 
 for binary in st3 stui st3-migrate pty; do
   path="$work/$package/bin/$binary"
@@ -76,7 +78,9 @@ tar -C "$work" -czf "$archive" "$package"
 # Verify the delivered bytes, not just the pre-archive staging directory.
 mkdir "$work/extracted"
 tar -C "$work/extracted" -xzf "$archive"
-"$work/extracted/$package/install.sh" --bin-dir "$work/installed"
+mkdir -p "$work/install-home"
+ST_MACOS_INSTALL_HOME="$work/install-home" ST_MACOS_APP_PATH="$work/installed/SmallTalk.app" \
+  "$work/extracted/$package/install.sh" --bin-dir "$work/installed"
 "$work/installed/st3" --help >/dev/null
 "$work/installed/st" --help >/dev/null
 "$work/installed/st3-migrate" --help >/dev/null

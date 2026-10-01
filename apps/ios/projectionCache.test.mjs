@@ -27,8 +27,8 @@ assert.equal(decodeProjectionCache(encoded, 'https://other.invalid', now), null)
 assert.equal(decodeProjectionCache(encoded, gateway, now + 8 * 24 * 60 * 60 * 1000), null);
 assert.equal(decodeProjectionCache(encoded, gateway, now - 6 * 60 * 1000), null);
 // A cache from before rows carried their steps is dropped rather than drawn without them.
-assert.ok(encoded.includes('"version":3'));
-assert.equal(decodeProjectionCache(encoded.replace('"version":3', '"version":2'), gateway, now), null);
+assert.ok(encoded.includes('"version":4'));
+assert.equal(decodeProjectionCache(encoded.replace('"version":4', '"version":3'), gateway, now), null);
 assert.equal(decodeProjectionCache('{bad json', gateway, now), null);
 assert.equal(decodeProjectionCache(encoded.replace('"kind":"session"', '"kind":"terminal-attachment"'), gateway, now), null);
 assert.equal(offlinePresentation(false).title, 'Offline');

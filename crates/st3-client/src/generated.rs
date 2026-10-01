@@ -47,6 +47,7 @@ pub enum ErrorCode {
     NotFound,
     Forbidden,
     UnsupportedCapability,
+    AttentionMigrated,
     ValidationFailed,
     IdempotencyConflict,
     StaleFence,
@@ -85,6 +86,10 @@ pub struct Limits {
     pub max_event_items: usize,
     pub max_response_bytes: usize,
     pub max_wait_ms: u64,
+    pub max_glass_body_bytes: Option<usize>,
+    pub max_glasses: Option<usize>,
+    pub max_glass_depth: Option<usize>,
+    pub max_glass_nodes: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -239,6 +244,12 @@ pub struct Operational {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Attention {
+    #[serde(default)]
+    pub episode: String,
+    #[serde(default)]
+    pub source_kind: String,
+    #[serde(default)]
+    pub action_parameters: BTreeMap<String, Value>,
     #[serde(flatten)]
     pub header: ResourceHeader,
     #[serde(flatten)]
@@ -1040,6 +1051,7 @@ pub enum Resource {
     Operation(Operation),
     History(History),
     Session(Session),
+    Glass(Glass),
 }
 
 impl Resource {
@@ -1063,6 +1075,7 @@ impl Resource {
             Self::Operation(v) => &v.header,
             Self::History(v) => &v.header,
             Self::Session(v) => &v.header,
+            Self::Glass(v) => &v.header,
         }
     }
 }
@@ -1492,6 +1505,12 @@ pub enum ActionType {
     MissionCancel,
     #[serde(rename = "session.import")]
     SessionImport,
+    #[serde(rename = "work.ask")]
+    WorkAsk,
+    #[serde(rename = "work.done")]
+    WorkDone,
+    #[serde(rename = "work.cancel-ask")]
+    WorkCancelAsk,
     #[serde(rename = "work.claim")]
     WorkClaim,
     #[serde(rename = "work.renew")]
@@ -2050,6 +2069,28 @@ impl ActionRequest {
             &parameters,
         )
     }
+    pub fn work_ask(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: PersonAskParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(id, ActionType::WorkAsk, idempotency_key, fence, &parameters)
+    }
+    pub fn work_cancel_ask(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: PersonStepParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::WorkCancelAsk,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
     pub fn work_claim(
         id: impl Into<String>,
         idempotency_key: impl Into<String>,
@@ -2073,6 +2114,20 @@ impl ActionRequest {
         Self::new(
             id,
             ActionType::WorkComplete,
+            idempotency_key,
+            fence,
+            &parameters,
+        )
+    }
+    pub fn work_done(
+        id: impl Into<String>,
+        idempotency_key: impl Into<String>,
+        fence: Fence,
+        parameters: PersonStepParameters,
+    ) -> Result<Self, serde_json::Error> {
+        Self::new(
+            id,
+            ActionType::WorkDone,
             idempotency_key,
             fence,
             &parameters,
@@ -2164,6 +2219,24 @@ impl ActionRequest {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PersonAskParameters {
+    pub person_id: String,
+    pub title: String,
+    pub reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub step_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub new_run: Option<String>,
+}
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PersonStepParameters {
+    pub target_id: String,
+    pub summary: String,
+    pub episode: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct TargetParameters {
     pub target_id: String,
@@ -2469,4 +2542,51 @@ pub struct TerminalScreen {
     pub lines: Vec<TerminalLine>,
     pub next_sequence: u64,
     pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum GlassLayout {
+    Pane {
+        pane: String,
+    },
+    Split {
+        split: GlassSplit,
+        children: [Box<GlassLayout>; 2],
+    },
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum GlassSplit {
+    Right,
+    Below,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct GlassTab {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub layout: GlassLayout,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct GlassBody {
+    pub name: String,
+    pub tabs: Vec<GlassTab>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Glass {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    pub body: Option<GlassBody>,
+    pub deleted: bool,
+    pub base_revision: Option<String>,
+    pub replaced_revision: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct GlassPut {
+    pub body: GlassBody,
+    pub base_revision: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct GlassDelete {
+    pub base_revision: Option<String>,
 }
