@@ -449,10 +449,13 @@ The closed stage/reason/source matrix is:
 | `seed` | `permissionUnavailable`, `malformedPermissions`, `missingAskId` | `permissionSnapshot` |
 | `seed` | `questionUnavailable`, `malformedQuestions`, `missingAskId` | `questionSnapshot` |
 | `providerAuth` | `providerAuthRejected` | `turnResult` |
+| `turn` | `turnUsageLimit`, `turnServerOverloaded`, `turnContextWindow`, `turnConnection`, `turnPolicy`, `turnAccount`, `turnRejected`, `turnInternal`, `turnUnclassified` | `turnError` |
 | `delivery` | `deliveryUnavailable`, `deliveryRejected` | `promptTransport` |
 | `readBack` | `readBackUnavailable`, `notDurable` | `messageReadBack` |
 
-One in-process publisher retains at most one current failure per stage and
+A fresh publisher inherits the readable projected failure for the same driver,
+so a later Claude hook process cannot hide an unresolved credential rejection
+with a turn failure. One in-process publisher retains at most one failure per stage and
 persists the earliest stage in the table's execution order. Re-publishing the
 same tuple is a no-op; it does not refresh `observedAt` or increment telemetry.
 A stage success clears only that stage and atomically reveals the next
@@ -476,8 +479,8 @@ The existing attempted-before-transport receipt, same-message retry,
 indeterminate-read-back no-resend rule, durable acceptance, and archive
 behavior are unchanged.
 
-Claude and omp publish exactly one of those stages — `providerAuth` — from
-their own typed turn-failure signal. Codex additionally publishes `launch` /
+Claude and Codex publish `providerAuth` and `turn` from their typed failure
+signals. omp publishes `providerAuth`. Codex additionally publishes `launch` /
 `launchConfigurationRejected` / `processExit` when a declared-argument
 rejection forces its one bounded known-safe boot fallback, and clears it on the
 next exact-config boot. The wrapper's owner-only diagnostic names declared
@@ -503,13 +506,38 @@ to decide them:
 | Codex | `turn/completed` with `turn.status: failed` and `turn.error.codexErrorInfo: unauthorized` | `turn/completed` with `turn.status: completed` | the version the protocol gate admitted / `supported` |
 | omp | a `type: "turn"` channel frame whose error carries omp's own `errorId` classification with `AuthFailed` set and `UsageLimit`, `AccountPolicy`, and `Transient` clear | a `type: "turn"` frame with no error, i.e. an `agent_end` whose last assistant message did not stop on an error | omitted / `unknown` — the wrapper, not the channel, owns the version gate |
 
+Turn causes are advisory evidence from Codex's `error` notification and Claude's
+`StopFailure` hook. They never change delivery eligibility or invent a human
+blocker. Repeated identical failures preserve the original evidence time.
+A human ask and a credential rejection keep their own observed reason.
+
+| Observed reason | Codex `codexErrorInfo` | Claude `StopFailure.error` |
+| --- | --- | --- |
+| `usageLimit` | `usageLimitExceeded`, `rateLimitExceeded`, `sessionBudgetExceeded` | `rate_limit` |
+| `serverOverloaded` | `serverOverloaded` | `overloaded` |
+| `contextWindow` | `contextWindowExceeded` | `max_output_tokens` |
+| `connection` | `httpConnectionFailed`, `responseStreamConnectionFailed`, `responseStreamDisconnected`, `responseTooManyFailedAttempts` | — |
+| `policy` | `cyberPolicy` | `oauth_org_not_allowed` |
+| `account` | — | `account_on_hold`, `billing_error` |
+| `rejected` | `badRequest`, `activeTurnNotSteerable` | `invalid_request`, `model_not_found` |
+| `internal` | `internalServerError`, `threadRollbackFailed`, `sandboxError` | `server_error` |
+| `unclassified` | `other`, unknown or unreadable cause | `unknown`, missing or unknown cause |
+
+Codex object variants carry the error word as their single key. A notification
+missing its required identity or retry fields proves nothing. A standing turn
+failure clears only on a successful matching completion, an idle thread, or a
+new turn starting. A failed completion and silence leave it standing. Claude's
+turn diagnostic clears only on `Stop`; `SessionStart` proves no recovery.
+
 No driver borrows the word for a neighbouring class: Claude's `rate_limit`,
 `overloaded`, `oauth_org_not_allowed`, `account_on_hold` and `billing_error`,
 Codex's `usageLimitExceeded` and `rateLimitExceeded`, and omp's `UsageLimit`,
 `AccountPolicy` and `Transient` flags are capacity, policy, or account state
-that a re-login cannot fix. Claude's `StopFailure` still writes `idle` with
-reason `apiError` for them — the turn did end — Codex keeps its `systemError`
-terminal, and omp's frame still writes `active` with omp's own bounded prose,
+that a re-login cannot fix. Claude's `StopFailure` writes `idle` with a
+classified reason for them, because the turn ended. Codex preserves its
+delivery state and names a standing error in the observation's reason. A quota
+or model-capacity rejection remains retryable `idle`; other terminal failures
+remain `ended`. omp's frame writes `active` with omp's own bounded prose,
 which is the only place a reader learns that a 403 was about credits. The Codex
 startup gate pins `unauthorized` and both quota words present in
 `CodexErrorInfo`, so a release that merged them refuses the launch instead of

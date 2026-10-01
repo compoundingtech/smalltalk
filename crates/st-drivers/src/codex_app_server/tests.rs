@@ -6039,3 +6039,718 @@ fn waiting_on_a_human_holds_the_exact_turn_and_releases_it_when_the_flag_clears(
     assert_eq!(released["method"], "turn/steer");
     assert_eq!(released["params"]["expectedTurnId"], "turn-1");
 }
+
+// ---------------------------------------------------------------------------
+// Turn failures: the cause reaches the record (#the 2026-09-08 overnight stall)
+// ---------------------------------------------------------------------------
+
+/// Drive one frame exactly as `pump_control` does, and return whether either record should be
+/// republished. Derived from the pump rather than re-implemented beside it: a test that drove a
+/// path the pump does not take would prove nothing about the pump.
+fn pump_frame(state: &mut CodexControlState, delivery: &mut CodexInboxDelivery, frame: &Value) {
+    delivery.observe_provider_auth(frame, state.thread_id());
+    let turn_error_changed = delivery.observe_turn_error(frame, state.thread_id());
+    let changed = state.observe(frame).unwrap();
+    if changed || turn_error_changed {
+        delivery.observe_harness(&state.observed);
+    }
+}
+
+fn error_frame(turn: &str, error_info: Value, will_retry: bool) -> Value {
+    json!({
+        "method": "error",
+        "params": {
+            "error": { "codexErrorInfo": error_info },
+            "threadId": "thread-main",
+            "turnId": turn,
+            "willRetry": will_retry,
+        }
+    })
+}
+
+fn observed_record(agent_dir: &Path) -> harness_state::Observed {
+    harness_state::read(&harness_state::harness_state_path(agent_dir), None)
+        .expect("an observed record must exist")
+}
+
+fn turn_diagnostic(agent_dir: &Path) -> driver_diagnostic::Observed {
+    driver_diagnostic::read(&driver_diagnostic::path(agent_dir))
+}
+
+/// The overnight stall, reproduced.
+///
+/// A fictional cobalt seat sat for hours on a model that was at capacity. Codex reported a live turn the whole
+/// time, so the delivery-relevant state never changed and nothing was ever republished: the record
+/// read `active`, `blockedOn: none`, `ask: none`, no reason, and the native-driver diagnostic read
+/// `absent` — which is also exactly what a healthy working seat reads. A supervisor swept it hourly
+/// all night and read progress every time.
+///
+/// The frames below are built from the app-server schema this build admits (`ErrorNotification`
+/// requires `error`, `threadId`, `turnId` and `willRetry`), not captured from that night. What is
+/// captured is the sibling test's fixture, which carries a real `error` frame of the same shape.
+#[test]
+fn a_retried_provider_failure_names_itself_while_codex_still_reports_a_live_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let agent_dir = config.agent_dir.clone();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let mut state = subscribed_state(CodexObservedState::AwaitingStatus);
+
+    for frame in [
+        json!({"method": "thread/status/changed",
+               "params": {"threadId": "thread-main",
+                          "status": {"type": "active", "activeFlags": []}}}),
+        json!({"method": "turn/started",
+               "params": {"threadId": "thread-main", "turn": {"id": "turn-stalled"}}}),
+    ] {
+        pump_frame(&mut state, &mut delivery, &frame);
+    }
+
+    // The state a reader saw all night, and the one this test exists to stop reading as health.
+    let working = observed_record(&agent_dir);
+    assert_eq!(working.state, harness_state::Activity::Active);
+    assert_eq!(working.reason, None);
+    assert_eq!(
+        turn_diagnostic(&agent_dir),
+        driver_diagnostic::Observed::Absent
+    );
+
+    // The provider refuses the turn and Codex says it will retry, so no `turn/completed` follows
+    // and the thread status does not move. This frame is the only evidence that exists.
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &error_frame("turn-stalled", json!("serverOverloaded"), true),
+    );
+
+    let stalled = observed_record(&agent_dir);
+    assert_eq!(
+        stalled.state,
+        harness_state::Activity::Active,
+        "Codex still reports a live turn, and st2 must not invent a state it cannot see"
+    );
+    assert_eq!(
+        stalled.reason.as_deref(),
+        Some("serverOverloaded"),
+        "the record has to hold the cause; `active` with no reason is what nobody could read"
+    );
+    let driver_diagnostic::Observed::Failure(failure) = turn_diagnostic(&agent_dir) else {
+        panic!("a refused turn must publish a native-driver diagnostic")
+    };
+    assert_eq!(failure.driver, driver_diagnostic::Driver::Codex);
+    assert_eq!(failure.stage, driver_diagnostic::Stage::Turn);
+    assert_eq!(
+        failure.reason,
+        driver_diagnostic::Reason::TurnServerOverloaded
+    );
+    assert_eq!(failure.source, driver_diagnostic::Source::TurnError);
+
+    // Hours of retries. Every republish is the same tuple, so `observedAt` is not refreshed and
+    // the evidence age is what tells a reader how long the seat has been stuck. The observed
+    // record's `since` holds for the same reason: an unchanged observation never re-opens a
+    // transition.
+    let since = stalled.since_ms;
+    let first_seen = failure.observed_at;
+    for _ in 0..5 {
+        pump_frame(
+            &mut state,
+            &mut delivery,
+            &error_frame("turn-stalled", json!("serverOverloaded"), true),
+        );
+    }
+    let driver_diagnostic::Observed::Failure(still) = turn_diagnostic(&agent_dir) else {
+        panic!("a standing failure must not clear itself by repeating")
+    };
+    assert_eq!(
+        still.observed_at, first_seen,
+        "a retry loop must not keep resetting the clock on its own failure"
+    );
+    assert_eq!(
+        observed_record(&agent_dir).since_ms,
+        since,
+        "restating one failure is not a new transition"
+    );
+}
+
+/// Silence is what a stuck seat produces, so silence must never clear the evidence that it is
+/// stuck. Only positive proof that the turn recovered does.
+#[test]
+fn only_positive_recovery_clears_a_standing_turn_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let agent_dir = config.agent_dir.clone();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let mut state = subscribed_state(CodexObservedState::AwaitingStatus);
+
+    let start = |turn: &str| {
+        json!({"method": "turn/started",
+               "params": {"threadId": "thread-main", "turn": {"id": turn}}})
+    };
+    pump_frame(&mut state, &mut delivery, &start("turn-a"));
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &error_frame("turn-a", json!("usageLimitExceeded"), false),
+    );
+    assert!(matches!(
+        turn_diagnostic(&agent_dir),
+        driver_diagnostic::Observed::Failure(_)
+    ));
+
+    // None of these is proof the turn recovered.
+    for frame in [
+        json!({"method": "thread/status/changed",
+               "params": {"threadId": "thread-main",
+                          "status": {"type": "active", "activeFlags": []}}}),
+        json!({"method": "thread/status/changed",
+               "params": {"threadId": "thread-main", "status": {"type": "systemError"}}}),
+        json!({"method": "item/completed",
+               "params": {"threadId": "thread-main", "turnId": "turn-a",
+                          "item": {"type": "agentMessage"}}}),
+        // A failure is not its own recovery.
+        json!({"method": "turn/completed",
+               "params": {"threadId": "thread-main",
+                          "turn": {"id": "turn-a", "status": "failed",
+                                   "error": {"codexErrorInfo": "usageLimitExceeded"}}}}),
+        // Another thread's good news says nothing about this one.
+        json!({"method": "turn/completed",
+               "params": {"threadId": "thread-other",
+                          "turn": {"id": "turn-a", "status": "completed"}}}),
+        // Nor does a completion for a turn that is not the one that failed.
+        json!({"method": "turn/completed",
+               "params": {"threadId": "thread-main",
+                          "turn": {"id": "turn-elsewhere", "status": "completed"}}}),
+    ] {
+        pump_frame(&mut state, &mut delivery, &frame);
+        assert!(
+            matches!(
+                turn_diagnostic(&agent_dir),
+                driver_diagnostic::Observed::Failure(_)
+            ),
+            "{} must not clear a standing turn failure",
+            frame["method"]
+        );
+    }
+    assert_eq!(
+        observed_record(&agent_dir).reason.as_deref(),
+        Some("usageLimit"),
+        "the terminal record names the cause instead of the bare word `systemError`"
+    );
+
+    // A thread that reports itself idle has no failing turn by definition.
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &json!({"method": "thread/status/changed",
+                "params": {"threadId": "thread-main", "status": {"type": "idle"}}}),
+    );
+    assert_eq!(
+        turn_diagnostic(&agent_dir),
+        driver_diagnostic::Observed::Absent
+    );
+    assert_eq!(observed_record(&agent_dir).reason, None);
+}
+
+/// The other two recovery edges, each on its own so a single over-broad clear cannot pass by
+/// standing in for the others.
+#[test]
+fn a_completed_turn_and_a_later_turn_each_clear_the_failure_they_supersede() {
+    for (label, recovery) in [
+        (
+            "the failed turn reaching its ordinary end",
+            json!({"method": "turn/completed",
+                   "params": {"threadId": "thread-main",
+                              "turn": {"id": "turn-a", "status": "completed"}}}),
+        ),
+        (
+            "a different turn starting",
+            json!({"method": "turn/started",
+                   "params": {"threadId": "thread-main", "turn": {"id": "turn-b"}}}),
+        ),
+    ] {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let agent_dir = config.agent_dir.clone();
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        let mut state = subscribed_state(CodexObservedState::AwaitingStatus);
+
+        pump_frame(
+            &mut state,
+            &mut delivery,
+            &json!({"method": "turn/started",
+                    "params": {"threadId": "thread-main", "turn": {"id": "turn-a"}}}),
+        );
+        pump_frame(
+            &mut state,
+            &mut delivery,
+            &error_frame("turn-a", json!("serverOverloaded"), true),
+        );
+        assert!(
+            matches!(
+                turn_diagnostic(&agent_dir),
+                driver_diagnostic::Observed::Failure(_)
+            ),
+            "{label}: the failure must stand before the recovery edge"
+        );
+
+        pump_frame(&mut state, &mut delivery, &recovery);
+        assert_eq!(
+            turn_diagnostic(&agent_dir),
+            driver_diagnostic::Observed::Absent,
+            "{label} must clear the failure it supersedes"
+        );
+        // Not `None`: a second turn starting while the first is believed live is a conflicting
+        // turn, and that hold has a reason of its own. What must be gone is the cause.
+        assert_ne!(
+            observed_record(&agent_dir).reason.as_deref(),
+            Some("serverOverloaded"),
+            "{label}: the cause must leave the observed record with the failure"
+        );
+    }
+}
+
+/// The classification is behavioural, not a table restated: every class here maps to a DISTINCT
+/// reason, so a build that collapsed them all onto one word fails (#268 §B). The credential word
+/// is the one that must not appear at all — it has its own stage, its own recovery edge and its
+/// own repair text, and it outranks this stage.
+#[test]
+fn each_codex_error_class_lands_on_its_own_reason_and_the_credential_word_stays_out() {
+    use driver_diagnostic::Reason;
+    let cases: [(Value, Reason, &str); 10] = [
+        (
+            json!("usageLimitExceeded"),
+            Reason::TurnUsageLimit,
+            "usageLimit",
+        ),
+        (
+            json!("sessionBudgetExceeded"),
+            Reason::TurnUsageLimit,
+            "usageLimit",
+        ),
+        (
+            json!("serverOverloaded"),
+            Reason::TurnServerOverloaded,
+            "serverOverloaded",
+        ),
+        (
+            json!("contextWindowExceeded"),
+            Reason::TurnContextWindow,
+            "contextWindow",
+        ),
+        (
+            json!("responseStreamDisconnected"),
+            Reason::TurnConnection,
+            "connection",
+        ),
+        // The object arms carry an HTTP status beside the word; both shapes reduce to one word.
+        (
+            json!({"httpConnectionFailed": {"httpStatusCode": 503}}),
+            Reason::TurnConnection,
+            "connection",
+        ),
+        (json!("cyberPolicy"), Reason::TurnPolicy, "policy"),
+        (json!("badRequest"), Reason::TurnRejected, "rejected"),
+        (
+            json!("internalServerError"),
+            Reason::TurnInternal,
+            "internal",
+        ),
+        // Codex's own catch-all and every word added after this build land together: a real
+        // failure this version cannot name, reported as exactly that.
+        (
+            json!("aWordThisBuildHasNeverSeen"),
+            Reason::TurnUnclassified,
+            "unclassified",
+        ),
+    ];
+    let distinct = cases
+        .iter()
+        .map(|(_, reason, _)| reason.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(
+        distinct.len(),
+        8,
+        "the classes must stay distinct; a table mapping every row to one word is not an oracle"
+    );
+
+    for (error_info, expected_reason, expected_word) in cases {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = delivery_config(tmp.path());
+        let agent_dir = config.agent_dir.clone();
+        let mut delivery = inbox_delivery(tmp.path(), config);
+        let mut state = subscribed_state(CodexObservedState::AwaitingStatus);
+        pump_frame(
+            &mut state,
+            &mut delivery,
+            &json!({"method": "turn/started",
+                    "params": {"threadId": "thread-main", "turn": {"id": "turn-a"}}}),
+        );
+        pump_frame(
+            &mut state,
+            &mut delivery,
+            &error_frame("turn-a", error_info.clone(), true),
+        );
+        let driver_diagnostic::Observed::Failure(failure) = turn_diagnostic(&agent_dir) else {
+            panic!("{error_info} must publish a diagnostic")
+        };
+        assert_eq!(failure.reason, expected_reason, "for {error_info}");
+        assert_eq!(
+            observed_record(&agent_dir).reason.as_deref(),
+            Some(expected_word),
+            "for {error_info}"
+        );
+    }
+
+    // The credential arm reaches the credential stage through `turn/completed`, and never this
+    // one — so a re-login is never advised for an exhausted allowance, and an at-capacity model
+    // is never reported as a rejected credential.
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let agent_dir = config.agent_dir.clone();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let mut state = subscribed_state(CodexObservedState::AwaitingStatus);
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &json!({"method": "turn/started",
+                "params": {"threadId": "thread-main", "turn": {"id": "turn-a"}}}),
+    );
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &error_frame("turn-a", json!("unauthorized"), false),
+    );
+    assert_eq!(
+        turn_diagnostic(&agent_dir),
+        driver_diagnostic::Observed::Absent,
+        "the credential word must not publish a turn failure"
+    );
+}
+
+/// A rejected credential is the more specific fact and must not be hidden behind the turn failure
+/// that is its own symptom.
+#[test]
+fn a_rejected_credential_outranks_a_standing_turn_failure_on_the_same_seat() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let agent_dir = config.agent_dir.clone();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let mut state = subscribed_state(CodexObservedState::AwaitingStatus);
+
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &json!({"method": "turn/started",
+                "params": {"threadId": "thread-main", "turn": {"id": "turn-a"}}}),
+    );
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &error_frame("turn-a", json!("serverOverloaded"), true),
+    );
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &json!({"method": "turn/completed",
+                "params": {"threadId": "thread-main",
+                           "turn": {"id": "turn-a", "status": "failed",
+                                    "error": {"codexErrorInfo": "unauthorized"}}}}),
+    );
+
+    let driver_diagnostic::Observed::Failure(failure) = turn_diagnostic(&agent_dir) else {
+        panic!("both stages are failing and one of them must be projected")
+    };
+    assert_eq!(
+        failure.stage,
+        driver_diagnostic::Stage::ProviderAuth,
+        "the credential is the cause; the refused turn is its symptom"
+    );
+    assert_eq!(
+        observed_record(&agent_dir).reason.as_deref(),
+        Some("providerAuth"),
+        "a more specific cause is not overwritten by the turn failure it explains"
+    );
+}
+
+/// A human waiting to be asked something is a stronger and more actionable fact than a failed
+/// turn, and it is the one axis a consumer filters on. It keeps its own reason.
+#[test]
+fn a_human_ask_keeps_its_reason_while_a_turn_failure_stands() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let agent_dir = config.agent_dir.clone();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let mut state = subscribed_state(CodexObservedState::AwaitingStatus);
+
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &json!({"method": "turn/started",
+                "params": {"threadId": "thread-main", "turn": {"id": "turn-a"}}}),
+    );
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &error_frame("turn-a", json!("serverOverloaded"), true),
+    );
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &json!({"method": "thread/status/changed",
+                "params": {"threadId": "thread-main",
+                           "status": {"type": "active", "activeFlags": ["waitingOnApproval"]}}}),
+    );
+
+    let observed = observed_record(&agent_dir);
+    assert_eq!(observed.blocked_on, harness_state::BlockedOn::Human);
+    assert_eq!(observed.ask, harness_state::Ask::Permission);
+    assert_eq!(observed.reason.as_deref(), Some("waitingOnApproval"));
+    assert!(
+        matches!(
+            turn_diagnostic(&agent_dir),
+            driver_diagnostic::Observed::Failure(_)
+        ),
+        "the turn failure still stands on the record that exists to hold it"
+    );
+}
+
+/// The real capture the repo already keeps of an exhausted allowance. It used to end at `ended`
+/// with the single word `systemError`, and a `driverDiagnostic` of `absent` — the same reading a
+/// healthy seat gives. The `error` frame naming `usageLimitExceeded` was in the capture the whole
+/// time and nothing read it.
+#[test]
+fn the_captured_usage_limit_stall_now_names_its_cause_on_both_records() {
+    let frames = include_str!("../../tests/fixtures/codex_usage_limit_inbound.jsonl")
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.get("method").and_then(Value::as_str) == Some("error")),
+        "the capture must still carry the frame this test is about"
+    );
+
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let agent_dir = config.agent_dir.clone();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let mut state = subscribed_state(CodexObservedState::AwaitingStatus);
+    for frame in &frames {
+        pump_frame(&mut state, &mut delivery, frame);
+    }
+
+    // The delivery predicate is untouched: a capacity failure still permits the next
+    // `turn/start`, so naming the cause has not made a failed seat unreachable.
+    assert_eq!(
+        state.observed(),
+        &CodexObservedState::TerminalError {
+            reason: CodexTerminalError::ProviderCapacity,
+        }
+    );
+    let observed = observed_record(&agent_dir);
+    assert_eq!(observed.state, harness_state::Activity::Idle);
+    assert_eq!(
+        observed.reason.as_deref(),
+        Some("usageLimit"),
+        "the observed state remains retryable while its reason names the spent allowance"
+    );
+    let driver_diagnostic::Observed::Failure(failure) = turn_diagnostic(&agent_dir) else {
+        panic!("the capture must publish a native-driver diagnostic")
+    };
+    assert_eq!(failure.stage, driver_diagnostic::Stage::Turn);
+    assert_eq!(failure.reason, driver_diagnostic::Reason::TurnUsageLimit);
+    assert_eq!(failure.source, driver_diagnostic::Source::TurnError);
+    assert_eq!(
+        failure.producer_version.as_deref(),
+        Some("codex-cli 0.153.0")
+    );
+}
+
+/// A frame missing any field `ErrorNotification` requires is not that notification. It proves
+/// nothing, so it must neither publish a failure nor clear one.
+#[test]
+fn a_malformed_error_frame_neither_publishes_nor_clears() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let agent_dir = config.agent_dir.clone();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let mut state = subscribed_state(CodexObservedState::AwaitingStatus);
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &json!({"method": "turn/started",
+                "params": {"threadId": "thread-main", "turn": {"id": "turn-a"}}}),
+    );
+
+    for malformed in [
+        // No `willRetry`.
+        json!({"method": "error", "params": {"threadId": "thread-main", "turnId": "turn-a",
+                                             "error": {"codexErrorInfo": "serverOverloaded"}}}),
+        // No `turnId`.
+        json!({"method": "error", "params": {"threadId": "thread-main", "willRetry": true,
+                                             "error": {"codexErrorInfo": "serverOverloaded"}}}),
+        // No error info at all.
+        json!({"method": "error", "params": {"threadId": "thread-main", "turnId": "turn-a",
+                                             "willRetry": true, "error": {}}}),
+        // Another thread's failure.
+        json!({"method": "error", "params": {"threadId": "thread-other", "turnId": "turn-a",
+                                             "willRetry": true,
+                                             "error": {"codexErrorInfo": "serverOverloaded"}}}),
+    ] {
+        pump_frame(&mut state, &mut delivery, &malformed);
+        assert_eq!(
+            turn_diagnostic(&agent_dir),
+            driver_diagnostic::Observed::Absent,
+            "{malformed} must not publish"
+        );
+    }
+
+    // …and having published nothing, a malformed frame must not clear a real failure either.
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &error_frame("turn-a", json!("serverOverloaded"), true),
+    );
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &json!({"method": "error", "params": {"threadId": "thread-main", "turnId": "turn-a",
+                                              "error": {"codexErrorInfo": "serverOverloaded"}}}),
+    );
+    assert!(matches!(
+        turn_diagnostic(&agent_dir),
+        driver_diagnostic::Observed::Failure(_)
+    ));
+}
+
+#[test]
+fn observed_recovery_clears_a_turn_diagnostic_inherited_after_driver_restart() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    let agent_dir = config.agent_dir.clone();
+    let mut delivery = inbox_delivery(tmp.path(), config);
+    let mut state = subscribed_state(CodexObservedState::Active {
+        turn_id: "turn-a".into(),
+    });
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &error_frame("turn-a", json!("serverOverloaded"), true),
+    );
+    drop(delivery);
+
+    let mut delivery = inbox_delivery(tmp.path(), delivery_config(tmp.path()));
+    assert!(matches!(
+        turn_diagnostic(&agent_dir),
+        driver_diagnostic::Observed::Failure(_)
+    ));
+    // A malformed completion provides no turn identity, so it cannot clear the predecessor.
+    assert!(!delivery.observe_turn_error(
+        &json!({"method": "turn/completed",
+        "params": {"threadId": "thread-main", "turn": {"status": "completed"}}}),
+        "thread-main"
+    ));
+    assert!(matches!(
+        turn_diagnostic(&agent_dir),
+        driver_diagnostic::Observed::Failure(_)
+    ));
+    pump_frame(
+        &mut state,
+        &mut delivery,
+        &json!({"method": "thread/status/changed",
+        "params": {"threadId": "thread-main", "status": {"type": "idle"}}}),
+    );
+    assert_eq!(
+        turn_diagnostic(&agent_dir),
+        driver_diagnostic::Observed::Absent
+    );
+}
+
+#[test]
+fn the_control_pump_reports_the_recorded_usage_limit_failure_over_its_socket() {
+    let tmp = tempfile::tempdir().unwrap();
+    let _stop_exclusive = stop_flag_tests();
+    let config = delivery_config(tmp.path());
+    let agent_dir = config.agent_dir.clone();
+    let socket = tmp.path().join("server.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let mut websocket = tungstenite::accept(stream).unwrap();
+        assert_eq!(
+            read_json_message(&mut websocket).unwrap().unwrap()["method"],
+            "initialize"
+        );
+        write_json_message(
+            &mut websocket,
+            &json!({ "id": 0, "result": { "userAgent": "fake" } }),
+        )
+        .unwrap();
+        assert_eq!(
+            read_json_message(&mut websocket).unwrap().unwrap()["method"],
+            "initialized"
+        );
+        for line in include_str!("../../tests/fixtures/codex_usage_limit_inbound.jsonl").lines() {
+            let frame = serde_json::from_str::<Value>(line).unwrap();
+            write_json_message(&mut websocket, &frame).unwrap();
+        }
+        // Keep the recorded stream open until the final completion reaches both records.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let observation =
+                harness_state::read(&harness_state::harness_state_path(&agent_dir), None);
+            if observation.is_some_and(|observation| {
+                observation.state == harness_state::Activity::Idle
+                    && observation.reason.as_deref() == Some("usageLimit")
+            }) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    });
+
+    let stream = UnixStream::connect(&socket).unwrap();
+    let shutdown = stream.try_clone().unwrap();
+    let websocket = initialize_control(stream)
+        .unwrap()
+        .expect("no stop raised in tests");
+    let binding_path = tmp.path().join("state/binding.json");
+    let control_state_path = tmp.path().join("state/control-state.json");
+    let runtime = CodexRuntime::fresh("h.worker".into(), "h.worker".into()).unwrap();
+    let (tx, rx) = mpsc::channel();
+    let binding_for_pump = binding_path.clone();
+    let control_state_for_pump = control_state_path.clone();
+    let pump = thread::spawn(move || {
+        pump_control(
+            websocket,
+            &binding_for_pump,
+            &control_state_for_pump,
+            &runtime,
+            None,
+            Some(config),
+            Arc::new(AtomicBool::new(false)),
+            tx,
+        )
+    });
+    assert!(matches!(
+        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        ControlEvent::Bound
+    ));
+    server.join().unwrap();
+    let _ = shutdown.shutdown(Shutdown::Both);
+    pump.join().unwrap();
+
+    let agent_dir = tmp.path().join("agents/h/worker");
+    let observed = observed_record(&agent_dir);
+    assert_eq!(observed.state, harness_state::Activity::Idle);
+    assert_eq!(observed.reason.as_deref(), Some("usageLimit"));
+    let driver_diagnostic::Observed::Failure(failure) = turn_diagnostic(&agent_dir) else {
+        panic!("the control pump must publish the recorded failure");
+    };
+    assert_eq!(failure.stage, driver_diagnostic::Stage::Turn);
+    assert_eq!(failure.reason, driver_diagnostic::Reason::TurnUsageLimit);
+}
