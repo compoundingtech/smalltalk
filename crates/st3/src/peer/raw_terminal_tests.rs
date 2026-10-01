@@ -90,7 +90,6 @@ async fn membership_only_gateway_holds_raw_writers_and_fences_capabilities() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     owner.store.publish_fleet_endpoints("listening", &[serde_json::json!({"transport": "loopback", "address": address.to_string()})], "test").unwrap();
-    gateway.store.import_replication("raw-owner", &owner.store.export_replication(0).unwrap()).unwrap();
     let peer = PeerState {
         backend: PeerBackend::Main(Client::unix(&owner_socket)), node: "raw-owner".into(),
         auth: FleetAuth::test(fleet, &[7; 32]).with_member_key(Some(owner_key.clone())),
@@ -98,6 +97,23 @@ async fn membership_only_gateway_holds_raw_writers_and_fences_capabilities() {
         main_socket: owner_socket.clone(), outbound_notify: watch::channel(0).0,
     };
     let peer_task = tokio::spawn(async move { axum::serve(listener, peer_router(peer)).await.unwrap(); });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while tokio::net::UnixStream::connect(&owner_socket).await.is_err() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.unwrap();
+    // Real signed replication over the owner's peer HTTP listener: the gateway learns the
+    // membership, the owner's advertised endpoint, and the seat's runtime incarnation.
+    exchange(
+        &replication_http_client(),
+        &PeerBackend::Local(gateway.store.clone()),
+        "raw-gateway",
+        &PeerConfig { name: "raw-owner".into(), url: format!("http://{address}") },
+        &FleetAuth::test(fleet, &[7; 32]).with_member_key(Some(gateway_key.clone())),
+        &member_context(&gateway.store, &gateway_key, &[owner_key.public()], &[], false),
+        Path::new("/no/such/socket"),
+    ).await.unwrap();
+    assert!(gateway.store.fleet_view_sealed().unwrap().members.iter().any(|member| member.name == "raw-owner" && !member.endpoints.is_empty()));
     let secret = gateway_root.path().join("fleet/secret");
     fs::write(&secret, [7_u8; 32]).unwrap();
     fs::set_permissions(&secret, fs::Permissions::from_mode(0o600)).unwrap();
