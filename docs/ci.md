@@ -64,9 +64,15 @@ compilation and runs nextest with a 25-minute test-step timeout, followed by Cli
 Codex control tests are not filtered out. Namespace provides job-isolated runners rather than
 reusing the fleet's long-lived target lanes and macOS debug-object cleanup policy.
 
-The Namespace GitHub App must be installed and authorized for this repository. Its installation
-has not been confirmed; jobs can queue indefinitely with no matching runner. Do not silently
-fall back to hosted or fleet runners.
+Namespace runs these jobs through its GitHub App. If the app loses access to this repository, or
+the profile has no capacity, jobs queue with no matching runner. A queued required check is not
+a pass. Do not silently fall back to hosted or fleet runners.
+
+Namespace's default Linux runner image does not boot systemd. The st2 transport-isolation and
+NO_COLOR scope tests need real systemd user scopes, so they fail on it rather than skip. Before
+`linux-gate` can become required, these tests need either a Namespace runner image with systemd
+or an agreed decision about where they run. `CI_RUN_ID` keeps the messaging-fault evidence under
+`target/messaging-faults/`, which is uploaded with the stage logs.
 
 ## Generated files and existing workflows
 

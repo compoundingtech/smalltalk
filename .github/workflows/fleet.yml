@@ -106,17 +106,6 @@ jobs:
       - name: Build workspace tests first (no debug info)
         shell: bash
         run: nix develop -c cargo nextest run --workspace --locked --profile ci --no-run
-      - name: Start the runner user systemd manager
-        run: |
-          uid=$(id -u)
-          sudo loginctl enable-linger "$USER"
-          for _ in $(seq 100); do
-            test -S "/run/user/$uid/bus" && break
-            sleep 0.2
-          done
-          export XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus"
-          systemd-run --user --scope --quiet true
-          printf 'XDG_RUNTIME_DIR=%s\nDBUS_SESSION_BUS_ADDRESS=%s\n' "$XDG_RUNTIME_DIR" "$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
       - name: Summarize tested revision and selection
         env:
           REASON: ${{ steps.st2.outputs.reason }}

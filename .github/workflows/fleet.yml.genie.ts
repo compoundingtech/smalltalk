@@ -40,19 +40,6 @@ export default githubWorkflow({
       steps: [
         ...workspacePreparationSteps,
         {
-          // The transport-isolation and NO_COLOR scope gates fail rather than skip without it.
-          name: 'Start the runner user systemd manager',
-          run: `uid=$(id -u)
-sudo loginctl enable-linger "$USER"
-for _ in $(seq 100); do
-  test -S "/run/user/$uid/bus" && break
-  sleep 0.2
-done
-export XDG_RUNTIME_DIR="/run/user/$uid" DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus"
-systemd-run --user --scope --quiet true
-printf 'XDG_RUNTIME_DIR=%s\\nDBUS_SESSION_BUS_ADDRESS=%s\\n' "$XDG_RUNTIME_DIR" "$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"`,
-        },
-        {
           name: 'Summarize tested revision and selection',
           env: { REASON: '${{ steps.st2.outputs.reason }}' },
           run: `printf 'Checked merge/commit: \\x60%s\\x60 on %s CPUs, %s\\n\\n%s\\n\\n| Stage | Result | Elapsed | Exit |\\n| --- | --- | --- | --- |\\n' "$(git rev-parse HEAD)" "$(nproc)" "$(free -h | awk '/^Mem:/ {print $2 " memory"}')" "$REASON" >> "$GITHUB_STEP_SUMMARY"`,
