@@ -144,6 +144,12 @@ CREATE TABLE IF NOT EXISTS documents (
 );
 CREATE INDEX IF NOT EXISTS document_latest ON documents(name, created_index DESC);
 
+-- Local answers to idempotent requests, by operation.
+CREATE TABLE IF NOT EXISTS idempotency (
+    operation_id TEXT PRIMARY KEY,
+    response TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
     store_index INTEGER PRIMARY KEY,
     kind TEXT NOT NULL,

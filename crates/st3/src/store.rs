@@ -260,11 +260,6 @@ WHERE kind='run-generation.created';
 CREATE INDEX IF NOT EXISTS claims_proposal_revision_index ON claims(json_extract(body, '$.fields.candidate_revision'))
 WHERE kind='revision-proposal.created';
 
-CREATE TABLE IF NOT EXISTS idempotency (
-    operation_id TEXT PRIMARY KEY,
-    response TEXT NOT NULL
-);
-
 CREATE TABLE IF NOT EXISTS mission_run_requests (
     operation_id TEXT PRIMARY KEY,
     request_hash TEXT NOT NULL
