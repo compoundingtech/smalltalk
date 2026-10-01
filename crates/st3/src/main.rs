@@ -3002,6 +3002,9 @@ struct MessageSendArgs {
     /// Print the generated message mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
+    /// Reuse this key with the same message when retrying an unconfirmed send.
+    #[arg(long)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -3043,6 +3046,9 @@ struct MessageReplyArgs {
     /// Print the generated reply mission KDL without publishing it.
     #[arg(long)]
     print_kdl: bool,
+    /// Reuse this key with the same message when retrying an unconfirmed send.
+    #[arg(long)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -11435,6 +11441,7 @@ async fn run_message(
                     tags: Vec::new(),
                     from: args.from,
                     print_kdl: args.print_kdl,
+                    idempotency_key: args.idempotency_key,
                 },
             )
             .await?;
@@ -11585,18 +11592,17 @@ async fn send_message(client: &Client, args: MessageSendArgs) -> Result<Option<M
         return Ok(None);
     }
     client
-        .post(
-            "/v1/messages",
-            &MessageSendRequest {
-                idempotency_key: format!("st3-message-send:{id}"),
-                from,
-                to,
-                content: args.body,
-                title: args.subject,
-                in_reply_to: args.in_reply_to,
-                tags: args.tags,
-            },
-        )
+        .send_message(&MessageSendRequest {
+            idempotency_key: args
+                .idempotency_key
+                .unwrap_or_else(|| format!("st3-message-send:{id}")),
+            from,
+            to,
+            content: args.body,
+            title: args.subject,
+            in_reply_to: args.in_reply_to,
+            tags: args.tags,
+        })
         .await
         .map(Some)
 }
@@ -18156,6 +18162,50 @@ mod tests {
         };
         assert_eq!(explicit.identity.as_deref(), Some("agent/explicit"));
         assert!(explicit.archive);
+    }
+
+    #[test]
+    fn message_send_and_reply_accept_a_key_for_unconfirmed_retries() {
+        let send = Cli::try_parse_from([
+            "st3",
+            "conversations",
+            "send",
+            "agent/example/worker",
+            "--from",
+            "person/ada",
+            "--body",
+            "Hello",
+            "--idempotency-key",
+            "retry-a-send",
+        ])
+        .unwrap();
+        let Command::Conversations {
+            command: MessageCommand::Send(send),
+        } = send.command
+        else {
+            panic!("send did not parse");
+        };
+        assert_eq!(send.idempotency_key.as_deref(), Some("retry-a-send"));
+        let reply = Cli::try_parse_from([
+            "st3",
+            "conversations",
+            "reply",
+            "message/example",
+            "--from",
+            "person/ada",
+            "--body",
+            "Hello",
+            "--idempotency-key",
+            "retry-a-reply",
+        ])
+        .unwrap();
+        let Command::Conversations {
+            command: MessageCommand::Reply(reply),
+        } = reply.command
+        else {
+            panic!("reply did not parse");
+        };
+        assert_eq!(reply.idempotency_key.as_deref(), Some("retry-a-reply"));
     }
 
     #[test]
