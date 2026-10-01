@@ -2,6 +2,10 @@
 
 ## GitHub Actions on Namespace
 
+**Main CI is off.** Neither `Workspace CI` nor `macOS CI` runs on pushes to `main` until the
+`push: { branches: ['main'] }` trigger is restored in `fleet.yml.genie.ts` and `macos.yml.genie.ts`
+(a one-line change in each; regenerate with genie).
+
 The generated `Workspace CI` workflow (`.github/workflows/fleet.yml`) and `macOS CI`
 (`.github/workflows/macos.yml`) replace the fleet's Linux `st/ci` and optional `st/ci-macos`
 execution. During the proving period both systems
@@ -15,23 +19,36 @@ head: it tests that head merged with the current base. Strict branch protection 
 that the head itself contain the latest `main`. No `pull_request_target` job runs PR code,
 and the gate has only `contents: read` permission. Forks do not receive publishing secrets.
 
-Linux uses `namespace-profile-linux-x86-64`. The gate prepares the provider component
-fixtures and installs matching rendered st2 hooks, then builds the workspace test executables
-first, alone, with dev/test debug info and incremental compilation disabled. After that build,
-`scripts/ci-linux` starts four stages in parallel and fails if any stage fails:
+The Linux gate runs as three jobs on separate runners, so they no longer share one machine's CPUs.
+`linux-gate` is the single required check: it needs the three jobs and passes only when every one of
+them succeeded (a skipped or cancelled stage fails it). The stage jobs use the Namespace shape
+`nscloud-ubuntu-24.04-amd64-16x32` (16 vCPUs, 32 GB); `genie-freshness`, `isolation-vm` and the
+`linux-gate` aggregate use `namespace-profile-linux-x86-64`. `scripts/ci-linux STAGE` runs one stage:
 
-- `cargo nextest run --workspace --locked --profile ci`, eight tests at a time, selected by the
-  profile's default filter (see [gate scope](#gate-scope));
-- `cargo clippy --workspace --all-targets --locked`;
-- `cargo run --locked -p st3-client-codegen -- --check`;
-- the fleet compatibility test against `.github/fleet-compat-baseline.json`'s pinned older st3.
+- `linux-tests`: prepares the provider component fixtures, installs matching rendered st2 hooks,
+  builds the workspace test executables with dev/test debug info and incremental compilation
+  disabled, then runs `cargo nextest run --workspace --locked --profile ci` on every CPU, selected
+  by the profile's default filter (see [gate scope](#gate-scope));
+- `linux-clippy`: `cargo clippy --workspace --all-targets --locked`, then
+  `cargo run --locked -p st3-client-codegen -- --check`;
+- `linux-fleet-compat`: the fleet compatibility test against `.github/fleet-compat-baseline.json`'s
+  pinned older st3. Building that baseline also runs the pinned pty's own unit tests, two of which
+  are timing-sensitive, so the build is retried up to three times.
+
+Each stage restores a job-keyed `actions/cache` entry (Namespace serves it from its accelerated
+backend) holding Cargo's registry and the workspace `target/` directory, keyed on `Cargo.lock` and
+`flake.lock`. Namespace cache volumes are not used: they are per node and replicate in the
+background, so a job landing on another node starts empty.
+
+For the trial, `linux-tests` skips the messaging fault matrix exactly as `st/ci` does this week
+(`scripts/ci-linux`), because it timed out in fixture startup on Namespace and its retries kept the
+job running for tens of minutes. Remove that skip when the matrix returns as parallel tests.
 
 `.config/nextest.toml` gives the messaging fault matrix and the fleet reconnect test, both with
 real multi-minute outages, first priority so their retries fit the CI test window. Failed tests
 retry twice with fixed 30-second delays; a retry pass is reported as flaky, not a gate failure.
-Clippy uses a separate target directory so its Cargo lock cannot serialize the parallel stages.
 Each run isolates test `HOME` and XDG state. The summary records the tested SHA,
-each stage's elapsed time, result and exit code; `linux-ci-logs` contains logs and `.time` files.
+each stage's elapsed time, result and exit code; each stage job uploads `<job>-logs` with its log and `.time` file.
 Nextest's final summary retains flaky outcomes.
 
 The workspace suite still covers the token-free two-node messaging fault matrix. Its historical
@@ -75,8 +92,8 @@ The job summary records the KVM probe and each phase's elapsed time.
 
 ### macOS
 
-The non-required `macos-ci` job uses `namespace-profile-macos-arm64` and runs on `main` pushes
-or PR events while the PR bears the `macos-ci` label. It is a separate workflow so adding a
+The non-required `macos-ci` job uses `namespace-profile-macos-arm64` and runs on PR events while
+the PR bears the `macos-ci` label. It is a separate workflow so adding a
 label does not restart or cancel the required Linux gate; it therefore runs beside Linux rather
 than waiting for Linux success. It builds the same workspace without debug info/incremental
 compilation and runs nextest with a 25-minute test-step timeout, followed by Clippy. The

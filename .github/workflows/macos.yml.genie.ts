@@ -11,7 +11,7 @@ export default githubWorkflow({
   name: 'macOS CI',
   on: {
     pull_request: { types: ['opened', 'synchronize', 'reopened', 'labeled'] },
-    push: { branches: ['main'] },
+    // Main CI is off until Nathan says to turn it back on: restore `push: { branches: ['main'] },` here.
   },
   permissions: { contents: 'read' },
   concurrency: {
