@@ -16,6 +16,7 @@ mod examples;
 mod fault_isolation;
 mod first_sync;
 mod fleet;
+mod hook_telemetry;
 mod log_diet;
 mod messaging_faults;
 mod mission_cancellation;

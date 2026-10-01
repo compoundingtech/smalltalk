@@ -1508,6 +1508,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "harness.telemetry",
+            &["agent"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::Append,
+            None,
+            false,
+            &[],
+        ),
+        (
             "harness.context-clear.requested",
             &["agent"],
             WritePolicy::AuthorizedRequester,
@@ -2010,7 +2019,7 @@ fn claim_retention(kind: &str) -> Retention {
     match kind {
         // The owner reads a transcript from the harness's own session file, or from this log
         // when there is none. Other nodes relay timeline reads to the owner.
-        "harness.timeline" => Retention::Local,
+        "harness.timeline" | "harness.telemetry" => Retention::Local,
         // Only the node that made them reads these: render receipts and the readiness
         // deadline, whose attention request replicates.
         "render.applied" | "runtime.readiness-deadline-reached" => Retention::Local,
@@ -2595,6 +2604,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("model", string()),
             ("incarnation_id", required_string()),
         ],
+        "harness.telemetry" => &[
+            ("driver", required_enum(&["claude"])),
+            ("unit", required_enum(&["hook"])),
+            ("incarnation_id", required_string()),
+            ("signals", required_object()),
+        ],
         "harness.timeline" => &[
             (
                 "operation",
@@ -3142,6 +3157,7 @@ mod tests {
                 "harness.diagnostic",
                 "harness.observed",
                 "harness.session-file",
+                "harness.telemetry",
                 "harness.timeline",
                 "harness.usage",
                 "intent.desired",
