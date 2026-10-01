@@ -197,9 +197,11 @@ const EntryView = memo(function EntryView({ entry, open, onToggle }: { entry: Co
     case 'mail': {
       // Mail to the person stands out; their own says how far it got: ✓ st has it, ✓✓ the agent has it.
       const toYou = body.to === 'you';
-      return <View style={[styles.entry, styles.barred, { borderLeftColor: theme.sapphire }, toYou ? { backgroundColor: theme.toolBg } : null]}>
-        <T><T bold color={theme.sapphire}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.from === 'you' ? (body.delivered ? <T color={theme.green}>  ✓✓ delivered</T> : <T dim>  ✓ sent</T>) : null}</T>
-        <Markdown text={body.text} color={toYou ? theme.text : theme.subtext0} />
+      // Mail the person is part of leads; mail between others stays in the background.
+      const theirs = toYou || body.from === 'you';
+      return <View style={[styles.entry, styles.barred, { borderLeftColor: theirs ? theme.sapphire : theme.surface2 }, toYou ? { backgroundColor: theme.toolBg } : null]}>
+        <T><T bold={theirs} color={theirs ? theme.sapphire : theme.overlay1}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold={theirs} color={theirs ? undefined : theme.overlay1}>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.from === 'you' ? (body.delivered ? <T color={theme.green}>  ✓✓ delivered</T> : <T dim>  ✓ sent</T>) : null}</T>
+        <Markdown text={body.text} color={theirs ? theme.text : theme.overlay1} />
       </View>;
     }
     case 'event': {

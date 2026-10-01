@@ -1234,6 +1234,21 @@ impl Ui {
         true
     }
 
+    /// Pasted text goes into an open palette's query.
+    pub(crate) fn paste_into_palette(&mut self, text: &str) -> bool {
+        let Some(palette) = self
+            .glasses
+            .as_mut()
+            .and_then(|glasses| glasses.palette.as_mut())
+        else {
+            return false;
+        };
+        palette.query.push_str(text);
+        palette.selected = 0;
+        palette.top = None;
+        true
+    }
+
     pub(crate) fn palette_open(&self) -> bool {
         self.glasses
             .as_ref()
@@ -2381,6 +2396,41 @@ mod tests {
         press(&mut ui, KeyCode::Left, KeyModifiers::ALT);
         assert!(!ui.glasses.as_ref().unwrap().zoomed);
         assert_eq!(tabs(&ui).0, 1);
+    }
+
+    #[test]
+    fn a_paste_lands_whole_and_a_pasted_image_path_attaches_to_the_message() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ui.live = true;
+        // A paste over the conversation starts a message; its newlines never send it.
+        ui.paste("first line\r\nsecond line".into());
+        assert!(ui.editing);
+        assert!(ui.effects.is_empty());
+        assert_eq!(
+            ui.conversation_state.drafts["agent/example/atlas/builder"],
+            "first line\nsecond line"
+        );
+        // A dropped image file becomes an attachment, shown as a chip.
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("shot.png");
+        std::fs::write(&image, b"\x89PNG\r\n\x1a\nnot really").unwrap();
+        ui.paste(image.display().to_string());
+        assert!(screen(&ui).contains("▣ 1 image"), "{}", screen(&ui));
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        let sent = std::mem::take(&mut ui.effects);
+        assert!(
+            matches!(&sent[..], [Effect::Send { text, .. }]
+                if text == &format!("first line\nsecond line\n\n[image: {}]", image.display())),
+            "{sent:?}"
+        );
+        assert!(
+            !screen(&ui).contains("▣ 1 image"),
+            "sent images leave the box"
+        );
     }
 
     #[test]

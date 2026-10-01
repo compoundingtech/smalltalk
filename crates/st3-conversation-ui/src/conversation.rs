@@ -221,7 +221,16 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             body,
             delivered,
         } => {
-            let bar = run("▎ ", theme::fg(theme.sapphire));
+            // Mail the person is part of leads; mail between others stays in the background.
+            let theirs = from == "you" || to == "you";
+            let bar = run(
+                "▎ ",
+                theme::fg(if theirs {
+                    theme.sapphire
+                } else {
+                    theme.surface2
+                }),
+            );
             // The person's own mail says how far it got: ✓ st has it, ✓✓ the agent's harness
             // has it.
             let progress = match (from == "you", delivered) {
@@ -246,9 +255,20 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                         } else {
                             format!("{from} → {to}")
                         },
-                        on(theme::strong(theme.sapphire)),
+                        on(if theirs {
+                            theme::strong(theme.sapphire)
+                        } else {
+                            theme::fg(theme.overlay1)
+                        }),
                     ),
-                    run(format!("  {}", text::sanitize(subject)), on(theme.bold())),
+                    run(
+                        format!("  {}", text::sanitize(subject)),
+                        on(if theirs {
+                            theme.bold()
+                        } else {
+                            theme::fg(theme.overlay1)
+                        }),
+                    ),
                     run(format!("  {}", entry.at), on(theme.dim())),
                     run(progress.text, on(progress.style)),
                 ],
@@ -257,7 +277,11 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 std::slice::from_ref(&bar),
                 tint,
             ));
-            let style = if to_you { theme.text() } else { theme.soft() };
+            let style = if theirs {
+                theme.text()
+            } else {
+                theme::fg(theme.overlay1)
+            };
             for line in text::markdown(body, inner.saturating_sub(2), on(style), theme) {
                 let mut spans = vec![Span::styled(bar.text.clone(), bar.style)];
                 spans.extend(line.spans.into_iter().map(|span| {
