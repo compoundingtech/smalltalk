@@ -2343,8 +2343,23 @@ enum AgentsCommand {
     /// Show one seat's current claim and its queued mission runs in order, or move a run.
     /// The show form is also available as `st missions queued AGENT`.
     Queue(AgentQueueArgs),
+    /// Inspect, set, or release a Codex/OpenCode delivery hold; the provider keeps running.
+    Hold(AgentHoldArgs),
 }
 
+#[derive(Args)]
+struct AgentHoldArgs {
+    subject: String,
+    /// Hold new native handoffs for this duration, such as 15m.
+    #[arg(long = "for", conflicts_with = "release")]
+    duration: Option<String>,
+    #[arg(long)]
+    release: bool,
+    #[arg(long)]
+    reason: Option<String>,
+    #[arg(long = "as")]
+    actor: Option<String>,
+}
 #[derive(Args)]
 #[command(args_conflicts_with_subcommands = true, subcommand_negates_reqs = true)]
 struct AgentQueueArgs {
@@ -3408,6 +3423,9 @@ fn guard_mutating_cli_actor(
             AgentsCommand::Apply(args) => Some(args.actor.as_str()),
             AgentsCommand::Start(args) => Some(args.actor.as_str()),
             AgentsCommand::Stop(args) => Some(args.actor.as_str()),
+            AgentsCommand::Hold(args) if args.duration.is_some() || args.release => Some(args.actor.as_deref().ok_or_else(|| {
+                anyhow::anyhow!("a harness delivery hold needs explicit --as {own}")
+            })?),
             AgentsCommand::Queue(args) => match &args.command {
                 Some(AgentQueueCommand::Move(args)) => Some(args.actor.as_deref().ok_or_else(|| {
                     anyhow::anyhow!("a harness queue move needs explicit --as {own}; it cannot use the configured person")
@@ -8290,6 +8308,83 @@ async fn run_agents(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        AgentsCommand::Hold(args) => {
+            let client = cli_client(endpoint);
+            let subject = seat_subject(&args.subject);
+            if args.duration.is_some() || args.release {
+                let duration = args
+                    .duration
+                    .as_deref()
+                    .map(|value| st3::graph::parse_duration(value, true))
+                    .transpose()?;
+                let now = u64::try_from(current_unix_ms()?)?;
+                let claim: ClaimRecord = client
+                    .post(
+                        "/v1/delivery/hold",
+                        &st3::delivery_hold::HoldRequest {
+                            subject: subject.clone(),
+                            actor: args
+                                .actor
+                                .or_else(|| configured_person.map(str::to_owned))
+                                .context("a hold needs --as or a configured person")?,
+                            held: !args.release,
+                            until_unix_ms: duration
+                                .map(|duration| {
+                                    now.checked_add(duration).context("hold expiry overflows")
+                                })
+                                .transpose()?
+                                .unwrap_or(0),
+                            reason: args
+                                .reason
+                                .context("setting or releasing a hold needs --reason")?,
+                            idempotency_key: format!("delivery-hold:{}", uuid::Uuid::now_v7()),
+                            legacy_adoption: false,
+                        },
+                    )
+                    .await?;
+                if json_output {
+                    return print_value(&claim, true);
+                }
+            } else {
+                anyhow::ensure!(
+                    args.actor.is_none() && args.reason.is_none(),
+                    "--as and --reason need --for or --release"
+                );
+            }
+            let hold: st3::delivery_hold::HoldView = client
+                .get(&format!(
+                    "/v1/delivery/hold?subject={}",
+                    urlencoding::encode(&subject)
+                ))
+                .await?;
+            if json_output {
+                return print_value(&hold, true);
+            }
+            let expiry = if hold.active {
+                hold.until_unix_ms
+                    .and_then(|value| i64::try_from(value).ok())
+                    .and_then(chrono::DateTime::from_timestamp_millis)
+                    .map(|value| {
+                        format!(
+                            " until {}",
+                            value.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+                        )
+                    })
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            println!(
+                "{} delivery {}{}{}",
+                subject,
+                if hold.active { "held" } else { "enabled" },
+                expiry,
+                hold.reason
+                    .map(|reason| format!(": {reason}"))
+                    .unwrap_or_default()
+            );
+            Ok(())
+        }
         AgentsCommand::Queue(args) => {
             run_agent_queue(endpoint, configured_person, args, json_output).await
         }
@@ -8969,7 +9064,8 @@ async fn run_agent_inspection(
         | AgentsCommand::Apply(_)
         | AgentsCommand::Start(_)
         | AgentsCommand::Stop(_)
-        | AgentsCommand::Queue(_) => {
+        | AgentsCommand::Queue(_)
+        | AgentsCommand::Hold(_) => {
             unreachable!("agent mutation and queue commands return before inspection")
         }
     };
@@ -11917,6 +12013,8 @@ async fn run_st2_native_driver(
 /// The private catalog paths a native driver derives from its subject.
 #[derive(Clone)]
 struct NativePaths {
+    delivery_gate: st_drivers::session_control::DeliveryGate,
+    pending_hold_adoption: Option<st3::delivery_hold::HoldRequest>,
     catalog: PathBuf,
     agent_dir: PathBuf,
     identity: String,
@@ -11927,6 +12025,8 @@ impl NativePaths {
     fn prepare(subject: &str) -> Result<Self> {
         let (catalog, agent_dir, identity, runtime_id) = prepare_native_driver(subject)?;
         Ok(Self {
+            delivery_gate: st_drivers::session_control::DeliveryGate::default(),
+            pending_hold_adoption: None,
             catalog,
             agent_dir,
             identity,
@@ -11965,10 +12065,10 @@ fn spawn_st2_provider(
                 paths.runtime_id,
                 argv,
             ),
-            "pi" => st_drivers::pi_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv),
-            "omp" => st_drivers::omp_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv),
+            "pi" => st_drivers::pi_session::run_native(&paths.catalog, paths.identity, paths.runtime_id, argv),
+            "omp" => st_drivers::omp_session::run_native(&paths.catalog, paths.identity, paths.runtime_id, argv),
             "opencode" => {
-                st_drivers::opencode_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv)
+                st_drivers::opencode_session::run_with_control(&paths.catalog, paths.identity, paths.runtime_id, argv, st_drivers::session_control::SessionControl::Graph(paths.delivery_gate))
             }
             _ => unreachable!("the native driver was checked"),
         },
@@ -11983,7 +12083,7 @@ fn spawn_st2_provider(
                     seq,
                 )
             }
-            ("pi", DetachedSession::Provider { pid, session, seq }) => st_drivers::pi_session::adopt(
+            ("pi", DetachedSession::Provider { pid, session, seq }) => st_drivers::pi_session::adopt_native(
                 &paths.catalog,
                 paths.identity,
                 paths.runtime_id,
@@ -11991,7 +12091,7 @@ fn spawn_st2_provider(
                 session,
                 seq,
             ),
-            ("omp", DetachedSession::Provider { pid, session, seq }) => st_drivers::omp_session::adopt(
+            ("omp", DetachedSession::Provider { pid, session, seq }) => st_drivers::omp_session::adopt_native(
                 &paths.catalog,
                 paths.identity,
                 paths.runtime_id,
@@ -12010,7 +12110,7 @@ fn spawn_st2_provider(
                     version_ok,
                     producer_version,
                 },
-            ) => st_drivers::opencode_session::adopt(
+            ) => st_drivers::opencode_session::adopt_with_control(
                 &paths.catalog,
                 paths.identity,
                 paths.runtime_id,
@@ -12021,6 +12121,7 @@ fn spawn_st2_provider(
                 password,
                 version_ok,
                 producer_version,
+                st_drivers::session_control::SessionControl::Graph(paths.delivery_gate),
             ),
             (driver, session) => {
                 anyhow::bail!("a {driver} driver cannot adopt this provider session: {session:?}")
@@ -12089,7 +12190,10 @@ async fn resume_native_driver(
         )
         .await;
     }
-    let paths = NativePaths::prepare(subject)?;
+    let mut paths = NativePaths::prepare(subject)?;
+    if driver == "opencode" {
+        paths.pending_hold_adoption = legacy_delivery_hold(subject, &paths.agent_dir);
+    }
     let task = spawn_st2_provider(driver, &paths, ProviderStart::Adopt(resume.session));
     drive_st2_native(
         client,
@@ -12213,7 +12317,7 @@ async fn drive_st2_native(
     client: &Client,
     subject: &str,
     driver: &str,
-    paths: NativePaths,
+    mut paths: NativePaths,
     incarnation: String,
     mut loop_state: NativeLoopState,
     mut task: tokio::task::JoinHandle<Result<()>>,
@@ -12223,6 +12327,7 @@ async fn drive_st2_native(
         agent_dir,
         identity,
         runtime_id,
+        ..
     } = paths.clone();
     let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
@@ -12289,6 +12394,11 @@ async fn drive_st2_native(
                 return outcome;
             }
             _ = interval.tick() => {
+                if driver == "opencode" {
+                    if let Err(error) = refresh_native_delivery_control(client, subject, &mut paths).await {
+                        note_driver_tick_failure(subject, error, &mut last_control_warning);
+                    }
+                }
                 let current_record = fs::read(&harness_state_path).ok();
                 loop_state.harness_record_started = harness_record_belongs_to_current_session(
                     loop_state.harness_record_started,
@@ -13585,6 +13695,78 @@ async fn message_content(client: &Client, message: &MessageView) -> Result<Strin
     }
 }
 
+async fn refresh_graph_delivery_gate(
+    client: &Client,
+    subject: &str,
+    gate: &st_drivers::session_control::DeliveryGate,
+) -> Result<()> {
+    let path = format!("/v1/delivery/hold?subject={}", urlencoding::encode(subject));
+    let read = client.get::<st3::delivery_hold::HoldView>(&path);
+    let result: Result<_> = async {
+        let view = tokio::time::timeout(Duration::from_millis(250), read)
+            .await
+            .context("delivery hold read timed out")??;
+        anyhow::ensure!(
+            view.subject == subject,
+            "delivery control names a different seat"
+        );
+        Ok(view.active)
+    }
+    .await;
+    gate.update(
+        result.as_ref().copied().unwrap_or(true),
+        Duration::from_secs(3),
+    );
+    result
+        .map(|_| ())
+        .context("new native handoffs held until graph delivery control is available")
+}
+
+async fn refresh_native_delivery_control(
+    client: &Client,
+    subject: &str,
+    paths: &mut NativePaths,
+) -> Result<()> {
+    let adoption: Result<()> = async {
+        if let Some(request) = &paths.pending_hold_adoption {
+            // The previous hold can expire during an outage. Never import it with a new deadline.
+            if current_unix_ms()? < u128::from(request.until_unix_ms) {
+                tokio::time::timeout(
+                    Duration::from_millis(250),
+                    client.post::<_, ClaimRecord>("/v1/delivery/hold", request),
+                )
+                .await
+                .context("delivery hold adoption timed out")??;
+            }
+            paths.pending_hold_adoption = None;
+        }
+        Ok(())
+    }
+    .await;
+    if let Err(error) = adoption {
+        paths.delivery_gate.update(true, Duration::ZERO);
+        return Err(error
+            .context("native delivery held while the predecessor's hold awaits graph adoption"));
+    }
+    refresh_graph_delivery_gate(client, subject, &paths.delivery_gate).await
+}
+
+/// The only transitional status read: one fresh DND on an adopted predecessor, with no writes.
+fn legacy_delivery_hold(
+    subject: &str,
+    agent_dir: &Path,
+) -> Option<st3::delivery_hold::HoldRequest> {
+    let until_unix_ms = st_drivers::status::dnd_deadline_ms(&agent_dir.join("status"))?;
+    Some(st3::delivery_hold::HoldRequest {
+        subject: subject.into(),
+        actor: subject.into(),
+        held: true,
+        until_unix_ms,
+        reason: "Unexpired delivery hold adopted from the previous native driver".into(),
+        idempotency_key: format!("delivery-hold-adoption:{subject}:{until_unix_ms}"),
+        legacy_adoption: true,
+    })
+}
 async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> Result<()> {
     anyhow::ensure!(!argv.is_empty(), "the Codex driver argv is empty");
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
@@ -13616,6 +13798,7 @@ fn spawn_codex_provider(
             paths.identity,
             paths.runtime_id,
             argv,
+            paths.delivery_gate,
         ),
         ProviderStart::Adopt(st_drivers::provider_session::DetachedSession::Codex {
             tui_pid,
@@ -13637,6 +13820,7 @@ fn spawn_codex_provider(
             owner_write_fd,
             socket_path,
             safe_fallback,
+            paths.delivery_gate,
         ),
         ProviderStart::Adopt(session) => {
             anyhow::bail!("a Codex driver cannot adopt this provider session: {session:?}")
@@ -13652,7 +13836,7 @@ async fn drive_codex_native(
     start: ProviderStart,
     mut loop_state: NativeLoopState,
 ) -> Result<()> {
-    let paths = NativePaths::prepare(subject)?;
+    let mut paths = NativePaths::prepare(subject)?;
     let NativePaths {
         agent_dir,
         identity,
@@ -13664,6 +13848,9 @@ async fn drive_codex_native(
     let prior_binding = std::fs::read(state_dir.join("binding.json")).ok();
     let inbox = st_drivers::message::inbox_dir(&agent_dir);
     let archive = st_drivers::message::archive_dir(&agent_dir);
+    if matches!(start, ProviderStart::Adopt(_)) {
+        paths.pending_hold_adoption = legacy_delivery_hold(subject, &paths.agent_dir);
+    }
     let mut task = spawn_codex_provider(&paths, &state_dir, &argv, start);
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -13715,6 +13902,9 @@ async fn drive_codex_native(
                 return outcome;
             },
             _ = interval.tick() => {
+                if let Err(error) = refresh_native_delivery_control(client, subject, &mut paths).await {
+                    note_driver_tick_failure(subject, error, &mut last_control_warning);
+                }
                 // Delivery runs first and on its own: a failing observation publish must never
                 // hold back a message.
                 delivery.report = Some(native_delivery_report("app-server", None));
@@ -18140,6 +18330,111 @@ mission "review" state="ready" {
 
         assert!(!inbox.join(&filename).exists());
         assert!(archive.join(filename).is_file());
+    }
+
+    #[tokio::test]
+    async fn graph_delivery_gate_closes_on_hold_outage_and_mismatched_subject() {
+        use axum::{Json, Router, routing::get};
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wrong_subject = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let handler_active = active.clone();
+        let handler_wrong = wrong_subject.clone();
+        let app = Router::new().route(
+            "/v1/delivery/hold",
+            get(move || {
+                let active = handler_active.clone();
+                let wrong = handler_wrong.clone();
+                async move {
+                    Json(
+                        json!({"api_version": "st3.v1", "value": st3::delivery_hold::HoldView {
+                            subject: if wrong.load(std::sync::atomic::Ordering::SeqCst) {
+                                "agent/eval/other"
+                            } else {
+                                "agent/eval/gated"
+                            }
+                            .into(),
+                            active: active.load(std::sync::atomic::Ordering::SeqCst),
+                            until_unix_ms: None,
+                            reason: None,
+                            actor: None,
+                            claim: None,
+                        }}),
+                    )
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let client = Client::new(Endpoint::Http(format!("http://{address}")));
+        let gate = st_drivers::session_control::DeliveryGate::default();
+        assert!(gate.held());
+        refresh_graph_delivery_gate(&client, "agent/eval/gated", &gate)
+            .await
+            .unwrap();
+        assert!(!gate.held());
+        active.store(true, std::sync::atomic::Ordering::SeqCst);
+        refresh_graph_delivery_gate(&client, "agent/eval/gated", &gate)
+            .await
+            .unwrap();
+        assert!(gate.held());
+        active.store(false, std::sync::atomic::Ordering::SeqCst);
+        wrong_subject.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(
+            refresh_graph_delivery_gate(&client, "agent/eval/gated", &gate)
+                .await
+                .is_err()
+        );
+        assert!(gate.held());
+        wrong_subject.store(false, std::sync::atomic::Ordering::SeqCst);
+        refresh_graph_delivery_gate(&client, "agent/eval/gated", &gate)
+            .await
+            .unwrap();
+        assert!(!gate.held());
+        let root = tempfile::tempdir().unwrap();
+        let request = st3::delivery_hold::HoldRequest {
+            subject: "agent/eval/gated".into(),
+            actor: "agent/eval/gated".into(),
+            held: true,
+            until_unix_ms: u64::try_from(current_unix_ms().unwrap()).unwrap() + 60_000,
+            reason: "adopted hold".into(),
+            idempotency_key: "adopt-test".into(),
+            legacy_adoption: true,
+        };
+        let deadline = request.until_unix_ms;
+        let mut paths = NativePaths {
+            catalog: root.path().into(),
+            agent_dir: root.path().into(),
+            identity: "h.gated".into(),
+            runtime_id: "gated".into(),
+            delivery_gate: gate.clone(),
+            pending_hold_adoption: Some(request),
+        };
+        assert!(
+            refresh_native_delivery_control(&client, "agent/eval/gated", &mut paths)
+                .await
+                .is_err()
+        );
+        assert!(gate.held());
+        assert_eq!(
+            paths.pending_hold_adoption.as_ref().unwrap().until_unix_ms,
+            deadline
+        );
+        paths.pending_hold_adoption.as_mut().unwrap().until_unix_ms = 0;
+        refresh_native_delivery_control(&client, "agent/eval/gated", &mut paths)
+            .await
+            .unwrap();
+        assert!(paths.pending_hold_adoption.is_none());
+        assert!(!gate.held());
+        server.abort();
+        assert!(
+            refresh_graph_delivery_gate(&client, "agent/eval/gated", &gate)
+                .await
+                .is_err()
+        );
+        assert!(gate.held());
     }
 
     #[test]
