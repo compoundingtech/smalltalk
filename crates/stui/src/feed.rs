@@ -9,8 +9,7 @@
 
 use st3_client::{
     CapabilityState, Client, ClientError, CollectionEvent, CollectionStream, ErrorCode, Fence,
-    Resource, Snapshot,
-    TargetParameters, TerminalScreen, TimelineEntry,
+    Resource, Snapshot, TargetParameters, TerminalScreen, TimelineEntry,
 };
 use std::collections::BTreeMap;
 use std::sync::mpsc;
@@ -71,6 +70,9 @@ impl Window {
         }
     }
 }
+
+/// The glasses capability version whose glasses are splits of tab groups.
+const GLASSES_VERSION: u32 = 1;
 
 /// The most glasses st keeps live for one person.
 const GLASSES: usize = 100;
@@ -134,16 +136,22 @@ pub enum Command {
         runtime_ids: Vec<String>,
     },
     Unfollow,
-    /// Show this agent's or session's conversation, in place of any other.
+    /// Keep exactly these agents' or sessions' conversations live, at most
+    /// `MAX_CONVERSATIONS`: the first is the focused one. An empty list follows none.
     Converse {
-        target: String,
+        targets: Vec<String>,
     },
-    Unconverse,
 }
 
-/// The conversation being shown.
+/// The most conversations followed at once. A socket holds eight subscriptions: three windows,
+/// glasses and a terminal leave three.
+pub const MAX_CONVERSATIONS: usize = 3;
+
+/// A conversation being shown, on its own subscription.
 struct Conversing {
     target: String,
+    /// The subscription id, named after the target so a frame never lands on another one.
+    id: String,
     /// When to subscribe again after a failure; `None` while subscribed.
     retry_at: Option<Instant>,
     failures: usize,
@@ -184,7 +192,7 @@ pub async fn run_members(
     let mut failures = 0_usize;
     let mut member = 0;
     let mut following: Option<Following> = None;
-    let mut conversing: Option<Conversing> = None;
+    let mut conversing: Vec<Conversing> = Vec::new();
     loop {
         // Try every paired member before waiting. Never forward a grant to another origin.
         let mut selected = None;
@@ -232,7 +240,7 @@ pub async fn run_members(
                         let _ =
                             updates.send(Update::Terminal(TerminalUpdate::Reconnecting(reason)));
                     }
-                    if let Some(current) = conversing.as_mut() {
+                    for current in &mut conversing {
                         current.retry_at = None;
                     }
                     if clients.len() > 1 {
@@ -258,10 +266,9 @@ pub async fn run_members(
                     None => return,
                     Some(Command::Reconnect) => { failures = 0; break; }
                     Some(Command::Unfollow) => following = None,
-                    Some(Command::Converse { target }) => {
-                        conversing = Some(Conversing { target, retry_at: None, failures: 0 });
+                    Some(Command::Converse { targets }) => {
+                        conversing = targets.into_iter().take(MAX_CONVERSATIONS).map(Conversing::new).collect();
                     }
-                    Some(Command::Unconverse) => conversing = None,
                     Some(Command::Follow { runtime_ids }) => {
                         following = None;
                         match resolve(&clients[member], &runtime_ids).await {
@@ -295,21 +302,28 @@ async fn connected(
     updates: &mpsc::Sender<Update>,
     commands: &mut channel::UnboundedReceiver<Command>,
     following: &mut Option<Following>,
-    conversing: &mut Option<Conversing>,
+    conversing: &mut Vec<Conversing>,
     failures: &mut usize,
 ) -> Ended {
     // A blackholed network can leave a WebSocket open indefinitely. A bounded read
     // detects that case even when the graph is idle; it never resends a mutation.
     let mut probe = tokio::time::interval(Duration::from_secs(15));
     probe.tick().await;
-    // Glasses are followed only where st grants them; elsewhere stui keeps them on the device.
+    // Glasses are followed only where st grants them in the shape this stui reads (splits of
+    // tab groups, version 1); elsewhere stui keeps them on the device. A member still on the
+    // earlier shape would send glasses this stui cannot decode, and that drops the connection.
     let granted = glasses
         && client.capabilities().await.is_ok_and(|capabilities| {
             capabilities.value.capabilities.iter().any(|capability| {
-                capability.id == "glasses" && capability.state == CapabilityState::Granted
+                capability.id == "glasses"
+                    && capability.version >= GLASSES_VERSION
+                    && capability.state == CapabilityState::Granted
             })
         });
-    for window in Window::ALL.into_iter().chain(granted.then_some(Window::Glasses)) {
+    for window in Window::ALL
+        .into_iter()
+        .chain(granted.then_some(Window::Glasses))
+    {
         if let Err(error) = stream
             .subscribe(window.id(), window.id(), window.limit(), None, None)
             .await
@@ -317,8 +331,10 @@ async fn connected(
             return Ended::Dropped(error.to_string());
         }
     }
-    if let Err(error) = converse(stream, conversing).await {
-        return Ended::Dropped(error.to_string());
+    for current in conversing.iter_mut() {
+        if let Err(error) = converse(stream, current).await {
+            return Ended::Dropped(error.to_string());
+        }
     }
     let mut windows = BTreeMap::<Window, BTreeMap<String, Resource>>::new();
     if following.is_some() {
@@ -329,7 +345,10 @@ async fn connected(
     }
     loop {
         let retry_at = following.as_ref().and_then(|current| current.retry_at);
-        let converse_at = conversing.as_ref().and_then(|current| current.retry_at);
+        let converse_at = conversing
+            .iter()
+            .filter_map(|current| current.retry_at)
+            .min();
         tokio::select! {
             _ = probe.tick(), if remote => {
                 match tokio::time::timeout(Duration::from_secs(5), client.capabilities()).await {
@@ -375,14 +394,14 @@ async fn connected(
                         }
                     }
                     CollectionEvent::Conversation { id, replace, items, has_more, .. } => {
-                        let Some(current) = conversing.as_mut().filter(|_| id == CONVERSATION) else { continue };
+                        let Some(current) = conversing.iter_mut().find(|current| current.id == id) else { continue };
                         current.failures = 0;
                         if updates.send(Update::Conversation { target: current.target.clone(), replace, has_more, items }).is_err() {
                             return Ended::Closed;
                         }
                     }
-                    CollectionEvent::Error { id, message, .. } if id == CONVERSATION => {
-                        let Some(current) = conversing.as_mut() else { continue };
+                    CollectionEvent::Error { id, message, .. } if id.starts_with(CONVERSATION) => {
+                        let Some(current) = conversing.iter_mut().find(|current| current.id == id) else { continue };
                         // Anything may clear: the agent starts, its host comes back, its
                         // history arrives. Ask again after a backoff.
                         current.retry_at = Some(Instant::now() + RETRY_DELAYS[current.failures.min(RETRY_DELAYS.len() - 1)]);
@@ -420,19 +439,28 @@ async fn connected(
                     return Ended::Closed;
                 }
                 Some(Command::Unfollow) => stop_following(client, stream, following).await,
-                Some(Command::Converse { target }) => {
-                    if conversing.as_ref().is_some_and(|current| current.target == target) {
-                        continue;
+                Some(Command::Converse { targets }) => {
+                    let targets = targets.into_iter().take(MAX_CONVERSATIONS).collect::<Vec<_>>();
+                    // Leave what is no longer shown; keep what still is, subscribed as it is.
+                    let mut kept = Vec::new();
+                    for current in std::mem::take(conversing) {
+                        if targets.contains(&current.target) {
+                            kept.push(current);
+                        } else {
+                            let _ = stream.unsubscribe(&current.id).await;
+                        }
                     }
-                    *conversing = Some(Conversing { target, retry_at: None, failures: 0 });
-                    if let Err(error) = converse(stream, conversing).await {
-                        return Ended::Dropped(error.to_string());
+                    for target in targets {
+                        if kept.iter().any(|current| current.target == target) {
+                            continue;
+                        }
+                        let mut current = Conversing::new(target);
+                        if let Err(error) = converse(stream, &mut current).await {
+                            return Ended::Dropped(error.to_string());
+                        }
+                        kept.push(current);
                     }
-                }
-                Some(Command::Unconverse) => {
-                    if conversing.take().is_some() {
-                        let _ = stream.unsubscribe(CONVERSATION).await;
-                    }
+                    *conversing = kept;
                 }
                 Some(Command::Follow { runtime_ids }) => {
                     stop_following(client, stream, following).await;
@@ -457,8 +485,11 @@ async fn connected(
                 }
             }
             () = tokio::time::sleep_until(converse_at.unwrap_or_else(Instant::now)), if converse_at.is_some() => {
-                if let Err(error) = converse(stream, conversing).await {
-                    return Ended::Dropped(error.to_string());
+                let now = Instant::now();
+                for current in conversing.iter_mut().filter(|current| current.retry_at.is_some_and(|at| at <= now)) {
+                    if let Err(error) = converse(stream, current).await {
+                        return Ended::Dropped(error.to_string());
+                    }
                 }
             }
         }
@@ -587,17 +618,25 @@ async fn follow(
         .await
 }
 
-/// Subscribe to the open conversation on this socket; a held subscription is replaced.
+impl Conversing {
+    fn new(target: String) -> Self {
+        Self {
+            id: format!("{CONVERSATION}:{target}"),
+            target,
+            retry_at: None,
+            failures: 0,
+        }
+    }
+}
+
+/// Subscribe to a shown conversation on this socket; a held subscription is replaced.
 async fn converse(
     stream: &mut CollectionStream,
-    conversing: &mut Option<Conversing>,
+    current: &mut Conversing,
 ) -> Result<(), ClientError> {
-    let Some(current) = conversing.as_mut() else {
-        return Ok(());
-    };
     current.retry_at = None;
     stream
-        .subscribe_conversation(CONVERSATION, &current.target)
+        .subscribe_conversation(&current.id, &current.target)
         .await
 }
 

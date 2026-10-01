@@ -659,8 +659,9 @@ ID. Names are free text and need not be unique. The client handles name lookup.
 its person; these routes accept no owner selector. Anonymous sessions and agents have no glass
 access. Paired devices need `read.glasses` for reads and `control.glasses` for writes. New
 limited pairings include both grants. Existing devices with explicit grants need a new pairing
-if they lack them. Discover the granted `glasses` capability (version 0) before migrating local
-storage; it is granted when the session has both read and write access.
+if they lack them. Discover the granted `glasses` capability (version 1 or later) before migrating local
+storage; it is granted when the session has both read and write access. Version 1 stores
+splits with tab groups; version 0 used tabs containing splits and is not compatible with this body.
 
 `PUT /v1/client/glasses/{uuid}` accepts `{body, base_revision}`. A new ID requires a null
 base revision. Existing IDs accept stale or null bases: writes replace the whole body, using
@@ -677,13 +678,23 @@ client's basis; `replaced_revision` records the head this member observed under 
 transaction. Both are null on a first creation. A deletion response has a null body and
 `deleted: true`; lists and detail reads show only current live glasses.
 
-The structure is `{name, tabs:[{title?, layout}]}`. A layout is `{pane: "opaque key"}` or
-`{split: "right" | "below", children: [layout, layout]}`. Pane keys convey no authority. No
-focus, scroll, selection, ratios, or last-used glass is stored. Empty `tabs: []` is valid:
-clients supply their implicit Home locally. Names and pane keys must be nonempty; splits have
-exactly two children, and no unknown structure fields are accepted.
-The daemon advertises limits: 65,536 bytes of compact UTF-8 JSON per body, 32 layout levels,
-1,024 layout nodes across all tabs, and 100 live glasses per person. The response ceiling is
+The structure is `{name, layout}`. A layout is a leaf group
+`{tabs:[{title?, pane: "opaque key"}]}` or a binary split
+`{split: "right" | "below", children: [layout, layout]}`. Each group has its own tab strip.
+Pane keys convey no authority. Focus, the selected tab in each group, scroll, ratios, and
+last-used glass stay local. Empty groups `{tabs: []}` are valid; clients supply their implicit
+Home locally in the first group. Names and pane keys must be nonempty; splits have exactly
+two children, and no unknown structure fields are accepted.
+The daemon advertises limits: 65,536 bytes of compact UTF-8 JSON per body, 32 layout levels
+(the root is level 1), 1,024 tabs and split nodes combined across the whole tree, and 100 live
+glasses per person. Leaf group containers do not add nodes; tabs do not add layout depth.
+Version-1 client writes reject the previous `{name, tabs}` body. Stored version-0 bodies
+are projected as one tab group: each pane becomes a tab in its old left/top-to-right/bottom
+order, and each old tab’s title goes to its first pane. The original claims and revisions remain unchanged, including during replication
+and replay. A subsequent version-1 write stores the new body and records the old revision it
+replaced. New client writes require the version-1 shape and bounds. An empty legacy body at
+the old byte limit can project slightly above 64 KiB; the next write must fit the current limit.
+The response ceiling is
 8 MiB, allowing a complete 100-glass subscription window at these bounds.
 
 Local creation is refused when the member already sees 100 live glasses. Concurrent creates

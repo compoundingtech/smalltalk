@@ -30,12 +30,12 @@ pub enum Hit {
     Revoke(String),
     /// Leave the terminal view.
     Detach,
-    /// Glasses: open the palette.
-    Palette,
     /// Glasses: open the palette at the glasses section.
     GlassMenu,
-    /// Glasses: show a tab (0 is Home).
-    GlassTab(usize),
+    /// Glasses: show a group's tab (group 0's tab 0 is Home).
+    GlassTab(usize, usize),
+    /// Glasses: open the palette for a new tab in a group.
+    GlassAdd(usize),
     /// Glasses: open a palette row.
     PaletteChoice(usize),
 }

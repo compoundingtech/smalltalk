@@ -1,4 +1,9 @@
 {
-  "body": { "name": "Home only", "tabs": [] },
+  "body": {
+    "name": "Home only",
+    "layout": {
+      "tabs": []
+    }
+  },
   "base_revision": null
 }

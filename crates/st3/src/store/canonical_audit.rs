@@ -461,7 +461,7 @@ fn write_audit_history(source: &Store) {
     );
     source.append_claim(&ClaimInput {
         subject:"glass/person/ada/019a0000-0000-7000-8000-000000000001".into(), kind:"glass.upserted".into(), actor:Some("person/ada".into()),
-        fields: serde_json::from_value(json!({"body":{"name":"Audit workspace","tabs":[{"layout":{"pane":"home:"}}]}, "base_revision":null})).unwrap(), evidence:vec![], expected_subject:None, idempotency_key:None,
+        fields: serde_json::from_value(json!({"body":{"name":"Audit workspace","layout":{"tabs":[{"pane":"opaque:anything"}]}}, "base_revision":null})).unwrap(), evidence:vec![], expected_subject:None, idempotency_key:None,
     }).unwrap();
     let declared_message = r#"version 2
 message "audit-declared" {

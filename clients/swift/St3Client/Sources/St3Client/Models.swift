@@ -355,17 +355,17 @@ public struct TerminalScreen: Codable, Sendable { public let kind: String; publi
 
 public enum GlassSplit: String, Codable, Sendable { case right, below }
 public indirect enum GlassLayout: Codable, Sendable {
-    case pane(String), split(GlassSplit, [GlassLayout])
-    enum CodingKeys: String, CodingKey { case pane, split, children }
+    case group([GlassTab]), split(GlassSplit, [GlassLayout])
+    enum CodingKeys: String, CodingKey { case tabs, split, children }
     public init(from decoder: Decoder) throws {
         let box = try decoder.container(keyedBy: CodingKeys.self)
-        if let pane = try box.decodeIfPresent(String.self, forKey: .pane) { self = .pane(pane) }
+        if box.contains(.tabs) { guard !box.contains(.split) && !box.contains(.children) else { throw DecodingError.dataCorruptedError(forKey: .tabs, in: box, debugDescription: "A group cannot also be a split") }; self = .group(try box.decode([GlassTab].self, forKey: .tabs)) }
         else { let children = try box.decode([GlassLayout].self, forKey: .children); guard children.count == 2 else { throw DecodingError.dataCorruptedError(forKey: .children, in: box, debugDescription: "A split needs two children") }; self = .split(try box.decode(GlassSplit.self, forKey: .split), children) }
     }
-    public func encode(to encoder: Encoder) throws { var box = encoder.container(keyedBy: CodingKeys.self); switch self { case .pane(let pane): try box.encode(pane, forKey: .pane); case .split(let split, let children): guard children.count == 2 else { throw EncodingError.invalidValue(children, .init(codingPath: encoder.codingPath, debugDescription: "A split needs two children")) }; try box.encode(split, forKey: .split); try box.encode(children, forKey: .children) } }
+    public func encode(to encoder: Encoder) throws { var box = encoder.container(keyedBy: CodingKeys.self); switch self { case .group(let tabs): try box.encode(tabs, forKey: .tabs); case .split(let split, let children): guard children.count == 2 else { throw EncodingError.invalidValue(children, .init(codingPath: encoder.codingPath, debugDescription: "A split needs two children")) }; try box.encode(split, forKey: .split); try box.encode(children, forKey: .children) } }
 }
-public struct GlassTab: Codable, Sendable { public var title: String?; public var layout: GlassLayout; public init(title: String? = nil, layout: GlassLayout) { self.title = title; self.layout = layout } }
-public struct GlassBody: Codable, Sendable { public var name: String; public var tabs: [GlassTab]; public init(name: String, tabs: [GlassTab]) { self.name = name; self.tabs = tabs } }
+public struct GlassTab: Codable, Sendable { public var title: String?; public var pane: String; public init(title: String? = nil, pane: String) { self.title = title; self.pane = pane } }
+public struct GlassBody: Codable, Sendable { public var name: String; public var layout: GlassLayout; public init(name: String, layout: GlassLayout) { self.name = name; self.layout = layout } }
 public struct GlassResource: Codable, Sendable, Identifiable {
     public let id: String
     public let kind: String
