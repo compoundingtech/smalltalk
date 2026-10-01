@@ -96,6 +96,7 @@ function Main() {
       if (parsed.kind === 'tab') navigationRef.navigate(parsed.tab, { screen: ROOTS[parsed.tab] } as never);
       else if (parsed.kind === 'mission') navigationRef.navigate('Missions', { screen: 'Mission', params: { id: parsed.id }, initial: false });
       else if (parsed.kind === 'agent') navigationRef.navigate('Agents', { screen: 'Conversation', params: { target: parsed.id }, initial: false });
+      else if (parsed.kind === 'terminal') navigationRef.navigate('Agents', { screen: 'Terminal', params: { terminalId: parsed.id }, initial: false });
       else if (parsed.kind === 'session') {
         navigationRef.navigate('Agents', { screen: 'Conversation', params: { target: parsed.id, sessionId: parsed.id }, initial: false });
         if (parsed.terminal) setTimeout(() => navigationRef.navigate('Agents', { screen: 'Terminal', params: { terminalId: parsed.terminal! }, initial: false }), 300);

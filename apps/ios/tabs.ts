@@ -26,6 +26,7 @@ export type DevLink =
   | { kind: 'mission'; id: string }
   | { kind: 'session'; id: string; terminal?: string }
   | { kind: 'agent'; id: string }
+  | { kind: 'terminal'; id: string }
   | { kind: 'tree'; on: boolean }
   | { kind: 'pair'; gateway: string; id: string; code: string };
 
@@ -44,6 +45,7 @@ export function parseDevLink(link: string): DevLink | null {
       return id?.startsWith('session/') ? { kind: 'session', id, ...(terminal?.startsWith('terminal/') ? { terminal } : {}) } : null;
     }
     case 'agent': { const id = params.get('id'); return id?.startsWith('agent/') ? { kind: 'agent', id } : null; }
+    case 'terminal': { const id = params.get('id'); return id?.startsWith('terminal/') ? { kind: 'terminal', id } : null; }
     case 'tree': return { kind: 'tree', on: params.get('on') !== '0' };
     case 'pair': {
       const gateway = params.get('gateway'), id = params.get('id'), code = params.get('code');
