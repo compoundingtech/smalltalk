@@ -14093,6 +14093,20 @@ fn legacy_delivery_hold(
 async fn run_codex_native(client: &Client, subject: &str, argv: Vec<String>) -> Result<()> {
     anyhow::ensure!(!argv.is_empty(), "the Codex driver argv is empty");
     let incarnation = wait_for_agent_incarnation(client, subject).await?;
+    // The local PTY can publish before reconciliation records runtime.running. Like the
+    // other native drivers, publish startup evidence before binding the mailbox: that bind
+    // must wait for the exact running incarnation instead of treating this fresh seat as stale.
+    retry_while_daemon_unreachable(subject, || {
+        publish_harness_state(
+            client,
+            subject,
+            "codex",
+            "starting",
+            Some(&incarnation),
+            None,
+        )
+    })
+    .await?;
     drive_codex_native(
         client,
         subject,
