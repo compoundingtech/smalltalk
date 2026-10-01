@@ -90,6 +90,12 @@ class Probe:
         self.deadline = int(config.get("deadline_ms", 60_000))
         if self.interval < 1000 or self.deadline < 1000 or self.deadline > 60_000:
             raise ValueError("interval must be positive; deadline must be 1–60 seconds")
+        # Replication status is one of the daemon's most expensive reads. Every route shares one
+        # reading, at most this old, instead of asking for it once a second per peer.
+        self.presence_ttl = int(config.get("presence_ttl_ms", 15_000))
+        # Each report is a replicated document write, which wakes every member's reconciler. A
+        # changed report publishes at once; an unchanged one only proves the probe is alive.
+        self.heartbeat = int(config.get("heartbeat_ms", 300_000))
         self.directory = Path(config["state_dir"])
         self.directory.mkdir(parents=True, exist_ok=True)
         self.lock = (self.directory / "probe.lock").open("a")
@@ -101,6 +107,7 @@ class Probe:
         self.child = None
         self.last_publish = 0
         self.changed = True
+        self.presence_reading = None
         self.tasks = set()
         self.measuring = {}
 
@@ -204,12 +211,25 @@ class Probe:
         if not task.cancelled() and task.exception():
             self.event("receiver-retry", error=str(task.exception()))
 
+    async def presence(self):
+        """The daemon's replication status, shared by every route while it is fresh."""
+        reading = self.presence_reading
+        if reading is None or time.monotonic() - reading[0] >= self.presence_ttl / 1000:
+            reading = (time.monotonic(), asyncio.ensure_future(self.api.get("/v1/replication/status")))
+            self.presence_reading = reading
+        try:
+            return await asyncio.shield(reading[1])
+        except Exception:
+            if self.presence_reading is reading:
+                self.presence_reading = None
+            raise
+
     async def route(self, target):
         route = self.state["routes"].get(target)
         if route and route.get("attention", "").startswith("attention/"):
             route.pop("attention")
             self.persist()
-        presence = await self.api.get("/v1/replication/status")
+        presence = await self.presence()
         direct = next((peer for peer in presence["peers"] if peer["peer"] == self.peers[target]), {})
         # A grant refusal says nothing about end-to-end reachability through a hub.
         # Continue real delivery probes while another replication path is active.
@@ -354,7 +374,7 @@ class Probe:
             # One failed route cannot prevent the other deadlines or receipts.
             await asyncio.gather(*(safely(self.route(target)) for target in self.peers),
                                  *(safely(self.acknowledge(subject)) for subject in list(self.state["receipts"])))
-            if self.changed or now_ms() - self.last_publish >= 30_000:
+            if self.changed or now_ms() - self.last_publish >= self.heartbeat:
                 await safely(self.publish())
             await asyncio.sleep(1)
 

@@ -103,6 +103,8 @@ CREATE TABLE IF NOT EXISTS claims (
     accepted_at_unix_ms TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS claims_subject_index ON claims(subject, store_index);
+CREATE INDEX IF NOT EXISTS claims_subject_accepted_index
+ON claims(subject, length(accepted_at_unix_ms), accepted_at_unix_ms);
 CREATE INDEX IF NOT EXISTS claims_kind_index ON claims(kind, store_index);
 CREATE INDEX IF NOT EXISTS claims_subject_kind_index ON claims(subject, kind, store_index);
 CREATE INDEX IF NOT EXISTS claims_subject_kind_accepted_index
@@ -1036,12 +1038,14 @@ pub fn previous_batch_hash(transaction: &Transaction<'_>, origin: &str) -> Resul
         .map_err(Into::into)
 }
 
+// Seek the newest time block before evaluating canonical writer/sequence/position ties.
+pub const LATEST_CLAIM_QUERY: &str = "SELECT id FROM claims INDEXED BY claims_subject_accepted_index
+    WHERE subject=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1";
+
 pub fn latest_claim_id_tx(transaction: &Transaction<'_>, subject: &str) -> Result<Option<String>> {
     transaction
         .query_row(
-            &canonical_sql(
-                "SELECT id FROM claims WHERE subject=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-            ),
+            &canonical_sql(LATEST_CLAIM_QUERY),
             [subject],
             |row| row.get(0),
         )

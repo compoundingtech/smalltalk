@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Run one Linux gate stage inside the pinned devShell: tests, clippy, or fleet-compat.
+# Each stage is its own GitHub Actions job on its own runner; `linux-gate` requires all three.
+set -euo pipefail
+stage=${1:?usage: scripts/ci-linux tests|clippy|fleet-compat}
+# Logs stay outside the checkout: the public-content test scans untracked files.
+logs="$RUNNER_TEMP/ci-logs"
+mkdir -p "$logs"
+
+fleet_compat() {
+  local baseline
+  baseline=$(jq -er .commit .github/fleet-compat-baseline.json) || return
+  # Building the baseline also runs the pinned pty's own unit tests, and two of its process-table
+  # tests are timing-sensitive on a loaded runner (different ones failed on different runs). A
+  # failed build leaves nothing behind, so a retry rebuilds only what failed.
+  local attempt
+  for attempt in 1 2 3; do
+    BASELINE="$baseline" nix build --impure --out-link "$RUNNER_TEMP/baseline" --print-build-logs --expr '
+      ((builtins.getFlake "github:compoundingtech/smalltalk/${builtins.getEnv "BASELINE"}")
+        .packages.${builtins.currentSystem}.st3).overrideAttrs (_: { doCheck = false; })' && break
+    [ "$attempt" -lt 3 ] || return 1
+    echo "baseline build attempt $attempt failed; retrying" >&2
+  done
+  export ST3_COMPAT_BIN="$RUNNER_TEMP/baseline/bin/st3"
+  test -x "$ST3_COMPAT_BIN" || return
+  if "$ST3_COMPAT_BIN" fleet --help > /dev/null 2>&1; then
+    echo "the baseline must predate fleet membership" >&2
+    return 1
+  fi
+  cargo test -p st3 --locked --test integration -- --ignored --exact \
+    fleet::an_old_build_config_peer_replicates_with_new_members 2>&1 | tee "$logs/compat-result.log" || return
+  grep -q "test result: ok. 1 passed" "$logs/compat-result.log"
+}
+
+clippy_and_codegen() {
+  cargo clippy --workspace --all-targets --locked
+  cargo run --locked -p st3-client-codegen -- --check
+}
+
+start=$SECONDS status=0
+case "$stage" in
+  # The nextest --no-run step already compiled the test executables.
+  # TRIAL ONLY (Namespace trial copy of #849): skip the messaging fault matrix exactly as st/ci skips it
+  # this week; it returns as parallel tests. Without the skip every case times out in fixture
+  # startup and its 30-second retries keep this job running for tens of minutes. The -E expression
+  # is combined with the ci profile's default-filter. Remove it when the matrix is parallelized.
+  tests) cargo nextest run --workspace --locked --profile ci --test-threads "$(nproc)" \
+    -E 'not test(/^messaging_faults::messages_recover_across_transport_and_process_faults$/)' \
+    2>&1 | tee "$logs/$stage.log" || status=$? ;;
+  clippy) clippy_and_codegen 2>&1 | tee "$logs/$stage.log" || status=$? ;;
+  fleet-compat) fleet_compat 2>&1 | tee "$logs/$stage.log" || status=$? ;;
+  *) echo "unknown stage: $stage" >&2; exit 2 ;;
+esac
+# `tee` hides the stage's exit status behind a pipeline; pipefail restores it above.
+result=passed
+[ "$status" -eq 0 ] || result=failed
+printf '%s %s\n' "$((SECONDS - start))" "$status" > "$logs/$stage.time"
+printf '| %s | %s | %ss | %s |\n' "$stage" "$result" "$((SECONDS - start))" "$status" >> "$GITHUB_STEP_SUMMARY"
+exit "$status"

@@ -21,6 +21,7 @@ impl Cache {
             .render(entries, width, expanded, spinner, &theme::conversation());
         Doc {
             lines: rendered.lines,
+            messages: rendered.messages,
             targets: rendered
                 .targets
                 .into_iter()

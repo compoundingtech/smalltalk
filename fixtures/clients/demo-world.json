@@ -715,6 +715,7 @@
             "kind": "mail",
             "value": {
               "body": "Robin asked for the remaining two keys today. Claim `rotate` when you are free.",
+              "delivered": false,
               "from": "Chief of Staff",
               "subject": "Finish the rotation",
               "to": "Rekey Worker"
@@ -744,6 +745,7 @@
             "kind": "mail",
             "value": {
               "body": "release-captain on harbor exited 4 times in 10 minutes. Restarts are paused until a person acts.",
+              "delivered": false,
               "from": "st",
               "subject": "Seat release-captain stopped restarting",
               "to": "Chief of Staff"

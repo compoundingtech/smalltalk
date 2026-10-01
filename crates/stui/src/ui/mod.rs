@@ -49,7 +49,7 @@ use screens::{Drafts, Item, ListState, Listing, TABS};
 use st3_conversation_ui::pane::order;
 use st3_conversation_ui::{PaneIntent, PaneState, Selection};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::{HashMap, HashSet},
     io::{self, Write},
     rc::Rc,
@@ -74,8 +74,13 @@ struct FrameInfo {
     sidebar: Rect,
     sidebar_lines: usize,
     sidebar_height: usize,
-    /// Glasses: where each pane of the shown tab was drawn, in leaf order.
+    /// Glasses: where each group's content was drawn, in group order.
     glass_leaves: Vec<Rect>,
+    read_messages: HashSet<String>,
+    /// The focused agent's pane was too narrow for details beside its conversation.
+    agent_narrow: bool,
+    /// The first palette row drawn.
+    palette_top: usize,
 }
 
 struct Demo {
@@ -161,6 +166,19 @@ pub(crate) struct TerminalView {
     pub(crate) ended: Option<String>,
 }
 
+/// `/` in a conversation: what to find there, and which match is current.
+struct Find {
+    /// The agent whose conversation is searched.
+    agent: String,
+    query: String,
+    /// The current match, counted from the newest: 0 is the latest one.
+    current: usize,
+    /// How many matches the last draw found.
+    count: Cell<usize>,
+    /// Scroll to the current match on the next draw.
+    jump: Cell<bool>,
+}
+
 /// An open "chat about this" on a Home item.
 #[derive(Clone, Debug)]
 struct ChatState {
@@ -218,11 +236,30 @@ pub struct Ui {
     /// The footer names this build (version, revision, age); off in tests, whose screens must
     /// not change with every commit.
     pub(crate) build: bool,
+    /// A pane too narrow for details beside the conversation shows them instead of it.
+    details_here: bool,
+    /// Finding text in a conversation.
+    find: Option<Find>,
     /// When st last sent each conversation something, shown above its message box.
     updated: HashMap<String, Instant>,
+    /// Why a conversation could not be brought up to date, until st sends it again.
+    stalled: HashMap<String, String>,
 }
 
 impl Ui {
+    /// Call only after the terminal successfully presented this frame.
+    pub(crate) fn visible_messages(&self) -> HashSet<String> {
+        if self.help
+            || self.popover.is_some()
+            || self
+                .glasses
+                .as_ref()
+                .is_some_and(|glasses| glasses.palette_open())
+        {
+            return HashSet::new();
+        }
+        self.frame.borrow().read_messages.clone()
+    }
     pub fn new(world: World) -> Self {
         Self {
             world,
@@ -257,7 +294,10 @@ impl Ui {
             snoozed: HashSet::new(),
             glasses: None,
             build: false,
+            details_here: false,
+            find: None,
             updated: HashMap::new(),
+            stalled: HashMap::new(),
         }
     }
 
@@ -279,6 +319,9 @@ impl Ui {
             }
         }
         self.tab = tab;
+        if self.glasses.is_some() {
+            self.resync_focus();
+        }
     }
 
     /// The conversations to keep live, the focused one first: the selected agent's in the
@@ -301,8 +344,22 @@ impl Ui {
         targets
     }
 
+    /// Details beside the conversation, or in its place when the pane is too narrow for both.
+    fn toggle_details(&mut self) {
+        if self.frame.borrow().agent_narrow {
+            self.details_here = !self.details_here;
+        } else {
+            self.details = !self.details;
+        }
+    }
+
     pub(crate) fn conversation_updated(&mut self, target: &str) {
         self.updated.insert(target.to_owned(), Instant::now());
+        self.stalled.remove(target);
+    }
+
+    pub(crate) fn conversation_failed(&mut self, target: &str, error: &str) {
+        self.stalled.insert(target.to_owned(), error.to_owned());
     }
 
     /// The agent whose message box has the keyboard: the selected agent while the Agents tab
@@ -322,6 +379,15 @@ impl Ui {
             }
         });
         let live = self.live_conversations().iter().any(|id| id == agent);
+        if live && let Some(error) = self.stalled.get(agent) {
+            let age = age
+                .map(|age| format!(" · updated {age}"))
+                .unwrap_or_default();
+            return Span::styled(
+                format!(" ⚠ retrying{age} · {} ", text::truncate(error, 60)),
+                theme::fg(theme::YELLOW),
+            );
+        }
         let (text, color) = match (live, age) {
             (true, Some(age)) => (format!(" ● live · updated {age} "), theme::OVERLAY1),
             (true, None) => (" ● live · waiting for st ".to_owned(), theme::OVERLAY1),
@@ -667,10 +733,13 @@ impl Ui {
             let mut hints = match &self.glasses {
                 Some(_) if self.split_shown() => vec![
                     ("ctrl+k", "open"),
-                    ("alt+←→↑↓", "panes"),
+                    ("[ ]", "tabs"),
+                    ("alt+←→↑↓", "splits"),
                     ("ctrl+w", "close"),
                 ],
-                Some(_) if !self.on_home() => vec![("ctrl+k", "open"), ("ctrl+w", "close")],
+                Some(_) if !self.on_home() => {
+                    vec![("ctrl+k", "open"), ("[ ]", "tabs"), ("ctrl+w", "close")]
+                }
                 Some(_) => vec![("ctrl+k", "open"), ("↑↓", "select")],
                 None => vec![("1-4", "tabs"), ("↑↓", "select")],
             };
@@ -1118,7 +1187,39 @@ impl Ui {
             buf.set_stringn(area.x, area.y + 1, message, width, theme::dim());
             return;
         };
-        let full = area;
+        let narrow = area.width < 90;
+        if self.composing(&agent.id) {
+            self.frame.borrow_mut().agent_narrow = narrow;
+        }
+        // Too narrow for details beside the conversation: `i` shows them in its place.
+        if narrow && self.details_here && !agent.unmanaged && self.composing(&agent.id) {
+            buf.set_stringn(
+                area.x,
+                area.y,
+                " i back to the conversation ",
+                area.width as usize,
+                theme::fg(theme::OVERLAY1),
+            );
+            self.hit(Rect { height: 1, ..area }, Hit::Key('i'));
+            let doc = screens::agent_details(
+                &self.world,
+                agent,
+                (area.width as usize).saturating_sub(3),
+                self.spinner(),
+            );
+            self.pane(
+                buf,
+                &format!("details:{}", agent.id),
+                Rect {
+                    y: area.y + 1,
+                    height: area.height.saturating_sub(1),
+                    ..area
+                },
+                doc,
+                false,
+            );
+            return;
+        }
         let area = if self.details && !agent.unmanaged && area.width >= 90 {
             let side = (area.width / 3).clamp(30, 44);
             let pane = Rect {
@@ -1171,8 +1272,10 @@ impl Ui {
             area.width as usize,
             theme::fg(theme::SURFACE0),
         );
-        if !agent.unmanaged && full.width >= 90 {
-            let label = if self.details {
+        if !agent.unmanaged && (!narrow || self.composing(&agent.id)) {
+            let label = if narrow {
+                " i details "
+            } else if self.details {
                 " i hide details ▸ "
             } else {
                 " ◂ i details "
@@ -1190,22 +1293,8 @@ impl Ui {
                 Hit::Key('i'),
             );
         }
-        // The composer grows with the draft (up to eight lines) and keeps the cursor in view.
-        let composer = if agent.unmanaged {
-            Vec::new()
-        } else {
-            self.composer_lines(agent, width)
-        };
-        let composer_height = if agent.unmanaged {
-            0
-        } else {
-            composer.len() as u16 + 2
-        };
-        let body = Rect {
-            y: area.y + header_height,
-            height: area.height.saturating_sub(header_height + composer_height),
-            ..area
-        };
+        // While finding, the find bar takes the message box's place.
+        let find = self.find.as_ref().filter(|find| find.agent == agent.id);
         let doc = match self.world.conversations.get(&agent.id) {
             None | Some(Load::Loading) => {
                 let mut doc = Doc::new();
@@ -1238,22 +1327,105 @@ impl Ui {
                 doc
             }
             Some(Load::Ready(entries)) => {
+                // Folded tool output with a match inside opens while finding.
+                let query = find
+                    .map(|find| find.query.to_lowercase())
+                    .unwrap_or_default();
+                let mut expanded = self.conversation_state.expanded.clone();
+                if !query.is_empty() {
+                    expanded.extend(entries.iter().filter_map(|entry| {
+                        match &entry.body {
+                            Body::Tool { output, .. }
+                                if output
+                                    .iter()
+                                    .any(|line| line.to_lowercase().contains(&query)) =>
+                            {
+                                Some(entry.id.clone())
+                            }
+                            _ => None,
+                        }
+                    }));
+                }
                 let mut doc = Doc::new();
                 doc.blank();
                 doc.append(
-                    self.cache.render(
-                        entries,
-                        width,
-                        &self.conversation_state.expanded,
-                        self.spinner(),
-                    ),
+                    self.cache.render(entries, width, &expanded, self.spinner()),
                     0,
                 );
                 doc.blank();
                 doc
             }
         };
-        self.pane(buf, &format!("chat:{}", agent.id), body, doc, true);
+        let key = format!("chat:{}", agent.id);
+        let matches = find
+            .map(|find| find_matches(&doc, &find.query))
+            .unwrap_or_default();
+        if let Some(find) = find {
+            find.count.set(matches.len());
+        }
+        // The composer grows with the draft (up to eight lines) and keeps the cursor in view.
+        let composer = if let Some(find) = find {
+            vec![self.find_bar(find)]
+        } else if agent.unmanaged {
+            Vec::new()
+        } else {
+            self.composer_lines(agent, width)
+        };
+        let composer_height = if composer.is_empty() {
+            0
+        } else {
+            composer.len() as u16 + 2
+        };
+        let body = Rect {
+            y: area.y + header_height,
+            height: area.height.saturating_sub(header_height + composer_height),
+            ..area
+        };
+        if let Some(find) = find {
+            let current = matches
+                .len()
+                .checked_sub(1 + find.current.min(matches.len().saturating_sub(1)))
+                .and_then(|index| matches.get(index));
+            if find.jump.replace(false)
+                && let Some((line, _, _)) = current
+            {
+                let mut panes = self.conversation_state.panes.borrow_mut();
+                let state = panes.entry(key.clone()).or_default();
+                state.top = line.saturating_sub(body.height as usize / 3);
+                state.follow = false;
+            }
+        }
+        self.pane(buf, &key, body, doc, true);
+        // Every match on screen is marked; the current one stands out.
+        if let Some(find) = find {
+            let top = self
+                .conversation_state
+                .panes
+                .borrow()
+                .get(&key)
+                .map_or(0, |state| state.top);
+            let current = matches
+                .len()
+                .saturating_sub(1 + find.current.min(matches.len().saturating_sub(1)));
+            for (index, (line, column, width)) in matches.iter().enumerate() {
+                if *line < top || *line >= top + body.height as usize {
+                    continue;
+                }
+                let y = body.y + (line - top) as u16;
+                let style = if index == current {
+                    Style::default().fg(theme::CRUST).bg(theme::YELLOW)
+                } else {
+                    Style::default().fg(theme::TEXT).bg(theme::SURFACE2)
+                };
+                for x in *column..column + width {
+                    if let Some(cell) = buf.cell_mut((body.x + x as u16, y))
+                        && x < body.width as usize
+                    {
+                        cell.set_style(style);
+                    }
+                }
+            }
+        }
         if composer_height > 0 {
             let y = body.y + body.height;
             buf.set_stringn(
@@ -1311,6 +1483,14 @@ impl Ui {
             *state
         };
         let top = state.top;
+        if area.width > 1 && height > 0 {
+            self.frame.borrow_mut().read_messages.extend(
+                doc.messages
+                    .iter()
+                    .filter(|(_, range)| range.start < top + height && range.end > top)
+                    .map(|(id, _)| id.clone()),
+            );
+        }
         let lines = Rc::new(doc.lines);
         for (offset, line) in lines.iter().skip(top).take(height).enumerate() {
             buf.set_line(
@@ -1490,6 +1670,26 @@ impl Ui {
                 cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
             }
         }
+    }
+
+    /// The find bar: what is sought, where the current match is, and the keys.
+    fn find_bar(&self, find: &Find) -> Line<'static> {
+        let count = find.count.get();
+        let place = match count {
+            0 if find.query.is_empty() => String::new(),
+            0 => "  no matches".to_owned(),
+            count => format!("  {} of {count}", find.current.min(count - 1) + 1),
+        };
+        Line::from(vec![
+            Span::styled("/ ", theme::strong(theme::ACCENT)),
+            Span::styled(find.query.clone(), theme::text()),
+            Span::styled("█", theme::fg(theme::ACCENT)),
+            Span::styled(place, theme::fg(theme::YELLOW)),
+            Span::styled(
+                "  · enter older · shift+enter newer · esc close",
+                theme::dim(),
+            ),
+        ])
     }
 
     /// The message box under a conversation, wrapped, newest lines last.
@@ -1757,6 +1957,29 @@ impl Ui {
             self.help = false;
             return;
         }
+        if let Some(find) = self.find.as_mut() {
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            let count = find.count.get().max(1);
+            match key.code {
+                KeyCode::Esc => self.find = None,
+                // Enter goes back in time, to the next older match; Shift+Enter forward.
+                KeyCode::Enter | KeyCode::Up if !shift => {
+                    find.current = (find.current + 1) % count;
+                    find.jump.set(true);
+                }
+                KeyCode::Enter | KeyCode::Down => {
+                    find.current = (find.current + count - 1) % count;
+                    find.jump.set(true);
+                }
+                _ => {
+                    if edit_text(&mut find.query, key) {
+                        find.current = 0;
+                        find.jump.set(true);
+                    }
+                }
+            }
+            return;
+        }
         if let Some((fields, focus)) = self.new_mission.as_mut() {
             let focus_now = *focus;
             match key.code {
@@ -1871,6 +2094,17 @@ impl Ui {
             KeyCode::Char('s') => self.sidebar = !self.sidebar,
             KeyCode::Char('x') if self.tab == 2 => self.system = !self.system,
             KeyCode::Char('o') if self.tab == 1 => self.toggle_all_tools(),
+            KeyCode::Char('/') if self.tab == 1 => {
+                if let Some(agent) = self.selected_id() {
+                    self.find = Some(Find {
+                        agent,
+                        query: String::new(),
+                        current: 0,
+                        count: Cell::new(0),
+                        jump: Cell::new(false),
+                    });
+                }
+            }
             KeyCode::Char(letter @ ('r' | 'x')) if self.tab == 1 && self.live => {
                 match self.undelivered() {
                     Some(entry) if letter == 'r' => self.effects.push(Effect::Resend { entry }),
@@ -1878,7 +2112,7 @@ impl Ui {
                     None => {}
                 }
             }
-            KeyCode::Char('i') if self.tab == 1 => self.details = !self.details,
+            KeyCode::Char('i') if self.tab == 1 => self.toggle_details(),
             KeyCode::Char('t') if matches!(self.tab, 1 | 2) => {
                 let id = self.selected_id();
                 self.tree = !self.tree;
@@ -2018,11 +2252,12 @@ impl Ui {
                     ("launch", 'd') | ("revision", 'j') | ("fault" | "request", 'r') => {
                         self.confirm = Some(key)
                     }
+                    ("request", 'y' | 'n') => self.confirm = Some(key),
                     ("message", 'm') => self.act('m'),
                     _ => {}
                 }
             }
-            1 if key == 'i' => self.details = !self.details,
+            1 if key == 'i' => self.toggle_details(),
             1 if key == 'c'
                 && self.world.agents.items().iter().any(|agent| {
                     Some(&agent.id) == self.selected_id().as_ref() && !agent.unmanaged
@@ -2226,6 +2461,7 @@ impl Ui {
                     to: chat.to_name.clone(),
                     subject: title.clone(),
                     body: text,
+                    delivered: false,
                 },
             });
             entries.push(Entry {
@@ -2236,6 +2472,7 @@ impl Ui {
                     to: "you".into(),
                     subject: title,
                     body: "Good question. Here is what I know, and what I would need from you to go on. (demo reply)".into(),
+                    delivered: false,
                 },
             });
         }
@@ -2326,6 +2563,7 @@ impl Ui {
                             to: name,
                             subject: String::new(),
                             body: draft,
+                            delivered: false,
                         },
                     });
                 }
@@ -2370,6 +2608,20 @@ impl Ui {
         let Some(id) = self.attention_focus() else {
             return;
         };
+        if matches!(action, 'y' | 'n') && self.current_kind() == Some("request") {
+            let answer = if action == 'y' { "Yes" } else { "No" };
+            if self.live {
+                self.effects.push(Effect::Attention {
+                    id,
+                    action: "work.done".into(),
+                    reason: Some(answer.into()),
+                });
+                self.flash(format!("Answering “{answer}”…"));
+            } else {
+                self.flash(format!("Answered “{answer}” · demo: nothing was sent"));
+            }
+            return;
+        }
         if self.live {
             let kind = self.current_kind().unwrap_or("");
             let name = match (kind, action) {
@@ -2561,6 +2813,7 @@ impl Ui {
     fn click(&mut self, hit: Hit) {
         match hit {
             Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
+            Hit::PaletteSection(section) => self.open_palette(Some(section), glass::Open::Here),
             Hit::GlassTab(group, tab) => self.show_in(group, tab),
             Hit::GlassAdd(group) => {
                 self.focus_group(group);
@@ -2828,6 +3081,37 @@ fn edit_text(text: &mut String, key: KeyEvent) -> bool {
         _ => return false,
     }
     true
+}
+
+/// Where `query` shows in a drawn document, case aside: (line, display column, display width).
+fn find_matches(doc: &Doc, query: &str) -> Vec<(usize, usize, usize)> {
+    let query = query.to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for (index, line) in doc.lines.iter().enumerate() {
+        let plain = st3_conversation_ui::text::plain(line);
+        let lower = plain.to_lowercase();
+        // Lowercasing keeps byte offsets only for ASCII; elsewhere match the line as written.
+        let haystack = if lower.len() == plain.len() {
+            &lower
+        } else {
+            &plain
+        };
+        let mut from = 0;
+        while let Some(offset) = haystack[from..].find(&query) {
+            let start = from + offset;
+            let end = start + query.len();
+            found.push((
+                index,
+                text::width(&plain[..start]),
+                text::width(&plain[start..end]),
+            ));
+            from = end;
+        }
+    }
+    found
 }
 
 /// Readline's word delete: the blanks before the end, then the word before them.

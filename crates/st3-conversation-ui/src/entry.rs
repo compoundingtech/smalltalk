@@ -31,6 +31,8 @@ pub enum Body {
         to: String,
         subject: String,
         body: String,
+        /// The recipient's harness has it: st delivered it into the agent's session.
+        delivered: bool,
     },
     /// A graph event worth a line: a step became ready, a run started.
     Event(String),
