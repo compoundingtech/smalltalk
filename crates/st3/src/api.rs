@@ -800,17 +800,7 @@ async fn response_envelope(
             "value": raw,
         })
     } else if client_request {
-        json!({
-            "api_version": CLIENT_API_VERSION,
-            "error_version": "st3.client.error.v0",
-            "request_id": request_id,
-            "code": client_error_code(raw.get("code").and_then(Value::as_str)),
-            "message": raw.get("message").and_then(Value::as_str).unwrap_or("the request failed"),
-            "retryable": matches!(status, StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE)
-                || (status == StatusCode::GONE
-                    && raw.get("code").and_then(Value::as_str) == Some("page-cursor-expired")),
-            "details": raw.get("details").cloned().unwrap_or_else(|| json!({})),
-        })
+        client_error_envelope(status, &raw, &request_id)
     } else if status.is_success() {
         json!({
             "api_version": "st3.v1",
@@ -996,6 +986,20 @@ fn client_host_id(node: &str) -> String {
     format!("host/{}", node.replace(char::is_whitespace, "-"))
 }
 
+fn client_error_envelope(status: StatusCode, raw: &Value, request_id: &str) -> Value {
+    json!({
+        "api_version": CLIENT_API_VERSION,
+        "error_version": "st3.client.error.v0",
+        "request_id": request_id,
+        "code": client_error_code(raw.get("code").and_then(Value::as_str)),
+        "message": raw.get("message").and_then(Value::as_str).unwrap_or("the request failed"),
+        "retryable": matches!(status, StatusCode::TOO_MANY_REQUESTS | StatusCode::SERVICE_UNAVAILABLE)
+            || (status == StatusCode::GONE
+                && raw.get("code").and_then(Value::as_str) == Some("page-cursor-expired")),
+        "details": raw.get("details").cloned().unwrap_or_else(|| json!({})),
+    })
+}
+
 fn client_error_code(code: Option<&str>) -> String {
     match code.unwrap_or("internal") {
         "not-found"
@@ -1015,7 +1019,8 @@ fn client_error_code(code: Option<&str>) -> String {
         "launch-review-not-authorized"
         | "wrong-message-recipient"
         | "lane-approval-denied"
-        | "glass-owner-forbidden" => "forbidden".into(),
+        | "glass-owner-forbidden"
+        | "foreign-agent-actor" => "forbidden".into(),
         "lane-not-found" => "not-found".into(),
         "invalid-person-ask"
         | "invalid-person-response"
@@ -4011,10 +4016,26 @@ async fn serve_unix_with_ancestor(
                     if let Some(caller) = caller {
                         request.extensions_mut().insert(caller);
                     }
+                    let client_request = request.uri().path().starts_with("/v1/client/");
                     let request = match guard_bound_request(request, bound_agent.as_deref()).await {
                         Ok(request) => request,
                         Err(error) => {
-                            return Ok::<_, std::convert::Infallible>(error.into_response());
+                            let response = if client_request {
+                                let status = error.status;
+                                let raw = json!({"code":error.code,"message":error.message,"details":error.details});
+                                (
+                                    status,
+                                    Json(client_error_envelope(
+                                        status,
+                                        &raw,
+                                        &format!("request/{}", new_request_id()),
+                                    )),
+                                )
+                                    .into_response()
+                            } else {
+                                error.into_response()
+                            };
+                            return Ok::<_, std::convert::Infallible>(response);
                         }
                     };
                     app.oneshot(request).await
@@ -11535,6 +11556,61 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
             .unwrap()
             .0;
         assert_eq!(detail["store_index"], first_index);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn bound_actor_refusals_decode_as_client_api_errors() {
+        fn own_seat(_pid: u32) -> Option<String> {
+            Some("agent/own".into())
+        }
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("api.sock");
+        let server_socket = socket.clone();
+        // Reaching the handler would succeed. The listener must reject the foreign actor first.
+        let app = Router::new().route(
+            "/v1/client/glasses/{id}",
+            axum::routing::put(|| async { Json(json!({})) }),
+        );
+        let server = tokio::spawn(async move {
+            serve_unix_with_ancestor(&server_socket, None, app, true, own_seat).await
+        });
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while !socket.exists() {
+            assert!(tokio::time::Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let error = st3_client::Client::unix_as(&socket, "person/alex")
+            .put_glass(
+                "0194b2e0-1234-7000-8000-000000000001",
+                &st3_client::GlassPut {
+                    body: st3_client::GlassBody {
+                        name: "Main".into(),
+                        layout: st3_client::GlassLayout::Group { tabs: vec![] },
+                    },
+                    base_revision: None,
+                },
+                "glass-foreign-actor-test-key",
+            )
+            .await
+            .unwrap_err();
+        server.abort();
+        let st3_client::ClientError::Api(code, message, envelope) = error else {
+            panic!("an actor refusal must be a typed client API error: {error}");
+        };
+        assert_eq!(code, st3_client::ErrorCode::Forbidden);
+        assert!(message.contains("cannot act as"));
+        let value = serde_json::to_value(envelope).unwrap();
+        assert_eq!(value["api_version"], CLIENT_API_VERSION);
+        assert_eq!(value["error_version"], "st3.client.error.v0");
+        assert!(
+            value["request_id"]
+                .as_str()
+                .unwrap()
+                .starts_with("request/")
+        );
+        assert_eq!(value["retryable"], false);
+        assert!(value["details"].is_object());
     }
 
     #[tokio::test]
