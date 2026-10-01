@@ -5602,6 +5602,12 @@ impl Store {
                     .optional()
                     .map_err(internal)?
                     .ok_or_else(|| St3Error::new("missing-step-run", format!("step run `{subject}` does not exist")))?;
+                // A claim must use the same effective readiness that reads expose:
+                // an expired worker no longer owns this step, even before repair.
+                let mut current = current;
+                if action == "claim" {
+                    apply_effective_step_state(transaction, &mut current, now).map_err(internal)?;
+                }
                 // A revision carries a claim into the successor generation. Its worker may still name the
                 // step by the predecessor subject.
                 let (subject, current) = match (action != "claim")
@@ -34523,17 +34529,33 @@ version 2
         assert_eq!(queue.current_work_ids, seat.current_work_ids);
         assert_eq!(queue.next_work_id, seat.next_work_id);
         assert_eq!(store.step_run(subject).unwrap().unwrap().status, "ready");
-        store
-            .set_step_state(subject, "ready", Some("the worker lease expired"))
+        let reclaimed = store
+            .work_action(subject, "claim", &request("two", "reclaim-after-expiry"))
             .unwrap();
+        assert_eq!(reclaimed.claim_incarnation.as_deref(), Some("two"));
+        assert_eq!(
+            store
+                .work_action(
+                    subject,
+                    "progress",
+                    &request("one", "old-progress-after-reclaim")
+                )
+                .unwrap_err()
+                .code,
+            "wrong-work-incarnation"
+        );
         store
-            .work_action(subject, "claim", &request("one", "reclaim-after-expiry"))
+            .work_action(
+                subject,
+                "progress",
+                &request("two", "new-progress-after-reclaim"),
+            )
             .unwrap();
         store
             .set_step_state(subject, "blocked", Some("waiting for a dependency"))
             .unwrap();
 
-        expire_work_lease_by_claim(&store, subject, "agent/node.worker", "one");
+        expire_work_lease_by_claim(&store, subject, "agent/node.worker", "two");
         let reclaimable = store.step_run(subject).unwrap().unwrap();
         assert_eq!(reclaimable.status, "ready");
         assert!(reclaimable.claimant.is_none());
