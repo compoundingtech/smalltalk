@@ -2557,7 +2557,7 @@ pub fn new_agent_form(form: &AgentForm, hosts: &[String], width: usize) -> Doc {
     inner.blank();
     inner.wrap(
         &[run(
-            "Say what it should do: that is its first message. st starts the agent and its conversation opens here.",
+            "The prompt is the agent's first message. st starts the agent and its conversation opens here.",
             theme::soft(),
         )],
         w,
@@ -2588,7 +2588,7 @@ pub fn new_agent_form(form: &AgentForm, hosts: &[String], width: usize) -> Doc {
     for (index, label, value, hint) in [
         (
             0,
-            "what it should do",
+            "prompt",
             &form.task,
             "Fix the flaky login test, then open a PR.",
         ),
@@ -2608,7 +2608,7 @@ pub fn new_agent_form(form: &AgentForm, hosts: &[String], width: usize) -> Doc {
                 body.lines(text::wrap(&runs, w.saturating_sub(4), &[], &[], None));
             }
         }
-        // What it should do gets room to write in from the start (Nathan, 2026-10-01).
+        // The prompt gets room to write in from the start (Nathan, 2026-10-01).
         if index == 0 {
             while body.lines.len() < 4 {
                 body.blank();
