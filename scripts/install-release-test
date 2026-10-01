@@ -3,6 +3,12 @@ set -Eeuo pipefail
 repo=$(cd "$(dirname "$0")/.." && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
+# These fixtures test regular-file installation; native macOS app transactions
+# are covered separately by install-macos-test.
+mkdir -p "$work/platform-bin"
+printf '#!/bin/sh\necho Linux\n' > "$work/platform-bin/uname"
+chmod +x "$work/platform-bin/uname"
+export PATH="$work/platform-bin:$PATH"
 mkdir -p "$work/package/bin" "$work/installed"
 cp "$repo/scripts/install-release" "$work/package/install.sh"
 for binary in st3 stui st3-migrate pty; do

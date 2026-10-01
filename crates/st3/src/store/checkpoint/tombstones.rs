@@ -185,6 +185,7 @@ pub(crate) fn checkpointed_operation(
         .prepare_cached(
             "SELECT request_digest, id FROM checkpoint_claims
              WHERE operation_id=?1 AND request_digest IS NOT NULL
+               AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=checkpoint_claims.id)
              ORDER BY request_digest, id",
         )?
         .query_map([operation_id], |row| Ok((row.get(0)?, row.get(1)?)))?
@@ -199,7 +200,8 @@ pub(crate) fn checkpointed_operations(
     connection
         .prepare_cached(
             "SELECT operation_id, request_digest, id FROM checkpoint_claims
-             WHERE operation_id IS NOT NULL AND request_digest IS NOT NULL",
+             WHERE operation_id IS NOT NULL AND request_digest IS NOT NULL
+               AND NOT EXISTS(SELECT 1 FROM projection_digest_repaired_claims WHERE id=checkpoint_claims.id)",
         )?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()
@@ -746,7 +748,13 @@ mod tests {
         let mut report = None;
         for _ in 0..16 {
             let mut answer = birch.heal_answer("alder", &query).unwrap();
-            if let ReplicationHealAnswer::Ranges { graph_digest, .. } = &mut answer {
+            if let ReplicationHealAnswer::Ranges {
+                graph_digest,
+                projection_digests,
+                ..
+            } = &mut answer
+            {
+                projection_digests.clear();
                 *graph_digest = "another graph".into();
             }
             match alder.heal_next("birch", answer).unwrap() {

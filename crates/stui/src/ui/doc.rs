@@ -29,6 +29,14 @@ pub enum Hit {
     Revoke(String),
     /// Leave the terminal view.
     Detach,
+    /// Glasses: open the palette.
+    Palette,
+    /// Glasses: open the palette at the glasses section.
+    GlassMenu,
+    /// Glasses: show a tab (0 is Home).
+    GlassTab(usize),
+    /// Glasses: open a palette row.
+    PaletteChoice(usize),
 }
 
 #[derive(Clone, Debug)]

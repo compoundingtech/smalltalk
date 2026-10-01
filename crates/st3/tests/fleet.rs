@@ -630,7 +630,7 @@ async fn members_with_the_same_envelopes_but_different_claims_report_divergence_
     )
     .await;
 
-    let in_sync_graph = a.st_json(&["replication", "status"])["graph_digest"].clone();
+    let in_sync_tables = a.st_json(&["replication", "status"])["projection_digests"].clone();
     // Heals wait while the divergence is inspected.
     let hold = (
         "ST3_REPLICATION_HEAL_AFTER_MS".to_owned(),
@@ -644,6 +644,7 @@ async fn members_with_the_same_envelopes_but_different_claims_report_divergence_
     b.stop();
     {
         let store = rusqlite::Connection::open(b.state_dir().join("claims.sqlite3")).unwrap();
+        st3::store::configure_projection_writer(&store).unwrap();
         let dropped = store
             .execute(
                 "DELETE FROM mission_definitions WHERE mission_id LIKE '%divergence-probe%'",
@@ -723,11 +724,18 @@ async fn members_with_the_same_envelopes_but_different_claims_report_divergence_
                 .all(|(node, peer)| peer_sync(node, peer)["diverged"] != true)
     })
     .await;
-    assert_eq!(
-        b.st_json(&["replication", "status"])["graph_digest"],
-        in_sync_graph,
-        "b projects the graph both showed before it lost the claims"
-    );
+    let restored_tables = b.st_json(&["replication", "status"])["projection_digests"].clone();
+    for (table, digest) in in_sync_tables.as_object().unwrap() {
+        // Restarts and healing append durable recovery claims and their retry operations.
+        // Both modern peers must agree on their complete maps above; materialized business
+        // tables must also recover the exact pre-fault contents.
+        if !matches!(table.as_str(), "claim_sources" | "operations") {
+            assert_eq!(
+                &restored_tables[table], digest,
+                "b restores the pre-fault shared table {table}"
+            );
+        }
+    }
     let heals = [(&a, "b"), (&b, "a")]
         .iter()
         .filter_map(|(node, peer)| {
@@ -2242,9 +2250,20 @@ async fn outbound_only_member_returns_after_minutes_and_aged_hours_without_alert
                 .unwrap();
             assert_eq!(machine["state"], "last-seen", "{machines}");
         }
+        let absent_attempts = attempts.load(Ordering::Relaxed) - before;
+        eprintln!("{absent_attempts} connection attempts during {label} absence");
+        if absent_attempts > 20 {
+            for node in [&a, &b] {
+                eprintln!(
+                    "{} after {label}: {}",
+                    node.name,
+                    node.st_json(&["replication", "status"])
+                );
+            }
+        }
         assert!(
-            attempts.load(Ordering::Relaxed) - before <= 20,
-            "absence did not back off"
+            absent_attempts <= 20,
+            "absence did not back off: {absent_attempts} attempts during {label}"
         );
         let always_on_notes = expected
             .iter()

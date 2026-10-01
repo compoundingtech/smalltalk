@@ -2,7 +2,7 @@
 # Install an extracted Smalltalk release without restarting any service.
 set -Eeuo pipefail
 source_dir=$(cd "$(dirname "$0")" && pwd)/bin
-bin_dir="$HOME/.local/bin"
+bin_dir="${ST_MACOS_BIN_DIR:-$HOME/.local/bin}"
 while (($#)); do
   case $1 in
     --bin-dir) bin_dir=${2:?--bin-dir needs a directory}; shift 2 ;;
@@ -20,6 +20,11 @@ for name in "${binaries[@]}" st; do
   [[ ! -d $bin_dir/$name ]] || { echo "refusing to replace directory: $name" >&2; exit 1; }
 done
 mkdir -p "$bin_dir"
+macos=false
+if [[ $(uname -s) == Darwin ]]; then
+  python3 "$(cd "$(dirname "$0")" && pwd)/install-macos.py" --from "$source_dir" --bin-dir "$bin_dir"
+  macos=true
+fi
 stage=$(mktemp -d "$bin_dir/.smalltalk-install.XXXXXX")
 trap 'rm -rf "$stage"' EXIT
 for binary in "${binaries[@]}"; do
@@ -28,6 +33,7 @@ for binary in "${binaries[@]}"; do
 done
 ln -s st3 "$stage/st"
 for name in "${binaries[@]}" st; do
+  if [[ $macos == true && ($name == st3 || $name == stui) ]]; then continue; fi
   mv -f "$stage/$name" "$bin_dir/$name"
 done
 printf 'Installed st3, st -> st3, stui, st3-migrate, and pty in %s\n' "$bin_dir"

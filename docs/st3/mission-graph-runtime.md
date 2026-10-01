@@ -744,20 +744,32 @@ The list excludes resolved requests, old generations, changed definitions, old a
 
 ### Human attention inbox
 
-`st attention ls --as person/NAME` combines every current item that needs that person. It includes
-human gates, launch approvals, revision approvals, unread person messages, and explicit fault
-requests. `--json` returns typed records and exact action argument arrays. The person argument is
-required and is never inferred from ambient process state.
+`st attention ls --as person/NAME` reads current source state: ready person steps, human
+gates, valid launch previews, outstanding proposal reviews, unread person messages/reminders,
+and failures whose current source needs a person. Priority precedes waiting age. Each card's
+identity includes its source, recipient and waiting episode. A cancelled or retired owner,
+removed source, replacement generation or changed attempt removes the card before cleanup.
+Failed sources can retain their own repair fault. Held subscription requests do not appear.
 
-The formatted view shows each item in oldest-first order. It includes the item kind, age, graph context, targets, and safe commands.
+```sh
+st attention ls --as person/operator
+st work ask --for person/operator --title "Choose a release date" \
+  --reason "The release needs a date" --step step-run/release/prepare \
+  --as agent/release/operator --idempotency-key release-date
+st work done step-run/release/ask-ID --as person/operator --summary "Friday"
+```
 
-A planning item appears only for the current valid preview. A preview with blockers does not appear. A revision item appears once for each reviewer who has not approved it.
+An ask creates a person-assigned runtime step in the live owning generation. Its origin waits in
+`waiting-person`, without a lease or time/retry consumption. Only the assigned person can
+complete it. The response resumes the same origin attempt with a new readiness epoch. A requester
+can use `st work cancel-ask STEP --as AGENT --summary TEXT`. An unclaimed live requester can
+use `--new-run NAME`; claimed work must name `--step`. Repeated keys return the same source.
 
-A person message remains until its `message.read` claim. Reading a sent message records delivery first. Archiving is separate and is not required to clear attention.
-
-An explicit fault uses the `attention/ID` subject family. `attention.requested` stores the reviewer, title, reason, severity, and optional targets. `attention.resolved` records a `resolved` or `dismissed` outcome.
-
-Only dedicated attention commands create these fault requests. The runtime does not convert every diagnostic into human work.
+A person message leaves on read or archive, without an age expiry. A launch needs its current
+valid preview. Faults describe source recovery and inspection; they have no independent dismiss
+state. Legacy `attention request`, `resolve` and `withdraw` return `attention-migrated`.
+Historical attention claims remain audit data; only provably live agent asks are imported as
+person steps. `st doctor` reads the same snapshot for attention age checks.
 
 ## Dependencies
 
@@ -1285,6 +1297,9 @@ st sends a cancellation message to each active claimant. The message tells the a
 A continuous mission stays open after its current steps are exhausted. It does not need a separate mission type.
 
 A recurring schedule creates a durable request for one exact finite mission revision.
+The schedule's work may name either a pinned `mission "fabric/cycle@REVISION"` or an
+unpinned `mission "fabric/cycle"`. Only scheduled work accepts the unpinned form;
+an explicit mission run still requires an exact revision.
 
 ```kdl
 schedule "cycle" {
@@ -1331,6 +1346,21 @@ offset. On first publication, the earliest candidate is today's local date for
 daily rules or the next matching weekday for weekly rules; missed occurrences
 afterward follow the declared catch-up policy.
 
+
+Publication requires an unpinned mission's name to exist in the publication scope or
+the stored graph, in any state; an unknown name is refused before occurrences begin.
+
+When an unpinned occurrence reaches its request time, the schedule host resolves its
+authoritative local published head. It requests work only when that head is ready.
+If there is no published head or the current head is draft or retired, the occurrence
+records `schedule.work-failed` with `no-ready-mission-revision`; it never falls back
+to an older ready revision. The request records the selected exact `mission_revision`,
+which the child run uses even if another revision is published before it starts.
+Publishing a new revision does not change already-requested or active occurrences.
+Pinned schedules keep requesting their named exact revision, including when that
+revision has not yet replicated to the schedule host.
+Repeated failures of this condition keep one attention item open per schedule.
+The runtime withdraws it when a subsequent occurrence successfully starts work.
 
 The runtime gives each occurrence a deterministic mission run and a unique workspace below the declared root.
 
@@ -1624,7 +1654,9 @@ Mission execution uses these important claim kinds:
 - `step-run.carried`, `step-run.state`, and `step-run.retried` record generation-specific step history.
 - `mission.produced` binds a generated mission to one producing attempt.
 - `gate.requested` and `gate.result` record gate operations and evidence.
-- `attention.requested` and `attention.resolved` record explicit human fault attention.
+- `work.person-asked`, `work.person-done`, and `work.person-cancelled` record person work.
+- `operational.failure` and `operational.recovered` record observed source failure episodes.
+- Historical `attention.requested` and `attention.resolved` remain audit claims.
 
 Evidence is a list of claim IDs or immutable graph references that support a result. The evidence does not replace the gate. The gate definition says what must be decided; evidence records why the result is trustworthy.
 

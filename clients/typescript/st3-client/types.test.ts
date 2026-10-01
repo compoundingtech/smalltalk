@@ -18,3 +18,12 @@ const missingFence: ActionOf<'launch.approve'> = {
     parameters: { launch_id: 'launch/test', variant_id: 'variant/test' },
 };
 void missingFence;
+
+// Every resource keeps its fields: a resource kind missing from ResourceHeader's kinds would make
+// its type `never`, and these would not compile.
+import type { Glass, Machine } from './Models.generated';
+const glass = null as unknown as Glass;
+const glassName: string | undefined = glass.body?.name;
+const machine = null as unknown as Machine;
+const machineHost: string = machine.host_id;
+void glassName; void machineHost;

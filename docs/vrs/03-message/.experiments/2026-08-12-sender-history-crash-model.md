@@ -84,7 +84,7 @@ record fails closed.
 The model's invariants are executable in
 `tests/message_cli.rs::keyed_retry_recovers_every_crash_boundary_without_false_sent_or_duplicates`.
 The shared coverage and row contract is executable in
-`crates/st2-wire/src/message.rs::sent_rows_carry_to_and_coverage_never_collapses_unavailable_into_empty`.
+`crates/st-wire/src/message.rs::sent_rows_carry_to_and_coverage_never_collapses_unavailable_into_empty`.
 The structural RED control makes an unrelated recipient box unreadable before Sent enumeration; a
 recipient-scanning implementation therefore fails while a sender-owned implementation succeeds.
 The throwaway driver is not part of the repository.

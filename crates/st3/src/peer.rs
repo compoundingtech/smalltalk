@@ -51,6 +51,11 @@ const EXCHANGE_PATH: &str = "/v1/peer/exchange";
 const CHECKPOINT_PATH: &str = "/v1/peer/checkpoint";
 const REPLICATION_EXCHANGE_TIMEOUT: Duration = Duration::from_secs(20);
 const REPLICATION_WAKE_COALESCE: Duration = Duration::from_secs(1);
+const PEER_PROBE_INTERVAL: Duration = Duration::from_secs(3);
+const PEER_PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+/// Recently working HTTP routes can return without any transport presence event. Probe
+/// briefly without exporting inventories or writing failures; long absences stay quiet.
+const PEER_PROBE_WINDOW: Duration = Duration::from_secs(5 * 60);
 const CLIENT_READ_PATH: &str = "/v1/peer/client-read";
 const HEAL_PATH: &str = "/v1/peer/heal";
 /// A heal question can make the peer replay its graph from nothing, which takes 41 seconds on a
@@ -907,6 +912,10 @@ struct FleetContext {
     connectivity_changed: watch::Sender<u64>,
     /// Sign of life from Fabric, distinct from a completed replication exchange.
     online: Arc<std::sync::RwLock<BTreeMap<String, tokio::time::Instant>>>,
+    /// Authenticated traffic and successful probes interrupt failure waits without waking
+    /// healthy anti-entropy exchanges or cancelling their coalescing window.
+    activity: Arc<std::sync::RwLock<BTreeMap<String, tokio::time::Instant>>>,
+    activity_changed: watch::Sender<u64>,
 }
 
 impl FleetContext {
@@ -931,6 +940,8 @@ impl FleetContext {
             inbound_authority: Arc::default(),
             connectivity_changed: watch::channel(0).0,
             online: Arc::default(),
+            activity: Arc::default(),
+            activity_changed: watch::channel(0).0,
         }
     }
 
@@ -956,6 +967,15 @@ impl FleetContext {
 
     fn is_removed(&self) -> bool {
         self.removed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn note_activity(&self, name: &str) {
+        self.activity
+            .write()
+            .expect("activity lock poisoned")
+            .insert(name.to_owned(), tokio::time::Instant::now());
+        self.activity_changed
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     /// Record that a member refused this node for good, so it stops dialing and `st3 doctor`
@@ -1359,6 +1379,8 @@ pub async fn run_worker(config: Config) -> Result<()> {
         inbound_authority: Arc::default(),
         connectivity_changed: watch::channel(0).0,
         online: Arc::default(),
+        activity: Arc::default(),
+        activity_changed: watch::channel(0).0,
     };
     tokio::spawn(keep_connectivity_current(fleet.clone()));
     if let Some(fabric) = fabric.clone() {
@@ -1834,6 +1856,7 @@ async fn receive_client_read(
             Ok(sender) if state.fleet.accept(&sender).is_ok() => sender.name,
             _ => return (StatusCode::UNAUTHORIZED, "untrusted fleet client read").into_response(),
         };
+    state.fleet.note_activity(&sender);
     let request_digest = FleetAuth::body_digest(&body);
     let result: Result<serde_json::Value> = async {
         anyhow::ensure!(
@@ -2165,9 +2188,11 @@ async fn dial_peer(
     let mut http = replication_http_client();
     let mut backoff = PeerBackoff::default();
     let mut inbound_changes = fleet.inbound_changed.subscribe();
+    let mut activity_changes = fleet.activity_changed.subscribe();
     let mut connectivity = fleet.connectivity_changed.subscribe();
     let mut must_send = false;
     let mut route = 0_usize;
+    let mut last_http_success = None;
     let mut refused = Vec::<(Route, tokio::time::Instant)>::new();
     loop {
         // A removed node stops dialing; `st3 doctor` says what to do next.
@@ -2240,6 +2265,9 @@ async fn dial_peer(
         if routes.has_changed().unwrap_or(false) {
             refused.clear();
         }
+        // Retry waits must retain signs of life received during this attempt, including
+        // an inbound request that arrives just before the outbound request fails.
+        let attempt_started = tokio::time::Instant::now();
         let selected = {
             let routes = routes.borrow_and_update();
             let now = tokio::time::Instant::now();
@@ -2256,6 +2284,7 @@ async fn dial_peer(
             }
             continue;
         }
+        let is_http = matches!(selected, Some(Route::Http(_)));
         let url = match selected {
             Some(Route::Http(url)) => Some(url),
             Some(selected @ Route::Fabric { .. }) => {
@@ -2294,9 +2323,13 @@ async fn dial_peer(
                 backoff.next(),
                 &mut routes,
                 &mut inbound_changes,
+                &mut activity_changes,
                 &mut connectivity,
                 &fleet,
                 &name,
+                attempt_started,
+                last_http_success.as_ref(),
+                &http,
             )
             .await
             {
@@ -2310,6 +2343,9 @@ async fn dial_peer(
         };
         match exchange(&http, &backend, &node, &peer, &auth, &fleet, &main_socket).await {
             Ok((moved, heal_now)) => {
+                if is_http {
+                    last_http_success = Some((peer.url.clone(), tokio::time::Instant::now()));
+                }
                 backoff = PeerBackoff::default();
                 must_send = false;
                 if heal_now {
@@ -2359,9 +2395,13 @@ async fn dial_peer(
                     backoff.next(),
                     &mut routes,
                     &mut inbound_changes,
+                    &mut activity_changes,
                     &mut connectivity,
                     &fleet,
                     &name,
+                    attempt_started,
+                    last_http_success.as_ref(),
+                    &http,
                 )
                 .await
                 {
@@ -2407,26 +2447,76 @@ impl PeerBackoff {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn wait_peer_retry(
     delay: Duration,
     routes: &mut watch::Receiver<Vec<Route>>,
     inbound_changes: &mut watch::Receiver<u64>,
+    activity_changes: &mut watch::Receiver<u64>,
     connectivity: &mut watch::Receiver<u64>,
     fleet: &FleetContext,
     name: &str,
+    attempt_started: tokio::time::Instant,
+    last_http_success: Option<&(String, tokio::time::Instant)>,
+    http: &reqwest::Client,
 ) -> bool {
     let started = tokio::time::Instant::now();
     let deadline = started + delay;
+    let mut next_probe = started + PEER_PROBE_INTERVAL;
     loop {
+        // Check before sleeping as well as after notification: watch channels coalesce
+        // events, and an accepted request can predate entry to this retry wait.
+        if fleet
+            .inbound
+            .read()
+            .expect("inbound lock poisoned")
+            .get(name)
+            .is_some_and(|at| *at >= attempt_started)
+            || fleet
+                .online
+                .read()
+                .expect("online lock poisoned")
+                .get(name)
+                .is_some_and(|at| *at >= attempt_started)
+            || fleet
+                .activity
+                .read()
+                .expect("activity lock poisoned")
+                .get(name)
+                .is_some_and(|at| *at >= attempt_started)
+        {
+            return true;
+        }
+        let probe_url = last_http_success
+            .filter(|(_, at)| at.elapsed() < PEER_PROBE_WINDOW)
+            .filter(|(url, _)| {
+                routes
+                    .borrow()
+                    .iter()
+                    .any(|route| matches!(route, Route::Http(current) if current == url))
+            })
+            .map(|(url, _)| url);
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => return false,
             changed = routes.changed() => return changed.is_ok(),
             changed = connectivity.changed() => return changed.is_ok(),
             changed = inbound_changes.changed() => {
                 if changed.is_err() { return false; }
-                if fleet.inbound.read().expect("inbound lock poisoned").get(name).is_some_and(|at| *at >= started)
-                    || fleet.online.read().expect("online lock poisoned").get(name).is_some_and(|at| *at >= started)
-                {
+            }
+            changed = activity_changes.changed() => {
+                if changed.is_err() { return false; }
+            }
+            alive = async {
+                tokio::time::sleep_until(next_probe).await;
+                // HEAD is answered by the existing router without accessing the graph.
+                // Any HTTP response proves transport life, including an older peer's 405.
+                // Only the ensuing signed exchange can authenticate or import peer data.
+                http.head(format!("{}{}", probe_url.unwrap().trim_end_matches('/'), EXCHANGE_PATH))
+                    .timeout(PEER_PROBE_TIMEOUT).send().await.is_ok()
+            }, if probe_url.is_some() => {
+                next_probe = tokio::time::Instant::now() + PEER_PROBE_INTERVAL;
+                if alive {
+                    fleet.note_activity(name);
                     return true;
                 }
             }
@@ -2493,6 +2583,8 @@ async fn receive_exchange(
         return signed_refusal(&state, &request_digest, &refusal)
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
+    // Authentication proves the connection returned before inventory processing finishes.
+    state.fleet.note_activity(&sender.name);
     let relay = sender.name;
     let result = async {
         let request: ReplicationExchange =
@@ -2599,6 +2691,7 @@ async fn receive_heal(State(state): State<PeerState>, headers: HeaderMap, body: 
         return signed_refusal(&state, &request_digest, &refusal)
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     }
+    state.fleet.note_activity(&sender.name);
     let result = async {
         let request: ReplicationHealRequest =
             serde_json::from_slice(&body).context("decode the heal request")?;
@@ -2648,6 +2741,7 @@ async fn receive_checkpoint_request(
             Ok(sender) if state.fleet.accept(&sender).is_ok() => sender,
             _ => return (StatusCode::UNAUTHORIZED, "untrusted checkpoint request").into_response(),
         };
+    state.fleet.note_activity(&sender.name);
     let request_digest = FleetAuth::body_digest(&body);
     let result = async {
         let request: CheckpointManifestRequest =
@@ -2759,6 +2853,7 @@ async fn fetch_checkpoint_manifest_page(
         response.api_version == "st3.v1",
         "the peer API version differs"
     );
+    fleet.note_activity(&peer.name);
     anyhow::ensure!(
         response.value.checkpoint == request.checkpoint
             && response.value.cut_unix_ms == request.cut_unix_ms,
@@ -3301,6 +3396,7 @@ async fn post_signed_to<B: Serialize, R: serde::de::DeserializeOwned>(
         response.api_version == "st3.v1",
         "the peer API version differs"
     );
+    fleet.note_activity(&peer.name);
     Ok((response.value, accepts_deflate(&headers)))
 }
 
@@ -4700,6 +4796,7 @@ mod tests {
             outbound_notify: watch::channel(0_u64).0,
         };
         let exchange = ReplicationExchange {
+            projection_digests: Default::default(),
             peer: "source".into(),
             fleet_id: fleet.into(),
             schema_digest: st3_schema::registry().digest(),
@@ -4791,6 +4888,7 @@ mod tests {
             outbound_notify: watch::channel(0_u64).0,
         };
         let exchange = ReplicationExchange {
+            projection_digests: Default::default(),
             peer: "source".into(),
             fleet_id: fleet.into(),
             schema_digest: st3_schema::registry().digest(),
@@ -5289,6 +5387,7 @@ mod tests {
         // The target loses the desired claim but keeps its envelope, before its first sync ends.
         {
             let connection = rusqlite::Connection::open(&target_path).unwrap();
+            crate::store::configure_projection_writer(&connection).unwrap();
             connection
                 .execute_batch(
                     "PRAGMA foreign_keys=OFF;
@@ -5740,6 +5839,8 @@ mod tests {
             inbound_authority: Arc::default(),
             connectivity_changed: watch::channel(0).0,
             online: Arc::default(),
+            activity: Arc::default(),
+            activity_changed: watch::channel(0).0,
         }
     }
 
@@ -5878,6 +5979,209 @@ mod tests {
 #[cfg(test)]
 mod retry_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn authenticated_activity_does_not_start_redundant_healthy_exchanges() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let fleet_id = "d706eab5-433c-474b-ae43-fd2a7891d85d";
+        let auth = FleetAuth::test(fleet_id, &[42; 32]);
+        let local = Arc::new(Store::open_memory("harbor").unwrap());
+        let remote = Arc::new(Store::open_memory("beacon").unwrap());
+        for store in [&local, &remote] {
+            store.bind_fleet(fleet_id).unwrap();
+        }
+        let fleet = FleetContext::legacy(BTreeSet::from(["beacon".into()]));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = requests.clone();
+        let app = peer_router(PeerState {
+            backend: PeerBackend::Local(remote),
+            node: "beacon".into(),
+            auth: auth.clone(),
+            fleet: FleetContext::legacy(BTreeSet::from(["harbor".into()])),
+            main_socket: PathBuf::from("unused.sock"),
+            outbound_notify: watch::channel(0).0,
+        })
+        .layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                counter.fetch_add(1, Ordering::Relaxed);
+                async move { next.run(request).await }
+            },
+        ));
+        let server = tokio::spawn(axum::serve(listener, app).into_future());
+        let (_route_tx, routes) = watch::channel(vec![Route::Http(url)]);
+        let (notify, _) = watch::channel(0);
+        let dialer = tokio::spawn(dial_peer(
+            PeerBackend::Local(local),
+            "harbor".into(),
+            "beacon".into(),
+            routes,
+            auth,
+            fleet.clone(),
+            PathBuf::from("unused.sock"),
+            notify.subscribe(),
+        ));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !fleet.activity.read().unwrap().contains_key("beacon") {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let before = requests.load(Ordering::Relaxed);
+        // A successful client read/probe proves peer life, but it does not change the graph.
+        fleet.note_activity("beacon");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert_eq!(
+            requests.load(Ordering::Relaxed),
+            before,
+            "authenticated activity interrupted healthy anti-entropy coalescing"
+        );
+        dialer.abort();
+        server.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn signs_of_life_during_a_failed_attempt_are_not_lost_before_the_retry_wait() {
+        let fleet = FleetContext::legacy(BTreeSet::new());
+        let (_route_tx, mut routes) = watch::channel(Vec::new());
+        let mut inbound = fleet.inbound_changed.subscribe();
+        let mut activity = fleet.activity_changed.subscribe();
+        let mut connectivity = fleet.connectivity_changed.subscribe();
+        let http = replication_http_client();
+        for completed_exchange in [false, true] {
+            let attempt_started = tokio::time::Instant::now();
+            tokio::time::advance(Duration::from_secs(1)).await;
+            if completed_exchange {
+                fleet
+                    .inbound
+                    .write()
+                    .unwrap()
+                    .insert("traveller".into(), tokio::time::Instant::now());
+                fleet
+                    .inbound_changed
+                    .send_modify(|generation| *generation += 1);
+            } else {
+                fleet.note_activity("traveller");
+            }
+            // The outbound request fails later, after a coalesced notification was read.
+            inbound.borrow_and_update();
+            activity.borrow_and_update();
+            tokio::time::advance(REPLICATION_EXCHANGE_TIMEOUT).await;
+            assert!(
+                wait_peer_retry(
+                    Duration::from_secs(3600),
+                    &mut routes,
+                    &mut inbound,
+                    &mut activity,
+                    &mut connectivity,
+                    &fleet,
+                    "traveller",
+                    attempt_started,
+                    None,
+                    &http,
+                )
+                .await
+            );
+            tokio::time::advance(Duration::from_millis(1)).await;
+        }
+        // Old activity must not reset the next failed attempt's backoff.
+        assert!(
+            !wait_peer_retry(
+                Duration::from_secs(3600),
+                &mut routes,
+                &mut inbound,
+                &mut activity,
+                &mut connectivity,
+                &fleet,
+                "traveller",
+                tokio::time::Instant::now(),
+                None,
+                &http,
+            )
+            .await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_silent_http_return_interrupts_backoff_without_an_inventory_export() {
+        let store = Arc::new(Store::open_memory("beacon").unwrap());
+        let fleet = FleetContext::legacy(BTreeSet::new());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(
+            axum::serve(
+                listener,
+                peer_router(PeerState {
+                    backend: PeerBackend::Local(store),
+                    node: "beacon".into(),
+                    auth: FleetAuth::test("invented-fleet", &[42; 32]),
+                    fleet: fleet.clone(),
+                    main_socket: PathBuf::from("unused.sock"),
+                    outbound_notify: watch::channel(0).0,
+                }),
+            )
+            .into_future(),
+        );
+        let (_route_tx, mut routes) = watch::channel(vec![Route::Http(url.clone())]);
+        let mut inbound = fleet.inbound_changed.subscribe();
+        let mut activity = fleet.activity_changed.subscribe();
+        let mut connectivity = fleet.connectivity_changed.subscribe();
+        let http = replication_http_client();
+        let previous = (
+            url.clone(),
+            tokio::time::Instant::now() - Duration::from_secs(120),
+        );
+        let started = tokio::time::Instant::now();
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                wait_peer_retry(
+                    Duration::from_secs(3600),
+                    &mut routes,
+                    &mut inbound,
+                    &mut activity,
+                    &mut connectivity,
+                    &fleet,
+                    "traveller",
+                    started,
+                    Some(&previous),
+                    &http,
+                )
+            )
+            .await
+            .unwrap()
+        );
+        assert!(fleet.activity.read().unwrap().contains_key("traveller"));
+        assert!(
+            fleet.inbound.read().unwrap().is_empty(),
+            "HEAD must not invoke receive_exchange"
+        );
+
+        // After five minutes, even this responsive route is no longer polled rapidly.
+        inbound.borrow_and_update();
+        let old = (url, tokio::time::Instant::now() - PEER_PROBE_WINDOW);
+        tokio::time::pause();
+        assert!(
+            !wait_peer_retry(
+                Duration::from_secs(3600),
+                &mut routes,
+                &mut inbound,
+                &mut activity,
+                &mut connectivity,
+                &fleet,
+                "traveller",
+                tokio::time::Instant::now(),
+                Some(&old),
+                &http,
+            )
+            .await
+        );
+        server.abort();
+    }
 
     #[test]
     fn refused_routes_allow_at_most_three_attempts_per_hour_from_the_first_refusal() {
@@ -6130,9 +6434,11 @@ mod retry_tests {
 
     #[tokio::test(start_paused = true)]
     async fn an_inbound_return_or_changed_route_interrupts_even_hours_of_absence() {
+        let http = replication_http_client();
         let fleet = FleetContext::legacy(BTreeSet::new());
         let (route_tx, mut routes) = watch::channel(vec![Route::Http("http://127.0.0.1:1".into())]);
         let mut inbound = fleet.inbound_changed.subscribe();
+        let mut activity = fleet.activity_changed.subscribe();
         let mut connectivity = fleet.connectivity_changed.subscribe();
         for away in [Duration::from_secs(120), Duration::from_secs(4 * 3600)] {
             tokio::time::advance(away).await;
@@ -6140,9 +6446,13 @@ mod retry_tests {
                 Duration::from_secs(300),
                 &mut routes,
                 &mut inbound,
+                &mut activity,
                 &mut connectivity,
                 &fleet,
                 "traveller",
+                tokio::time::Instant::now(),
+                None,
+                &http,
             );
             tokio::pin!(wait);
             assert!(futures_util::poll!(&mut wait).is_pending());
@@ -6166,13 +6476,18 @@ mod retry_tests {
                 .send_modify(|generation| *generation += 1);
             assert!(wait.await);
         }
+        tokio::time::advance(Duration::from_millis(1)).await;
         let wait = wait_peer_retry(
             Duration::from_secs(300),
             &mut routes,
             &mut inbound,
+            &mut activity,
             &mut connectivity,
             &fleet,
             "traveller",
+            tokio::time::Instant::now(),
+            None,
+            &http,
         );
         tokio::pin!(wait);
         assert!(futures_util::poll!(&mut wait).is_pending());
@@ -6454,6 +6769,7 @@ mod retry_tests {
 
     #[tokio::test(start_paused = true)]
     async fn fabric_online_events_reset_only_the_member_they_name() {
+        let http = replication_http_client();
         let mut fleet = FleetContext::legacy(BTreeSet::new());
         let member = crate::fleet::MemberView {
             name: "traveller".into(),
@@ -6474,14 +6790,19 @@ mod retry_tests {
         let (_route_tx, mut routes) =
             watch::channel(vec![Route::Http("http://127.0.0.1:1".into())]);
         let mut inbound = fleet.inbound_changed.subscribe();
+        let mut activity = fleet.activity_changed.subscribe();
         let mut connectivity = fleet.connectivity_changed.subscribe();
         let wait = wait_peer_retry(
             Duration::from_secs(3600),
             &mut routes,
             &mut inbound,
+            &mut activity,
             &mut connectivity,
             &fleet,
             "traveller",
+            tokio::time::Instant::now(),
+            None,
+            &http,
         );
         tokio::pin!(wait);
         // Retain the routes sender while waiting.
