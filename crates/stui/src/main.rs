@@ -1638,12 +1638,12 @@ fn poll_terminal() -> Result<bool> {
     }
     Ok(true)
 }
-#[cfg(target_os = "macos")]
 fn watch_terminal_hangup() {
-    // On Darwin, crossterm can loop inside event::poll on PTY EOF and never
-    // return to the main loop's terminal check. A separate poller observes the
-    // hangup without consuming input. Once the PTY is gone there is no terminal
-    // left to restore, so end the process even if crossterm is stuck.
+    // crossterm can loop inside event::poll (Darwin) or event::read (Linux) on PTY EOF and
+    // never return to the main loop's terminal check; a stui left like that spins at full CPU
+    // and keeps polling the daemon for hours. A separate poller observes the hangup without
+    // consuming input. Once the PTY is gone there is no terminal left to restore, so end the
+    // process even if crossterm is stuck.
     std::thread::spawn(|| {
         loop {
             let mut fd = libc::pollfd {
