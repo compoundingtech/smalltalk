@@ -41,7 +41,7 @@ impl Fence {
                 }
                 Err(error)
                     if crate::client::api_error_code(&error)
-                        .is_some_and(|code| code != "internal") =>
+                        .is_some_and(|code| !matches!(code, "internal" | "mailbox-session-starting")) =>
                 {
                     return Err(error);
                 }
@@ -198,6 +198,28 @@ pub(crate) mod tests {
             ))
             .unwrap();
     }
+    #[test]
+    fn mailbox_startup_waits_for_running_evidence_without_allocating_or_admitting_stale_sessions() {
+        let store = Store::open_memory("node").unwrap();
+        let request = Fence::new("agent/eval.worker", "session-1", "delivery");
+        store.append_claim(&claim("agent/eval.worker", "harness.observed",
+            json!({"state":"starting","driver":"claude","incarnation_id":"session-1"}), "starting")).unwrap();
+        for runtime in [None, Some("starting")] {
+            if let Some(status) = runtime {
+                store.append_claim(&claim("agent/eval.worker", "runtime.observed",
+                    json!({"status":status,"runtime_id":"eval.worker"}), "runtime-starting")).unwrap();
+            }
+            assert_eq!(store.bind_mailbox(&request).unwrap_err().code, "mailbox-session-starting");
+            assert_eq!(store.bind_mailbox(&Fence::new("agent/eval.worker", "foreign", "delivery")).unwrap_err().code, "stale-mailbox-session");
+        }
+        ready(&store, "session-1");
+        let bound = store.bind_mailbox(&request).unwrap();
+        assert_eq!(bound.epoch, 1, "startup retries never allocate an owner");
+        ready(&store, "session-2");
+        assert_eq!(store.bind_mailbox(&request).unwrap_err().code, "stale-mailbox-session");
+        assert_eq!(store.check_mailbox(&bound).unwrap_err().code, "stale-mailbox-session");
+    }
+
     #[test]
     fn mailbox_can_bind_before_the_native_provider_reports_ready() {
         let store = Store::open_memory("node").unwrap();

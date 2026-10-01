@@ -770,15 +770,28 @@ export default function (pi: ExtensionAPI) {
     if (typeof total === "number" && Number.isFinite(total)) state.lastCostUsd = total;
   };
 
+  // OMP loads extensions into subagent sessions that share this process-wide stash.
+  // Keep delivery, receipt evidence and label authority on the top-level seat (#852).
+  const isSubagent = (ctx: ExtensionContext | undefined): boolean =>
+    (ctx as { agent?: { kind?: unknown } } | undefined)?.agent?.kind === "sub";
+  const register = pi.on.bind(pi) as unknown as (
+    event: string,
+    handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
+  ) => void;
+  const onWidened = (
+    event: string,
+    handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
+  ) => register(event, (payload, ctx) => isSubagent(ctx) ? undefined : handler(payload, ctx));
+
   // Registered only now that every helper above is initialized: a use-before-declaration in this
   // file is the defect class that once shipped green through the type gate.
-  pi.on("agent_start", async () => {
+  onWidened("agent_start", async () => {
     cancelSettle();
     state.running = true;
     toolCallsInFlight().clear();
     sendFrame({ type: "state", state: "active" });
   });
-  pi.on("agent_end", async (event, ctx) => {
+  onWidened("agent_end", async (event, ctx) => {
     captureCost(event);
     sendContext(ctx);
     const end = event as AgentEndFrame;
@@ -810,10 +823,6 @@ export default function (pi: ExtensionAPI) {
     watchSettle(ctx);
   });
 
-  const onWidened = pi.on.bind(pi) as unknown as (
-    event: string,
-    handler: (event: unknown, ctx: ExtensionContext) => void | Promise<void>,
-  ) => void;
   // The finest boundary that carries a fresh reading. Turn-boundary-only observation was measured
   // at 92% of pre-compaction warnings missed, because the wedge case is a single long turn.
   for (const name of ["message_end", "turn_end"]) {
@@ -941,7 +950,8 @@ export default function (pi: ExtensionAPI) {
     sendFrame({ type: "pre_compact" });
   });
 
-  pi.on("context", async (event) => {
+  pi.on("context", async (event, ctx) => {
+    if (isSubagent(ctx)) return;
     const texts = event.messages.flatMap((message) => {
       if (message.role !== "user") return [];
       return typeof message.content === "string" ? [message.content] : message.content.flatMap((part: { type: string; text?: string }) =>
@@ -955,12 +965,12 @@ export default function (pi: ExtensionAPI) {
       }
     }
   });
-  (pi.on as unknown as (event: string, handler: (event: unknown, ctx: ExtensionContext) => Promise<void>) => void)("session_switch", async (_event, ctx) => {
+  onWidened("session_switch", async (_event, ctx) => {
     await applyLabel(ctx);
     await open(ctx);
     await applyLabel(ctx);
   });
-  pi.on("session_start", async (_event, ctx) => {
+  onWidened("session_start", async (_event, ctx) => {
     // Awaited before the session's first turn, which is what makes restored context reach the boot
     // prompt rather than the turn after it.
     await applyLabel(ctx);
@@ -983,7 +993,7 @@ export default function (pi: ExtensionAPI) {
   // Upstream's `session_shutdown` payload has no reason: source defines it as process exit only.
   // Replacement is a separate session-switch lifecycle and remains handled by `open()` closing
   // the named predecessor.
-  pi.on("session_shutdown", async () => {
+  onWidened("session_shutdown", async () => {
     state.shuttingDown = true;
     if (state.reconnectTimer !== undefined) clearTimeout(state.reconnectTimer);
     state.reconnectTimer = undefined;

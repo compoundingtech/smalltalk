@@ -19867,6 +19867,36 @@ fn check_mailbox_incarnation(
     let fields = runtime.get("fields").unwrap_or(&runtime);
     let live = fields.get("status").and_then(Value::as_str) == Some("running")
         && fields.get("incarnation_id").and_then(Value::as_str) == Some(&fence.incarnation);
+    if !live
+        && matches!(
+            fields.get("status").and_then(Value::as_str),
+            None | Some("starting")
+        )
+    {
+        let harness: Option<String> = connection
+            .prepare_cached(&format!(
+                "{} LIMIT 1",
+                newest_claims_of_kind_query("claims.body", "harness.observed")
+            ))
+            .map_err(internal)?
+            .query_row(params![fence.subject, i64::MAX], |row| row.get(0))
+            .optional()
+            .map_err(internal)?;
+        if let Some(harness) = harness {
+            let harness: Value = serde_json::from_str(&harness).map_err(internal)?;
+            let fields = harness.get("fields").unwrap_or(&harness);
+            if fields.get("state").and_then(Value::as_str) == Some("starting")
+                && fields.get("incarnation_id").and_then(Value::as_str) == Some(&fence.incarnation)
+            {
+                // The provider can start before reconciliation publishes runtime.running.
+                // Retry without allocating ownership or authorizing any mailbox reads/receipts.
+                return Err(St3Error::new(
+                    "mailbox-session-starting",
+                    "waiting for the seat's running incarnation",
+                ));
+            }
+        }
+    }
     let ended = current_harness_at(connection, &fence.subject, None)
         .map_err(internal)?
         .is_some_and(|harness| harness.state == "ended");

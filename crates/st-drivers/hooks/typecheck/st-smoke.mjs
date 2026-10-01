@@ -79,6 +79,34 @@ send({type:"message",content:"INDIGO SIGNAL",meta:synchronous});
 await until(()=>read().some(frame=>frame.type==="read"&&frame.meta?.messageId===synchronous.messageId));
 send({type:"settled",meta:synchronous});
 await until(()=>!globalThis[driver==="pi"?"__stPiChannel":"__stOmpChannel"].accepted.has(synchronous.messageId));
+if (driver === "omp") {
+  const subEvents = new Map();
+  const subHandoffs = [];
+  let subTitle = "Subagent";
+  extension({...api, on:(name,handler)=>subEvents.set(name,handler),
+    setSessionName:(name)=>{subTitle=name;}, sendUserMessage:(text)=>subHandoffs.push(text)});
+  const subCtx = {...ctx,agent:{kind:"sub",depth:0},isIdle:()=>false,
+    sessionManager:{getSessionId:()=>"sub-session",getEntries:()=>[]}};
+  const state = globalThis.__stOmpChannel;
+  const child = state.child;
+  const pending = {messageId:"message/sub-proof"};
+  synchronousContext=false;
+  send({type:"message",content:"TOP LEVEL ONLY",meta:pending});
+  await until(()=>read().some(frame=>frame.type==="delivered"&&frame.meta?.messageId===pending.messageId));
+  await new Promise(r=>setTimeout(r,100));
+  const afterDelivery = read().length;
+  for (const name of ["session_start","session_switch","agent_start","tool_call","agent_end","session_shutdown"]) {
+    await subEvents.get(name)({},subCtx);
+  }
+  await subEvents.get("context")({messages:[{role:"user",content:"TOP LEVEL ONLY"}]},subCtx);
+  await new Promise(r=>setTimeout(r,100));
+  assert.equal(state.child,child,"subagent lifecycle keeps the top-level channel");
+  assert.equal(read().length,afterDelivery,"subagent events write no seat frames or receipts");
+  assert.equal(subTitle,"Subagent","seat authority does not rename a subagent");
+  assert.deepEqual(subHandoffs,[],"subagent receives no seat mail");
+  await events.get("context")({messages:[{role:"user",content:"TOP LEVEL ONLY"}]},ctx);
+  await until(()=>read().some(frame=>frame.type==="read"&&frame.meta?.messageId===pending.messageId));
+}
 assert.ok(!fs.existsSync(path.join(dir,"resources/inbox")));
 assert.ok(!fs.existsSync(path.join(dir,"resources/archive")));
 await events.get("session_shutdown")(driver==="pi"?{reason:"quit"}:{},ctx);
