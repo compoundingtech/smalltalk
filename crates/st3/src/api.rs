@@ -281,6 +281,10 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             get(client_v0::request_latency),
         )
         .route("/v1/client/documents/content", get(client_v0::document_get))
+        .route(
+            "/v1/client/subject-definition",
+            get(client_v0::subject_definition),
+        )
         .route("/v1/client/now", get(client_v0::now))
         .route("/v1/client/machines", get(client_v0::machines))
         .route("/v1/client/devices", get(client_v0::devices))
