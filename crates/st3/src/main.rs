@@ -3133,14 +3133,8 @@ fn run_driver_hook() -> ExitCode {
         );
         return ExitCode::from(2);
     };
-    // Telemetry as st2's CLI built it: an event hook is its own `hook` process unit, and the
-    // status line, which Claude runs every five seconds, builds no exporter at all.
-    let mut telemetry = match name.as_str() {
-        "claude-observe" => st_drivers::telemetry::Telemetry::init("hook"),
-        _ => st_drivers::telemetry::Telemetry::local_only(),
-    };
     let env = st3::driver_hook::ProcessEnv;
-    let code = st3::driver_hook::run(
+    let run = || st3::driver_hook::run(
         name,
         rest,
         &env,
@@ -3155,7 +3149,12 @@ fn run_driver_hook() -> ExitCode {
             }
         },
     );
-    telemetry.shutdown();
+    let code = if name == "claude-observe" {
+        st3::telemetry::hook(&env, run)
+    } else {
+        st3::telemetry::local_only();
+        run()
+    };
     ExitCode::from(code)
 }
 
@@ -3182,6 +3181,9 @@ fn record_daemon_commands(args: &UpArgs) {
 
 #[tokio::main]
 async fn run_cli(cli: Cli) -> ExitCode {
+    if matches!(&cli.command, Command::Driver(_)) {
+        st3::telemetry::local_only();
+    }
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

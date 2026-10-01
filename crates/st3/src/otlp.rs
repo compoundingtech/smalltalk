@@ -1,8 +1,9 @@
 //! Optional OpenTelemetry export of this node's local observation log.
 //!
-//! Each local observation becomes one OTLP log record, sent as OTLP/HTTP JSON to
-//! `{endpoint}/v1/logs`. The export cursor advances only after the collector accepts a
-//! batch, so delivery is at least once. Export never blocks a write: a collector that is
+//! Local observations become OTLP/HTTP JSON logs; hook telemetry also supplies delta counters
+//! and operation spans. The cursor advances only after every signal in a batch is accepted,
+//! so delivery is at least once (a partially accepted batch can repeat). Export never blocks a write:
+//! a collector that is
 //! down only delays export, and observations trimmed before export are counted as a gap.
 
 use std::collections::BTreeMap;
@@ -13,6 +14,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 
 use crate::model::ClaimRecord;
 use crate::store::{Store, local_observation_position};
@@ -71,6 +73,8 @@ pub struct ExportOutcome {
 pub struct OtlpExporter {
     client: reqwest::Client,
     url: String,
+    metrics_url: String,
+    traces_url: String,
     headers: reqwest::header::HeaderMap,
     node: String,
 }
@@ -92,6 +96,8 @@ impl OtlpExporter {
                 .timeout(Duration::from_secs(30))
                 .build()?,
             url: config.logs_url(),
+            metrics_url: format!("{}/v1/metrics", config.endpoint.trim_end_matches('/')),
+            traces_url: format!("{}/v1/traces", config.endpoint.trim_end_matches('/')),
             headers,
             node: node.to_owned(),
         })
@@ -117,26 +123,37 @@ impl OtlpExporter {
             .and_then(local_observation_position)
             .unwrap_or(last);
         let skipped = first.saturating_sub(cursor).saturating_sub(1);
-        let response = self
-            .client
-            .post(&self.url)
-            .headers(self.headers.clone())
-            .json(&otlp_logs(&self.node, &batch))
-            .send()
-            .await
-            .with_context(|| format!("send observations to {}", self.url))?;
-        let status = response.status();
-        anyhow::ensure!(
-            status.is_success(),
-            "the collector at {} answered {status}",
-            self.url
-        );
+        self.send(&self.url, &otlp_logs(&self.node, &batch)).await?;
+        if let Some(metrics) = otlp_hook_metrics(&self.node, &batch) {
+            self.send(&self.metrics_url, &metrics).await?;
+        }
+        if let Some(traces) = otlp_hook_traces(&self.node, &batch) {
+            self.send(&self.traces_url, &traces).await?;
+        }
         let store = store.clone();
         tokio::task::spawn_blocking(move || store.set_otlp_export_cursor(last)).await??;
         Ok(ExportOutcome {
             exported: batch.len(),
             skipped,
         })
+    }
+
+    async fn send(&self, url: &str, body: &Value) -> Result<()> {
+        let response = self
+            .client
+            .post(url)
+            .headers(self.headers.clone())
+            .json(body)
+            .send()
+            .await
+            .with_context(|| format!("send observations to {url}"))?;
+        let status = response.status();
+        anyhow::ensure!(
+            status.is_success(),
+            "the collector at {} answered {status}",
+            url
+        );
+        Ok(())
     }
 }
 
@@ -170,7 +187,7 @@ pub async fn run(store: Arc<Store>, exporter: OtlpExporter) {
 pub fn otlp_logs(node: &str, batch: &[ClaimRecord]) -> Value {
     let records = batch
         .iter()
-        .map(|observation| {
+        .flat_map(|observation| {
             let fields = observation
                 .body
                 .get("fields")
@@ -194,7 +211,7 @@ pub fn otlp_logs(node: &str, batch: &[ClaimRecord]) -> Value {
                     json!({ "stringValue": incarnation }),
                 ));
             }
-            json!({
+            let mut record = json!({
                 "timeUnixNano": time,
                 "observedTimeUnixNano": time,
                 "severityNumber": 9,
@@ -202,24 +219,160 @@ pub fn otlp_logs(node: &str, batch: &[ClaimRecord]) -> Value {
                 "eventName": observation.kind,
                 "body": any_value(&fields),
                 "attributes": attributes,
-            })
+            });
+            let span = hook_span(observation);
+            if let Some(span) = &span {
+                record["traceId"] = span["traceId"].clone();
+                record["spanId"] = span["spanId"].clone();
+            }
+            let mut records = vec![record];
+            if observation.kind == crate::telemetry::KIND
+                && let Some(logs) = fields.pointer("/signals/logs").and_then(Value::as_array)
+            {
+                    for log in logs.iter().take(16) {
+                        let (severity, number) = match log["severity"].as_str() {
+                            Some("WARN") => ("WARN", 13),
+                            Some("ERROR") => ("ERROR", 17),
+                            _ => continue,
+                        };
+                        let mut warning = json!({
+                            "timeUnixNano": time, "observedTimeUnixNano": time,
+                            "severityNumber": number, "severityText": severity,
+                            "eventName": "st.hook.warning",
+                            "body": any_value(&log["fields"]),
+                            "attributes": attributes,
+                        });
+                        if let Some(span) = &span {
+                            warning["traceId"] = span["traceId"].clone();
+                            warning["spanId"] = span["spanId"].clone();
+                        }
+                        records.push(warning);
+                    }
+            }
+            records
         })
         .collect::<Vec<_>>();
     json!({
         "resourceLogs": [{
-            "resource": {
-                "attributes": [
-                    attribute("service.name", json!({ "stringValue": "st3" })),
-                    attribute("host.name", json!({ "stringValue": node })),
-                    attribute("st3.node", json!({ "stringValue": node })),
-                ]
-            },
+            "resource": resource(node),
             "scopeLogs": [{
-                "scope": { "name": "st3.observations" },
+                "scope": { "name": "st.observations" },
                 "logRecords": records,
             }]
         }]
     })
+}
+
+fn resource(node: &str) -> Value {
+    json!({"attributes": [
+        attribute("service.name", json!({"stringValue": "st"})),
+        attribute("host.name", json!({"stringValue": node})),
+        attribute("st3.node", json!({"stringValue": node})),
+    ]})
+}
+
+fn hook_invocations(observation: &ClaimRecord) -> Vec<&str> {
+    if observation.kind != crate::telemetry::KIND {
+        return Vec::new();
+    }
+    observation
+        .body
+        .pointer("/fields/signals/hook_invocations")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .take(16)
+        .filter(|invocation| invocation["hook"] == "claude-observe")
+        .filter_map(|invocation| invocation["event"].as_str())
+        .map(st_drivers::metrics::normalize_hook_event)
+        .collect()
+}
+
+/// Delta points retain the bounded hook/event labels; identities only appear in logs/spans.
+fn otlp_hook_metrics(node: &str, batch: &[ClaimRecord]) -> Option<Value> {
+    let mut counts = BTreeMap::<&str, u64>::new();
+    for observation in batch {
+        for event in hook_invocations(observation) {
+            *counts.entry(event).or_default() += 1;
+        }
+    }
+    if counts.is_empty() {
+        return None;
+    }
+    let first = (batch.first()?.accepted_at_unix_ms * 1_000_000) as u64;
+    let started = batch
+        .iter()
+        .filter(|observation| !hook_invocations(observation).is_empty())
+        .filter_map(|observation| {
+            observation
+                .body
+                .pointer("/fields/signals/started_at_unix_nano")?
+                .as_str()?
+                .parse::<u64>()
+                .ok()
+        })
+        .min()
+        .unwrap_or(first.saturating_sub(1))
+        .min(first.saturating_sub(1))
+        .to_string();
+    let ended = (batch.last()?.accepted_at_unix_ms * 1_000_000).to_string();
+    let points = counts
+        .into_iter()
+        .map(|(event, count)| {
+            json!({
+                "startTimeUnixNano": started, "timeUnixNano": ended, "asInt": count.to_string(),
+                "attributes": [
+                    attribute("hook", json!({"stringValue": "claude-observe"})),
+                    attribute("event", json!({"stringValue": event})),
+                ],
+            })
+        })
+        .collect::<Vec<_>>();
+    Some(
+        json!({"resourceMetrics": [{"resource": resource(node), "scopeMetrics": [{
+            "scope": {"name": "st"}, "metrics": [{
+                "name": "hook_invocations_total", "unit": "1",
+                "description": "Lifecycle hook invocations applied in-process, by hook and event",
+                "sum": {"aggregationTemporality": 1, "isMonotonic": true, "dataPoints": points},
+            }],
+        }]}]}),
+    )
+}
+
+fn hook_span(observation: &ClaimRecord) -> Option<Value> {
+    let events = hook_invocations(observation);
+    let event = events.first()?;
+    let signals = observation.body.pointer("/fields/signals")?;
+    let start = signals["started_at_unix_nano"]
+        .as_str()?
+        .parse::<u64>()
+        .ok()?;
+    let end = signals["ended_at_unix_nano"]
+        .as_str()?
+        .parse::<u64>()
+        .ok()?;
+    if end < start {
+        return None;
+    }
+    let digest = Sha256::digest(observation.id.as_bytes());
+    Some(json!({
+        "traceId": hex::encode(&digest[..16]), "spanId": hex::encode(&digest[16..24]),
+        "name": "st.hook.claude-observe", "kind": 1,
+        "startTimeUnixNano": start.to_string(), "endTimeUnixNano": end.to_string(),
+        "attributes": [
+            attribute("st.subject", json!({"stringValue": observation.subject})),
+            attribute("st.incarnation_id", json!({"stringValue": observation.body["fields"]["incarnation_id"]})),
+            attribute("st.hook.event", json!({"stringValue": event})),
+        ],
+        "status": {"code": if signals["exit_code"] == 0 {1} else {2}},
+    }))
+}
+
+fn otlp_hook_traces(node: &str, batch: &[ClaimRecord]) -> Option<Value> {
+    let spans = batch.iter().filter_map(hook_span).collect::<Vec<_>>();
+    (!spans.is_empty()).then(|| json!({"resourceSpans": [{
+        "resource": resource(node), "scopeSpans": [{"scope": {"name": "st.hooks"}, "spans": spans}],
+    }]}))
 }
 
 fn attribute(key: &str, value: Value) -> Value {
@@ -265,15 +418,27 @@ mod tests {
     struct Collector {
         requests: Arc<Mutex<Vec<(HeaderMap, Value)>>>,
         status: Arc<AtomicU16>,
+        metrics_status: Arc<AtomicU16>,
+        traces_status: Arc<AtomicU16>,
     }
 
     async fn collect(
         State(collector): State<Collector>,
+        axum::extract::OriginalUri(uri): axum::extract::OriginalUri,
         headers: HeaderMap,
         axum::Json(body): axum::Json<Value>,
     ) -> StatusCode {
-        let status =
-            StatusCode::from_u16(collector.status.load(Ordering::SeqCst)).unwrap_or(StatusCode::OK);
+        let signal_status = match uri.path() {
+            "/v1/metrics" => collector.metrics_status.load(Ordering::SeqCst),
+            "/v1/traces" => collector.traces_status.load(Ordering::SeqCst),
+            _ => 0,
+        };
+        let status = StatusCode::from_u16(if signal_status == 0 {
+            collector.status.load(Ordering::SeqCst)
+        } else {
+            signal_status
+        })
+        .unwrap_or(StatusCode::OK);
         if status.is_success() {
             collector.requests.lock().unwrap().push((headers, body));
         }
@@ -285,6 +450,8 @@ mod tests {
         collector.status.store(200, Ordering::SeqCst);
         let app = Router::new()
             .route("/v1/logs", post(collect))
+            .route("/v1/metrics", post(collect))
+            .route("/v1/traces", post(collect))
             .with_state(collector.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
@@ -335,7 +502,7 @@ mod tests {
         let request = otlp_logs("node-a", &batch);
         let resource = &request["resourceLogs"][0]["resource"]["attributes"];
         assert!(resource.as_array().unwrap().contains(&json!({
-            "key": "service.name", "value": {"stringValue": "st3"}
+            "key": "service.name", "value": {"stringValue": "st"}
         })));
         assert!(resource.as_array().unwrap().contains(&json!({
             "key": "st3.node", "value": {"stringValue": "node-a"}
@@ -438,6 +605,116 @@ mod tests {
         );
         assert_eq!(store.otlp_export_cursor().unwrap(), 6);
         assert_eq!(collector.requests.lock().unwrap().len(), 3);
+    }
+
+    fn observe_hook(store: &Store, event: &str) {
+        store.append_claim(&ClaimInput {
+            subject: "agent/example/seat".into(), kind: crate::telemetry::KIND.into(),
+            actor: Some("agent/example/seat".into()),
+            fields: BTreeMap::from([
+                ("driver".into(), json!("claude")), ("unit".into(), json!("hook")),
+                ("incarnation_id".into(), json!("incarnation-1")),
+                ("signals".into(), json!({
+                    "started_at_unix_nano": "1000000000", "ended_at_unix_nano": "1025000000",
+                    "exit_code": 0,
+                    "hook_invocations": [{"hook": "claude-observe", "event": event}],
+                    "logs": [{"severity": "WARN", "fields": {"message": "example warning"}}],
+                })),
+            ]),
+            evidence: Vec::new(), expected_subject: None, idempotency_key: None,
+        }).unwrap();
+    }
+
+    #[tokio::test]
+    async fn hook_signals_share_one_service_and_do_not_advance_until_every_signal_is_accepted() {
+        let (collector, endpoint) = start_collector().await;
+        let store = Arc::new(Store::open_memory("node-a").unwrap());
+        observe_hook(&store, "PreToolUse");
+        let batch = store.local_observations_after(0, 10).unwrap();
+        assert_eq!(
+            store.index().unwrap(),
+            0,
+            "telemetry never enters replicated history"
+        );
+        let exporter = OtlpExporter::new(
+            &OtlpConfig {
+                endpoint,
+                headers_file: None,
+            },
+            "node-a",
+        )
+        .unwrap();
+        collector.metrics_status.store(503, Ordering::SeqCst);
+        assert!(exporter.export_once(&store).await.is_err());
+        assert_eq!(store.otlp_export_cursor().unwrap(), 0);
+        collector.metrics_status.store(200, Ordering::SeqCst);
+        collector.traces_status.store(503, Ordering::SeqCst);
+        assert!(exporter.export_once(&store).await.is_err());
+        assert_eq!(store.otlp_export_cursor().unwrap(), 0);
+        collector.traces_status.store(200, Ordering::SeqCst);
+        assert_eq!(exporter.export_once(&store).await.unwrap().exported, 1);
+        assert_eq!(store.otlp_export_cursor().unwrap(), 1);
+        assert_eq!(exporter.export_once(&store).await.unwrap().exported, 0);
+        let requests = collector.requests.lock().unwrap();
+        assert_eq!(
+            requests.len(),
+            6,
+            "a partial acceptance can repeat, without dropping a signal"
+        );
+        for (_, request) in requests.iter() {
+            let resource = request["resourceLogs"]
+                .get(0)
+                .or_else(|| request["resourceMetrics"].get(0))
+                .or_else(|| request["resourceSpans"].get(0))
+                .unwrap();
+            assert!(
+                resource["resource"]["attributes"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!({
+                        "key": "service.name", "value": {"stringValue": "st"},
+                    }))
+            );
+        }
+        let logs = records(&requests[0].1);
+        assert_eq!(logs.len(), 2);
+        assert_eq!(logs[1]["severityText"], "WARN");
+        let expected_span = hook_span(&batch[0]).unwrap();
+        assert_eq!(logs[1]["traceId"], expected_span["traceId"]);
+        assert_eq!(logs[1]["spanId"], expected_span["spanId"]);
+        let metrics = &requests[2].1["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0];
+        assert_eq!(metrics["name"], "hook_invocations_total");
+        assert_eq!(metrics["sum"]["aggregationTemporality"], 1);
+        assert_eq!(metrics["sum"]["dataPoints"][0]["asInt"], "1");
+        assert_eq!(
+            metrics["sum"]["dataPoints"][0]["attributes"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        let spans = &requests[5].1["resourceSpans"][0]["scopeSpans"][0]["spans"];
+        assert_eq!(spans, &json!([expected_span]));
+    }
+
+    #[test]
+    fn hook_metric_labels_are_bounded_and_a_non_application_has_no_counter_or_span() {
+        let store = Store::open_memory("node-a").unwrap();
+        observe_hook(&store, "arbitrary-new-event-with-an-identity");
+        let mut batch = store.local_observations_after(0, 10).unwrap();
+        let metric = otlp_hook_metrics("node-a", &batch).unwrap();
+        assert_eq!(
+            metric["resourceMetrics"][0]["scopeMetrics"][0]["metrics"][0]["sum"]["dataPoints"][0]["attributes"]
+                [1]["value"]["stringValue"],
+            "other"
+        );
+        batch[0].body["fields"]["signals"]["hook_invocations"] = json!([]);
+        assert!(otlp_hook_metrics("node-a", &batch).is_none());
+        assert!(otlp_hook_traces("node-a", &batch).is_none());
+        assert_eq!(
+            records(&otlp_logs("node-a", &batch))[1]["severityText"],
+            "WARN"
+        );
     }
 
     #[test]
