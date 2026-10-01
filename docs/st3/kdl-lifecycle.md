@@ -172,6 +172,13 @@ and `restart always`.
 Any seat may publish, start, revise, and cancel missions, and apply, start, and stop seats,
 including itself; see [free mode](#free-mode).
 
+`st agents restart AGENT --as person/NAME` replaces a top-level or mission seat's process
+without changing its declaration or mission ownership. It uses the normal shutdown timeout
+and waits for a new running incarnation, even when the declaration says `restart never`.
+`--timeout DURATION` bounds the wait (default `10m`); failures and timeouts include a reason
+and an inspection command. Restart requires an active seat declaration; start a stopped
+seat first.
+
 ## Ordered queue authoring
 
 Use `queue` when source order is an intentional one-at-a-time workflow.

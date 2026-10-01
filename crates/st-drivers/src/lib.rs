@@ -12,6 +12,7 @@
 //! declared task running and delivers native messages. Harness-specific behavior stays explicit in
 //! each declaration's command, environment, hooks, and workspace materialization block.
 
+pub mod account;
 pub mod catalog;
 pub mod catalog_archive;
 pub mod catalog_lock;

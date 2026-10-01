@@ -48,7 +48,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_observations",
         "local_blobs",
         "local_subscription_mission_deferrals",
-        "local_usage_totals",
+        "local_usage_spend",
         "local_usage_seen",
         "local_latest_slots",
         "graph_generation",
@@ -400,6 +400,14 @@ fn compare_shared(expected: &Store, actual: &Store, phase: &str, mismatches: &mu
                     "{phase}: attention snapshot at {as_of} for {person:?}"
                 ));
             }
+        }
+    }
+    // Each node names the same owner for each fault, so exactly one host tells that agent.
+    for as_of in [2_000_000_000_000_u128, 2_000_000_600_000_u128] {
+        let faults =
+            |store: &Store| serde_json::to_value(store.fault_snapshot(as_of).unwrap()).unwrap();
+        if faults(expected) != faults(actual) {
+            mismatches.push(format!("{phase}: fault snapshot at {as_of}"));
         }
     }
     let message_state = |store: &Store| {
