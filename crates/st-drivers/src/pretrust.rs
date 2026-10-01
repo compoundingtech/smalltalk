@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use crate::flock::{self, FileLock};
 
 /// The claude config file: `$CLAUDE_CONFIG_DIR/.claude.json` if set, else `$HOME/.claude.json`.
-fn config_path() -> Result<PathBuf> {
+pub(crate) fn config_path() -> Result<PathBuf> {
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         Ok(PathBuf::from(dir).join(".claude.json"))
     } else {

@@ -18,6 +18,30 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  namespace-capacity:
+    name: namespace-capacity
+    if: github.event_name == 'workflow_dispatch'
+    runs-on:
+      [namespace-profile-linux-x86-64, "namespace-features:github.run-id=${{ github.run_id }}"]
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Record Namespace platform capacity
+        run: |
+          nsc workspace concurrency --output json | jq '{concurrency: [.concurrency[] | {platforms, limits, activeConcurrency}]}' > "$RUNNER_TEMP/namespace-capacity.json"
+          cat "$RUNNER_TEMP/namespace-capacity.json"
+          printf 'Measured at %s\n\n' "$(date -u +%FT%TZ)" >> "$GITHUB_STEP_SUMMARY"
+          printf '\x60\x60\x60json\n' >> "$GITHUB_STEP_SUMMARY"
+          cat "$RUNNER_TEMP/namespace-capacity.json" >> "$GITHUB_STEP_SUMMARY"
+          printf '\n\x60\x60\x60\n' >> "$GITHUB_STEP_SUMMARY"
+      - name: Retain Namespace capacity evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: namespace-capacity
+          path: "${{ runner.temp }}/namespace-capacity.json"
+          if-no-files-found: error
   genie-freshness:
     name: genie-freshness
     timeout-minutes: 20
@@ -95,6 +119,11 @@ jobs:
           home="$RUNNER_TEMP/test-home"
           mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
+      - name: Prepare the historical messaging channel
+        if: runner.os == 'Linux'
+        run: |
+          binary=$(timeout 10m bash scripts/messaging-compat-binary)
+          printf 'ST3_MESSAGING_COMPAT_BIN=%s\n' "$binary" >> "$GITHUB_ENV"
       - name: Prepare provider component fixtures
         run: |
           system=$(nix eval --impure --raw --expr builtins.currentSystem)
@@ -316,7 +345,7 @@ jobs:
           start=$SECONDS
           nix build --print-build-logs --out-link "$RUNNER_TEMP/vm-driver" .#legacyPackages.x86_64-linux.transport-isolation-vm.driver
           printf '| VM driver build | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"
-      - name: Run the exec and pty cascade tests in the VM
+      - name: Run all three systemd-scope tests in the VM
         env:
           ST_ISOLATION_ARCHIVE: "${{ runner.temp }}/isolation.tar.zst"
           ST_ISOLATION_WORKSPACE: ${{ github.workspace }}
@@ -325,5 +354,5 @@ jobs:
           start=$SECONDS
           mkdir -p "$RUNNER_TEMP/vm-out"
           "$RUNNER_TEMP/vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/vm-out"
-          jq -r '"| VM boot | \(.boot_seconds)s |\n| cascade tests in VM (extract and run) | \(.test_seconds)s |"' "$ST_ISOLATION_TIMINGS" >> "$GITHUB_STEP_SUMMARY"
+          jq -r '"| VM boot | \(.boot_seconds)s |\n| systemd-scope tests in VM (extract and run) | \(.test_seconds)s |"' "$ST_ISOLATION_TIMINGS" >> "$GITHUB_STEP_SUMMARY"
           printf '| VM test driver total | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"

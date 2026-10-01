@@ -104,6 +104,8 @@ const WRAPPER_DIAGNOSTIC_SCHEMA: &str = "st.codex-wrapper-diagnostic.v1";
 const CONTROL_TUI_LOADED_REQUEST_ID: u64 = 0;
 const CONTROL_SUBSCRIBE_REQUEST_ID: u64 = 1;
 const FIRST_DELIVERY_REQUEST_ID: u64 = 2;
+/// A string ID can never collide with the numeric subscription and delivery requests.
+const ACCOUNT_READ_REQUEST_ID: &str = "st-account-read";
 const HOOK_TRUST_PREFLIGHT_REQUEST_ID: u64 = 1;
 // The inner provider result must reach the wrapper before the outer ownership wait expires.
 const TUI_LOADED_TIMEOUT: Duration = Duration::from_secs(15);
@@ -679,6 +681,13 @@ struct RejectedCodexDelivery {
     rejected_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AccountRead {
+    Due,
+    Pending,
+    Settled,
+}
+
 struct CodexInboxDelivery {
     config: CodexDeliveryConfig,
     runtime: CodexRuntime,
@@ -711,6 +720,9 @@ struct CodexInboxDelivery {
     /// Crash-safe normalized conversation operations for the client-v0 timeline.
     timeline: crate::harness_timeline::Writer,
     model_attempted: BTreeSet<String>,
+    /// The paying account is read once the thread is bound and again after Codex reports an
+    /// account change, so each response is recorded against the account that paid for it.
+    account_read: AccountRead,
     /// Native-driver boundary diagnostics for launch fallback, provider credentials, delivery,
     /// and turn failures. Earlier protocol gates refuse admission before the session starts.
     diagnostics: driver_diagnostic::Publisher,
@@ -855,11 +867,46 @@ impl CodexInboxDelivery {
             context,
             timeline,
             model_attempted: BTreeSet::new(),
+            account_read: AccountRead::Due,
             diagnostics,
             turn_error: None,
             safe_fallback_active,
             safe_fallback_diagnostic_published,
         })
+    }
+
+    /// `account/read` when the account is due to be read and no read is outstanding.
+    fn maybe_account_request(&mut self) -> Option<Value> {
+        if self.account_read != AccountRead::Due {
+            return None;
+        }
+        self.account_read = AccountRead::Pending;
+        Some(json!({ "method": "account/read", "id": ACCOUNT_READ_REQUEST_ID, "params": {} }))
+    }
+
+    /// Consume the response to [`Self::maybe_account_request`], and schedule another read when
+    /// Codex reports a login change. A refused read leaves later responses without an account.
+    fn observe_account(&mut self, message: &Value) -> bool {
+        if message.get("method").and_then(Value::as_str) == Some("account/updated") {
+            if self.account_read == AccountRead::Settled {
+                self.account_read = AccountRead::Due;
+            }
+            return false;
+        }
+        if message.get("method").is_some()
+            || message.get("id").and_then(Value::as_str) != Some(ACCOUNT_READ_REQUEST_ID)
+        {
+            return false;
+        }
+        self.account_read = AccountRead::Settled;
+        let account = message
+            .get("result")
+            .and_then(crate::account::codex_account_from_read);
+        if account.is_none() {
+            tracing::debug!("st codex: account/read named no account; usage stays unattributed");
+        }
+        self.timeline.set_account(account);
+        true
     }
 
     fn sync_safe_fallback_diagnostic(&mut self) {
@@ -4642,6 +4689,10 @@ fn pump_control(
                         &events,
                     )?;
                     if let Some(delivery) = delivery.as_mut() {
+                        if let Some(request) = delivery.maybe_account_request() {
+                            write_json_message(&mut websocket, &request)
+                                .context("sending Codex account/read")?;
+                        }
                         if let Some(request) = delivery.maybe_snapshot_request(state)? {
                             write_json_message(&mut websocket, &request)
                                 .context("sending Codex on-demand thread/read")?;
@@ -4653,6 +4704,11 @@ fn pump_control(
                 }
                 continue;
             };
+            if let Some(delivery) = delivery.as_mut()
+                && delivery.observe_account(&message)
+            {
+                continue;
+            }
             if control_state.is_none() {
                 if let Some(thread_id) = expected_resume {
                     if message.get("method").is_some()
@@ -4901,6 +4957,10 @@ fn pump_control(
                 &events,
             )?;
             if let Some(delivery) = delivery.as_mut() {
+                if let Some(request) = delivery.maybe_account_request() {
+                    write_json_message(&mut websocket, &request)
+                        .context("sending Codex account/read")?;
+                }
                 if let Some(request) = delivery.maybe_snapshot_request(state)? {
                     write_json_message(&mut websocket, &request)
                         .context("sending Codex on-demand thread/read")?;
@@ -5420,6 +5480,18 @@ fn atomic_json(path: &Path, value: &impl Serialize) -> Result<()> {
         let _ = fs::remove_file(&temp);
     }
     result
+}
+
+/// The incarnation of the Codex runtime this state directory currently holds. Its records, such
+/// as the harness timeline, are stamped with this ID rather than st's runtime incarnation.
+pub fn current_runtime_incarnation(
+    state_dir: &Path,
+    agent: &str,
+    runtime_id: &str,
+) -> Option<String> {
+    load_runtime(&state_dir.join("runtime.json"), agent, runtime_id)
+        .ok()
+        .map(|runtime| runtime.incarnation)
 }
 
 fn load_runtime(path: &Path, agent: &str, runtime_id: &str) -> Result<CodexRuntime> {

@@ -41,9 +41,11 @@ backend) holding Cargo's registry and the workspace `target/` directory, keyed o
 `flake.lock`. Namespace cache volumes are not used: they are per node and replicate in the
 background, so a job landing on another node starts empty.
 
-For the trial, `linux-tests` skips the messaging fault matrix exactly as `st/ci` does this week
-(`scripts/ci-linux`), because it timed out in fixture startup on Namespace and its retries kept the
-job running for tens of minutes. Remove that skip when the matrix returns as parallel tests.
+The messaging fault matrix runs as eleven independent `messaging_faults::*` tests in
+`linux-tests`. Nextest schedules the cases in parallel and retries each failing case separately.
+Each case keeps its own evidence directory under `target/messaging-faults/`. The fixture uses
+a systemd user runtime only when its bus exists, so runners without a user manager use the
+existing detached process path instead of trying to create scopes through a synthetic runtime.
 
 `.config/nextest.toml` gives the messaging fault matrix and the fleet reconnect test, both with
 real multi-minute outages, first priority so their retries fit the CI test window. Failed tests
@@ -76,9 +78,11 @@ workspace. List the selection with `cargo nextest list --workspace --profile ci`
 ### Isolation VM
 
 `tests/transport_isolation.rs` proves that a task st2 starts in its own systemd user scope
-survives a SIGKILL of its supervisor's cgroup, for both exec and pty tasks. It needs a real
-systemd user manager, which Namespace's runner image does not boot, so `linux-gate` leaves it
-out and the `isolation-vm` job runs it in a NixOS VM (`nix/transport-isolation-vm.nix`):
+survives a SIGKILL of its supervisor's cgroup, for both exec and pty tasks. The managed-agent
+color contract also checks environment propagation through a real user scope, including a
+PTY restart. These three tests need a real systemd user manager, which Namespace's runner
+image does not boot. They run in a NixOS VM (`nix/transport-isolation-vm.nix`) in the required
+`isolation-vm` job:
 
 1. Probe `/dev/kvm`: the job fails unless KVM can create a VM. Namespace offers nested
    virtualization on `linux/amd64`. QEMU is configured with `forceAccel`, and the test checks
@@ -86,10 +90,12 @@ out and the `isolation-vm` job runs it in a NixOS VM (`nix/transport-isolation-v
 2. `cargo nextest archive -p st2 --test integration` builds the integration test binary and st2.
 3. The job builds the VM test driver from the flake and runs it on the runner. The VM boots
    NixOS with a lingering user, copies in the archive, extracts it at the checkout's path (the
-   test binary has st2's path compiled in) and runs both cascade tests with nextest as a
+   test binary has st2's path compiled in) and runs both cascade tests and
+   `nomad_survival::managed_agent_color_contract_crosses_systemd_scope` with nextest as a
    transient service of that user's systemd manager. The VM compiles nothing.
 
-The job summary records the KVM probe and each phase's elapsed time.
+The VM requires all three tests to run and pass, with no isolation opt-out. The job summary
+records the KVM probe and each phase's elapsed time.
 
 ### macOS
 
@@ -158,7 +164,8 @@ queue it again. The merge train (`st lanes join smalltalk`) is retired.
 The ruleset (`.github/repo-settings.json`, generated from `repo-settings.json.genie.ts`, applied
 by an administrator and never by CI) requires the three checks from GitHub Actions with an empty
 bypass list, keeps the pull-request, deletion and force-push protections, and configures the queue:
-merge method MERGE, up to five entries build at once, up to five merge together, and a check that
+merge method MERGE, up to five entries build at once (see [Measured concurrency](#measured-concurrency)),
+up to five merge together, and a check that
 never reports fails its entry after 30 minutes. Repository settings enable native auto-merge and
 branch deletion after merge. Check the live settings against the file with `gh-check-settings`:
 
@@ -172,6 +179,52 @@ pull request has merged through the queue.
 To roll back, restore the previous ruleset (the JSON is in the body of pull request #916) with
 `gh api --method PUT repos/compoundingtech/smalltalk/rulesets/20563764 --input old-main-ruleset.json`,
 then start the train again with `st missions start` on its mission.
+
+## Measured concurrency
+
+The [manual capacity run](https://github.com/compoundingtech/smalltalk/actions/runs/36931429222)
+on 2026-10-01 recorded the workspace limits with `nsc workspace concurrency --output json`:
+
+| Platform | Concurrent vCPUs | Concurrent memory |
+| --- | ---: | ---: |
+| Linux (amd64 and arm64 share a pool) | 320 | 640 GiB |
+| macOS arm64 | 96 | 224 GiB |
+
+Namespace limits CPU and memory per platform; a workflow run is not a fixed unit of capacity.
+Each Workspace CI group initially starts three 16-vCPU/32-GiB stage jobs and two
+8-vCPU/16-GiB profile jobs: 64 vCPUs and 128 GiB at peak. Five complete groups fit the Linux
+limit, which matches `max_entries_to_build: 5` in both the generated and live main rulesets.
+PRs, main pushes and other workloads share that capacity; Namespace queues jobs until resources
+are available. The `linux-gate` aggregate starts after the three stage jobs finish, so it does
+not add to the initial peak. macOS uses its own pool.
+
+At 21:51:47 UTC, GitHub's job step timestamps showed seven PR, merge-group and main workflow
+runs executing 19 Namespace jobs together. Including the manual capacity run, the overlap was
+eight runs and 24 jobs. These are observed overlaps of runs at different stages, rather than
+eight fully parallel Workspace CI groups. The runs were:
+
+- main: [Workspace CI](https://github.com/compoundingtech/smalltalk/actions/runs/36930646852)
+  and [macOS CI](https://github.com/compoundingtech/smalltalk/actions/runs/36930646948) for one commit,
+  with [Workspace CI](https://github.com/compoundingtech/smalltalk/actions/runs/36931186016)
+  and [macOS CI](https://github.com/compoundingtech/smalltalk/actions/runs/36931186029) for the next;
+- merge group: [Workspace CI](https://github.com/compoundingtech/smalltalk/actions/runs/36930644645);
+- PRs: [Workspace CI](https://github.com/compoundingtech/smalltalk/actions/runs/36931199367)
+  and [Workspace CI](https://github.com/compoundingtech/smalltalk/actions/runs/36931346163).
+
+The initial jobs in 13 observed CI runs created from 21:30 UTC had a median startup delay of
+18 seconds, a 95th percentile of 187 seconds (nearest rank) and a maximum of 305 seconds (57 jobs). Startup
+delay is measured from workflow creation to the first job step; jobs waiting on dependencies,
+skipped jobs and jobs without a Namespace runner are excluded. Each active job's interval runs
+from its first step to job completion, with unfinished jobs counted through the observation.
+The observation is repository-scoped; the workspace can also have jobs from other repositories.
+
+To refresh the capacity measurement, dispatch Workspace CI on `main`. Its `namespace-capacity`
+job runs only for `workflow_dispatch`, publishes platform limits and current usage to the job
+summary and retains the `namespace-capacity` artifact. It reports no workspace or account identity.
+See Namespace's [resource limits](https://namespace.so/docs/architecture/compute/resource-limits)
+and [profile concurrency controls](https://namespace.so/docs/solutions/github-actions/runner-controls/concurrent-runners)
+for the scheduler's limits, and GitHub's [merge queue settings](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/configuring-pull-request-merges/managing-a-merge-queue)
+for the distinction between build concurrency and merge batch size.
 
 ## Namespace jobs that never start
 

@@ -1,6 +1,6 @@
-# Give the full fault matrix time to finish its CI retries within the test window.
+# Start the parallel fault cases early so the two-minute outage and retries fit the CI window.
 [[profile.default.overrides]]
-filter = 'package(st3) and test(/^messaging_faults::messages_recover_across_transport_and_process_faults$/)'
+filter = 'package(st3) and test(/^messaging_faults::/)'
 priority = 100
 
 [profile.ci]

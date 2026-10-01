@@ -1271,6 +1271,9 @@ fn observe_payload(
         tracing::warn!("st claude-observe: harness-timeline write failed: {error:#}");
     }
     if event == "Stop" {
+        // Responses are read from the transcript at Stop, so the account is read here too: the
+        // one this Claude config is signed in to when its responses are recorded.
+        timeline.set_account(crate::account::claude_account_cached(agent_dir));
         if let Some(home) = var("HOME") {
             if let Err(error) = crate::harness_timeline::observe_claude_stop_transcript(
                 &mut timeline,

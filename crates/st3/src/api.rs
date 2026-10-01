@@ -307,6 +307,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
             get(client_v0::request_latency),
         )
         .route("/v1/client/documents/content", get(client_v0::document_get))
+        .route("/v1/client/usage", get(client_v0::usage_period))
         .route(
             "/v1/client/subject-definition",
             get(client_v0::subject_definition),
@@ -419,6 +420,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/intent/mission", post(mission))
         .route("/v1/intent/apply", post(apply))
         .route("/v1/agents/rename", post(rename_agent))
+        .route("/v1/agents/restart", post(restart_agent))
         .route("/v1/missions/{id}", get(get_mission))
         .route("/v1/missions/{id}/retire", post(retire_mission))
         .route("/v1/launches/{id}", get(get_planning_session))
@@ -4329,6 +4331,7 @@ async fn guard_bound_request(
         "/v1/intent/apply",
         "/v1/agent-queue-moves",
         "/v1/agents/rename",
+        "/v1/agents/restart",
         "/v1/delivery/hold",
         "/v1/lane-changes",
         "/v1/work/",
@@ -4555,6 +4558,22 @@ fn github_usage_checks(usage: &crate::resource::GithubUsageReport, now: u128) ->
 }
 
 /// Every person's open attention items that have waited more than a day, oldest first.
+/// Every person's attention, then every fault under the agent that owns it, so an old fault
+/// that no agent took up still shows in doctor.
+fn doctor_attention_items(
+    store: &Store,
+    now: u128,
+) -> anyhow::Result<Vec<crate::model::AttentionItemView>> {
+    let mut items = store.attention_snapshot(None, now)?;
+    items.extend(store.fault_snapshot(now)?.into_iter().map(|fault| {
+        crate::model::AttentionItemView {
+            person: fault.owner.unwrap_or_else(|| "no owning agent".into()),
+            ..fault.item
+        }
+    }));
+    Ok(items)
+}
+
 fn stale_attention_check(items: &[crate::model::AttentionItemView], now: u128) -> DoctorCheck {
     const DAY_MS: u128 = 86_400_000;
     const LISTED: usize = 20;
@@ -4595,7 +4614,7 @@ fn stale_attention_check(items: &[crate::model::AttentionItemView], now: u128) -
         name: "attention-age".into(),
         status: "warn".into(),
         message: format!(
-            "{} attention items have been open for more than a day; `st attention ls --as PERSON` shows how to close each: {}",
+            "{} attention items have been open for more than a day; `st attention ls --as PERSON` shows how to close a person's item, and a fault closes at its source: {}",
             stale.len(),
             listed.join("; ")
         ),
@@ -5358,10 +5377,7 @@ fn doctor_report(state: &AppState) -> Result<Json<DoctorReport>, ApiError> {
         }),
     }
     checks.push(stale_attention_check(
-        &state
-            .store
-            .attention_items(None)
-            .map_err(ApiError::internal)?,
+        &doctor_attention_items(&state.store, client_now_ms()).map_err(ApiError::internal)?,
         client_now_ms(),
     ));
     let report_status = if checks.iter().any(|check| check.status == "fail") {
@@ -7793,6 +7809,109 @@ async fn publication_refusals(
         })
     })
     .await
+}
+
+#[derive(Deserialize)]
+struct AgentRestartRequest {
+    subject: String,
+    actor: String,
+    idempotency_key: String,
+}
+
+async fn restart_agent(
+    State(state): State<AppState>,
+    Json(request): Json<AgentRestartRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    let actor = person_or_agent_actor(&request.actor, "invalid-restart-actor")?;
+    let subject = if request.subject.starts_with("agent/") {
+        request.subject
+    } else {
+        format!("agent/{}", request.subject)
+    };
+    let key = format!("agent-restart:{subject}:{}", request.idempotency_key);
+    if let Some(prior) = state
+        .store
+        .operation_claim(&key)
+        .map_err(ApiError::internal)?
+    {
+        return Ok(Json(prior));
+    }
+    let status = state
+        .store
+        .status(Some(&subject))
+        .map_err(ApiError::internal)?;
+    let current = status
+        .subjects
+        .iter()
+        .find(|item| item.subject == subject)
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "missing-agent",
+                format!("no seat `{subject}`"),
+            ))
+        })?;
+    if !current.conflicts.is_empty() {
+        return Err(ApiError::bad(St3Error::new(
+            "restart-conflict",
+            "resolve the seat's conflicting declarations before restarting",
+        )));
+    }
+    let desired = state
+        .store
+        .desired_subject_with_writer(&subject)
+        .map_err(ApiError::internal)?
+        .map(|(desired, _)| desired)
+        .filter(|desired| desired.kind == "agent")
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "restart-not-declared",
+                "restart needs an active seat declaration; start a stopped seat first",
+            ))
+        })?;
+    let member = desired
+        .member
+        .as_ref()
+        .filter(|member| member.lifecycle == crate::model::MemberLifecycle::Service)
+        .ok_or_else(|| {
+            ApiError::bad(St3Error::new(
+                "restart-no-launch",
+                "the seat has no readable service launch declaration",
+            ))
+        })?;
+    let token = current.desired_token.clone().ok_or_else(|| {
+        ApiError::bad(St3Error::new(
+            "restart-not-declared",
+            "the seat has no selected declaration",
+        ))
+    })?;
+    let incarnation = current
+        .actual
+        .as_ref()
+        .map(|actual| actual.get("fields").unwrap_or(actual))
+        .and_then(|fields| fields.get("incarnation_id"))
+        .and_then(Value::as_str)
+        .unwrap_or("");
+    let claim = state
+        .store
+        .append_claim(&ClaimInput {
+            subject,
+            kind: "runtime.action.requested".into(),
+            actor: Some(actor),
+            fields: BTreeMap::from([
+                ("action".into(), Value::String("restart".into())),
+                (
+                    "runtime_id".into(),
+                    Value::String(member.runtime_id.clone()),
+                ),
+                ("incarnation_id".into(), Value::String(incarnation.into())),
+            ]),
+            evidence: vec![token],
+            expected_subject: None,
+            idempotency_key: Some(key),
+        })
+        .map_err(ApiError::bad)?;
+    signal_changed(&state);
+    Ok(Json(claim))
 }
 
 #[derive(Deserialize)]
@@ -11618,6 +11737,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         for path in [
             "/v1/agent-queue-moves",
             "/v1/agents/rename",
+            "/v1/agents/restart",
             "/v1/work/revision/approve/proposal",
             "/v1/mission-runs/example%2Fdemo%2F1/outcome",
             "/v1/mission-runs/example%2Fdemo%2F1/revision",
@@ -12145,7 +12265,7 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         assert_eq!(status, StatusCode::OK, "{repeated}");
         assert_eq!(repeated["id"], observation["id"]);
         let (_, report) = get_request(
-            app,
+            app.clone(),
             &format!("/v1/usage?since_ms=0&until_ms={}", client_now_ms() + 60_000),
         )
         .await;
@@ -12153,6 +12273,38 @@ agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
         assert_eq!(report["rows"][0]["total_tokens"], 29);
         assert_eq!(report["rows"][0]["cache_write_tokens"], 3);
         assert_eq!(report["rows"][0]["cached_tokens"], 20);
+        // Clients read the same rows, without the identities st does not know.
+        let (status, period) = get_request(
+            app.clone(),
+            &format!(
+                "/v1/client/usage?since_ms=0&until_ms={}",
+                client_now_ms() + 60_000
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{period}");
+        let period = period.get("value").unwrap_or(&period);
+        let row = &period["rows"][0];
+        assert_eq!(period["rows"].as_array().unwrap().len(), 1, "{period}");
+        assert_eq!(row["agent"], subject);
+        assert_eq!(row["total_tokens"], 29);
+        assert!(
+            row.get("mission_run").is_none() && row.get("step").is_none(),
+            "{row}"
+        );
+        let typed: st3_client::UsagePeriod = serde_json::from_value(period.clone()).unwrap();
+        assert_eq!(typed.rows[0].model.as_deref(), Some("claude-example"));
+        let backwards = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/client/usage?since_ms=2&until_ms=1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(backwards.status(), StatusCode::UNPROCESSABLE_ENTITY);
         // The response timeline and its latest-retention rollup both stay local.
         assert_eq!(
             state.store.local_observations_after(0, 10).unwrap().len(),
@@ -13645,7 +13797,8 @@ agent "good" {{ workspace {:?}; command "true" }}
                 )
                 .unwrap();
         }
-        let items = state.store.attention_items(None).unwrap();
+        assert!(state.store.attention_items(None).unwrap().is_empty());
+        let items = doctor_attention_items(&state.store, client_now_ms()).unwrap();
         assert_eq!(items.len(), 2);
         let requested = items
             .iter()
@@ -13670,7 +13823,7 @@ agent "good" {{ workspace {:?}; command "true" }}
         assert!(
             stale
                 .message
-                .contains("daemon/first for person/alex, open 2d 3h: Renew the signing key"),
+                .contains("daemon/first for no owning agent, open 2d 3h: Renew the signing key"),
             "{}",
             stale.message
         );
@@ -18212,37 +18365,31 @@ version 2
     }
 
     #[tokio::test]
-    async fn client_now_keeps_attention_priority_order_and_fault_details() {
+    async fn client_now_never_lists_a_fault() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
         let store = state.store.clone();
-        for (subject, severity) in [("daemon/low", "warning"), ("daemon/high", "error")] {
-            store
-                .record_operational_failure(
-                    subject,
-                    &AttentionRequest {
-                        reviewer: "person/alex".into(),
-                        title: format!("Fault {severity}"),
-                        reason: "The subscription needs a correction.".into(),
-                        severity: severity.into(),
-                        targets: vec![subject.into()],
-                        actor: "daemon/runtime".into(),
-                        idempotency_key: subject.into(),
-                    },
-                )
-                .unwrap();
-        }
+        store
+            .record_operational_failure(
+                "daemon/high",
+                &AttentionRequest {
+                    reviewer: "person/alex".into(),
+                    title: "Fault error".into(),
+                    reason: "The subscription needs a correction.".into(),
+                    severity: "error".into(),
+                    targets: vec!["daemon/high".into()],
+                    actor: "daemon/runtime".into(),
+                    idempotency_key: "daemon/high".into(),
+                },
+            )
+            .unwrap();
+        assert_eq!(store.fault_snapshot(client_now_ms()).unwrap().len(), 1);
         let app = router(state);
-        let (status, page) = get_request(app, "/v1/client/now?person=person%2Falex").await;
-        assert_eq!(status, StatusCode::OK, "{page}");
-        assert_eq!(page["items"][0]["source_id"], "daemon/high");
-        assert_eq!(page["items"][1]["source_id"], "daemon/low");
-        assert_eq!(page["items"][0]["what"], "Fault error");
-        assert_eq!(
-            page["items"][0]["because"],
-            "The subscription needs a correction."
-        );
-        assert!(page["items"][0]["actions"].as_array().unwrap().is_empty());
+        for path in ["/v1/client/now?person=person%2Falex", "/v1/client/now"] {
+            let (status, page) = get_request(app.clone(), path).await;
+            assert_eq!(status, StatusCode::OK, "{page}");
+            assert_eq!(page["items"], json!([]), "{path}");
+        }
     }
 
     #[test]
@@ -18346,7 +18493,7 @@ agent "seat" { workspace "/tmp"; command "true" }
     }
 
     #[test]
-    fn source_failure_priorities_are_shared_across_readers() {
+    fn source_failure_priorities_order_faults_and_never_reach_attention() {
         let store = Store::open_memory("alder").unwrap();
         for severity in ["warning", "error"] {
             store
@@ -18364,11 +18511,15 @@ agent "seat" { workspace "/tmp"; command "true" }
                 )
                 .unwrap();
         }
+        let faults = store.fault_snapshot(client_now_ms()).unwrap();
+        assert_eq!(faults[0].item.priority, "high");
+        assert_eq!(faults[1].item.priority, "normal");
         for history in [false, true] {
-            let resources =
-                client_attention_resources(&store, Some("person/avery"), history).unwrap();
-            assert_eq!(resources[0]["priority"], "high");
-            assert_eq!(resources[1]["priority"], "normal");
+            assert!(
+                client_attention_resources(&store, Some("person/avery"), history)
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 

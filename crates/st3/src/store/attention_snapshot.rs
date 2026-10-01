@@ -92,6 +92,89 @@ impl Store {
         Ok(items)
     }
 
+    /// The fleet's fault agent: the first live agent, by subject, whose declaration carries
+    /// `handles-faults`. It takes each fault that no step assignee or agent requester owns.
+    pub(crate) fn fleet_fault_agent(&self) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        let mut query = connection.prepare(
+            "SELECT subject FROM desired WHERE kind='agent' AND EXISTS (
+                SELECT 1 FROM json_each(desired.body, '$.children')
+                WHERE json_extract(value, '$.name')='handles-faults'
+            ) ORDER BY subject",
+        )?;
+        let agents = query
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        for agent in agents {
+            if person_work::declaration_live(&connection, &agent)? {
+                return Ok(Some(agent));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The agent that owns `fault`: the agent assigned to the failed step, else the requester
+    /// of its run or of a run above it when that is an agent, else `fallback`. Only a live agent
+    /// declaration owns a fault, and a faulted agent never owns its own fault.
+    pub(super) fn fault_owner(
+        &self,
+        fault: &AttentionItemView,
+        fallback: Option<&str>,
+    ) -> Result<Option<String>> {
+        let connection = self.readers.get();
+        let owns = |agent: &str| -> Result<bool> {
+            Ok(agent.starts_with("agent/")
+                && agent != fault.subject
+                && current_desired_row(&connection, agent)?.is_some_and(|row| row.kind == "agent")
+                && person_work::declaration_live(&connection, agent)?)
+        };
+        let mut step = fault.step.clone().or_else(|| {
+            fault
+                .subject
+                .starts_with("step-run/")
+                .then(|| fault.subject.clone())
+        });
+        let mut run = fault.mission_run.clone().or_else(|| {
+            fault
+                .subject
+                .starts_with("mission-run/")
+                .then(|| fault.subject.clone())
+        });
+        if step.is_none() && run.is_none() {
+            run = current_desired_row(&connection, &fault.subject)?.and_then(|row| row.owner_run);
+        }
+        let mut seen = BTreeSet::new();
+        loop {
+            if let Some(view) = step
+                .take()
+                .map(|step| person_work::step(&connection, &step))
+            {
+                let Some(view) = view? else { break };
+                if let Some(agent) = view.assigned_to.as_deref()
+                    && owns(agent)?
+                {
+                    return Ok(Some(agent.to_owned()));
+                }
+                run = Some(view.run);
+            }
+            let Some(current) = run.take() else { break };
+            let id = current.trim_start_matches("mission-run/").to_owned();
+            if !seen.insert(id.clone()) {
+                break;
+            }
+            let Some(header) = mission_run_header_tx(&connection, &id).optional()? else {
+                break;
+            };
+            if owns(&header.requester)? {
+                return Ok(Some(header.requester));
+            }
+            step = header.parent_step_run;
+        }
+        Ok(fallback
+            .filter(|agent| *agent != fault.subject)
+            .map(str::to_owned))
+    }
+
     /// Persist the observed episode on its operational subject, with declaration/incarnation
     /// fences. The compatibility view returned here is used only inside the reconciler.
     pub(crate) fn record_operational_failure(

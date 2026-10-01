@@ -89,6 +89,35 @@ export default githubWorkflow({
     selfHostedRunnerLabels: [...(defaultActionlintConfig.selfHostedRunnerLabels ?? []), ...linuxStageRunner],
   },
   jobs: {
+    // Namespace runners are already authenticated. Manual runs record the platform resource limits
+    // alongside the CI workload so queue concurrency can be chosen from the actual account capacity.
+    'namespace-capacity': {
+      name: 'namespace-capacity',
+      if: "github.event_name == 'workflow_dispatch'",
+      'runs-on': linuxRunner,
+      'timeout-minutes': 5,
+      defaults: { run: { shell: 'bash' } },
+      steps: [
+        {
+          name: 'Record Namespace platform capacity',
+          run: `nsc workspace concurrency --output json | jq '{concurrency: [.concurrency[] | {platforms, limits, activeConcurrency}]}' > "$RUNNER_TEMP/namespace-capacity.json"
+cat "$RUNNER_TEMP/namespace-capacity.json"
+printf 'Measured at %s\\n\\n' "$(date -u +%FT%TZ)" >> "$GITHUB_STEP_SUMMARY"
+printf '\\x60\\x60\\x60json\\n' >> "$GITHUB_STEP_SUMMARY"
+cat "$RUNNER_TEMP/namespace-capacity.json" >> "$GITHUB_STEP_SUMMARY"
+printf '\\n\\x60\\x60\\x60\\n' >> "$GITHUB_STEP_SUMMARY"`,
+        },
+        {
+          name: 'Retain Namespace capacity evidence',
+          uses: 'actions/upload-artifact@v4',
+          with: {
+            name: 'namespace-capacity',
+            path: '${{ runner.temp }}/namespace-capacity.json',
+            'if-no-files-found': 'error',
+          },
+        },
+      ],
+    },
     'genie-freshness': plainFlakeJob({
       name: 'genie-freshness',
       runsOn: linuxRunner,
@@ -161,7 +190,7 @@ nix build --print-build-logs --out-link "$RUNNER_TEMP/vm-driver" .#legacyPackage
 printf '| VM driver build | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"`,
         },
         {
-          name: 'Run the exec and pty cascade tests in the VM',
+          name: 'Run all three systemd-scope tests in the VM',
           env: {
             ST_ISOLATION_ARCHIVE: '${{ runner.temp }}/isolation.tar.zst',
             ST_ISOLATION_WORKSPACE: '${{ github.workspace }}',
@@ -170,7 +199,7 @@ printf '| VM driver build | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SU
           run: `start=$SECONDS
 mkdir -p "$RUNNER_TEMP/vm-out"
 "$RUNNER_TEMP/vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/vm-out"
-jq -r '"| VM boot | \\(.boot_seconds)s |\\n| cascade tests in VM (extract and run) | \\(.test_seconds)s |"' "$ST_ISOLATION_TIMINGS" >> "$GITHUB_STEP_SUMMARY"
+jq -r '"| VM boot | \\(.boot_seconds)s |\\n| systemd-scope tests in VM (extract and run) | \\(.test_seconds)s |"' "$ST_ISOLATION_TIMINGS" >> "$GITHUB_STEP_SUMMARY"
 printf '| VM test driver total | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"`,
         },
       ],

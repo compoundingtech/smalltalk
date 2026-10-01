@@ -20,8 +20,8 @@ use crate::model::{
     ApplyResponse, AttentionActionView, AttentionClosing, AttentionItemView, AttentionRequest,
     AttentionRequestView, AttentionResolveRequest, AttentionWithdrawRequest, Capability,
     ClaimInput, ClaimRecord, ClaimsPage, ContextUsage, DependencySpec, DesiredSubject, EventRecord,
-    HumanReviewView, IntentInput, LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS, MessageView,
-    MissionDefinitionView, MissionInputKind, MissionOutputView, MissionResponse,
+    FaultView, HumanReviewView, IntentInput, LoopRoundView, LoopRunView, MAX_EVAL_TIMEOUT_MS,
+    MessageView, MissionDefinitionView, MissionInputKind, MissionOutputView, MissionResponse,
     MissionRevisionOperation, MissionRunDeclaration, MissionRunInput, MissionRunOutcomeView,
     MissionRunRequest, MissionRunView, MissionSpec, MissionState, NormalizedIntent,
     OperationalAnnotation, OperationalRepairItem, OperationalRepairPlan, OperationalRepairResult,
@@ -470,20 +470,30 @@ CREATE TABLE IF NOT EXISTS local_subscription_mission_deferrals (
 );
 CREATE INDEX IF NOT EXISTS local_subscription_mission_deferrals_deadline_index
 ON local_subscription_mission_deferrals(not_before_unix_ms);
-CREATE TABLE IF NOT EXISTS local_usage_totals (
+-- Response spend accumulated per agent incarnation, model, paying account, owning mission run and
+-- step, and host. Each key replicates as a cumulative `harness.usage` rollup. The account joined
+-- the key after the first release, which kept these totals in `local_usage_totals`; that table's
+-- keys already replicated, so its totals end where these begin and nothing counts twice.
+DROP TABLE IF EXISTS local_usage_totals;
+CREATE TABLE IF NOT EXISTS local_usage_spend (
     subject TEXT NOT NULL,
     incarnation_id TEXT NOT NULL,
     model TEXT NOT NULL,
+    account TEXT NOT NULL,
     owner_run TEXT NOT NULL,
     owner_step TEXT NOT NULL,
     host TEXT NOT NULL,
     input_tokens INTEGER NOT NULL DEFAULT 0,
     output_tokens INTEGER NOT NULL DEFAULT 0,
     cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_write_1h_tokens INTEGER NOT NULL DEFAULT 0,
     cached_tokens INTEGER NOT NULL DEFAULT 0,
     total_tokens INTEGER NOT NULL DEFAULT 0,
+    cost_microusd INTEGER NOT NULL DEFAULT 0,
+    reported_cost_microusd INTEGER NOT NULL DEFAULT 0,
+    unpriced_tokens INTEGER NOT NULL DEFAULT 0,
     observed_at_unix_ms INTEGER NOT NULL,
-    PRIMARY KEY(subject, incarnation_id, model, owner_run, owner_step, host)
+    PRIMARY KEY(subject, incarnation_id, model, account, owner_run, owner_step, host)
 );
 CREATE TABLE IF NOT EXISTS local_usage_seen (
     subject TEXT NOT NULL,
@@ -7616,31 +7626,40 @@ impl Store {
         }
         let incarnation = fields["incarnation_id"].as_str().unwrap_or("");
         let model = fields["body"]["model"].as_str().unwrap_or("unknown");
+        let account = fields["body"]["account"].as_str().unwrap_or("");
         let owner_run = fields["attribution"]["mission_run_id"]
             .as_str()
             .unwrap_or("");
         let owner_step = fields["attribution"]["step_id"].as_str().unwrap_or("");
         let host = fields["host"].as_str().unwrap_or(&self.origin);
         let connection = self.readers.get();
-        let totals = connection.query_row(
-            "SELECT input_tokens, output_tokens, cache_write_tokens, cached_tokens, total_tokens, observed_at_unix_ms
-             FROM local_usage_totals WHERE subject=?1 AND incarnation_id=?2 AND model=?3 AND owner_run=?4 AND owner_step=?5 AND host=?6",
-            params![observation.subject, incarnation, model, owner_run, owner_step, host],
-            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, u64>(1)?, row.get::<_, u64>(2)?,
-                row.get::<_, u64>(3)?, row.get::<_, u64>(4)?, row.get::<_, u64>(5)?)),
-        ).optional()?;
-        let Some((
-            input_tokens,
-            output_tokens,
-            cache_write_tokens,
-            cached_tokens,
-            total_tokens,
-            observed_at,
-        )) = totals
-        else {
+        let totals = connection
+            .query_row(
+                "SELECT input_tokens, output_tokens, cache_write_tokens, cache_write_1h_tokens,
+                    cached_tokens, total_tokens, cost_microusd, reported_cost_microusd,
+                    unpriced_tokens, observed_at_unix_ms
+                 FROM local_usage_spend WHERE subject=?1 AND incarnation_id=?2 AND model=?3
+                    AND account=?4 AND owner_run=?5 AND owner_step=?6 AND host=?7",
+                params![
+                    observation.subject,
+                    incarnation,
+                    model,
+                    account,
+                    owner_run,
+                    owner_step,
+                    host
+                ],
+                |row| {
+                    (0..10)
+                        .map(|index| row.get::<_, u64>(index))
+                        .collect::<Result<Vec<_>, _>>()
+                },
+            )
+            .optional()?;
+        let Some(totals) = totals else {
             return Ok(None);
         };
-        let fields = BTreeMap::from([
+        let mut fields = BTreeMap::from([
             ("semantics".into(), Value::String("response_rollup".into())),
             ("driver".into(), fields["driver"].clone()),
             ("incarnation_id".into(), Value::String(incarnation.into())),
@@ -7648,13 +7667,31 @@ impl Store {
             ("owner_run".into(), Value::String(owner_run.into())),
             ("owner_step".into(), Value::String(owner_step.into())),
             ("host".into(), Value::String(host.into())),
-            ("input_tokens".into(), Value::from(input_tokens)),
-            ("output_tokens".into(), Value::from(output_tokens)),
-            ("cache_write_tokens".into(), Value::from(cache_write_tokens)),
-            ("cached_tokens".into(), Value::from(cached_tokens)),
-            ("total_tokens".into(), Value::from(total_tokens)),
-            ("observed_at_unix_ms".into(), Value::from(observed_at)),
+            (
+                "pricing".into(),
+                Value::String(crate::pricing::PRICING_REVISION.into()),
+            ),
         ]);
+        if !account.is_empty() {
+            fields.insert("account".into(), Value::String(account.into()));
+        }
+        for (name, value) in [
+            "input_tokens",
+            "output_tokens",
+            "cache_write_tokens",
+            "cache_write_1h_tokens",
+            "cached_tokens",
+            "total_tokens",
+            "cost_microusd",
+            "reported_cost_microusd",
+            "unpriced_tokens",
+            "observed_at_unix_ms",
+        ]
+        .into_iter()
+        .zip(totals)
+        {
+            fields.insert(name.into(), Value::from(value));
+        }
         let digest = hex::encode(Sha256::digest(serde_json::to_vec(&fields)?));
         Ok(Some(ClaimInput {
             subject: observation.subject.clone(),
@@ -9982,64 +10019,52 @@ impl Store {
         self.attention_snapshot(person, now_ms())
     }
 
+    /// The current faults raised for `person` under the reviewer each one names, owners aside.
+    #[cfg(test)]
+    pub(crate) fn fault_items(&self, person: Option<&str>) -> Result<Vec<AttentionItemView>> {
+        Ok(self
+            .fault_snapshot(now_ms())?
+            .into_iter()
+            .map(|fault| fault.item)
+            .filter(|item| person.is_none_or(|person| item.person == person))
+            .collect())
+    }
+
+    /// What waits on `person` and no agent can resolve: requests (person steps and agents'
+    /// asks) and reviews (human gates, launch and revision approvals). Messages stay in
+    /// conversations, and a fault goes to the agent that owns it, see `fault_snapshot`.
     pub fn attention_snapshot(
         &self,
         person: Option<&str>,
         as_of: u128,
     ) -> Result<Vec<AttentionItemView>> {
         let mut items = self.mission_run_attention_items(person)?;
+        items.extend(self.person_attention_items(person, as_of)?);
+        self.current_attention(items, as_of)
+    }
 
-        // Only a person's messages need attention. Without a person, read each person's
-        // mailbox through the recipient index instead of every open message in the fleet.
-        let messages = match person {
-            Some(person) => self.messages(Some(person), false)?,
-            None => {
-                let people = {
-                    let connection = self.readers.get();
-                    let mut statement = connection.prepare(
-                        "SELECT DISTINCT json_extract(body, '$.fields.to')
-                         FROM claims INDEXED BY claims_message_to_index
-                         WHERE kind='message.sent'
-                           AND json_extract(body, '$.fields.to') >= 'person/'
-                           AND json_extract(body, '$.fields.to') < 'person0'",
-                    )?;
-                    statement
-                        .query_map([], |row| row.get::<_, String>(0))?
-                        .collect::<Result<Vec<_>, _>>()?
-                };
-                let mut messages = Vec::new();
-                for person in people {
-                    messages.extend(self.messages(Some(&person), false)?);
-                }
-                messages
-            }
-        };
-        let messages = selected_actionable_messages(&self.readers.get(), messages)?;
-        if !messages.is_empty() {
-            let connection = self.readers.get();
-            for message in messages.into_iter().filter(|message| {
-                message.to.starts_with("person/")
-                    && matches!(message.status.as_str(), "sent" | "delivered")
-            }) {
-                // The message's first claim in canonical order, so every node that holds it
-                // shows the same wait.
-                let requested_at_unix_ms = connection.query_row(
-                    &canonical_sql(
-                        "SELECT accepted_at_unix_ms FROM claims
-                     WHERE subject=?1
-                     ORDER BY CANONICAL_ASC(claims)
-                     LIMIT 1",
-                    ),
-                    [&message.subject],
-                    |row| row.get::<_, String>(0),
-                )?;
-                items.push(attention_item_from_message(
-                    message,
-                    requested_at_unix_ms.parse().unwrap_or(0),
-                ));
-            }
-        }
+    /// Every current fault, each with the agent that owns it: the agent assigned to the failed
+    /// step, else the run's requester when that is an agent, else the fleet's fault agent. No
+    /// fault is a person's: the owning agent retries, revises or cancels, and asks a person
+    /// only for what only a person can give.
+    pub fn fault_snapshot(&self, as_of: u128) -> Result<Vec<FaultView>> {
+        let mut items = self.subscription_fault_items(as_of)?;
+        items.extend(self.operational_attention_items(None, as_of)?);
+        items.extend(self.checkpoint_attention_items(None, as_of)?);
+        let fallback = self.fleet_fault_agent()?;
+        self.current_attention(items, as_of)?
+            .into_iter()
+            .map(|item| {
+                Ok(FaultView {
+                    owner: self.fault_owner(&item, fallback.as_deref())?,
+                    item,
+                })
+            })
+            .collect()
+    }
 
+    fn subscription_fault_items(&self, as_of: u128) -> Result<Vec<AttentionItemView>> {
+        let mut items = Vec::new();
         {
             let connection = self.readers.get();
             let mut statement = connection.prepare(
@@ -10073,9 +10098,6 @@ impl Store {
                 let reviewer = requester
                     .filter(|value| value.starts_with("person/"))
                     .unwrap_or_else(|| "person/operator".into());
-                if person.is_some_and(|person| !reviewer.is_empty() && person != reviewer) {
-                    continue;
-                }
                 let code = fields
                     .get("code")
                     .and_then(Value::as_str)
@@ -10115,9 +10137,15 @@ impl Store {
                 });
             }
         }
-        items.extend(self.person_attention_items(person, as_of)?);
-        items.extend(self.operational_attention_items(person, as_of)?);
-        items.extend(self.checkpoint_attention_items(person, as_of)?);
+        Ok(items)
+    }
+
+    /// Keep the items requested by `as_of` whose run is still current, then order them.
+    fn current_attention(
+        &self,
+        mut items: Vec<AttentionItemView>,
+        as_of: u128,
+    ) -> Result<Vec<AttentionItemView>> {
         let connection = self.readers.get();
         items.retain(|item| item.requested_at_unix_ms <= as_of);
         let mut live = Vec::new();
@@ -11417,15 +11445,25 @@ impl Store {
 
     /// Period spend from replicated cumulative snapshots. The snapshot immediately before the
     /// start is the baseline, so a long-lived incarnation only contributes spend in the period.
+    /// Each row is one agent incarnation's spend on one model and account for one mission run
+    /// and step on one host, with its API-equivalent cost in millionths of a dollar. Tokens no
+    /// price covers are counted in `unpriced_tokens`, never as free.
     pub fn usage_period_rows(&self, since_ms: u64, until_ms: u64) -> Result<Vec<Value>> {
+        const BUCKETS: [&str; 9] = [
+            "total_tokens",
+            "input_tokens",
+            "output_tokens",
+            "cache_write_tokens",
+            "cache_write_1h_tokens",
+            "cached_tokens",
+            "cost_microusd",
+            "reported_cost_microusd",
+            "unpriced_tokens",
+        ];
         #[derive(Clone, Copy, Default)]
-        struct Bucket {
+        struct Snapshot {
             at: u64,
-            total: u64,
-            input: u64,
-            output: u64,
-            writes: u64,
-            reads: u64,
+            buckets: [u64; BUCKETS.len()],
         }
         let connection = self.readers.get();
         let mut statement = connection.prepare(&canonical_sql(
@@ -11440,10 +11478,8 @@ impl Store {
                 row.get::<_, String>(2)?,
             ))
         })?;
-        let mut groups = BTreeMap::<
-            (String, String, String, String, String, String),
-            (Option<Bucket>, Option<Bucket>),
-        >::new();
+        type Key = (String, String, String, String, String, String, String);
+        let mut groups = BTreeMap::<Key, (Option<Snapshot>, Option<Snapshot>, String)>::new();
         for row in rows {
             let (subject, _index, body) = row?;
             let body: Value = serde_json::from_str(&body)?;
@@ -11452,49 +11488,63 @@ impl Store {
             if at > until_ms {
                 continue;
             }
-            let value = |name| fields[name].as_u64().unwrap_or(0);
-            let bucket = Bucket {
+            let mut snapshot = Snapshot {
                 at,
-                total: value("total_tokens"),
-                input: value("input_tokens"),
-                output: value("output_tokens"),
-                writes: value("cache_write_tokens"),
-                reads: value("cached_tokens"),
+                ..Snapshot::default()
             };
+            for (bucket, name) in snapshot.buckets.iter_mut().zip(BUCKETS) {
+                *bucket = fields[name].as_u64().unwrap_or(0);
+            }
+            // A rollup from before costs were recorded priced nothing: its tokens are unpriced.
+            if fields.get("cost_microusd").is_none() {
+                snapshot.buckets[8] = snapshot.buckets[0];
+            }
             let text = |name| fields[name].as_str().unwrap_or("").to_owned();
             let key = (
                 subject,
                 text("incarnation_id"),
                 text("model"),
+                text("account"),
                 text("owner_run"),
                 text("owner_step"),
                 text("host"),
             );
-            let (baseline, latest) = groups.entry(key).or_default();
+            let (baseline, latest, pricing) = groups.entry(key).or_default();
             let target = if at <= since_ms { baseline } else { latest };
             if target.is_none_or(|previous| at >= previous.at) {
-                *target = Some(bucket);
+                *target = Some(snapshot);
+                if at > since_ms {
+                    *pricing = text("pricing");
+                }
             }
         }
         let mut result = Vec::new();
-        for ((agent, _incarnation, model, mission_run, step, host), (baseline, latest)) in groups {
+        for (
+            (agent, _incarnation, model, account, mission_run, step, host),
+            (baseline, latest, pricing),
+        ) in groups
+        {
             let Some(latest) = latest else {
                 continue;
             };
-            let baseline = baseline.unwrap_or_default();
-            let total = latest.total.saturating_sub(baseline.total);
-            if total == 0 {
+            // A series that went backwards restarted from zero, for example when a node's local
+            // totals were rebuilt; everything after the restart is spend in the period.
+            let baseline = baseline
+                .filter(|baseline| baseline.buckets[0] <= latest.buckets[0])
+                .unwrap_or_default();
+            let mut row = json!({
+                "agent": agent, "mission_run": mission_run, "step": step,
+                "model": model, "account": account, "host": host,
+                "pricing": pricing,
+            });
+            for (index, name) in BUCKETS.iter().enumerate() {
+                row[*name] =
+                    Value::from(latest.buckets[index].saturating_sub(baseline.buckets[index]));
+            }
+            if row["total_tokens"] == 0 {
                 continue;
             }
-            result.push(json!({
-                "agent": agent, "mission_run": mission_run, "step": step,
-                "model": model, "host": host,
-                "total_tokens": total,
-                "input_tokens": latest.input.saturating_sub(baseline.input),
-                "output_tokens": latest.output.saturating_sub(baseline.output),
-                "cache_write_tokens": latest.writes.saturating_sub(baseline.writes),
-                "cached_tokens": latest.reads.saturating_sub(baseline.reads),
-            }));
+            result.push(row);
         }
         result.sort_by(|a, b| b["total_tokens"].as_u64().cmp(&a["total_tokens"].as_u64()));
         Ok(result)
@@ -14560,14 +14610,23 @@ fn insert_local_observation_tx(
             .get("incarnation_id")
             .and_then(Value::as_str)
             .unwrap_or("");
+        // Bind the response to the step its agent held when the harness recorded it, not when
+        // st ingested it: a replayed backlog must not charge older responses to a step that
+        // became active later.
+        let responded_at = input
+            .fields
+            .get("observed_at_unix_ms")
+            .and_then(Value::as_u64)
+            .map_or(observed_at, |at| (at as u128).min(observed_at));
         let active_step: Option<(String, String, String)> = transaction
             .query_row(
                 "SELECT subject, 'mission-run/' || run_id, 'run-generation/' || generation_id
                  FROM step_runs WHERE lease_owner=?1 AND lease_incarnation=?2
                    AND CAST(lease_expires_at_unix_ms AS INTEGER)>?3
+                   AND COALESCE(CAST(activated_at_unix_ms AS INTEGER), 0)<=?3
                    AND status IN ('claimed', 'working', 'submitted')
                  ORDER BY updated_at_unix_ms DESC LIMIT 1",
-                params![input.subject, incarnation, observed_at as i64],
+                params![input.subject, incarnation, responded_at as i64],
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
@@ -14591,12 +14650,37 @@ fn insert_local_observation_tx(
             .get("model")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
+        let account = usage.get("account").and_then(Value::as_str).unwrap_or("");
         let bucket = |key| usage.get(key).and_then(Value::as_u64).unwrap_or(0);
         let input_tokens = bucket("input_tokens");
         let output_tokens = bucket("output_tokens");
         let cache_write_tokens = bucket("cache_write_tokens");
+        let cache_write_1h_tokens = bucket("cache_write_1h_tokens").min(cache_write_tokens);
         let cached_tokens = bucket("cached_tokens");
         let total_tokens = bucket("total_tokens");
+        // A price the harness reported for this response wins over st's table. A response
+        // neither can price stays unpriced, never free.
+        let reported_cost = usage
+            .get("cost")
+            .and_then(Value::as_f64)
+            .filter(|cost| cost.is_finite() && *cost >= 0.0)
+            .map(|cost| (cost * 1_000_000.0).round() as u64);
+        let estimated_cost = crate::pricing::cost_microusd(
+            model,
+            crate::pricing::Tokens {
+                input: input_tokens,
+                output: output_tokens,
+                cache_read: cached_tokens,
+                cache_write: cache_write_tokens,
+                cache_write_1h: cache_write_1h_tokens,
+            },
+        );
+        let cost_microusd = reported_cost.or(estimated_cost).unwrap_or(0);
+        let unpriced_tokens = if reported_cost.or(estimated_cost).is_some() {
+            0
+        } else {
+            total_tokens
+        };
         body["fields"]["attribution"] = json!({
             "agent_id": input.subject,
             "mission_run_id": if owner_run.is_empty() { None } else { Some(owner_run) },
@@ -14619,18 +14703,25 @@ fn insert_local_observation_tx(
             != 0;
         if new_response {
             transaction.execute(
-                "INSERT INTO local_usage_totals(subject, incarnation_id, model, owner_run, owner_step, host,
-                    input_tokens, output_tokens, cache_write_tokens, cached_tokens, total_tokens, observed_at_unix_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-                 ON CONFLICT(subject, incarnation_id, model, owner_run, owner_step, host) DO UPDATE SET
+                "INSERT INTO local_usage_spend(subject, incarnation_id, model, account, owner_run, owner_step, host,
+                    input_tokens, output_tokens, cache_write_tokens, cache_write_1h_tokens, cached_tokens,
+                    total_tokens, cost_microusd, reported_cost_microusd, unpriced_tokens, observed_at_unix_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
+                 ON CONFLICT(subject, incarnation_id, model, account, owner_run, owner_step, host) DO UPDATE SET
                     input_tokens=input_tokens+excluded.input_tokens,
                     output_tokens=output_tokens+excluded.output_tokens,
                     cache_write_tokens=cache_write_tokens+excluded.cache_write_tokens,
+                    cache_write_1h_tokens=cache_write_1h_tokens+excluded.cache_write_1h_tokens,
                     cached_tokens=cached_tokens+excluded.cached_tokens,
                     total_tokens=total_tokens+excluded.total_tokens,
+                    cost_microusd=cost_microusd+excluded.cost_microusd,
+                    reported_cost_microusd=reported_cost_microusd+excluded.reported_cost_microusd,
+                    unpriced_tokens=unpriced_tokens+excluded.unpriced_tokens,
                     observed_at_unix_ms=excluded.observed_at_unix_ms",
-                params![input.subject, incarnation, model, owner_run, owner_step, origin,
-                    input_tokens, output_tokens, cache_write_tokens, cached_tokens, total_tokens, observed_at as i64],
+                params![input.subject, incarnation, model, account, owner_run, owner_step, origin,
+                    input_tokens, output_tokens, cache_write_tokens, cache_write_1h_tokens, cached_tokens,
+                    total_tokens, cost_microusd, reported_cost.unwrap_or(0), unpriced_tokens,
+                    observed_at as i64],
             ).map_err(internal)?;
         }
     }
@@ -14760,6 +14851,21 @@ fn publish_changed_harness_state_tx(
 }
 
 fn usage_slot(fields: &BTreeMap<String, Value>) -> String {
+    if fields.get("semantics").and_then(Value::as_str) == Some("response_rollup") {
+        // Each rollup key is its own cumulative series. Sharing one slot per incarnation would
+        // let a pending rollup of the next step or account replace the previous one's final
+        // totals before they replicated.
+        return json!([
+            fields.get("incarnation_id"),
+            fields.get("semantics"),
+            fields.get("model"),
+            fields.get("account"),
+            fields.get("owner_run"),
+            fields.get("owner_step"),
+            fields.get("host"),
+        ])
+        .to_string();
+    }
     json!([fields.get("incarnation_id"), fields.get("semantics")]).to_string()
 }
 
@@ -15976,16 +16082,25 @@ fn check_mailbox_incarnation(
     connection: &Connection,
     fence: &crate::mailbox::Fence,
 ) -> Result<(), St3Error> {
-    let runtime: Option<String> = connection
+    let runtime: Option<(String, String)> = connection
         .prepare_cached(&format!(
             "{} LIMIT 1",
-            newest_claims_of_kind_query("claims.body", "runtime.observed")
+            newest_claims_of_kind_query("claims.id, claims.body", "runtime.observed")
         ))
         .map_err(internal)?
-        .query_row(params![fence.subject, i64::MAX], |row| row.get(0))
+        .query_row(params![fence.subject, i64::MAX], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
         .optional()
         .map_err(internal)?;
-    let runtime: Value = serde_json::from_str(&runtime.unwrap_or_default()).unwrap_or(Value::Null);
+    let runtime_claim = runtime.as_ref().map(|(claim, _)| claim.as_str());
+    let runtime: Value = serde_json::from_str(
+        runtime
+            .as_ref()
+            .map(|(_, body)| body.as_str())
+            .unwrap_or_default(),
+    )
+    .unwrap_or(Value::Null);
     let fields = runtime.get("fields").unwrap_or(&runtime);
     let live = fields.get("status").and_then(Value::as_str) == Some("running")
         && fields.get("incarnation_id").and_then(Value::as_str) == Some(&fence.incarnation);
@@ -16026,9 +16141,8 @@ fn check_mailbox_incarnation(
             }
         }
     }
-    let ended = current_harness_at(connection, &fence.subject, None)
-        .map_err(internal)?
-        .is_some_and(|harness| harness.state == "ended");
+    let ended = live
+        && mailbox_harness_ended(connection, fence, runtime_claim.unwrap()).map_err(internal)?;
     if !live || ended {
         return Err(St3Error::new(
             "stale-mailbox-session",
@@ -16037,6 +16151,51 @@ fn check_mailbox_incarnation(
     }
 
     Ok(())
+}
+
+/// Mailbox authorization needs the state, not the optional display fields accumulated by
+/// `current_harness_at`. Sparse observations can leave those fields unknown forever, making
+/// a display fold walk every prior incarnation on every graph wake.
+fn mailbox_harness_ended(
+    connection: &Connection,
+    fence: &crate::mailbox::Fence,
+    runtime_claim: &str,
+) -> Result<bool> {
+    let mut statement = connection.prepare_cached(&newest_claims_of_kind_query(
+        "claims.id, claims.body",
+        "harness.observed",
+    ))?;
+    let mut rows = statement.query(params![fence.subject, i64::MAX])?;
+    let mut runtime_key = None;
+    while let Some(row) = rows.next()? {
+        let claim: String = row.get(0)?;
+        let body: String = row.get(1)?;
+        let body: Value = serde_json::from_str(&body)?;
+        let fields = body.get("fields").unwrap_or(&body);
+        let belongs = match fields.get("incarnation_id").and_then(Value::as_str) {
+            Some(incarnation) => incarnation == fence.incarnation,
+            None => {
+                let key = match &runtime_key {
+                    Some(key) => key,
+                    None => runtime_key.insert(canonical::claim_key(connection, runtime_claim)?),
+                };
+                canonical::claim_key(connection, &claim)? > *key
+            }
+        };
+        if !belongs {
+            continue;
+        }
+        if let Some(state) = fields.get("state").and_then(Value::as_str) {
+            if state != "ended" {
+                return Ok(false);
+            }
+            // Diagnostics or newer work activity can override an ended observation. Keep
+            // exactly the existing reduction for that exceptional case.
+            return Ok(current_harness_at(connection, &fence.subject, None)?
+                .is_some_and(|harness| harness.state == "ended"));
+        }
+    }
+    Ok(false)
 }
 
 fn check_mailbox_fence(
@@ -17254,44 +17413,6 @@ fn attention_item_from_revision(
                 ],
             ),
         ],
-    }
-}
-
-fn attention_item_from_message(
-    message: MessageView,
-    requested_at_unix_ms: u128,
-) -> AttentionItemView {
-    AttentionItemView {
-        episode: message.subject.clone(),
-        priority: "normal".into(),
-        kind: "unread-message".into(),
-        review_mode: None,
-        subject: message.subject.clone(),
-        person: message.to.clone(),
-        requester_id: Some(message.from.clone()),
-        launch_id: None,
-        variant_id: None,
-        message_id: Some(message.subject.clone()),
-        title: message
-            .title
-            .unwrap_or_else(|| format!("Message from {}", message.from)),
-        detail: format!("Unread message from {}.", message.from),
-        mission: None,
-        mission_run: None,
-        step: None,
-        targets: Vec::new(),
-        requested_at_unix_ms,
-        actions: vec![attention_action(
-            "read",
-            &[
-                "st",
-                "conversations",
-                "read",
-                &message.subject,
-                "--as",
-                &message.to,
-            ],
-        )],
     }
 }
 
@@ -33293,6 +33414,162 @@ version 2
         assert_eq!(store.claims_for("agent/example", None).unwrap().len(), 21);
     }
 
+    #[test]
+    fn mailbox_state_read_preserves_ended_diagnostic_work_and_legacy_semantics() {
+        let store = Store::open_memory("alder").unwrap();
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        let subject = "agent/example";
+        let fence = crate::mailbox::Fence::new(subject, "current", "delivery");
+        let mut sequence = 0;
+        let mut insert = |kind: &str, fields: Value| {
+            sequence += 1;
+            let id = format!("claim-{sequence}");
+            let time = sequence.to_string();
+            transaction
+                .execute(
+                    "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+                 VALUES(?1,'alder',?2,?1,?3)",
+                    params![id, sequence, time],
+                )
+                .unwrap();
+            transaction.execute(
+                "INSERT INTO claims(id,batch_id,subject,kind,origin,actor,body,predecessors,accepted_at_unix_ms)
+                 VALUES(?1,?1,?2,?3,'alder',?2,?4,'[]',?5)",
+                params![id, subject, kind, json!({"fields": fields}).to_string(), time],
+            ).unwrap();
+        };
+        insert(
+            "runtime.observed",
+            json!({"status":"running","incarnation_id":"current"}),
+        );
+        for (kind, fields, expected_ended) in [
+            (
+                "harness.observed",
+                json!({"state":"ended","incarnation_id":"prior"}),
+                false,
+            ),
+            (
+                "harness.observed",
+                json!({"state":"idle","incarnation_id":"current"}),
+                false,
+            ),
+            (
+                "harness.observed",
+                json!({"state":"ended","incarnation_id":"current"}),
+                true,
+            ),
+            (
+                "harness.observed",
+                json!({"driver":"claude","incarnation_id":"current"}),
+                true,
+            ),
+            (
+                "harness.diagnostic",
+                json!({"code":"provider-auth-expired","incarnation_id":"current"}),
+                false,
+            ),
+            (
+                "harness.diagnostic",
+                json!({"code":"provider-auth-restored","incarnation_id":"current"}),
+                true,
+            ),
+            (
+                "work.progress",
+                json!({"claim_incarnation":"current"}),
+                false,
+            ),
+            ("harness.observed", json!({"state":"ended"}), true),
+            ("harness.observed", json!({"state":"idle"}), false),
+        ] {
+            insert(kind, fields);
+            let ended = current_harness_at(&transaction, subject, None)
+                .unwrap()
+                .is_some_and(|harness| harness.state == "ended");
+            assert_eq!(ended, expected_ended, "{kind}");
+            assert_eq!(
+                check_mailbox_incarnation(&transaction, &fence).is_err(),
+                ended,
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn mailbox_fence_cost_does_not_grow_with_sparse_prior_incarnations() {
+        let store = Store::open_memory("alder").unwrap();
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        let insert = |id: &str, kind: &str, fields: Value, time: &str| {
+            transaction
+                .execute(
+                    "INSERT INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+                 VALUES(?1,'alder',1,?1,?2)",
+                    params![id, time],
+                )
+                .unwrap();
+            transaction.execute(
+                "INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+                 VALUES(?1,?1,'agent/example',?2,'alder',?3,'[]',?4)",
+                params![id, kind, json!({"fields": fields}).to_string(), time],
+            ).unwrap();
+        };
+        insert(
+            "runtime",
+            "runtime.observed",
+            json!({"status":"running", "incarnation_id":"current"}),
+            "20000",
+        );
+        insert(
+            "current",
+            "harness.observed",
+            json!({"state":"idle", "incarnation_id":"current"}),
+            "20001",
+        );
+        let fence = crate::mailbox::Fence::new("agent/example", "current", "delivery");
+        // Count the actual statements used by the fence, including the previous display fold.
+        // Cached statement reset does not reset SQLite's VM step counter.
+        let queries = [
+            newest_claims_of_kind_query("claims.id, claims.body", "harness.observed"),
+            newest_claims_of_kind_query(
+                "claims.id, claims.store_index, claims.body, claims.accepted_at_unix_ms",
+                "harness.observed",
+            ),
+        ];
+        let mut costs = Vec::new();
+        for n in 1..=10_000 {
+            insert(
+                &format!("old-{n}"),
+                "harness.observed",
+                json!({"state":"working", "incarnation_id":"prior"}),
+                &n.to_string(),
+            );
+            if n == 100 || n == 10_000 {
+                for query in &queries {
+                    transaction
+                        .prepare_cached(query)
+                        .unwrap()
+                        .reset_status(rusqlite::StatementStatus::VmStep);
+                }
+                check_mailbox_incarnation(&transaction, &fence).unwrap();
+                let cost: i32 = queries
+                    .iter()
+                    .map(|query| {
+                        transaction
+                            .prepare_cached(query)
+                            .unwrap()
+                            .get_status(rusqlite::StatementStatus::VmStep)
+                    })
+                    .sum();
+                costs.push(cost);
+            }
+        }
+        assert!(
+            costs[1] <= costs[0] * 2 && costs[1] < 1_000,
+            "a live fence must read its state, not its optional display history: {costs:?}"
+        );
+    }
+
     /// The reads behind the session list, a mission detail and the missions tree seek or walk an
     /// index whose part they read is what they show: one incarnation's claims, the newest
     /// observations, the open runs and steps. None reads or sorts every claim of a kind, every
@@ -35768,6 +36045,173 @@ mission "nested-work" state="ready" {
                 .total_tokens,
             65
         );
+    }
+
+    #[test]
+    fn response_spend_is_priced_and_kept_apart_by_account_and_step() {
+        let local = Store::open_memory("host-one").unwrap();
+        let subject = "agent/example.worker";
+        let observed = |state: &str, key: &str| {
+            local
+                .append_claim(&ClaimInput {
+                    subject: subject.into(),
+                    kind: "harness.observed".into(),
+                    actor: Some(subject.into()),
+                    fields: BTreeMap::from([
+                        ("state".into(), Value::String(state.into())),
+                        ("driver".into(), Value::String("claude".into())),
+                        ("incarnation_id".into(), Value::String("inc-one".into())),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(key.into()),
+                })
+                .unwrap()
+        };
+        let seed = observed("working", "spend-seed");
+        let own_step = |step: &str| {
+            local.connection.lock().unwrap().execute(
+                "INSERT OR REPLACE INTO desired(subject, kind, revision, claim_id, body, owner_run, owner_generation, owner_step)
+                 VALUES (?1, 'agent', 'revision', ?2, '{}', 'mission-run/example', 'run-generation/example', ?3)",
+                params![subject, seed.id, step],
+            ).unwrap();
+        };
+        let respond = |entry: &str, body: Value| {
+            let mut claim = timeline_observation(subject, "inc-one", entry);
+            claim
+                .fields
+                .insert("entry_type".into(), Value::String("usage".into()));
+            claim
+                .fields
+                .insert("role".into(), Value::String("system".into()));
+            claim
+                .fields
+                .insert("driver".into(), Value::String("claude".into()));
+            claim.fields.insert("body".into(), body);
+            let (observation, appended) = local.append_claim_outcome(&claim).unwrap();
+            assert!(appended);
+            let rollup = local
+                .usage_rollup_for_timeline(&observation)
+                .unwrap()
+                .unwrap();
+            local.append_client_claim(&rollup).unwrap();
+            rollup
+        };
+        let opus = |account: &str| {
+            json!({"semantics": "response", "model": "claude-opus-5-5", "account": account,
+                "input_tokens": 1000, "output_tokens": 100, "cached_tokens": 10000,
+                "cache_write_tokens": 2000, "cache_write_1h_tokens": 1000, "total_tokens": 13100})
+        };
+        let start = now_ms() as u64;
+        own_step("step-run/example/build");
+        let build = respond("response-a", opus("claude/aaaaaaaaaaaaaaaa"));
+        // $4 input, $20 output, $0.20 cache read, $5 and $8 for five-minute and one-hour writes.
+        assert_eq!(
+            build.fields["cost_microusd"],
+            4_000 + 2_000 + 2_000 + 5_000 + 8_000
+        );
+        assert_eq!(build.fields["account"], "claude/aaaaaaaaaaaaaaaa");
+        assert_eq!(build.fields["pricing"], crate::pricing::PRICING_REVISION);
+        own_step("step-run/example/review");
+        respond("response-b", opus("claude/bbbbbbbbbbbbbbbb"));
+        respond(
+            "response-c",
+            json!({"semantics": "response", "model": "local-example", "input_tokens": 70, "output_tokens": 7, "total_tokens": 77}),
+        );
+        respond(
+            "response-d",
+            json!({"semantics": "response", "model": "local-example", "input_tokens": 9, "output_tokens": 1, "total_tokens": 10, "cost": 0.0025, "currency": "USD"}),
+        );
+
+        // Each key replicates even while the harness keeps working: a step change must not
+        // leave the previous step's last totals pending behind the next step's.
+        let replicated = local.claims_for(subject, Some("harness.usage")).unwrap();
+        assert_eq!(replicated.len(), 3, "{replicated:#?}");
+        // The local model's second response waits for the next interval, or for the harness
+        // to stop working.
+        observed("ready", "spend-idle");
+        assert_eq!(
+            local
+                .claims_for(subject, Some("harness.usage"))
+                .unwrap()
+                .len(),
+            4
+        );
+
+        let rows = local
+            .usage_period_rows(start.saturating_sub(1), now_ms() as u64 + 1)
+            .unwrap();
+        let row = |step: &str, account: &str, model: &str| {
+            rows.iter()
+                .find(|row| {
+                    row["step"] == step && row["account"] == account && row["model"] == model
+                })
+                .unwrap_or_else(|| panic!("{step} {account} {model}: {rows:#?}"))
+        };
+        let build = row(
+            "step-run/example/build",
+            "claude/aaaaaaaaaaaaaaaa",
+            "claude-opus-5-5",
+        );
+        assert_eq!(build["cost_microusd"], 21_000);
+        assert_eq!(build["unpriced_tokens"], 0);
+        let review = row(
+            "step-run/example/review",
+            "claude/bbbbbbbbbbbbbbbb",
+            "claude-opus-5-5",
+        );
+        assert_eq!(review["cost_microusd"], 21_000);
+        assert_eq!(review["mission_run"], "mission-run/example");
+        let local_model = row("step-run/example/review", "", "local-example");
+        assert_eq!(local_model["total_tokens"], 87);
+        assert_eq!(
+            local_model["unpriced_tokens"], 77,
+            "an unpriced response is never free"
+        );
+        assert_eq!(local_model["cost_microusd"], 2_500);
+        assert_eq!(local_model["reported_cost_microusd"], 2_500);
+    }
+
+    #[test]
+    fn response_usage_binds_to_the_step_held_when_the_harness_recorded_it() {
+        let store = Store::open_memory("host-one").unwrap();
+        let subject = "agent/example.worker";
+        let activated = now_ms() as u64 - 60_000;
+        {
+            let connection = store.connection.lock().unwrap();
+            connection
+                .execute_batch("PRAGMA foreign_keys=OFF;")
+                .unwrap();
+            connection.execute(
+                "INSERT INTO step_runs(subject, run_id, generation_id, step_path, definition_hash, status, attempt,
+                    goals, lease_owner, lease_incarnation, lease_expires_at_unix_ms, activated_at_unix_ms,
+                    created_at_unix_ms, updated_at_unix_ms)
+                 VALUES ('step-run/example/build', 'example', 'example', 'build', 'hash', 'working', 1,
+                    '[]', ?1, 'inc-one', ?2, ?3, ?3, ?3)",
+                params![subject, (activated + 3_600_000).to_string(), activated.to_string()],
+            ).unwrap();
+            connection.execute_batch("PRAGMA foreign_keys=ON;").unwrap();
+        }
+        let respond = |entry: &str, at: u64| {
+            let mut claim = timeline_observation(subject, "inc-one", entry);
+            claim
+                .fields
+                .insert("entry_type".into(), Value::String("usage".into()));
+            claim
+                .fields
+                .insert("observed_at_unix_ms".into(), Value::from(at));
+            claim.fields.insert(
+                "body".into(),
+                json!({"semantics": "response", "model": "claude-opus-5-5", "input_tokens": 1, "output_tokens": 1, "total_tokens": 2}),
+            );
+            store.append_claim_outcome(&claim).unwrap().0.body["fields"]["attribution"].clone()
+        };
+        let during = respond("during", activated + 1);
+        assert_eq!(during["step_id"], "step-run/example/build");
+        assert_eq!(during["mission_run_id"], "mission-run/example");
+        // Replayed later, a response from before the step began is not charged to it.
+        let before = respond("before", activated - 1);
+        assert!(before["step_id"].is_null(), "{before}");
     }
 
     #[test]
@@ -40355,7 +40799,7 @@ mission "typecase" state="ready" {
     }
 
     #[test]
-    fn desired_person_messages_appear_in_attention_without_a_sent_claim() {
+    fn a_declared_person_message_stays_in_conversations_and_out_of_attention() {
         let store = Store::open_memory("node").unwrap();
         let source = r#"
 version 2
@@ -40380,32 +40824,20 @@ message "human-attention" {
             .apply(&intent, &preview.subject_tokens, "desired-human-attention")
             .unwrap();
 
-        let items = store.attention_items(Some("person/alex")).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, "unread-message");
-        assert_eq!(items[0].title, "Please review");
-        assert!(items[0].requested_at_unix_ms > 0);
-        assert_eq!(
-            items[0].actions[0].argv,
-            [
-                "st",
-                "conversations",
-                "read",
-                "message/human-attention",
-                "--as",
-                "person/alex",
-            ]
-        );
+        let mailbox = store.messages(Some("person/alex"), false).unwrap();
+        assert_eq!(mailbox.len(), 1);
+        assert_eq!(mailbox[0].title.as_deref(), Some("Please review"));
         assert!(
             store
-                .claims_for("message/human-attention", Some("message.sent"))
+                .attention_items(Some("person/alex"))
                 .unwrap()
                 .is_empty()
         );
+        assert!(store.attention_items(None).unwrap().is_empty());
     }
 
     #[test]
-    fn unread_person_messages_leave_attention_after_read() {
+    fn an_unread_person_message_never_enters_attention() {
         let store = Store::open_memory("node").unwrap();
         let message = store
             .append_claim(&ClaimInput {
@@ -40415,6 +40847,7 @@ message "human-attention" {
                 fields: BTreeMap::from([
                     ("from".into(), Value::String("agent/demo/worker".into())),
                     ("to".into(), Value::String("person/alex".into())),
+                    ("title".into(), Value::String("Can you look?".into())),
                     ("content".into(), Value::String("Please read this.".into())),
                     ("status".into(), Value::String("sent".into())),
                 ]),
@@ -40423,10 +40856,14 @@ message "human-attention" {
                 idempotency_key: Some("human-attention-message".into()),
             })
             .unwrap();
-        let items = store.attention_items(Some("person/alex")).unwrap();
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].kind, "unread-message");
-        assert_eq!(items[0].actions[0].label, "read");
+        let quiet = |store: &Store| {
+            store
+                .attention_items(Some("person/alex"))
+                .unwrap()
+                .is_empty()
+                && store.attention_items(None).unwrap().is_empty()
+        };
+        assert!(quiet(&store));
 
         store
             .append_claim(&ClaimInput {
@@ -40442,26 +40879,10 @@ message "human-attention" {
                 idempotency_key: Some("deliver-human-attention-message".into()),
             })
             .unwrap();
+        assert!(quiet(&store));
         assert_eq!(
-            store.attention_items(Some("person/alex")).unwrap()[0].kind,
-            "unread-message"
-        );
-        store
-            .append_claim(&ClaimInput {
-                subject: message.subject,
-                kind: "message.read".into(),
-                actor: Some("person/alex".into()),
-                fields: BTreeMap::from([("status".into(), Value::String("read".into()))]),
-                evidence: Vec::new(),
-                expected_subject: None,
-                idempotency_key: Some("read-human-attention-message".into()),
-            })
-            .unwrap();
-        assert!(
-            store
-                .attention_items(Some("person/alex"))
-                .unwrap()
-                .is_empty()
+            store.messages(Some("person/alex"), false).unwrap()[0].status,
+            "delivered"
         );
     }
 
