@@ -127,6 +127,9 @@ impl OtlpExporter {
         if let Some(metrics) = otlp_hook_metrics(&self.node, &batch) {
             self.send(&self.metrics_url, &metrics).await?;
         }
+        if let Some(metrics) = otlp_usage_metrics(&self.node, &batch) {
+            self.send(&self.metrics_url, &metrics).await?;
+        }
         if let Some(traces) = otlp_hook_traces(&self.node, &batch) {
             self.send(&self.traces_url, &traces).await?;
         }
@@ -226,6 +229,9 @@ pub fn otlp_logs(node: &str, batch: &[ClaimRecord]) -> Value {
                 record["spanId"] = span["spanId"].clone();
             }
             let mut records = vec![record];
+            if let Some(usage) = UsageResponse::of(observation) {
+                records.push(usage.log_record());
+            }
             if observation.kind == crate::telemetry::KIND
                 && let Some(logs) = fields.pointer("/signals/logs").and_then(Value::as_array)
             {
@@ -261,6 +267,154 @@ pub fn otlp_logs(node: &str, batch: &[ClaimRecord]) -> Value {
             }]
         }]
     })
+}
+
+/// One model response's spend, from the harness timeline entry st recorded for it.
+struct UsageResponse<'a> {
+    observation: &'a ClaimRecord,
+    fields: &'a Value,
+}
+
+impl<'a> UsageResponse<'a> {
+    fn of(observation: &'a ClaimRecord) -> Option<Self> {
+        let fields = observation.body.get("fields")?;
+        (observation.kind == "harness.timeline"
+            && fields["entry_type"] == "usage"
+            && fields["body"]["semantics"] == "response")
+            .then_some(Self {
+                observation,
+                fields,
+            })
+    }
+
+    fn text(&self, pointer: &str) -> &'a str {
+        self.fields
+            .pointer(pointer)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("unknown")
+    }
+
+    fn tokens(&self, name: &str) -> u64 {
+        self.fields["body"][name].as_u64().unwrap_or(0)
+    }
+
+    fn cost_microusd(&self) -> u64 {
+        self.fields["spend"]["cost_microusd"].as_u64().unwrap_or(0)
+    }
+
+    /// Bounded metric labels: no agent, step or run identity, which stay in the log record.
+    fn labels(&self) -> [(&'static str, &'a str); 4] {
+        [
+            ("driver", self.text("/driver")),
+            ("model", self.text("/body/model")),
+            ("account", self.text("/body/account")),
+            ("basis", self.text("/spend/basis")),
+        ]
+    }
+
+    const TOKENS: [(&'static str, &'static str); 4] = [
+        ("input", "input_tokens"),
+        ("output", "output_tokens"),
+        ("cache_read", "cached_tokens"),
+        ("cache_write", "cache_write_tokens"),
+    ];
+
+    /// `st.usage.response`: the response's attribution, tokens and cost as flat attributes, so a
+    /// log store can sum spend by agent, mission run, step, model and account.
+    fn log_record(&self) -> Value {
+        let at = self.fields["observed_at_unix_ms"]
+            .as_u64()
+            .map_or(self.observation.accepted_at_unix_ms, u128::from);
+        let time = (at * 1_000_000).to_string();
+        let string = |key: &str, value: &str| attribute(key, json!({ "stringValue": value }));
+        let int = |key: &str, value: u64| attribute(key, json!({ "intValue": value.to_string() }));
+        let mut attributes = vec![
+            string("st.agent", &self.observation.subject),
+            string("st.mission_run", self.text("/attribution/mission_run_id")),
+            string("st.step", self.text("/attribution/step_id")),
+            string("st.incarnation_id", self.text("/incarnation_id")),
+            string("st.host", self.text("/host")),
+            string("st.pricing", self.text("/spend/pricing")),
+        ];
+        for (name, value) in self.labels() {
+            attributes.push(string(&format!("st.{name}"), value));
+        }
+        for (name, field) in Self::TOKENS {
+            attributes.push(int(&format!("st.tokens.{name}"), self.tokens(field)));
+        }
+        attributes.push(int("st.tokens.total", self.tokens("total_tokens")));
+        attributes.push(int("st.cost.microusd", self.cost_microusd()));
+        json!({
+            "timeUnixNano": time,
+            "observedTimeUnixNano": (self.observation.accepted_at_unix_ms * 1_000_000).to_string(),
+            "severityNumber": 9,
+            "severityText": "INFO",
+            "eventName": "st.usage.response",
+            "body": { "stringValue": "model response" },
+            "attributes": attributes,
+        })
+    }
+}
+
+/// Token and cost counters for the batch's model responses, as delta sums.
+fn otlp_usage_metrics(node: &str, batch: &[ClaimRecord]) -> Option<Value> {
+    let responses = batch
+        .iter()
+        .filter_map(UsageResponse::of)
+        .collect::<Vec<_>>();
+    if responses.is_empty() {
+        return None;
+    }
+    let mut tokens = BTreeMap::<(Vec<(&str, &str)>, &str), u64>::new();
+    let mut cost = BTreeMap::<Vec<(&str, &str)>, u64>::new();
+    for response in &responses {
+        let labels = response.labels().to_vec();
+        for (name, field) in UsageResponse::TOKENS {
+            *tokens.entry((labels.clone(), name)).or_default() += response.tokens(field);
+        }
+        *cost.entry(labels).or_default() += response.cost_microusd();
+    }
+    let started = (batch.first()?.accepted_at_unix_ms * 1_000_000)
+        .saturating_sub(1)
+        .to_string();
+    let ended = (batch.last()?.accepted_at_unix_ms * 1_000_000).to_string();
+    let point = |labels: &[(&str, &str)], extra: Option<(&str, &str)>, value: u64| {
+        let attributes = labels
+            .iter()
+            .copied()
+            .chain(extra)
+            .map(|(key, value)| attribute(key, json!({ "stringValue": value })))
+            .collect::<Vec<_>>();
+        json!({
+            "startTimeUnixNano": started, "timeUnixNano": ended,
+            "asInt": value.to_string(), "attributes": attributes,
+        })
+    };
+    let token_points = tokens
+        .iter()
+        .map(|((labels, kind), value)| point(labels, Some(("type", kind)), *value))
+        .collect::<Vec<_>>();
+    let cost_points = cost
+        .iter()
+        .map(|(labels, value)| point(labels, None, *value))
+        .collect::<Vec<_>>();
+    Some(
+        json!({"resourceMetrics": [{"resource": resource(node), "scopeMetrics": [{
+            "scope": {"name": "st"}, "metrics": [
+                {
+                    "name": "st_usage_tokens_total", "unit": "{token}",
+                    "description": "Model tokens by driver, model, paying account, cost basis and token type",
+                    "sum": {"aggregationTemporality": 1, "isMonotonic": true, "dataPoints": token_points},
+                },
+                {
+                    "name": "st_usage_cost_microusd_total", "unit": "{microUSD}",
+                    "description": "API-equivalent cost in millionths of a US dollar, by driver, model, paying account and cost basis",
+                    "sum": {"aggregationTemporality": 1, "isMonotonic": true, "dataPoints": cost_points},
+                },
+            ],
+        }]}]}),
+    )
 }
 
 fn resource(node: &str) -> Value {
@@ -536,6 +690,106 @@ mod tests {
                 {"key": "text", "value": {"stringValue": "entry 7"}}
             ]}}
         })));
+    }
+
+    #[tokio::test]
+    async fn each_model_response_exports_its_spend_as_a_log_and_bounded_counters() {
+        let (collector, endpoint) = start_collector().await;
+        let store = Arc::new(Store::open_memory("node-a").unwrap());
+        let respond = |entry: u64, account: Option<&str>| {
+            let mut body = json!({"semantics": "response", "model": "claude-opus-5-5",
+                "input_tokens": 1000, "output_tokens": 100, "cached_tokens": 10000,
+                "cache_write_tokens": 0, "total_tokens": 11100});
+            if let Some(account) = account {
+                body["account"] = json!(account);
+            }
+            store
+                .append_claim(&ClaimInput {
+                    subject: "agent/node.worker".into(),
+                    kind: "harness.timeline".into(),
+                    actor: Some("agent/node.worker".into()),
+                    fields: BTreeMap::from([
+                        ("operation".into(), json!("append")),
+                        ("entry_id".into(), json!(format!("usage-{entry}"))),
+                        ("source_id".into(), json!(format!("source-{entry}"))),
+                        ("sequence".into(), json!(entry)),
+                        ("revision".into(), json!(1)),
+                        ("role".into(), json!("system")),
+                        ("entry_type".into(), json!("usage")),
+                        ("final".into(), json!(true)),
+                        ("body".into(), body),
+                        ("driver".into(), json!("claude")),
+                        ("incarnation_id".into(), json!("inc-1")),
+                        (
+                            "observed_at_unix_ms".into(),
+                            json!(1_700_000_000_000_u64 + entry),
+                        ),
+                    ]),
+                    evidence: Vec::new(),
+                    expected_subject: None,
+                    idempotency_key: Some(format!("otlp-usage-{entry}")),
+                })
+                .unwrap();
+        };
+        respond(1, Some("claude/aaaaaaaaaaaaaaaa"));
+        respond(2, Some("claude/aaaaaaaaaaaaaaaa"));
+        respond(3, None);
+        let exporter = OtlpExporter::new(
+            &OtlpConfig {
+                endpoint,
+                headers_file: None,
+            },
+            "node-a",
+        )
+        .unwrap();
+        assert_eq!(exporter.export_once(&store).await.unwrap().exported, 3);
+        let requests = collector.requests.lock().unwrap();
+        let usage = records(&requests[0].1)
+            .into_iter()
+            .filter(|record| record["eventName"] == "st.usage.response")
+            .collect::<Vec<_>>();
+        assert_eq!(usage.len(), 3);
+        assert_eq!(usage[0]["timeUnixNano"], "1700000000001000000");
+        let attributes = usage[0]["attributes"].as_array().unwrap();
+        // Opus 5.5: $4 input, $20 output and $0.20 cache reads per million tokens.
+        for (key, value) in [
+            ("st.agent", json!({"stringValue": "agent/node.worker"})),
+            ("st.model", json!({"stringValue": "claude-opus-5-5"})),
+            (
+                "st.account",
+                json!({"stringValue": "claude/aaaaaaaaaaaaaaaa"}),
+            ),
+            ("st.basis", json!({"stringValue": "estimated"})),
+            ("st.step", json!({"stringValue": "unknown"})),
+            ("st.tokens.cache_read", json!({"intValue": "10000"})),
+            ("st.cost.microusd", json!({"intValue": "8000"})),
+        ] {
+            assert!(
+                attributes.contains(&json!({"key": key, "value": value})),
+                "{key}: {attributes:#?}"
+            );
+        }
+        let metrics = requests
+            .iter()
+            .find(|(_, body)| body.get("resourceMetrics").is_some())
+            .map(|(_, body)| &body["resourceMetrics"][0]["scopeMetrics"][0]["metrics"])
+            .unwrap();
+        let cost = metrics
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|metric| metric["name"] == "st_usage_cost_microusd_total")
+            .unwrap();
+        let points = cost["sum"]["dataPoints"].as_array().unwrap();
+        assert_eq!(points.len(), 2, "one point per account: {points:#?}");
+        assert!(points.iter().any(|point| point["asInt"] == "16000"));
+        let labels = points[0]["attributes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|attribute| attribute["key"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(labels, ["driver", "model", "account", "basis"]);
     }
 
     #[tokio::test]
