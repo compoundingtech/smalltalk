@@ -1,18 +1,21 @@
-import type { ReactNode } from 'react';
-import { MenuView } from '@react-native-menu/menu';
+import { cloneElement, isValidElement, type ReactElement } from 'react';
+import { ActionSheetIOS } from 'react-native';
 
-// A native context menu (UIMenu) on long press, from @react-native-menu/menu. The row's own tap
-// still opens it; the menu offers the other things a person can do with it.
+// What else a person can do with a row, on long press, as an action sheet. The row keeps its
+// own tap. A native UIMenu wrapped around the row swallowed that tap on iOS 27, so a list of
+// agents could not be opened (Nathan, 2026-10-01).
 export type MenuAction = { id: string; title: string; symbol?: string; destructive?: boolean; run: () => void };
 
-export function ContextMenu({ actions, title, children }: { actions: MenuAction[]; title?: string; children: ReactNode }) {
-  if (!actions.length) return <>{children}</>;
-  return <MenuView
-    title={title}
-    shouldOpenOnLongPress
-    actions={actions.map(action => ({ id: action.id, title: action.title, image: action.symbol, attributes: action.destructive ? { destructive: true } : undefined }))}
-    onPressAction={({ nativeEvent }) => actions.find(action => action.id === nativeEvent.event)?.run()}
-  >
-    {children}
-  </MenuView>;
+export function ContextMenu({ actions, title, children }: { actions: MenuAction[]; title?: string; children: ReactElement<{ onLongPress?: () => void }> }) {
+  if (!actions.length || !isValidElement(children)) return children;
+  const show = () => ActionSheetIOS.showActionSheetWithOptions(
+    {
+      title,
+      options: [...actions.map(action => action.title), 'Cancel'],
+      cancelButtonIndex: actions.length,
+      destructiveButtonIndex: actions.flatMap((action, index) => action.destructive ? [index] : []),
+    },
+    index => actions[index]?.run(),
+  );
+  return cloneElement(children, { onLongPress: show });
 }
