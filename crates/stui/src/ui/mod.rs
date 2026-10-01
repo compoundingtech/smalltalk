@@ -397,6 +397,75 @@ impl Ui {
         self.tab == 1 && self.selected_id().as_deref() == Some(agent)
     }
 
+    /// Make the links drawn in `area` clickable: addresses written out, and markdown links by
+    /// the text they were drawn with.
+    fn links(&self, buf: &Buffer, area: Rect) {
+        for y in area.y..area.y + area.height {
+            let cells = (area.x..area.x + area.width)
+                .map(|x| (x, &buf[(x, y)]))
+                .collect::<Vec<_>>();
+            let row = cells
+                .iter()
+                .map(|(_, cell)| cell.symbol().chars().next().unwrap_or(' '))
+                .collect::<Vec<_>>();
+            let text = row.iter().collect::<String>();
+            // Written-out addresses.
+            let mut from = 0;
+            while let Some(offset) = text[from..].find("http") {
+                let start = from + offset;
+                let tail = &text[start..];
+                if !(tail.starts_with("https://") || tail.starts_with("http://")) {
+                    from = start + 4;
+                    continue;
+                }
+                let url = tail
+                    .split(char::is_whitespace)
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches(['.', ',', ')', ']', ';', ':', '"', '\'', '>']);
+                let column = text[..start].chars().count();
+                let width = url.chars().count();
+                if let Some((x, _)) = cells.get(column) {
+                    self.hit(
+                        Rect {
+                            x: *x,
+                            y,
+                            width: width as u16,
+                            height: 1,
+                        },
+                        Hit::Link(url.to_owned()),
+                    );
+                }
+                from = start + url.len().max(1);
+            }
+            // Markdown links: underlined runs whose text names a link.
+            let mut index = 0;
+            while index < cells.len() {
+                if !cells[index].1.modifier.contains(Modifier::UNDERLINED) {
+                    index += 1;
+                    continue;
+                }
+                let start = index;
+                while index < cells.len() && cells[index].1.modifier.contains(Modifier::UNDERLINED)
+                {
+                    index += 1;
+                }
+                let words = row[start..index].iter().collect::<String>();
+                if let Some(url) = st3_conversation_ui::text::link_for(&words) {
+                    self.hit(
+                        Rect {
+                            x: cells[start].0,
+                            y,
+                            width: (index - start) as u16,
+                            height: 1,
+                        },
+                        Hit::Link(url),
+                    );
+                }
+            }
+        }
+    }
+
     /// One attachment's thumbnail, encoded on first sight and kept.
     fn draw_thumbnail(&self, buf: &mut Buffer, area: Rect, attachment: &attach::Attachment) {
         let Some(picker) = &self.picker else { return };
@@ -1654,6 +1723,14 @@ impl Ui {
                 area.width.saturating_sub(1),
             );
         }
+        self.links(
+            buf,
+            Rect {
+                height: (total.saturating_sub(top)).min(height) as u16,
+                width: area.width.saturating_sub(1),
+                ..area
+            },
+        );
         for target in &doc.targets {
             if target.line >= top && target.line < top + height {
                 let rect = Rect {
@@ -3199,6 +3276,15 @@ impl Ui {
             Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
             Hit::PaletteSection(section) => self.open_palette(Some(section), glass::Open::Here),
             Hit::NewAgent => self.open_new_agent(None),
+            // The terminal may be on another machine than stui (over SSH or fabric): the
+            // clipboard is the person's, so the link lands where their browser is.
+            Hit::Link(url) => {
+                copy(&url);
+                self.flash(format!(
+                    "Copied {} · paste it in a browser",
+                    text::truncate(&url, 60)
+                ));
+            }
             Hit::Split(right) => self.split(right),
             Hit::GlassTab(group, tab) => self.show_in(group, tab),
             Hit::GlassAdd(group) => {

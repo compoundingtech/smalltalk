@@ -207,6 +207,27 @@ fn with_bg(style: Style, fill: Option<Color>) -> Style {
     }
 }
 
+thread_local! {
+    /// The address behind each markdown link's text, so a client can open what it drew.
+    static LINKS: std::cell::RefCell<std::collections::HashMap<String, String>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+/// The address of a markdown link drawn with this text, once it has been drawn.
+pub fn link_for(text: &str) -> Option<String> {
+    LINKS.with(|links| links.borrow().get(text.trim()).cloned())
+}
+
+fn remember_link(text: &str, url: &str) {
+    LINKS.with(|links| {
+        let mut links = links.borrow_mut();
+        if links.len() > 2048 {
+            links.clear();
+        }
+        links.insert(text.trim().to_owned(), url.trim().to_owned());
+    });
+}
+
 /// Inline markdown: **bold**, `code`, [text](url).
 pub fn inline(text: &str, base: Style, theme: &Theme) -> Vec<Run> {
     let mut runs = Vec::new();
@@ -235,6 +256,7 @@ pub fn inline(text: &str, base: Style, theme: &Theme) -> Vec<Run> {
             && let Some(end) = after[close + 2..].find(')')
         {
             flush(&mut plain, &mut runs);
+            remember_link(&after[..close], &after[close + 2..close + 2 + end]);
             runs.push(run(
                 &after[..close],
                 base.fg(theme.blue).add_modifier(Modifier::UNDERLINED),
