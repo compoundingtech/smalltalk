@@ -7,10 +7,11 @@
 //! which the R11 control-plane replacement guarantee exists to prevent — so the wrapper exports its
 //! own executable path. The second is the catalog and identity the channel must bind.
 //!
-//! The wrapper also owns presence for the same reason the Claude wrapper does: the extension lives
+//! Catalog wrappers also own their status lease for the same reason Claude does: the extension lives
 //! only as long as the provider's process, and a measured SIGKILL of pi produces no terminal record
 //! at all (`docs/vrs/.experiments/2026-08-18-pi-harness-integration.md`). Presence therefore decays
-//! by staleness, exactly as for the other harnesses.
+//! by staleness, exactly as for the other harnesses. Native launches omit that status transport
+//! and retain session-owned observed records and terminal fencing.
 //!
 //! The fork between the two harnesses is a [`HarnessKind`] descriptor, mirroring the
 //! [`crate::pi_channel::ChannelKind`] fork the family's channel side already uses: the same fork
@@ -93,6 +94,7 @@ pub(crate) fn run_for(
         &[],
         &[],
         None,
+        true,
     )
 }
 
@@ -106,6 +108,7 @@ pub(crate) fn run_for_with_environment(
     additional_env: &[(String, String)],
     removed_env: &[&str],
     required_incarnation: Option<String>,
+    legacy_presence: bool,
 ) -> Result<()> {
     let label = kind.label;
     let agent_dir =
@@ -209,11 +212,13 @@ pub(crate) fn run_for_with_environment(
     );
     let outcome = run_provider_observed_with_env_removals(
         label,
-        &status::status_path(&agent_dir),
+        legacy_presence
+            .then(|| status::status_path(&agent_dir))
+            .as_deref(),
         &provider_argv,
         &env,
         removed_env,
-        status::STATUS_REFRESH,
+        crate::provider_session::SESSION_REFRESH,
         PROVIDER_POLL,
         &STOP,
         Some(&observer),
@@ -241,6 +246,7 @@ pub(crate) fn adopt_for(
     pid: u32,
     session: String,
     seq: u64,
+    legacy_presence: bool,
 ) -> Result<()> {
     let label = kind.label;
     let agent_dir =
@@ -256,9 +262,11 @@ pub(crate) fn adopt_for(
     );
     let outcome = crate::provider_session::adopt_provider_observed(
         label,
-        &status::status_path(&agent_dir),
+        legacy_presence
+            .then(|| status::status_path(&agent_dir))
+            .as_deref(),
         pid,
-        status::STATUS_REFRESH,
+        crate::provider_session::SESSION_REFRESH,
         PROVIDER_POLL,
         &STOP,
         Some(&observer),

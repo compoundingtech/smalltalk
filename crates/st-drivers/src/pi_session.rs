@@ -80,6 +80,7 @@ pub fn adopt(
         pid,
         session,
         seq,
+        true,
     )
 }
 
@@ -102,7 +103,7 @@ mod tests {
 
         run_provider(
             "pi",
-            &presence,
+            Some(&presence),
             // Deliberately cheaper than the Claude twin: this binary already runs one
             // spawn-and-poll presence test, and the codex app-server tests beside it are
             // timing-sensitive. One refresh inside the child's life is all this needs to prove.
@@ -128,7 +129,7 @@ mod tests {
         let stop = AtomicBool::new(false);
         let outcome = crate::provider_session::run_provider_observed(
             "pi",
-            &status::status_path(tmp.path()),
+            Some(&status::status_path(tmp.path())),
             &["sh".into(), "-c".into(), "exit 3".into()],
             &[],
             Duration::from_secs(60),
@@ -181,4 +182,46 @@ mod tests {
         assert_eq!(observed.state, Activity::Ended);
         assert_eq!(observed.exit.as_deref(), Some("signal 9"));
     }
+}
+
+/// Launch a native graph-owned session without legacy presence transport.
+pub fn run_native(
+    catalog_root: &Path,
+    identity: String,
+    runtime_id: String,
+    argv: Vec<String>,
+) -> Result<()> {
+    pi_family_session::run_for_with_environment(
+        catalog_root,
+        identity,
+        runtime_id,
+        argv,
+        &PI_KIND,
+        &[],
+        &[],
+        None,
+        false,
+    )
+}
+
+/// Adopt a native graph-owned session without legacy presence transport.
+#[allow(clippy::too_many_arguments)]
+pub fn adopt_native(
+    catalog_root: &Path,
+    identity: String,
+    runtime_id: String,
+    pid: u32,
+    session: String,
+    seq: u64,
+) -> Result<()> {
+    pi_family_session::adopt_for(
+        catalog_root,
+        identity,
+        runtime_id,
+        &PI_KIND,
+        pid,
+        session,
+        seq,
+        false,
+    )
 }

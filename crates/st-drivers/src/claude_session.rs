@@ -1,8 +1,8 @@
-//! Controlled Claude launch with a session-owned presence lease.
+//! Controlled Claude launch with session-owned observed state.
 //!
 //! Claude can close its stdio MCP child after startup. That child cannot prove that the interactive
-//! provider still lives. This wrapper launches the provider and refreshes presence while that exact
-//! child remains alive. It uses the provider's existing terminal process group. The launch body
+//! provider still lives. This wrapper supervises that exact child and refreshes its observed
+//! record while it remains alive. Catalog launches also maintain their status lease. It uses the provider's existing terminal process group. The launch body
 //! itself lives in [`crate::provider_session`], which every interactive harness wrapper shares.
 //!
 //! Observed harness state for Claude has two producers with one owner each: hook invocations
@@ -122,11 +122,11 @@ fn run_with_required_resume(
     }
     run_provider_with_env_removals(
         "Claude",
-        &status::status_path(&agent_dir),
+        Some(&status::status_path(&agent_dir)),
         &claude_argv,
         &env,
         &[EXPECTED_NATIVE_SESSION_ENV, RESUME_GENERATION_ENV],
-        status::STATUS_REFRESH,
+        crate::provider_session::SESSION_REFRESH,
         PROVIDER_POLL,
         &STOP,
         Some(&observer),
@@ -169,11 +169,11 @@ pub fn run_controlled_paths(
     // An st3 seat never carries an st2 residency fence, so an inherited one must not reach hooks.
     run_provider_with_env_removals(
         "Claude",
-        &status::status_path(agent_dir),
+        None,
         &claude_argv,
         &env,
         &[EXPECTED_NATIVE_SESSION_ENV, RESUME_GENERATION_ENV],
-        status::STATUS_REFRESH,
+        crate::provider_session::SESSION_REFRESH,
         PROVIDER_POLL,
         &STOP,
         Some(&observer),
@@ -194,9 +194,9 @@ pub fn adopt_controlled_paths(
     let observer = SessionObserver::adopt(agent_dir, identity, "claude", runtime_id, session, seq);
     crate::provider_session::adopt_provider(
         "Claude",
-        &status::status_path(agent_dir),
+        None,
         pid,
-        status::STATUS_REFRESH,
+        crate::provider_session::SESSION_REFRESH,
         PROVIDER_POLL,
         &STOP,
         Some(&observer),
@@ -2020,7 +2020,7 @@ mod tests {
 
         run_provider(
             "Claude",
-            &presence,
+            Some(&presence),
             &[
                 "sh".into(),
                 "-c".into(),
@@ -2487,7 +2487,7 @@ mod tests {
 
         let result = run_provider(
             "Claude",
-            &presence,
+            Some(&presence),
             &["sh".into(), "-c".into(), "kill -9 $$".into()],
             &[],
             Duration::from_millis(25),
@@ -2512,7 +2512,7 @@ mod tests {
 
         run_provider(
             "Claude",
-            &presence,
+            Some(&presence),
             &["true".into()],
             &[],
             Duration::from_millis(25),

@@ -1096,6 +1096,7 @@ fn captured_delivery_frames_carrying_no_token_count_publish_no_record() {
 fn delivery_config(root: &Path) -> CodexDeliveryConfig {
     let agent_dir = root.join("agents/h/worker");
     CodexDeliveryConfig {
+        control: crate::session_control::SessionControl::Catalog,
         catalog_root: root.to_path_buf(),
         inbox: message::inbox_dir(&agent_dir),
         agent_dir,
@@ -1395,6 +1396,43 @@ fn delivery_client_id_is_stable_and_binds_every_identity_component() {
         id,
         stable_client_user_message_id("h.worker", "thread-main", "1786380000000-def456.md")
     );
+}
+
+#[test]
+fn graph_hold_allows_readonly_thread_snapshots() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = delivery_config(root.path());
+    config.control = crate::session_control::SessionControl::Graph(
+        crate::session_control::DeliveryGate::default(),
+    );
+    message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body").unwrap();
+    let mut delivery = inbox_delivery(root.path(), config);
+    let state = subscribed_state(CodexObservedState::Idle);
+    assert!(delivery.maybe_request(&state).unwrap().is_none());
+    let request = delivery.maybe_snapshot_request(&state).unwrap().unwrap();
+    assert_eq!(request["method"], "thread/read");
+}
+
+#[test]
+fn graph_hold_controls_native_handoff_independently_of_status_and_inbox_refresh() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = delivery_config(root.path());
+    let gate = crate::session_control::DeliveryGate::default();
+    config.control = crate::session_control::SessionControl::Graph(gate.clone());
+    let filename =
+        message::send_to_inbox(&config.inbox, "h.sender", Some("held"), None, &[], "body").unwrap();
+    let mut delivery = inbox_delivery(root.path(), config.clone());
+    let state = subscribed_state(CodexObservedState::Idle);
+    assert!(delivery.maybe_request(&state).unwrap().is_none());
+    assert!(!config.agent_dir.join("status").exists());
+    status::set_state(&config.agent_dir.join("status"), status::State::Dnd).unwrap();
+    gate.update(false, Duration::from_secs(30));
+    gate.update(true, Duration::from_secs(30));
+    assert!(delivery.maybe_request(&state).unwrap().is_none());
+    assert!(config.inbox.join(&filename).exists());
+    gate.update(false, Duration::from_secs(30));
+    let request = delivery.maybe_request(&state).unwrap().unwrap();
+    assert_eq!(request["method"], "turn/start");
 }
 
 #[test]

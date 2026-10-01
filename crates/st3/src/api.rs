@@ -423,6 +423,7 @@ fn router_for_transport(state: AppState, transport: ClientTransportBoundary) -> 
         .route("/v1/documents", get(list_documents).post(put_document))
         .route("/v1/documents/content", get(get_document))
         .route("/v1/diagnostics/harness", post(post_harness_diagnostic))
+        .route("/v1/delivery/hold", get(get_delivery_hold).post(post_delivery_hold))
         .route("/v1/claims", get(list_claims).post(post_claim))
         .route("/v1/usage", get(get_usage))
         .route("/v1/claims/by-id/{id}", get(get_claim))
@@ -4272,6 +4273,7 @@ async fn guard_bound_request(
     if ![
         "/v1/intent/apply",
         "/v1/agent-queue-moves",
+        "/v1/delivery/hold",
         "/v1/lane-changes",
         "/v1/work/",
         "/v1/attention",
@@ -7947,6 +7949,59 @@ async fn get_document(
     }))
 }
 
+#[derive(Deserialize)]
+struct DeliveryHoldQuery {
+    subject: String,
+}
+
+async fn get_delivery_hold(
+    State(state): State<AppState>,
+    Query(query): Query<DeliveryHoldQuery>,
+) -> Result<Json<crate::delivery_hold::HoldView>, ApiError> {
+    st3_schema::registry()
+        .validate_subject(&query.subject)
+        .map_err(|error| ApiError::bad(St3Error::new(error.code, error.message)))?;
+    let store = state.store.clone();
+    blocking_store(move || {
+        crate::delivery_hold::view(&store, &query.subject, client_now_ms() as u64)
+    })
+    .await
+    .map(Json)
+}
+
+async fn post_delivery_hold(
+    State(state): State<AppState>,
+    Json(request): Json<crate::delivery_hold::HoldRequest>,
+) -> Result<Json<ClaimRecord>, ApiError> {
+    let input =
+        crate::delivery_hold::input(request, client_now_ms() as u64).map_err(ApiError::bad)?;
+    let store = state.store.clone();
+    let (claim, appended) = blocking_action(move || {
+        if input.fields.get("held") == Some(&Value::Bool(true))
+            && input.fields.get("legacy_adoption") != Some(&Value::Bool(true))
+        {
+            let subjects = store
+                .desired_subjects_named(std::slice::from_ref(&input.subject))
+                .map_err(|error| St3Error::new("internal", error.to_string()))?;
+            let driver = subjects
+                .first()
+                .and_then(|subject| subject.member.as_ref())
+                .and_then(|member| member.driver.as_deref());
+            if !matches!(driver, Some("codex" | "opencode")) {
+                return Err(St3Error::new(
+                    "unsupported-delivery-hold",
+                    "delivery holds currently require a declared Codex or OpenCode seat",
+                ));
+            }
+        }
+        store.append_claim_outcome(&input)
+    })
+    .await?;
+    if appended {
+        signal_visible_change(&state);
+    }
+    Ok(Json(claim))
+}
 async fn post_claim(
     State(state): State<AppState>,
     Json(request): Json<ClaimInput>,
@@ -11532,6 +11587,70 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn delivery_hold_api_enforces_authority_and_keeps_presence_separate() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        state
+            .store
+            .apply_internal(
+                &parse_intent(
+                    r#"version 2
+agent "eval/held" { workspace "/tmp"; harness "codex" {} }
+agent "eval/channel" { workspace "/tmp"; harness "claude" {} }
+"#,
+                    "node",
+                )
+                .unwrap(),
+                "hold-fixture",
+            )
+            .unwrap();
+        let store = state.store.clone();
+        let app = router(state);
+        let now = client_now_ms() as u64;
+        let request = json!({"subject":"agent/eval/held", "actor":"person/alex", "held":true,
+            "until_unix_ms": now + 60_000, "reason":"quiet interval", "idempotency_key":"hold-api"});
+        let (status, claim) = json_request(app.clone(), "/v1/delivery/hold", request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{claim}");
+        let (status, replay) =
+            json_request(app.clone(), "/v1/delivery/hold", request.clone()).await;
+        assert_eq!(status, StatusCode::OK, "{replay}");
+        assert_eq!(claim["id"], replay["id"]);
+        let (_, hold) =
+            get_request(app.clone(), "/v1/delivery/hold?subject=agent%2Feval%2Fheld").await;
+        assert_eq!(hold["active"], true);
+        assert!(
+            store
+                .latest_claim("agent/eval/held", Some("agent.presence"))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .latest_claim("agent/eval/held", Some("harness.observed"))
+                .unwrap()
+                .is_none()
+        );
+        let mut foreign = request.clone();
+        foreign["actor"] = json!("agent/eval/other");
+        let (status, error) = json_request(app.clone(), "/v1/delivery/hold", foreign).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(error["code"], "delivery-hold-forbidden");
+        let mut unsupported = request.clone();
+        unsupported["subject"] = json!("agent/eval/channel");
+        let (_, error) = json_request(app.clone(), "/v1/delivery/hold", unsupported).await;
+        assert_eq!(error["code"], "unsupported-delivery-hold");
+        let mut release = request;
+        release["held"] = json!(false);
+        release["until_unix_ms"] = json!(0);
+        release["actor"] = json!("agent/eval/held");
+        release["idempotency_key"] = json!("hold-release");
+        let (status, result) = json_request(app.clone(), "/v1/delivery/hold", release).await;
+        assert_eq!(status, StatusCode::OK, "{result}");
+        let (_, hold) = get_request(app, "/v1/delivery/hold?subject=agent%2Feval%2Fheld").await;
+        assert_eq!(hold["active"], false);
+    }
 
     #[tokio::test]
     async fn history_pages_and_detail_do_not_cache_the_whole_claim_log() {
