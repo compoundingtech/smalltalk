@@ -6,7 +6,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { TimelineEntry } from '../../../clients/typescript/st3-client';
 import { agentGlyph, agentName, agentState, agentWord, harnessColor, harnessName } from '../agentsView';
 import { Banners } from '../chrome';
-import { conversationEntries, entryMatches, shownToolLines, unreadableTranscript, type ConversationEntry } from '../conversationView';
+import { COLLAPSED_TOOL_LINES, conversationEntries, entryMatches, shownToolLines, unreadableTranscript, type ConversationEntry } from '../conversationView';
 import { rememberBounded } from '../boundedCache';
 import type { RootScreen } from '../navigation';
 import { applyConversation, isUnresolved, type Conversation } from '../sessionView';
@@ -35,6 +35,8 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   const unresolved = session ? isUnresolved(session) : false;
   const title = route.params.title ?? (agent ? agentName(agent) : session?.driver ?? target.split('/').pop() ?? target);
   const [timeline, setTimeline] = useState<Conversation<TimelineEntry>>(() => conversationCache.current.get(target) ?? empty);
+  // Whether st has answered at all: until it has, the screen says it is loading, never "nothing".
+  const [loaded, setLoaded] = useState(() => conversationCache.current.has(target));
   const [issue, setIssue] = useState('');
   const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
   const [pending, setPending] = useState<Pending[]>([]);
@@ -77,6 +79,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     setIssue('');
     const follow = feed.followConversation(target, {
       onEntries: frame => setTimeline(previous => {
+        setLoaded(true);
         const next = applyConversation(previous, frame);
         rememberBounded(conversationCache.current, target, next, 24);
         return next;
@@ -137,7 +140,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
       renderItem={({ item: row }) => row.kind === 'older'
         ? <View style={styles.entry}><T dim>older history is not shown here · `st conversations timeline` has all of it</T></View>
         : row.kind === 'pending' ? <PendingView pending={row.pending} /> : <EntryView entry={row.entry} open={open.has(row.entry.id)} onToggle={toggle} />}
-      ListEmptyComponent={<View style={[styles.entry, { transform: [{ scaleY: -1 }] }]}>{unreadable ? <T color={theme.waiting} selectable>{unreadable}</T> : <T dim>{unresolved ? 'This process has no exact native session history.' : status === 'online' ? 'No conversation in the recent timeline.' : 'Offline; this conversation has not been loaded.'}</T>}</View>}
+      ListEmptyComponent={<View style={[styles.entry, { transform: [{ scaleY: -1 }] }]}>{unreadable ? <T color={theme.waiting} selectable>{unreadable}</T> : <T dim>{unresolved ? 'This process has no exact native session history.' : !loaded ? (status === 'online' ? 'Loading the conversation…' : 'Offline; this conversation has not been loaded yet.') : 'No conversation in the recent timeline.'}</T>}</View>}
       maintainVisibleContentPosition={{ minIndexForVisible: 0, autoscrollToTopThreshold: 60 }}
       keyboardDismissMode="interactive"
       keyboardShouldPersistTaps="handled"
@@ -213,14 +216,18 @@ const EntryView = memo(function EntryView({ entry, open, onToggle }: { entry: Co
       </View>;
     }
     case 'tool': {
-      const [bg, glyph, color] = body.state === 'running' ? [theme.toolBg, '⠿', theme.working] : body.state === 'ok' ? [theme.toolOkBg, '✓', theme.green] : [theme.toolErrBg, '✕', theme.red];
+      // Quiet until opened, as in stui: an edge in the outcome's colour, dim text, no fill, and
+      // at most six one-line rows; opened, it reads at full brightness.
+      const [glyph, color] = body.state === 'running' ? ['⠿', theme.working] : body.state === 'ok' ? ['✓', theme.green] : ['✕', theme.red];
       const shown = shownToolLines(body, open);
-      const expandable = body.output.length > 5 && body.state !== 'failed';
-      return <Pressable accessibilityRole={expandable ? 'button' : undefined} accessibilityState={expandable ? { expanded: open } : undefined} disabled={!expandable} onPress={() => onToggle(entry.id)} style={[styles.tool, { backgroundColor: bg }]}>
-        <T numberOfLines={1}><T bold color={color}>{glyph} </T><T bold>{body.title}</T></T>
-        {shown.hidden ? <T dim>  … {shown.hidden} earlier lines · tap to expand</T> : null}
-        {shown.lines.map((line, index) => <T key={index} selectable style={styles.toolLine} color={line.startsWith('+') ? theme.green : line.startsWith('-') || line.includes('error') ? theme.red : theme.subtext0}>{line || ' '}</T>)}
-        {open && expandable ? <T dim>  collapse</T> : null}
+      const expandable = body.output.length > COLLAPSED_TOOL_LINES;
+      const quiet = !open;
+      return <Pressable accessibilityRole={expandable ? 'button' : undefined} accessibilityState={expandable ? { expanded: open } : undefined} disabled={!expandable} onPress={() => onToggle(entry.id)} style={[styles.tool, { borderLeftColor: color }]}>
+        <T numberOfLines={1}><T bold color={color}>{glyph} </T><T bold={!quiet} color={quiet ? theme.overlay1 : theme.text}>{body.title}</T></T>
+        {shown.hidden ? <T dim>  … {shown.hidden} more lines · tap to show</T> : null}
+        {open && expandable ? <T dim>  ▴ collapse</T> : null}
+        {shown.lines.map((line, index) => <T key={index} selectable={!quiet} numberOfLines={quiet ? 1 : undefined} style={[styles.toolLine, quiet && { opacity: 0.7 }]} color={line.startsWith('+') ? theme.green : line.startsWith('-') || line.includes('error') ? theme.red : quiet ? theme.overlay0 : theme.subtext0}>{line || ' '}</T>)}
+        {open && expandable ? <T dim>  ▴ collapse</T> : null}
       </Pressable>;
     }
   }
@@ -232,7 +239,7 @@ const styles = StyleSheet.create({
   entry: { paddingHorizontal: 12, paddingVertical: 6 },
   user: { backgroundColor: theme.userBg, paddingHorizontal: 12, paddingVertical: 8, marginVertical: 6 },
   barred: { borderLeftWidth: 2, marginLeft: 10, paddingLeft: 8 },
-  tool: { marginHorizontal: 8, marginVertical: 4, paddingHorizontal: 8, paddingVertical: 6 },
+  tool: { marginHorizontal: 8, marginVertical: 4, paddingHorizontal: 8, paddingVertical: 4, borderLeftWidth: 2 },
   toolLine: { fontSize: 12, lineHeight: 17, paddingLeft: 18 },
   composer: { flexDirection: 'row', alignItems: 'flex-end', gap: 6, paddingHorizontal: 10, paddingTop: 6, borderTopColor: theme.surface0, borderTopWidth: StyleSheet.hairlineWidth * 2, backgroundColor: theme.mantle },
   prompt: { paddingBottom: 9, fontFamily: fonts.bold },

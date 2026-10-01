@@ -349,9 +349,10 @@ export function foldDeliveryFlaps(entries: ConversationEntry[]): ConversationEnt
   return out;
 }
 
-export const COLLAPSED_TOOL_LINES = 5;
+/** The most lines a tool call shows until opened, failed ones too, as in stui. */
+export const COLLAPSED_TOOL_LINES = 6;
 /** The lines a tool box shows: all when open, failed, or short; otherwise its last five. */
 export function shownToolLines(body: Extract<Body, { kind: 'tool' }>, open: boolean): { hidden: number; lines: string[] } {
-  if (open || body.state === 'failed' || body.output.length <= COLLAPSED_TOOL_LINES) return { hidden: 0, lines: body.output };
+  if (open || body.output.length <= COLLAPSED_TOOL_LINES) return { hidden: 0, lines: body.output };
   return { hidden: body.output.length - COLLAPSED_TOOL_LINES, lines: body.output.slice(-COLLAPSED_TOOL_LINES) };
 }
