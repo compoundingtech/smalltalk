@@ -27,9 +27,7 @@ export const buildEnv = { CARGO_PROFILE_DEV_DEBUG: '0', CARGO_PROFILE_TEST_DEBUG
 export const commonSetupSteps = [
   { uses: 'actions/checkout@v4', with: { 'fetch-depth': 0, 'persist-credentials': false } },
   // Namespace cache volume: the last committed cache is mounted at these paths for every run.
-  // /nix is deliberately not cached: a restored /nix carries the Nix installer's receipt but not its
-  // daemon, users or config, so the installer skips setup and every Nix command fails with
-  // "cannot connect to socket". Built Nix outputs are exported into ~/.cache/st-ci instead.
+  // /nix is deliberately not cached (see scripts/ci-nix-cache); ~/.cache/st-ci holds a local Nix binary cache.
   // Linux only: the macOS profile has no cache volume.
   {
     name: 'Mount Rust and CI caches',
@@ -49,6 +47,11 @@ printf 'CARGO_HOME=%s\\nCI_CACHE_DIR=%s\\n' "\${CARGO_HOME:-$HOME/.cargo}" "$HOM
 home="$RUNNER_TEMP/test-home"
 mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
 printf 'HOME=%s\\nXDG_CONFIG_HOME=%s/.config\\nXDG_CACHE_HOME=%s/.cache\\nXDG_STATE_HOME=%s/.local/state\\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"`,
+  },
+  {
+    name: 'Use the cached Nix outputs',
+    if: "runner.os == 'Linux'",
+    run: 'bash scripts/ci-nix-cache use || echo "::warning::the local Nix cache is unavailable; this run builds everything"',
   },
 ]
 

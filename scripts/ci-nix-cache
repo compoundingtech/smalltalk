@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# A local Nix binary cache on the Namespace cache volume, for Nix-built outputs and downloads.
+#
+# /nix itself cannot be cached: a restored /nix carries the Nix installer's receipt but not its
+# daemon, build users or nix.conf, so the installer skips setup and every Nix command then fails
+# with "cannot connect to socket". Instead each run installs Nix normally, `use` makes the cache
+# volume's file:// store a preferred substituter, and `save` copies what the run added back to it.
+set -euo pipefail
+cmd=${1:?usage: scripts/ci-nix-cache use|save}
+dir=${CI_CACHE_DIR:?CI_CACHE_DIR is not set}
+cache="$dir/nix-cache"
+key="$dir/nix-cache-key"
+
+case "$cmd" in
+  use)
+    mkdir -p "$cache"
+    # One signing key per cache volume; the volume is private to this repository's runners.
+    [ -s "$key.sec" ] || nix key generate-secret --key-name st-ci-cache-1 > "$key.sec"
+    nix key convert-secret-to-public < "$key.sec" > "$key.pub"
+    {
+      echo "NIX_CONFIG<<ST_CI_NIX_CONFIG"
+      echo "extra-substituters = file://$cache?priority=10"
+      echo "extra-trusted-public-keys = $(cat "$key.pub")"
+      echo "ST_CI_NIX_CONFIG"
+    } >> "$GITHUB_ENV"
+    printf 'Nix cache %s: %s store paths\n' "$cache" "$(find "$cache" -maxdepth 1 -name '*.narinfo' | wc -l)"
+    ;;
+  save)
+    start=$SECONDS
+    # Paths already in the cache are skipped, so only the first run copies the whole store.
+    nix copy --to "file://$cache?secret-key=$key.sec&compression=none" --all --no-check-sigs
+    printf 'Nix cache %s: %s store paths after saving (%ss)\n' "$cache" \
+      "$(find "$cache" -maxdepth 1 -name '*.narinfo' | wc -l)" "$((SECONDS - start))"
+    ;;
+  *) echo "unknown command: $cmd" >&2; exit 2 ;;
+esac
