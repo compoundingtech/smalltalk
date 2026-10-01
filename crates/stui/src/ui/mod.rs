@@ -1901,7 +1901,7 @@ impl Ui {
             buf.set_stringn(
                 area.x,
                 area.y + 1,
-                " Not attached. Open the agent and press Enter to attach its terminal.",
+                " Not attached. Enter attaches the terminal; Ctrl+\\ leaves it.",
                 area.width as usize,
                 theme::dim(),
             );
@@ -2667,6 +2667,30 @@ impl Ui {
             self.flash(format!("{} has no terminal to open", agent.name));
             return;
         }
+        // In glasses the terminal is a tab of its own; focusing it attaches it.
+        if self.glasses.is_some() {
+            if self.focused_pane() == Some(Pane::Terminal(agent.id.clone())) {
+                self.attach_terminal(&agent.id);
+            } else {
+                self.open_in_glass(Pane::Terminal(agent.id), glass::Open::Tab);
+            }
+            return;
+        }
+        self.attach_terminal(&agent.id);
+    }
+
+    /// Attach `agent`'s terminal: followed live, or the demo's in demo mode.
+    pub(crate) fn attach_terminal(&mut self, agent: &str) {
+        let Some(agent) = self
+            .world
+            .agents
+            .items()
+            .iter()
+            .find(|candidate| candidate.id == agent)
+            .cloned()
+        else {
+            return;
+        };
         if self.live {
             self.effects.push(Effect::OpenTerminal { agent: agent.id });
             self.flash("Opening the terminal…");

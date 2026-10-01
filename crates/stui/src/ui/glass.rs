@@ -493,6 +493,21 @@ impl Ui {
                 Pane::Agent(Some(agent.id.clone())),
             );
         }
+        // An agent's terminal, once something is typed: "atlas term".
+        if !query.trim().is_empty() {
+            for agent in screens::agent_order(&self.world)
+                .into_iter()
+                .filter(|agent| agent.terminal)
+            {
+                open(
+                    1,
+                    ("⌨", theme::OVERLAY1),
+                    format!("{} terminal", agent.name),
+                    "its terminal, attached".to_owned(),
+                    Pane::Terminal(agent.id.clone()),
+                );
+            }
+        }
         for mission in screens::mission_order(&self.world, true) {
             open(
                 2,
@@ -2201,13 +2216,35 @@ impl Ui {
         self.show_focused();
     }
 
+    /// The pane in the focused split's current tab, in glasses.
+    pub(crate) fn focused_pane(&self) -> Option<Pane> {
+        self.glasses
+            .as_ref()
+            .and_then(|glasses| glasses.glass().focused().and_then(Pane::parse))
+    }
+
     /// Point stui's own tab and selection at a pane's subject, so its keys act on it.
     fn focus_pane(&mut self, pane: &Pane) {
         let Some((tab, subject)) = pane_subject(pane) else {
             return;
         };
         self.tab = tab;
-        self.terminal = self.terminal.take().filter(|_| tab == 1);
+        // One terminal is followed at a time: the focused terminal tab's. Focusing one attaches
+        // it; focusing anything else lets the attached one go.
+        let wanted = match pane {
+            Pane::Terminal(agent) => Some(agent.as_str()),
+            _ => None,
+        };
+        let attached = self.terminal.as_ref().map(|view| view.agent.clone());
+        if attached.is_some() && attached.as_deref() != wanted {
+            self.terminal = None;
+            self.effects.push(Effect::CloseTerminal);
+        }
+        if let Some(agent) = wanted
+            && attached.as_deref() != Some(agent)
+        {
+            self.attach_terminal(agent);
+        }
         self.kdl = matches!(pane, Pane::Declaration(_));
         self.agent_form = matches!(pane, Pane::NewAgent);
         let Some(subject) = subject else { return };
@@ -2236,6 +2273,7 @@ fn pane_subject(pane: &Pane) -> Option<(usize, Option<String>)> {
     Some(match pane {
         Pane::Home(id) => (0, id.clone()),
         Pane::Agent(id) => (1, id.clone()),
+        Pane::Terminal(id) => (1, Some(id.clone())),
         Pane::Mission(id) | Pane::Declaration(id) => (2, id.clone()),
         Pane::NewAgent => (1, None),
         Pane::Machine(id) => (
@@ -2562,6 +2600,41 @@ mod tests {
         assert_eq!(tabs(&ui), (0, 0, vec![vec![ATLAS.to_owned()]]));
         ctrl(&mut ui, 'w');
         assert_eq!(tabs(&ui), (0, 0, vec![vec![]]));
+    }
+
+    #[test]
+    fn enter_opens_an_agents_terminal_in_a_tab_that_holds_it_while_focused() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        let terminal = "terminal:agent/example/atlas/builder";
+        assert_eq!(
+            tabs(&ui).2,
+            vec![vec![ATLAS.to_owned(), terminal.to_owned()]]
+        );
+        assert_eq!(
+            ui.terminal.as_ref().map(|view| view.agent.as_str()),
+            Some("agent/example/atlas/builder")
+        );
+        assert!(screen(&ui).contains("demo terminal"));
+        // Back on the conversation the terminal lets go; its tab attaches it again.
+        ui.show_tab(0);
+        assert!(ui.terminal.is_none());
+        assert!(
+            ui.effects
+                .iter()
+                .any(|effect| matches!(effect, Effect::CloseTerminal))
+        );
+        ui.show_tab(1);
+        assert!(ui.terminal.is_some());
+        // Ctrl+K finds it by name too.
+        ui.show_tab(0);
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, "builder term");
+        assert!(screen(&ui).contains("terminal"), "{}", screen(&ui));
     }
 
     #[test]
