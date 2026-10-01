@@ -11636,9 +11636,9 @@ async fn stage_message(
     transport: &str,
     runtime_id: Option<&str>,
     idempotency_key: String,
-) -> Result<()> {
+) -> Result<ClaimRecord> {
     let reference = normalize_message_reference(reference);
-    let _: ClaimRecord = client
+    client
         .post(
             &format!("/v1/messages/{}/claims", urlencoding::encode(&reference)),
             &MessageLifecycleRequest {
@@ -11651,8 +11651,7 @@ async fn stage_message(
                 idempotency_key,
             },
         )
-        .await?;
-    Ok(())
+        .await
 }
 
 async fn close_message(client: &Client, reference: &str, actor: &str) -> Result<ClaimRecord> {
@@ -13437,7 +13436,7 @@ async fn run_pi_channel(
                     };
                     if message.status == "sent" {
                         let staged = match &state.pending.fence {
-                            Some(fence) => mailbox_receipt(client, fence, &message.subject, "staged").await.map(|_| true),
+                            Some(fence) => mailbox_receipt_claim(client, fence, &message.subject, "staged").await.map(|claim| claim.kind == "message.staged"),
                             None => stage_pi_family_message(client, &message.subject, subject, driver).await,
                         };
                         match staged {
@@ -13724,7 +13723,7 @@ async fn stage_pi_family_message(
     )
     .await
     {
-        Ok(_) => Ok(true),
+        Ok(claim) => Ok(claim.kind == "message.staged"),
         Err(error) => match read_message(client, message).await {
             Ok(view) if view.status == "staged" => Ok(true),
             Ok(view) if matches!(view.status.as_str(), "delivered" | "read" | "closed") => {
@@ -14792,7 +14791,17 @@ async fn mailbox_receipt(
     message: &str,
     lifecycle: &str,
 ) -> Result<()> {
-    let _: ClaimRecord = client
+    mailbox_receipt_claim(client, fence, message, lifecycle).await?;
+    Ok(())
+}
+
+async fn mailbox_receipt_claim(
+    client: &Client,
+    fence: &st3::mailbox::Fence,
+    message: &str,
+    lifecycle: &str,
+) -> Result<ClaimRecord> {
+    client
         .post(
             "/v1/mailbox/receipts",
             &st3::mailbox::Receipt {
@@ -14801,8 +14810,7 @@ async fn mailbox_receipt(
                 lifecycle: lifecycle.into(),
             },
         )
-        .await?;
-    Ok(())
+        .await
 }
 
 fn seat_label(seat: &st3::model::DesiredSubject) -> String {
@@ -16211,13 +16219,11 @@ mod tests {
             "staged"
         );
 
-        // The late acknowledgement itself is still an invalid transition...
-        assert!(
-            deliver_message(&client, "message/held", seat, "late".into())
-                .await
-                .is_err()
-        );
-        // ...but it must not end the channel.
+        // The recipient's late acknowledgement settles to its existing read evidence.
+        deliver_message(&client, "message/held", seat, "late".into())
+            .await
+            .unwrap();
+        // Receipt replay must not end the channel or cause another handoff.
         acknowledge_pi_family_delivery(&client, seat, "message/held")
             .await
             .unwrap();
