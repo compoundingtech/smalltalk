@@ -137,6 +137,19 @@ impl Layout {
         index + 1
     }
 
+    /// Split group `index`, putting `group` before it: to its left (`Right` splits) or above it
+    /// (`Below`). Returns the new group's index, which is `index`; the old group moves after it.
+    pub fn split_first(&mut self, index: usize, side: Side, group: Group) -> usize {
+        if let Some(node) = self.node_mut(index) {
+            let old = std::mem::take(node);
+            *node = Layout::Split {
+                split: side,
+                children: vec![Layout::Group(group), old],
+            };
+        }
+        index
+    }
+
     /// The layout without group `index`; `None` when that was its only group. A split left
     /// with one child becomes that child.
     pub fn remove(self, index: usize) -> Option<Layout> {
@@ -232,6 +245,25 @@ impl Layout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_split_can_put_the_new_group_first() {
+        let mut layout = Layout::Group(Group::of(Tab::pane("agent:a")));
+        assert_eq!(
+            layout.split_first(0, Side::Right, Group::of(Tab::pane("mission:m"))),
+            0
+        );
+        let keys = |layout: &Layout| {
+            layout
+                .groups()
+                .iter()
+                .map(|group| group.tabs[0].pane.clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(keys(&layout), ["mission:m", "agent:a"]);
+        layout.split_first(1, Side::Below, Group::of(Tab::pane("machine:h")));
+        assert_eq!(keys(&layout), ["mission:m", "machine:h", "agent:a"]);
+    }
 
     fn tabs(layout: &Layout) -> Vec<Vec<&str>> {
         layout

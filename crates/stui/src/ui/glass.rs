@@ -47,10 +47,36 @@ pub(crate) struct Glasses {
     home: bool,
     /// The Ctrl+S sidebar: the old stui list beside the splits, to browse and open from.
     pub(crate) sidebar: Sidebar,
+    /// A tab being dragged with the mouse, from its press until the button is let go.
+    drag: Option<TabDrag>,
     /// The glass made at start only because this device had none by the name asked for. If it
     /// is still empty when st first sends the person's glasses, st's glass of that name is
     /// shown instead of keeping both.
     placeholder: Option<String>,
+}
+
+/// A tab pressed with the mouse: it becomes a drag once the pointer moves with the button held;
+/// until the button is let go nothing is changed.
+#[derive(Clone, Copy, Debug)]
+struct TabDrag {
+    /// The group and tab pressed.
+    from: (usize, usize),
+    start: (u16, u16),
+    at: (u16, u16),
+    moving: bool,
+}
+
+/// Where a dragged tab would land.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Drop {
+    /// Into a group's tab strip, before tab `index` (or at its end).
+    Strip { group: usize, index: usize },
+    /// A new split on one side of a group, holding the tab.
+    Edge {
+        group: usize,
+        side: Side,
+        first: bool,
+    },
 }
 
 /// The sidebar's sections, what the number keys were in the old stui.
@@ -308,6 +334,7 @@ impl Glasses {
             zoomed: false,
             home: false,
             sidebar,
+            drag: None,
             pending: BTreeMap::new(),
             placeholder,
         }
@@ -849,6 +876,7 @@ impl Ui {
         if let Some(palette) = &glasses.palette {
             self.draw_palette(buf, area, palette);
         }
+        self.draw_drag(buf);
     }
 
     /// The sidebar: its sections across the top, then that section's list.
@@ -908,6 +936,292 @@ impl Ui {
             sidebar.selected[sidebar.section],
             Hit::SidebarRow,
         );
+    }
+
+    /// The mouse, for dragging tabs: a press on a tab may start a drag (the click still shows
+    /// the tab), movement with the button held makes it one, and letting go drops it. `true`
+    /// when the event belonged to a drag.
+    pub(crate) fn drag_mouse(&mut self, mouse: crossterm::event::MouseEvent) -> bool {
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let Some(glasses) = self.glasses.as_mut() else {
+            return false;
+        };
+        let point = (mouse.column, mouse.row);
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => {
+                let tab = self
+                    .frame
+                    .borrow()
+                    .hits
+                    .iter()
+                    .rev()
+                    .find(|(rect, _)| super::contains(*rect, point.0, point.1))
+                    .and_then(|(_, hit)| match hit {
+                        Hit::GlassTab(group, tab) => Some((*group, *tab)),
+                        _ => None,
+                    });
+                glasses.drag = tab.map(|from| TabDrag {
+                    from,
+                    start: point,
+                    at: point,
+                    moving: false,
+                });
+                false
+            }
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let Some(drag) = glasses.drag.as_mut() else {
+                    return false;
+                };
+                drag.at = point;
+                drag.moving |= point != drag.start;
+                true
+            }
+            MouseEventKind::Up(MouseButton::Left) => {
+                let Some(drag) = glasses.drag.take() else {
+                    return false;
+                };
+                if !drag.moving {
+                    return false;
+                }
+                if let Some(target) = self.drop_at(point) {
+                    self.drop_tab(drag.from, target);
+                }
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a tab is being dragged; Esc lets it go where it was.
+    pub(crate) fn cancel_drag(&mut self) -> bool {
+        self.glasses
+            .as_mut()
+            .and_then(|glasses| glasses.drag.take())
+            .is_some_and(|drag| drag.moving)
+    }
+
+    /// Where a tab let go at `point` lands: a tab strip, or a split's edge or middle.
+    fn drop_at(&self, point: (u16, u16)) -> Option<Drop> {
+        let info = self.frame.borrow();
+        for (group, content) in info.glass_leaves.iter().enumerate() {
+            if content.width == 0 || content.height == 0 {
+                continue;
+            }
+            let strip = Rect {
+                y: content.y.saturating_sub(1),
+                height: 1,
+                ..*content
+            };
+            if super::contains(strip, point.0, point.1) {
+                // Before the first tab whose middle is right of the pointer.
+                let index = info
+                    .hits
+                    .iter()
+                    .filter_map(|(rect, hit)| match hit {
+                        Hit::GlassTab(at, tab) if *at == group => Some((*rect, *tab)),
+                        _ => None,
+                    })
+                    .filter(|(rect, _)| rect.x + rect.width / 2 < point.0)
+                    .map(|(_, tab)| tab + 1)
+                    .max()
+                    .unwrap_or(0);
+                return Some(Drop::Strip { group, index });
+            }
+            if super::contains(*content, point.0, point.1) {
+                // The outer quarter on each side makes a split there; the middle joins the group.
+                let x = f32::from(point.0 - content.x) / f32::from(content.width);
+                let y = f32::from(point.1 - content.y) / f32::from(content.height);
+                let edges = [
+                    (x, Side::Right, true),
+                    (1.0 - x, Side::Right, false),
+                    (y, Side::Below, true),
+                    (1.0 - y, Side::Below, false),
+                ];
+                let (distance, side, first) = edges
+                    .into_iter()
+                    .min_by(|a, b| a.0.total_cmp(&b.0))
+                    .unwrap_or((1.0, Side::Right, false));
+                if distance < 0.25 {
+                    return Some(Drop::Edge { group, side, first });
+                }
+                let index = self
+                    .glasses
+                    .as_ref()
+                    .and_then(|glasses| {
+                        glasses
+                            .glass()
+                            .layout
+                            .groups()
+                            .get(group)
+                            .map(|group| group.tabs.len())
+                    })
+                    .unwrap_or(0);
+                return Some(Drop::Strip { group, index });
+            }
+        }
+        None
+    }
+
+    /// Move the tab at `from` to `target`, keep the glass, and show it there.
+    fn drop_tab(&mut self, from: (usize, usize), target: Drop) {
+        let Some(glasses) = self.glasses.as_mut() else {
+            return;
+        };
+        let glass = glasses.glass_mut();
+        let (from_group, from_tab) = from;
+        let sources = glass
+            .layout
+            .groups()
+            .get(from_group)
+            .map_or(0, |group| group.tabs.len());
+        if from_tab >= sources {
+            return;
+        }
+        // Splitting a group off its only tab, onto itself, changes nothing.
+        if sources == 1 && matches!(target, Drop::Edge { group, .. } if group == from_group) {
+            return;
+        }
+        let Some(tab) = glass
+            .layout
+            .group_mut(from_group)
+            .map(|group| group.tabs.remove(from_tab))
+        else {
+            return;
+        };
+        let emptied = sources == 1 && glass.layout.groups().len() > 1;
+        if emptied {
+            let layout = std::mem::take(&mut glass.layout);
+            glass.layout = layout.remove(from_group).unwrap_or_default();
+        }
+        // Groups after an emptied one moved down one.
+        let shift = |group: usize| {
+            if emptied && group > from_group {
+                group - 1
+            } else {
+                group
+            }
+        };
+        let (group, index) = match target {
+            Drop::Strip { group, index } => {
+                let group = shift(group);
+                // Within the same group, the tab's own place no longer counts.
+                let index = if group == from_group && !emptied && index > from_tab {
+                    index - 1
+                } else {
+                    index
+                };
+                let Some(at) = glass.layout.group_mut(group) else {
+                    return;
+                };
+                let index = index.min(at.tabs.len());
+                at.tabs.insert(index, tab);
+                (group, index)
+            }
+            Drop::Edge { group, side, first } => {
+                let group = shift(group);
+                let new = if first {
+                    glass.layout.split_first(group, side, Group::of(tab))
+                } else {
+                    glass.layout.split(group, side, Group::of(tab))
+                };
+                (new, 0)
+            }
+        };
+        glass.focus = group;
+        if let Some(at) = glass.layout.group_mut(group) {
+            at.current = index + offset(group);
+        }
+        glasses.zoomed = false;
+        let id = glasses.glass().id.clone();
+        self.glass_changed(&id);
+        self.show_focused();
+    }
+
+    /// While a tab is dragged: where it would land, and its name by the pointer.
+    fn draw_drag(&self, buf: &mut Buffer) {
+        let Some(drag) = self.glasses.as_ref().and_then(|glasses| glasses.drag) else {
+            return;
+        };
+        if !drag.moving {
+            return;
+        }
+        let mark = Style::default().bg(theme::SURFACE1);
+        match self.drop_at(drag.at) {
+            Some(Drop::Strip { group, .. }) => {
+                let info = self.frame.borrow();
+                if let Some(content) = info.glass_leaves.get(group) {
+                    let x = drag.at.0;
+                    let y = content.y.saturating_sub(1);
+                    if let Some(cell) = buf.cell_mut((x, y)) {
+                        cell.set_symbol("▏").set_style(theme::strong(theme::ACCENT));
+                    }
+                }
+            }
+            Some(Drop::Edge { group, side, first }) => {
+                let content = self.frame.borrow().glass_leaves.get(group).copied();
+                if let Some(content) = content {
+                    let half = match (side, first) {
+                        (Side::Right, true) => Rect {
+                            width: content.width / 2,
+                            ..content
+                        },
+                        (Side::Right, false) => Rect {
+                            x: content.x + content.width / 2,
+                            width: content.width - content.width / 2,
+                            ..content
+                        },
+                        (Side::Below, true) => Rect {
+                            height: content.height / 2,
+                            ..content
+                        },
+                        (Side::Below, false) => Rect {
+                            y: content.y + content.height / 2,
+                            height: content.height - content.height / 2,
+                            ..content
+                        },
+                    };
+                    buf.set_style(half, mark);
+                }
+            }
+            None => {}
+        }
+        let name = self
+            .glasses
+            .as_ref()
+            .and_then(|glasses| {
+                glasses
+                    .glass()
+                    .layout
+                    .groups()
+                    .get(drag.from.0)
+                    .and_then(|group| {
+                        group
+                            .tabs
+                            .get(drag.from.1.saturating_sub(offset(drag.from.0)))
+                    })
+                    .cloned()
+            })
+            .map(|tab| {
+                tab.title.unwrap_or_else(|| {
+                    Pane::parse(&tab.pane)
+                        .map(|pane| self.pane_title(&pane))
+                        .unwrap_or(tab.pane)
+                })
+            })
+            .unwrap_or_default();
+        let label = format!(" ⇄ {name} ");
+        let x = drag.at.0.saturating_add(1);
+        let y = drag.at.1.saturating_add(1);
+        let area = buf.area;
+        if y < area.y + area.height {
+            buf.set_stringn(
+                x,
+                y,
+                &label,
+                (area.x + area.width).saturating_sub(x) as usize,
+                theme::strong(theme::CRUST).bg(theme::ACCENT),
+            );
+        }
     }
 
     /// Show the sidebar with the keys, or hide it when it has them (Ctrl+S).
@@ -1647,6 +1961,10 @@ impl Ui {
 
     /// Keys glasses own. Returns whether the key was used here.
     pub(crate) fn glass_key(&mut self, key: KeyEvent) -> bool {
+        // Esc lets a dragged tab go back where it was.
+        if key.code == KeyCode::Esc && self.cancel_drag() {
+            return true;
+        }
         let terminal_focused = self.terminal_focused();
         let mission_form = self.mission_form_focused();
         let Some(glasses) = self.glasses.as_mut() else {
@@ -3063,6 +3381,123 @@ mod tests {
         press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
         assert!(ui.new_mission.is_none());
         assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
+    }
+
+    #[test]
+    fn tabs_drag_to_reorder_to_other_splits_and_to_an_edge_to_split() {
+        use crossterm::event::{MouseButton, MouseEvent, MouseEventKind};
+        let mouse = |ui: &mut Ui, kind, (column, row): (u16, u16)| {
+            ui.mouse(MouseEvent {
+                kind,
+                column,
+                row,
+                modifiers: KeyModifiers::NONE,
+            })
+        };
+        let tab_at = |ui: &Ui, group: usize, tab: usize| -> (u16, u16) {
+            screen(ui);
+            let info = ui.frame.borrow();
+            let rect = info
+                .hits
+                .iter()
+                .find(|(_, hit)| *hit == Hit::GlassTab(group, tab))
+                .map(|(rect, _)| *rect)
+                .expect("the tab is drawn");
+            (rect.x + 1, rect.y)
+        };
+        let drag = |ui: &mut Ui, from: (u16, u16), to: (u16, u16)| {
+            mouse(ui, MouseEventKind::Down(MouseButton::Left), from);
+            mouse(ui, MouseEventKind::Drag(MouseButton::Left), to);
+            screen(ui);
+            mouse(ui, MouseEventKind::Up(MouseButton::Left), to);
+        };
+        let mut ui = glass();
+        let mission = "mission:mission/fleet/release/weekly";
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ui.open_in_glass(
+            Pane::Mission(Some("mission/fleet/release/weekly".into())),
+            Open::Tab,
+        );
+        assert_eq!(
+            tabs(&ui).2,
+            vec![vec![ATLAS.to_owned(), mission.to_owned()]]
+        );
+
+        // A press and let-go without moving is a click: it shows the tab and moves nothing.
+        let first = tab_at(&ui, 0, 0);
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Left), first);
+        mouse(&mut ui, MouseEventKind::Up(MouseButton::Left), first);
+        assert_eq!(
+            tabs(&ui).2,
+            vec![vec![ATLAS.to_owned(), mission.to_owned()]]
+        );
+
+        // Along the strip: the mission goes before the agent.
+        let (to_x, to_y) = tab_at(&ui, 0, 0);
+        let from = tab_at(&ui, 0, 1);
+        drag(&mut ui, from, (to_x.saturating_sub(1), to_y));
+        assert_eq!(
+            tabs(&ui).2,
+            vec![vec![mission.to_owned(), ATLAS.to_owned()]]
+        );
+
+        // To the right edge of the content: a new split holding it.
+        screen(&ui);
+        let content = ui.frame.borrow().glass_leaves[0];
+        let edge = (
+            content.x + content.width - 2,
+            content.y + content.height / 2,
+        );
+        let from = tab_at(&ui, 0, 1);
+        drag(&mut ui, from, edge);
+        assert_eq!(
+            tabs(&ui).2,
+            vec![vec![mission.to_owned()], vec![ATLAS.to_owned()]]
+        );
+        assert_eq!(tabs(&ui).0, 1, "the dropped tab has the focus");
+
+        // Its only tab dragged onto its own edge changes nothing.
+        screen(&ui);
+        let content = ui.frame.borrow().glass_leaves[1];
+        let from = tab_at(&ui, 1, 0);
+        drag(
+            &mut ui,
+            from,
+            (content.x + 1, content.y + content.height / 2),
+        );
+        assert_eq!(tabs(&ui).2.len(), 2);
+
+        // Esc during a drag lets it go back.
+        let from = tab_at(&ui, 1, 0);
+        mouse(&mut ui, MouseEventKind::Down(MouseButton::Left), from);
+        mouse(
+            &mut ui,
+            MouseEventKind::Drag(MouseButton::Left),
+            (from.0 - 30, from.1),
+        );
+        assert!(
+            screen(&ui).contains("⇄"),
+            "the dragged tab follows the pointer"
+        );
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        mouse(
+            &mut ui,
+            MouseEventKind::Up(MouseButton::Left),
+            (from.0 - 30, from.1),
+        );
+        assert_eq!(tabs(&ui).2.len(), 2);
+
+        // Into the other split's strip: the emptied split goes.
+        let (to_x, to_y) = tab_at(&ui, 0, 0);
+        let from = tab_at(&ui, 1, 0);
+        drag(&mut ui, from, (to_x + 12, to_y));
+        assert_eq!(
+            tabs(&ui).2,
+            vec![vec![mission.to_owned(), ATLAS.to_owned()]]
+        );
     }
 
     #[test]

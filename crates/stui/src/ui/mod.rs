@@ -3575,6 +3575,10 @@ impl Ui {
             native.write(bytes);
             return;
         }
+        // A tab dragged to another place or a split's edge.
+        if self.drag_mouse(mouse) {
+            return;
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.glass_click(mouse.column, mouse.row) {
