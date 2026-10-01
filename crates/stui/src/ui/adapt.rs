@@ -986,6 +986,7 @@ mod tests {
                 to,
                 subject,
                 body,
+                ..
             } => {
                 assert_eq!(to, "COS");
                 assert!(from.contains("harbor"), "{from}");
@@ -1112,6 +1113,7 @@ mod tests {
                     to,
                     subject,
                     body,
+                    ..
                 },
             ] => {
                 assert_eq!(
@@ -1123,12 +1125,10 @@ mod tests {
             }
             other => panic!("expected mail, got {other:?}"),
         }
+        // Mail the stream already shows is marked delivered on the mail, not announced again.
         let shown = BTreeSet::from(["message/a1".to_owned()]);
         let bodies = from_harness(true, envelope, &shown);
-        assert!(
-            matches!(&bodies[..], [Body::Event(line)] if line == "delivered to the agent: Keys & locks · from example/harbor"),
-            "{bodies:?}"
-        );
+        assert!(bodies.is_empty(), "{bodies:?}");
         let bodies = from_harness(
             true,
             "[PING from st3] message/b2 from agent/example/quay: Tide tables\nplease look",
@@ -1139,6 +1139,54 @@ mod tests {
                 if text == "please look" && line == "delivered to the agent: Tide tables · from example/quay"),
             "{bodies:?}"
         );
+    }
+
+    #[test]
+    fn the_persons_mail_says_when_the_agent_has_it_and_its_delivery_is_not_a_line() {
+        let timeline: Vec<TimelineEntry> = serde_json::from_value(json!([
+            {"id":"m","sequence":1,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"message","final":true,
+             "body":{"message_id":"message/one","from":"person/avery","to":"agent/example/harbor/keeper"}},
+            {"id":"c","sequence":2,"revision":1,"timestamp":"2026-10-01T10:00:00Z","role":"user","type":"content","final":true,
+             "body":{"media_type":"text/plain","text":"How is the audit going?"}},
+            {"id":"m2","sequence":3,"revision":1,"timestamp":"2026-10-01T10:00:01Z","role":"user","type":"message","final":true,
+             "body":{"message_id":"message/two","from":"person/avery","to":"agent/example/harbor/keeper"}},
+            {"id":"c2","sequence":4,"revision":1,"timestamp":"2026-10-01T10:00:01Z","role":"user","type":"content","final":true,
+             "body":{"media_type":"text/plain","text":"And the keys?"}},
+            {"id":"h","sequence":5,"revision":1,"timestamp":"2026-10-01T10:00:02Z","role":"user","type":"content","final":true,
+             "body":{"media_type":"text/plain","text":"<channel source=\"plugin:st3-channel:st3\" from=\"person/avery\">[st3-delivery:1.md]\n[PING from st3] message/one from person/avery: (no subject)\n</channel>"}},
+        ]))
+        .unwrap();
+        let names = BTreeMap::from([("person/avery".to_owned(), "you".to_owned())]);
+        let entries = conversation(&timeline, &names);
+        let marks = entries
+            .iter()
+            .map(|entry| match &entry.body {
+                Body::Mail { delivered, .. } => format!("mail {delivered}"),
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            marks,
+            ["mail true", "mail false"],
+            "no delivery line, once or twice"
+        );
+        let doc = st3_conversation_ui::conversation::Cache::default().render(
+            &entries,
+            80,
+            &Default::default(),
+            "⠋",
+            &super::super::theme::conversation(),
+        );
+        let text = doc
+            .lines
+            .iter()
+            .map(st3_conversation_ui::text::plain)
+            .collect::<Vec<_>>();
+        assert!(
+            text.iter().any(|line| line.contains("✓✓ delivered")),
+            "{text:?}"
+        );
+        assert!(text.iter().any(|line| line.contains("✓ sent")), "{text:?}");
     }
 
     #[test]

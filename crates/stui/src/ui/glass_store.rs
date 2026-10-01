@@ -34,6 +34,17 @@ pub struct StoredGlass {
     pub name: String,
     /// Its splits and their tabs; Home, the first group's first tab, is not stored.
     pub layout: Layout,
+    /// Where this device left it: the focused group and each group's shown tab. Kept on this
+    /// device only; st keeps structure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub view: Option<StoredView>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoredView {
+    pub focus: usize,
+    /// Each group's shown tab as its strip counts them: in the first group, 0 is Home.
+    pub current: Vec<usize>,
 }
 
 /// Version 1: a glass was tabs, and each tab a tree of split panes.
@@ -103,6 +114,7 @@ fn from_v1(old: StoredV1) -> Stored {
                         .collect(),
                     current: 0,
                 }),
+                view: None,
             })
             .collect(),
     }
@@ -205,12 +217,17 @@ mod tests {
                     revision: None,
                     name: "main".into(),
                     layout: Layout::default(),
+                    view: None,
                 },
                 StoredGlass {
                     id: "0190a1b2-0000-7000-8000-000000000002".into(),
                     revision: Some("r2".into()),
                     name: "review".into(),
                     layout,
+                    view: Some(StoredView {
+                        focus: 1,
+                        current: vec![0, 1],
+                    }),
                 },
             ],
         };

@@ -84,3 +84,13 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 0);
   assert.deepEqual(shown.map(entry => entry.body), [{ kind: 'event', tone: 'quiet', text: 'nothing in the harness yet since this seat started' }]);
 }
 
+
+// The person's mail says when the agent has it; the delivery is not another line.
+{
+  const delivered = conversationEntries([
+    { id: 'm', sequence: 1, revision: 1, timestamp: '2026-10-01T10:00:00Z', role: 'user', type: 'message', final: true, body: { message_id: 'message/one', from: 'person/avery', to: 'agent/example/harbor/keeper' } },
+    { id: 'c', sequence: 2, revision: 1, timestamp: '2026-10-01T10:00:00Z', role: 'user', type: 'content', final: true, body: { media_type: 'text/plain', text: 'How is the audit going?' } },
+    { id: 'h', sequence: 3, revision: 1, timestamp: '2026-10-01T10:00:02Z', role: 'user', type: 'content', final: true, body: { media_type: 'text/plain', text: '<channel source="plugin:st3-channel:st3" from="person/avery">[st3-delivery:1.md]\n[PING from st3] message/one from person/avery: (no subject)\n</channel>' } },
+  ], new Map([['person/avery', 'you']]));
+  assert.deepEqual(delivered.map(entry => [entry.body.kind, entry.body.delivered]), [['mail', true]]);
+}
