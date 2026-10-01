@@ -703,10 +703,15 @@ impl Ui {
             let mut hints = match &self.glasses {
                 Some(_) if self.split_shown() => vec![
                     ("ctrl+k", "open"),
-                    ("alt+←→↑↓", "panes"),
+                    ("[ ]", "tabs"),
+                    ("alt+←→↑↓", "splits"),
                     ("ctrl+w", "close"),
                 ],
-                Some(_) if !self.on_home() => vec![("ctrl+k", "open"), ("ctrl+w", "close")],
+                Some(_) if !self.on_home() => vec![
+                    ("ctrl+k", "open"),
+                    ("[ ]", "tabs"),
+                    ("ctrl+w", "close"),
+                ],
                 Some(_) => vec![("ctrl+k", "open"), ("↑↓", "select")],
                 None => vec![("1-4", "tabs"), ("↑↓", "select")],
             };

@@ -1126,8 +1126,18 @@ impl Ui {
             KeyCode::Char('w') if control => self.close_tab(),
             KeyCode::Char('o') if control => self.next_glass(),
             KeyCode::Char(digit @ '1'..='9') if alt => self.show_tab(digit as usize - '1' as usize),
-            KeyCode::PageDown if control => self.show_tab((current + 1) % tabs),
-            KeyCode::PageUp if control => self.show_tab((current + tabs - 1) % tabs),
+            // Next and previous tab in the focused split: Ctrl+PgDn/PgUp, Ctrl+Tab where the
+            // terminal reports it, and ] and [ whenever nothing is being typed.
+            KeyCode::PageDown | KeyCode::Tab if control => self.show_tab((current + 1) % tabs),
+            KeyCode::PageUp | KeyCode::BackTab if control => {
+                self.show_tab((current + tabs - 1) % tabs)
+            }
+            KeyCode::Char(']') if quiet && key.modifiers.is_empty() => {
+                self.show_tab((current + 1) % tabs)
+            }
+            KeyCode::Char('[') if quiet && key.modifiers.is_empty() => {
+                self.show_tab((current + tabs - 1) % tabs)
+            }
             KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down if alt => {
                 self.move_focus(key.code)
             }
@@ -1972,6 +1982,10 @@ mod tests {
         assert_eq!((tabs(&ui).1, ui.tab), (0, 0));
         ctrl(&mut ui, 'w');
         assert_eq!(tabs(&ui).2[0].len(), 2, "Home cannot be closed");
+        typed(&mut ui, "]");
+        assert_eq!(tabs(&ui).1, 1);
+        typed(&mut ui, "[");
+        assert_eq!(tabs(&ui).1, 0);
         press(&mut ui, KeyCode::PageDown, KeyModifiers::CONTROL);
         assert_eq!(tabs(&ui).1, 1);
         ctrl(&mut ui, 'w');
