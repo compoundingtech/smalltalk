@@ -628,7 +628,7 @@ pub struct CalendarSchedule {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ScheduledWork {
     pub mission: String,
-    pub revision: String,
+    pub revision: Option<String>,
     pub workspace: String,
     #[serde(default)]
     pub inputs: BTreeMap<String, String>,
