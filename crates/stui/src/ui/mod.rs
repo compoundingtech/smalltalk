@@ -77,6 +77,10 @@ struct FrameInfo {
     sidebar: Rect,
     sidebar_lines: usize,
     sidebar_height: usize,
+    /// The section the sidebar list drawn is for.
+    sidebar_tab: usize,
+    /// The Ctrl+S sidebar in a glass, all of it.
+    glass_sidebar: Rect,
     /// Glasses: where each group's content was drawn, in group order.
     glass_leaves: Vec<Rect>,
     /// Glasses: where Home was drawn over the glass, while it is open.
@@ -953,7 +957,19 @@ impl Ui {
             );
             return;
         }
-        let hints: Vec<(&str, &str)> = if self.terminal_focused() {
+        let sidebar = self
+            .glasses
+            .as_ref()
+            .is_some_and(|glasses| glasses.sidebar.shown && glasses.sidebar.focused);
+        let hints: Vec<(&str, &str)> = if sidebar && !self.editing {
+            vec![
+                ("↑↓", "select"),
+                ("←→", "section"),
+                ("enter", "open in a tab"),
+                ("esc", "hide"),
+                ("ctrl+k", "find"),
+            ]
+        } else if self.terminal_focused() {
             vec![
                 ("ctrl+\\", "return"),
                 ("keys", "go to the terminal"),
@@ -1089,6 +1105,18 @@ impl Ui {
 
     /// A tab's list, as the sidebar draws it.
     fn draw_list(&self, buf: &mut Buffer, area: Rect, tab: usize) {
+        self.draw_list_as(buf, area, tab, self.selected[tab], Hit::Row);
+    }
+
+    /// A tab's list with `selected` marked, each row a `hit` to click.
+    pub(crate) fn draw_list_as(
+        &self,
+        buf: &mut Buffer,
+        area: Rect,
+        tab: usize,
+        selected: usize,
+        hit: fn(usize) -> Hit,
+    ) {
         buf.set_style(area, Style::default().bg(theme::MANTLE));
         // One column for the frame edge and one kept free for the scrollbar.
         let width = area.width.saturating_sub(2) as usize;
@@ -1105,6 +1133,7 @@ impl Ui {
         {
             let mut info = self.frame.borrow_mut();
             info.sidebar = list;
+            info.sidebar_tab = tab;
         }
         // Legend, pinned to the bottom.
         if legend_height > 0 {
@@ -1165,7 +1194,7 @@ impl Ui {
             ListState::Ready => {}
         }
         // Lay the items out as lines, remembering where the selected row sits.
-        let selected = self.selected[tab].min(listing.ids.len().saturating_sub(1));
+        let selected = selected.min(listing.ids.len().saturating_sub(1));
         let mut rows: Vec<(Option<usize>, Line<'static>, bool)> = Vec::new();
         let mut selected_range = (0, 0);
         for item in &listing.items {
@@ -1265,7 +1294,7 @@ impl Ui {
             }
             buf.set_line(list.x + 1, y, line, list.width.saturating_sub(1));
             if let Some(index) = index {
-                self.hit(row, Hit::Row(*index));
+                self.hit(row, hit(*index));
             }
         }
         if rows.len() > height {
@@ -3622,12 +3651,12 @@ impl Ui {
                     )
                 };
                 if in_sidebar {
-                    let (lines, height) = {
+                    let (lines, height, tab) = {
                         let info = self.frame.borrow();
-                        (info.sidebar_lines, info.sidebar_height)
+                        (info.sidebar_lines, info.sidebar_height, info.sidebar_tab)
                     };
                     let mut tops = self.list_top.borrow_mut();
-                    tops[self.tab] = (tops[self.tab] as isize + delta)
+                    tops[tab] = (tops[tab] as isize + delta)
                         .clamp(0, lines.saturating_sub(height) as isize)
                         as usize;
                 } else if let Some(key) = pane {
@@ -3673,6 +3702,19 @@ impl Ui {
             Hit::PaletteChoice(index) => self.open_choice(Some(index), glass::Open::Here),
             Hit::Tab(tab) => self.switch_tab(tab),
             Hit::Row(index) => self.select(index),
+            Hit::SidebarRow(index) => {
+                if let Some(glasses) = self.glasses.as_mut() {
+                    let sidebar = &mut glasses.sidebar;
+                    sidebar.selected[sidebar.section] = index;
+                }
+                self.open_from_sidebar();
+            }
+            Hit::SidebarSection(section) => {
+                if let Some(glasses) = self.glasses.as_mut() {
+                    glasses.sidebar.section = section;
+                    glasses.sidebar.focused = true;
+                }
+            }
             Hit::Key(key) if self.popover.is_some() => {
                 let subject = self.popover.take().unwrap_or_default();
                 match key {
