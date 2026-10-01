@@ -7,6 +7,7 @@
 //! data in place: it never empties a list or a conversation while the fresh copy is on its way.
 
 use super::adapt::{self, Extras};
+use super::glass::GlassWrite;
 use super::view::{Load, MissionPreview};
 use super::{Effect, Guard, Ui};
 use crate::feed::{self, Command, TerminalUpdate, Window};
@@ -71,6 +72,58 @@ enum Fetched {
     Devices(Collection),
     /// A send finished: the pending token and st's message id, or why it failed.
     Sent(String, Result<Option<String>, String>),
+    /// st answered a glass write: the glass, the write's key, and the revision it accepted.
+    GlassSaved {
+        id: String,
+        key: String,
+        outcome: Result<Option<String>, String>,
+    },
+}
+
+/// Send one glass write to st; its answer comes back as `Fetched::GlassSaved`.
+fn save_glass(
+    runtime: &tokio::runtime::Runtime,
+    client: &Client,
+    tx: &std::sync::mpsc::Sender<Fetched>,
+    write: GlassWrite,
+) {
+    let client = client.clone();
+    let tx = tx.clone();
+    runtime.spawn(async move {
+        let outcome = match &write {
+            GlassWrite::Put { id, body, base, key } => match serde_json::from_str(body) {
+                Ok(body) => client
+                    .put_glass(
+                        id,
+                        &st3_client::GlassPut {
+                            body,
+                            base_revision: base.clone(),
+                        },
+                        key,
+                    )
+                    .await
+                    .map(|saved| Some(saved.value.header.revision))
+                    .map_err(|error| error.to_string()),
+                Err(error) => Err(error.to_string()),
+            },
+            GlassWrite::Delete { id, base, key } => client
+                .delete_glass(
+                    id,
+                    &st3_client::GlassDelete {
+                        base_revision: base.clone(),
+                    },
+                    key,
+                )
+                .await
+                .map(|_| None)
+                .map_err(|error| error.to_string()),
+        };
+        let _ = tx.send(Fetched::GlassSaved {
+            id: write.id().to_owned(),
+            key: write.key().to_owned(),
+            outcome,
+        });
+    });
 }
 
 pub fn run(context: Context) -> Result<()> {
@@ -142,11 +195,33 @@ pub fn run(context: Context) -> Result<()> {
                     changed = true;
                 }
                 feed::Update::Window {
+                    window: Window::Glasses,
+                    items,
+                    ..
+                } => {
+                    ui.glasses_from_graph(
+                        items
+                            .into_iter()
+                            .filter_map(|item| match item {
+                                Resource::Glass(glass) => Some(glass),
+                                _ => None,
+                            })
+                            .collect(),
+                    );
+                    changed = true;
+                }
+                feed::Update::Window {
                     window,
                     snapshot,
                     items,
                     has_more,
                 } => {
+                    // Back in touch: glass changes st has not confirmed go again, same keys.
+                    if !extras.live {
+                        for write in ui.unsent_glass_writes() {
+                            save_glass(&runtime, &client, &fetched_tx, write);
+                        }
+                    }
                     let collection = Collection {
                         items,
                         snapshot: Some(snapshot),
@@ -157,6 +232,7 @@ pub fn run(context: Context) -> Result<()> {
                         Window::Attention => model.now = collection,
                         Window::Missions => model.missions = collection,
                         Window::Agents => model.agents = collection,
+                        Window::Glasses => {}
                     }
                     extras.live = true;
                     extras.offline = None;
@@ -282,6 +358,7 @@ pub fn run(context: Context) -> Result<()> {
                 }
                 Fetched::Machines(machines) => model.machines = machines,
                 Fetched::Devices(devices) => model.devices = devices,
+                Fetched::GlassSaved { id, key, outcome } => ui.glass_saved(&id, &key, outcome),
             }
             changed = true;
         }
@@ -324,7 +401,9 @@ pub fn run(context: Context) -> Result<()> {
                     }
                 });
             }
-            if tab == 3 {
+            // Glasses show the fleet in the status line and the palette, so they need the
+            // machines from the start rather than when a Fleet tab opens.
+            if tab == 3 || (ui.glasses.is_some() && model.machines.snapshot.is_none()) {
                 let client = client.clone();
                 let tx = fetched_tx.clone();
                 runtime.spawn(async move {
@@ -436,6 +515,13 @@ pub fn run(context: Context) -> Result<()> {
         }
         let mut effects = Vec::new();
         for effect in std::mem::take(&mut ui.effects) {
+            // A glass change is kept until st confirms it, and goes once st is reachable.
+            if let Effect::SaveGlass(write) = effect {
+                if extras.live {
+                    save_glass(&runtime, &client, &fetched_tx, write);
+                }
+                continue;
+            }
             if !extras.live && !matches!(effect, Effect::CloseTerminal) {
                 ui.flash("Offline · reconnect before acting; nothing was queued");
                 continue;
@@ -686,6 +772,8 @@ async fn perform(
     effect: Effect,
 ) -> Result<(String, Option<String>)> {
     match effect {
+        // Glass writes never reach here: the loop sends them itself.
+        Effect::SaveGlass(_) => Ok((String::new(), None)),
         Effect::Attention { id, action, reason } => {
             crate::attention_action(client, person, &id, &action, reason)
                 .await
