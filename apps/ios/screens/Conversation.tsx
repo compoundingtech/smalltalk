@@ -182,11 +182,14 @@ const EntryView = memo(function EntryView({ entry, open, onToggle }: { entry: Co
       </View>;
     case 'assistant':
       return <View style={styles.entry}><Markdown text={body.text} /></View>;
-    case 'mail':
-      return <View style={[styles.entry, styles.barred, { borderLeftColor: theme.sapphire }]}>
-        <T><T bold color={theme.sapphire}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold>  {body.subject}</T> : null}<T dim>  {entry.at}</T></T>
-        <Markdown text={body.text} color={theme.subtext0} />
+    case 'mail': {
+      // Mail to the person stands out; their own says how far it got: ✓ st has it, ✓✓ the agent has it.
+      const toYou = body.to === 'you';
+      return <View style={[styles.entry, styles.barred, { borderLeftColor: theme.sapphire }, toYou ? { backgroundColor: theme.toolBg } : null]}>
+        <T><T bold color={theme.sapphire}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.from === 'you' ? (body.delivered ? <T color={theme.green}>  ✓✓ delivered</T> : <T dim>  ✓ sent</T>) : null}</T>
+        <Markdown text={body.text} color={toYou ? theme.text : theme.subtext0} />
       </View>;
+    }
     case 'event': {
       const color = body.tone === 'fault' ? theme.red : body.tone === 'warning' ? theme.yellow : theme.overlay0;
       return <View style={[styles.entry, { flexDirection: 'row' }]}>
