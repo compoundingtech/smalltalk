@@ -8,7 +8,8 @@
 //! devices also make a bounded liveness read so an idle network blackhole becomes offline.
 
 use st3_client::{
-    Client, ClientError, CollectionEvent, CollectionStream, ErrorCode, Fence, Resource, Snapshot,
+    CapabilityState, Client, ClientError, CollectionEvent, CollectionStream, ErrorCode, Fence,
+    Resource, Snapshot,
     TargetParameters, TerminalScreen, TimelineEntry,
 };
 use std::collections::BTreeMap;
@@ -39,6 +40,8 @@ pub enum Window {
     Attention,
     Missions,
     Agents,
+    /// The person's glasses, followed only by `stui --glasses` when st grants them.
+    Glasses,
 }
 
 impl Window {
@@ -49,13 +52,28 @@ impl Window {
             Self::Attention => "attention",
             Self::Missions => "missions",
             Self::Agents => "agents",
+            Self::Glasses => "glasses",
         }
     }
 
     fn from_id(id: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|window| window.id() == id)
+        Self::ALL
+            .into_iter()
+            .chain([Self::Glasses])
+            .find(|window| window.id() == id)
+    }
+
+    /// How many items to follow: every glass a person may keep, a page of anything else.
+    fn limit(self) -> usize {
+        match self {
+            Self::Glasses => GLASSES,
+            _ => WINDOW,
+        }
     }
 }
+
+/// The most glasses st keeps live for one person.
+const GLASSES: usize = 100;
 
 #[derive(Debug)]
 pub enum Update {
@@ -149,12 +167,13 @@ pub async fn run(
     updates: mpsc::Sender<Update>,
     commands: channel::UnboundedReceiver<Command>,
 ) {
-    run_members(vec![client], false, updates, commands).await;
+    run_members(vec![client], false, false, updates, commands).await;
 }
 
 pub async fn run_members(
     clients: Vec<Client>,
     remote: bool,
+    glasses: bool,
     updates: mpsc::Sender<Update>,
     mut commands: channel::UnboundedReceiver<Command>,
 ) {
@@ -191,6 +210,7 @@ pub async fn run_members(
             match connected(
                 client,
                 remote,
+                glasses,
                 &mut stream,
                 &updates,
                 &mut commands,
@@ -269,6 +289,7 @@ enum Ended {
 async fn connected(
     client: &Client,
     remote: bool,
+    glasses: bool,
     stream: &mut CollectionStream,
     updates: &mpsc::Sender<Update>,
     commands: &mut channel::UnboundedReceiver<Command>,
@@ -280,9 +301,16 @@ async fn connected(
     // detects that case even when the graph is idle; it never resends a mutation.
     let mut probe = tokio::time::interval(Duration::from_secs(15));
     probe.tick().await;
-    for window in Window::ALL {
+    // Glasses are followed only where st grants them; elsewhere stui keeps them on the device.
+    let granted = glasses
+        && client.capabilities().await.is_ok_and(|capabilities| {
+            capabilities.value.capabilities.iter().any(|capability| {
+                capability.id == "glasses" && capability.state == CapabilityState::Granted
+            })
+        });
+    for window in Window::ALL.into_iter().chain(granted.then_some(Window::Glasses)) {
         if let Err(error) = stream
-            .subscribe(window.id(), window.id(), WINDOW, None, None)
+            .subscribe(window.id(), window.id(), window.limit(), None, None)
             .await
         {
             return Ended::Dropped(error.to_string());
@@ -340,7 +368,7 @@ async fn connected(
                     }
                     CollectionEvent::Resync { id } => {
                         if let Some(window) = Window::from_id(&id)
-                            && let Err(error) = stream.subscribe(window.id(), window.id(), WINDOW, None, None).await
+                            && let Err(error) = stream.subscribe(window.id(), window.id(), window.limit(), None, None).await
                         {
                             return Ended::Dropped(error.to_string());
                         }

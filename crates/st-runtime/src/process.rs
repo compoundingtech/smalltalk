@@ -28,6 +28,8 @@ pub struct ExecGeneration {
     #[serde(default)]
     pub exit_signal: Option<i32>,
     #[serde(default)]
+    pub group_exited: bool,
+    #[serde(default)]
     pub isolation_mode: String,
     #[serde(default)]
     pub scope_unit: Option<String>,
@@ -141,6 +143,7 @@ impl ExecRuntime {
             generation_id,
             exit_code: None,
             exit_signal: None,
+            group_exited: false,
             isolation_mode: isolation_name(crate::isolation_mode()).into(),
             scope_unit: (crate::isolation_mode() == crate::Isolation::Scope).then_some(unit),
         };
@@ -169,11 +172,14 @@ impl ExecRuntime {
                 generation.schema
             ))));
         }
-        // A terminal generation is durable evidence about this exact exec. In particular, do not
+        // A terminal group is durable evidence about this exact exec. In particular, do not
         // let an unrelated process that later reuses the PID make a completed generation look
         // live again on platforms whose best available start token is the PID itself.
-        if generation.exit_code.is_some() || generation.exit_signal.is_some() {
+        if generation.group_exited {
             return Ok(Some(ExecObservation::Exited(generation)));
+        }
+        if generation.exit_code.is_some() || generation.exit_signal.is_some() {
+            return self.observe_exited_group(id, generation).map(Some);
         }
         let owned_exit = {
             let mut children = self
@@ -194,20 +200,35 @@ impl ExecRuntime {
             generation.exit_code = status.code();
             generation.exit_signal = exit_signal(&status);
             self.write_generation(id, &generation)?;
-            return Ok(Some(ExecObservation::Exited(generation)));
+            return self.observe_exited_group(id, generation).map(Some);
         }
         match process_identity(generation.pid) {
             Ok((state, token)) if token == generation.start_token && state != 'Z' => {
                 Ok(Some(ExecObservation::Running(generation)))
             }
             Ok((_state, token)) if token == generation.start_token => {
-                Ok(Some(ExecObservation::Exited(generation)))
+                self.observe_exited_group(id, generation).map(Some)
             }
             Ok(_) => Ok(Some(ExecObservation::Exited(generation))),
             Err(error) if process_is_absent(&error) => {
-                Ok(Some(ExecObservation::Exited(generation)))
+                self.observe_exited_group(id, generation).map(Some)
             }
             Err(error) => Ok(Some(ExecObservation::Indeterminate(error.to_string()))),
+        }
+    }
+
+    fn observe_exited_group(
+        &self,
+        id: &str,
+        generation: ExecGeneration,
+    ) -> Result<ExecObservation> {
+        match observe_exited_group(generation)? {
+            ExecObservation::Exited(mut generation) => {
+                generation.group_exited = true;
+                self.write_generation(id, &generation)?;
+                Ok(ExecObservation::Exited(generation))
+            }
+            observation => Ok(observation),
         }
     }
 
@@ -333,6 +354,64 @@ impl ExecRuntime {
     }
 }
 
+/// The wrapper can exit on SIGTERM while its children ignore that signal. Keep its group
+/// running until those children stop, so reconciliation still escalates to SIGKILL after
+/// a daemon restart. A reused leader PID never grants authority over its new group.
+fn observe_exited_group(generation: ExecGeneration) -> Result<ExecObservation> {
+    match process_identity(generation.pid) {
+        Ok((state, token)) if token != generation.start_token || state != 'Z' => {
+            return Ok(ExecObservation::Exited(generation));
+        }
+        Ok(_) => {}
+        Err(error) if process_is_absent(&error) => {}
+        Err(error) => return Ok(ExecObservation::Indeterminate(error.to_string())),
+    }
+    match process_group_is_live(generation.pid) {
+        Ok(true) => Ok(ExecObservation::Running(generation)),
+        Ok(false) => Ok(ExecObservation::Exited(generation)),
+        Err(error) => Ok(ExecObservation::Indeterminate(error.to_string())),
+    }
+}
+
+fn process_group_is_live(group: u32) -> Result<bool> {
+    if unsafe { libc::kill(-(group as i32), 0) } != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(false);
+        }
+        return Err(error.into());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // kill(0) includes zombies. Orphaned descendants may await reaping by the host's
+        // init process; they can no longer execute work and must not hold cleanup open.
+        for entry in fs::read_dir("/proc")? {
+            let entry = entry?;
+            if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+                continue;
+            }
+            let stat = match fs::read_to_string(entry.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => continue,
+                Err(error) => return Err(error.into()),
+            };
+            let Some((_, tail)) = stat.rsplit_once(") ") else {
+                continue;
+            };
+            let mut fields = tail.split_whitespace();
+            let state = fields.next();
+            let process_group = fields.nth(1).and_then(|field| field.parse::<u32>().ok());
+            if process_group == Some(group) && state != Some("Z") {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+    #[cfg(not(target_os = "linux"))]
+    Ok(true)
+}
+
 fn process_is_absent(error: &anyhow::Error) -> bool {
     error.downcast_ref::<std::io::Error>().is_some_and(|error| {
         error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
@@ -453,6 +532,7 @@ mod tests {
             generation_id: "completed-generation".into(),
             exit_code: Some(0),
             exit_signal: None,
+            group_exited: true,
             isolation_mode: "detached".into(),
             scope_unit: None,
         };
@@ -521,5 +601,61 @@ mod tests {
             runtime.read_log_bytes("work", false).unwrap().unwrap(),
             b"second"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_exited_wrapper_keeps_its_resistant_children_owned_after_adoption() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = ExecRuntime::new(root.path().join("exec"), root.path().join("logs"));
+        let generation = runtime.spawn(
+            "work",
+            &crate::Launch::Shell("sh -c 'trap \"\" TERM; echo $$ > child.pid; while :; do sleep 60; done' & wait".into()),
+            root.path(), &std::env::vars().collect(),
+        ).unwrap();
+        struct Cleanup(i32);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                unsafe {
+                    libc::kill(-self.0, libc::SIGKILL);
+                }
+            }
+        }
+        let _cleanup = Cleanup(generation.pid as i32);
+        for _ in 0..200 {
+            if root.path().join("child.pid").exists() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let child = fs::read_to_string(root.path().join("child.pid"))
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        runtime
+            .stop_if("work", Some(&generation.generation_id))
+            .unwrap();
+        // Reap the wrapper and retain its exit status while the child still runs.
+        for _ in 0..200 {
+            if let Some(ExecObservation::Running(observed)) = runtime.observe("work").unwrap()
+                && observed.exit_signal.is_some()
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let adopted = ExecRuntime::new(root.path().join("exec"), root.path().join("logs"));
+        assert!(matches!(
+            adopted.observe("work").unwrap(),
+            Some(ExecObservation::Running(_))
+        ));
+        assert!(adopted.kill_if("work", Some("another-generation")).is_err());
+        adopted
+            .kill_if("work", Some(&generation.generation_id))
+            .unwrap();
+        let exited = wait_for_exit(&adopted, "work");
+        assert_eq!(exited.exit_signal, Some(libc::SIGTERM));
+        assert!(process_identity(child).map_or(true, |(state, _)| state == 'Z'));
     }
 }

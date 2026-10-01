@@ -37,7 +37,7 @@ export function HomeScreen() {
         { id: 'open', title: 'Open', symbol: 'arrow.up.right', run: () => navigation.navigate('Attention', { id: row.item.id }) },
         ...(agentOf(row) ? [{ id: 'chat', title: 'Chat with the agent', symbol: 'bubble.left.and.bubble.right', run: () => navigation.navigate('Conversation', { target: agentOf(row)! }) }] : []),
         ...(row.item.mission_id ? [{ id: 'mission', title: 'Open the mission', symbol: 'point.3.connected.trianglepath.dotted', run: () => navigation.navigate('Mission', { id: row.item.mission_id! }) }] : []),
-        ...(row.item.actions.includes('attention.resolve') && !busy && status === 'online' ? [{ id: 'resolve', title: 'Resolve', symbol: 'checkmark.circle', destructive: true, run: () => Alert.alert('Resolve attention?', row.title, [{ text: 'Cancel' }, { text: 'Resolve', onPress: () => void actions.resolve(row.item) }]) }] : []),
+        ...(row.item.actions.includes('work.done') && !busy && status === 'online' ? [{ id: 'done', title: 'Complete step', symbol: 'checkmark.circle', run: () => Alert.prompt('Complete step', row.title, summary => { if (summary.trim()) void actions.done(row.item, summary); }) }] : []),
       ]}>
         <ListRow
           glyph={row.glyph}
@@ -68,7 +68,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
   const agentId = [item.requester_id, item.source_id].find(id => id?.startsWith('agent/'));
   const agent = agentId ? data.agents.find(candidate => candidate.id === agentId) : undefined;
   const mission = item.mission_id ? data.missions.find(candidate => candidate.id === item.mission_id) : undefined;
-  const other = item.actions.filter(action => action !== 'attention.resolve');
+  const other = item.actions.filter(action => action !== 'work.done');
   return <Screen>
     <Banners />
     <View style={{ padding: 12, gap: 6 }}>
@@ -80,7 +80,7 @@ export function AttentionScreen({ route, navigation }: RootScreen<'Attention'>) 
       {mission ? <Button label={`mission ${missionTitle(mission)}`} onPress={() => navigation.navigate('Mission', { id: mission.id })} /> : item.mission_id ? <T dim>mission {item.mission_id}</T> : null}
       {agentId ? <Button label={`chat with ${agent ? agentName(agent) : agentId}`} onPress={() => navigation.navigate('Conversation', { target: agentId, title: agent ? agentName(agent) : undefined })} /> : null}
       <T dim selectable>{item.id}{item.source_id !== item.id ? ` · from ${item.source_id}` : ''}</T>
-      {item.actions.includes('attention.resolve') ? <Button label={attentionActionLabel('attention.resolve').toLowerCase()} disabled={busy || status !== 'online'} onPress={() => Alert.alert('Resolve attention?', item.title, [{ text: 'Cancel' }, { text: 'Resolve', onPress: () => void actions.resolve(item).then(done => { if (done) navigation.goBack(); }) }])} /> : null}
+      {item.actions.includes('work.done') ? <Button label={attentionActionLabel('work.done').toLowerCase()} disabled={busy || status !== 'online'} onPress={() => Alert.prompt('Complete step', item.title, summary => { if (summary.trim()) void actions.done(item, summary).then(done => { if (done) navigation.goBack(); }); })} /> : null}
       {other.length ? <Note>in the CLI: {other.map(attentionActionLabel).join(', ')}</Note> : null}
     </View>
   </Screen>;

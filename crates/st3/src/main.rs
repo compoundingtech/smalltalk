@@ -26,13 +26,14 @@ use st3::model::{
     MissionOutputView, MissionProductionRequest, MissionRequest, MissionResponse,
     MissionRetireRequest, MissionRevisionRequest, MissionRunOutcomeRequest, MissionRunView,
     MissionSpec, MissionState, OperationalRepairApplyRequest, OperationalRepairPlan,
-    OperationalRepairResult, PlannerSpec, PlanningApprovalRequest, PlanningCandidateSubmitRequest,
-    PlanningProposalRequest, PlanningSessionView, ReplicaRecordView, ReplicationPeerStatus,
-    ReplicationRepairRequest, ReplicationStatus, ReviewRequest, RevisionApprovalRequest,
-    RevisionCancelRequest, RevisionProposalView, RevisionSubmissionView, RunGenerationView,
-    SessionControlResponse, SessionInputMode, SessionInputRequest, SessionScreen,
-    SessionSignalRequest, StatusResponse, StepRunView, SubscriptionRequestDecision,
-    SubscriptionRequestView, WorkRequest, WorkRetryRequest, WorkWakeRequest,
+    OperationalRepairResult, PersonAskRequest, PersonStepResponse, PlannerSpec,
+    PlanningApprovalRequest, PlanningCandidateSubmitRequest, PlanningProposalRequest,
+    PlanningSessionView, ReplicaRecordView, ReplicationPeerStatus, ReplicationRepairRequest,
+    ReplicationStatus, ReviewRequest, RevisionApprovalRequest, RevisionCancelRequest,
+    RevisionProposalView, RevisionSubmissionView, RunGenerationView, SessionControlResponse,
+    SessionInputMode, SessionInputRequest, SessionScreen, SessionSignalRequest, StatusResponse,
+    StepRunView, SubscriptionRequestDecision, SubscriptionRequestView, WorkRequest,
+    WorkRetryRequest, WorkWakeRequest,
 };
 use st3::reconcile::Reconciler;
 use st3::store::Store;
@@ -1522,7 +1523,7 @@ enum MissionViewCommand {
     /// List current missions; use --all for historical terminal missions.
     Ls {
         /// Follow current collection changes.
-        #[arg(long, conflicts_with_all = ["all", "cursor"])]
+        #[arg(long, conflicts_with_all = ["all", "cursor", "since", "until", "status"])]
         watch: bool,
         #[arg(long)]
         all: bool,
@@ -1530,6 +1531,15 @@ enum MissionViewCommand {
         cursor: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Terminal transitions since a duration such as 6h, or an RFC3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// End of the time window (RFC3339 timestamp or duration ago).
+        #[arg(long)]
+        until: Option<String>,
+        /// Terminal state: failed, cancelled, timed-out, or completed. Includes reasons.
+        #[arg(long, value_parser = ["failed", "cancelled", "timed-out", "completed"])]
+        status: Option<String>,
     },
     /// Explain one mission run, its goals, state, work, and usage.
     Show(MissionShowArgs),
@@ -1614,8 +1624,8 @@ struct MissionCancelArgs {
     /// Why the run is no longer wanted.
     #[arg(long)]
     reason: String,
-    /// Concrete human authority carried over the trusted local Unix boundary.
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    /// Person or authorized agent carried over the trusted local Unix boundary.
+    #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
 }
 
@@ -2087,6 +2097,9 @@ enum TraceCommand {
 struct DoctorArgs {
     #[arg(long)]
     strict: bool,
+    /// Show only the slowest requests and queries over the last five minutes.
+    #[arg(long)]
+    performance: bool,
 }
 
 #[derive(Subcommand)]
@@ -2632,35 +2645,11 @@ enum AttentionCommand {
         #[arg(long = "as", value_parser = parse_person_subject)]
         actor: Option<String>,
     },
-    /// Request attention after an explicit fault.
-    ///
-    /// A request names what closes it. The item stays in `st now` until a person resolves it or
-    /// you withdraw it with `st attention withdraw` once the condition clears. It also leaves
-    /// `now` on its own:
-    ///
-    /// - when the step you have claimed ends, if the request names no target that can end, no
-    ///   --until and no --person-closes; the step ends when it completes, fails, is cancelled,
-    ///   starts another attempt or leaves its run's current generation, and --step names
-    ///   another step;
-    /// - once every target meets its --until condition;
-    /// - at once, when a `step-run/` or `run-generation/` target is no longer current, or a
-    ///   pull request target is merged or closed;
-    /// - otherwise, once every other target has ended after the request: a `mission/` retired or
-    ///   cancelled, a `mission-run/` terminal, an `attention/` item resolved or its gate no
-    ///   longer pending, an `agent/` stopped or ready on a later incarnation, an `observer/`
-    ///   stopped or observing again, a `subscription/` stopped, a `loop-run/` running again or
-    ///   its run revised or cancelled, or a `message/` closed.
-    ///
-    /// Other `resource/` targets and `doc/` targets are context and never end an item. A target
-    /// of any other kind, or one that had already ended when you made the request, keeps it open.
-    ///
-    /// st refuses a request that nothing could close. Pass --person-closes when only a person
-    /// can say it is done.
-    #[command(verbatim_doc_comment)]
+    /// Legacy mutation: returns attention-migrated. Use work ask or remedy the source.
     Request(AttentionRequestArgs),
-    /// Resolve or dismiss any attention request, as any person.
+    /// Legacy mutation: returns attention-migrated. Complete a person step with work done.
     Resolve(AttentionResolveArgs),
-    /// Withdraw an obsolete attention request as its original requester.
+    /// Legacy mutation: returns attention-migrated. Cancel your ask with work cancel-ask.
     Withdraw(AttentionWithdrawArgs),
     /// Approve one person-owned gate or launch review.
     Approve(ReviewArgs),
@@ -2722,10 +2711,16 @@ struct AttentionWithdrawArgs {
 
 #[derive(Subcommand)]
 enum WorkCommand {
+    /// Ask a person through a runtime step owned by live work.
+    Ask(WorkAskArgs),
+    /// Complete a person-assigned step with a response.
+    Done(WorkDoneArgs),
+    /// Cancel your own ask and resume its live origin.
+    CancelAsk(WorkDoneArgs),
     /// List current actionable work; use --as to filter one agent or --all for history.
     Ls {
         /// Follow current collection changes.
-        #[arg(long, conflicts_with_all = ["all", "cursor"])]
+        #[arg(long, conflicts_with_all = ["all", "cursor", "since", "until", "status"])]
         watch: bool,
         #[arg(long = "as")]
         actor: Option<String>,
@@ -2736,6 +2731,15 @@ enum WorkCommand {
         cursor: Option<String>,
         #[arg(long, default_value_t = 50)]
         limit: usize,
+        /// Terminal transitions since a duration such as 6h, or an RFC3339 timestamp.
+        #[arg(long)]
+        since: Option<String>,
+        /// End of the time window (RFC3339 timestamp or duration ago).
+        #[arg(long)]
+        until: Option<String>,
+        /// Terminal state: failed, cancelled, timed-out, or completed. Includes reasons.
+        #[arg(long, value_parser = ["failed", "cancelled", "timed-out", "completed"])]
+        status: Option<String>,
     },
     /// Explain one work item, its owner, readiness, lease, and evidence.
     Show { subject: String },
@@ -2764,6 +2768,41 @@ enum WorkCommand {
         #[command(subcommand)]
         command: WorkRevisionCommand,
     },
+}
+
+#[derive(Args)]
+struct WorkAskArgs {
+    #[arg(long = "for")]
+    person: String,
+    #[arg(long)]
+    title: String,
+    #[arg(long)]
+    reason: String,
+    #[arg(long, conflicts_with = "new_run")]
+    step: Option<String>,
+    #[arg(long, conflicts_with = "step")]
+    new_run: Option<String>,
+    #[arg(long = "as", env = "ST_AGENT")]
+    actor: String,
+    #[arg(long, env = "ST3_INCARNATION")]
+    incarnation: Option<String>,
+    #[arg(long)]
+    idempotency_key: String,
+}
+
+#[derive(Args)]
+struct WorkDoneArgs {
+    subject: String,
+    #[arg(long = "as")]
+    actor: String,
+    #[arg(long, alias = "reason")]
+    summary: String,
+    #[arg(long)]
+    evidence: Vec<String>,
+    #[arg(long)]
+    episode: Option<String>,
+    #[arg(long)]
+    idempotency_key: Option<String>,
 }
 
 #[derive(Args)]
@@ -3047,9 +3086,9 @@ fn main() -> ExitCode {
     }
     // A seat process asks a replacement binary which resume formats it reads before executing it.
     if std::env::args_os().nth(1).as_deref()
-        == Some(std::ffi::OsStr::new(st2::reexec::PROBE_SUBCOMMAND))
+        == Some(std::ffi::OsStr::new(st_drivers::reexec::PROBE_SUBCOMMAND))
     {
-        println!("{}", st2::reexec::probe_answer());
+        println!("{}", st_drivers::reexec::probe_answer());
         return ExitCode::SUCCESS;
     }
     // A seat's harness runs its hooks through this binary. They are hidden from help, need no
@@ -3061,12 +3100,12 @@ fn main() -> ExitCode {
         return run_driver_hook();
     }
     // SAFETY: no other thread exists yet; the async runtime starts after this returns.
-    unsafe { st2::reexec::take_resume_environment() };
-    if st2::reexec::resume_path(st2::reexec::DRIVER_RESUME_ENV).is_some() {
+    unsafe { st_drivers::reexec::take_resume_environment() };
+    if st_drivers::reexec::resume_path(st_drivers::reexec::DRIVER_RESUME_ENV).is_some() {
         // The predecessor blocked the stop signals across its exec. Install the handlers before
         // unblocking them, so a stop that arrived in between ends the session the ordinary way.
-        st2::provider_session::install_stop_handlers();
-        st2::reexec::unblock_stop_signals();
+        st_drivers::provider_session::install_stop_handlers();
+        st_drivers::reexec::unblock_stop_signals();
     }
     let arguments = std::env::args_os().collect::<Vec<_>>();
     if cli_help::all_help_requested(&arguments) {
@@ -3094,14 +3133,8 @@ fn run_driver_hook() -> ExitCode {
         );
         return ExitCode::from(2);
     };
-    // Telemetry as st2's CLI built it: an event hook is its own `hook` process unit, and the
-    // status line, which Claude runs every five seconds, builds no exporter at all.
-    let mut telemetry = match name.as_str() {
-        "claude-observe" => st2::telemetry::Telemetry::init("hook"),
-        _ => st2::telemetry::Telemetry::local_only(),
-    };
     let env = st3::driver_hook::ProcessEnv;
-    let code = st3::driver_hook::run(
+    let run = || st3::driver_hook::run(
         name,
         rest,
         &env,
@@ -3116,7 +3149,12 @@ fn run_driver_hook() -> ExitCode {
             }
         },
     );
-    telemetry.shutdown();
+    let code = if name == "claude-observe" {
+        st3::telemetry::hook(&env, run)
+    } else {
+        st3::telemetry::local_only();
+        run()
+    };
     ExitCode::from(code)
 }
 
@@ -3143,6 +3181,9 @@ fn record_daemon_commands(args: &UpArgs) {
 
 #[tokio::main]
 async fn run_cli(cli: Cli) -> ExitCode {
+    if matches!(&cli.command, Command::Driver(_)) {
+        st3::telemetry::local_only();
+    }
     match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -3414,7 +3455,7 @@ fn guard_mutating_cli_actor(
     if let Some(actor) = actor {
         if actor.starts_with("person/") || actor == "requester" {
             anyhow::bail!(
-                "this harness is `{own}` (ST_AGENT) and cannot act as `{actor}` on a mutating command; request a person through `st attention request --as \"$ST_AGENT\"`"
+                "this harness is `{own}` (ST_AGENT) and cannot act as `{actor}` on a mutating command; request a person through `st work ask --as \"$ST_AGENT\"`"
             );
         }
         if let Some(message) = foreign_agent_actor(actor, Some(own), mission_run) {
@@ -3447,16 +3488,16 @@ fn run_skill(args: SkillArgs) -> Result<()> {
 fn run_claude_channel(command: ClaudeChannelCommand) -> Result<()> {
     match command {
         ClaudeChannelCommand::Install { no_policy } => {
-            st2::claude_channel::install_st3(no_policy).map(|_| ())
+            st_drivers::claude_channel::install_st3(no_policy).map(|_| ())
         }
-        ClaudeChannelCommand::Status => st2::claude_channel::status_st3(),
+        ClaudeChannelCommand::Status => st_drivers::claude_channel::status_st3(),
         ClaudeChannelCommand::Uninstall { keep_policy } => {
-            st2::claude_channel::uninstall_st3(keep_policy)
+            st_drivers::claude_channel::uninstall_st3(keep_policy)
         }
         ClaudeChannelCommand::InstallPolicy => {
-            st2::claude_channel::install_st3_policy().map(|_| ())
+            st_drivers::claude_channel::install_st3_policy().map(|_| ())
         }
-        ClaudeChannelCommand::UninstallPolicy => st2::claude_channel::uninstall_st3_policy(),
+        ClaudeChannelCommand::UninstallPolicy => st_drivers::claude_channel::uninstall_st3_policy(),
     }
 }
 
@@ -4235,11 +4276,34 @@ async fn run_mission_view(
             all,
             cursor,
             limit,
+            since,
+            until,
+            status,
         } => {
             anyhow::ensure!(
                 limit > 0 && limit <= 200,
                 "the mission limit must be 1 through 200"
             );
+            if since.is_some()
+                || until.is_some()
+                || status.is_some()
+                || cursor
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with("outcomes:"))
+            {
+                return list_outcomes(
+                    client,
+                    "missions",
+                    since,
+                    until,
+                    status,
+                    None,
+                    cursor,
+                    limit,
+                    json_output,
+                )
+                .await;
+            }
             if watch {
                 return run_collection_watch(
                     endpoint,
@@ -4265,28 +4329,36 @@ async fn run_mission_view(
             )
         }
         MissionViewCommand::Show(args) => {
-            let selected = args.mission_or_run;
-            let run = if selected.starts_with("mission-run/") {
-                client
-                    .get::<MissionRunView>(&format!(
-                        "/v1/mission-runs/{}",
-                        urlencoding::encode(&selected)
-                    ))
-                    .await?
-            } else {
-                let runs: Vec<MissionRunView> = client
+            let mut selected = args.mission_or_run;
+            if !selected.starts_with("mission-run/") {
+                let overview: Value = client
                     .get(&format!(
-                        "/v1/mission-runs?mission={}",
+                        "/v1/mission-overview?mission={}",
                         urlencoding::encode(&selected)
                     ))
                     .await?;
-                anyhow::ensure!(
-                    runs.len() == 1,
-                    "mission `{selected}` has {} active runs; use an exact mission run subject",
-                    runs.len()
-                );
-                runs.into_iter().next().expect("one active run was checked")
-            };
+                if overview["total_runs"].as_u64() != Some(1) {
+                    anyhow::ensure!(
+                        !args.follow,
+                        "--follow needs an exact mission run subject; choose a run from the summary"
+                    );
+                    if json_output {
+                        return print_value(&overview, true);
+                    }
+                    print!("{}", render_mission_overview(&overview));
+                    return Ok(());
+                }
+                selected = overview["newest"][0]["id"]
+                    .as_str()
+                    .context("missing run in mission summary")?
+                    .to_owned();
+            }
+            let run = client
+                .get::<MissionRunView>(&format!(
+                    "/v1/mission-runs/{}",
+                    urlencoding::encode(&selected)
+                ))
+                .await?;
             if args.follow {
                 return follow_mission_run(client, run, 0, json_output).await;
             }
@@ -6005,7 +6077,12 @@ fn attention_target_line(target: &st3_client::AttentionTargetState, now_unix_ms:
 /// Active and finished runs apart, so a mission with one live run and five old ones does not
 /// read as six runs. A daemon that does not report active runs gets the plain total.
 fn render_mission_runs(mission: &st3_client::Mission) -> String {
-    let total = mission.runs.len();
+    let total = mission
+        .extra
+        .get("total_runs")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(mission.runs.len());
     let plural = |count: usize| if count == 1 { "" } else { "s" };
     let Some(active) = mission.active_runs.map(|active| active.min(total)) else {
         return format!("{total} run{}", plural(total));
@@ -6087,7 +6164,9 @@ fn render_product_page(title: &str, page: &ClientPage, continuation_command: &st
                 if let Some(usage) = &item.usage {
                     let _ = writeln!(output, "  usage {}", render_usage(usage));
                 }
-                if let Some(run) = item.runs.last() {
+                if item.extra.get("runs_truncated").and_then(Value::as_bool) == Some(true) {
+                    let _ = writeln!(output, "  inspect: st missions show {}", item.header.id);
+                } else if let Some(run) = item.runs.last() {
                     let _ = writeln!(output, "  inspect: st missions show {run}");
                 }
             }
@@ -6816,7 +6895,201 @@ fn parse_timeout(value: &str) -> Result<Duration> {
     anyhow::bail!("a timeout must use ms, s, m, h, or zero")
 }
 
+fn outcome_time(value: &str, now: u128) -> Result<u128> {
+    if let Ok(at) = chrono::DateTime::parse_from_rfc3339(value) {
+        return u128::try_from(at.timestamp_millis())
+            .context("the time must be after the Unix epoch");
+    }
+    let ago = parse_timeout(value).context("use a duration such as 6h or an RFC3339 timestamp")?;
+    Ok(now.saturating_sub(ago.as_millis()))
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct OutcomeCursor {
+    collection: String,
+    since: u128,
+    until: u128,
+    status: Option<String>,
+    actor: Option<String>,
+    before: u64,
+    limit: usize,
+}
+
+async fn list_outcomes(
+    client: &Client,
+    collection: &str,
+    since: Option<String>,
+    until: Option<String>,
+    status: Option<String>,
+    actor: Option<String>,
+    cursor: Option<String>,
+    limit: usize,
+    json_output: bool,
+) -> Result<()> {
+    let now = current_unix_ms()?;
+    let mut filter = if let Some(cursor) = cursor {
+        let encoded = cursor
+            .strip_prefix("outcomes:")
+            .context("use the outcome cursor printed by this command")?;
+        let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(encoded)?;
+        let saved: OutcomeCursor = serde_json::from_slice(&decoded)?;
+        anyhow::ensure!(
+            saved.collection == collection
+                && saved.limit == limit
+                && saved.actor == actor
+                && status
+                    .as_deref()
+                    .is_none_or(|s| saved.status.as_deref() == Some(s)),
+            "the outcome cursor does not match the collection or filters"
+        );
+        anyhow::ensure!(
+            since.is_none() && until.is_none(),
+            "the cursor already fixes the time window; omit --since and --until"
+        );
+        saved
+    } else {
+        OutcomeCursor {
+            collection: collection.into(),
+            since: since
+                .as_deref()
+                .map(|v| outcome_time(v, now))
+                .transpose()?
+                .unwrap_or(0),
+            until: until
+                .as_deref()
+                .map(|v| outcome_time(v, now))
+                .transpose()?
+                .unwrap_or(now),
+            status,
+            actor,
+            before: i64::MAX as u64,
+            limit,
+        }
+    };
+    anyhow::ensure!(
+        filter.since <= filter.until,
+        "--since must be before --until"
+    );
+    let mut path = format!(
+        "/v1/outcome-history?collection={collection}&since={}&until={}&before={}&limit={limit}",
+        filter.since, filter.until, filter.before
+    );
+    if let Some(status) = &filter.status {
+        path.push_str(&format!("&status={}", urlencoding::encode(status)));
+    }
+    if let Some(actor) = &filter.actor {
+        path.push_str(&format!("&actor={}", urlencoding::encode(actor)));
+    }
+    let mut page: Value = client.get(&path).await?;
+    if let Some(before) = page["next_before"].as_u64() {
+        filter.before = before;
+        let next = format!(
+            "outcomes:{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(&filter)?)
+        );
+        page["next_cursor"] = json!(next);
+    }
+    if json_output {
+        return print_value(&page, true);
+    }
+    let items = page["items"].as_array().context("invalid outcome page")?;
+    println!("{} OUTCOMES  {}", collection.to_uppercase(), items.len());
+    for item in items {
+        println!(
+            "{}  {}  {}",
+            item["subject"].as_str().unwrap_or("?"),
+            item["status"].as_str().unwrap_or("?"),
+            relative_time(item["at_unix_ms"].as_u64().unwrap_or(0) as u128, now)
+        );
+        if let Some(reason) = item["reason"].as_str() {
+            println!("  reason: {reason}");
+        }
+        if let Some(mission) = item["mission"].as_str() {
+            println!("  mission: {mission}");
+        }
+    }
+    if let Some(cursor) = page["next_cursor"].as_str() {
+        let actor = filter
+            .actor
+            .as_deref()
+            .map(|a| format!(" --as {a}"))
+            .unwrap_or_default();
+        println!("Next: st {collection} ls{actor} --limit {limit} --cursor '{cursor}'");
+    }
+    Ok(())
+}
+
+fn render_mission_overview(view: &Value) -> String {
+    use std::fmt::Write as _;
+    let mut out = format!(
+        "MISSION  {}\nRUNS     {} total\n",
+        view["mission"].as_str().unwrap_or("?"),
+        view["total_runs"]
+    );
+    if let Some(counts) = view["counts"].as_object() {
+        for (state, count) in counts {
+            let _ = writeln!(out, "  {state}: {count}");
+        }
+    }
+    for (key, title) in [("newest", "NEWEST"), ("failed", "FAILED")] {
+        let _ = writeln!(out, "{title} (up to {} runs)", view["preview_limit"]);
+        if let Some(runs) = view[key].as_array() {
+            for run in runs {
+                let _ = writeln!(
+                    out,
+                    "  {}  {}",
+                    run["id"].as_str().unwrap_or("?"),
+                    run["status"].as_str().unwrap_or("?")
+                );
+                if let Some(reason) = run["reason"].as_str() {
+                    let _ = writeln!(out, "    reason: {reason}");
+                }
+            }
+        }
+    }
+    out
+}
+
+fn render_performance(view: &Value) -> String {
+    use std::fmt::Write as _;
+    if view.is_null() {
+        return String::new();
+    }
+    let mut out = format!(
+        "PERFORMANCE  last {} seconds · sorted by total wall time\n",
+        view["window_seconds"]
+    );
+    for (key, title) in [("requests", "REQUESTS AND TASKS"), ("queries", "QUERIES")] {
+        let _ = writeln!(out, "{title}  count · total ms · max ms · CPU ms · kind");
+        if let Some(rows) = view[key].as_array() {
+            for row in rows {
+                let _ = writeln!(
+                    out,
+                    "  {}  {:.1}  {:.1}  {:.1}  {}",
+                    row["count"],
+                    row["total_ms"].as_f64().unwrap_or(0.0),
+                    row["max_ms"].as_f64().unwrap_or(0.0),
+                    row["cpu_ms"].as_f64().unwrap_or(0.0),
+                    row["kind"].as_str().unwrap_or("?")
+                );
+            }
+        }
+    }
+    if let Some(note) = view["query_time_note"].as_str() {
+        let _ = writeln!(out, "{note}");
+    }
+    out
+}
+
 async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Result<()> {
+    if args.performance {
+        let report: Value = client.get("/v1/performance").await?;
+        if json_output {
+            return print_value(&report, true);
+        }
+        print!("{}", render_performance(&report));
+        return Ok(());
+    }
     let report: DoctorReport = client.get("/v1/doctor").await?;
     if json_output {
         print_value(&report, true)?;
@@ -6824,6 +7097,7 @@ async fn run_doctor(client: &Client, args: DoctorArgs, json_output: bool) -> Res
         for check in &report.checks {
             println!("{}\t{}\t{}", check.status, check.name, check.message);
         }
+        print!("{}", render_performance(&report.performance));
     }
     anyhow::ensure!(report.status != "fail", "st doctor found a failed check");
     anyhow::ensure!(
@@ -9338,6 +9612,7 @@ fn render_mission_authority(authority: &st3_client::AgentMissionAuthority) -> St
         ("publish", &authority.publish),
         ("start", &authority.start),
         ("revise", &authority.revise),
+        ("cancel", &authority.cancel),
     ] {
         for pattern in rules {
             match patterns.iter_mut().find(|(known, _)| known == pattern) {
@@ -9912,12 +10187,60 @@ async fn run_work(
     json_output: bool,
 ) -> Result<()> {
     match command {
+        WorkCommand::Ask(args) => {
+            reject_foreign_agent_actor(&args.actor)?;
+            let result: StepRunView = client
+                .post(
+                    "/v1/work/ask",
+                    &PersonAskRequest {
+                        legacy_request: None,
+                        person: args.person,
+                        title: args.title,
+                        reason: args.reason,
+                        actor: args.actor,
+                        step: args.step,
+                        new_run: args.new_run,
+                        incarnation: args.incarnation,
+                        idempotency_key: args.idempotency_key,
+                    },
+                )
+                .await?;
+            print_value(&result, json_output)
+        }
+        command @ (WorkCommand::Done(_) | WorkCommand::CancelAsk(_)) => {
+            let (args, path) = match command {
+                WorkCommand::Done(args) => (args, "/v1/work/done"),
+                WorkCommand::CancelAsk(args) => (args, "/v1/work/cancel-ask"),
+                _ => unreachable!(),
+            };
+            reject_foreign_agent_actor(&args.actor)?;
+            let result: StepRunView = client
+                .post(
+                    path,
+                    &PersonStepResponse {
+                        subject: args.subject,
+                        actor: args.actor,
+                        summary: args.summary,
+                        evidence: args.evidence,
+                        episode: args.episode,
+                        idempotency_key: args.idempotency_key.unwrap_or_else(|| {
+                            format!("person-response:{}", uuid::Uuid::now_v7().simple())
+                        }),
+                    },
+                )
+                .await?;
+            print_value(&result, json_output)
+        }
+
         WorkCommand::Ls {
             watch,
             actor,
             all,
             cursor,
             limit,
+            since,
+            until,
+            status,
         } => {
             if let Some(actor) = actor.as_deref() {
                 reject_foreign_agent_actor(actor)?;
@@ -9926,6 +10249,26 @@ async fn run_work(
                 limit > 0 && limit <= 200,
                 "the work limit must be 1 through 200"
             );
+            if since.is_some()
+                || until.is_some()
+                || status.is_some()
+                || cursor
+                    .as_deref()
+                    .is_some_and(|c| c.starts_with("outcomes:"))
+            {
+                return list_outcomes(
+                    client,
+                    "work",
+                    since,
+                    until,
+                    status,
+                    actor,
+                    cursor,
+                    limit,
+                    json_output,
+                )
+                .await;
+            }
             if watch {
                 return run_collection_watch(
                     endpoint,
@@ -11243,7 +11586,7 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
             .as_deref()
             .context("the Claude channel has no subject")?;
         let (catalog, _agent_dir, identity, _runtime_id) = prepare_native_driver(subject)?;
-        return st2::claude_mcp::run_st3(&catalog, &identity);
+        return st_drivers::claude_mcp::run_st3(&catalog, &identity);
     }
     if matches!(args.driver.as_str(), "pi-channel" | "omp-channel") {
         let identity = args
@@ -11285,9 +11628,9 @@ async fn run_driver(client: &Client, args: DriverArgs, catalog: Option<&Path>) -
         // Harness-session state (OpenCode delivery ledgers, Claude resume bindings) stays beneath
         // st3's driver directory, never st2's; the seat's hooks choose the same root.
         if let Some(drivers) = std::env::var_os("ST3_DRIVER_STATE_DIR") {
-            st2::run::use_harness_state_root(PathBuf::from(drivers).join("sessions"));
+            st_drivers::run::use_harness_state_root(PathBuf::from(drivers).join("sessions"));
         }
-        if let Some(state) = st2::reexec::resume_path(st2::reexec::DRIVER_RESUME_ENV) {
+        if let Some(state) = st_drivers::reexec::resume_path(st_drivers::reexec::DRIVER_RESUME_ENV) {
             return resume_native_driver(client, subject, &args.driver, argv, &state).await;
         }
         if args.driver == "codex" {
@@ -11369,7 +11712,7 @@ async fn run_st2_native_driver(
         )
     })
     .await?;
-    let harness_state_path = st2::harness_state::harness_state_path(&paths.agent_dir);
+    let harness_state_path = st_drivers::harness_state::harness_state_path(&paths.agent_dir);
     let loop_state = NativeLoopState {
         predecessor_harness_record: fs::read(&harness_state_path).ok(),
         ..NativeLoopState::default()
@@ -11418,7 +11761,7 @@ impl NativePaths {
 
 enum ProviderStart {
     Launch(Vec<String>),
-    Adopt(st2::provider_session::DetachedSession),
+    Adopt(st_drivers::provider_session::DetachedSession),
 }
 
 fn spawn_st2_provider(
@@ -11426,28 +11769,28 @@ fn spawn_st2_provider(
     paths: &NativePaths,
     start: ProviderStart,
 ) -> tokio::task::JoinHandle<Result<()>> {
-    use st2::provider_session::DetachedSession;
+    use st_drivers::provider_session::DetachedSession;
     let paths = paths.clone();
     let driver = driver.to_owned();
     tokio::task::spawn_blocking(move || match start {
         ProviderStart::Launch(argv) => match driver.as_str() {
-            "claude" => st2::claude_session::run_controlled_paths(
+            "claude" => st_drivers::claude_session::run_controlled_paths(
                 &paths.catalog,
                 &paths.agent_dir,
                 paths.identity,
                 paths.runtime_id,
                 argv,
             ),
-            "pi" => st2::pi_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv),
-            "omp" => st2::omp_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv),
+            "pi" => st_drivers::pi_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv),
+            "omp" => st_drivers::omp_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv),
             "opencode" => {
-                st2::opencode_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv)
+                st_drivers::opencode_session::run(&paths.catalog, paths.identity, paths.runtime_id, argv)
             }
             _ => unreachable!("the native driver was checked"),
         },
         ProviderStart::Adopt(session) => match (driver.as_str(), session) {
             ("claude", DetachedSession::Provider { pid, session, seq }) => {
-                st2::claude_session::adopt_controlled_paths(
+                st_drivers::claude_session::adopt_controlled_paths(
                     &paths.agent_dir,
                     &paths.identity,
                     &paths.runtime_id,
@@ -11456,7 +11799,7 @@ fn spawn_st2_provider(
                     seq,
                 )
             }
-            ("pi", DetachedSession::Provider { pid, session, seq }) => st2::pi_session::adopt(
+            ("pi", DetachedSession::Provider { pid, session, seq }) => st_drivers::pi_session::adopt(
                 &paths.catalog,
                 paths.identity,
                 paths.runtime_id,
@@ -11464,7 +11807,7 @@ fn spawn_st2_provider(
                 session,
                 seq,
             ),
-            ("omp", DetachedSession::Provider { pid, session, seq }) => st2::omp_session::adopt(
+            ("omp", DetachedSession::Provider { pid, session, seq }) => st_drivers::omp_session::adopt(
                 &paths.catalog,
                 paths.identity,
                 paths.runtime_id,
@@ -11483,7 +11826,7 @@ fn spawn_st2_provider(
                     version_ok,
                     producer_version,
                 },
-            ) => st2::opencode_session::adopt(
+            ) => st_drivers::opencode_session::adopt(
                 &paths.catalog,
                 paths.identity,
                 paths.runtime_id,
@@ -11522,7 +11865,7 @@ struct DriverResume {
     driver: String,
     subject: String,
     incarnation: String,
-    session: st2::provider_session::DetachedSession,
+    session: st_drivers::provider_session::DetachedSession,
     loop_state: NativeLoopState,
 }
 
@@ -11534,7 +11877,7 @@ async fn resume_native_driver(
     argv: Vec<String>,
     state_path: &Path,
 ) -> Result<()> {
-    let mut resume: DriverResume = st2::reexec::read_state(state_path)?;
+    let mut resume: DriverResume = st_drivers::reexec::read_state(state_path)?;
     anyhow::ensure!(
         resume.subject == subject && resume.driver == driver,
         "the resume state belongs to the {} driver of `{}`, not the {driver} driver of `{subject}`",
@@ -11546,7 +11889,7 @@ async fn resume_native_driver(
         subject,
         &format!(
             "the {driver} driver resumed in {} after its st binary was replaced; the provider kept running",
-            st2::reexec::installed_binary()
+            st_drivers::reexec::installed_binary()
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "a replacement binary".into())
         ),
@@ -11579,14 +11922,14 @@ async fn resume_native_driver(
 /// Follows the installed st binary for a native driver. Once a replacement is ready, the driver
 /// asks its provider task to detach and re-executes with the session it released.
 struct DriverReplacement {
-    watch: Option<st2::reexec::ReplacementWatch>,
+    watch: Option<st_drivers::reexec::ReplacementWatch>,
     pending: Option<PathBuf>,
 }
 
 impl DriverReplacement {
     fn new() -> Self {
         Self {
-            watch: st2::reexec::ReplacementWatch::for_current_process(),
+            watch: st_drivers::reexec::ReplacementWatch::for_current_process(),
             pending: None,
         }
     }
@@ -11604,14 +11947,14 @@ impl DriverReplacement {
             return false;
         };
         self.pending = Some(binary);
-        st2::provider_session::DETACH.store(true, std::sync::atomic::Ordering::SeqCst);
+        st_drivers::provider_session::DETACH.store(true, std::sync::atomic::Ordering::SeqCst);
         true
     }
 
     /// Re-execute with a released session. Returns only when that failed; the caller then adopts
     /// the session again in this image and retries the replacement later.
     fn exec(&mut self, subject: &str, state_root: &Path, resume: &DriverResume) -> anyhow::Error {
-        st2::provider_session::DETACH.store(false, std::sync::atomic::Ordering::SeqCst);
+        st_drivers::provider_session::DETACH.store(false, std::sync::atomic::Ordering::SeqCst);
         let Some(binary) = self.pending.take() else {
             return anyhow::anyhow!("no replacement binary was pending");
         };
@@ -11623,14 +11966,14 @@ impl DriverReplacement {
                 resume.driver
             ),
         );
-        let error = match st2::reexec::write_state(state_root, "driver-resume", resume) {
+        let error = match st_drivers::reexec::write_state(state_root, "driver-resume", resume) {
             Ok(path) => {
-                let error = st2::reexec::exec_unless_stopped(
+                let error = st_drivers::reexec::exec_unless_stopped(
                     &binary,
-                    st2::reexec::DRIVER_RESUME_ENV,
+                    st_drivers::reexec::DRIVER_RESUME_ENV,
                     &path,
                     &resume.session.inherited_descriptors(),
-                    &st2::provider_session::stop_requested,
+                    &st_drivers::provider_session::stop_requested,
                 );
                 let _ = fs::remove_file(&path);
                 anyhow::Error::new(error).context(format!("executing {}", binary.display()))
@@ -11651,11 +11994,11 @@ impl DriverReplacement {
 }
 
 /// The detached session a provider task returned, if it returned one.
-fn detached_session(outcome: &Result<()>) -> Option<st2::provider_session::DetachedSession> {
+fn detached_session(outcome: &Result<()>) -> Option<st_drivers::provider_session::DetachedSession> {
     outcome
         .as_ref()
         .err()?
-        .downcast_ref::<st2::provider_session::Detached>()
+        .downcast_ref::<st_drivers::provider_session::Detached>()
         .map(|detached| detached.session.clone())
 }
 
@@ -11665,10 +12008,10 @@ fn native_delivery_report(transport: &str, agent_dir: Option<&Path>) -> String {
     let mut report = json!({
         "transport": transport,
         "pid": std::process::id(),
-        "image": st2::reexec::running_identity().map(|identity| identity.token()),
+        "image": st_drivers::reexec::running_identity().map(|identity| identity.token()),
     });
     if let Some(agent_dir) = agent_dir {
-        let channel = st2::claude_mcp::read_presence(agent_dir);
+        let channel = st_drivers::claude_mcp::read_presence(agent_dir);
         let now = current_unix_ms().unwrap_or_default() as u64;
         report["channel"] = match channel {
             Some(presence) => json!({
@@ -11697,9 +12040,9 @@ async fn drive_st2_native(
         identity,
         runtime_id,
     } = paths.clone();
-    let harness_state_path = st2::harness_state::harness_state_path(&agent_dir);
-    let inbox = st2::message::inbox_dir(&agent_dir);
-    let archive = st2::message::archive_dir(&agent_dir);
+    let harness_state_path = st_drivers::harness_state::harness_state_path(&agent_dir);
+    let inbox = st_drivers::message::inbox_dir(&agent_dir);
+    let archive = st_drivers::message::archive_dir(&agent_dir);
     // Mailbox projection reads the durable message history. A one-second poll
     // bounds delivery latency without repeatedly walking it four times a
     // second for every native harness during idle periods.
@@ -11769,7 +12112,7 @@ async fn drive_st2_native(
                     current_record.as_deref(),
                 );
                 let provider_incarnation = if loop_state.harness_record_started {
-                    st2::harness_state::read(&harness_state_path, None)
+                    st_drivers::harness_state::read(&harness_state_path, None)
                         .and_then(|observed| observed.evidence_incarnation)
                 } else {
                     None
@@ -11844,21 +12187,21 @@ async fn drive_st2_native(
                 let tick: Result<()> = async {
                     if native_file_may_override_channel(driver)
                         && loop_state.harness_record_started
-                        && let Some(observed) = st2::harness_state::read(&harness_state_path, None)
+                        && let Some(observed) = st_drivers::harness_state::read(&harness_state_path, None)
                     {
                         // A session claim is a startup fence, not an observation. Preserve the
                         // explicit `starting` state until a hook or the initialized ST3 channel
                         // supplies positive evidence; publishing the derived `claimed`
                         // indeterminacy would erase the more precise lifecycle state.
                         let claim_placeholder =
-                            observed.state == st2::harness_state::Activity::Unknown
+                            observed.state == st_drivers::harness_state::Activity::Unknown
                                 && observed.reason.as_deref() == Some("claimed");
                         if !claim_placeholder {
                             if !loop_state.ready
                                 && !matches!(
                                     observed.state,
-                                    st2::harness_state::Activity::Unknown
-                                        | st2::harness_state::Activity::Ended
+                                    st_drivers::harness_state::Activity::Unknown
+                                        | st_drivers::harness_state::Activity::Ended
                                 )
                             {
                                 let _: ClaimRecord = client.post("/v1/claims", &ClaimInput {
@@ -12073,7 +12416,7 @@ fn prepare_native_driver_in(
         "catalog { pty-root \"/tmp/st3-native\" }\n",
     )?;
     let identity = subject.strip_prefix("agent/").unwrap_or(subject).to_owned();
-    let host = st2::run::detect_host();
+    let host = st_drivers::run::detect_host();
     let leaf = &hex::encode(Sha256::digest(identity.as_bytes()))[..16];
     let agent_dir = catalog.join("agents").join(&host).join(leaf);
     fs::create_dir_all(&agent_dir)?;
@@ -12086,13 +12429,13 @@ fn prepare_native_driver_in(
     Ok((catalog, agent_dir, identity.clone(), identity))
 }
 
-fn harness_activity_state(activity: st2::harness_state::Activity) -> &'static str {
+fn harness_activity_state(activity: st_drivers::harness_state::Activity) -> &'static str {
     match activity {
-        st2::harness_state::Activity::Ready => "ready",
-        st2::harness_state::Activity::Idle => "idle",
-        st2::harness_state::Activity::Active | st2::harness_state::Activity::Child => "working",
-        st2::harness_state::Activity::Ended => "ended",
-        st2::harness_state::Activity::Unknown => "indeterminate",
+        st_drivers::harness_state::Activity::Ready => "ready",
+        st_drivers::harness_state::Activity::Idle => "idle",
+        st_drivers::harness_state::Activity::Active | st_drivers::harness_state::Activity::Child => "working",
+        st_drivers::harness_state::Activity::Ended => "ended",
+        st_drivers::harness_state::Activity::Unknown => "indeterminate",
     }
 }
 
@@ -12102,7 +12445,7 @@ async fn publish_harness_activity(
     driver: &str,
     transport: &str,
     incarnation: Option<&str>,
-    observed: &st2::harness_state::Observed,
+    observed: &st_drivers::harness_state::Observed,
     last_fingerprint: &mut Option<String>,
 ) -> Result<()> {
     let status = harness_activity_state(observed.state);
@@ -12206,7 +12549,7 @@ async fn publish_harness_usage(
     last_fingerprint: &mut Option<String>,
 ) -> Result<()> {
     let Some(observed) =
-        st2::harness_context::read(&st2::harness_context::harness_context_path(agent_dir))
+        st_drivers::harness_context::read(&st_drivers::harness_context::harness_context_path(agent_dir))
     else {
         return Ok(());
     };
@@ -12364,7 +12707,7 @@ async fn publish_harness_timeline(
     published: &mut BTreeSet<String>,
 ) -> Result<()> {
     let Some(record) =
-        st2::harness_timeline::read(&st2::harness_timeline::timeline_path(agent_dir))
+        st_drivers::harness_timeline::read(&st_drivers::harness_timeline::timeline_path(agent_dir))
     else {
         return Ok(());
     };
@@ -12412,7 +12755,7 @@ async fn publish_harness_timeline(
 }
 
 fn timeline_record_is_current(
-    record: &st2::harness_timeline::Record,
+    record: &st_drivers::harness_timeline::Record,
     driver: &str,
     provider_incarnation: Option<&str>,
 ) -> bool {
@@ -12420,7 +12763,7 @@ fn timeline_record_is_current(
 }
 
 fn timeline_claim_fields(
-    operation: st2::harness_timeline::Operation,
+    operation: st_drivers::harness_timeline::Operation,
     runtime_incarnation: &str,
 ) -> BTreeMap<String, Value> {
     let mut fields = BTreeMap::from([
@@ -12500,13 +12843,13 @@ fn pi_family_message_frame(message: &st3::model::MessageView, body: &str, identi
     json!({
         "type": "message",
         "deliverAs": "steer",
-        "content": st2::ding::st3_notification_text(
+        "content": st_drivers::ding::st3_notification_text(
             &message.subject,
             &message.from,
             &message.to,
             message.title.as_deref(),
             body,
-            &st2::ding::st3_body_sha256(body),
+            &st_drivers::ding::st3_body_sha256(body),
         ),
         "meta": {
             "from": message.from,
@@ -12539,10 +12882,10 @@ async fn run_pi_channel(
     use tokio::io::AsyncWriteExt as _;
 
     let identity = subject.strip_prefix("agent/").unwrap_or(subject);
-    let resumed = match st2::reexec::resume_path(st2::reexec::CHANNEL_RESUME_ENV) {
+    let resumed = match st_drivers::reexec::resume_path(st_drivers::reexec::CHANNEL_RESUME_ENV) {
         Some(path) => {
-            let state = st2::reexec::read_state::<PiChannelResume>(&path);
-            st2::reexec::unblock_stop_signals();
+            let state = st_drivers::reexec::read_state::<PiChannelResume>(&path);
+            st_drivers::reexec::unblock_stop_signals();
             Some(state.context("resuming the pi-family channel after a binary replacement")?)
         }
         None => None,
@@ -12583,8 +12926,12 @@ async fn run_pi_channel(
             stdout.flush().await?;
             PiChannelResume {
                 incarnation,
-                session: std::env::var("ST2_PI_CHANNEL_SESSION")
-                    .unwrap_or_else(|_| "unknown".into()),
+                session: st_drivers::contracts::env(if driver == "omp" {
+                    st_drivers::omp_session::CHANNEL_SESSION
+                } else {
+                    st_drivers::pi_session::CHANNEL_SESSION
+                })
+                .unwrap_or_else(|| "unknown".into()),
                 ..PiChannelResume::default()
             }
         }
@@ -12593,11 +12940,11 @@ async fn run_pi_channel(
     let session = state.session.clone();
     let transport = format!("{driver}-channel");
     let (input_tx, mut input_rx) = tokio::sync::mpsc::unbounded_channel();
-    let spawn_reader = |sender: tokio::sync::mpsc::UnboundedSender<st2::reexec::StdinChunk>| {
-        st2::reexec::StdinReader::spawn(move |chunk| sender.send(chunk).is_ok())
+    let spawn_reader = |sender: tokio::sync::mpsc::UnboundedSender<st_drivers::reexec::StdinChunk>| {
+        st_drivers::reexec::StdinReader::spawn(move |chunk| sender.send(chunk).is_ok())
     };
     let mut reader = Some(spawn_reader(input_tx.clone()));
-    let mut watch = st2::reexec::ReplacementWatch::for_current_process();
+    let mut watch = st_drivers::reexec::ReplacementWatch::for_current_process();
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_warning = None;
@@ -12609,14 +12956,14 @@ async fn run_pi_channel(
             chunk = input_rx.recv() => {
                 let mut publish = false;
                 match chunk {
-                    Some(st2::reexec::StdinChunk::Bytes(bytes)) => {
+                    Some(st_drivers::reexec::StdinChunk::Bytes(bytes)) => {
                         state.lines.push(&bytes);
                         while let Some(line) = state.lines.next_line() {
                             publish |= state.accept_frame(&line);
                         }
                     }
                     // The extension ends the pipe when its session ends.
-                    Some(st2::reexec::StdinChunk::Eof) | None => {
+                    Some(st_drivers::reexec::StdinChunk::Eof) | None => {
                         if let Some(line) = state.lines.finish()
                             && state.accept_frame(&line)
                         {
@@ -12627,7 +12974,7 @@ async fn run_pi_channel(
                         }
                         return Ok(());
                     }
-                    Some(st2::reexec::StdinChunk::Failed(error)) => {
+                    Some(st_drivers::reexec::StdinChunk::Failed(error)) => {
                         return Err(error).context("reading the pi-family channel input");
                     }
                 }
@@ -12757,9 +13104,9 @@ async fn run_pi_channel(
                     let mut publish = false;
                     while let Ok(chunk) = input_rx.try_recv() {
                         match chunk {
-                            st2::reexec::StdinChunk::Bytes(bytes) => state.lines.push(&bytes),
-                            st2::reexec::StdinChunk::Eof => return Ok(()),
-                            st2::reexec::StdinChunk::Failed(error) => {
+                            st_drivers::reexec::StdinChunk::Bytes(bytes) => state.lines.push(&bytes),
+                            st_drivers::reexec::StdinChunk::Eof => return Ok(()),
+                            st_drivers::reexec::StdinChunk::Failed(error) => {
                                 return Err(error).context("reading the pi-family channel input");
                             }
                         }
@@ -12782,11 +13129,11 @@ async fn run_pi_channel(
                             binary.display()
                         ),
                     );
-                    let failure = match st2::reexec::write_state(state_root, "channel-resume", &state) {
+                    let failure = match st_drivers::reexec::write_state(state_root, "channel-resume", &state) {
                         Ok(path) => {
-                            let error = st2::reexec::exec(
+                            let error = st_drivers::reexec::exec(
                                 &binary,
-                                st2::reexec::CHANNEL_RESUME_ENV,
+                                st_drivers::reexec::CHANNEL_RESUME_ENV,
                                 &path,
                                 &[],
                             );
@@ -12834,7 +13181,7 @@ struct PiChannelResume {
     // Reports the daemon has not accepted yet. A restart must not end the channel or lose the
     // harness's latest state, so each waits here and is sent again on the next tick.
     pending: PiFamilyReports,
-    lines: st2::reexec::LineBuffer,
+    lines: st_drivers::reexec::LineBuffer,
 }
 
 impl PiChannelResume {
@@ -13078,7 +13425,7 @@ fn spawn_codex_provider(
     let state_dir = state_dir.to_path_buf();
     let argv = argv.to_vec();
     tokio::task::spawn_blocking(move || match start {
-        ProviderStart::Launch(_) => st2::codex_app_server::run_controlled_paths(
+        ProviderStart::Launch(_) => st_drivers::codex_app_server::run_controlled_paths(
             &paths.catalog,
             &state_dir,
             &paths.agent_dir,
@@ -13086,14 +13433,14 @@ fn spawn_codex_provider(
             paths.runtime_id,
             argv,
         ),
-        ProviderStart::Adopt(st2::provider_session::DetachedSession::Codex {
+        ProviderStart::Adopt(st_drivers::provider_session::DetachedSession::Codex {
             tui_pid,
             server_pid,
             watchdog_pid,
             owner_write_fd,
             socket_path,
             safe_fallback,
-        }) => st2::codex_app_server::adopt_controlled_paths(
+        }) => st_drivers::codex_app_server::adopt_controlled_paths(
             &paths.catalog,
             &state_dir,
             &paths.agent_dir,
@@ -13131,8 +13478,8 @@ async fn drive_codex_native(
     let root = paths.state_root();
     let state_dir = root.join("state");
     let prior_binding = std::fs::read(state_dir.join("binding.json")).ok();
-    let inbox = st2::message::inbox_dir(&agent_dir);
-    let archive = st2::message::archive_dir(&agent_dir);
+    let inbox = st_drivers::message::inbox_dir(&agent_dir);
+    let archive = st_drivers::message::archive_dir(&agent_dir);
     let mut task = spawn_codex_provider(&paths, &state_dir, &argv, start);
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -13223,8 +13570,8 @@ async fn drive_codex_native(
                         }).await?;
                         loop_state.ready = true;
                     }
-                    if let Some(observed) = st2::harness_state::read(
-                        &st2::harness_state::harness_state_path(&agent_dir),
+                    if let Some(observed) = st_drivers::harness_state::read(
+                        &st_drivers::harness_state::harness_state_path(&agent_dir),
                         None,
                     ) {
                         publish_harness_activity(
@@ -13931,7 +14278,7 @@ async fn forward_projected_messages_reporting(
             state_dir,
             identity,
             runtime_id,
-        } => st2::codex_app_server::consumed_delivery_filenames(state_dir, identity, runtime_id),
+        } => st_drivers::codex_app_server::consumed_delivery_filenames(state_dir, identity, runtime_id),
         NativeDeliveryReceipts::ClaudeChannel {
             agent_dir,
             incarnation,
@@ -13940,7 +14287,7 @@ async fn forward_projected_messages_reporting(
             catalog_root,
             identity,
             runtime_id,
-        } => st2::opencode_session::consumed_delivery_filenames(catalog_root, identity, runtime_id),
+        } => st_drivers::opencode_session::consumed_delivery_filenames(catalog_root, identity, runtime_id),
     }?;
     let mut cursor = None;
     let mut failures = Vec::new();
@@ -13988,13 +14335,13 @@ async fn forward_projected_messages_reporting(
                     };
                     let mut tags = message.tags.clone();
                     tags.push(format!("{TAG_PREFIX}{}", message.subject));
-                    tags.push(format!("{}{}", st2::ding::ST3_TO_TAG, message.to));
+                    tags.push(format!("{}{}", st_drivers::ding::ST3_TO_TAG, message.to));
                     tags.push(format!(
                         "{}{}",
-                        st2::ding::ST3_SHA256_TAG,
-                        st2::ding::st3_body_sha256(&content)
+                        st_drivers::ding::ST3_SHA256_TAG,
+                        st_drivers::ding::st3_body_sha256(&content)
                     ));
-                    let filename = st2::message::send_to_inbox(
+                    let filename = st_drivers::message::send_to_inbox(
                         inbox,
                         &message.from,
                         message.title.as_deref(),
@@ -14044,7 +14391,7 @@ async fn forward_projected_messages_reporting(
     // A message can close between polls. The active page intentionally excludes
     // history, so inspect only projected files still in the native inbox before
     // deciding whether to archive them. A failed lookup keeps the file in place.
-    for file in st2::message::list_dir(inbox)? {
+    for file in st_drivers::message::list_dir(inbox)? {
         for reference in file
             .tags
             .iter()
@@ -14091,7 +14438,7 @@ fn claude_channel_consumed_delivery_filenames(
 ) -> Result<BTreeSet<String>> {
     const PREFIX: &str = "[st3-delivery:";
     let Some(record) =
-        st2::harness_timeline::read(&st2::harness_timeline::timeline_path(agent_dir))
+        st_drivers::harness_timeline::read(&st_drivers::harness_timeline::timeline_path(agent_dir))
     else {
         return Ok(BTreeSet::new());
     };
@@ -14105,7 +14452,7 @@ fn claude_channel_consumed_delivery_filenames(
         .filter_map(|operation| operation.body.get("text").and_then(Value::as_str))
         .flat_map(|text| text.split(PREFIX).skip(1))
         .filter_map(|tail| tail.split_once(']').map(|(filename, _)| filename))
-        .filter(|filename| st2::message::is_message_filename(filename))
+        .filter(|filename| st_drivers::message::is_message_filename(filename))
         .map(str::to_owned)
         .collect())
 }
@@ -14133,14 +14480,14 @@ fn sync_consumed_projected_messages(
     consumed_by_recipient: &BTreeSet<String>,
 ) -> Result<()> {
     const TAG_PREFIX: &str = "st3-message:";
-    for message in st2::message::list_dir(inbox)? {
+    for message in st_drivers::message::list_dir(inbox)? {
         let is_consumed = message
             .tags
             .iter()
             .filter_map(|tag| tag.strip_prefix(TAG_PREFIX))
             .any(|subject| consumed_by_recipient.contains(subject));
         if is_consumed {
-            st2::message::archive_msg(inbox, archive, &message.filename)?;
+            st_drivers::message::archive_msg(inbox, archive, &message.filename)?;
         }
     }
     Ok(())
@@ -14155,9 +14502,9 @@ fn projected_message_subjects(inbox: &Path, archive: &Path) -> Result<BTreeSet<S
 
 fn projected_message_files(inbox: &Path, archive: &Path) -> Result<BTreeMap<String, String>> {
     const TAG_PREFIX: &str = "st3-message:";
-    Ok(st2::message::list_dir(inbox)?
+    Ok(st_drivers::message::list_dir(inbox)?
         .into_iter()
-        .chain(st2::message::list_dir(archive)?)
+        .chain(st_drivers::message::list_dir(archive)?)
         .flat_map(|message| {
             message.tags.into_iter().filter_map(move |tag| {
                 tag.strip_prefix(TAG_PREFIX)
@@ -14548,7 +14895,7 @@ mod tests {
                 "<smalltalk-message id=\"0123456789abcdef\" from=\"agent/run-1/wake.claude\" \
                  to=\"agent/run-1/wake.omp-2\" subject=\"Cross-harness consensus: idle\" \
                  sha256=\"{}\" graph=\"message/0123456789abcdef\">\nFACT QUARTZ\n</smalltalk-message>",
-                st2::ding::st3_body_sha256("FACT QUARTZ")
+                st_drivers::ding::st3_body_sha256("FACT QUARTZ")
             )
         );
         assert_eq!(omp["meta"]["messageId"], "message/0123456789abcdef");
@@ -14735,7 +15082,7 @@ mod tests {
             driver: "claude".into(),
             subject: "agent/example/worker".into(),
             incarnation: "1:one".into(),
-            session: st2::provider_session::DetachedSession::Provider {
+            session: st_drivers::provider_session::DetachedSession::Provider {
                 pid: 42,
                 session: "token".into(),
                 seq: 3,
@@ -14815,10 +15162,10 @@ mod tests {
         assert!(
             card(serde_json::json!({
                 "source": "declared",
-                "publish": ["fleet/website/docs/*"], "start": ["fleet/website/docs/*", "fleet/website/deploy"]
+                "publish": ["fleet/website/docs/*"], "start": ["fleet/website/docs/*", "fleet/website/deploy"], "cancel": ["fleet/website/deploy"]
             }))
             .contains(
-                "AUTHORITY    publish, start mission/fleet/website/docs/*; start mission/fleet/website/deploy (declared)"
+                "AUTHORITY    publish, start mission/fleet/website/docs/*; start, cancel mission/fleet/website/deploy (declared)"
             )
         );
         assert!(
@@ -15931,7 +16278,7 @@ mod tests {
     }
 
     #[test]
-    fn attention_request_help_says_which_targets_end_an_item() {
+    fn legacy_attention_help_directs_callers_to_person_work() {
         let mut command = Cli::command();
         let help = command
             .find_subcommand_mut("attention")
@@ -15940,20 +16287,8 @@ mod tests {
             .unwrap()
             .render_long_help()
             .to_string();
-        for expected in [
-            "st attention withdraw",
-            "`step-run/` or `run-generation/` target is no longer current",
-            "a `mission/` retired or\n  cancelled",
-            "pull request target is merged or closed",
-            "a `loop-run/` running again",
-            "Other `resource/` targets and `doc/` targets are context",
-            "had already ended when you made the request, keeps it open",
-            "when the step you have claimed ends",
-            "st refuses a request that nothing could close",
-            "--person-closes",
-        ] {
-            assert!(help.contains(expected), "missing {expected:?} in:\n{help}");
-        }
+        assert!(help.contains("attention-migrated"), "{help}");
+        assert!(help.contains("work ask"), "{help}");
     }
 
     #[test]
@@ -16417,6 +16752,34 @@ mod tests {
 
     #[test]
     fn mission_cancel_requires_an_exact_actor_and_reason() {
+        for actor in ["agent/example/operator", "person/alex"] {
+            assert!(
+                Cli::try_parse_from([
+                    "st3",
+                    "missions",
+                    "cancel",
+                    "mission-run/example/one",
+                    "--reason",
+                    "superseded",
+                    "--as",
+                    actor
+                ])
+                .is_ok()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "missions",
+                "cancel",
+                "mission-run/example/one",
+                "--reason",
+                "superseded",
+                "--as",
+                "operator"
+            ])
+            .is_err()
+        );
         let cli = Cli::try_parse_from([
             "st3",
             "missions",
@@ -16544,7 +16907,7 @@ mod tests {
     #[test]
     fn an_ended_harness_uses_the_registered_state() {
         assert_eq!(
-            harness_activity_state(st2::harness_state::Activity::Ended),
+            harness_activity_state(st_drivers::harness_state::Activity::Ended),
             "ended"
         );
         st3_schema::registry()
@@ -16585,12 +16948,12 @@ mod tests {
     #[test]
     fn claude_delivery_requires_the_exact_incarnations_prompt_submit_receipt() {
         let root = tempfile::tempdir().unwrap();
-        let mut writer = st2::harness_timeline::Writer::new(root.path(), "claude", "inc-2");
+        let mut writer = st_drivers::harness_timeline::Writer::new(root.path(), "claude", "inc-2");
         writer
             .append(
                 "prompt-1",
-                st2::harness_timeline::Role::User,
-                st2::harness_timeline::EntryType::Content,
+                st_drivers::harness_timeline::Role::User,
+                st_drivers::harness_timeline::EntryType::Content,
                 serde_json::json!({
                     "text": "[st3-delivery:1784649988123-abc23z.md]\nhello"
                 }),
@@ -16625,12 +16988,12 @@ mod tests {
     fn claude_receipts_use_provider_session_not_runtime_incarnation() {
         let root = tempfile::tempdir().unwrap();
         let mut writer =
-            st2::harness_timeline::Writer::new(root.path(), "claude", "provider-current");
+            st_drivers::harness_timeline::Writer::new(root.path(), "claude", "provider-current");
         writer
             .append(
                 "prompt-1",
-                st2::harness_timeline::Role::User,
-                st2::harness_timeline::EntryType::Content,
+                st_drivers::harness_timeline::Role::User,
+                st_drivers::harness_timeline::EntryType::Content,
                 serde_json::json!({"text": "[st3-delivery:1784649988123-abc23z.md] hello"}),
                 true,
             )
@@ -17491,13 +17854,13 @@ mission "review" state="ready" {
         assert_eq!(runtime_id, "node.worker");
         let (long_catalog, _, _, _) =
             prepare_native_driver_in("agent/example/app-web/standing/app-web", root.path()).unwrap();
-        let report = st2::validate::validate_for_host(&long_catalog, &st2::run::detect_host());
+        let report = st_drivers::validate::validate_for_host(&long_catalog, &st_drivers::run::detect_host());
         assert!(report.issues.is_empty(), "{report:?}");
     }
 
     #[test]
     fn native_timeline_fences_provider_session_but_claims_runtime_session() {
-        let record = st2::harness_timeline::Record {
+        let record = st_drivers::harness_timeline::Record {
             schema: "st2.harness-timeline.v1".into(),
             driver: "claude".into(),
             incarnation_id: "provider-current".into(),
@@ -17520,7 +17883,7 @@ mission "review" state="ready" {
             Some("provider-current")
         ));
         let fields = timeline_claim_fields(
-            st2::harness_timeline::Operation {
+            st_drivers::harness_timeline::Operation {
                 operation: "append".into(),
                 entry_id: "timeline-entry/test".into(),
                 sequence: 1,
@@ -17546,7 +17909,7 @@ mission "review" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let inbox = root.path().join("inbox");
         let archive = root.path().join("archive");
-        st2::message::send_to_inbox(
+        st_drivers::message::send_to_inbox(
             &inbox,
             "requester",
             Some("Start"),
@@ -17579,7 +17942,7 @@ mission "review" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let inbox = root.path().join("inbox");
         let archive = root.path().join("archive");
-        let filename = st2::message::send_to_inbox(
+        let filename = st_drivers::message::send_to_inbox(
             &inbox,
             "requester",
             Some("Start"),
@@ -17600,7 +17963,7 @@ mission "review" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let inbox = root.path().join("inbox");
         let archive = root.path().join("archive");
-        let old = st2::message::send_to_inbox(
+        let old = st_drivers::message::send_to_inbox(
             &inbox,
             "requester",
             Some("Already read"),
@@ -17609,7 +17972,7 @@ mission "review" state="ready" {
             "The recipient read this through the graph.",
         )
         .unwrap();
-        let next = st2::message::send_to_inbox(
+        let next = st_drivers::message::send_to_inbox(
             &inbox,
             "requester",
             Some("Still staged"),
@@ -17626,7 +17989,7 @@ mission "review" state="ready" {
         assert!(!inbox.join(&old).exists());
         assert!(archive.join(old).is_file());
         assert!(inbox.join(next).is_file());
-        assert_eq!(st2::message::list_dir(&archive).unwrap().len(), 1);
+        assert_eq!(st_drivers::message::list_dir(&archive).unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -17662,7 +18025,7 @@ mission "review" state="ready" {
         let root = tempfile::tempdir().unwrap();
         let inbox = root.path().join("inbox");
         let archive = root.path().join("archive");
-        let filename = st2::message::send_to_inbox(
+        let filename = st_drivers::message::send_to_inbox(
             &inbox,
             "agent/sender",
             Some("done"),
@@ -17733,18 +18096,18 @@ mission "review" state="ready" {
         .unwrap();
         server.abort();
 
-        let projected = st2::message::list_inbox(&inbox).unwrap();
+        let projected = st_drivers::message::list_inbox(&inbox).unwrap();
         assert_eq!(projected.len(), 1);
         // The inbox file appends a newline, so the hash must come from the graph content.
         assert_eq!(projected[0].body, "FACT <b>QUARTZ</b>\n");
         let catalog = tempfile::tempdir().unwrap();
         assert_eq!(
-            st2::ding::poke_text(catalog.path(), "h", "run-1/wake.right", &projected[0]),
+            st_drivers::ding::poke_text(catalog.path(), "h", "run-1/wake.right", &projected[0]),
             format!(
                 "<smalltalk-message id=\"fact\" from=\"agent/run-1/wake.left\" \
                  to=\"agent/run-1/wake.right\" subject=\"Fact\" sha256=\"{}\" \
                  graph=\"message/fact\">\nFACT &lt;b&gt;QUARTZ&lt;/b&gt;\n</smalltalk-message>",
-                st2::ding::st3_body_sha256("FACT <b>QUARTZ</b>")
+                st_drivers::ding::st3_body_sha256("FACT <b>QUARTZ</b>")
             )
         );
     }
@@ -17860,7 +18223,7 @@ mission "review" state="ready" {
                 .collect::<Vec<_>>(),
             ["message/missing"]
         );
-        let projected = st2::message::list_inbox(&inbox).unwrap();
+        let projected = st_drivers::message::list_inbox(&inbox).unwrap();
         assert_eq!(projected.len(), 1);
         assert_eq!(projected[0].body, "the next message\n");
     }

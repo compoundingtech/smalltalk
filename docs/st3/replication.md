@@ -24,6 +24,18 @@ its own digest so a mismatch names the source. Local receipt metadata, physical 
 lease overlays and live reachability are excluded explicitly. Retained history and checkpoint
 tombstones represent the same logical source identity.
 
+Uploaded bytes in `local_blobs` are staged locally until a durable claim references them.
+Claim admission promotes those bytes into `blobs` in the claim's transaction; every column of
+`blobs` remains in the shared digest. Unreferenced uploads never enter envelopes and cannot be
+compared as shared authority. On upgrade, retained claim references, document bindings and valid
+received blob records identify existing shared bytes. Other bytes move to local staging without
+being deleted. If checkpoint tombstones already removed historical references, the upgrade
+conservatively keeps all existing shared blobs.
+
+A keyed worker signs batches beyond its last processed batch, including envelopes another
+unkeyed process already sealed at startup. Signature requests recover missing signatures after
+an upgrade. Equal envelope inventories alone cannot prove equal claim admission.
+
 `store::tests::canonical_audit::every_shared_projection_agrees_after_shuffle_restart_and_checkpoint`
 checks both invariants by comparing shared rows, selected readers and per-table digest oracles
 across isolated stores. `shared_folds_never_order_by_local_arrival` rejects raw shared arrival
@@ -51,6 +63,14 @@ The shuffle fixture compares paged document answers and the existing person atte
 including unread messages, reminder selection and episode onset. Proposal lifecycle tests
 compare all shared rows and digests through creation, review, draining, cancellation and apply.
 
+Documents record a sortable encoding of the complete binding claim key at admission.
+`document_canonical_latest(name,binding_key DESC)` serves latest selection and history order;
+readers never sort a name's entire claim history for each returned version. Schema 15 backfills
+the keys once, choosing the earliest canonical binding for each repeated name/hash. The key is
+a shared derived column and is digested with the document row. The fleet-size regression builds
+260,000 claims and 10,000 document versions, then requires latest listings, history pages,
+lookup and cursor reads to finish within two seconds and verifies the indexed latest query plan.
+
 ## Projection digest coverage and cost
 
 `store/projection_digest.rs::TABLES` lists the shared tables: operations, blobs, documents,
@@ -70,6 +90,14 @@ subscriptions, fleet membership, usage, observer/fault episodes, and attention. 
 answer must still be tested at the same explicit time and recipients. Host-local liveness,
 leases, receipts, cursors, secrets and notification bookkeeping stay outside shared digests.
 
+A repaired original is no longer an admitted projection source. One member may retain its
+old claim row while another rejected it before admission; both exclude it from claim-source
+and operation projections. The original wire bytes remain committed by authenticated envelope
+inventory, and the repair and replacement remain shared claim sources. A local
+`projection_digest_repaired_claims` cache retains the exclusion after receipt cleanup; repair
+record updates and cached source digests commit or roll back together. Registry version 5
+backfills existing repairs once, and operation rules version 2 rebuilds older operation rows.
+
 Operations are logical rows over the hot operation table and operation facts retained in
 checkpoint tombstones. Trimming a claim changes its storage representation, preserving its
 logical operation and claim-source digests. The shuffle test compares that logical union.
@@ -78,6 +106,9 @@ SQLite triggers update per-table row counts and 512-bit modular sums of domain-s
 SHA-512 row hashes in the row's own transaction. Insert, update, delete, replacement, savepoint
 rollback and commit therefore change rows and cached digest state together. SHA-256 commits the
 table name, column schema, count and sum; a sorted map of those table digests commits the graph.
+Shared columns are encoded in sorted name order, including the logical operation row. A fresh
+schema and an additive migration can place the same column at different physical positions;
+that layout does not change the digest. Registry version 6 rebuilds older physical-order caches.
 These are diagnostic digests; authenticated envelopes and signatures remain the replication
 integrity boundary. Work scales with changed row bytes, plus the fixed-size accumulator.
 Reading all table digests reads one small cache, independent of retained history size. Operations

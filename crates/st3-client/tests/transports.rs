@@ -11,12 +11,12 @@ use hyper::{Request, StatusCode};
 use hyper_util::rt::TokioIo;
 use serde_json::Value;
 use st3::api::AppState;
-use st3::model::{AttentionRequest, ClaimInput};
+use st3::model::ClaimInput;
 use st3::store::Store;
 use st3_client::{
-    AttentionResolveParameters, Capabilities, Client, ClientError, CollectionEvent, Envelope,
-    ErrorCode, Fence, LaunchVariantParameters, PairingBegin, PairingComplete, Resource,
-    RawTerminalMode, TargetParameters, TerminalAttachment, TerminalColor, TerminalInputMode,
+    Capabilities, Client, ClientError, CollectionEvent, Envelope, ErrorCode, Fence,
+    LaunchVariantParameters, PairingBegin, PairingComplete, PersonStepParameters, RawTerminalMode,
+    Resource, TargetParameters, TerminalAttachment, TerminalColor, TerminalInputMode,
     TerminalInputParameters, TerminalResizeParameters, TerminalRun, TerminalScreen, TerminalStream,
     TimelineBody, TimelineUsageSemantics,
 };
@@ -943,36 +943,33 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
     let state = state(root.path(), "client-unix");
     publish_terminal(&state, "terminal-demo-runtime:i1");
     let _pty = FakePty::start(&state, 24, 80);
+    let intent = st3::graph::parse_intent(
+        "version 2\nagent \"asker\" { workspace \"/tmp\"; command \"true\" }",
+        state.store.origin(),
+    )
+    .unwrap();
     state
         .store
-        .request_attention(
-            "attention/ada-client-proof",
-            &AttentionRequest {
-                reviewer: "person/ada".into(),
-                title: "Client proof".into(),
-                reason: "Resolve through the generated client".into(),
-                severity: "error".into(),
-                targets: vec!["agent/terminal-demo".into()],
-                actor: "daemon/runtime".into(),
-                idempotency_key: "attention-ada-client-proof".into(),
-            },
-        )
+        .apply_internal(&intent, "transport-person-asker")
         .unwrap();
-    state
-        .store
-        .request_attention(
-            "attention/alex-client-proof",
-            &AttentionRequest {
-                reviewer: "person/alex".into(),
-                title: "Other person's attention".into(),
-                reason: "Must not resolve as Ada".into(),
-                severity: "warning".into(),
-                targets: Vec::new(),
-                actor: "daemon/runtime".into(),
-                idempotency_key: "attention-alex-client-proof".into(),
-            },
-        )
-        .unwrap();
+    let ask = |person: &str| {
+        state
+            .store
+            .ask_person(&st3::model::PersonAskRequest {
+                legacy_request: None,
+                person: person.into(),
+                title: "Choose a date".into(),
+                reason: "Reply with a date".into(),
+                actor: format!("agent/{}.asker", state.store.origin()),
+                step: None,
+                new_run: Some(person.into()),
+                incarnation: None,
+                idempotency_key: format!("transport-{person}"),
+            })
+            .unwrap()
+    };
+    let ada_step = ask("person/ada");
+    let alex_step = ask("person/alex");
     let app = st3::api::router(state.clone());
     let server = tokio::spawn(async move { st3::api::serve_unix(&server_socket, app).await });
     wait_for_socket(&socket).await;
@@ -1013,9 +1010,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
         .items
         .iter()
         .find_map(|resource| match resource {
-            Resource::Attention(attention)
-                if attention.header.id == "attention/ada-client-proof" =>
-            {
+            Resource::Attention(attention) if attention.source_id == ada_step.subject => {
                 Some(attention)
             }
             _ => None,
@@ -1029,14 +1024,15 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
         )]),
         ..Fence::default()
     };
-    let resolve_parameters = AttentionResolveParameters {
-        attention_id: attention.header.id.clone(),
-        outcome: "resolved".into(),
-        reason: Some("generated client proof".into()),
+    let resolve_parameters = PersonStepParameters {
+        target_id: attention.source_id.clone(),
+        episode: attention.episode.clone(),
+        summary: "Friday".into(),
+        evidence: vec![],
     };
     assert!(
         read_only
-            .attention_resolve(
+            .work_done(
                 "action/attention-resolve-read-only",
                 "attention-resolve-read-only-0001",
                 resolve_fence.clone(),
@@ -1093,7 +1089,7 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
     assert_eq!(usage.driver, "codex");
     assert_eq!(usage.total_tokens, Some(7));
     client
-        .attention_resolve(
+        .work_done(
             "action/attention-resolve-generated-client",
             "attention-resolve-client-0001",
             resolve_fence,
@@ -1117,16 +1113,14 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
         .items
         .iter()
         .find_map(|resource| match resource {
-            Resource::Attention(attention)
-                if attention.header.id == "attention/alex-client-proof" =>
-            {
+            Resource::Attention(attention) if attention.source_id == alex_step.subject => {
                 Some(attention)
             }
             _ => None,
         })
         .unwrap();
     client
-        .attention_resolve(
+        .work_done(
             "action/attention-resolve-cross-person",
             "attention-resolve-cross-0001",
             Fence {
@@ -1137,28 +1131,23 @@ async fn generated_client_conforms_over_the_real_unix_transport() {
                 )]),
                 ..Fence::default()
             },
-            AttentionResolveParameters {
-                attention_id: alex.header.id.clone(),
-                outcome: "resolved".into(),
-                reason: None,
+            PersonStepParameters {
+                target_id: alex.source_id.clone(),
+                episode: alex.episode.clone(),
+                summary: "Friday".into(),
+                evidence: vec![],
             },
         )
         .await
-        .expect("person/ada closes person/alex attention");
-    let closed = state
-        .store
-        .latest_claim("attention/alex-client-proof", Some("attention.resolved"))
-        .unwrap()
-        .expect("the item was closed");
-    assert_eq!(closed.actor.as_deref(), Some("person/ada"));
+        .expect_err("only the assigned person completes the step");
     assert_eq!(
-        closed
-            .body
-            .pointer("/fields/outcome")
-            .and_then(|outcome| outcome.as_str()),
-        Some("resolved"),
-        "{}",
-        closed.body
+        state
+            .store
+            .step_run(&alex_step.subject)
+            .unwrap()
+            .unwrap()
+            .status,
+        "ready"
     );
 
     let read_only_attachment = attach_terminal(&read_only, "unix-read-only").await;
@@ -1511,10 +1500,13 @@ async fn generated_client_conforms_over_paired_loopback_and_rejects_bad_credenti
     drop(collections);
 
     let fabric_attachment = attach_terminal(&client, "fabric-first").await;
-    let (_terminal_stream, terminal) =
-        first_screen(&client, &fabric_attachment, "terminal-demo-runtime:fabric-i1")
-            .await
-            .unwrap();
+    let (_terminal_stream, terminal) = first_screen(
+        &client,
+        &fabric_attachment,
+        "terminal-demo-runtime:fabric-i1",
+    )
+    .await
+    .unwrap();
     assert_eq!(
         terminal.value.runtime_incarnation,
         "terminal-demo-runtime:fabric-i1"

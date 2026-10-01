@@ -346,7 +346,7 @@ fn catalog_digest_is_a_typed_read_only_projection_receipt() {
         String::from_utf8_lossy(&digest.stderr)
     );
     let digest: Value = serde_json::from_slice(&digest.stdout).unwrap();
-    assert_eq!(digest["schema"], "st2.catalog-digest.v1");
+    assert_eq!(digest["schema"], "st.catalog-digest.v1");
     assert_eq!(
         digest["catalog"],
         catalog.canonicalize().unwrap().to_str().unwrap()
@@ -490,7 +490,7 @@ fn bootstrap_atomically_publishes_an_absent_catalog_and_replays_exactly() {
         String::from_utf8_lossy(&first.stderr)
     );
     let first: Value = serde_json::from_slice(&first.stdout).unwrap();
-    assert_eq!(first["schema"], "st2.catalog-bootstrap.v1");
+    assert_eq!(first["schema"], "st.catalog-bootstrap.v1");
     assert_eq!(first["status"], "created");
     assert_eq!(first["rootSha256"], captured["rootSha256"]);
     assert_eq!(
@@ -1249,7 +1249,7 @@ fn snapshot_is_typed_deterministic_and_excludes_state_and_workspaces() {
 
     let output = temp.path().join("snapshot");
     let first = snapshot(&catalog, &output);
-    assert_eq!(first["schema"], "st2.catalog-snapshot.v1");
+    assert_eq!(first["schema"], "st.catalog-snapshot.v1");
     assert_eq!(first["status"], "created");
     assert!(output.join("agents/host/worker/agent.kdl").is_file());
     assert!(output.join("agents/host/worker/assets/tool.sh").is_file());
@@ -1885,10 +1885,7 @@ fn raw_preimage_repairs_an_invalid_catalog_and_preserves_mutable_state() {
         String::from_utf8_lossy(&raw_capture.stderr)
     );
     let raw_capture: Value = serde_json::from_slice(&raw_capture.stdout).unwrap();
-    assert_eq!(
-        raw_capture["schema"],
-        "st2.catalog-raw-preimage-snapshot.v1"
-    );
+    assert_eq!(raw_capture["schema"], "st.catalog-raw-preimage-snapshot.v1");
     assert!(
         !raw_capture_dir
             .join("agents/host/worker/resources")
@@ -1925,7 +1922,7 @@ fn raw_preimage_repairs_an_invalid_catalog_and_preserves_mutable_state() {
         String::from_utf8_lossy(&repaired.stderr)
     );
     let repaired: Value = serde_json::from_slice(&repaired.stdout).unwrap();
-    assert_eq!(repaired["schema"], "st2.catalog-raw-preimage-apply.v1");
+    assert_eq!(repaired["schema"], "st.catalog-raw-preimage-apply.v1");
     assert_eq!(repaired["status"], "applied");
     assert_eq!(repaired["beforeSha256"], raw_capture["rootSha256"]);
     assert_eq!(
@@ -1989,10 +1986,7 @@ fn raw_preimage_repairs_a_catalog_whose_declared_workspace_fact_is_runtime_only(
         String::from_utf8_lossy(&raw_capture.stderr)
     );
     let raw_capture: Value = serde_json::from_slice(&raw_capture.stdout).unwrap();
-    assert_eq!(
-        raw_capture["schema"],
-        "st2.catalog-raw-preimage-snapshot.v1"
-    );
+    assert_eq!(raw_capture["schema"], "st.catalog-raw-preimage-snapshot.v1");
     assert!(!prepared.join("agents/host/worker/.workspace").exists());
 
     fs::write(
@@ -2012,7 +2006,7 @@ fn raw_preimage_repairs_a_catalog_whose_declared_workspace_fact_is_runtime_only(
         String::from_utf8_lossy(&repaired.stderr)
     );
     let repaired: Value = serde_json::from_slice(&repaired.stdout).unwrap();
-    assert_eq!(repaired["schema"], "st2.catalog-raw-preimage-apply.v1");
+    assert_eq!(repaired["schema"], "st.catalog-raw-preimage-apply.v1");
     assert_eq!(repaired["status"], "applied");
     assert_eq!(repaired["beforeSha256"], raw_capture["rootSha256"]);
     assert!(
@@ -2386,7 +2380,7 @@ fn raw_preimage_resume_uses_the_durable_validated_stage() {
         String::from_utf8_lossy(&recovered.stderr)
     );
     let recovered: Value = serde_json::from_slice(&recovered.stdout).unwrap();
-    assert_eq!(recovered["schema"], "st2.catalog-raw-preimage-apply.v1");
+    assert_eq!(recovered["schema"], "st.catalog-raw-preimage-apply.v1");
     assert_eq!(recovered["recovered"], true);
     assert!(
         !fs::read_to_string(agent_dir(&catalog, "worker").join("agent.kdl"))
@@ -2552,7 +2546,7 @@ fn apply_is_cas_guarded_idempotent_and_preserves_orphan_state() {
         String::from_utf8_lossy(&applied.stderr)
     );
     let applied: Value = serde_json::from_slice(&applied.stdout).unwrap();
-    assert_eq!(applied["schema"], "st2.catalog-apply.v1");
+    assert_eq!(applied["schema"], "st.catalog-apply.v1");
     assert_eq!(applied["status"], "applied");
     assert!(!dir.join("agent.kdl").exists());
     assert_eq!(
@@ -3524,7 +3518,7 @@ fn mismatched_recovery_and_malformed_markers_remain_fenced_without_mutation() {
     let marker = catalog.join(".st2/catalog-apply-incomplete");
     assert!(marker.is_file());
     let marker_json: Value = serde_json::from_slice(&fs::read(&marker).unwrap()).unwrap();
-    assert_eq!(marker_json["schema"], "st2.catalog-apply-incomplete.v1");
+    assert_eq!(marker_json["schema"], "st.catalog-apply-incomplete.v1");
     assert_eq!(marker_json["expectedRootSha256"], before["rootSha256"]);
     assert!(
         marker_json["stageName"]

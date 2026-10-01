@@ -106,16 +106,17 @@ Each `move` rule names an exact seat identity or a terminal `/*` namespace, with
 seat has no authority over its own queue unless a rule names it. The daemon reads the grant from
 the agent's current desired declaration when the move arrives, and refuses a move outside it with
 `queue-authority-denied`, or `missing-agent-queue-authority` when the agent has no declaration.
-An agent cannot grant itself the authority: a top-level agent declaration that an agent publishes
-is refused with `agent-authority-grant-denied` when it carries `queue-authority`,
-`mission-authority`, or `seat-authority`. Agents may declare or stop a top-level seat only when a
-person grants `seat-authority { declare "NAMESPACE/*"; stop "NAMESPACE/*" }` in the agent's
-current declaration. A seat with authority cannot be re-declared by an agent, because that would
-remove its person's grant. A person-declared top-level seat named `fleet/PROJECT/...` also holds
-mission authority for `fleet/PROJECT/*` by default, and loses it while an agent's declaration of the
-seat is current ([agent mission authority](kdl-lifecycle.md#agent-mission-authority)).
-The agent's move goes to `POST /v1/agent-queue-moves`, because client-v0 actions carry only
-person authority. That route also accepts a person. With `--json`, it prints the move claim.
+An agent can delegate queue authority only when it holds both `agent-authority { apply PATH }`
+over the target declaration and `queue-authority { move PATH }` over the same or a wider queue
+path. The same kind, verb, and path checks apply to every other authority block; see
+[agent declaration authority](kdl-lifecycle.md#agent-declaration-authority). Existing
+`seat-authority { declare "NAMESPACE/*"; stop "NAMESPACE/*" }` rules continue to authorize
+plain declarations and stops. A person-declared top-level seat named `fleet/PROJECT/...` also
+holds mission authority for `fleet/PROJECT/*` by default, and loses that default while an agent's
+declaration is current ([agent mission authority](kdl-lifecycle.md#agent-mission-authority)).
+The agent's queue move goes to `POST /v1/agent-queue-moves`; that route also accepts a person.
+Client-v0 agent mutations cover work and authorized mission cancellation, while queue moves
+through client-v0 still require a person. With `--json`, the route prints the move claim.
 
 The typed client exposes the same surface:
 
