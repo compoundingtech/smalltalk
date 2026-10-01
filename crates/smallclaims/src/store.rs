@@ -3857,15 +3857,17 @@ impl Store {
     /// The latest claim of a subject, or of one kind of it, in canonical order.
     pub fn latest_claim(&self, subject: &str, kind: Option<&str>) -> Result<Option<ClaimRecord>> {
         let connection = self.readers.get();
-        let filter = if kind.is_some() {
-            " AND claims.kind=?2"
+        // With a kind, walk the accepted-time index newest first and sort only claims accepted in
+        // the same millisecond, as `newest_claims_of_kind_query` does. Sorting every claim of the
+        // kind made the reconciler's once-per-pass checks of every settled stop cost a pass 70 ms.
+        let query = if kind.is_some() {
+            latest_claim_of_kind_query()
         } else {
-            " AND ?2 IS NULL"
+            format!(
+                "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
+                 WHERE claims.subject=?1 AND ?2 IS NULL ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+            )
         };
-        let query = format!(
-            "SELECT {CLAIM_COLUMNS} FROM claims JOIN batches ON batches.id=claims.batch_id
-             WHERE claims.subject=?1{filter} ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
-        );
         connection
             .prepare_cached(&query)?
             .query_row(params![subject, kind], claim_from_row)
@@ -5869,6 +5871,15 @@ pub fn normalize_actor(value: &str, default_kind: &str) -> String {
     } else {
         format!("{default_kind}/{value}")
     }
+}
+
+/// Subject `?1`'s newest claim of kind `?2` in canonical order. See [`Store::latest_claim`].
+pub fn latest_claim_of_kind_query() -> String {
+    format!(
+        "SELECT {CLAIM_COLUMNS} FROM claims INDEXED BY claims_subject_kind_accepted_index
+         JOIN batches ON batches.id=claims.batch_id
+         WHERE claims.subject=?1 AND claims.kind=?2 ORDER BY {CANONICAL_ORDER_DESC} LIMIT 1"
+    )
 }
 
 pub fn claims_for_subject_query(kind: bool) -> String {
