@@ -713,6 +713,330 @@ mission "person-work" state="ready" {
             "cancelled"
         );
     }
+
+    const TEST_FLEET: &str = "7c9e6679-7425-40de-944b-e07fc1f90ae7";
+
+    fn receive(source: &Store, target: &Store) {
+        let exchange = source
+            .export_replication_exchange_answering(
+                TEST_FLEET,
+                &target.replication_inventory().unwrap(),
+                &[],
+            )
+            .unwrap();
+        receive_exchange(target, &exchange);
+    }
+
+    fn receive_exchange(target: &Store, exchange: &ReplicationExchange) {
+        let before = FULL_REPLAYS.with(|count| count.get());
+        target
+            .receive_replication_exchange(&exchange.peer, TEST_FLEET, exchange)
+            .unwrap();
+        target.validate_replication_backlog().unwrap();
+        assert!(target.project_replication_backlog().unwrap());
+        assert_eq!(
+            FULL_REPLAYS.with(|count| count.get()),
+            before,
+            "person work replayed the whole graph"
+        );
+        let incremental = projection_digest::tables(&target.readers.get()).unwrap();
+        target.replay_replication_graph().unwrap();
+        assert_eq!(
+            incremental,
+            projection_digest::tables(&target.readers.get()).unwrap(),
+            "person work differs from full replay"
+        );
+    }
+
+    #[test]
+    fn person_lifecycle_replication_rebuilds_only_its_tree() {
+        for mode in ["step", "standalone", "owned"] {
+            let standalone = mode != "step";
+            for cancel in [false, true] {
+                let (source, origin, mut input) = fixture();
+                let directory = tempfile::tempdir().unwrap();
+                let path = directory.path().join("claims.sqlite3");
+                let target = Store::open(&path, "birch").unwrap();
+                // The first graph has no healthy frontier; its initial replay is intentional.
+                target.project_replication_backlog().unwrap();
+                receive(&source, &target);
+                if standalone {
+                    source
+                        .set_step_state(&origin.subject, "completed", None)
+                        .unwrap();
+                    input.step = None;
+                    input.new_run = Some("release-question".into());
+                }
+                if mode == "owned" {
+                    let mut owned = crate::graph::parse_internal_intent(
+                        r#"version 2
+agent "alder.asker" { workspace "/tmp"; command "true"; restart always; }
+"#,
+                        "alder",
+                    )
+                    .unwrap();
+                    let declaration = owned.subjects.get_mut("agent/alder.asker").unwrap();
+                    declaration.owner_run = Some(origin.run.clone());
+                    declaration.owner_generation = Some(origin.generation.clone());
+                    source.apply_internal(&owned, "own-the-requester").unwrap();
+                }
+                let ask = source.ask_person(&input).unwrap();
+                receive(&source, &target);
+                assert_eq!(
+                    target.step_run(&ask.subject).unwrap().unwrap().status,
+                    "ready"
+                );
+                if !standalone {
+                    assert_eq!(
+                        target.step_run(&origin.subject).unwrap().unwrap().status,
+                        "waiting-person"
+                    );
+                }
+                source
+                    .finish_person_step(
+                        &PersonStepResponse {
+                            subject: ask.subject.clone(),
+                            actor: if cancel { input.actor } else { input.person },
+                            summary: "Release reviewed".into(),
+                            evidence: vec![],
+                            episode: None,
+                            idempotency_key: "review-release".into(),
+                        },
+                        cancel,
+                    )
+                    .unwrap();
+                receive(&source, &target);
+                assert_eq!(
+                    target.step_run(&ask.subject).unwrap().unwrap().status,
+                    if cancel { "cancelled" } else { "completed" }
+                );
+                if !standalone {
+                    assert_eq!(
+                        target.step_run(&origin.subject).unwrap().unwrap().status,
+                        "ready"
+                    );
+                }
+                target
+                    .replication_status(true, Some(TEST_FLEET), &[])
+                    .unwrap();
+                let before = projection_digest::tables(&target.readers.get()).unwrap();
+                drop(target);
+                let reopened = Store::open(&path, "birch").unwrap();
+                assert_eq!(
+                    before,
+                    projection_digest::tables(&reopened.readers.get()).unwrap()
+                );
+                assert_eq!(
+                    before,
+                    projection_digest::oracle(&reopened.readers.get()).unwrap()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn person_response_before_standalone_ask_matches_full_replay() {
+        let (source, origin, mut input) = fixture();
+        source
+            .set_step_state(&origin.subject, "completed", None)
+            .unwrap();
+        let target = Store::open_memory("birch").unwrap();
+        target.project_replication_backlog().unwrap();
+        receive(&source, &target);
+        input.step = None;
+        input.new_run = Some("release-question".into());
+        let ask = source.ask_person(&input).unwrap();
+        let asking = source
+            .export_replication_exchange_answering(
+                TEST_FLEET,
+                &target.replication_inventory().unwrap(),
+                &[],
+            )
+            .unwrap();
+        source
+            .finish_person_step(
+                &PersonStepResponse {
+                    subject: ask.subject.clone(),
+                    actor: input.actor,
+                    summary: "No longer needed".into(),
+                    evidence: vec![],
+                    episode: None,
+                    idempotency_key: "cancel-release".into(),
+                },
+                true,
+            )
+            .unwrap();
+        let mut response = source
+            .export_replication_exchange_answering(
+                TEST_FLEET,
+                &target.replication_inventory().unwrap(),
+                &[],
+            )
+            .unwrap();
+        response
+            .envelopes
+            .retain(|envelope| !asking.envelopes.iter().any(|old| old.hash == envelope.hash));
+        receive_exchange(&target, &response);
+        assert!(target.step_run(&ask.subject).unwrap().is_none());
+        receive_exchange(&target, &asking);
+        assert_eq!(
+            target.step_run(&ask.subject).unwrap().unwrap().status,
+            "cancelled"
+        );
+    }
+
+    #[test]
+    fn populated_person_receive_does_not_block_claims_and_renewals() {
+        use std::sync::{Arc, Barrier};
+        use std::time::{Duration, Instant};
+        let (source, origin, mut input) = fixture();
+        source
+            .set_step_state(&origin.subject, "completed", None)
+            .unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let target = Store::open(&directory.path().join("claims.sqlite3"), "birch").unwrap();
+        target.project_replication_backlog().unwrap();
+        receive(&source, &target);
+        let intent = crate::graph::parse_internal_intent(
+            r#"version 2
+agent "birch.worker" { workspace "/tmp"; command "true"; restart always; }
+mission "writer-load" state="ready" {
+ goal "Write while a peer receives.";
+ step "write" { assigned-to "agent/birch.worker"; goal "Keep working."; }
+}"#,
+            "birch",
+        )
+        .unwrap();
+        target.apply_internal(&intent, "writer-load").unwrap();
+        let run = target
+            .create_mission_run(&MissionRunRequest {
+                mission: "writer-load".into(),
+                revision: None,
+                workspace: "/tmp".into(),
+                requester: Some("person/avery".into()),
+                mode: Some("run".into()),
+                inputs: BTreeMap::new(),
+                idempotency_key: "writer-load-run".into(),
+            })
+            .unwrap();
+        let worker = &run.steps[0];
+        target.connection.batched(|tx| -> Result<()> {
+            let claim = append_claim_tx(tx, "birch", &worker.subject, "work.claimed", Some("agent/birch.worker"),
+                &json!({"fields":{"attempt":1,"status":"claimed","claimant":"agent/birch.worker",
+                    "claim_incarnation":"worker-one","claim_expires_at_unix_ms":(now_ms()+600_000) as u64}}), &[], None)?;
+            project_mission_run_update(tx, &claim).unwrap();
+            // These are valid retained claims on unrelated subjects, not the run being updated.
+            for n in 0..20_000 {
+                append_claim_tx(tx, "birch", "daemon/birch", "daemon.diagnostic", None,
+                    &json!({"fields":{"severity":"warning","code":"retained","reason":format!("history {n}")}}), &[], None)?;
+            }
+            Ok(())
+        }).unwrap().unwrap();
+        target.project_replication_backlog().unwrap();
+        input.step = None;
+        input.new_run = Some("release-question".into());
+        let ask = source.ask_person(&input).unwrap();
+        source
+            .finish_person_step(
+                &PersonStepResponse {
+                    subject: ask.subject.clone(),
+                    actor: input.actor,
+                    summary: "No longer needed".into(),
+                    evidence: vec![],
+                    episode: None,
+                    idempotency_key: "cancel-release".into(),
+                },
+                true,
+            )
+            .unwrap();
+        let exchange = source
+            .export_replication_exchange_answering(
+                TEST_FLEET,
+                &target.replication_inventory().unwrap(),
+                &[],
+            )
+            .unwrap();
+        let gate = Arc::new(Barrier::new(3));
+        std::thread::scope(|scope| {
+            let receiving = scope.spawn(|| {
+                gate.wait();
+
+                let before = FULL_REPLAYS.with(|count| count.get());
+                let start = Instant::now();
+                target
+                    .receive_replication_exchange(&exchange.peer, TEST_FLEET, &exchange)
+                    .unwrap();
+                target.validate_replication_backlog().unwrap();
+                target.apply_replication_repairs().unwrap();
+                target.project_replication_backlog().unwrap();
+                assert_eq!(FULL_REPLAYS.with(|count| count.get()), before);
+                let elapsed = start.elapsed();
+
+                elapsed
+            });
+            let writing = scope.spawn(|| {
+                gate.wait();
+
+                let start = Instant::now();
+                for n in 0..10 {
+                    target.append_claim(&ClaimInput {
+                        subject: "daemon/birch".into(), kind: "daemon.diagnostic".into(), actor: None,
+                        fields: serde_json::from_value(json!({"severity":"warning","code":"live","reason":format!("claim {n}")})).unwrap(),
+                        evidence: vec![], expected_subject: None, idempotency_key: None,
+                    }).unwrap();
+                }
+                let elapsed = start.elapsed();
+
+                elapsed
+            });
+            gate.wait();
+
+            let start = Instant::now();
+            for n in 0..10 {
+                target
+                    .work_action(
+                        &worker.subject,
+                        "renew",
+                        &WorkRequest {
+                            actor: Some("agent/birch.worker".into()),
+                            incarnation: Some("worker-one".into()),
+                            summary: None,
+                            reason: None,
+                            evidence: vec![],
+                            idempotency_key: format!("load-renewal-{n}"),
+                        },
+                    )
+                    .unwrap();
+            }
+            let renewing = start.elapsed();
+
+            for (label, elapsed) in [
+                ("receive/apply", receiving.join().unwrap()),
+                ("claims", writing.join().unwrap()),
+                ("renewals", renewing),
+            ] {
+                assert!(
+                    elapsed < Duration::from_secs(2),
+                    "{label} queued for {elapsed:?}"
+                );
+            }
+        });
+        assert_eq!(
+            target.step_run(&ask.subject).unwrap().unwrap().status,
+            "cancelled"
+        );
+        target.project_replication_backlog().unwrap();
+        let incremental = projection_digest::tables(&target.readers.get()).unwrap();
+        target.replay_replication_graph().unwrap();
+        assert_eq!(
+            incremental,
+            projection_digest::tables(&target.readers.get()).unwrap()
+        );
+        assert_eq!(
+            incremental,
+            projection_digest::oracle(&target.readers.get()).unwrap()
+        );
+    }
     #[test]
     fn authored_person_work_waits_for_readiness_and_only_assignee_can_finish() {
         let (store, origin, _input) = fixture();
