@@ -1406,12 +1406,16 @@ impl<R: RuntimeControl> Reconciler<R> {
             } else {
                 "pass/member live"
             });
+            // A stop's actual origin is read once a pass here and reused by `reconcile_stop`:
+            // every settled stop a host ever declared is checked on every pass.
+            let mut actual_origin = None;
             let owner = if let Some(member) = &subject.member {
                 Ok(Some(member.host.clone()))
             } else if subject.kind == "stop" {
                 self.store
                     .selected_actual_origin(&subject.subject)
                     .and_then(|origin| {
+                        actual_origin = Some(origin.clone());
                         Ok(origin.or(self.store.selected_desired_origin(&subject.subject)?))
                     })
             } else {
@@ -1433,7 +1437,7 @@ impl<R: RuntimeControl> Reconciler<R> {
                 // is still observed, checked, and given its work.
                 let mut blocked = member_errors.remove(&subject.subject);
                 if subject.kind == "stop" {
-                    self.reconcile_stop(subject, ptys.as_ref())?;
+                    self.reconcile_stop_with_origin(subject, ptys.as_ref(), actual_origin)?;
                     self.remove_checkout_after_run(subject, &live_workspaces)?;
                     return Ok(());
                 }
@@ -2712,10 +2716,22 @@ impl<R: RuntimeControl> Reconciler<R> {
             }))
     }
 
+    #[cfg(test)]
     fn reconcile_stop(
         &self,
         subject: &DesiredSubject,
         ptys: Option<&HashMap<String, RuntimeObservation>>,
+    ) -> Result<()> {
+        self.reconcile_stop_with_origin(subject, ptys, None)
+    }
+
+    /// Reconcile a stop. `actual_origin` is the subject's selected actual origin when the caller
+    /// already read it in this pass.
+    fn reconcile_stop_with_origin(
+        &self,
+        subject: &DesiredSubject,
+        ptys: Option<&HashMap<String, RuntimeObservation>>,
+        actual_origin: Option<Option<String>>,
     ) -> Result<()> {
         let Some(actual) = self.store.latest_actual_value(&subject.subject)? else {
             // A stop-only declaration with no observed runtime is already satisfied.
@@ -2741,7 +2757,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             return Ok(());
         };
         let fields = actual.get("fields").unwrap_or(&actual);
-        let selected_origin = self.store.selected_actual_origin(&subject.subject)?;
+        let selected_origin = match actual_origin {
+            Some(origin) => origin,
+            None => self.store.selected_actual_origin(&subject.subject)?,
+        };
         let owner_host = subject
             .member
             .as_ref()

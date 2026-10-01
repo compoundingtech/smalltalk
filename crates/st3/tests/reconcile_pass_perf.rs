@@ -101,6 +101,9 @@ fn thread_cpu_ms() -> f64 {
 #[test]
 #[ignore = "needs ST3_PERF_STORE pointing at a copy of a member's store, inside a sandbox"]
 fn quiet_reconcile_passes_on_a_store_copy() {
+    // With ST3_PROFILE_DIR set, the file profiler writes each reconcile section's time to
+    // totals.json there.
+    st3::profile::init_from_env();
     let path = PathBuf::from(std::env::var("ST3_PERF_STORE").expect("set ST3_PERF_STORE"));
     let node = std::env::var("ST3_PERF_NODE").unwrap_or_else(|_| "hetz".into());
     let store = Arc::new(st3::store::Store::open(&path, node.clone()).unwrap());
@@ -168,7 +171,7 @@ fn quiet_reconcile_passes_on_a_store_copy() {
     for _ in 0..passes {
         let started = Instant::now();
         let cpu_started = thread_cpu_ms();
-        reconciler.reconcile_once().unwrap();
+        st3::profile::task("task reconcile-pass", || reconciler.reconcile_once()).unwrap();
         cpu.push(thread_cpu_ms() - cpu_started);
         wall.push(started.elapsed().as_secs_f64() * 1000.0);
     }
