@@ -1591,6 +1591,13 @@ pub struct MissionRunStateMoment {
 /// whether it includes history, and the status.
 type AgentStatusEntry = (u64, u64, bool, Arc<StatusResponse>);
 
+pub(crate) struct MissionGateRunner {
+    pub subject: String,
+    pub host: String,
+    pub owner_run: String,
+    pub retired: bool,
+}
+
 pub struct Store {
     connection: WriterConnection,
     readers: ReadPool,
@@ -1641,6 +1648,7 @@ const TERMINAL_OWNED_RUNTIME_SUBJECTS: &str = "SELECT desired.subject
      LEFT JOIN run_generations generation
        ON substr(desired.owner_generation, 1, 15)='run-generation/'
       AND generation.id=substr(desired.owner_generation, 16)
+     LEFT JOIN step_runs step ON step.subject=desired.owner_step
      WHERE desired.member IS NOT NULL
        AND (
          owner.status IN ('completed','failed','cancelled')
@@ -1648,6 +1656,9 @@ const TERMINAL_OWNED_RUNTIME_SUBJECTS: &str = "SELECT desired.subject
          OR root.status IN ('completed','failed','cancelled')
          OR root.phase='terminal'
          OR generation.status IN ('completed','failed','cancelled')
+         OR step.status='cancelled'
+         OR (owner.phase='final-cancelled' AND desired.kind IN ('exec','pty')
+             AND (desired.owner_step IS NULL OR step.status IN ('completed','failed')))
        )
      ORDER BY desired.subject";
 const RETIRED_OWNED_INTAKE_SUBJECTS: &str = "SELECT desired.subject
@@ -10444,6 +10455,81 @@ impl Store {
             .query_map([], |row| row.get::<_, String>(0))?
             .collect::<Result<BTreeSet<_>, _>>()
             .map_err(Into::into)
+    }
+
+    /// Gate runners are launched directly rather than through desired declarations. Their
+    /// owner is durable in the request; older mechanical/LLM requests encode it in the subject.
+    pub(crate) fn mission_gate_runners(&self) -> Result<Vec<MissionGateRunner>> {
+        let connection = self.readers.get();
+        let mut statement = connection.prepare(
+            "SELECT DISTINCT subject, origin,
+                    COALESCE(json_extract(body, '$.fields.owner'),
+                      'legacy:' || substr(subject, 16, instr(substr(subject, 16), '/')-1))
+             FROM claims request WHERE kind='gate.requested'
+               AND (json_extract(body, '$.fields.runner') IN ('exec','loop-metric')
+                    OR json_extract(body, '$.fields.model') IS NOT NULL)
+               AND NOT EXISTS (
+                 SELECT 1 FROM claims stopped
+                 WHERE stopped.subject=request.subject AND stopped.kind='runtime.observed'
+                   AND json_extract(stopped.body, '$.fields.status')='stopped'
+               )",
+        )?;
+        let mut requests = BTreeMap::<String, Vec<(String, String)>>::new();
+        for row in statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })? {
+            let (subject, host, owner) = row?;
+            requests.entry(owner).or_default().push((subject, host));
+        }
+        if requests.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Match by a map rather than an OR/prefix SQL join. That join visits every step
+        // for every historical gate request and stalls reconciliation as runs accumulate.
+        let mut owners = connection.prepare(
+            "SELECT step.subject, 'mission-run/' || run.id,
+                    step.status IN ('completed','failed','cancelled')
+                    OR generation.status IN ('completed','failed','cancelled','superseded')
+                    OR run.phase='terminal' OR run.phase LIKE 'cleanup-%'
+                    OR root.phase='terminal' OR root.phase LIKE 'cleanup-%'
+             FROM step_runs step
+             JOIN mission_runs run ON run.id=step.run_id
+             JOIN mission_runs root ON root.id=run.root_run_id
+             JOIN run_generations generation ON generation.id=step.generation_id
+             UNION ALL
+             SELECT 'mission-run/' || run.id, 'mission-run/' || run.id,
+                    run.phase IN ('final-cancelled','terminal') OR run.phase LIKE 'cleanup-%'
+                    OR run.status IN ('completed','failed','cancelled')
+                    OR root.phase='terminal' OR root.phase LIKE 'cleanup-%'
+             FROM mission_runs run
+             JOIN mission_runs root ON root.id=run.root_run_id",
+        )?;
+        let mut runners = Vec::new();
+        for row in owners.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, bool>(2)?,
+            ))
+        })? {
+            let (owner, owner_run, retired) = row?;
+            for key in [owner.clone(), format!("legacy:{}", owner.replace('/', "."))] {
+                if let Some(requests) = requests.get(&key) {
+                    runners.extend(requests.iter().map(|(subject, host)| MissionGateRunner {
+                        subject: subject.clone(),
+                        host: host.clone(),
+                        owner_run: owner_run.clone(),
+                        retired,
+                    }));
+                }
+            }
+        }
+        runners.sort_by(|left, right| left.subject.cmp(&right.subject));
+        Ok(runners)
     }
 
     /// Observers, subscriptions, and schedules whose owner run is terminal or whose owner
