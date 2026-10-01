@@ -70,6 +70,145 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
+    fn schema_fifteen_glasses_rollback_keeps_writes_deletes_and_replication() {
+        use super::super::tests::{exchange_from, receive_and_project};
+        use crate::model::ReplicationInventory;
+
+        fn glass(id: usize, name: &str) -> ClaimInput {
+            ClaimInput {
+                subject: format!("glass/person/ada/019a0000-0000-7000-8000-{id:012x}"),
+                kind: "glass.upserted".into(),
+                actor: Some("person/ada".into()),
+                fields: serde_json::from_value(json!({
+                    "body": {"name": name, "tabs": [{"layout": {"pane": "home:"}}]},
+                    "base_revision": null
+                }))
+                .unwrap(),
+                evidence: vec![],
+                expected_subject: None,
+                idempotency_key: None,
+            }
+        }
+        fn sync(source: &Store, target: &Store) {
+            receive_and_project(
+                target,
+                &source.origin,
+                &exchange_from(source, &ReplicationInventory::default()),
+            );
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("claims.sqlite3");
+        let store = Store::open(&path, "alder").unwrap();
+        let first = store.append_claim(&glass(1, "Before rollback")).unwrap();
+        let before_doc = store
+            .put_document("doc/glass-rollback", b"before", &None, "before")
+            .unwrap();
+        let before = projection_digest::tables(&store.readers.get()).unwrap();
+        let before_glasses = store.glasses("person/ada", u64::MAX).unwrap();
+        drop(store);
+
+        let fallback = Store::open(&path, "alder").unwrap();
+        assert_eq!(
+            before,
+            projection_digest::tables(&fallback.readers.get()).unwrap()
+        );
+        assert_eq!(
+            before_glasses,
+            fallback.glasses("person/ada", u64::MAX).unwrap()
+        );
+        let peer = Store::open_memory("birch").unwrap();
+        sync(&fallback, &peer);
+        let mut update = glass(1, "After rollback");
+        update
+            .fields
+            .insert("base_revision".into(), json!(first.id));
+        let updated = fallback.append_claim(&update).unwrap();
+        assert_eq!(updated.body["fields"]["replaced_revision"], first.id);
+        fallback
+            .append_claim(&glass(2, "Retained workspace"))
+            .unwrap();
+        // An offline peer's edit must remain retired when the fallback's delete arrives.
+        peer.append_claim(&glass(1, "Offline update")).unwrap();
+        let mut delete = glass(1, "");
+        delete.kind = "glass.deleted".into();
+        delete.fields.remove("body");
+        fallback.append_claim(&delete).unwrap();
+        let after_doc = fallback
+            .put_document(
+                "doc/glass-rollback",
+                b"after rollback",
+                &Some(before_doc.binding_claim_id),
+                "after",
+            )
+            .unwrap();
+        sync(&fallback, &peer);
+        sync(&peer, &fallback);
+        assert_eq!(
+            fallback.append_claim(&glass(1, "Reuse")).unwrap_err().code,
+            "glass-deleted"
+        );
+        let live = fallback.glasses("person/ada", u64::MAX).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0]["body"]["name"], "Retained workspace");
+        assert_eq!(live, peer.glasses("person/ada", u64::MAX).unwrap());
+        let stable = projection_digest::tables(&fallback.readers.get()).unwrap();
+        assert_eq!(
+            stable,
+            projection_digest::oracle(&fallback.readers.get()).unwrap()
+        );
+        assert_eq!(
+            stable,
+            projection_digest::tables(&peer.readers.get()).unwrap()
+        );
+        assert_eq!(
+            15,
+            fallback
+                .readers
+                .get()
+                .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
+                .unwrap()
+        );
+        fallback.rebuild_claim_projections().unwrap();
+        assert_eq!(
+            stable,
+            projection_digest::tables(&fallback.readers.get()).unwrap()
+        );
+        assert_eq!(live, fallback.glasses("person/ada", u64::MAX).unwrap());
+        drop(fallback);
+
+        let reopened = Store::open(&path, "alder").unwrap();
+        assert_eq!(
+            stable,
+            projection_digest::tables(&reopened.readers.get()).unwrap()
+        );
+        assert_eq!(live, reopened.glasses("person/ada", u64::MAX).unwrap());
+        assert_eq!(
+            reopened.get_blob(&after_doc.hash).unwrap().unwrap(),
+            b"after rollback"
+        );
+        assert_eq!(
+            reopened
+                .append_claim(&glass(1, "Reuse after reopen"))
+                .unwrap_err()
+                .code,
+            "glass-deleted"
+        );
+        reopened
+            .append_claim(&glass(3, "Continued writes"))
+            .unwrap();
+        sync(&reopened, &peer);
+        assert_eq!(
+            reopened.glasses("person/ada", u64::MAX).unwrap(),
+            peer.glasses("person/ada", u64::MAX).unwrap()
+        );
+        assert_eq!(
+            projection_digest::tables(&reopened.readers.get()).unwrap(),
+            projection_digest::tables(&peer.readers.get()).unwrap()
+        );
+    }
+
+    #[test]
     fn schema_fifteen_rollback_retains_and_resolves_current_person_work() {
         use crate::model::{PersonAskRequest, PersonStepResponse};
 
@@ -394,11 +533,9 @@ mod tests {
             )
             .unwrap();
         assert_eq!(next.len(), 1000);
-        assert!(
-            !next
-                .iter()
-                .any(|version| version.binding_claim_id == cursor.binding_claim_id)
-        );
+        assert!(!next
+            .iter()
+            .any(|version| version.binding_claim_id == cursor.binding_claim_id));
         let (name, hash) = first.unwrap();
         assert!(
             !find_document(&store.readers.get(), &name, &hash)
