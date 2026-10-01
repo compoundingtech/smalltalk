@@ -763,6 +763,81 @@ pub(super) async fn document_get(
     Ok(Json(json!({ "reference": query.name, "bytes": bytes })))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct SubjectDefinitionQuery {
+    subject: String,
+    #[serde(default)]
+    show_env_values: bool,
+}
+
+/// One agent's applied definition, reconstructed from its selected desired claim, not authored
+/// source. Missions are published as compiled revisions and keep no canonical declaration AST.
+/// Environment values are redacted unless the caller asks for them and holds declaration scope.
+pub(super) async fn subject_definition(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Query(query): Query<SubjectDefinitionQuery>,
+) -> Result<(Extension<ClientSnapshot>, Json<Value>), ApiError> {
+    require_scope(&session, "read.projections")?;
+    if query.show_env_values {
+        require_scope(&session, "read.declarations")?;
+    }
+    if !query.subject.starts_with("agent/") {
+        return Err(ApiError::bad(St3Error::new(
+            "validation-failed",
+            "a definition subject must start with `agent/`; missions are published revisions \
+             without a canonical declaration",
+        )));
+    }
+    let subject = query.subject.clone();
+    let show_env_values = query.show_env_values;
+    let result = blocking_store(move || {
+        let store = state.store.clone();
+        store.read_snapshot(|index| {
+            let status = store.status_at(Some(&subject), None, Some(index))?;
+            let Some(status) = status.subjects.into_iter().find(|item| item.subject == subject)
+            else {
+                return Ok(None);
+            };
+            let Some(mut desired) = status.desired else {
+                return Ok(None);
+            };
+            if !show_env_values {
+                crate::graph::redact_agent_env_values(&mut desired);
+            }
+            let kdl = crate::graph::render_agent_desired_kdl(&desired)?;
+            let revision = status.desired_revision
+                .ok_or_else(|| anyhow::anyhow!("an applied definition has no desired revision"))?;
+            let token = status.desired_token
+                .ok_or_else(|| anyhow::anyhow!("an applied definition has no desired token"))?;
+            let value = json!({
+                "kind": "subject-definition",
+                "subject": subject,
+                "desired": desired,
+                "kdl": kdl,
+                "desired_revision": revision,
+                "desired_token": token,
+                "conflicts": status.conflicts,
+            });
+            Ok(Some((client_snapshot_at(&state, index), value)))
+        })
+    }).await?;
+    let (snapshot, value) = result.ok_or_else(|| ApiError::not_found(
+        format!("subject `{}` has no applied definition", query.subject),
+    ))?;
+    // Reserve space for the snapshot and response envelope. Definitions are never truncated.
+    if serde_json::to_vec(&value).map_err(ApiError::internal)?.len()
+        > CLIENT_MAX_RESPONSE_BYTES - 4096
+    {
+        return Err(ApiError::bad(St3Error::new(
+            "validation-failed",
+            "the applied definition exceeds the client response limit",
+        )));
+    }
+    Ok((Extension(snapshot), Json(value)))
+}
+
 const ALL_SCOPES: &[&str] = &[
     "read.projections",
     "read.declarations",
@@ -7562,6 +7637,44 @@ mod tests {
                 .contains("could not identify its saved session")
         );
         assert!(!error.message.contains("does not exist"));
+    }
+
+    #[test]
+    fn applied_definition_kdl_preserves_kdl_scalars_and_identifiers() {
+        let desired = json!({
+            "name": "agent",
+            "arguments": ["example/worker"],
+            "children": [{
+                "name": "name with spaces",
+                "arguments": ["λ \"quoted\"\\\n", i64::MIN, i64::MAX, 1.0, 1.25, true, false, null],
+                "properties": { "property with spaces": "\"\\\nλ" },
+                "children": [{ "name": "child", "arguments": [null] }],
+            }],
+        });
+        let rendered = crate::graph::render_agent_desired_kdl(&desired).unwrap();
+        let document = rendered.parse::<kdl::KdlDocument>().unwrap();
+        assert_eq!(document.nodes()[0].name().value(), "version");
+        assert_eq!(document.nodes()[1].name().value(), "agent");
+        let node = &document.nodes()[1].children().unwrap().nodes()[0];
+        assert_eq!(node.name().value(), "name with spaces");
+        let values = node.entries().iter().filter(|entry| entry.name().is_none())
+            .map(|entry| entry.value().clone()).collect::<Vec<_>>();
+        assert_eq!(values, vec![
+            kdl::KdlValue::String("λ \"quoted\"\\\n".into()),
+            kdl::KdlValue::Integer(i128::from(i64::MIN)),
+            kdl::KdlValue::Integer(i128::from(i64::MAX)),
+            kdl::KdlValue::Float(1.0),
+            kdl::KdlValue::Float(1.25),
+            kdl::KdlValue::Bool(true),
+            kdl::KdlValue::Bool(false),
+            kdl::KdlValue::Null,
+        ]);
+        let property = node.entries().iter().find(|entry| entry.name().is_some()).unwrap();
+        assert_eq!(property.name().unwrap().value(), "property with spaces");
+        assert_eq!(property.value(), &kdl::KdlValue::String("\"\\\nλ".into()));
+        let child = &node.children().unwrap().nodes()[0];
+        assert_eq!(child.name().value(), "child");
+        assert_eq!(child.entries()[0].value(), &kdl::KdlValue::Null);
     }
 
     fn test_state(root: &Path) -> AppState {
