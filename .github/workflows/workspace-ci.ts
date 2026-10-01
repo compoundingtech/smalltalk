@@ -55,7 +55,7 @@ export const commonSetupSteps = [
   {
     name: 'Isolate test home and XDG state',
     run: `# Cargo's home and the CI cache directory live under RUNNER_TEMP, not HOME: tests get an isolated HOME,
-# and actions/cache expands `~` against the HOME of the step that runs it.
+# and actions/cache expands a leading tilde against the HOME of the step that runs it.
 printf 'CARGO_HOME=%s\\nCI_CACHE_DIR=%s\\n' "$RUNNER_TEMP/cargo-home" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
 home="$RUNNER_TEMP/test-home"
 mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"

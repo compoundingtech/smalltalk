@@ -12,9 +12,17 @@ fleet_compat() {
   baseline=$(jq -er .commit .github/fleet-compat-baseline.json) || return
   # The pinned baseline never changes: after the first run its Nix output is substituted from the
   # cache volume's local binary cache (scripts/ci-nix-cache) instead of being built again.
-  BASELINE="$baseline" nix build --impure --out-link "$RUNNER_TEMP/baseline" --print-build-logs --expr '
-    ((builtins.getFlake "github:compoundingtech/smalltalk/${builtins.getEnv "BASELINE"}")
-      .packages.${builtins.currentSystem}.st3).overrideAttrs (_: { doCheck = false; })' || return
+  # Building the baseline also runs the pinned pty's own unit tests, and two of its process-table
+  # tests are timing-sensitive on a loaded runner (different ones failed on different runs). A
+  # failed build leaves nothing behind, so a retry rebuilds only what failed.
+  local attempt
+  for attempt in 1 2 3; do
+    BASELINE="$baseline" nix build --impure --out-link "$RUNNER_TEMP/baseline" --print-build-logs --expr '
+      ((builtins.getFlake "github:compoundingtech/smalltalk/${builtins.getEnv "BASELINE"}")
+        .packages.${builtins.currentSystem}.st3).overrideAttrs (_: { doCheck = false; })' && break
+    [ "$attempt" -lt 3 ] || return 1
+    echo "baseline build attempt $attempt failed; retrying" >&2
+  done
   export ST3_COMPAT_BIN="$RUNNER_TEMP/baseline/bin/st3"
   test -x "$ST3_COMPAT_BIN" || return
   if "$ST3_COMPAT_BIN" fleet --help > /dev/null 2>&1; then

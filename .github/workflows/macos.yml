@@ -42,8 +42,8 @@ jobs:
         with:
           path: |
             ${{ github.workspace }}/target
-            ~/.cargo/registry
-            ~/.cargo/git
+            ${{ runner.temp }}/cargo-home/registry
+            ${{ runner.temp }}/cargo-home/git
           key: "cargo-${{ github.job }}-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'flake.lock') }}"
           restore-keys: "cargo-${{ github.job }}-${{ runner.os }}-"
       - name: Restore the local Nix cache
@@ -51,7 +51,7 @@ jobs:
         if: runner.os == 'Linux'
         uses: actions/cache@v4
         with:
-          path: ~/.cache/st-ci
+          path: "${{ runner.temp }}/st-ci-cache"
           key: "nix-${{ github.job }}-${{ runner.os }}-${{ hashFiles('flake.lock') }}"
           restore-keys: "nix-${{ github.job }}-${{ runner.os }}-"
       - name: Install Nix
@@ -68,8 +68,9 @@ jobs:
           summarize: true
       - name: Isolate test home and XDG state
         run: |
-          # The cached Cargo registry lives under the real HOME; tests get the isolated one.
-          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "${CARGO_HOME:-$HOME/.cargo}" "$HOME/.cache/st-ci" >> "$GITHUB_ENV"
+          # Cargo's home and the CI cache directory live under RUNNER_TEMP, not HOME: tests get an isolated HOME,
+          # and actions/cache expands a leading tilde against the HOME of the step that runs it.
+          printf 'CARGO_HOME=%s\nCI_CACHE_DIR=%s\n' "$RUNNER_TEMP/cargo-home" "$RUNNER_TEMP/st-ci-cache" >> "$GITHUB_ENV"
           home="$RUNNER_TEMP/test-home"
           mkdir -p "$home" "$home/.config" "$home/.cache" "$home/.local/state"
           printf 'HOME=%s\nXDG_CONFIG_HOME=%s/.config\nXDG_CACHE_HOME=%s/.cache\nXDG_STATE_HOME=%s/.local/state\n' "$home" "$home" "$home" "$home" >> "$GITHUB_ENV"
