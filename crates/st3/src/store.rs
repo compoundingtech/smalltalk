@@ -43,6 +43,7 @@ use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
 
 mod canonical;
 mod checkpoint;
+mod document_index;
 mod projection_digest;
 use canonical::{CANONICAL_ORDER, CANONICAL_ORDER_DESC, canonical_sql};
 mod checkpoint_agreement;
@@ -222,6 +223,7 @@ CREATE TABLE IF NOT EXISTS documents (
     hash TEXT NOT NULL REFERENCES blobs(hash),
     created_index INTEGER NOT NULL,
     binding_claim_id TEXT NOT NULL DEFAULT '',
+    binding_key BLOB NOT NULL DEFAULT x'',
     PRIMARY KEY(name, hash)
 );
 CREATE INDEX IF NOT EXISTS document_latest ON documents(name, created_index DESC);
@@ -697,7 +699,7 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 CREATE INDEX IF NOT EXISTS checkpoint_claims_subject ON checkpoint_claims(subject);
 CREATE INDEX IF NOT EXISTS checkpoint_claims_operation
 ON checkpoint_claims(operation_id) WHERE operation_id IS NOT NULL;
-PRAGMA user_version = 14;
+PRAGMA user_version = 15;
 "#;
 
 /// The writer connection's clock offset. Only a simulation sets it; see `write_time`.
@@ -2205,11 +2207,11 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
         |row| row.get(0),
     )?;
     anyhow::ensure!(
-        table_count == 0 || matches!(version, 10..=14),
+        table_count == 0 || matches!(version, 10..=15),
         "this database uses an unsupported st schema; start with a new state directory"
     );
     anyhow::ensure!(
-        matches!(version, 0 | 10 | 11 | 12 | 13 | 14),
+        matches!(version, 0 | 10 | 11 | 12 | 13 | 14 | 15),
         "this database uses unsupported st schema version {version}"
     );
     Ok(())
@@ -2217,7 +2219,7 @@ fn reject_old_schema(connection: &Connection) -> Result<()> {
 
 fn migrate_schema(connection: &Connection) -> Result<()> {
     let version: u32 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-    if version == 0 || version == 13 || version == 14 {
+    if version == 0 || version == 13 || version == 14 || version == 15 {
         return Ok(());
     }
     if version == 12 {
@@ -2693,6 +2695,7 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        document_index::initialize(&connection)?;
         backfill_message_index(&connection)?;
         connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(&connection)?;
@@ -2769,6 +2772,7 @@ impl Store {
         reject_old_schema(&connection)?;
         migrate_schema(&connection)?;
         connection.execute_batch(SCHEMA)?;
+        document_index::initialize(&connection)?;
         backfill_message_index(&connection)?;
         connection.execute_batch(WRITE_CLOCK)?;
         create_graph_generation_triggers(&connection)?;
@@ -8838,12 +8842,7 @@ impl Store {
                     None,
                 )
                 .map_err(internal)?;
-                transaction
-                    .execute(
-                        "INSERT INTO documents(name, hash, created_index, binding_claim_id) VALUES (?1, ?2, ?3, ?4)",
-                        params![name, hash, record.store_index, record.id],
-                    )
-                    .map_err(internal)?;
+                select_replicated_document(transaction, &record, record.store_index)?;
                 let version = DocumentVersion {
                     name: name.into(),
                     hash,
@@ -28778,10 +28777,33 @@ fn select_replicated_document(
             )
         })?;
     validate_document_name(name)?;
+    let binding_key =
+        canonical::sortable_key(&canonical::claim_key(transaction, &claim.id).map_err(internal)?);
+    let previous: Option<String> = transaction
+        .query_row(
+            "SELECT binding_claim_id FROM documents WHERE name=?1 AND hash=?2",
+            params![name, hash],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(internal)?;
+    if let Some(previous) = previous {
+        if canonical::claim_key(transaction, &claim.id).map_err(internal)?
+            < canonical::claim_key(transaction, &previous).map_err(internal)?
+        {
+            transaction
+                .execute(
+                    "UPDATE documents SET binding_claim_id=?3,binding_key=?4 WHERE name=?1 AND hash=?2",
+                    params![name, hash, claim.id, binding_key],
+                )
+                .map_err(internal)?;
+        }
+        return Ok(());
+    }
     transaction
         .execute(
-            "INSERT OR IGNORE INTO documents(name, hash, created_index, binding_claim_id) VALUES (?1, ?2, ?3, ?4)",
-            params![name, hash, created_index, claim.id],
+            "INSERT OR IGNORE INTO documents(name, hash, created_index, binding_claim_id, binding_key) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![name, hash, created_index, claim.id, binding_key],
         )
         .map_err(internal)?;
     Ok(())
@@ -39954,7 +39976,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            14
+            15
         );
         assert_eq!(
             connection
@@ -40028,7 +40050,7 @@ version 2
             connection
                 .query_row("PRAGMA user_version", [], |row| row.get::<_, u32>(0))
                 .unwrap(),
-            14
+            15
         );
     }
 
@@ -40061,7 +40083,7 @@ version 2
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, 14);
+        assert_eq!(version, 15);
         assert_eq!(planner_column, 1);
     }
 
