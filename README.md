@@ -308,8 +308,8 @@ st agents rename agent/example/worker --clear --as person/ada
 Rename publishes only `desired.display_name`, the same durable field as KDL `name`. It does not
 restart the seat or change its identity, and a stopped seat keeps its restart budget and any
 crash-loop hold. The Agent API uses this effective label; clearing it restores `example/worker`.
-The label must be non-empty. Rename requires the same declaration authority as applying the
-seat's KDL and preserves the original declaring authority.
+The label must be non-empty. Like declaring a seat in free mode, a person or an agent may rename
+any seat. A bound harness must act as itself, and rename preserves the original declaring actor.
 
 [`examples/st3/seats`](examples/st3/seats) has a seat file for each harness.
 

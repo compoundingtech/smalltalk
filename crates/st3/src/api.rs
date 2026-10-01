@@ -17174,7 +17174,7 @@ agent "test/target" { workspace "."; command "true"; name "Initial seat" }
         assert_eq!(initial.iter().find(|agent| agent["id"] == "agent/test/target").unwrap()["name"], "Initial seat");
         let app = router(state.clone());
         let (status, _) = json_request(app.clone(), "/v1/agents/rename", json!({
-            "subject": "test/target", "name": "Denied", "actor": "invalid",
+            "subject": "test/target", "name": "Denied", "actor": "daemon/test",
             "idempotency_key": "invalid-actor",
         })).await;
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);

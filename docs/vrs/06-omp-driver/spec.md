@@ -126,11 +126,12 @@ message / delivered / failed / state / context frames, PROTOCOL constant). Diffe
 
 `desired.display_name` (KDL `name`) is the authority for the human label. Its stored declaration
 contains the canonical KDL name child and the normalized member's `display_name`; rename keeps
-these two representations identical and preserves the original declaring authority.
+these two representations identical and preserves the original declaring actor.
 `st3 agents rename <subject> <label>` and `st3 agents rename <subject> --clear` publish only
 this presentation field through the durable desired-state log, without restarting the harness.
-Rename requires declaration authority over the seat and a non-empty label, and refuses a seat
-whose stored launch this build cannot read, since republishing it would erase that launch.
+In free mode, any person or agent may rename any seat, but a bound harness must act as itself.
+Rename requires a non-empty label and refuses a seat whose stored launch this build cannot read,
+since republishing it would erase that launch.
 Clearing restores the subject without the `agent/` prefix, which the Agent API uses as the
 effective label. A revision that differs from a predecessor only in the label (for a merge of
 concurrent revisions, from any one of its predecessors) keeps that predecessor's launch revision:
