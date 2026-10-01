@@ -425,6 +425,8 @@ enum Action {
     Home,
     /// A plain shell in a new tab.
     NewTerminal,
+    /// The new mission form, in a new tab.
+    NewMission,
     /// Ask for a name, for a glass to rename, make or copy.
     Name(Naming),
 }
@@ -592,6 +594,12 @@ impl Ui {
             Action::NewAgent(None),
         ));
         choices.push(start(
+            "New mission".into(),
+            "describe it; a planner drafts it for you to approve",
+            "new mission launch".into(),
+            Action::NewMission,
+        ));
+        choices.push(start(
             "New terminal".into(),
             "a shell in a new tab",
             "new terminal shell".into(),
@@ -746,9 +754,12 @@ impl Ui {
         if !palette.query.is_empty() {
             // Starting an agent from whatever was typed matches anything, so it comes last:
             // "close glass" closes the glass rather than starting an agent named that.
+            // What is typed exactly as a choice begins ("new mission", "atlas") is first.
+            let typed = palette.query.trim().to_lowercase();
             scored.sort_by_key(|(choice, score)| {
                 let catch_all = matches!(choice.action, Action::NewAgent(Some(_)));
-                (catch_all, RANK[choice.section], -score)
+                let named = choice.label.to_lowercase().starts_with(&typed);
+                (catch_all, !named, RANK[choice.section], -score)
             });
         }
         scored.into_iter().map(|(choice, _)| choice).collect()
@@ -1636,6 +1647,7 @@ impl Ui {
     /// Keys glasses own. Returns whether the key was used here.
     pub(crate) fn glass_key(&mut self, key: KeyEvent) -> bool {
         let terminal_focused = self.terminal_focused();
+        let mission_form = self.mission_form_focused();
         let Some(glasses) = self.glasses.as_mut() else {
             return false;
         };
@@ -1716,7 +1728,7 @@ impl Ui {
         if self.editing
             || self.find.is_some()
             || (self.agent_form && self.tab == 1 && self.new_agent.is_some())
-            || self.new_mission.is_some()
+            || mission_form
             || self.chat.as_ref().is_some_and(|chat| chat.editing)
         {
             return false;
@@ -1911,6 +1923,7 @@ impl Ui {
             Action::ShowGlass(index) => self.show_glass(index),
             Action::NewAgent(task) => self.open_new_agent(task),
             Action::NewTerminal => self.open_new_terminal(),
+            Action::NewMission => self.open_new_mission(),
             Action::Home => self.open_home(),
             Action::Name(naming) => {
                 let query = match naming {
@@ -2407,7 +2420,7 @@ impl Ui {
             .glasses
             .as_ref()
             .and_then(|glasses| glasses.glass().focused())
-            .is_some_and(|key| key == Pane::NewAgent.key());
+            .is_some_and(|key| key == Pane::NewAgent.key() || key == Pane::NewMission.key());
         if form {
             self.close_tab();
         }
@@ -2500,6 +2513,12 @@ impl Ui {
         tab.pane = pane.key();
         let id = glass.id.clone();
         self.glass_changed(&id);
+    }
+
+    /// Whether the new mission form takes the keys: in a glass only while its tab has focus.
+    pub(crate) fn mission_form_focused(&self) -> bool {
+        self.new_mission.is_some()
+            && (self.glasses.is_none() || self.focused_pane() == Some(Pane::NewMission))
     }
 
     /// The pane in the focused split's current tab, in glasses.
@@ -3014,6 +3033,35 @@ mod tests {
         press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
         assert!(!sidebar(&ui).shown);
         assert!(!screen(&ui).contains(" Fleet "));
+    }
+
+    #[test]
+    fn ctrl_k_new_mission_opens_its_form_in_a_tab_that_takes_keys_only_while_focused() {
+        let mut ui = glass();
+        ui.open_in_glass(
+            Pane::Agent(Some("agent/example/atlas/builder".into())),
+            Open::Tab,
+        );
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, "new mission");
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            tabs(&ui).2,
+            vec![vec![ATLAS.to_owned(), "new-mission:".to_owned()]]
+        );
+        typed(&mut ui, "Ship it");
+        assert_eq!(ui.new_mission.as_ref().unwrap().0[0], "Ship it");
+        // On another tab the form takes no keys.
+        ui.show_tab(0);
+        typed(&mut ui, "c");
+        assert!(ui.editing, "keys reach the focused conversation");
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        assert_eq!(ui.new_mission.as_ref().unwrap().0[0], "Ship it");
+        // Esc on its tab drops the form and its tab.
+        ui.show_tab(1);
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(ui.new_mission.is_none());
+        assert_eq!(tabs(&ui).2, vec![vec![ATLAS.to_owned()]]);
     }
 
     #[test]
