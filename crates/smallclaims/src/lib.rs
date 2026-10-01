@@ -6,6 +6,7 @@
 
 pub mod claim;
 pub mod error;
+pub mod fleet;
 pub mod hash;
 pub mod replication;
 

@@ -178,6 +178,8 @@
           "st2-vista-component"
           # `checks.st3` gates these crates with the runtime inputs their tests need.
           "--exclude"
+          "smallclaims"
+          "--exclude"
           "st-runtime"
           "--exclude"
           "st3"
@@ -340,6 +342,8 @@
           # `--no-fail-fast` reports every failing test target in one run.
           cargoTestFlags = [
             "--no-fail-fast"
+            "-p"
+            "smallclaims"
             "-p"
             "st-runtime"
             "-p"

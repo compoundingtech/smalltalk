@@ -1106,7 +1106,7 @@ The worker gains hidden settings for tests: `--anti-entropy-interval-ms` and
 - `advertised_endpoints_accept_only_loopback_tailnet_or_fabric`
 - `a_legacy_config_peer_fleet_validates_unchanged`
 
-`crates/st3/src/fleet/code.rs`
+`crates/smallclaims/src/fleet/code.rs`
 
 - `a_join_code_round_trips`
 - `a_damaged_code_fails_its_checksum`
@@ -1115,7 +1115,7 @@ The worker gains hidden settings for tests: `--anti-entropy-interval-ms` and
   and base64 forms never occur in any code)
 - `send_fabric_leaves_no_local_code_file_and_fabric_inbox_deletes_the_received_one` (shim)
 
-`crates/st3/src/fleet/handshake.rs`
+`crates/smallclaims/src/fleet/handshake.rs`
 
 - `the_handshake_delivers_the_secret_to_the_token_holder`
 - `a_wrong_token_gets_the_same_refusal_as_an_unknown_invite`

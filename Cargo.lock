@@ -3664,11 +3664,18 @@ name = "smallclaims"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "ciborium",
+ "data-encoding",
+ "getrandom 0.3.4",
  "hex",
+ "hmac",
+ "ring",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
+ "uuid",
 ]
 
 [[package]]
