@@ -162,7 +162,7 @@ members and the rest of the pass still run.
 A member whose start keeps failing does not spawn again on every pass:
 
 - it waits 15 seconds between attempts;
-- after three failures within five minutes it parks with one attention request.
+- after three failures within five minutes it parks; the current parked source appears in attention until replaced or retired.
 
 Cleanup of a cancelled, failed, or finished run reads only the declarations that the run owns. It
 never waits for the run's mission revision or its steps, so a run whose revision is unavailable

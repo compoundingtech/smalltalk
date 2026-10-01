@@ -1449,6 +1449,8 @@ mod tests {
     fn attention_list_shows_kind_age_targets_and_safe_commands() {
         let item = AttentionItemView {
             kind: "fault".into(),
+            episode: "failure-one".into(),
+            priority: "high".into(),
             review_mode: None,
             subject: "attention/fabric".into(),
             person: "person/alex".into(),

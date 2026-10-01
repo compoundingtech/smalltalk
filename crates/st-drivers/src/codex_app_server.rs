@@ -310,6 +310,71 @@ pub enum CodexTerminalError {
     ProviderCapacity,
 }
 
+/// A cause reported by Codex's `error` notification. Retryable failures may arrive without
+/// a completion or thread-status change, so retain this evidence independently of delivery state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CodexTurnError {
+    /// The turn the error belongs to. A later turn's start clears it; a foreign turn's does not.
+    turn_id: String,
+    /// st2's classification of `error.codexErrorInfo`, for the native-driver diagnostic.
+    reason: driver_diagnostic::Reason,
+    /// The word the observed-state record shows a reader. One word, from a closed set.
+    word: &'static str,
+    /// Codex's own `willRetry`. `true` means no `turn/completed` is coming until the retries are
+    /// spent, so this error is the only evidence the seat is not progressing.
+    will_retry: bool,
+}
+
+/// Classify one `CodexErrorInfo` value.
+///
+/// The value is either one of Codex's enum words or a single-key object (`httpConnectionFailed`
+/// and its siblings carry an HTTP status). Both shapes reduce to one word here.
+///
+/// The classes are st2's, not Codex's, and they are chosen by WHAT A PERSON DOES about them: wait
+/// for an allowance, pick another model, shorten the context, fix the network, take it up with
+/// the provider, or fix st2's own request. A word this build does not know is `turnUnclassified`
+/// — a real failure whose cause this version cannot name — never silently dropped and never
+/// folded into a class it might not belong to.
+fn codex_error_class(
+    error_info: Option<&Value>,
+) -> Option<(driver_diagnostic::Reason, &'static str, String)> {
+    use driver_diagnostic::Reason;
+    let word = match error_info {
+        Some(Value::String(word)) => word.as_str(),
+        Some(Value::Object(map)) if map.len() == 1 => map.keys().next()?.as_str(),
+        _ => {
+            return Some((
+                Reason::TurnUnclassified,
+                "unclassified",
+                "unreadable".to_string(),
+            ));
+        }
+    };
+    let (reason, class) = match word {
+        // The credential class is NOT here on purpose: it has its own stage, its own recovery
+        // edge and its own repair text, and it outranks this one in the projection order.
+        CODEX_PROVIDER_AUTH_REJECTED => return None,
+        "usageLimitExceeded" | "rateLimitExceeded" | "sessionBudgetExceeded" => {
+            (Reason::TurnUsageLimit, "usageLimit")
+        }
+        "serverOverloaded" => (Reason::TurnServerOverloaded, "serverOverloaded"),
+        "contextWindowExceeded" => (Reason::TurnContextWindow, "contextWindow"),
+        "httpConnectionFailed"
+        | "responseStreamConnectionFailed"
+        | "responseStreamDisconnected"
+        | "responseTooManyFailedAttempts" => (Reason::TurnConnection, "connection"),
+        "cyberPolicy" => (Reason::TurnPolicy, "policy"),
+        "badRequest" | "activeTurnNotSteerable" => (Reason::TurnRejected, "rejected"),
+        "internalServerError" | "threadRollbackFailed" | "sandboxError" => {
+            (Reason::TurnInternal, "internal")
+        }
+        // Codex's own catch-all and every word added after this build was written land together:
+        // both mean "a real failure this version cannot name", which is the honest report.
+        _ => (Reason::TurnUnclassified, "unclassified"),
+    };
+    Some((reason, class, word.to_string()))
+}
+
 /// The `CodexErrorInfo` word that names a rejected provider credential.
 ///
 /// It is the 401/invalid-credential arm of Codex's own closed error vocabulary and is distinct
@@ -643,10 +708,11 @@ struct CodexInboxDelivery {
     /// Crash-safe normalized conversation operations for the client-v0 timeline.
     timeline: crate::harness_timeline::Writer,
     model_attempted: BTreeSet<String>,
-    /// The native-driver boundary record. Codex publishes exactly one stage on it — the provider
-    /// credential — because every earlier boundary is already fail-closed at admission: an
-    /// incompatible protocol refuses the launch instead of degrading into an observation.
+    /// Native-driver boundary diagnostics for launch fallback, provider credentials, delivery,
+    /// and turn failures. Earlier protocol gates refuse admission before the session starts.
     diagnostics: driver_diagnostic::Publisher,
+    /// Failure reported for the turn, retained until observed recovery.
+    turn_error: Option<CodexTurnError>,
     safe_fallback_active: Arc<AtomicBool>,
     safe_fallback_diagnostic_published: bool,
 }
@@ -776,6 +842,7 @@ impl CodexInboxDelivery {
             timeline,
             model_attempted: BTreeSet::new(),
             diagnostics,
+            turn_error: None,
             safe_fallback_active,
             safe_fallback_diagnostic_published,
         })
@@ -802,7 +869,7 @@ impl CodexInboxDelivery {
     /// contradiction of the latest observation.
     fn observe_harness(&mut self, observed: &CodexObservedState) {
         match observed.harness_observation() {
-            Some(observation) => self.publish_observation(observation),
+            Some(observation) => self.publish_observation(self.name_turn_error(observation)),
             None => {
                 // Evidence lost: stop heartbeating, drop anything pending (it predates the gap),
                 // and mark the stream discontinuous so a state restated after the gap opens a
@@ -954,6 +1021,162 @@ impl CodexInboxDelivery {
             CodexTurnOutcome::ProviderCapacity => {}
             CodexTurnOutcome::Indeterminate => {}
         }
+    }
+
+    /// Let a standing turn error name itself in the observed record.
+    ///
+    /// The delivery-relevant [`CodexObservedState`] is untouched by this: `Held` stays exactly the
+    /// complement of steerable (decision 0001), so nothing here can make a seat unreachable. What
+    /// changes is the one field a reader looks at to find out why a seat is not moving.
+    ///
+    /// The rule is that the CAUSE outranks the ACTIVITY. `active` with no reason, `ended` with the
+    /// bare word `systemError`, and every hold reason describe what kind of work the thread
+    /// believes it is doing; the turn error describes why none of it is progressing, and that is
+    /// what the reader needs. Two reasons are left alone: a human ask (`blockedOn: human`), which
+    /// is a stronger and more actionable fact than a failed turn, and `providerAuth`, which names
+    /// the same failure's more specific cause from a stage of its own.
+    fn name_turn_error(
+        &self,
+        observation: harness_state::Observation,
+    ) -> harness_state::Observation {
+        use crate::harness_state::BlockedOn;
+        let Some(error) = self.turn_error.as_ref() else {
+            return observation;
+        };
+        if observation.blocked_on == BlockedOn::Human
+            || observation.reason.as_deref() == Some("providerAuth")
+        {
+            return observation;
+        }
+        observation.with_reason(error.word)
+    }
+
+    /// Record what one inbound frame proves about the live turn, and return whether the standing
+    /// error changed — the caller republishes the observed record when it did.
+    ///
+    /// Frame-level like [`Self::observe_context`] and [`Self::observe_provider_auth`], and for the
+    /// same reason: it reads frames no delivery branch looks at, and every one of them may
+    /// `continue`.
+    ///
+    /// A standing error is cleared only by POSITIVE proof that the turn recovered — a completed
+    /// turn, an idle thread, or a different turn starting. Never by silence, and never by a
+    /// `turn/completed` that itself reports `failed`: a failure is not its own recovery. That
+    /// asymmetry is the whole point. Evidence that a seat is stuck must survive quiet, because
+    /// quiet is exactly what a stuck seat produces.
+    fn observe_turn_error(&mut self, message: &Value, thread_id: &str) -> bool {
+        let Some(method) = message.get("method").and_then(Value::as_str) else {
+            return false;
+        };
+        if message.pointer("/params/threadId").and_then(Value::as_str) != Some(thread_id) {
+            return false;
+        }
+        let before = self.turn_error.clone();
+        match method {
+            "error" => {
+                // ErrorNotification requires the identity, retry flag, and error object.
+                // Missing one proves nothing and must not clear a standing failure.
+                let (Some(turn_id), Some(will_retry)) = (
+                    message.pointer("/params/turnId").and_then(Value::as_str),
+                    message
+                        .pointer("/params/willRetry")
+                        .and_then(Value::as_bool),
+                ) else {
+                    return false;
+                };
+                let Some(error) = message
+                    .pointer("/params/error")
+                    .filter(|error| error.is_object())
+                else {
+                    return false;
+                };
+                // TurnError.codexErrorInfo is optional and nullable. The notification proves a
+                // failure even when the producer cannot name its cause.
+                let Some((reason, word, codex_word)) =
+                    codex_error_class(error.get("codexErrorInfo"))
+                else {
+                    // The credential arm. `observe_provider_auth` owns it from `turn/completed`,
+                    // where the same rejection arrives with the turn's own typed result.
+                    return false;
+                };
+                self.turn_error = Some(CodexTurnError {
+                    turn_id: turn_id.to_string(),
+                    reason,
+                    word,
+                    will_retry,
+                });
+                self.diagnostics.publish(
+                    driver_diagnostic::Stage::Turn,
+                    reason,
+                    driver_diagnostic::Source::TurnError,
+                );
+                // The record carries a closed vocabulary a consumer can branch on. The log
+                // carries Codex's own word beside it, so an operator reading the wrapper log
+                // learns the exact cause even when this build classified it as `unclassified` —
+                // which is the case where they need it most.
+                tracing::warn!(
+                    turn = turn_id,
+                    class = word,
+                    codex_error_info = codex_word,
+                    will_retry = will_retry,
+                    reason = reason.as_str(),
+                    "st2 codex: the provider failed this turn"
+                );
+            }
+            "turn/completed" => {
+                // Only a turn that reached its ordinary end is proof of recovery, and only for
+                // the turn that failed. A `failed` completion leaves the error standing, which is
+                // what keeps a cause on the record after the thread goes terminal.
+                let status = message
+                    .pointer("/params/turn/status")
+                    .and_then(Value::as_str);
+                if status != Some("completed") {
+                    return false;
+                }
+                if let Some(turn_id) = message.pointer("/params/turn/id").and_then(Value::as_str) {
+                    self.clear_turn_error(Some(turn_id));
+                }
+            }
+            "turn/started" => {
+                // A different turn beginning means the seat moved on; the same turn starting
+                // twice is not evidence about the failure it already reported.
+                let started = message.pointer("/params/turn/id").and_then(Value::as_str);
+                if started.is_some_and(|started| {
+                    self.turn_error
+                        .as_ref()
+                        .is_none_or(|error| error.turn_id != started)
+                }) {
+                    self.clear_turn_error(None);
+                }
+            }
+            // A thread that reports itself idle has no failing turn by definition. This is the
+            // one clear edge that does not name a turn, and it is deliberately narrow: `active`
+            // and `systemError` prove nothing about the error, so they leave it alone.
+            "thread/status/changed" => {
+                if message
+                    .pointer("/params/status/type")
+                    .and_then(Value::as_str)
+                    == Some("idle")
+                {
+                    self.clear_turn_error(None);
+                }
+            }
+            _ => return false,
+        }
+        self.turn_error != before
+    }
+
+    /// Clear a standing turn error and its diagnostic stage. `turn_id` scopes the clear to one
+    /// turn; `None` clears whatever stands.
+    fn clear_turn_error(&mut self, turn_id: Option<&str>) {
+        if turn_id.is_some_and(|turn_id| {
+            self.turn_error
+                .as_ref()
+                .is_some_and(|error| error.turn_id != turn_id)
+        }) {
+            return;
+        }
+        self.turn_error = None;
+        self.diagnostics.clear(driver_diagnostic::Stage::Turn);
     }
 
     fn publish_observation(&mut self, observation: harness_state::Observation) {
@@ -4523,6 +4746,7 @@ fn pump_control(
             // another reading on the next model response, roughly 10-15 per turn — and the record
             // is honest about the gap through `ageMs` meanwhile, which is cheaper than teaching the
             // binding handshake to hold observability frames it has no state to attribute yet.
+            let mut turn_error_changed = false;
             if let Some(delivery) = delivery.as_mut() {
                 let active_turn = match &state.observed {
                     CodexObservedState::Active { turn_id } => Some(turn_id.as_str()),
@@ -4536,6 +4760,7 @@ fn pump_control(
                 // The credential axis, taken here for the same reason: it reads a typed turn
                 // result no branch below looks at, and every one of them may `continue`.
                 delivery.observe_provider_auth(&message, state.thread_id());
+                turn_error_changed = delivery.observe_turn_error(&message, state.thread_id());
             }
             let before_delivery_state = state.observed.clone();
             let delivery_response = match delivery.as_mut() {
@@ -4595,6 +4820,14 @@ fn pump_control(
                     delivery.observe_harness(&state.observed);
                 }
                 let _ = events.send(ControlEvent::Observed);
+            } else if turn_error_changed {
+                // The delivery-relevant state is unchanged and the reason is not. That is the
+                // exact shape of the overnight stall: Codex kept reporting a live turn while the
+                // provider refused every attempt, so nothing here changed and nothing was
+                // republished. The record has to learn the cause on this edge or never.
+                if let Some(delivery) = delivery.as_mut() {
+                    delivery.observe_harness(&state.observed);
+                }
             }
             if !state.subscribed
                 && !subscription_pending
