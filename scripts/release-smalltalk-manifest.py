@@ -19,6 +19,10 @@ for target in targets:
         for binary in ('st3', 'stui', 'st3-migrate', 'pty'):
             member = archive.getmember(f'{package}/bin/{binary}')
             assert member.isfile() and member.mode & 0o111, f'missing executable: {binary}'
+        for installer in ('install.sh', 'install-macos.py'):
+            member = archive.getmember(f'{package}/{installer}')
+            assert member.isfile() and member.mode & 0o111, f'missing installer: {installer}'
+        assert archive.getmember(f'{package}/macos-installation.md').isfile()
         records.append(record)
 assert len({record['pty_revision'] for record in records}) == 1, 'PTY pins differ'
 assert len({record['tag'] for record in records}) == 1, 'tags differ'
