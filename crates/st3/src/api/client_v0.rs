@@ -56,6 +56,7 @@ const COLLECTION_REREAD_INTERVAL: Duration = Duration::from_millis(1_500);
 
 /// Claims that no collection window shows: rereading for them only costs.
 fn collection_ignores(collection: &str, kind: &str) -> bool {
+    if collection == "glasses" { return !kind.starts_with("glass."); }
     matches!(kind, "daemon.diagnostic" | "transport.observed")
         || (kind == "harness.usage" && collection != "agents")
 }
@@ -94,7 +95,7 @@ async fn collection_items(
 ) -> Result<(ClientSnapshot, Vec<Value>, bool), ApiError> {
     if !matches!(
         request.collection.as_str(),
-        "missions" | "attention" | "agents" | "work"
+        "missions" | "attention" | "agents" | "work" | "glasses"
     ) {
         return Err(validation("unknown collection subscription"));
     }
@@ -105,7 +106,12 @@ async fn collection_items(
     if !(1..=CLIENT_MAX_PAGE_ITEMS).contains(&limit) {
         return Err(validation("collection limit must be 1 through 200"));
     }
-    let person = if request.collection == "attention" {
+    let person = if request.collection == "glasses" {
+        if request.person.is_some() || request.actor.is_some() {
+            return Err(validation("glasses select the session person"));
+        }
+        Some(glass_person(session, false)?)
+    } else if request.collection == "attention" {
         person_filter(session, request.person.as_deref())?
     } else {
         None
@@ -127,6 +133,9 @@ async fn collection_items(
                     ids.truncate(limit);
                     let items = mission_resources_filtered(&store, index, false, None, Some(&ids))?;
                     return Ok((snapshot, items, has_more));
+                }
+                "glasses" => {
+                    store.glasses(person.as_deref().expect("authenticated glass owner"), index)?
                 }
                 "attention" => client_attention_resources(&store, person.as_deref(), false)?,
                 "agents" => client_agent_resources(&store, false, &at, index)?,
@@ -605,7 +614,8 @@ async fn collection_stream_socket(mut socket: WebSocket, state: AppState, sessio
                 let index = state.store.index().unwrap_or(weighed);
                 if index > weighed {
                     let claims = state.store.claims_page(None, None, weighed, index.checked_add(1), false, 10_000).map(|page| page.claims).unwrap_or_default();
-                    reread_due |= claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
+                    let glasses_changed = subscriptions.values().any(|s| s.request.collection == "glasses") && state.store.glasses_changed(weighed, index).unwrap_or(true);
+                    reread_due |= glasses_changed || claims.len() >= 10_000 || subscriptions.values().any(|subscription| {
                         claims.iter().any(|claim| !collection_ignores(&subscription.request.collection, &claim.kind))
                     });
                     weighed = index;
@@ -746,6 +756,8 @@ pub(super) async fn document_get(
 const ALL_SCOPES: &[&str] = &[
     "read.projections",
     "read.declarations",
+    "read.glasses",
+    "control.glasses",
     "terminal.read",
     "terminal.control",
     "control.attention",
@@ -758,6 +770,8 @@ const ALL_SCOPES: &[&str] = &[
 ];
 const LIMITED_PAIRING_SCOPES: &[&str] = &[
     "read.projections",
+    "read.glasses",
+    "control.glasses",
     "terminal.read",
     "control.attention",
     "control.launches",
@@ -920,6 +934,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
+    capabilities.push(json!({"id":"glasses", "version":0, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
     capabilities.extend(ACTIONS.iter().map(|action| {
         let scope = action_scope(action).expect("registered client action has a scope");
         let state = if !AVAILABLE_ACTIONS.contains(action) {
@@ -11342,4 +11357,164 @@ mission "example/zero-run" state="ready" {
         assert_eq!(indeterminate["terminal_access"]["read"], "unavailable");
         assert_eq!(indeterminate["operational"]["actionable"], false);
     }
+}
+
+fn glass_person(session: &ClientSession, write: bool) -> Result<String, ApiError> {
+    require_scope(
+        session,
+        if write {
+            "control.glasses"
+        } else {
+            "read.glasses"
+        },
+    )?;
+    let person = &session.authority_actor;
+    if !person.starts_with("person/") || person.matches('/').count() != 1 {
+        return Err(forbidden("glasses require the session's concrete person"));
+    }
+    Ok(person.clone())
+}
+
+fn glass_subject(person: &str, id: &str) -> Result<String, ApiError> {
+    if !st3_schema::glasses::valid_uuid(id) {
+        return Err(validation("a glass ID must be a canonical lowercase UUID"));
+    }
+    Ok(format!("glass/{person}/{id}"))
+}
+
+pub(super) async fn glasses_list(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    Query(query): Query<ClientListQuery>,
+) -> Result<Json<ClientResourcePage>, ApiError> {
+    let person = glass_person(&session, false)?;
+    if query.person.is_some() || query.actor.is_some() || query.history {
+        return Err(validation(
+            "glasses always select the session person and current state",
+        ));
+    }
+    let store = state.store.clone();
+    let through = snapshot.store_index;
+    let items = blocking_store(move || store.glasses(&person, through)).await?;
+    Ok(Json(client_page(
+        &state, &snapshot, "glasses", items, &query,
+    )?))
+}
+
+pub(super) async fn glass_get(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    Extension(snapshot): Extension<ClientSnapshot>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let person = glass_person(&session, false)?;
+    let subject = glass_subject(&person, &id)?;
+    let store = state.store.clone();
+    let through = snapshot.store_index;
+    blocking_store(move || store.glasses(&person, through))
+        .await?
+        .into_iter()
+        .find(|glass| glass["id"].as_str() == Some(&subject))
+        .map(Json)
+        .ok_or_else(|| {
+            ApiError::not_found("the glass is absent, retired, or outside the current quota")
+        })
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GlassPut {
+    body: Value,
+    #[serde(deserialize_with = "glass_base_revision")]
+    base_revision: Option<String>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct GlassDelete {
+    #[serde(deserialize_with = "glass_base_revision")]
+    base_revision: Option<String>,
+}
+fn glass_base_revision<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    Option::<String>::deserialize(d)
+}
+
+async fn glass_write(
+    state: AppState,
+    session: ClientSession,
+    id: String,
+    headers: HeaderMap,
+    body: Option<Value>,
+    base_revision: Option<String>,
+) -> Result<Json<Value>, ApiError> {
+    let person = glass_person(&session, true)?;
+    let subject = glass_subject(&person, &id)?;
+    let key = headers
+        .get("idempotency-key")
+        .and_then(|h| h.to_str().ok())
+        .filter(|key| !key.is_empty() && key.len() <= 200)
+        .ok_or_else(|| validation("glass writes require a bounded Idempotency-Key header"))?;
+    let idempotency_key = format!("glass:{}:{key}", session.actor);
+    let mut fields = BTreeMap::from([("base_revision".into(), json!(base_revision))]);
+    let kind = if let Some(body) = body {
+        st3_schema::glasses::validate_body(&body).map_err(|e| validation(e.message))?;
+        fields.insert("body".into(), body);
+        "glass.upserted"
+    } else {
+        "glass.deleted"
+    };
+    let store = state.store.clone();
+    let claim = blocking_store(move || {
+        Ok(store.append_claim(&ClaimInput {
+            subject,
+            kind: kind.into(),
+            actor: Some(person),
+            fields,
+            evidence: vec![],
+            expected_subject: None,
+            idempotency_key: Some(idempotency_key),
+        }))
+    })
+    .await?
+    .map_err(|error| {
+        let is_idempotency = matches!(error.code, "idempotency-mismatch" | "idempotency-conflict");
+        let mut error = ApiError::bad(error);
+        if is_idempotency { error.code = "idempotency-conflict".into(); error.status = StatusCode::CONFLICT; }
+        error
+    })?;
+    signal_changed(&state);
+    Ok(Json(
+        json!({"id":claim.subject, "kind":"glass", "revision":claim.id,
+        "body":claim.body["fields"]["body"], "deleted":claim.kind == "glass.deleted",
+        "base_revision":claim.body["fields"]["base_revision"],
+        "replaced_revision":claim.body["fields"]["replaced_revision"],
+        "updated_at":client_timestamp(claim.accepted_at_unix_ms)}),
+    ))
+}
+
+pub(super) async fn glass_put(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(request): Json<GlassPut>,
+) -> Result<Json<Value>, ApiError> {
+    glass_write(
+        state,
+        session,
+        id,
+        headers,
+        Some(request.body),
+        request.base_revision,
+    )
+    .await
+}
+pub(super) async fn glass_delete(
+    State(state): State<AppState>,
+    Extension(session): Extension<ClientSession>,
+    AxumPath(id): AxumPath<String>,
+    headers: HeaderMap,
+    Json(request): Json<GlassDelete>,
+) -> Result<Json<Value>, ApiError> {
+    glass_write(state, session, id, headers, None, request.base_revision).await
 }

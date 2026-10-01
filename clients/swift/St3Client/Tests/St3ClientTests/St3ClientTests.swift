@@ -2,6 +2,20 @@ import XCTest
 @testable import St3Client
 
 final class St3ClientTests: XCTestCase {
+    func testGlassFixtureAndNullCreationBase() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/fixtures/glasses.json"))
+        let glass = try JSONDecoder().decode(Envelope<Glass>.self, from: data).value
+        XCTAssertEqual(glass.body?.name, "Main workspace")
+        XCTAssertEqual(glass.body?.tabs.count, 2)
+        XCTAssertNil(glass.baseRevision)
+        let encoded = try JSONEncoder().encode(GlassPut(body: try XCTUnwrap(glass.body), baseRevision: nil))
+        let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
+        XCTAssertTrue(object["base_revision"] is NSNull)
+        _ = try JSONDecoder().decode(Resource.self, from: JSONEncoder().encode(glass))
+    }
+
     func testTimelineRouteIDStripsPrefixAndEncodesOneSegment() {
         XCTAssertEqual(St3Client.routedSessionID("session/release-agent/9"), "release-agent%2F9")
         XCTAssertEqual(St3Client.routedSessionID("release agent/9"), "release%20agent%2F9")
@@ -40,7 +54,7 @@ final class St3ClientTests: XCTestCase {
         for _ in 0..<6 { root.deleteLastPathComponent() }
         let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/fixtures/resources.json"))
         let resources = try JSONDecoder().decode([Resource].self, from: data)
-        XCTAssertEqual(resources.count, 15)
+        XCTAssertEqual(resources.count, 18)
         guard case .attention(let attention) = resources[0] else { return XCTFail("attention discriminator lost") }
         XCTAssertEqual(attention.priority, "high")
         XCTAssertEqual(attention.actions, ["launch.approve", "launch.cancel"])
@@ -64,14 +78,14 @@ final class St3ClientTests: XCTestCase {
         guard case .runtime(let runtime) = resources[9] else { return XCTFail("runtime discriminator lost") }
         XCTAssertEqual(runtime.ownerHostID, "host/host-a")
         XCTAssertEqual(runtime.incarnationID, "runtime-9:2026-09-20T11:06:30Z")
-        guard case .machine(let machine) = resources[10] else { return XCTFail("machine discriminator lost") }
+        guard case .machine(let machine) = resources[13] else { return XCTFail("machine discriminator lost") }
         XCTAssertEqual(machine.hostID, "host/host-a")
         XCTAssertEqual(machine.capacity.state, "unknown")
         XCTAssertEqual(machine.occupancy.runningRuntimes, 1)
         XCTAssertEqual(machine.projects, [])
-        guard case .history(let history) = resources[13] else { return XCTFail("history discriminator lost") }
+        guard case .history(let history) = resources[16] else { return XCTFail("history discriminator lost") }
         XCTAssertEqual(history.storeIndex, 1842)
-        guard case .session(let session) = resources[14] else { return XCTFail("session discriminator lost") }
+        guard case .session(let session) = resources[17] else { return XCTFail("session discriminator lost") }
         XCTAssertEqual(session.timelineCursor, "timeline-cursor/release-agent/9/8")
     }
 

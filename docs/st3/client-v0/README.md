@@ -529,3 +529,65 @@ manifest. [`fixtures/manifest.json`](fixtures/manifest.json) maps every golden f
 schema definition. The Rust tests validate fixture coverage, IDs, ordering, fences, timeline links,
 and deterministic preview tokens. Ignored baseline tests exercise the missing implementation and
 are intentionally red until the corresponding server work lands.
+
+## Private glasses
+
+A glass is one person's named workspace. Its stable subject is `glass/person/NAME/UUID`;
+clients generate a lowercase UUID (stui uses UUIDv7). Renaming changes `body.name`, never the
+ID. Names are free text and need not be unique. The client handles name lookup.
+
+`GET /v1/client/glasses` returns the ordinary paged resource list, ordered by ID, and
+`GET /v1/client/glasses/{uuid}` returns one resource. The authenticated session determines
+its person; these routes accept no owner selector. Anonymous sessions and agents have no glass
+access. Paired devices need `read.glasses` for reads and `control.glasses` for writes. New
+limited pairings include both grants. Existing devices with explicit grants need a new pairing
+if they lack them. Discover the granted `glasses` capability (version 0) before migrating local
+storage; it is granted when the session has both read and write access.
+
+`PUT /v1/client/glasses/{uuid}` accepts `{body, base_revision}`. A new ID requires a null
+base revision. Existing IDs accept stale or null bases: writes replace the whole body, using
+canonical claim order to choose the winner. `DELETE` on that route accepts `{base_revision}`
+and records a tombstone. Both mutations require an `Idempotency-Key` header (1–200 bytes).
+Reusing a key with identical input returns the same accepted revision; different input fails.
+The device/session identity isolates keys. A deleted ID is permanently retired, including
+when an offline device sends an edit after the deletion.
+
+A resource contains `id`, `kind: "glass"`, `revision`, `updated_at`, `body`, `deleted`,
+`base_revision`, and `replaced_revision`. Mutation responses identify the revision accepted by
+this member; a subsequently received concurrent revision may win. `base_revision` records the
+client's basis; `replaced_revision` records the head this member observed under its writer
+transaction. Both are null on a first creation. A deletion response has a null body and
+`deleted: true`; lists and detail reads show only current live glasses.
+
+The structure is `{name, tabs:[{title?, layout}]}`. A layout is `{pane: "opaque key"}` or
+`{split: "right" | "below", children: [layout, layout]}`. Pane keys convey no authority. No
+focus, scroll, selection, ratios, or last-used glass is stored. There must be at least one tab,
+a nonempty name and pane key, exactly two children per split, and no unknown structure fields.
+The daemon advertises limits: 65,536 bytes of compact UTF-8 JSON per body, 32 layout levels,
+1,024 layout nodes across all tabs, and 100 live glasses per person. The response ceiling is
+8 MiB, allowing a complete 100-glass subscription window at these bounds.
+
+Local creation is refused when the member already sees 100 live glasses. Concurrent creates
+on separate members are all retained as immutable claims. After synchronization, the earliest
+100 created, undeleted IDs in canonical claim order occupy the live slots; the remaining
+bodies are retained outside the live view. Deleting a live glass opens a slot for the next
+retained ID. Editing or renaming does not change creation priority. Detail reads outside the
+live quota return `not-found`; a client that saves on a disconnected member may later see its
+ID disappear from the live view after synchronization. This rule converges independently of
+arrival order and never discards the saved structure.
+
+Subscribe to `collection: "glasses"` on `st3.client.collections.v0`, with `limit: 100`, to
+follow the person's current glass set. The existing `snapshot` / `changes` frames carry full
+resource upserts and removed IDs, including deletions and quota changes. A reconnect starts
+with an authoritative snapshot. The server applies ownership and read grants to each
+subscription read. Glass bodies are excluded from generic claim lists, claim detail, status,
+events, and history used by agents. Dedicated operations and replicated admission both check
+the claim's person owner. Typed `glass.upserted` and `glass.deleted` claims are durable;
+reads derive their answers from canonical order, and checkpoint proofs compare the same view.
+
+Generated clients expose Rust `list_glasses`, `get_glass`, `put_glass`, `delete_glass`, and
+`CollectionStream::subscribe_glasses`; TypeScript `listGlasses`, `getGlass`, `putGlass`,
+`deleteGlass`, and `CollectionStream.subscribeGlasses`; and Swift `listGlasses`, `getGlass`,
+`putGlass`, `deleteGlass`, and `glassesStream`. Each supplies typed bodies and recursive layouts.
+Mutation methods take an explicit idempotency key so a retry uses the original key and input.
+Member daemons replicate the claims; paired clients read them through a member gateway.

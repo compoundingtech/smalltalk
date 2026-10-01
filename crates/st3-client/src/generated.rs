@@ -85,6 +85,10 @@ pub struct Limits {
     pub max_event_items: usize,
     pub max_response_bytes: usize,
     pub max_wait_ms: u64,
+    pub max_glass_body_bytes: Option<usize>,
+    pub max_glasses: Option<usize>,
+    pub max_glass_depth: Option<usize>,
+    pub max_glass_nodes: Option<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -1040,6 +1044,7 @@ pub enum Resource {
     Operation(Operation),
     History(History),
     Session(Session),
+    Glass(Glass),
 }
 
 impl Resource {
@@ -1063,6 +1068,7 @@ impl Resource {
             Self::Operation(v) => &v.header,
             Self::History(v) => &v.header,
             Self::Session(v) => &v.header,
+            Self::Glass(v) => &v.header,
         }
     }
 }
@@ -2469,4 +2475,51 @@ pub struct TerminalScreen {
     pub lines: Vec<TerminalLine>,
     pub next_sequence: u64,
     pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(untagged)]
+pub enum GlassLayout {
+    Pane {
+        pane: String,
+    },
+    Split {
+        split: GlassSplit,
+        children: [Box<GlassLayout>; 2],
+    },
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum GlassSplit {
+    Right,
+    Below,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct GlassTab {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub layout: GlassLayout,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct GlassBody {
+    pub name: String,
+    pub tabs: Vec<GlassTab>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct Glass {
+    #[serde(flatten)]
+    pub header: ResourceHeader,
+    pub body: Option<GlassBody>,
+    pub deleted: bool,
+    pub base_revision: Option<String>,
+    pub replaced_revision: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct GlassPut {
+    pub body: GlassBody,
+    pub base_revision: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct GlassDelete {
+    pub base_revision: Option<String>,
 }

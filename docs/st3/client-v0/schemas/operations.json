@@ -48,14 +48,18 @@
     { "id": "timeline.list", "method": "GET", "path": "/v1/client/sessions/{id}/timeline", "response": "TimelinePage" },
     { "id": "conversation.changes", "method": "GET", "path": "/v1/client/conversations/{id}/changes", "response": "ConversationChanges" },
     { "id": "events.list", "method": "GET", "path": "/v1/client/events", "response": "EventPage" },
-    { "id": "terminal.screen", "method": "GET", "path": "/v1/client/terminals/{id}/screen", "response": "TerminalScreen" }
+    { "id": "terminal.screen", "method": "GET", "path": "/v1/client/terminals/{id}/screen", "response": "TerminalScreen" },
+    {"id": "glasses.list", "method": "GET", "path": "/v1/client/glasses", "response": "Page", "scope": "read.glasses"},
+    {"id": "glasses.get", "method": "GET", "path": "/v1/client/glasses/{id}", "response": "Glass", "scope": "read.glasses"}
   ],
   "commands": [
     { "id": "action.submit", "method": "POST", "path": "/v1/client/actions", "request": "ActionRequest", "response": "ActionResult" },
     { "id": "pairing.begin", "method": "POST", "path": "/v1/client/pairings", "request": "PairingBegin", "response": "PairingChallenge", "local_only": true },
     { "id": "pairing.complete", "method": "POST", "path": "/v1/client/pairings/{id}/complete", "request": "PairingComplete", "response": "PairedSession" },
     { "id": "terminal.stream", "method": "GET", "path": "/v1/client/terminals/{id}/stream", "response": "TerminalScreen", "websocket_protocol": "st3.client.terminal.v0" },
-    { "id": "conversation.stream", "method": "GET", "path": "/v1/client/conversations/{id}/stream", "response": "ConversationChanges", "websocket_protocol": "st3.client.conversation.v0" }
+    { "id": "conversation.stream", "method": "GET", "path": "/v1/client/conversations/{id}/stream", "response": "ConversationChanges", "websocket_protocol": "st3.client.conversation.v0" },
+    {"id": "glasses.put", "method": "PUT", "path": "/v1/client/glasses/{id}", "request": "GlassPut", "response": "Glass", "scope": "control.glasses", "idempotency_header": "Idempotency-Key"},
+    {"id": "glasses.delete", "method": "DELETE", "path": "/v1/client/glasses/{id}", "request": "GlassDelete", "response": "Glass", "scope": "control.glasses", "idempotency_header": "Idempotency-Key"}
   ],
   "actions": {
     "review.approve": { "capability": "control.attention", "parameters": "TargetParameters" },
@@ -105,7 +109,7 @@
     "default_page_items": 50,
     "max_page_items": 200,
     "max_event_items": 500,
-    "max_response_bytes": 1048576,
+    "max_response_bytes": 8388608,
     "max_wait_ms": 30000,
     "event_retention_seconds": 86400,
     "idempotency_retention_seconds": 2592000,
