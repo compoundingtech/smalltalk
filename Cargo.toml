@@ -9,6 +9,7 @@ members = [
   "components/vista",
   "crates/agent-spec",
   "crates/demo-resolver-wasm",
+  "crates/st-drivers",
   "crates/st-runtime",
   "crates/st2-resource-protocol",
   "crates/st2-resource-providers",
@@ -24,6 +25,7 @@ members = [
 default-members = [
   ".",
   "crates/agent-spec",
+  "crates/st-drivers",
   "crates/st-runtime",
   "crates/st2-resource-protocol",
   "crates/st2-wire",
@@ -88,6 +90,7 @@ path = "tests/resource_profile_supervisor_e2e.rs"
 # Sync by design: the runner is I/O-light (shell-outs to `pty` plus a
 # folder watch + a sleep), so no tokio. Deps grow per milestone; M0 needs only parse + CLI.
 agent-spec = { path = "crates/agent-spec" }
+st-drivers = { path = "crates/st-drivers" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
@@ -123,11 +126,12 @@ wat = "1"
 [features]
 # Sandbox wasm resource-profile resolvers (`agent-spec/profile_wasm`). Off by default: the
 # runner binary carries no wasmtime unless a build opts in.
-wasm-resolver = ["agent-spec/wasm-resolver"]
+wasm-resolver = ["agent-spec/wasm-resolver", "st-drivers/wasm-resolver"]
 # Typed Component Model resource providers. This is the sole feature that admits Wasmtime for
 # observation; default members and the default st2 binary remain Wasmtime-free.
 wasip2-provider-runtime = [
   "wasm-resolver",
   "dep:st2-resource-providers",
   "dep:st2-resource-wasip2",
+  "st-drivers/wasip2-provider-runtime",
 ]

@@ -1762,12 +1762,14 @@ pub fn apply(request: ApplyRequest) -> Result<ApplyResult> {
 ///
 /// Lifecycle authoring compares these rather than diagnostic prose because projection paths make
 /// messages unstable. The coverage matches [`validate_full_catalog`], including its runtime root.
-pub(crate) struct FullCatalogErrors {
+#[doc(hidden)]
+pub struct FullCatalogErrors {
     pub identities: BTreeMap<(&'static str, String, Option<String>), usize>,
     issues: Vec<crate::validate::Issue>,
 }
 
-pub(crate) fn collect_full_catalog_errors(
+#[doc(hidden)]
+pub fn collect_full_catalog_errors(
     root: &Path,
     runtime: crate::validate::RuntimeRoot<'_>,
 ) -> Result<FullCatalogErrors> {
@@ -1838,7 +1840,8 @@ fn collect_error_identities(
 /// validates a capture, bootstrap validates a stage, and a retained live catalog is addressed
 /// through a file-descriptor path. Reading the bound off `root` charged declarations for the depth
 /// of whichever temporary tree happened to be under inspection.
-pub(crate) fn validate_full_catalog(
+#[doc(hidden)]
+pub fn validate_full_catalog(
     root: &Path,
     runtime: crate::validate::RuntimeRoot<'_>,
 ) -> Result<()> {
@@ -3245,7 +3248,8 @@ fn collect_dirs(root: &Path, dirs: &mut Vec<PathBuf>) -> Result<()> {
 }
 
 /// Capture a publication bundle while retaining `.workspace` only as an empty directory fact.
-pub(crate) fn capture_agent_bundle(source: &Path, destination: &Path) -> Result<()> {
+#[doc(hidden)]
+pub fn capture_agent_bundle(source: &Path, destination: &Path) -> Result<()> {
     capture_tree(source, destination, CaptureMode::AgentBundle)
 }
 
@@ -3310,7 +3314,8 @@ fn prepared_capture_checkpoint(_point: &str) {}
 /// A path naming the directory `dir` is open on, which callers may **join a child component onto**.
 /// That last part is the contract — every call site appends to the result — and it is what makes the
 /// two platforms need different mechanisms rather than symmetrical-looking strings.
-pub(crate) fn retained_dir_path(dir: &File) -> Result<PathBuf> {
+#[doc(hidden)]
+pub fn retained_dir_path(dir: &File) -> Result<PathBuf> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
         // A symlink to the pathname, so a child component resolves through it.
@@ -3427,6 +3432,11 @@ fn is_canonical_workspace_fact(path: &Path) -> bool {
 }
 
 mod capability;
+#[doc(hidden)]
+pub use capability::{
+    link_tempfile_from_control, open_dir_beneath, persist_tempfile_from_control,
+    rename_noreplace_between_dirs, sync_dir,
+};
 pub(crate) use capability::*;
 
 #[cfg(debug_assertions)]

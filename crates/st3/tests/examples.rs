@@ -807,14 +807,14 @@ fn every_selected_eval_has_one_st2_and_one_st3_form() {
         let st3_document: kdl::KdlDocument = st3_source.parse().expect("parse st3 KDL");
 
         assert_eq!(
-            st2::kdl_version::document_version(&st2_document).unwrap(),
+            st_drivers::kdl_version::document_version(&st2_document).unwrap(),
             1
         );
         assert_eq!(
-            st2::kdl_version::document_version(&st3_document).unwrap(),
+            st_drivers::kdl_version::document_version(&st3_document).unwrap(),
             2
         );
-        let st2_spec = st2::eval_spec::parse_spec(&st2_source)
+        let st2_spec = st_drivers::eval_spec::parse_spec(&st2_source)
             .unwrap_or_else(|error| panic!("{}: {error:#}", st2_file.display()));
         st3::parse_intent(&st3_source, "local")
             .unwrap_or_else(|error| panic!("{}: {error}", st3_file.display()));
@@ -859,7 +859,7 @@ fn every_selected_eval_has_one_st2_and_one_st3_form() {
                 st3_file.display()
             );
         }
-        assert!(st2::eval_spec::parse_spec(&st3_source).is_err());
+        assert!(st_drivers::eval_spec::parse_spec(&st3_source).is_err());
         assert!(st3::parse_intent(&st2_source, "local").is_err());
     }
 }
@@ -884,7 +884,7 @@ fn selected_eval_harness_counts_match_the_inventory() {
 
     for (name, st2_expected, st3_expected) in expected {
         let st2_source = fs::read_to_string(root.join("st2").join(name).join("eval.kdl")).unwrap();
-        let st2_spec = st2::eval_spec::parse_spec(&st2_source).unwrap();
+        let st2_spec = st_drivers::eval_spec::parse_spec(&st2_source).unwrap();
         let mut st2_counts = (0, 0);
         for agent in st2_spec.agents.iter().chain(
             st2_spec
@@ -1071,7 +1071,7 @@ fn restart_continuity_fixtures_match_their_claude_teams() {
     }
 
     let st2_source = fs::read_to_string(root.join("st2/restart-continuity/eval.kdl")).unwrap();
-    let st2_spec = st2::eval_spec::parse_spec(&st2_source).unwrap();
+    let st2_spec = st_drivers::eval_spec::parse_spec(&st2_source).unwrap();
     let supervisor = st2_spec
         .agents
         .iter()
