@@ -1,5 +1,7 @@
 //! The authoritative st3 subject, resource, and claim registry.
 
+pub mod glasses;
+
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 
@@ -340,6 +342,18 @@ impl Registry {
                 self.validate_reference(kind, name, value, field)?;
             }
         }
+        if subject_spec.family == "glass" {
+            glasses::owner(subject)?;
+            if !matches!(kind, "glass.upserted" | "glass.deleted") {
+                return Err(error(
+                    "claim-write-forbidden",
+                    "a glass requires a dedicated glass claim",
+                ));
+            }
+            if kind == "glass.upserted" {
+                glasses::validate_body(fields.get("body").unwrap_or(&Value::Null))?;
+            }
+        }
         Ok(spec)
     }
 
@@ -616,6 +630,12 @@ fn build_registry() -> Registry {
             false,
         ),
         ("person", "person/IDENTITY", "A human actor.", false),
+        (
+            "glass",
+            "glass/person/NAME/UUID",
+            "A private person workspace.",
+            false,
+        ),
         (
             "mission",
             "mission/ID",
@@ -959,6 +979,24 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             ],
         ),
         (
+            "glass.upserted",
+            &["glass"],
+            WritePolicy::AuthorizedRequester,
+            Cardinality::Append,
+            Some("glasses"),
+            false,
+            &[],
+        ),
+        (
+            "glass.deleted",
+            &["glass"],
+            WritePolicy::AuthorizedRequester,
+            Cardinality::Append,
+            Some("glasses"),
+            false,
+            &[],
+        ),
+        (
             "doc.bound",
             &["doc"],
             WritePolicy::AuthorizedRequester,
@@ -1099,6 +1137,33 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             Some("step-runs"),
             true,
             &["step"],
+        ),
+        (
+            "work.person-asked",
+            &["step-run"],
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Append,
+            Some("work"),
+            true,
+            &[],
+        ),
+        (
+            "work.person-done",
+            &["step-run"],
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Append,
+            Some("work"),
+            true,
+            &[],
+        ),
+        (
+            "work.person-cancelled",
+            &["step-run"],
+            WritePolicy::AuthorizedParticipant,
+            Cardinality::Append,
+            Some("work"),
+            true,
+            &[],
         ),
         (
             "work.claimed",
@@ -1439,6 +1504,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             WritePolicy::SameSubjectActor,
             Cardinality::Append,
             Some("harnesses"),
+            false,
+            &[],
+        ),
+        (
+            "harness.telemetry",
+            &["agent"],
+            WritePolicy::SameSubjectActor,
+            Cardinality::Append,
+            None,
             false,
             &[],
         ),
@@ -1812,6 +1886,52 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "operational.failure",
+            &[
+                "agent",
+                "exec",
+                "pty",
+                "observer",
+                "subscription",
+                "schedule",
+                "daemon",
+                "machine",
+                "step-run",
+                "mission-run",
+                "loop-run",
+                "resource",
+                "checkpoint",
+            ],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("operational"),
+            true,
+            &[],
+        ),
+        (
+            "operational.recovered",
+            &[
+                "agent",
+                "exec",
+                "pty",
+                "observer",
+                "subscription",
+                "schedule",
+                "daemon",
+                "machine",
+                "step-run",
+                "mission-run",
+                "loop-run",
+                "resource",
+                "checkpoint",
+            ],
+            WritePolicy::SystemOnly,
+            Cardinality::Append,
+            Some("operational"),
+            true,
+            &[],
+        ),
+        (
             "reconcile.fault",
             &[
                 "daemon",
@@ -1899,7 +2019,7 @@ fn claim_retention(kind: &str) -> Retention {
     match kind {
         // The owner reads a transcript from the harness's own session file, or from this log
         // when there is none. Other nodes relay timeline reads to the owner.
-        "harness.timeline" => Retention::Local,
+        "harness.timeline" | "harness.telemetry" => Retention::Local,
         // Only the node that made them reads these: render receipts and the readiness
         // deadline, whose attention request replicates.
         "render.applied" | "runtime.readiness-deadline-reached" => Retention::Local,
@@ -1945,6 +2065,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("revision", string()),
             ("desired", object()),
         ],
+        "glass.upserted" => &[
+            ("body", object()),
+            ("base_revision", string()),
+            ("replaced_revision", string()),
+        ],
+        "glass.deleted" => &[("base_revision", string()), ("replaced_revision", string())],
         "doc.bound" => &[
             ("name", string()),
             ("hash", string()),
@@ -2070,6 +2196,31 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("claimant", reference()),
             ("claim_incarnation", string()),
             ("claim_expires_at_unix_ms", integer()),
+        ],
+        "work.person-asked" => &[
+            ("run", reference()),
+            ("generation", reference()),
+            ("origin_step", reference()),
+            ("origin_attempt", integer()),
+            ("person", reference()),
+            ("title", string()),
+            ("reason", string()),
+            ("key", string()),
+            ("attempt", integer()),
+            ("status", string()),
+            ("mission_spec", object()),
+            ("owner_run", reference()),
+            ("owner_generation", reference()),
+            ("waiting_since", string()),
+            ("legacy_request", string()),
+            ("requester_declaration", string()),
+        ],
+        "work.person-done" | "work.person-cancelled" => &[
+            ("attempt", integer()),
+            ("status", string()),
+            ("summary", string()),
+            ("key", string()),
+            ("episode", string()),
         ],
         "work.claimed" | "work.renewed" | "work.progress" | "work.submitted" | "work.failed"
         | "work.released" => &[
@@ -2275,6 +2426,22 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("last_success_at", integer()),
             ("remote_heads", object()),
         ],
+        "operational.failure" => &[
+            ("episode", string()),
+            ("condition", string()),
+            ("reviewer", reference()),
+            ("title", string()),
+            ("reason", string()),
+            ("severity", string()),
+            ("targets", array()),
+            ("source_revision", string()),
+            ("incarnation", string()),
+        ],
+        "operational.recovered" => &[
+            ("episode", string()),
+            ("failure", string()),
+            ("reason", string()),
+        ],
         "reconcile.fault" => &[
             ("scope", required_string()),
             ("status", required_enum(&["faulted", "recovered"])),
@@ -2436,6 +2603,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("driver", required_string()),
             ("model", string()),
             ("incarnation_id", required_string()),
+        ],
+        "harness.telemetry" => &[
+            ("driver", required_enum(&["claude"])),
+            ("unit", required_enum(&["hook"])),
+            ("incarnation_id", required_string()),
+            ("signals", required_object()),
         ],
         "harness.timeline" => &[
             (
@@ -2690,10 +2863,7 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("checkpoint_protocol", required_integer()),
             ("build", string()),
         ],
-        "checkpoint.excused" => &[
-            ("writer", required_string()),
-            ("reason", required_string()),
-        ],
+        "checkpoint.excused" => &[("writer", required_string()), ("reason", required_string())],
         "subscription.mission-deferred" => &[
             ("request", required_string()),
             ("not_before_unix_ms", required_integer()),
@@ -2898,6 +3068,7 @@ mod tests {
                 "file",
                 "fleet-invite",
                 "gate-operation",
+                "glass",
                 "host",
                 "lane",
                 "loop-run",
@@ -2979,11 +3150,14 @@ mod tests {
                 "fleet.member-removed",
                 "gate.requested",
                 "gate.result",
+                "glass.deleted",
+                "glass.upserted",
                 "harness.context-clear.requested",
                 "harness.context-clear.result",
                 "harness.diagnostic",
                 "harness.observed",
                 "harness.session-file",
+                "harness.telemetry",
                 "harness.timeline",
                 "harness.usage",
                 "intent.desired",
@@ -3007,6 +3181,8 @@ mod tests {
                 "observer.observed",
                 "observer.refresh-requested",
                 "observer.state",
+                "operational.failure",
+                "operational.recovered",
                 "planning-session.approved",
                 "planning-session.cancelled",
                 "planning-session.candidate-submitted",
@@ -3057,6 +3233,9 @@ mod tests {
                 "transport.observed",
                 "work.claimed",
                 "work.failed",
+                "work.person-asked",
+                "work.person-cancelled",
+                "work.person-done",
                 "work.progress",
                 "work.released",
                 "work.renewed",
@@ -3228,6 +3407,9 @@ mod tests {
                 "subscription.mission-request-released",
                 "work.claimed",
                 "work.failed",
+                "work.person-asked",
+                "work.person-cancelled",
+                "work.person-done",
                 "work.progress",
                 "work.released",
                 "work.renewed",

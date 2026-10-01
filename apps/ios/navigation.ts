@@ -10,6 +10,10 @@ export type StackParams = {
   AgentsRoot: undefined;
   MissionsRoot: undefined;
   FleetRoot: undefined;
+  /** Glasses, an experiment: the chosen glass's tabs. */
+  GlassesRoot: undefined;
+  /** One glass tab's panes, by glass id and tab index. */
+  GlassTab: { glass: string; index: number };
   Conversation: { target: string; sessionId?: string; title?: string };
   Terminal: { terminalId: string; title?: string };
   Mission: { id: string; title?: string };
@@ -18,7 +22,8 @@ export type StackParams = {
   NewMission: undefined;
   History: undefined;
 };
-export type TabParams = { [K in Tab]: NavigatorScreenParams<StackParams> | undefined };
+/** The tabs, and Glasses while that experiment is on. */
+export type TabParams = { [K in Tab | 'Glasses']: NavigatorScreenParams<StackParams> | undefined };
 
 export const ROOTS: Record<Tab, keyof StackParams> = { Home: 'HomeRoot', Agents: 'AgentsRoot', Missions: 'MissionsRoot', Fleet: 'FleetRoot' };
 /** Details that take the whole screen: the tab bar hides while they are on top, as in Messages. */

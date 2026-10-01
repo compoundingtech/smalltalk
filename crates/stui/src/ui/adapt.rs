@@ -254,7 +254,7 @@ fn attention(model: &Model, extras: &Extras) -> Vec<Attention> {
                     },
                 ),
                 // An agent stopped on the person: a request to answer, not a fault to clear.
-                "agent-request" => (
+                "person-step" | "agent-request" => (
                     Tier::Stopped,
                     AttentionKind::Request {
                         from: item

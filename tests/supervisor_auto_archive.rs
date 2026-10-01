@@ -155,7 +155,7 @@ fn a_pass_records_a_fresh_retirement_and_archives_nothing() {
     );
     assert!(!stdout(&output).contains("archived"), "{}", stdout(&output));
     let ledger = ledger(&catalog).expect("the pass must record when it first saw the retirement");
-    assert_eq!(ledger["schema"], "st2.catalog-retired-observed.v1");
+    assert_eq!(ledger["schema"], "st.catalog-retired-observed.v1");
     let observed = ledger["hosts"]["h"]["gone"].as_u64().unwrap();
     assert!(
         now_ms().saturating_sub(observed) < 5 * 60 * 1000,
@@ -197,7 +197,7 @@ fn a_retirement_older_than_the_grace_period_is_archived_with_a_tombstone() {
         &fs::read(catalog.join(".st2/archive/h/gone.tombstone.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(tombstone["schema"], "st2.catalog-archive-tombstone.v1");
+    assert_eq!(tombstone["schema"], "st.catalog-archive-tombstone.v1");
     assert_eq!(tombstone["id"], "h.gone");
     assert_eq!(tombstone["reason"], "Migration finished");
     assert!(tombstone["archivedAt"].as_u64().unwrap() > 0);
@@ -791,7 +791,7 @@ fn a_direct_actor_whose_pty_death_outlived_the_grace_period_is_archived_and_a_li
         &fs::read(catalog.join(".st2/archive/h/direct.omp.x-776562.tombstone.json")).unwrap(),
     )
     .unwrap();
-    assert_eq!(tombstone["schema"], "st2.catalog-archive-tombstone.v1");
+    assert_eq!(tombstone["schema"], "st.catalog-archive-tombstone.v1");
     assert_eq!(tombstone["id"], "h.direct.omp.x-776562");
     assert_eq!(tombstone["identity"], "direct.omp.x-776562");
     assert_eq!(

@@ -20,6 +20,7 @@ pub mod mission;
 pub mod model;
 pub mod otlp;
 pub mod peer;
+pub mod performance;
 /// Opt-in accounting of where the daemon's time goes, turned on by `ST3_PROFILE_DIR`.
 pub mod profile;
 pub mod projection;
@@ -39,6 +40,7 @@ pub mod service;
 /// The st agent skill bundled in this binary and installed for each harness.
 pub mod skill;
 pub mod store;
+pub mod telemetry;
 /// Attaches a local terminal to another fleet host's PTY session over Fabric, without st daemons.
 pub mod terminal_fabric;
 

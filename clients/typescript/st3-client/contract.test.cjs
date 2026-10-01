@@ -214,3 +214,24 @@ test('generated hash uses normative schema and operations bytes', () => {
     hash.update(fs.readFileSync(path.join(root, 'docs/st3/client-v0/schemas/operations.json')));
     assert.equal(CONTRACT_SHA256, hash.digest('hex'));
 });
+
+test('glass methods preserve structure, null creation base, and idempotency headers', async () => {
+    const fixture = require('../../../docs/st3/client-v0/fixtures/glasses.json');
+    const put = require('../../../docs/st3/client-v0/fixtures/glass-put.json');
+    const calls = [];
+    const client = new St3Client({baseUrl: 'https://example.test', fetchImpl: async (url, options) => {
+        calls.push({url, options});
+        if (url.endsWith('/capabilities')) return response(envelope(capabilities));
+        return response(fixture);
+    }});
+    const uuid = fixture.value.id.split('/').pop();
+    assert.equal((await client.putGlass(uuid, put, 'create')).value.body.name, 'Main workspace');
+    assert.equal(calls[0].options.method, 'PUT');
+    assert.equal(calls[0].options.headers['Idempotency-Key'], 'create');
+    assert.equal(JSON.parse(calls[0].options.body).base_revision, null);
+    await client.getGlass(fixture.value.id);
+    assert.ok(calls.some(call => call.url.endsWith('/glasses/' + uuid)));
+    await client.deleteGlass(uuid, {base_revision: fixture.value.revision}, 'delete');
+    assert.equal(calls.at(-1).options.method, 'DELETE');
+    assert.equal(calls.at(-1).options.headers['Idempotency-Key'], 'delete');
+});

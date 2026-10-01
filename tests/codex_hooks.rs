@@ -63,7 +63,7 @@ impl Fixture {
     fn run(&self, script: &str) -> Output {
         self.run_path(
             &Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("hooks")
+                .join("crates/st-drivers/hooks")
                 .join(script),
         )
     }
@@ -250,7 +250,7 @@ fn stop_fails_open_without_required_commands() {
     let output = Command::new(bash())
         .arg(
             Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("hooks")
+                .join("crates/st-drivers/hooks")
                 .join("codex-stop.sh"),
         )
         .env("PATH", fixture._tmp.path().join("missing-bin"))

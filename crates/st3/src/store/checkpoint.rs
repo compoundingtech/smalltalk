@@ -938,6 +938,17 @@ fn claims_of_kind_in_order(
 /// Every answer about `subject` that a checkpoint must leave unchanged, as of the cut.
 fn subject_answers(connection: &Connection, subject: &str, cut: u128) -> Result<Value> {
     let mut answers = serde_json::Map::new();
+    if subject.starts_with("glass/") {
+        let person = st3_schema::glasses::owner(subject).map_err(anyhow::Error::new)?;
+        answers.insert(
+            "glasses".into(),
+            json!(super::glasses::glasses_at(
+                connection,
+                person,
+                i64::MAX as u64
+            )?),
+        );
+    }
     answers.insert(
         "actual".into(),
         json!(latest_actual_at(connection, subject, None)?),
@@ -2804,7 +2815,8 @@ mod tests {
     #[ignore = "reads the store copy named by ST3_CHECKPOINT_STORE"]
     fn plan_a_copy_of_a_real_store() {
         let path = PathBuf::from(std::env::var("ST3_CHECKPOINT_STORE").unwrap());
-        let origin = std::env::var("ST3_CHECKPOINT_ORIGIN").unwrap_or_else(|_| "example-linux".into());
+        let origin =
+            std::env::var("ST3_CHECKPOINT_ORIGIN").unwrap_or_else(|_| "example-linux".into());
         let day = std::env::var("ST3_CHECKPOINT_DAY").unwrap();
         let started = std::time::Instant::now();
         let store = Store::open(&path, origin).unwrap();

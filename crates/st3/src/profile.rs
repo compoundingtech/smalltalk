@@ -551,6 +551,10 @@ pub fn enter(op: Option<&Op>) -> Option<Entered> {
 
 /// Run `work` as its own operation, unless this thread already works for one.
 pub fn task<T>(label: &'static str, work: impl FnOnce() -> T) -> T {
+    crate::performance::task(label, || profiled_task(label, work))
+}
+
+fn profiled_task<T>(label: &'static str, work: impl FnOnce() -> T) -> T {
     if !enabled() || CURRENT.with(|current| current.borrow().is_some()) {
         return work();
     }

@@ -113,7 +113,7 @@ fn step_style(state: StepState, spinner: &'static str) -> (&'static str, Color, 
     }
 }
 
-fn attention_style(kind: &AttentionKind) -> (&'static str, Color) {
+pub fn attention_style(kind: &AttentionKind) -> (&'static str, Color) {
     match kind {
         AttentionKind::Review { .. }
         | AttentionKind::Feedback { .. }
@@ -703,9 +703,10 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 card.card("suggested fix", theme::GREEN, false, suggestion, inner);
             }
             card.blank();
-            if !confirm_row(&mut card, drafts, "Mark this fault resolved") {
-                card.buttons(&[("r", "Mark resolved", Hit::Key('r'), theme::GREEN)]);
-            }
+            card.wrap(
+                &text::inline("Act on the source to clear this fault.", theme::soft()),
+                inner,
+            );
         }
         AttentionKind::Request { from, question, .. } => {
             card.line(Line::from(vec![
@@ -718,14 +719,11 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
             if drafts.editing || drafts.text.is_some_and(|text| !text.is_empty()) {
                 text_box(&mut card, &format!("answer {from}"), drafts, "", inner);
                 card.buttons(&[
-                    ("enter", "Send answer", Hit::Enter, theme::ACCENT),
+                    ("enter", "Complete step", Hit::Enter, theme::ACCENT),
                     ("esc", "Cancel", Hit::Escape, theme::OVERLAY1),
                 ]);
             } else if !confirm_row(&mut card, drafts, "Mark this request answered") {
-                card.buttons(&[
-                    ("c", "Answer", Hit::Key('c'), theme::ACCENT),
-                    ("r", "Mark answered", Hit::Key('r'), theme::GREEN),
-                ]);
+                card.buttons(&[("c", "Complete step", Hit::Key('c'), theme::ACCENT)]);
             }
         }
         AttentionKind::Message { from, body } => {
@@ -1267,7 +1265,11 @@ pub fn mission_detail(
             ),
             span(format!("{:<11}", word), theme::fg(color)),
             span(
-                format!("{:<18}", step.owner.as_deref().unwrap_or("nobody")),
+                // A long owner is cut so its age never runs into it.
+                format!(
+                    "{:<18}",
+                    text::truncate(step.owner.as_deref().unwrap_or("nobody"), 17)
+                ),
                 if step.owner.is_some() {
                     theme::soft()
                 } else {
@@ -1572,7 +1574,7 @@ pub fn fleet_list(world: &World) -> Listing {
     }
 }
 
-fn reach_style(reach: Reach) -> (&'static str, Color) {
+pub fn reach_style(reach: Reach) -> (&'static str, Color) {
     match reach {
         Reach::Here | Reach::Direct => ("●", theme::GREEN),
         Reach::Indirect => ("◐", theme::SAPPHIRE),
