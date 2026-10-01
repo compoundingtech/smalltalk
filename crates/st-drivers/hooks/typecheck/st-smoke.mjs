@@ -12,7 +12,7 @@ const frames = path.join(dir, "frames.jsonl");
 const outgoing = path.join(dir, "outgoing.jsonl");
 const label = path.join(dir, "label.json");
 const recorder = path.join(dir, "recorder.mjs");
-fs.writeFileSync(label, JSON.stringify({ subject:"agent/eval.worker",desired:{display_name:"Quartz"},member:{tags:{persona:"gen"}} }));
+fs.writeFileSync(label, JSON.stringify({ subject:"agent/eval.worker",desired:{display_name:"Quartz"} }));
 fs.writeFileSync(recorder, `#!${process.execPath}
 import fs from "node:fs";
 process.stdout.write(JSON.stringify({type:"hello",protocol:2,sessionContext:""})+"\\n");
@@ -23,6 +23,7 @@ let offset=0;
 setInterval(()=>{let text="";try{text=fs.readFileSync(${JSON.stringify(outgoing)},"utf8");}catch{}
 if(text.length>offset){process.stdout.write(text.slice(offset));offset=text.length;}},10);
 `,{mode:0o755});
+process.env.AGENT_PERSONA_SHORT = "gen";
 const prefix = `ST_${driver.toUpperCase()}_CHANNEL_`;
 for (const [key, value] of Object.entries({BIN:recorder,CATALOG:"/test/catalog",IDENTITY:"eval.worker",RUNTIME_ID:"eval.worker",SESSION:"wrapper",SEQ:"1"})) {
   process.env[prefix+key] = value;
@@ -48,7 +49,7 @@ const until = async(predicate)=>{for(let i=0;i<200;i++){if(predicate())return;aw
 const {default:extension}=await import(pathToFileURL(path.resolve(asset)));
 extension(api);
 await events.get("session_start")({},ctx);
-await until(()=>title==="Quartz [gen]");
+await until(()=>title==="Quartz[gen]");
 assert.ok(events.has("session_switch"),"OMP /new uses session_switch");
 const meta={messageId:"message/quartz-1"};
 send({type:"message",content:"QUARTZ SIGNAL",meta});
@@ -59,7 +60,7 @@ await until(()=>read().some(frame=>frame.type==="read"&&frame.meta?.messageId===
 const count=handoffs.length;
 // A successful native handoff whose receipt acknowledgement was lost is replayed as receipts.
 await events.get("session_switch")({},ctx);
-await until(()=>title==="Quartz [gen]");
+await until(()=>title==="Quartz[gen]");
 send({type:"message",content:"QUARTZ SIGNAL",meta});
 await new Promise(r=>setTimeout(r,100));
 assert.equal(handoffs.length,count,"channel replacement must not repeat accepted native input");
@@ -67,11 +68,11 @@ assert.equal(handoffs.length,count,"channel replacement must not repeat accepted
 nativeSession="native-2";
 title="Native local rename";
 await events.get("session_switch")({},ctx);
-await until(()=>title==="Quartz [gen]");
-assert.equal(title,"Quartz [gen]");
+await until(()=>title==="Quartz[gen]");
+assert.equal(title,"Quartz[gen]");
 api.setSessionName("Native temporary rename");
-send({type:"seat",seat:{subject:"agent/eval.worker",desired:{display_name:"Indigo"},member:{tags:{persona:"gen"}}}});
-await until(()=>title==="Indigo [gen]");
+send({type:"seat",seat:{subject:"agent/eval.worker",desired:{display_name:"In\u001b]0;x\u0007digo"}}});
+await until(()=>title==="In]0;xdigo[gen]");
 // Some providers raise context synchronously from the handoff call itself.
 synchronousContext=true;
 const synchronous={messageId:"message/quartz-2"};

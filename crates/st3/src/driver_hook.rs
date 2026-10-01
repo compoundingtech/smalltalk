@@ -150,6 +150,7 @@ fn live_claude_label(env: &dyn HookEnv, identity: &str) -> Result<String> {
         .var("ST3_SUBJECT")
         .or_else(|| env.var("ST_AGENT"))
         .unwrap_or_else(|| format!("agent/{identity}"));
+    let persona_short = env.var("AGENT_PERSONA_SHORT");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -169,15 +170,18 @@ fn live_claude_label(env: &dyn HookEnv, identity: &str) -> Result<String> {
             .and_then(|seat| seat.desired)
             .context("seat has no desired record")?;
         let member = serde_json::from_value::<crate::model::MemberSpec>(desired.clone()).ok();
-        Ok(crate::mailbox::seat_label(&crate::model::DesiredSubject {
-            subject,
-            kind: "agent".into(),
-            desired,
-            member,
-            owner_run: None,
-            owner_generation: None,
-            owner_step: None,
-        }))
+        Ok(crate::mailbox::seat_label(
+            &crate::model::DesiredSubject {
+                subject,
+                kind: "agent".into(),
+                desired,
+                member,
+                owner_run: None,
+                owner_generation: None,
+                owner_step: None,
+            },
+            persona_short.as_deref(),
+        ))
     })
 }
 

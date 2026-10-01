@@ -51,8 +51,9 @@ impl Fence {
     }
 }
 
-/// Display names belong to the seat record. Strip terminal control characters at the output edge.
-pub fn seat_label(seat: &DesiredSubject) -> String {
+/// Display names belong to the seat record; the launcher supplies the persona short code
+/// (`AGENT_PERSONA_SHORT`). Strip terminal control characters at the output edge.
+pub fn seat_label(seat: &DesiredSubject, persona_short: Option<&str>) -> String {
     let name = seat
         .desired
         .get("display_name")
@@ -63,13 +64,8 @@ pub fn seat_label(seat: &DesiredSubject) -> String {
                 .and_then(|member| member.display_name.as_deref())
         })
         .unwrap_or(seat.subject.strip_prefix("agent/").unwrap_or(&seat.subject));
-    let persona = seat
-        .member
-        .as_ref()
-        .and_then(|member| member.tags.get("persona"))
-        .map(String::as_str);
-    let label = match persona {
-        Some(persona) => format!("{name} [{persona}]"),
+    let label = match persona_short.map(str::trim).filter(|short| !short.is_empty()) {
+        Some(short) => format!("{name}[{short}]"),
         None => name.to_owned(),
     };
     label
@@ -197,6 +193,21 @@ pub(crate) mod tests {
                 &format!("harness:{incarnation}"),
             ))
             .unwrap();
+    }
+    #[test]
+    fn seat_label_appends_launcher_persona_short_without_space_and_strips_controls() {
+        let seat = DesiredSubject {
+            subject: "agent/eval.worker".into(),
+            kind: "agent".into(),
+            desired: json!({"display_name":"Qu\u{1b}]0;x\u{7}artz"}),
+            member: None,
+            owner_run: None,
+            owner_generation: None,
+            owner_step: None,
+        };
+        assert_eq!(seat_label(&seat, Some("gen")), "Qu]0;xartz[gen]");
+        assert_eq!(seat_label(&seat, Some("  ")), "Qu]0;xartz");
+        assert_eq!(seat_label(&seat, None), "Qu]0;xartz");
     }
     #[test]
     fn mailbox_startup_waits_for_running_evidence_without_allocating_or_admitting_stale_sessions() {

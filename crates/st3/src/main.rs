@@ -15032,7 +15032,10 @@ async fn mailbox_receipt_claim(
 }
 
 fn seat_label(seat: &st3::model::DesiredSubject) -> String {
-    st3::mailbox::seat_label(seat)
+    st3::mailbox::seat_label(
+        seat,
+        std::env::var("AGENT_PERSONA_SHORT").ok().as_deref(),
+    )
 }
 fn update_native_title(seat: &st3::model::DesiredSubject, runtime_id: &str) -> Result<()> {
     let label = seat_label(seat);
