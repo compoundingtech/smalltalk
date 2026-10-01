@@ -19,17 +19,8 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context as _, Result};
 use serde_json::Value;
 
-/// Every hook this subcommand answers. The hook set holds one script per name.
-pub const HOOKS: [&str; 8] = [
-    "claude-observe",
-    "claude-statusline",
-    "claude-session-start",
-    "claude-pre-compact",
-    "claude-stop-failure",
-    "codex-session-start",
-    "codex-pre-compact",
-    "codex-stop",
-];
+/// Active hooks this subcommand answers. New hook sets hold one script per name.
+pub const HOOKS: [&str; 2] = ["claude-observe", "claude-statusline"];
 
 /// The subcommand name st3's hook scripts exec.
 pub const SUBCOMMAND: &str = "driver-hook";
@@ -101,19 +92,24 @@ pub fn run(
                 }
             }
         }
-        // st3 seats take no startup turn, the driver delivers messages, compaction is counted by
-        // `claude-observe`, and a failed turn is recorded there too. These are answered so a
-        // workspace whose own settings still name them keeps working; they add nothing.
-        "claude-session-start"
-        | "claude-pre-compact"
-        | "claude-stop-failure"
-        | "codex-session-start"
-        | "codex-pre-compact"
-        | "codex-stop" => {
-            let _ = std::io::copy(stdin, &mut std::io::sink());
-            0
-        }
         other => {
+            // A binary replacement must still answer scripts held by running old seats.
+            // New sets contain none of these aliases, and direct invocations are rejected.
+            if matches!(
+                other,
+                "claude-session-start"
+                    | "claude-pre-compact"
+                    | "claude-stop-failure"
+                    | "codex-session-start"
+                    | "codex-pre-compact"
+                    | "codex-stop"
+            ) && env
+                .var("ST_HOOKS")
+                .is_some_and(|dir| crate::hooks::older_set_contains_hook(Path::new(&dir), other))
+            {
+                let _ = std::io::copy(stdin, &mut std::io::sink());
+                return 0;
+            }
             let _ = std::io::copy(stdin, &mut std::io::sink());
             eprintln!(
                 "st: unknown driver hook `{other}`; this binary answers {}",
@@ -412,16 +408,47 @@ mod tests {
     }
 
     #[test]
-    fn context_and_inbox_hooks_answer_without_output() {
-        let env = BTreeMap::new();
-        for name in HOOKS {
-            if matches!(name, "claude-observe" | "claude-statusline") {
-                continue;
-            }
-            assert_eq!(
-                hook(name, &[], &env, r#"{"session_id":"x"}"#),
-                (0, Vec::new())
+    fn retired_hooks_require_an_intact_older_set() {
+        let root = tempfile::tempdir().unwrap();
+        let mut env = BTreeMap::new();
+        let mut files = BTreeMap::new();
+        let names = [
+            "claude-session-start",
+            "claude-pre-compact",
+            "claude-stop-failure",
+            "codex-session-start",
+            "codex-pre-compact",
+            "codex-stop",
+        ];
+        let script = b"#!/bin/sh\nexit 0\n";
+        use sha2::{Digest as _, Sha256};
+        for name in names {
+            files.insert(
+                format!("{name}.sh"),
+                format!("sha256:{}", hex::encode(Sha256::digest(script))),
             );
+        }
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schema": 1, "owner": "st3", "files": files,
+        }))
+        .unwrap();
+        let older = root
+            .path()
+            .join(format!("sha256-{}", hex::encode(Sha256::digest(&manifest))));
+        std::fs::create_dir(&older).unwrap();
+        std::fs::write(older.join(crate::hooks::MANIFEST), &manifest).unwrap();
+        let current = crate::hooks::ensure_installed(root.path()).unwrap();
+        for name in names {
+            std::fs::write(older.join(format!("{name}.sh")), script).unwrap();
+            assert_eq!(hook(name, &[], &env, "{}").0, 1);
+            env.insert("ST_HOOKS".into(), current.display().to_string());
+            assert_eq!(hook(name, &[], &env, "{}").0, 1);
+            assert!(!current.join(format!("{name}.sh")).exists());
+            env.insert("ST_HOOKS".into(), older.display().to_string());
+            assert_eq!(hook(name, &[], &env, "{}"), (0, Vec::new()));
+            std::fs::write(older.join(format!("{name}.sh")), "changed").unwrap();
+            assert_eq!(hook(name, &[], &env, "{}").0, 1);
+            env.clear();
         }
         assert_eq!(hook("st2-boot", &[], &env, "").0, 1);
     }

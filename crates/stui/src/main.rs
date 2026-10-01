@@ -2579,7 +2579,7 @@ fn main() -> Result<()> {
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
         println!(
-            "stui [--client | --local] [--old]\nstui pair MEMBER_URL PAIRING_ID\n\nPairing reads the single-use code privately from the terminal (or stdin).\nPaired devices use the network automatically; --local selects the local daemon.\n--client requires a paired device. --demo opens invented data."
+            "stui [--client | --local] [--old] [--glasses | --glass NAME]\nstui pair MEMBER_URL PAIRING_ID\n\nPairing reads the single-use code privately from the terminal (or stdin).\nPaired devices use the network automatically; --local selects the local daemon.\n--client requires a paired device. --demo opens invented data.\n--glasses tries the tabs-and-palette layout (an experiment); --glass NAME opens that glass."
         );
         return Ok(());
     }
@@ -2689,6 +2689,7 @@ fn main() -> Result<()> {
             person: person.unwrap_or_default(),
             cache_path,
             cached,
+            glass: ui::glass_name(&args),
         });
     }
     let (updates, incoming) = mpsc::channel::<Update>();
