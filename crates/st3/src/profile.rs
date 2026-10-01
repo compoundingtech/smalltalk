@@ -355,16 +355,10 @@ struct OpInner {
 pub struct Caller(pub Arc<str>);
 
 impl Caller {
-    /// Name the process `pid` by its first command words, under the agent it is bound to.
-    pub fn of_peer(pid: u32, bound_agent: Option<&str>) -> Self {
-        let command = fs::read(format!("/proc/{pid}/cmdline"))
-            .ok()
-            .map(|cmdline| {
-                let words = cmdline
-                    .split(|byte| *byte == 0)
-                    .filter(|word| !word.is_empty())
-                    .map(|word| String::from_utf8_lossy(word).into_owned())
-                    .collect::<Vec<_>>();
+    /// Name a peer by its first command words (`None` once it exited), under its bound agent.
+    pub fn of_command(arguments: Option<Vec<String>>, bound_agent: Option<&str>) -> Self {
+        let command = arguments
+            .map(|words| {
                 let program = words
                     .first()
                     .map(|program| program.rsplit('/').next().unwrap_or(program).to_owned())
