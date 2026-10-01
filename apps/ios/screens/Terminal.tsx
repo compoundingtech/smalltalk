@@ -44,10 +44,14 @@ export function TerminalScreen({ route, navigation }: RootScreen<'Terminal'>) {
   const headerHeight = useHeaderHeight();
   const canType = canControlTerminal && status === 'online' && !issue;
 
+  // The store's actions change identity on every render; one queue serves the screen's life,
+  // so keys stay in order.
+  const latest = useRef(actions);
+  latest.current = actions;
   const queue = useMemo(() => new InputQueue(
-    bytes => actions.terminalInput(terminalId, incarnation.current, 'raw', rawInput(bytes)).then(() => setNotice('')),
+    bytes => latest.current.terminalInput(terminalId, incarnation.current, 'raw', rawInput(bytes)).then(() => setNotice('')),
     cause => setNotice(`Some keys were not confirmed; look at the screen before typing on: ${errorText(cause)}`),
-  ), [actions, terminalId]);
+  ), [terminalId]);
   const send = useCallback((bytes: string) => {
     if (!incarnation.current || live.current.status !== 'online') { setNotice('Offline; keys are not sent.'); return; }
     queue.push(bytes);
@@ -101,9 +105,9 @@ export function TerminalScreen({ route, navigation }: RootScreen<'Terminal'>) {
     if (!incarnation.current || !area.width) return;
     const columns = Math.floor((area.width - PADDING * 2) / (READABLE * ADVANCE));
     const rows = Math.floor((area.height - PADDING * 2) / lineHeightFor(READABLE));
-    void actions.terminalResize(terminalId, incarnation.current, Math.max(rows, 8), Math.max(columns, 20))
+    void latest.current.terminalResize(terminalId, incarnation.current, Math.max(rows, 8), Math.max(columns, 20))
       .catch(cause => setNotice(`The terminal was not resized: ${errorText(cause)}`));
-  }, [actions, terminalId, area]);
+  }, [terminalId, area]);
 
   useLayoutEffect(() => {
     navigation.setOptions({
