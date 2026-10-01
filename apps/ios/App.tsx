@@ -53,7 +53,7 @@ const stackOptions: NativeStackNavigationOptions = {
 function TabStack({ tab }: { tab: Tab | 'Glasses' }) {
   return <Stack.Navigator screenOptions={stackOptions}>
     {tab === 'Glasses'
-      ? <Stack.Screen name="GlassesRoot" component={GlassesScreen} options={{ title: 'Glasses' }} />
+      ? <Stack.Screen name="GlassesRoot" component={GlassesScreen} options={{ title: 'Spaces' }} />
       : <Stack.Screen name={ROOTS[tab] as keyof typeof ROOT_SCREENS} component={ROOT_SCREENS[ROOTS[tab] as keyof typeof ROOT_SCREENS]} options={{ title: tab }} />}
     <Stack.Screen name="Conversation" component={ConversationScreen} options={{ title: 'Conversation' }} />
     <Stack.Screen name="SelectText" component={SelectTextScreen} options={{ title: 'Select text', presentation: 'formSheet', sheetAllowedDetents: [0.6, 1], sheetGrabberVisible: true }} />
@@ -137,7 +137,7 @@ function Main() {
       component={TAB_COMPONENTS[tab]}
       options={tab === 'Home' && homeCount ? { tabBarBadge: homeCount, tabBarBadgeStyle: { backgroundColor: theme.person, color: theme.crust } } : {}}
     />)}
-    {glassesOn ? <Tabs.Screen name="Glasses" component={GlassesTab} /> : null}
+    {glassesOn ? <Tabs.Screen name="Glasses" component={GlassesTab} options={{ title: 'Spaces', tabBarLabel: 'Spaces' }} /> : null}
   </Tabs.Navigator>;
 }
 

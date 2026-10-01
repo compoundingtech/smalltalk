@@ -1914,6 +1914,20 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<Vec<String>> {
+        Ok(self
+            .mission_collection_page(history, offset, limit, None)?
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect())
+    }
+
+    pub(crate) fn mission_collection_page(
+        &self,
+        history: bool,
+        offset: usize,
+        limit: usize,
+        after: Option<&(u128, String)>,
+    ) -> Result<Vec<(String, u128)>> {
         let ended_since = recently_ended_since();
         let connection = self.readers.get();
         let mut statement = connection.prepare(
@@ -1928,13 +1942,15 @@ impl Store {
                        ROW_NUMBER() OVER (PARTITION BY mission_id ORDER BY created_at_unix_ms DESC, id DESC) AS rank
                 FROM mission_runs
              )
-             SELECT ids.mission_id
+             SELECT ids.mission_id, COALESCE(latest.updated_at_unix_ms,published.accepted_at_unix_ms,'0')
              FROM ids
              LEFT JOIN mission_definitions def ON def.mission_id=ids.mission_id
              LEFT JOIN claims published ON published.id=def.claim_id
              LEFT JOIN run_states ON run_states.mission_id=ids.mission_id
              LEFT JOIN latest ON latest.mission_id=ids.mission_id AND latest.rank=1
-             WHERE (?1 OR ids.mission_id NOT LIKE '__st3/%')
+             WHERE (?5 IS NULL OR CAST(COALESCE(latest.updated_at_unix_ms,published.accepted_at_unix_ms, '0') AS INTEGER) < ?5
+                 OR (CAST(COALESCE(latest.updated_at_unix_ms,published.accepted_at_unix_ms, '0') AS INTEGER) = ?5 AND ids.mission_id > ?6))
+               AND (?1 OR ids.mission_id NOT LIKE '__st3/%')
                AND (?1 OR CASE
                    WHEN COALESCE(run_states.running,0)>0 THEN 'running'
                    WHEN COALESCE(run_states.standing,0)>0 THEN 'standing'
@@ -1954,11 +1970,26 @@ impl Store {
         )?;
         statement
             .query_map(
-                params![history, limit as i64, offset as i64, ended_since as i64],
-                |row| row.get::<_, String>(0).map(|id| format!("mission/{id}")),
+                params![
+                    history,
+                    limit as i64,
+                    offset as i64,
+                    ended_since as i64,
+                    after.map(|key| key.0 as i64),
+                    after.map(|key| key.1.trim_start_matches("mission/"))
+                ],
+                |row| {
+                    Ok((
+                        format!("mission/{}", row.get::<_, String>(0)?),
+                        row.get::<_, String>(1)?,
+                    ))
+                },
             )?
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+            .map(|row| {
+                let (id, time) = row?;
+                Ok((id, time.parse()?))
+            })
+            .collect()
     }
 
     pub fn mission_definitions_for_ids(
@@ -5255,6 +5286,17 @@ impl Store {
         offset: usize,
         limit: usize,
     ) -> Result<(Vec<StepRunView>, bool)> {
+        self.client_work_history_page_after(actor, snapshot_unix_ms, offset, limit, None)
+    }
+
+    pub(crate) fn client_work_history_page_after(
+        &self,
+        actor: Option<&str>,
+        snapshot_unix_ms: u128,
+        offset: usize,
+        limit: usize,
+        after: Option<&(u128, String)>,
+    ) -> Result<(Vec<StepRunView>, bool)> {
         let actor = actor.map(|value| normalize_actor(value, "agent"));
         let connection = self.readers.get();
         // Enrichment can clear a step's claimant, through its effective state alone, but
@@ -5281,12 +5323,22 @@ impl Store {
             "SELECT subject, run_id, step_path, definition_hash, status, attempt, assignee, available_to, agentless, title, goals, worker_reported,
                     lease_owner, lease_incarnation, lease_expires_at_unix_ms, blocked_reason, not_before_unix_ms, created_at_unix_ms, updated_at_unix_ms, readiness_epoch, constraints
              FROM step_runs
-             WHERE (agentless=0 OR ?1 IS NULL)
+             WHERE (?2 IS NULL OR length(updated_at_unix_ms)<length(?2)
+                    OR (length(updated_at_unix_ms)=length(?2) AND updated_at_unix_ms<?2)
+                    OR (updated_at_unix_ms=?2 AND subject>?3))
+               AND (agentless=0 OR ?1 IS NULL)
                AND (?1 IS NULL OR assignee=?1 OR lease_owner=?1
                     OR EXISTS (SELECT 1 FROM json_each(step_runs.available_to) WHERE value=?1))
              ORDER BY length(updated_at_unix_ms) DESC, updated_at_unix_ms DESC, subject",
         )?;
-        let rows = statement.query_map(params![actor.as_deref()], step_run_from_row)?;
+        let rows = statement.query_map(
+            params![
+                actor.as_deref(),
+                after.map(|key| key.0.to_string()),
+                after.map(|key| key.1.as_str())
+            ],
+            step_run_from_row,
+        )?;
         let (mut skipped, mut page) = (0, Vec::new());
         for row in rows {
             let mut view = row?;

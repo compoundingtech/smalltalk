@@ -57,6 +57,8 @@ pub enum ErrorCode {
     RuntimeNotLocal,
     RuntimeAuthorityIndeterminate,
     RemoteUnavailable,
+    TerminalUnavailable,
+    TerminalEnded,
     Internal,
     #[serde(other)]
     Unknown,

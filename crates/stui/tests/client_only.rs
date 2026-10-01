@@ -66,6 +66,8 @@ impl Tui {
             })
             .unwrap();
         let mut command = CommandBuilder::new(env!("CARGO_BIN_EXE_stui"));
+        // This proves pairing and control, read off the classic layout's screens.
+        command.arg("--classic");
         command.env_clear();
         command.env("HOME", root);
         command.env("XDG_CONFIG_HOME", root.join("config"));

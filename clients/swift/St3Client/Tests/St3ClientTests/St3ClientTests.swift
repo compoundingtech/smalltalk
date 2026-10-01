@@ -66,10 +66,30 @@ final class St3ClientTests: XCTestCase {
         XCTAssertEqual(Set(ReadOperation.allCases.map(\.rawValue)), Set(reads.compactMap { $0["id"] as? String }))
     }
 
+    func testSchemaErrorCodesAreKnownAndRoundTrip() throws {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<6 { root.deleteLastPathComponent() }
+        let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/schemas/client-v0.schema.json"))
+        let schema = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let definitions = try XCTUnwrap(schema["$defs"] as? [String: Any])
+        let envelope = try XCTUnwrap(definitions["ErrorEnvelope"] as? [String: Any])
+        let properties = try XCTUnwrap(envelope["properties"] as? [String: Any])
+        let code = try XCTUnwrap(properties["code"] as? [String: Any])
+        let codes = try XCTUnwrap(code["enum"] as? [String])
+        for raw in codes {
+            let encoded = try JSONEncoder().encode(raw)
+            let decoded = try JSONDecoder().decode(ErrorCode.self, from: encoded)
+            if case .unknown = decoded { XCTFail("schema error code is unknown: \(raw)") }
+            XCTAssertEqual(try JSONEncoder().encode(decoded), encoded)
+        }
+    }
+
     func testAuthorityErrorCodesAreTypedAndRoundTrip() throws {
         for (raw, expected) in [
             ("runtime-not-local", ErrorCode.runtimeNotLocal),
             ("runtime-authority-indeterminate", ErrorCode.runtimeAuthorityIndeterminate),
+            ("terminal-unavailable", ErrorCode.terminalUnavailable),
+            ("terminal-ended", ErrorCode.terminalEnded),
         ] {
             let decoded = try JSONDecoder().decode(ErrorCode.self, from: Data("\"\(raw)\"".utf8))
             XCTAssertEqual(decoded, expected)

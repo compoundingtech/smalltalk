@@ -11,6 +11,10 @@ use ratatui::text::{Line, Span};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Hit {
+    /// A row of the Ctrl+S sidebar's list: select it and open it.
+    SidebarRow(usize),
+    /// One of the sidebar's sections across its top.
+    SidebarSection(usize),
     Tab(usize),
     Row(usize),
     Key(char),
