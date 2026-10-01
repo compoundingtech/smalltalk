@@ -7,7 +7,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1"
-crossterm = "0.28"
+crossterm = "0.29"
 ratatui = { workspace = true }
 st3-client = { path = "../st3-client" }
 st3-conversation-ui = { path = "../st3-conversation-ui" }
