@@ -93,6 +93,148 @@ fn value(output: &Output) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn operational_cli_lists_outcomes_summarizes_runs_and_reports_performance() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let source = "version 2\nmission \"example/operations\" state=\"ready\" {\n concurrent-runs max=20\n goal \"Build the example.\"\n step \"build\" {goal \"Build.\"}\n}\n";
+    let intent = st3::graph::parse_intent(source, "client-v0-cli").unwrap();
+    let planned = state
+        .store
+        .mission(
+            &intent,
+            IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    state
+        .store
+        .apply(&intent, &planned.subject_tokens, "operations")
+        .unwrap();
+    for i in 0..16 {
+        let run = state
+            .store
+            .create_mission_run(&MissionRunRequest {
+                mission: "example/operations".into(),
+                revision: None,
+                workspace: root.path().display().to_string(),
+                requester: Some("person/operator".into()),
+                mode: None,
+                inputs: BTreeMap::new(),
+                idempotency_key: format!("operations-{i}"),
+            })
+            .unwrap();
+        if i < 2 {
+            state
+                .store
+                .set_step_state(
+                    &run.steps[0].subject,
+                    "failed",
+                    Some("the active execution timeout expired"),
+                )
+                .unwrap();
+            // Runtime cleanup may write the terminal state without repeating the original reason.
+            state
+                .store
+                .set_mission_run_state(
+                    &run.id,
+                    "running",
+                    "cleanup-failed",
+                    Some("the mission timeout expired"),
+                )
+                .unwrap();
+            state
+                .store
+                .set_mission_run_state(&run.id, "failed", "terminal", None)
+                .unwrap();
+        }
+    }
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let overview =
+        value(&run_cli(&socket, &["missions", "show", "mission/example/operations"]).await);
+    assert_eq!(overview["total_runs"], 16);
+    assert_eq!(overview["counts"]["running"], 14);
+    assert_eq!(overview["counts"]["failed"], 2);
+    let shown = run_cli_human(&socket, &["missions", "show", "mission/example/operations"]).await;
+    assert!(shown.status.success());
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("running: 14"));
+    let listing = value(&run_cli(&socket, &["missions", "ls", "--all"]).await);
+    assert_eq!(listing["value"]["items"][0]["total_runs"], 16);
+    for collection in ["missions", "work"] {
+        let page = value(
+            &run_cli(
+                &socket,
+                &[
+                    collection, "ls", "--since", "6h", "--status", "failed", "--limit", "1",
+                ],
+            )
+            .await,
+        );
+        assert_eq!(page["items"].as_array().unwrap().len(), 1);
+        assert!(
+            page["items"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("timeout")
+        );
+        let next = page["next_cursor"].as_str().unwrap();
+        let next_page = value(
+            &run_cli(
+                &socket,
+                &[collection, "ls", "--limit", "1", "--cursor", next],
+            )
+            .await,
+        );
+        assert_ne!(next_page["items"][0]["id"], page["items"][0]["id"]);
+        let timed = value(
+            &run_cli(
+                &socket,
+                &[collection, "ls", "--since", "6h", "--status", "timed-out"],
+            )
+            .await,
+        );
+        assert_eq!(timed["items"].as_array().unwrap().len(), 2);
+        let empty = value(
+            &run_cli(
+                &socket,
+                &[
+                    collection,
+                    "ls",
+                    "--since",
+                    "2020-01-01T00:00:00Z",
+                    "--until",
+                    "2020-01-02T00:00:00Z",
+                    "--status",
+                    "cancelled",
+                ],
+            )
+            .await,
+        );
+        assert!(empty["items"].as_array().unwrap().is_empty());
+    }
+    let report = value(&run_cli(&socket, &["doctor", "--performance"]).await);
+    assert_eq!(report["window_seconds"], 300);
+    assert!(!report["requests"].as_array().unwrap().is_empty());
+    assert!(!report["queries"].as_array().unwrap().is_empty());
+    let shown = run_cli_human(&socket, &["doctor", "--performance"]).await;
+    assert!(shown.status.success());
+    assert!(String::from_utf8_lossy(&shown.stdout).contains("REQUESTS AND TASKS"));
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_declaration_cli_redacts_environment_unless_explicitly_requested() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
