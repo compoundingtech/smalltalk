@@ -682,37 +682,37 @@ pub fn run(context: Context) -> Result<()> {
         execute!(io::stdout(), BeginSynchronizedUpdate)?;
         terminal.draw(|frame| ui.render(frame))?;
         execute!(io::stdout(), EndSynchronizedUpdate)?;
-        if extras.live {
-            let visible = ui.visible_messages();
-            let incoming: HashSet<_> = timelines
-                .values()
-                .flat_map(|timeline| &timeline.items)
-                .filter_map(|entry| match &entry.body {
-                    TimelineBody::Message(message)
-                        if message.to.as_deref() == Some(person.as_str()) =>
-                    {
-                        Some(message.message_id.as_str())
-                    }
-                    _ => None,
-                })
-                .collect();
-            for id in visible
-                .into_iter()
-                .filter(|id| incoming.contains(id.as_str()))
-            {
-                read_receipts.displayed(id, Instant::now());
-            }
-            if let Some(id) = read_receipts.next(Instant::now()) {
-                let client = client.clone();
-                let person = person.clone();
-                let tx = fetched_tx.clone();
-                runtime.spawn(async move {
-                    let result = acknowledge_visible_message(&client, &person, &id)
-                        .await
-                        .map_err(|error| error.to_string());
-                    let _ = tx.send(Fetched::Read(id, result));
-                });
-            }
+        let visible = ui.visible_messages();
+        let incoming: HashSet<_> = timelines
+            .values()
+            .flat_map(|timeline| &timeline.items)
+            .filter_map(|entry| match &entry.body {
+                TimelineBody::Message(message)
+                    if message.to.as_deref() == Some(person.as_str()) =>
+                {
+                    Some(message.message_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        for id in visible
+            .into_iter()
+            .filter(|id| incoming.contains(id.as_str()))
+        {
+            read_receipts.displayed(id, Instant::now());
+        }
+        if extras.live
+            && let Some(id) = read_receipts.next(Instant::now())
+        {
+            let client = client.clone();
+            let person = person.clone();
+            let tx = fetched_tx.clone();
+            runtime.spawn(async move {
+                let result = acknowledge_visible_message(&client, &person, &id)
+                    .await
+                    .map_err(|error| error.to_string());
+                let _ = tx.send(Fetched::Read(id, result));
+            });
         }
         if event::poll(Duration::from_millis(80))? {
             // crossterm's read never returns on a closed terminal, so check for one before each.
@@ -1150,6 +1150,37 @@ mod tests {
         assert!(
             receipts.next(now + Duration::from_secs(3)).is_none(),
             "redrawing does not resend a confirmed receipt"
+        );
+    }
+
+    #[test]
+    fn a_visible_message_header_without_its_body_is_not_a_read() {
+        use super::super::view::{Body, Entry};
+        let entries = vec![Entry {
+            id: "message/reply".into(),
+            at: "12:00".into(),
+            body: Body::Mail {
+                from: "keeper".into(),
+                to: "you".into(),
+                subject: "Reply".into(),
+                body: "Here is the reply.".into(),
+            },
+        }];
+        let cache = super::super::conversation::Cache::default();
+        let doc = cache.render(&entries, 90, &HashSet::new(), "*");
+        let body_start = doc.messages[0].1.start as u16;
+        let ui = Ui::new(super::super::demo::world());
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(90, body_start)).unwrap();
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                ui.pane(frame.buffer_mut(), "header", area, doc.clone(), false);
+            })
+            .unwrap();
+        assert!(
+            ui.visible_messages().is_empty(),
+            "a header is not body consumption"
         );
     }
 
