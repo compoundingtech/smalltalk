@@ -27,6 +27,8 @@ pub(crate) struct Glasses {
 /// A named workspace: Home, then tabs of panes.
 #[derive(Clone)]
 struct Glass {
+    /// Stable across renames; the graph will keep the glass under it.
+    id: String,
     name: String,
     /// The tabs after Home, which is always first and cannot be closed.
     tabs: Vec<Tab>,
@@ -36,6 +38,8 @@ struct Glass {
 
 #[derive(Clone)]
 struct Tab {
+    /// A name the person gave the tab; otherwise it is named after its focused pane.
+    title: Option<String>,
     layout: Layout,
     /// The focused leaf.
     focus: usize,
@@ -44,6 +48,7 @@ struct Tab {
 impl Glass {
     fn new(name: String) -> Self {
         Self {
+            id: new_id(),
             name,
             tabs: Vec::new(),
             current: 0,
@@ -82,11 +87,17 @@ impl Glasses {
             .glasses
             .into_iter()
             .map(|glass| Glass {
+                id: if glass.id.is_empty() {
+                    new_id()
+                } else {
+                    glass.id
+                },
                 name: glass.name,
                 tabs: glass
                     .tabs
                     .into_iter()
                     .map(|tab| Tab {
+                        title: tab.title,
                         layout: tab.layout,
                         focus: 0,
                     })
@@ -128,11 +139,13 @@ impl Glasses {
                 .all
                 .iter()
                 .map(|glass| StoredGlass {
+                    id: glass.id.clone(),
                     name: glass.name.clone(),
                     tabs: glass
                         .tabs
                         .iter()
                         .map(|tab| StoredTab {
+                            title: tab.title.clone(),
                             layout: tab.layout.clone(),
                         })
                         .collect(),
@@ -651,10 +664,10 @@ impl Ui {
                         .unwrap_or_default();
                     let more = panes.len().saturating_sub(1);
                     (
-                        if more > 0 {
-                            format!("{first} +{more}")
-                        } else {
-                            first
+                        match (&tab.title, more) {
+                            (Some(title), _) => title.clone(),
+                            (None, 0) => first,
+                            (None, more) => format!("{first} +{more}"),
                         },
                         panes.iter().any(|pane| self.pane_needs_person(pane)),
                     )
@@ -1000,6 +1013,7 @@ impl Ui {
             }
             Action::DuplicateGlass(name) => {
                 let mut copy = glasses.glass().clone();
+                copy.id = new_id();
                 copy.name = glasses.unused_name(&name);
                 glasses.all.push(copy);
                 let last = glasses.all.len() - 1;
@@ -1033,6 +1047,7 @@ impl Ui {
             let name = glasses.unused_name(&title);
             let mut glass = Glass::new(name);
             glass.tabs.push(Tab {
+                title: None,
                 layout: Layout::pane(&key),
                 focus: 0,
             });
@@ -1062,6 +1077,7 @@ impl Ui {
             }
             _ => {
                 glass.tabs.push(Tab {
+                    title: None,
                     layout: Layout::pane(&key),
                     focus: 0,
                 });
@@ -1192,7 +1208,14 @@ impl Ui {
         match tab.layout.remove(tab.focus) {
             Some(layout) => {
                 let focus = tab.focus.min(layout.leaves().len() - 1);
-                glass.tabs.insert(index, Tab { layout, focus });
+                glass.tabs.insert(
+                    index,
+                    Tab {
+                        title: tab.title,
+                        layout,
+                        focus,
+                    },
+                );
             }
             None => glass.current = glass.current.min(glass.tabs.len()),
         }
@@ -1267,6 +1290,11 @@ impl Ui {
             self.selected[tab] = position;
         }
     }
+}
+
+/// A glass's identity: made here, kept for good.
+fn new_id() -> String {
+    uuid::Uuid::now_v7().to_string()
 }
 
 /// The pane a graph subject opens as, for links followed inside a glass.

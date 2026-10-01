@@ -24,6 +24,9 @@ pub struct Stored {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoredGlass {
+    /// Made here once and never changed, renaming included: the graph keeps a glass under it.
+    #[serde(default)]
+    pub id: String,
     pub name: String,
     /// The tabs after Home.
     pub tabs: Vec<StoredTab>,
@@ -31,6 +34,8 @@ pub struct StoredGlass {
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct StoredTab {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     pub layout: Layout,
 }
 
@@ -110,12 +115,17 @@ mod tests {
             last: Some("review".into()),
             glasses: vec![
                 StoredGlass {
+                    id: "0190a1b2-0000-7000-8000-000000000001".into(),
                     name: "main".into(),
                     tabs: vec![],
                 },
                 StoredGlass {
+                    id: "0190a1b2-0000-7000-8000-000000000002".into(),
                     name: "review".into(),
-                    tabs: vec![StoredTab { layout }],
+                    tabs: vec![StoredTab {
+                        title: Some("the audit".into()),
+                        layout,
+                    }],
                 },
             ],
         };
