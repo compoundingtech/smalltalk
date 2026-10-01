@@ -96,6 +96,7 @@ pub fn word_style(word: Word, spinner: &'static str) -> (&'static str, Color) {
         Word::Done => ("✓", theme::DONE),
         Word::Failed => ("✕", theme::FAULT),
         Word::Cancelled => ("⊘", theme::QUIET),
+        Word::NotStarted => ("○", theme::QUIET),
     }
 }
 
@@ -588,7 +589,10 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 card.section("agents", Some(preview.agents.len()), inner);
                 for agent in &preview.agents {
                     card.line(Line::from(vec![
-                        span(format!("  {:<18}", agent.name), theme::text()),
+                        span(
+                            format!("  {:<18} ", text::truncate(&agent.name, 18)),
+                            theme::text(),
+                        ),
                         span(
                             format!("{:<8}", agent.harness.name()),
                             theme::fg(harness_color(agent.harness)),
@@ -755,13 +759,12 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
     card.blank();
     // What the item is about, as links wherever st names a graph subject.
     card.section("related", None, inner);
-    card.line(Line::from(vec![
-        span(format!("{:<10}", "raised by"), theme::dim()),
-        match &item.raised_by {
-            Some(who) => span(who.clone(), theme::soft()),
-            None => span("st does not say yet", theme::dim()),
-        },
-    ]));
+    if let Some(who) = &item.raised_by {
+        card.line(Line::from(vec![
+            span(format!("{:<10}", "raised by"), theme::dim()),
+            span(who.clone(), theme::soft()),
+        ]));
+    }
     if item.related.is_empty() && item.mission.is_none() && item.agent.is_none() {
         card.line(Line::from(span(
             "st names no agent, mission or step for this item.",
@@ -877,17 +880,12 @@ fn flow<'a>(
             .filter(|(index, _)| depth[*index] == layer)
             .map(|(_, step)| *step)
             .collect::<Vec<_>>();
-        if names.len() > 1 {
-            runs.push(run("{", theme::dim()));
-        }
+        // Steps that can run side by side read as a list: `a, b → c`.
         for (index, (name, _, color)) in names.iter().enumerate() {
             if index > 0 {
                 runs.push(run(", ", theme::dim()));
             }
             runs.push(run(name.to_string(), theme::fg(*color)));
-        }
-        if names.len() > 1 {
-            runs.push(run("}", theme::dim()));
         }
     }
     text::wrap(
@@ -1037,10 +1035,15 @@ pub fn mission_order(world: &World, system: bool) -> Vec<&Mission> {
         .missions
         .items()
         .iter()
-        .filter(|mission| system || !mission.system)
+        .filter(|mission| system || !hidden_by_default(mission))
         .collect::<Vec<_>>();
     missions.sort_by_key(|mission| (mission.word, mission.title.to_lowercase()));
     missions
+}
+
+/// Missions a person rarely looks for: st's own, and ones nobody has started. `x` shows them.
+fn hidden_by_default(mission: &Mission) -> bool {
+    mission.system || mission.word == Word::NotStarted
 }
 
 pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> Listing {
@@ -1064,7 +1067,9 @@ pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> List
         let (glyph, color) = word_style(mission.word, spinner);
         let (done, total) = mission.progress();
         // st reports only current steps for many runs, so a 0/1 meter would claim too much.
-        let right = if done > 0 {
+        let right = if mission.word == Word::NotStarted {
+            vec![]
+        } else if done > 0 {
             let mut right = meter(done, total, 5, color);
             right.push(span(format!(" {done}/{total}"), theme::dim()));
             right
@@ -1092,17 +1097,32 @@ pub fn missions_list(world: &World, spinner: &'static str, system: bool) -> List
         });
         ids.push(mission.id.clone());
     }
-    let hidden = world
-        .missions
-        .items()
-        .iter()
-        .filter(|mission| mission.system && !system)
-        .count();
-    if hidden > 0 {
-        items.push(Item::Note(Line::from(span(
-            format!(" {hidden} system missions hidden · x shows them"),
-            theme::dim(),
-        ))));
+    if !system {
+        let count = |hidden: fn(&Mission) -> bool| {
+            world
+                .missions
+                .items()
+                .iter()
+                .filter(|mission| hidden(mission))
+                .count()
+        };
+        let kinds = [
+            (count(|mission| mission.system), "from st"),
+            (
+                count(|mission| !mission.system && mission.word == Word::NotStarted),
+                "not started",
+            ),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, kind)| format!("{count} {kind}"))
+        .collect::<Vec<_>>();
+        if !kinds.is_empty() {
+            items.push(Item::Note(Line::from(span(
+                format!(" hidden: {} · x shows them", kinds.join(", ")),
+                theme::dim(),
+            ))));
+        }
     }
     Listing {
         items,
@@ -1203,16 +1223,19 @@ pub fn mission_detail(
     let mut bar = meter(done, total, 20, theme::DONE);
     bar.push(span(format!("  {done}/{total} done"), theme::dim()));
     steps.line(Line::from(bar));
-    steps.lines(flow(
-        mission.steps.iter().map(|step| {
-            (
-                step.name.as_str(),
-                step.after.as_slice(),
-                step_style(step.state, spinner).1,
-            )
-        }),
-        inner,
-    ));
+    // The order only says something when a step waits for another.
+    if mission.steps.iter().any(|step| !step.after.is_empty()) {
+        steps.lines(flow(
+            mission.steps.iter().map(|step| {
+                (
+                    step.name.as_str(),
+                    step.after.as_slice(),
+                    step_style(step.state, spinner).1,
+                )
+            }),
+            inner,
+        ));
+    }
     let name_width = mission
         .steps
         .iter()
@@ -1297,7 +1320,7 @@ pub fn mission_detail(
     for id in &mission.agents {
         if let Some(agent) = world.agents.items().iter().find(|agent| &agent.id == id) {
             let (glyph, color) = agent_glyph(agent.state, spinner);
-            let label = format!("{glyph} {:<18}", agent.name);
+            let label = format!("{glyph} {:<18} ", text::truncate(&agent.name, 18));
             agents.targets.push(super::doc::Target {
                 line: agents.lines.len(),
                 column: 0,
@@ -1508,11 +1531,7 @@ pub fn fleet_list(world: &World) -> Listing {
     let mut items = Vec::new();
     let mut ids = Vec::new();
     for machine in world.machines.items() {
-        let (glyph, color) = if machine.online {
-            ("●", theme::GREEN)
-        } else {
-            ("○", theme::RED)
-        };
+        let (glyph, color) = reach_style(machine.reach);
         let agents = world
             .agents
             .items()
@@ -1533,11 +1552,11 @@ pub fn fleet_list(world: &World) -> Listing {
                     theme::fg(theme::ACCENT),
                 ),
             ],
-            right: vec![span(format!("{agents} agents"), theme::dim())],
-            second: vec![span(
-                format!("   {} · seen {}", machine.platform, machine.seen),
+            right: vec![span(
+                format!("{agents} agent{}", if agents == 1 { "" } else { "s" }),
                 theme::dim(),
             )],
+            second: vec![span(format!("   {}", machine_line(machine)), theme::dim())],
         });
         ids.push(machine.name.clone());
     }
@@ -1545,8 +1564,35 @@ pub fn fleet_list(world: &World) -> Listing {
         items,
         ids,
         state: state_of(&world.machines, "Loading machines…", "No machines yet."),
-        legend: legend(&[("●", theme::GREEN, "online"), ("○", theme::RED, "offline")]),
+        legend: legend(&[
+            ("●", theme::GREEN, "connected"),
+            ("◐", theme::SAPPHIRE, "through another"),
+            ("○", theme::RED, "offline"),
+        ]),
     }
+}
+
+fn reach_style(reach: Reach) -> (&'static str, Color) {
+    match reach {
+        Reach::Here | Reach::Direct => ("●", theme::GREEN),
+        Reach::Indirect => ("◐", theme::SAPPHIRE),
+        Reach::Offline => ("○", theme::RED),
+        Reach::Unknown => ("◌", theme::OVERLAY1),
+    }
+}
+
+/// How a machine is reached and when it was last heard from, in words.
+fn machine_line(machine: &Machine) -> String {
+    let mut parts = vec![machine.reach.word().to_owned()];
+    if !machine.platform.is_empty() {
+        parts.push(machine.platform.clone());
+    }
+    match (machine.reach, machine.seen.as_str()) {
+        (Reach::Here, _) => {}
+        (_, "never") => parts.push("never heard from".into()),
+        (_, seen) => parts.push(format!("heard {seen}")),
+    }
+    parts.join(" · ")
 }
 
 pub fn fleet_detail(world: &World, id: Option<&str>, width: usize, spinner: &'static str) -> Doc {
@@ -1561,18 +1607,11 @@ pub fn fleet_detail(world: &World, id: Option<&str>, width: usize, spinner: &'st
         doc.line(Line::from(span("Select a machine.", theme::dim())));
         return doc;
     };
-    let (glyph, color) = if machine.online {
-        ("●", theme::GREEN)
-    } else {
-        ("○", theme::RED)
-    };
+    let (glyph, color) = reach_style(machine.reach);
     doc.line(Line::from(vec![
         span(format!(" {glyph} "), theme::strong(color)),
         span(machine.name.clone(), theme::bold()),
-        span(
-            format!("  {} · seen {}", machine.platform, machine.seen),
-            theme::dim(),
-        ),
+        span(format!("  {}", machine_line(machine)), theme::dim()),
     ]));
     if let Some(load) = &machine.load {
         doc.line(Line::from(span(format!("   {load}"), theme::soft())));
@@ -1591,7 +1630,11 @@ pub fn fleet_detail(world: &World, id: Option<&str>, width: usize, spinner: &'st
     }
     if links.lines.is_empty() {
         links.line(Line::from(span(
-            "Unknown while this machine is offline.",
+            if machine.you_are_here {
+                "This is the machine stui is talking to."
+            } else {
+                "st reports no link to this machine."
+            },
             theme::dim(),
         )));
     }
@@ -1602,7 +1645,7 @@ pub fn fleet_detail(world: &World, id: Option<&str>, width: usize, spinner: &'st
         .filter(|agent| agent.host == machine.name)
     {
         let (glyph, color) = agent_glyph(agent.state, spinner);
-        let label = format!("{glyph} {:<20}", agent.name);
+        let label = format!("{glyph} {:<20} ", text::truncate(&agent.name, 20));
         agents.targets.push(super::doc::Target {
             line: agents.lines.len(),
             column: 0,
@@ -1734,7 +1777,7 @@ pub fn worktree_detail(
     for id in &tree.agents {
         if let Some(agent) = world.agents.items().iter().find(|agent| &agent.id == id) {
             let (glyph, color) = agent_glyph(agent.state, spinner);
-            let label = format!("{glyph} {:<20}", agent.name);
+            let label = format!("{glyph} {:<20} ", text::truncate(&agent.name, 20));
             agents.targets.push(super::doc::Target {
                 line: agents.lines.len(),
                 column: 0,

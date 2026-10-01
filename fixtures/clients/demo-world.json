@@ -981,8 +981,8 @@
         ],
         "load": "2 agents",
         "name": "lark",
-        "online": true,
         "platform": "macOS · arm64",
+        "reach": "here",
         "seen": "now",
         "you_are_here": true
       },
@@ -1001,8 +1001,8 @@
         ],
         "load": "6 agents · 41% cpu",
         "name": "harbor",
-        "online": true,
         "platform": "linux · x86_64",
+        "reach": "direct",
         "seen": "4s ago",
         "you_are_here": false
       },
@@ -1010,8 +1010,8 @@
         "links": [],
         "load": null,
         "name": "wren",
-        "online": false,
         "platform": "linux · arm64",
+        "reach": "offline",
         "seen": "2d ago",
         "you_are_here": false
       }
