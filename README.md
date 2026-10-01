@@ -2,11 +2,11 @@
 
 ## Continuous integration
 
-Small Talk runs pull request and main branch CI on our own Linux and macOS machines through
-`st`. The `st/ci` commit status reports the Linux debug workspace tests and Clippy;
-`st/ci-macos` reports the same checks on macOS. GitHub Actions handles tags and forked
-pull requests. A ready pull request merges through the merge train: `st lanes join smalltalk
-NUMBER`. See [CI operations](docs/ci.md) for the train and to inspect a failing run.
+Small Talk runs pull request CI on GitHub Actions with Namespace runners. `linux-gate`,
+`isolation-vm` and `genie-freshness` are the required checks; `macos-ci` is optional and runs
+when a pull request carries the `macos-ci` label. A ready pull request lands through GitHub's
+merge queue: `gh pr merge NUMBER --auto`. See [CI operations](docs/ci.md) for the queue and to
+inspect a failing run.
 
 Small Talk (`st`) runs coding agents as durable seats and hands them work as missions. The graph
 records every seat, mission, step, message, and decision, so the state of your agents survives
