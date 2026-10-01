@@ -19,12 +19,14 @@ const SECTIONS: [&str; 6] = [
     "agents",
     "missions",
     "fleet",
-    "glasses",
+    "spaces",
     "start",
 ];
 const GLASSES: usize = 4;
-/// Where each section ranks while a query is typed: agents, missions, then the rest in order.
-const RANK: [usize; 6] = [2, 0, 1, 3, 4, 5];
+/// Where each section ranks while a query is typed: agents, missions, what needs you, then
+/// starting things (so "new terminal" finds New terminal before a glass named after it), the
+/// fleet, and glasses.
+const RANK: [usize; 6] = [2, 0, 1, 4, 5, 3];
 const START: usize = 5;
 
 /// Every glass this window knows, and the one it shows.
@@ -43,10 +45,36 @@ pub(crate) struct Glasses {
     zoomed: bool,
     /// Home is open over the glass (⌂ in the top bar).
     home: bool,
+    /// The Ctrl+S sidebar: the old stui list beside the splits, to browse and open from.
+    pub(crate) sidebar: Sidebar,
     /// The glass made at start only because this device had none by the name asked for. If it
     /// is still empty when st first sends the person's glasses, st's glass of that name is
     /// shown instead of keeping both.
     placeholder: Option<String>,
+}
+
+/// The sidebar's sections, what the number keys were in the old stui.
+pub(crate) const SIDEBAR_SECTIONS: [&str; 4] = ["Home", "Agents", "Missions", "Fleet"];
+
+/// The Ctrl+S sidebar. It keeps its section and each section's selection while hidden.
+#[derive(Clone, Debug)]
+pub(crate) struct Sidebar {
+    pub(crate) shown: bool,
+    /// It has the keys: the arrows move through it and Enter opens.
+    pub(crate) focused: bool,
+    pub(crate) section: usize,
+    pub(crate) selected: [usize; 4],
+}
+
+impl Default for Sidebar {
+    fn default() -> Self {
+        Self {
+            shown: false,
+            focused: false,
+            section: 1,
+            selected: [0; 4],
+        }
+    }
 }
 
 /// A change for st to keep. The body travels as JSON text and the idempotency key goes with
@@ -237,6 +265,11 @@ impl Glasses {
     /// Open `wanted` (or the last glass used here, or `main`) from what this device keeps.
     pub(crate) fn open(wanted: Option<String>, store: Option<PathBuf>) -> Self {
         let stored = store.as_deref().map(glass_store::load).unwrap_or_default();
+        // A device that never chose shows the sidebar, as the old stui's list always was.
+        let sidebar = Sidebar {
+            shown: stored.sidebar.unwrap_or(store.is_some()),
+            ..Sidebar::default()
+        };
         let mut all = stored
             .glasses
             .into_iter()
@@ -274,6 +307,7 @@ impl Glasses {
             graph: false,
             zoomed: false,
             home: false,
+            sidebar,
             pending: BTreeMap::new(),
             placeholder,
         }
@@ -309,6 +343,7 @@ impl Glasses {
         let Some(path) = &self.store else { return };
         let stored = Stored {
             version: 0,
+            sidebar: Some(self.sidebar.shown),
             last: Some(self.glass().name.clone()),
             glasses: self
                 .all
@@ -388,6 +423,8 @@ enum Action {
     NewAgent(Option<String>),
     /// Home, over the glass.
     Home,
+    /// A plain shell in a new tab.
+    NewTerminal,
     /// Ask for a name, for a glass to rename, make or copy.
     Name(Naming),
 }
@@ -554,6 +591,12 @@ impl Ui {
             "new agent start".into(),
             Action::NewAgent(None),
         ));
+        choices.push(start(
+            "New terminal".into(),
+            "a shell in a new tab",
+            "new terminal shell".into(),
+            Action::NewTerminal,
+        ));
         if !name.is_empty() {
             choices.push(start(
                 format!("Start an agent: “{name}”"),
@@ -591,14 +634,14 @@ impl Ui {
             (
                 "✎",
                 format!("Rename “{current}”…"),
-                "rename glass",
+                "rename space glass",
                 Naming::Rename,
             ),
-            ("+", "New glass…".to_owned(), "new glass", Naming::New),
+            ("+", "New space…".to_owned(), "new space glass", Naming::New),
             (
                 "⧉",
                 format!("Duplicate “{current}”…"),
-                "duplicate glass copy",
+                "duplicate space glass copy",
                 Naming::Duplicate,
             ),
         ] {
@@ -613,7 +656,7 @@ impl Ui {
         if !name.is_empty() {
             choices.push(glass(
                 "+",
-                format!("New glass “{name}”"),
+                format!("New space “{name}”"),
                 "ctrl+g switches",
                 String::new(),
                 Action::NewGlass(name.to_owned()),
@@ -638,7 +681,7 @@ impl Ui {
                 "×",
                 format!("Close “{}”", glasses.glass().name),
                 "its tabs go with it",
-                "close glass".to_owned(),
+                "close space glass".to_owned(),
                 Action::CloseGlass,
             ));
         }
@@ -659,7 +702,7 @@ impl Ui {
                 ),
                 Naming::New => (
                     "+",
-                    format!("New glass “{name}”"),
+                    format!("New space “{name}”"),
                     Action::NewGlass(name.clone()),
                 ),
                 Naming::Duplicate => (
@@ -701,7 +744,12 @@ impl Ui {
             .collect::<Vec<_>>();
         // While something is typed, a matching agent ranks first, then missions, then the rest.
         if !palette.query.is_empty() {
-            scored.sort_by_key(|(choice, score)| (RANK[choice.section], -score));
+            // Starting an agent from whatever was typed matches anything, so it comes last:
+            // "close glass" closes the glass rather than starting an agent named that.
+            scored.sort_by_key(|(choice, score)| {
+                let catch_all = matches!(choice.action, Action::NewAgent(Some(_)));
+                (catch_all, RANK[choice.section], -score)
+            });
         }
         scored.into_iter().map(|(choice, _)| choice).collect()
     }
@@ -710,11 +758,26 @@ impl Ui {
         let Some(glasses) = &self.glasses else { return };
         let glass = glasses.glass();
         self.status_line(buf, Rect { height: 1, ..area }, glass);
-        let body = Rect {
+        let mut body = Rect {
             y: area.y + 1,
             height: area.height.saturating_sub(2),
             ..area
         };
+        // The sidebar takes the left of the glass, beside the splits rather than over them.
+        if glasses.sidebar.shown && body.width > 40 {
+            let width = (body.width / 3).clamp(28, 44);
+            self.draw_sidebar(buf, Rect { width, ..body }, &glasses.sidebar);
+            for y in body.y..body.y + body.height {
+                buf[(body.x + width, y)]
+                    .set_symbol("│")
+                    .set_style(Style::default().fg(theme::SURFACE1).bg(theme::BASE));
+            }
+            body = Rect {
+                x: body.x + width + 1,
+                width: body.width - width - 1,
+                ..body
+            };
+        }
         // Zoomed, the focused split takes the whole glass and the others wait unseen.
         let (rects, dividers) = if glasses.zoomed {
             let groups = glass.layout.groups().len();
@@ -775,6 +838,143 @@ impl Ui {
         if let Some(palette) = &glasses.palette {
             self.draw_palette(buf, area, palette);
         }
+    }
+
+    /// The sidebar: its sections across the top, then that section's list.
+    fn draw_sidebar(&self, buf: &mut Buffer, area: Rect, sidebar: &Sidebar) {
+        buf.set_style(area, Style::default().bg(theme::MANTLE));
+        self.frame.borrow_mut().glass_sidebar = area;
+        let mut spans = vec![Span::raw(" ")];
+        for (index, name) in SIDEBAR_SECTIONS.iter().enumerate() {
+            let label = match index {
+                0 => {
+                    let count = self.world.attention.items().len();
+                    if count > 0 {
+                        format!(" {name} ◆{count} ")
+                    } else {
+                        format!(" {name} ")
+                    }
+                }
+                _ => format!(" {name} "),
+            };
+            let style = if index == sidebar.section {
+                if sidebar.focused {
+                    Style::default().fg(theme::CRUST).bg(theme::ACCENT)
+                } else {
+                    Style::default().fg(theme::TEXT).bg(theme::SURFACE1)
+                }
+            } else {
+                theme::dim().bg(theme::MANTLE)
+            };
+            let x = area.x
+                + spans
+                    .iter()
+                    .map(|span| text::width(&span.content) as u16)
+                    .sum::<u16>();
+            let width = text::width(&label) as u16;
+            if x + width <= area.x + area.width {
+                self.hit(
+                    Rect {
+                        x,
+                        y: area.y,
+                        width,
+                        height: 1,
+                    },
+                    Hit::SidebarSection(index),
+                );
+            }
+            spans.push(Span::styled(label, style));
+        }
+        buf.set_line(area.x, area.y, &Line::from(spans), area.width);
+        self.draw_list_as(
+            buf,
+            Rect {
+                y: area.y + 2,
+                height: area.height.saturating_sub(2),
+                ..area
+            },
+            sidebar.section,
+            sidebar.selected[sidebar.section],
+            Hit::SidebarRow,
+        );
+    }
+
+    /// Show the sidebar with the keys, or hide it when it has them (Ctrl+S).
+    pub(crate) fn toggle_sidebar(&mut self) {
+        let Some(glasses) = self.glasses.as_mut() else {
+            return;
+        };
+        let sidebar = &mut glasses.sidebar;
+        if sidebar.shown && sidebar.focused {
+            sidebar.shown = false;
+            sidebar.focused = false;
+        } else {
+            sidebar.shown = true;
+            sidebar.focused = true;
+        }
+        glasses.save();
+    }
+
+    /// Open the sidebar's selection as a new tab in the focused split; the keys go back to it.
+    pub(crate) fn open_from_sidebar(&mut self) {
+        let Some(sidebar) = self.glasses.as_ref().map(|glasses| glasses.sidebar.clone()) else {
+            return;
+        };
+        let ids = self.listing_for(sidebar.section, 40).ids;
+        let Some(id) = ids.get(sidebar.selected[sidebar.section]).cloned() else {
+            return;
+        };
+        if let Some(glasses) = self.glasses.as_mut() {
+            glasses.sidebar.focused = false;
+        }
+        if sidebar.section == 0 {
+            // What needs you opens where it is answered: Home, at that item.
+            self.open_home();
+            self.selected[0] = sidebar.selected[0];
+        } else if let Some(pane) = pane_for(&id) {
+            self.open_in_glass(pane, Open::Tab);
+        } else if sidebar.section == 3 {
+            self.open_in_glass(Pane::Machine(Some(format!("machine/{id}"))), Open::Tab);
+        }
+    }
+
+    /// The sidebar's keys while it has them; `false` for a key it leaves to the glass.
+    fn sidebar_key(&mut self, key: KeyEvent) -> bool {
+        let control = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(section) = self.glasses.as_ref().map(|glasses| glasses.sidebar.section) else {
+            return false;
+        };
+        let count = self.listing_for(section, 40).ids.len();
+        let Some(sidebar) = self.glasses.as_mut().map(|glasses| &mut glasses.sidebar) else {
+            return false;
+        };
+        let selected = &mut sidebar.selected[section];
+        match key.code {
+            KeyCode::Char('s') if control => {
+                sidebar.shown = false;
+                sidebar.focused = false;
+            }
+            KeyCode::Esc => {
+                sidebar.shown = false;
+                sidebar.focused = false;
+            }
+            KeyCode::Up | KeyCode::Char('k') if !control => *selected = selected.saturating_sub(1),
+            KeyCode::Down | KeyCode::Char('j') if !control => {
+                *selected = (*selected + 1).min(count.saturating_sub(1))
+            }
+            KeyCode::Home if !control => *selected = 0,
+            KeyCode::End if !control => *selected = count.saturating_sub(1),
+            KeyCode::Left | KeyCode::BackTab => sidebar.section = (section + 3) % 4,
+            KeyCode::Right | KeyCode::Tab => sidebar.section = (section + 1) % 4,
+            KeyCode::Char(digit @ '1'..='4') if !control => {
+                sidebar.section = digit as usize - '1' as usize
+            }
+            KeyCode::Enter => self.open_from_sidebar(),
+            // The glass's own keys (Ctrl+K, Ctrl+T...) still work; nothing else reaches a pane.
+            _ if control => return false,
+            _ => {}
+        }
+        true
     }
 
     /// Home over the glass: its list and cards, as large as the glass allows, keys and all.
@@ -962,6 +1162,7 @@ impl Ui {
     /// A pane whose subject st no longer lists. Unknown while its list is still loading.
     fn subject_gone(&self, pane: &Pane) -> bool {
         match pane {
+            Pane::Terminal(id) if id.starts_with("terminal/") => false,
             Pane::Agent(Some(id)) | Pane::Terminal(id) => self
                 .world
                 .agents
@@ -1222,6 +1423,7 @@ impl Ui {
     fn pane_title(&self, pane: &Pane) -> String {
         let find = |id: &Option<String>| id.clone().unwrap_or_default();
         match pane {
+            Pane::Terminal(id) if id.starts_with("terminal/") => "shell".into(),
             Pane::Agent(Some(id)) | Pane::Terminal(id) => self
                 .world
                 .agents
@@ -1278,7 +1480,7 @@ impl Ui {
             (Open::Tab, Some(title)) => format!("open in a new tab beside “{title}”"),
             (Open::Right, _) => "open in a new split to the right".to_owned(),
             (Open::Below, _) => "open in a new split below".to_owned(),
-            (Open::Glass, _) => "open in a new glass".to_owned(),
+            (Open::Glass, _) => "open in a new space".to_owned(),
         };
         let place = if split { " · focused split" } else { "" };
         format!(" {} ", text::truncate(&format!("{target}{place}"), 60))
@@ -1317,7 +1519,7 @@ impl Ui {
             (Some(Naming::Rename), Some(glasses)) => {
                 format!(" rename “{}”: type its new name ", glasses.glass().name)
             }
-            (Some(Naming::New), _) => " a new glass: type its name ".to_owned(),
+            (Some(Naming::New), _) => " a new space: type its name ".to_owned(),
             (Some(Naming::Duplicate), Some(glasses)) => {
                 format!(" a copy of “{}”: type its name ", glasses.glass().name)
             }
@@ -1425,7 +1627,7 @@ impl Ui {
         buf.set_stringn(
             rect.x + 2,
             rect.y + rect.height - 2,
-            "enter open · ctrl+v split right · ctrl+x split below · ctrl+t tab · ctrl+g glass · esc",
+            "enter open · ctrl+v split right · ctrl+x split below · ctrl+t tab · ctrl+g spaces · esc",
             inner,
             theme::dim().bg(theme::MANTLE),
         );
@@ -1483,6 +1685,18 @@ impl Ui {
             self.clamp_palette();
             return true;
         }
+        // The sidebar, while it has the keys.
+        if glasses.sidebar.focused
+            && glasses.sidebar.shown
+            && !self.editing
+            && self.find.is_none()
+            && self.sidebar_key(key)
+        {
+            return true;
+        }
+        let Some(glasses) = self.glasses.as_mut() else {
+            return false;
+        };
         // Home over the glass takes the keys, as Home does; Esc closes it and Ctrl+K still opens
         // the palette.
         if glasses.home
@@ -1518,6 +1732,7 @@ impl Ui {
         let quiet = !self.editing && self.new_mission.is_none() && self.chat.is_none();
         match key.code {
             KeyCode::Char('k') if control || command => self.open_palette(None, Open::Here),
+            KeyCode::Char('s') if control => self.toggle_sidebar(),
             KeyCode::Char('t') if control => self.open_palette(None, Open::Tab),
             KeyCode::Char('v') if control => self.split_group(Side::Right),
             KeyCode::Char('x') if control => self.split_group(Side::Below),
@@ -1695,6 +1910,7 @@ impl Ui {
             Action::Open(pane) => self.open_in_glass(pane, how),
             Action::ShowGlass(index) => self.show_glass(index),
             Action::NewAgent(task) => self.open_new_agent(task),
+            Action::NewTerminal => self.open_new_terminal(),
             Action::Home => self.open_home(),
             Action::Name(naming) => {
                 let query = match naming {
@@ -1718,7 +1934,7 @@ impl Ui {
             }
             Action::RenameGlass(name) => {
                 if glasses.all.iter().any(|glass| glass.name == name) {
-                    self.flash(format!("A glass is already called “{name}”"));
+                    self.flash(format!("A space is already called “{name}”"));
                 } else {
                     glasses.glass_mut().name = name;
                     let id = glasses.glass().id.clone();
@@ -1750,7 +1966,7 @@ impl Ui {
                         self.effects.push(Effect::SaveGlass(write));
                     }
                     self.show_glass(next);
-                    self.flash(format!("Closed the glass “{}”", closed.name));
+                    self.flash(format!("Closed the space “{}”", closed.name));
                 }
             }
         }
@@ -1955,8 +2171,8 @@ impl Ui {
         }
         if gone > 0 {
             self.flash(match gone {
-                1 => "A glass was closed elsewhere".to_owned(),
-                n => format!("{n} glasses were closed elsewhere"),
+                1 => "A space was closed elsewhere".to_owned(),
+                n => format!("{n} spaces were closed elsewhere"),
             });
         }
         self.show_focused();
@@ -1990,7 +2206,7 @@ impl Ui {
                 glasses.save();
             }
             Err(error) if current => self.flash(format!(
-                "st did not keep a glass yet ({error}); stui will try again"
+                "st did not keep a space yet ({error}); stui will try again"
             )),
             Err(_) => {}
         }
@@ -2124,6 +2340,22 @@ impl Ui {
     /// A click inside a group that is not focused focuses it, and does nothing else. While the
     /// palette is open, only its rows take clicks; a click elsewhere closes it.
     pub(crate) fn glass_click(&mut self, column: u16, row: u16) -> bool {
+        // A click outside the sidebar takes the keys from it (it stays shown); inside, the
+        // sidebar's own targets act.
+        let in_sidebar = {
+            let info = self.frame.borrow();
+            let area = info.glass_sidebar;
+            column >= area.x
+                && column < area.x + area.width
+                && row >= area.y
+                && row < area.y + area.height
+        };
+        if let Some(glasses) = self.glasses.as_mut()
+            && glasses.sidebar.shown
+            && !in_sidebar
+        {
+            glasses.sidebar.focused = false;
+        }
         // Home over the glass takes clicks inside it; a click outside closes it, except on the
         // top bar, whose ⌂ toggles it.
         if self.home_open() && !self.palette_open() {
@@ -2708,6 +2940,80 @@ mod tests {
         assert!(screen(&ui).contains("Atlas Builder terminal"));
         press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
         assert!(ui.terminal_focused());
+    }
+
+    #[test]
+    fn a_shell_opens_in_a_tab_detaches_in_place_and_attaches_itself_not_the_selected_agent() {
+        let mut ui = glass();
+        // The agents list has a selection of its own, which a shell's keys must never reach.
+        ui.tab = 1;
+        ui.selected[1] = 2;
+        ctrl(&mut ui, 'k');
+        typed(&mut ui, "new terminal");
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        let shell = "terminal/pty/person/demo/shell";
+        assert_eq!(tabs(&ui).2, vec![vec![format!("terminal:{shell}")]]);
+        assert_eq!(
+            ui.terminal.as_ref().map(|view| view.agent.as_str()),
+            Some(shell)
+        );
+        assert!(screen(&ui).contains("shell"));
+        // Ctrl+\ leaves it a shell tab, detached.
+        ctrl(&mut ui, '\\');
+        ui.terminal = None;
+        assert_eq!(tabs(&ui).2, vec![vec![format!("terminal:{shell}")]]);
+        // Ctrl+] attaches this shell again, not whichever agent the list has selected.
+        ctrl(&mut ui, ']');
+        assert_eq!(
+            ui.terminal.as_ref().map(|view| view.agent.as_str()),
+            Some(shell)
+        );
+        assert_eq!(tabs(&ui).2, vec![vec![format!("terminal:{shell}")]]);
+    }
+
+    #[test]
+    fn ctrl_s_shows_the_sidebar_to_browse_and_open_tabs_from() {
+        let mut ui = glass();
+        ctrl(&mut ui, 's');
+        let sidebar = |ui: &Ui| ui.glasses.as_ref().unwrap().sidebar.clone();
+        assert!(sidebar(&ui).shown && sidebar(&ui).focused);
+        let shown = screen(&ui);
+        for section in SIDEBAR_SECTIONS {
+            assert!(shown.contains(section), "{shown}");
+        }
+        // Agents first; the arrows move, Enter opens the selection as a tab and gives the keys
+        // back to the glass, with the sidebar still shown.
+        let agents = ui.listing_for(1, 40).ids;
+        press(&mut ui, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(tabs(&ui).2, vec![vec![format!("agent:{}", agents[1])]]);
+        assert!(sidebar(&ui).shown && !sidebar(&ui).focused);
+        typed(&mut ui, "c");
+        assert!(ui.editing, "keys reach the opened pane");
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        // Ctrl+S takes the keys again, then hides it; shown again it remembers where it was.
+        ctrl(&mut ui, 's');
+        assert!(sidebar(&ui).focused);
+        press(&mut ui, KeyCode::Right, KeyModifiers::NONE);
+        ctrl(&mut ui, 's');
+        assert!(!sidebar(&ui).shown);
+        ctrl(&mut ui, 's');
+        assert_eq!((sidebar(&ui).section, sidebar(&ui).selected[1]), (2, 1));
+        // A mission opens as a tab beside the agent; opening never replaces it.
+        let missions = ui.listing_for(2, 40).ids;
+        press(&mut ui, KeyCode::Enter, KeyModifiers::NONE);
+        assert_eq!(
+            tabs(&ui).2,
+            vec![vec![
+                format!("agent:{}", agents[1]),
+                format!("mission:{}", missions[0])
+            ]]
+        );
+        // Esc hides it; the glass's keys work again.
+        ctrl(&mut ui, 's');
+        press(&mut ui, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(!sidebar(&ui).shown);
+        assert!(!screen(&ui).contains(" Fleet "));
     }
 
     #[test]
@@ -3310,6 +3616,7 @@ mod tests {
             cursor: None,
             stale: None,
             ended: None,
+            native: None,
         });
         ui.effects.clear();
         assert!(ui.terminal_focused());
@@ -3574,6 +3881,24 @@ mod tests {
             matches!(&sent[..], [GlassWrite::Delete { id, base, .. }] if id == "0190-b" && base.as_deref() == Some("r2")),
             "{sent:?}"
         );
+    }
+
+    #[test]
+    fn what_is_typed_picks_the_action_it_names_before_starting_an_agent_called_that() {
+        let mut ui = glass();
+        let glasses = ui.glasses.as_mut().unwrap();
+        glasses.all.push(Glass::new("new terminal".into()));
+        let first = |ui: &mut Ui, query: &str| {
+            ui.open_palette(None, Open::Here);
+            typed(ui, query);
+            let palette = ui.glasses.as_ref().unwrap().palette.as_ref().unwrap();
+            let top = ui.matches(palette)[0].action.clone();
+            press(ui, KeyCode::Esc, KeyModifiers::NONE);
+            top
+        };
+        assert_eq!(first(&mut ui, "new terminal"), Action::NewTerminal);
+        assert_eq!(first(&mut ui, "close glass"), Action::CloseGlass);
+        assert_eq!(first(&mut ui, "shell"), Action::NewTerminal);
     }
 
     #[test]

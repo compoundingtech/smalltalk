@@ -134,8 +134,13 @@ responses also carry one `snapshot`:
 
 A snapshot ID identifies the complete projected state at one local store index and projection
 version. All items in a response are computed in one read transaction. A page cursor is opaque,
-bound to the snapshot ID, filter, page size, and final sort tuple, and expires no earlier than the
-advertised `cursor_expires_at`. A cursor cannot silently move to a newer snapshot.
+bound to the collection, filter, page size, and final sort tuple, with an advertised
+`cursor_expires_at`. Unrelated commits do not invalidate a page. Cached collections continue from
+the original snapshot; missions and work history seek after the last timestamp and ID in a fresh
+read transaction and explicitly name that page's snapshot. A fresh page sequence observes rows
+that move ahead of the continuation position; current collection subscriptions supply live
+updates. Real retention expiry still returns
+`page-cursor-expired`, so clients restart the page sequence.
 
 ## Discovery, lists, and details
 
@@ -395,9 +400,12 @@ fields are:
 - `parameters`: the type-specific body.
 
 The authenticated session supplies actor and scopes. `actor`, `credential`, and fleet secrets are
-invalid request fields. Repeating the same key and byte-equivalent action returns the original
-result. Reusing a key with different bytes returns `idempotency-conflict`. Stale generation,
-revision, incarnation, or snapshot fences return `stale-fence` without a partial mutation.
+invalid request fields. Repeating the same key, action ID, type and parameters returns the
+original result; a refreshed fence does not change the action's idempotency identity. A different
+action under that key returns `idempotency-conflict`. Receipts from older daemons still accept the
+exact original request. A snapshot fence proves the host and an index no newer than the current
+store; unrelated commits do not stale an action. Stale generation, subject revision, incarnation,
+preview or terminal screen fences return `stale-fence` without a partial mutation.
 Multi-subject actions commit atomically or have no effect.
 
 The v0 action discriminators are:
@@ -650,7 +658,8 @@ Errors have `error_version: st3.client.error.v0`, a stable kebab-case code, safe
 `retryable`, structured details, and optional `retry_after_ms`. Required v0 codes are `not-found`,
 `forbidden`, `unsupported-capability`, `validation-failed`, `idempotency-conflict`, `stale-fence`,
 `cursor-gap`, `page-cursor-expired`, `rate-limited`, `runtime-not-local`,
-`runtime-authority-indeterminate`, `remote-unavailable`, and `internal`.
+`runtime-authority-indeterminate`, `remote-unavailable`, `terminal-unavailable`, `terminal-ended`,
+and `internal`.
 
 Adding optional fields is compatible. Removing or retyping a field, changing ordering or token
 rules, adding a required action parameter, or changing action semantics requires a new capability

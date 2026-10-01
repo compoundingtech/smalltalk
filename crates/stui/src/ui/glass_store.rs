@@ -21,6 +21,9 @@ pub struct Stored {
     /// The glass `stui --glasses` opens here.
     pub last: Option<String>,
     pub glasses: Vec<StoredGlass>,
+    /// Whether the Ctrl+S sidebar is shown here; unset, it is, as the old stui's list was.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidebar: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -91,6 +94,7 @@ impl LayoutV1 {
 fn from_v1(old: StoredV1) -> Stored {
     Stored {
         version: VERSION,
+        sidebar: None,
         last: old.last,
         glasses: old
             .glasses
@@ -210,6 +214,7 @@ mod tests {
         );
         let stored = Stored {
             version: VERSION,
+            sidebar: None,
             last: Some("review".into()),
             glasses: vec![
                 StoredGlass {

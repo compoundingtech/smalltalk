@@ -18,6 +18,7 @@ mod glass_store;
 pub mod layout;
 pub mod live;
 pub mod pane;
+mod pty;
 pub mod screens;
 pub mod text;
 pub mod theme;
@@ -76,6 +77,10 @@ struct FrameInfo {
     sidebar: Rect,
     sidebar_lines: usize,
     sidebar_height: usize,
+    /// The section the sidebar list drawn is for.
+    sidebar_tab: usize,
+    /// The Ctrl+S sidebar in a glass, all of it.
+    glass_sidebar: Rect,
     /// Glasses: where each group's content was drawn, in group order.
     glass_leaves: Vec<Rect>,
     /// Glasses: where Home was drawn over the glass, while it is open.
@@ -150,6 +155,10 @@ pub enum Effect {
         agent: String,
     },
     /// Start a new agent; its first message is what the person asked of it.
+    /// Start a plain shell for the person; it opens in a new tab.
+    CreateTerminal {
+        name: String,
+    },
     CreateAgent {
         name: String,
         harness: String,
@@ -181,6 +190,16 @@ pub(crate) struct TerminalView {
     /// Why the screen shown is not current: still connecting, or reconnecting after a drop.
     pub(crate) stale: Option<String>,
     pub(crate) ended: Option<String>,
+    /// The terminal attached through its PTY session, once that connects; until then, or when
+    /// st cannot give a direct stream, the screens above are st's view of it.
+    pub(crate) native: Option<pty::NativeTerminal>,
+}
+
+/// The entry at the top of a pane read back, how far into it, and the top it gave.
+struct Anchor {
+    entry: String,
+    offset: usize,
+    top: usize,
 }
 
 /// `/` in a conversation: what to find there, and which match is current.
@@ -267,6 +286,12 @@ pub struct Ui {
     attachments: HashMap<String, Vec<attach::Attachment>>,
     /// Where typing goes in the input that has the keyboard.
     cursor: edit::Cursor,
+    /// Where each pane being read back was, by entry, so it keeps its place.
+    anchors: RefCell<HashMap<String, Anchor>>,
+    /// The rows and columns the terminal pane last had, to attach at.
+    pub(crate) terminal_size: Cell<(u16, u16)>,
+    /// Where the attached terminal's screen was last drawn, for its mouse.
+    terminal_body: Cell<Option<Rect>>,
     /// How this terminal draws images (kitty, sixel, iTerm2, half blocks), asked once at start.
     pub(crate) picker: Option<ratatui_image::picker::Picker>,
     /// Each attachment's thumbnail, encoded once so a redraw never sends the image again.
@@ -332,6 +357,9 @@ impl Ui {
             started: None,
             attachments: HashMap::new(),
             cursor: edit::Cursor::default(),
+            terminal_size: Cell::new((24, 80)),
+            terminal_body: Cell::new(None),
+            anchors: RefCell::new(HashMap::new()),
             picker: None,
             thumbnails: RefCell::new(HashMap::new()),
             updated: HashMap::new(),
@@ -544,6 +572,12 @@ impl Ui {
     /// included, so a paste never sends anything by itself. A pasted path to an image, such as a
     /// file dropped on the terminal, attaches that image to a message to an agent.
     pub fn paste(&mut self, text: String) {
+        if self.terminal_focused()
+            && let Some(native) = self.native_terminal()
+        {
+            native.paste(&text);
+            return;
+        }
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let first = text.lines().next().unwrap_or("").to_owned();
         if let Some(find) = self.find.as_mut() {
@@ -923,10 +957,22 @@ impl Ui {
             );
             return;
         }
-        let hints: Vec<(&str, &str)> = if self.terminal_focused() {
+        let sidebar = self
+            .glasses
+            .as_ref()
+            .is_some_and(|glasses| glasses.sidebar.shown && glasses.sidebar.focused);
+        let hints: Vec<(&str, &str)> = if sidebar && !self.editing {
+            vec![
+                ("↑↓", "select"),
+                ("←→", "section"),
+                ("enter", "open in a tab"),
+                ("esc", "hide"),
+                ("ctrl+k", "find"),
+            ]
+        } else if self.terminal_focused() {
             vec![
                 ("ctrl+\\", "return"),
-                ("keys", "go to the agent"),
+                ("keys", "go to the terminal"),
                 ("ctrl-c twice", "interrupt"),
             ]
         } else if self.new_mission.is_some() && self.tab == 2 {
@@ -1059,6 +1105,18 @@ impl Ui {
 
     /// A tab's list, as the sidebar draws it.
     fn draw_list(&self, buf: &mut Buffer, area: Rect, tab: usize) {
+        self.draw_list_as(buf, area, tab, self.selected[tab], Hit::Row);
+    }
+
+    /// A tab's list with `selected` marked, each row a `hit` to click.
+    pub(crate) fn draw_list_as(
+        &self,
+        buf: &mut Buffer,
+        area: Rect,
+        tab: usize,
+        selected: usize,
+        hit: fn(usize) -> Hit,
+    ) {
         buf.set_style(area, Style::default().bg(theme::MANTLE));
         // One column for the frame edge and one kept free for the scrollbar.
         let width = area.width.saturating_sub(2) as usize;
@@ -1075,6 +1133,7 @@ impl Ui {
         {
             let mut info = self.frame.borrow_mut();
             info.sidebar = list;
+            info.sidebar_tab = tab;
         }
         // Legend, pinned to the bottom.
         if legend_height > 0 {
@@ -1135,7 +1194,7 @@ impl Ui {
             ListState::Ready => {}
         }
         // Lay the items out as lines, remembering where the selected row sits.
-        let selected = self.selected[tab].min(listing.ids.len().saturating_sub(1));
+        let selected = selected.min(listing.ids.len().saturating_sub(1));
         let mut rows: Vec<(Option<usize>, Line<'static>, bool)> = Vec::new();
         let mut selected_range = (0, 0);
         for item in &listing.items {
@@ -1235,7 +1294,7 @@ impl Ui {
             }
             buf.set_line(list.x + 1, y, line, list.width.saturating_sub(1));
             if let Some(index) = index {
-                self.hit(row, Hit::Row(*index));
+                self.hit(row, hit(*index));
             }
         }
         if rows.len() > height {
@@ -1760,7 +1819,38 @@ impl Ui {
                 seen: total,
                 ..PaneState::default()
             });
+            // Someone reading back keeps their place by entry: lines added, removed or grown
+            // above it (a window that slid, a late entry, a tool call that grew) never move
+            // what they read. Unless they scrolled since, the entry at the top stays there.
+            let mut anchors = self.anchors.borrow_mut();
+            if !state.follow
+                && let Some(anchor) = anchors.get(key)
+                && anchor.top == state.top
+                && let Some((_, start)) = doc.entries.iter().find(|(id, _)| *id == anchor.entry)
+            {
+                state.top = start + anchor.offset;
+            }
             state.reconcile(total, height);
+            match doc
+                .entries
+                .iter()
+                .rev()
+                .find(|(_, start)| *start <= state.top)
+            {
+                Some((entry, start)) if !state.follow => {
+                    anchors.insert(
+                        key.to_owned(),
+                        Anchor {
+                            entry: entry.clone(),
+                            offset: state.top - start,
+                            top: state.top,
+                        },
+                    );
+                }
+                _ => {
+                    anchors.remove(key);
+                }
+            }
             *state
         };
         let top = state.top;
@@ -1920,6 +2010,38 @@ impl Ui {
             );
             return;
         };
+        if let Some(native) = view.native.as_ref() {
+            // One line for where this is and how to leave; the PTY gets the rest of the pane.
+            let scrolled = native.scrolled();
+            let status = match (native.ended(), native.attached(), scrolled) {
+                (Some(reason), _, _) => format!("ended: {reason}"),
+                (None, false, _) => "attaching…".into(),
+                (None, true, 0) => {
+                    "ctrl-c twice reaches it · wheel or shift+pgup scrolls back".into()
+                }
+                (None, true, lines) => format!("↑ {lines} lines back · type to return"),
+            };
+            let header = Line::from(vec![
+                Span::styled(
+                    format!(" ← Ctrl+\\  {}", view.title),
+                    theme::strong(theme::ACCENT),
+                ),
+                Span::styled(format!("   {status}"), theme::dim()),
+            ]);
+            buf.set_line(area.x, area.y, &header, area.width);
+            self.hit(Rect { height: 1, ..area }, Hit::Detach);
+            let body = Rect {
+                y: area.y + 1,
+                height: area.height.saturating_sub(1),
+                ..area
+            };
+            self.terminal_size
+                .set((body.height.max(1), body.width.max(1)));
+            self.terminal_body.set(Some(body));
+            native.fit(body.height, body.width);
+            native.draw(buf, body);
+            return;
+        }
         let header = format!(" ← Return · Ctrl+\\   {}", view.title);
         buf.set_stringn(
             area.x,
@@ -1958,6 +2080,24 @@ impl Ui {
             if let Some(cell) = buf.cell_mut(position) {
                 cell.set_style(cell.style().add_modifier(Modifier::REVERSED));
             }
+        }
+    }
+
+    /// The attached terminal's direct connection, when it has one.
+    pub(crate) fn native_terminal(&self) -> Option<&pty::NativeTerminal> {
+        self.terminal.as_ref().and_then(|view| view.native.as_ref())
+    }
+
+    /// A key for the focused terminal: its bytes straight to the PTY when attached directly,
+    /// else through st.
+    fn terminal_key(&mut self, key: KeyEvent) {
+        match self.native_terminal() {
+            Some(native) => {
+                if let Some(bytes) = pty::key_bytes(key, native.mode()) {
+                    native.write(bytes);
+                }
+            }
+            None => self.effects.push(Effect::TerminalKey(key)),
         }
     }
 
@@ -2255,8 +2395,11 @@ impl Ui {
             match key.code {
                 // Terminals send Ctrl+\\ as 0x1c, which crossterm reports as Ctrl+4.
                 KeyCode::Char('\\' | '4') if control => {
-                    // In glasses the tab turns back into the agent's conversation.
-                    if let Some(Pane::Terminal(agent)) = self.focused_pane() {
+                    // In glasses an agent's tab turns back into its conversation; a shell's tab
+                    // stays a shell, detached.
+                    if let Some(Pane::Terminal(agent)) = self.focused_pane()
+                        && agent.starts_with("agent/")
+                    {
                         self.swap_focused_pane(Pane::Agent(Some(agent)));
                         self.terminal = None;
                     }
@@ -2268,7 +2411,7 @@ impl Ui {
                         pending == code && at.elapsed() < Duration::from_secs(2)
                     }) {
                         self.terminal_confirm = None;
-                        self.effects.push(Effect::TerminalKey(key));
+                        self.terminal_key(key);
                     } else {
                         self.terminal_confirm = Some((code, Instant::now()));
                         self.flash(format!(
@@ -2277,7 +2420,16 @@ impl Ui {
                         ));
                     }
                 }
-                _ => self.effects.push(Effect::TerminalKey(key)),
+                // Shift+PgUp/PgDn page through what scrolled off the top.
+                KeyCode::PageUp | KeyCode::PageDown
+                    if key.modifiers.contains(KeyModifiers::SHIFT)
+                        && self.native_terminal().is_some() =>
+                {
+                    if let Some(native) = self.native_terminal() {
+                        native.page(key.code == KeyCode::PageUp);
+                    }
+                }
+                _ => self.terminal_key(key),
             }
             return;
         }
@@ -2449,12 +2601,9 @@ impl Ui {
         }
         if let Some(action) = self.confirm {
             match key.code {
-                // Enter is how a message is sent; it never confirms stopping an agent.
+                // Only y confirms. Enter is how a message is sent, so it never confirms anything
+                // that acts for the person: stopping, approving, closing, cancelling, revoking.
                 KeyCode::Char('y') => {
-                    self.confirm = None;
-                    self.act(action);
-                }
-                KeyCode::Enter if action != 's' => {
                     self.confirm = None;
                     self.act(action);
                 }
@@ -2704,7 +2853,24 @@ impl Ui {
     }
 
     fn open_terminal(&mut self) {
-        let Some(agent) = self.selected_id().and_then(|id| {
+        // A plain shell's tab attaches itself; it has no agent to look up.
+        if let Some(Pane::Terminal(id)) = self.focused_pane()
+            && id.starts_with("terminal/")
+        {
+            self.attach_terminal(&id);
+            return;
+        }
+        // In glasses it is the focused pane's own agent, never the list's selection, which can
+        // be another agent's.
+        let subject = if self.glasses.is_some() {
+            match self.focused_pane() {
+                Some(Pane::Agent(Some(id)) | Pane::Terminal(id)) => Some(id),
+                _ => None,
+            }
+        } else {
+            self.selected_id()
+        };
+        let Some(agent) = subject.and_then(|id| {
             self.world
                 .agents
                 .items()
@@ -2735,6 +2901,27 @@ impl Ui {
 
     /// Attach `agent`'s terminal: followed live, or the demo's in demo mode.
     pub(crate) fn attach_terminal(&mut self, agent: &str) {
+        // A plain shell is a terminal of its own, not an agent's.
+        if agent.starts_with("terminal/") {
+            if self.live {
+                self.effects.push(Effect::OpenTerminal {
+                    agent: agent.to_owned(),
+                });
+                self.flash("Opening the terminal…");
+            } else {
+                self.terminal = Some(TerminalView {
+                    agent: agent.to_owned(),
+                    title: "shell · demo terminal".into(),
+                    name: "shell".into(),
+                    lines: demo::terminal("shell"),
+                    cursor: None,
+                    stale: None,
+                    ended: None,
+                    native: None,
+                });
+            }
+            return;
+        }
         let Some(agent) = self
             .world
             .agents
@@ -2757,6 +2944,7 @@ impl Ui {
                 cursor: None,
                 stale: None,
                 ended: None,
+                native: None,
             });
         }
     }
@@ -2876,6 +3064,26 @@ impl Ui {
     }
 
     /// st started the agent asked for here: its conversation replaces the form.
+    /// Start a plain shell for the person, opened in a new tab once st has it.
+    pub(crate) fn open_new_terminal(&mut self) {
+        if self.live {
+            self.effects.push(Effect::CreateTerminal {
+                name: screens::random_name(),
+            });
+            self.flash("Starting a shell…");
+        } else {
+            self.terminal_started("terminal/pty/person/demo/shell".into());
+        }
+    }
+
+    /// st started a shell asked for here: it opens in a new tab, attached.
+    pub(crate) fn terminal_started(&mut self, id: String) {
+        if self.glasses.is_some() {
+            self.open_in_glass(Pane::Terminal(id.clone()), glass::Open::Tab);
+        }
+        self.attach_terminal(&id);
+    }
+
     pub(crate) fn agent_started(&mut self, id: String) {
         self.new_agent = None;
         self.agent_form = false;
@@ -3232,8 +3440,13 @@ impl Ui {
         let Some(id) = self.attention_focus() else {
             return;
         };
-        if matches!(action, 'y' | 'n') && self.current_kind() == Some("request") {
-            let answer = if action == 'y' { "Yes" } else { "No" };
+        if matches!(action, 'y' | 'n' | 'r') && self.current_kind() == Some("request") {
+            // r closes a request that needs nothing from the person; the step continues.
+            let answer = match action {
+                'y' => "Yes",
+                'n' => "No",
+                _ => "Nothing for me to do here.",
+            };
             if self.live {
                 self.effects.push(Effect::Attention {
                     id,
@@ -3325,6 +3538,21 @@ impl Ui {
             if matches!(mouse.kind, MouseEventKind::Down(_)) {
                 self.help = false;
             }
+            return;
+        }
+        // A program in the focused terminal that asked for the mouse gets its clicks there.
+        if self.terminal_focused()
+            && let Some(native) = self.native_terminal()
+            && let Some(body) = self.terminal_body.get()
+            && contains(body, mouse.column, mouse.row)
+            && let Some(bytes) = pty::mouse_bytes(
+                mouse,
+                mouse.column - body.x,
+                mouse.row - body.y,
+                native.mode(),
+            )
+        {
+            native.write(bytes);
             return;
         }
         match mouse.kind {
@@ -3423,16 +3651,26 @@ impl Ui {
                     )
                 };
                 if in_sidebar {
-                    let (lines, height) = {
+                    let (lines, height, tab) = {
                         let info = self.frame.borrow();
-                        (info.sidebar_lines, info.sidebar_height)
+                        (info.sidebar_lines, info.sidebar_height, info.sidebar_tab)
                     };
                     let mut tops = self.list_top.borrow_mut();
-                    tops[self.tab] = (tops[self.tab] as isize + delta)
+                    tops[tab] = (tops[tab] as isize + delta)
                         .clamp(0, lines.saturating_sub(height) as isize)
                         as usize;
                 } else if let Some(key) = pane {
-                    self.scroll_pane(&key, delta);
+                    // An attached terminal scrolls its own history (or tells its program).
+                    match self.native_terminal() {
+                        Some(native)
+                            if self.terminal.as_ref().is_some_and(|view| {
+                                key == Pane::Terminal(view.agent.clone()).key()
+                            }) =>
+                        {
+                            native.wheel(-(delta as i32));
+                        }
+                        _ => self.scroll_pane(&key, delta),
+                    }
                 }
             }
             _ => {}
@@ -3464,6 +3702,19 @@ impl Ui {
             Hit::PaletteChoice(index) => self.open_choice(Some(index), glass::Open::Here),
             Hit::Tab(tab) => self.switch_tab(tab),
             Hit::Row(index) => self.select(index),
+            Hit::SidebarRow(index) => {
+                if let Some(glasses) = self.glasses.as_mut() {
+                    let sidebar = &mut glasses.sidebar;
+                    sidebar.selected[sidebar.section] = index;
+                }
+                self.open_from_sidebar();
+            }
+            Hit::SidebarSection(section) => {
+                if let Some(glasses) = self.glasses.as_mut() {
+                    glasses.sidebar.section = section;
+                    glasses.sidebar.focused = true;
+                }
+            }
             Hit::Key(key) if self.popover.is_some() => {
                 let subject = self.popover.take().unwrap_or_default();
                 match key {
@@ -3892,13 +4143,14 @@ impl Drop for Guard {
     }
 }
 
-/// Whether glasses are asked for, and which: `stui --glass NAME` names one, `stui --glasses`
-/// opens the last one used on this device (`Some(None)`); plain stui asks for none.
+/// Which space to open: `stui --space NAME` names one; otherwise the last one used on this
+/// device (`Some(None)`). Spaces are how stui works; `--classic` keeps the old layout for a
+/// while (`None`). The older `--glass` and `--glasses` still work.
 pub fn glass_request(args: &[String]) -> Option<Option<String>> {
-    match arg(args, "--glass") {
-        Some(name) => Some(Some(name)),
-        None => args.iter().any(|arg| arg == "--glasses").then_some(None),
+    if args.iter().any(|arg| arg == "--classic") {
+        return None;
     }
+    Some(arg(args, "--space").or_else(|| arg(args, "--glass")))
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -3918,8 +4170,12 @@ pub fn run_demo(args: &[String]) -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.hide_cursor()?;
     let mut ui = Ui::new(demo::loading());
-    // The demo keeps its glasses in memory only.
-    ui.glasses = glass.map(|name| glass::Glasses::open(name, None));
+    // The demo keeps its glasses in memory only, and shows the sidebar as a new device does.
+    ui.glasses = glass.map(|name| {
+        let mut glasses = glass::Glasses::open(name, None);
+        glasses.sidebar.shown = true;
+        glasses
+    });
     ui.demo = Some(Demo {
         started: Instant::now(),
         loaded: false,
@@ -4179,6 +4435,7 @@ mod tests {
             cursor: None,
             stale: None,
             ended: None,
+            native: None,
         });
         for (key, shows) in [
             ("list:missions".to_owned(), "needs you".to_owned()),
@@ -4224,6 +4481,63 @@ mod tests {
             .map(|cell| cell.symbol())
             .collect::<String>();
         assert!(screen.contains("Not attached"));
+    }
+
+    #[test]
+    fn a_conversation_read_back_keeps_its_place_while_entries_come_and_go() {
+        let mut ui = Ui::new(demo::world());
+        ui.tab = 1;
+        let id = ui.selected_id().unwrap();
+        frame(&ui, 120, 30);
+        let pane = ui
+            .frame
+            .borrow()
+            .panes
+            .iter()
+            .find(|pane| pane.key.starts_with("chat:"))
+            .map(|pane| pane.rect)
+            .unwrap();
+        for _ in 0..4 {
+            ui.mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: pane.x + 2,
+                row: pane.y + 2,
+                modifiers: KeyModifiers::NONE,
+            });
+            frame(&ui, 120, 30);
+        }
+        // The rows read, without the scrollbar, whose thumb moves as the length changes.
+        let shown = |ui: &Ui| {
+            frame(ui, 120, 30)[usize::from(pane.y) + 1..usize::from(pane.y) + 8]
+                .iter()
+                .map(|line| {
+                    line.chars()
+                        .take(usize::from(pane.x + pane.width) - 2)
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+        };
+        let before = shown(&ui);
+        // The window slides (the oldest entry leaves), a reply arrives, and an entry above
+        // grows: what is being read stays where it is.
+        let Some(Load::Ready(entries)) = ui.world.conversations.get_mut(&id) else {
+            panic!("the demo agent has a conversation")
+        };
+        entries.remove(0);
+        entries.push(Entry {
+            id: "late".into(),
+            at: "09:59".into(),
+            body: Body::Assistant("a reply arrives below".into()),
+        });
+        assert_eq!(shown(&ui), before);
+        // At the bottom it follows as before.
+        press(&mut ui, KeyCode::End);
+        frame(&ui, 120, 30);
+        assert!(
+            frame(&ui, 120, 30)
+                .join("\n")
+                .contains("a reply arrives below")
+        );
     }
 
     #[test]
@@ -4542,6 +4856,7 @@ mod tests {
             cursor: Some((5, 2)),
             stale: Some("st closed the connection".into()),
             ended: None,
+            native: None,
         });
         let screen = frame(&ui, 120, 20).join("\n");
         assert!(screen.contains("row 5"), "{screen}");

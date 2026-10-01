@@ -2101,26 +2101,19 @@ async fn receive_client_read(
                     matches!(action_type.as_str(), "terminal.input" | "terminal.resize"),
                     "the terminal control action is invalid"
                 );
-                let screen = client.terminal_screen(&terminal_id).await?;
-                if screen.value.runtime_incarnation != runtime_incarnation
-                    || screen.value.next_sequence != expected_sequence
-                {
-                    return Err(ClientReadRejected {
-                        code: "stale-fence".into(),
-                        status: StatusCode::CONFLICT.as_u16(),
-                        message: "the terminal control fence is stale".into(),
-                    }
-                    .into());
-                }
+                // The owner checks its receipt before validating the terminal fence. A
+                // retry after an accepted input must not be refused because that input
+                // already changed the screen. Send the original terminal fence unchanged.
+                let snapshot = client.capabilities().await?.snapshot;
                 let fence = st3_client::Fence {
-                    snapshot_id: screen.snapshot.id,
+                    snapshot_id: snapshot.id,
                     subject_revisions: Default::default(),
                     mission_generation: None,
                     step_definition: None,
                     attempt: None,
                     readiness_epoch: None,
                     runtime_incarnation: Some(runtime_incarnation),
-                    terminal_sequence: Some(screen.value.next_sequence),
+                    terminal_sequence: Some(expected_sequence),
                     preview_token: None,
                 };
                 let result = match action_type.as_str() {

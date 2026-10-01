@@ -54,6 +54,11 @@ const linuxStageJob = ({
     },
     nixDevelopStep({ name: description ?? 'Run nextest', command: ['bash', 'scripts/ci-linux', stage] }),
     {
+      name: 'Save Nix outputs to the local Nix cache',
+      if: 'success()',
+      run: 'bash scripts/ci-nix-cache save || echo "::warning::could not save the local Nix cache"',
+    },
+    {
       name: 'Retain stage logs and timings',
       uses: 'actions/upload-artifact@v4',
       if: 'always()',
