@@ -265,6 +265,11 @@ impl Glasses {
     /// Open `wanted` (or the last glass used here, or `main`) from what this device keeps.
     pub(crate) fn open(wanted: Option<String>, store: Option<PathBuf>) -> Self {
         let stored = store.as_deref().map(glass_store::load).unwrap_or_default();
+        // A device that never chose shows the sidebar, as the old stui's list always was.
+        let sidebar = Sidebar {
+            shown: stored.sidebar.unwrap_or(store.is_some()),
+            ..Sidebar::default()
+        };
         let mut all = stored
             .glasses
             .into_iter()
@@ -302,7 +307,7 @@ impl Glasses {
             graph: false,
             zoomed: false,
             home: false,
-            sidebar: Sidebar::default(),
+            sidebar,
             pending: BTreeMap::new(),
             placeholder,
         }
@@ -338,6 +343,7 @@ impl Glasses {
         let Some(path) = &self.store else { return };
         let stored = Stored {
             version: 0,
+            sidebar: Some(self.sidebar.shown),
             last: Some(self.glass().name.clone()),
             glasses: self
                 .all
@@ -906,6 +912,7 @@ impl Ui {
             sidebar.shown = true;
             sidebar.focused = true;
         }
+        glasses.save();
     }
 
     /// Open the sidebar's selection as a new tab in the focused split; the keys go back to it.

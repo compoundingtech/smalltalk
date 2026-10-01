@@ -54,7 +54,7 @@ export function GlassesScreen() {
     <Banners />
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingBottom: 32 }}>
       <StatusLine />
-      {!glassesGranted ? <Note tone="warning">This gateway does not keep spaces yet, or this device was paired before it could. Spaces made in stui --spaces appear here once it does.</Note> : null}
+      {!glassesGranted ? <Note tone="warning">This gateway does not keep spaces yet, or this device was paired before it could. Spaces made in stui appear here once it does.</Note> : null}
       {glassesIssue ? <Note tone="fault">{glassesIssue}</Note> : null}
       {choices.length > 1 ? <View style={{ paddingHorizontal: 12, paddingVertical: 8 }}>
         <SegmentedControl
@@ -81,7 +81,7 @@ export function GlassesScreen() {
           })}
           {many && split.tabs.length === 0 ? <T dim style={{ paddingHorizontal: 12, paddingVertical: 6 }}>Empty on the computer too.</T> : null}
         </View>)}
-      </> : glassesGranted ? <Empty text="No spaces yet. Make one with stui --spaces on a computer." /> : null}
+      </> : glassesGranted ? <Empty text="No spaces yet. Make one in stui on a computer." /> : null}
     </ScrollView>
   </Screen>;
 }

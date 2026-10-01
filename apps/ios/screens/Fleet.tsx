@@ -52,12 +52,12 @@ export function FleetScreen() {
       <SectionHeader title="agent work" count={busy.length + unhealthy.length} />
       {unhealthy.map(agent => <ListRow key={`unhealthy-${agent.id}`} glyph="✕" glyphColor={theme.fault} title={agentName(agent)} second={`${agentHealth(agent).label} · observed ${ago(agent.updated_at, now)} ago`} />)}
       {busy.map(agent => <ListRow key={agent.id} glyph="⠿" glyphColor={theme.working} title={agentName(agent)} right={<T dim>{agent.active_work_count ?? 0} active</T>} second={queuedWorkSummary(agent, now) ?? undefined} />)}
-      <SectionHeader title="experiments" />
+      <SectionHeader title="tabs" />
       <ListRow
         glyph={glassesOn ? '●' : '○'}
         glyphColor={glassesOn ? theme.green : theme.overlay1}
-        title={`spaces · ${glassesOn ? 'on' : 'off'}`}
-        second="stui's tabs and splits, one at a time, in a Spaces tab"
+        title={`Spaces tab · ${glassesOn ? 'on' : 'off'}`}
+        second="stui's spaces, their tabs and splits, one thing at a time"
         onPress={() => actions.setGlassesOn(!glassesOn)}
         accessibilityLabel={`Spaces, ${glassesOn ? 'on' : 'off'}. Double-tap to turn ${glassesOn ? 'off' : 'on'}.`}
       />

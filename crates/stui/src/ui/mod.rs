@@ -4143,17 +4143,14 @@ impl Drop for Guard {
     }
 }
 
-/// Whether spaces are asked for, and which: `stui --space NAME` names one, `stui --spaces`
-/// opens the last one used on this device (`Some(None)`); plain stui asks for none. The older
-/// `--glass` and `--glasses` still work.
+/// Which space to open: `stui --space NAME` names one; otherwise the last one used on this
+/// device (`Some(None)`). Spaces are how stui works; `--classic` keeps the old layout for a
+/// while (`None`). The older `--glass` and `--glasses` still work.
 pub fn glass_request(args: &[String]) -> Option<Option<String>> {
-    match arg(args, "--space").or_else(|| arg(args, "--glass")) {
-        Some(name) => Some(Some(name)),
-        None => args
-            .iter()
-            .any(|arg| arg == "--spaces" || arg == "--glasses")
-            .then_some(None),
+    if args.iter().any(|arg| arg == "--classic") {
+        return None;
     }
+    Some(arg(args, "--space").or_else(|| arg(args, "--glass")))
 }
 
 fn arg(args: &[String], name: &str) -> Option<String> {
@@ -4173,8 +4170,12 @@ pub fn run_demo(args: &[String]) -> Result<()> {
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.hide_cursor()?;
     let mut ui = Ui::new(demo::loading());
-    // The demo keeps its glasses in memory only.
-    ui.glasses = glass.map(|name| glass::Glasses::open(name, None));
+    // The demo keeps its glasses in memory only, and shows the sidebar as a new device does.
+    ui.glasses = glass.map(|name| {
+        let mut glasses = glass::Glasses::open(name, None);
+        glasses.sidebar.shown = true;
+        glasses
+    });
     ui.demo = Some(Demo {
         started: Instant::now(),
         loaded: false,

@@ -56,7 +56,8 @@ function useAppStore() {
   // The Agents tab shows a list or a tree, as stui's `t` toggles. Debug links can set it, and ask
   // the visible screen to scroll for screenshots.
   const [treeView, setTreeView] = useState(false);
-  const [glassesOn, setGlassesOn] = useState(false);
+  // Spaces are how stui works, so the tab is on unless this phone turned it off.
+  const [glassesOn, setGlassesOn] = useState(true);
   const [glasses, setGlasses] = useState<Glass[]>([]), [glassesIssue, setGlassesIssue] = useState('');
   const [scrollRequest, setScrollRequest] = useState<{ y: number; at: number } | null>(null);
   const cachedActor = useRef(''), cacheSavedAt = useRef(0), cacheGeneration = useRef(0);
@@ -131,7 +132,7 @@ function useAppStore() {
   }, []);
 
   // Glasses: followed on the feed's socket while the experiment is on and the gateway grants them.
-  useEffect(() => { void AsyncStorage.getItem(GLASSES_KEY).then(value => setGlassesOn(value === '1')).catch(() => {}); }, []);
+  useEffect(() => { void AsyncStorage.getItem(GLASSES_KEY).then(value => setGlassesOn(value !== '0')).catch(() => {}); }, []);
   // Version 1 glasses are splits of tab groups; an earlier member's glasses are a shape this app no longer reads.
   const glassesGranted = caps?.capabilities.some(capability => capability.id === 'glasses' && capability.version >= 1 && capability.state === 'granted') ?? false;
   useEffect(() => {

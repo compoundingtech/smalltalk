@@ -234,6 +234,11 @@ pub fn run(context: Context) -> Result<()> {
     });
     // A glass opens where this device left it.
     ui.show_focused();
+    if ui.glasses.is_none() {
+        ui.flash(
+            "The classic layout is going away: plain stui opens spaces, with Ctrl+S for this list",
+        );
+    }
 
     let _guard = Guard::enter(ui.glasses.is_some())?;
     // How images are drawn: asked of a terminal known to draw them, once, inside the
