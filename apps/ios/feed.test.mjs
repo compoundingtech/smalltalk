@@ -42,7 +42,14 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
 
   // A refused window is reported by name, and the other windows keep going.
   sockets[0].frame({ kind: 'error', id: 'attention', message: 'invalid subscription' });
-  assert.deepEqual(seen.errors, ['attention: invalid subscription']);
+  assert.deepEqual(seen.errors, ['attention: invalid subscription · trying again']);
+  // st stopped sending it, so it is asked for again after the backoff, said only once.
+  await new Promise(resolve => setTimeout(resolve, 20));
+  assert.deepEqual(sockets[0].sent.at(-1), { kind: 'subscribe', id: 'attention', collection: 'attention', limit: sockets[0].sent.find(sent => sent.id === 'attention').limit });
+  sockets[0].frame({ kind: 'error', id: 'attention', message: 'invalid subscription' });
+  assert.equal(seen.errors.length, 1, 'a failure that keeps happening is said once');
+  // Once it loads, nothing more is scheduled for it.
+  sockets[0].frame({ kind: 'snapshot', id: 'attention', collection: 'attention', snapshot: snapshot(4), items: [], order: [], has_more: false });
   sockets[0].frame({ kind: 'snapshot', id: 'agents', collection: 'agents', snapshot: snapshot(3), items: [agent('agent/one')], order: ['agent/one'], has_more: false });
   assert.deepEqual(seen.windows.agents.ids, ['agent/one']);
   assert.deepEqual(seen.connection, ['connecting', 'live'], 'a socket goes live once, at its first snapshot');
@@ -141,7 +148,7 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
   sockets[0].frame({ kind: 'conversation', id: 'conversation', collection: 'conversation', session_id: 'session/one', replace: false, items: [{ id: 'entry/2' }] });
   assert.deepEqual(frames.map(frame => [frame.replace, frame.items.map(item => item.id), frame.hasMore]), [[true, ['entry/1'], true], [false, ['entry/2'], false]]);
   sockets[0].frame({ kind: 'error', id: 'conversation', collection: 'conversation', code: 'remote-unavailable', message: 'owner host/two is temporarily unavailable' });
-  assert.equal(issues.at(-1), 'remote-unavailable: owner host/two is temporarily unavailable · trying again');
+  assert.equal(issues.at(-1), 'two cannot be reached right now · trying again');
   // An ended subscription is asked for again after the backoff.
   const before = sockets[0].sent.length;
   await new Promise(resolve => setTimeout(resolve, 20));
@@ -180,7 +187,7 @@ const subscribed = socket => socket.sent.filter(command => command.kind === 'sub
   sockets[0].frame({ kind: 'changes', id: 'glasses', collection: 'glasses', snapshot, upserts: [glass('b', 'review')], removes: [], order: ['glass/person/avery/a', 'glass/person/avery/b'], has_more: false });
   assert.deepEqual(seen, [['main'], ['main', 'review']]);
   sockets[0].frame({ kind: 'error', id: 'glasses', collection: 'glasses', code: 'forbidden', message: 'this device lacks read.glasses' });
-  assert.equal(issues.at(-1), 'forbidden: this device lacks read.glasses');
+  assert.equal(issues.at(-1), 'not allowed: this device lacks read.glasses');
   sockets[0].drop(new Error('lost'));
   await settle();
   assert.ok(subscribed(sockets[1]).includes('glasses'), 'a reconnect follows the glasses again');
