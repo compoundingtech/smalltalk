@@ -158,7 +158,7 @@ impl Store {
             .unwrap_or_else(PoisonError::into_inner);
         match *fault {
             Some(TrimFault::TouchGraph) => {
-                transaction.execute("UPDATE graph_generation SET value=value+1", [])?;
+                transaction.execute("UPDATE projection_digest_generation SET value=value+1", [])?;
             }
             Some(TrimFault::ChangeGraph) => {
                 transaction.execute(
@@ -585,11 +585,11 @@ impl Store {
                 .collect::<Vec<_>>();
             // Deleting claims touches no graph table, so the generation stays. Only if it moved
             // are the digests themselves compared, before and after, in this transaction.
-            let generation = graph_generation(&transaction)?;
+            let generation = projection_digest::generation(&transaction)?;
             transaction.execute_batch("SAVEPOINT trim_chunk")?;
             delete_dropped_rows_tx(&transaction, &envelopes, &claims)?;
             self.alter_graph_for_trim_fault(&transaction)?;
-            let changed = if graph_generation(&transaction)? == generation {
+            let changed = if projection_digest::generation(&transaction)? == generation {
                 false
             } else {
                 let after = graph_digest(&transaction)?;

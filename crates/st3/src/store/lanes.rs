@@ -391,8 +391,8 @@ fn lane_view_tx(connection: &Connection, declaration: &DesiredSubject) -> Result
 }
 
 /// A lane's claims in the store's replica-stable order.
-fn lane_events_tx(connection: &Connection, subject: &str) -> Result<Vec<Event>> {
-    let mut statement = connection.prepare_cached(
+pub(super) fn lane_events_tx(connection: &Connection, subject: &str) -> Result<Vec<Event>> {
+    let mut statement = connection.prepare_cached(&canonical_sql(
         "SELECT claims.id, claims.kind, claims.actor, claims.body, claims.accepted_at_unix_ms
          FROM claims JOIN batches ON batches.id=claims.batch_id
          WHERE claims.subject=?1 AND claims.kind IN
@@ -402,9 +402,8 @@ fn lane_events_tx(connection: &Connection, subject: &str) -> Result<Vec<Event>> 
                WHERE replica_records.claim_id=claims.id
                  AND replica_records.state='repaired'
            )
-         ORDER BY length(claims.accepted_at_unix_ms), claims.accepted_at_unix_ms,
-                  batches.origin, batches.replica_sequence, claims.store_index",
-    )?;
+         ORDER BY CANONICAL_ASC(claims)",
+    ))?;
     let rows = statement.query_map([subject], |row| {
         Ok((
             row.get::<_, String>(0)?,

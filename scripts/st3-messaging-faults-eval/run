@@ -11,8 +11,10 @@ import shlex
 import shutil
 import signal
 import socket
+import secrets
 import tempfile
 import time
+import tomllib
 import uuid
 
 HERE = Path(__file__).resolve().parent
@@ -59,9 +61,12 @@ class Link:
         self.enabled = True
         self.connections = set()
         self.servers = []
+        self.events = []
 
     async def listen(self, target_port):
         async def accept(reader, writer):
+            self.events.append({"at_unix_ms": now_ms(), "event": "connect", "port": target_port,
+                                "enabled": self.enabled})
             self.connections.add(writer)
             upstream = None
             try:
@@ -70,16 +75,20 @@ class Link:
                 peer_reader, upstream = await asyncio.open_connection("127.0.0.1", target_port)
                 self.connections.add(upstream)
 
-                async def copy(source, destination):
+                async def copy(source, destination, direction):
                     while self.enabled:
                         chunk = await source.read(65536)
                         if not chunk:
                             break
+                        if chunk.startswith((b"POST ", b"GET ", b"HEAD ", b"HTTP/")):
+                            self.events.append({"at_unix_ms": now_ms(), "event": direction,
+                                                "port": target_port,
+                                                "line": chunk.split(b"\r\n", 1)[0].decode(errors="replace")})
                         destination.write(chunk)
                         await destination.drain()
                     destination.close()
 
-                await asyncio.gather(copy(reader, upstream), copy(peer_reader, writer))
+                await asyncio.gather(copy(reader, upstream, "request"), copy(peer_reader, writer, "response"))
             except (OSError, ConnectionError):
                 pass
             finally:
@@ -103,10 +112,25 @@ class Link:
             await server.wait_closed()
 
 
+_PORT_RESERVATIONS = {}
+
+
 def free_port():
-    with socket.socket() as listener:
-        listener.bind(("127.0.0.1", 0))
-        return listener.getsockname()[1]
+    # Keep the selected listener reserved throughout daemon startup. Allocate
+    # below Linux's ephemeral range so an outgoing proxy/client connection
+    # cannot take it during the handover to the replication worker.
+    ephemeral_start = int(Path("/proc/sys/net/ipv4/ip_local_port_range").read_text().split()[0])
+    for _ in range(100):
+        port = 1024 + secrets.randbelow(ephemeral_start - 1024)
+        listener = socket.socket()
+        try:
+            listener.bind(("127.0.0.1", port))
+        except OSError:
+            listener.close()
+            continue
+        _PORT_RESERVATIONS[port] = listener
+        return port
+    raise RuntimeError("could not reserve an isolated replication port")
 
 
 class Node:
@@ -177,13 +201,35 @@ class Node:
             return None
 
     async def start(self):
+        config = tomllib.loads((self.root / "config.toml").read_text())
+        peer_host, peer_port = config["peer_listen"].rsplit(":", 1)
+        peer_port = int(peer_port)
+        # Restarts reserve their original address again before starting up.
+        if peer_port not in _PORT_RESERVATIONS:
+            listener = socket.socket()
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            listener.bind((peer_host, peer_port))
+            listener.listen()
+            _PORT_RESERVATIONS[peer_port] = listener
         self.daemon = await self.spawn(["up", "--config", str(self.root / "config.toml")], "daemon.log")
         async def ready():
             if self.daemon.returncode is not None:
                 raise RuntimeError("isolated daemon exited: " + (self.root / "daemon.log").read_text()[-2000:])
             return await self.api("/v1/replication/status")
         await until(ready)
+        _PORT_RESERVATIONS.pop(peer_port).close()
         self.worker = await self.spawn(["replication-worker", "--config", str(self.root / "config.toml")], "worker.log")
+        async def peer_ready():
+            if self.worker.returncode is not None:
+                raise RuntimeError("isolated replication worker exited: " + (self.root / "worker.log").read_text()[-2000:])
+            try:
+                _, writer = await asyncio.open_connection(peer_host, peer_port)
+                writer.close()
+                await writer.wait_closed()
+                return True
+            except OSError:
+                return False
+        await until(peer_ready)
 
     async def down(self):
         await stop(self.worker)
@@ -448,6 +494,12 @@ agent "fault-probe" {{
         reads = [row for row in relevant if row["event"] == "read"]
         read_at = min((row["accepted_at_unix_ms"] for row in reads), default=None)
         delay = read_at - cleared if read_at is not None else None
+        requests = [event["at_unix_ms"] for event in link.events
+                    if event["event"] == "request" and event["at_unix_ms"] >= cleared]
+        first_request = min(requests, default=None)
+        result.update(first_request_after_clear_ms=first_request - cleared if first_request is not None else None,
+                      read_after_first_request_ms=read_at - first_request
+                          if read_at is not None and first_request is not None else None)
         starts = [row for row in all_receipts if row["event"] == "started"]
         expected_starts = 2 if case == "harness-restart" else 1
         trace_text = await target.cli("trace", "show", subject, "--json", "--limit", "100")
@@ -478,6 +530,7 @@ agent "fault-probe" {{
             trace = await node.cli("trace", "show", "agent/eval/fault-probe", "--json", "--limit", "100", check=False)
             (directory / f"{node.name}-error-trace.jsonl").write_text(trace)
     finally:
+        write_json(directory / "link-events.json", link.events)
         await link.close()
         for node in reversed(nodes):
             terminal = await asyncio.create_subprocess_exec("pty", "peek", "--plain", "--full", "eval.fault-probe",

@@ -666,8 +666,10 @@ fn missions(model: &Model) -> Vec<Mission> {
             } else if !work.is_empty()
                 && work.iter().all(|step| {
                     step.state == "completed"
-                        || (matches!(step.state.as_str(), "claimed" | "running")
-                            && step.agentless
+                        || (matches!(
+                            step.state.as_str(),
+                            "claimed" | "working" | "running" | "verifying"
+                        ) && step.agentless
                             && keeps_open(&step.path))
                 })
                 && work.iter().any(|step| step.state != "completed")
@@ -676,7 +678,7 @@ fn missions(model: &Model) -> Vec<Mission> {
                 Word::Watching
             } else if states
                 .iter()
-                .any(|state| matches!(*state, "claimed" | "running"))
+                .any(|state| matches!(*state, "claimed" | "working" | "running" | "verifying"))
             {
                 Word::Working
             } else if let Some(ready) = work
@@ -694,7 +696,10 @@ fn missions(model: &Model) -> Vec<Mission> {
                     Some(_) => Word::Queued,
                     None => Word::Unclaimed,
                 }
-            } else if states.contains(&"waiting") {
+            } else if states
+                .iter()
+                .any(|state| matches!(*state, "waiting" | "pending"))
+            {
                 Word::Held
             } else if matches!(
                 mission.state.as_str(),
@@ -709,10 +714,10 @@ fn missions(model: &Model) -> Vec<Mission> {
                 .map(|step| {
                     let state = match step.state.as_str() {
                         "completed" => StepState::Done,
-                        "claimed" | "running" => StepState::Working,
+                        "claimed" | "working" | "running" | "verifying" => StepState::Working,
                         "ready" => StepState::Ready,
-                        "waiting" => StepState::Waiting,
-                        "blocked" => StepState::Waiting,
+                        "waiting" | "pending" | "blocked" => StepState::Waiting,
+                        "cancelled" => StepState::Cancelled,
                         "failed" => StepState::Failed,
                         _ => StepState::Pending,
                     };
@@ -762,7 +767,7 @@ fn missions(model: &Model) -> Vec<Mission> {
             // one working now.
             let mut steps = steps;
             steps.sort_by_key(|step| match step.state {
-                StepState::Done => 0,
+                StepState::Done | StepState::Cancelled => 0,
                 StepState::NeedsYou | StepState::Failed => 1,
                 StepState::Working => 2,
                 StepState::Ready => 3,
@@ -1323,11 +1328,11 @@ mod tests {
     fn small_talk_in_the_timeline_draws_as_mail_and_step_pings_as_events() {
         let timeline: Vec<TimelineEntry> = serde_json::from_value(serde_json::json!([
             {"id":"e1","sequence":4,"revision":1,"timestamp":"2026-09-29T10:00:00Z","role":"user","type":"message","final":true,
-             "body":{"message_id":"message/one","from":"agent/fleet/harbor","to":"agent/fleet/cos","title":"A question"}},
+             "body":{"message_id":"message/one","from":"agent/example/harbor","to":"agent/example/cos","title":"A question"}},
             {"id":"e2","sequence":5,"revision":1,"timestamp":"2026-09-29T10:00:00Z","role":"user","type":"content","final":true,
              "body":{"media_type":"text/plain","text":"Can you look?"}},
             {"id":"e3","sequence":8,"revision":1,"timestamp":"2026-09-29T10:01:00Z","role":"user","type":"message","final":true,
-             "body":{"message_id":"message/two","from":"daemon/runtime","to":"agent/fleet/cos","title":"Mission step ready: review"}},
+             "body":{"message_id":"message/two","from":"daemon/runtime","to":"agent/example/cos","title":"Mission step ready: review"}},
             {"id":"e4","sequence":9,"revision":1,"timestamp":"2026-09-29T10:01:00Z","role":"user","type":"content","final":true,
              "body":{"media_type":"text/plain","text":"A mission step is ready."}},
             {"id":"e5a","sequence":11,"revision":1,"timestamp":"2026-09-29T10:02:00Z","role":"assistant","type":"message","final":true,
@@ -1336,7 +1341,7 @@ mod tests {
              "body":{"media_type":"text/plain","text":"On it."}}
         ]))
         .unwrap();
-        let names = BTreeMap::from([("agent/fleet/cos".to_owned(), "COS".to_owned())]);
+        let names = BTreeMap::from([("agent/example/cos".to_owned(), "COS".to_owned())]);
         let entries = conversation(&timeline, &names);
         assert_eq!(entries.len(), 3, "{entries:#?}");
         match &entries[0].body {
@@ -1528,13 +1533,13 @@ mod tests {
             "goals": ["Audit dependencies"],
             "display_order": ["scan", "merge"],
             "steps": {
-                "scan": {"path": "scan", "work_selector": {"kind": "assigned", "agent": "agent/fleet/auditor"}, "dependencies": [], "gates": []},
+                "scan": {"path": "scan", "work_selector": {"kind": "assigned", "agent": "agent/example/auditor"}, "dependencies": [], "gates": []},
                 "merge": {"path": "merge", "work_selector": {"kind": "agentless"}, "dependencies": [{"dependency": "step", "step": "scan", "state": "completed"}], "gates": [{"reviewer": "person/robin"}]}
             }
         });
         let preview = preview("harbor/audit", &normalized);
         assert_eq!(preview.goals, vec!["Audit dependencies"]);
-        assert_eq!(preview.steps[0].assignee, "fleet/auditor");
+        assert_eq!(preview.steps[0].assignee, "example/auditor");
         assert_eq!(preview.steps[1].after, vec!["scan"]);
         assert!(preview.steps[1].asks_you);
         assert_eq!(preview.agents.len(), 1);
@@ -1620,11 +1625,54 @@ mod tests {
     }
 
     #[test]
+    fn mission_steps_map_every_contract_state_and_held_work_is_working() {
+        for (state, expected) in [
+            ("waiting", StepState::Waiting),
+            ("ready", StepState::Ready),
+            ("claimed", StepState::Working),
+            ("blocked", StepState::Waiting),
+            ("verifying", StepState::Working),
+            ("completed", StepState::Done),
+            ("failed", StepState::Failed),
+            ("cancelled", StepState::Cancelled),
+            // Cached projections from older daemons keep their meaning.
+            ("working", StepState::Working),
+            ("pending", StepState::Waiting),
+        ] {
+            let mut model = Model::default();
+            model.missions = window(vec![serde_json::json!({
+                "id": "mission/fleet/harbor/build", "kind": "mission", "revision": "r1",
+                "updated_at": "2026-09-29T09:58:00Z", "title": "fleet/harbor/build",
+                "state": "running", "mission_revision": "r1", "runs": ["mission-run/build-1"],
+                "run_details": [{
+                    "id": "mission-run/build-1", "requester": "person/avery", "status": "running",
+                    "phase": "normal", "progress": {"done": 0, "total": 2}, "current_steps": [],
+                    "must_act": "agent", "state_since": "2026-09-29T09:58:00Z",
+                    "steps": [
+                        {"id": "step-run/build-1/build", "path": "build", "state": state, "attempt": 1,
+                         "claimant": "agent/example/harbor/builder", "since": "2026-09-29T09:58:00Z"},
+                        {"id": "step-run/build-1/deploy", "path": "deploy", "state": "waiting", "attempt": 0,
+                         "since": "2026-09-29T09:58:00Z"}
+                    ],
+                }],
+            })]);
+            let world = world(&model, "person/avery", &Extras::default());
+            let Load::Ready(missions) = &world.missions else {
+                panic!("missions loaded")
+            };
+            assert_eq!(missions[0].steps[0].state, expected, "{state}");
+            if expected == StepState::Working {
+                assert_eq!(missions[0].word, Word::Working, "{state}");
+            }
+        }
+    }
+
+    #[test]
     fn missions_and_agents_read_what_st_joined_without_work_or_runtime_lists() {
         let step = |id: &str, path: &str, state: &str, claimant: Option<&str>| {
             serde_json::json!({
                 "id": id, "path": path, "state": state, "attempt": 1,
-                "assignee": "agent/fleet/harbor/keeper", "claimant": claimant,
+                "assignee": "agent/example/harbor/keeper", "claimant": claimant,
                 "since": "2026-09-29T09:58:00Z", "goals": [format!("Do {path}.")],
                 "constraints": [], "blockers": [],
             })
@@ -1654,13 +1702,13 @@ mod tests {
                 // A finished earlier run whose steps must not mix with the open one.
                 run("mission-run/audit-0", "completed", vec![step("step-run/old/scan", "scan", "completed", None)]),
                 run("mission-run/audit-1", "running", vec![
-                    step("step-run/audit-1/scan", "scan", "claimed", Some("agent/fleet/harbor/keeper")),
+                    step("step-run/audit-1/scan", "scan", "claimed", Some("agent/example/harbor/keeper")),
                     step("step-run/audit-1/report", "report", "ready", None),
                 ]),
             ],
         })]);
         model.agents = window(vec![serde_json::json!({
-            "id": "agent/fleet/harbor/keeper", "kind": "agent", "revision": "r2",
+            "id": "agent/example/harbor/keeper", "kind": "agent", "revision": "r2",
             "updated_at": "2026-09-29T09:59:00Z", "name": "fleet/harbor/keeper",
             "state": "running", "reachability": "local", "harness_state": "working",
             "host_id": "host/lighthouse", "runtime_ids": ["runtime/keeper"],
@@ -1689,7 +1737,7 @@ mod tests {
             [("scan", StepState::Working), ("report", StepState::Ready)]
         );
         assert_eq!(mission.steps[0].goals, ["Do scan."]);
-        assert_eq!(mission.agents, ["agent/fleet/harbor/keeper"]);
+        assert_eq!(mission.agents, ["agent/example/harbor/keeper"]);
         assert_eq!(
             mission.steps[1].note.as_deref(),
             Some("queued for Keeper, which is busy with fleet/harbor · Audit › scan")

@@ -1614,11 +1614,38 @@ mod tests {
         alder.set_trim_fault(Some(TrimFault::TouchGraph));
         assert_eq!(kinds(&step(&alder, &context)), ["trimmed"]);
 
-        let (_, graph) = authority(&birch);
+        let mut projection_tables = projection_digest::tables(&birch.readers.get()).unwrap();
+        projection_tables.remove("claim_sources");
+        projection_tables.remove("operations");
+        let previous_operations = projection_digest::operation_rows();
+        let previous_operations = birch
+            .readers
+            .get()
+            .prepare(&previous_operations)
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .unwrap();
         let held = claim_ids(&birch);
         birch.set_trim_fault(Some(TrimFault::ChangeGraph));
         assert_eq!(kinds(&step(&birch, &context)), ["graph-changed"]);
-        assert_eq!(authority(&birch).1, graph);
+        let mut current_tables = projection_digest::tables(&birch.readers.get()).unwrap();
+        current_tables.remove("claim_sources");
+        current_tables.remove("operations");
+        let current_operations = birch
+            .readers
+            .get()
+            .prepare(&projection_digest::operation_rows())
+            .unwrap()
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<BTreeSet<_>>>()
+            .unwrap();
+        assert!(current_operations.is_superset(&previous_operations));
+        // The new checkpoint fault, diagnostic claims and their operation rows change digests.
+        // Earlier shared rows remain intact when the trim transaction is refused.
+        assert_eq!(current_tables, projection_tables);
         assert!(claim_ids(&birch).is_superset(&held));
         let status = birch.checkpoint_status(context.now_unix_ms, &[]).unwrap();
         assert!(status.halted);

@@ -3419,6 +3419,7 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
             "at",
             "every",
             "anchor",
+            "calendar",
             "catch-up",
             "max-catch-up",
             "work",
@@ -3431,6 +3432,7 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
         "at",
         "every",
         "anchor",
+        "calendar",
         "catch-up",
         "max-catch-up",
         "work",
@@ -3439,17 +3441,20 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
     }
     let at = child_string(body, "at")?;
     let every = child_string(body, "every")?;
-    if at.is_some() == every.is_some() {
+    let calendar = unique_child(body, "calendar")?;
+    if usize::from(at.is_some()) + usize::from(every.is_some()) + usize::from(calendar.is_some())
+        != 1
+    {
         return Err(St3Error::new(
             "invalid-schedule-time",
-            "a schedule needs exactly one of `at` and `every`",
+            "a schedule needs exactly one of `at`, `every`, and `calendar`",
         ));
     }
     let anchor = child_string(body, "anchor")?;
-    if at.is_some() && anchor.is_some() || every.is_some() && anchor.is_none() {
+    if anchor.is_some() != every.is_some() {
         return Err(St3Error::new(
             "invalid-schedule-anchor",
-            "an interval schedule needs an anchor and a one-time schedule cannot have one",
+            "only an interval schedule has an anchor, and it requires one",
         ));
     }
     if let Some(at) = at.as_deref().or(anchor.as_deref()) {
@@ -3457,6 +3462,26 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
     }
     if let Some(every) = every {
         parse_duration(&every, true)?;
+    }
+    if let Some(calendar) = calendar {
+        ensure_bare(calendar)?;
+        let calendar_body = calendar.children().ok_or_else(|| {
+            St3Error::new(
+                "invalid-schedule-calendar",
+                "a calendar needs `at` and `timezone`",
+            )
+        })?;
+        reject_unknown_children(calendar_body, &["at", "timezone"], "calendar", "calendar")?;
+        unique_child(calendar_body, "at")?;
+        unique_child(calendar_body, "timezone")?;
+        parse_calendar_time(&required_child_string(calendar_body, "at", "calendar")?)?;
+        let timezone = required_child_string(calendar_body, "timezone", "calendar")?;
+        timezone.parse::<chrono_tz::Tz>().map_err(|_| {
+            St3Error::new(
+                "invalid-schedule-timezone",
+                format!("unknown IANA timezone `{timezone}`"),
+            )
+        })?;
     }
     let catch_up = child_string(body, "catch-up")?;
     let max = child_integer(body, "max-catch-up")?;
@@ -3509,7 +3534,13 @@ fn validate_schedule(node: &KdlNode) -> Result<(), St3Error> {
     unique_child(work_body, "mission")?;
     unique_child(work_body, "workspace")?;
     let reference = required_child_string(work_body, "mission", "schedule work")?;
-    validate_exact_mission_reference(&reference)?;
+    if reference.contains('@') {
+        validate_exact_mission_reference(&reference)?;
+    } else {
+        crate::mission::validate_mission_id(
+            reference.strip_prefix("mission/").unwrap_or(&reference),
+        )?;
+    }
     let workspace = required_child_string(work_body, "workspace", "schedule work")?;
     if workspace.trim().is_empty() {
         return Err(St3Error::new(
@@ -3691,6 +3722,60 @@ fn parse_utc_time(value: &str) -> Result<i64, St3Error> {
         .map_err(|error| St3Error::new("invalid-utc-time", error.to_string()))
 }
 
+fn parse_calendar_time(value: &str) -> Result<(Option<u8>, u16), St3Error> {
+    let (weekday, clock) = value
+        .split_once(' ')
+        .map_or((None, value), |(day, clock)| (Some(day), clock));
+    let weekday = match weekday {
+        None => None,
+        Some("Mon") => Some(1),
+        Some("Tue") => Some(2),
+        Some("Wed") => Some(3),
+        Some("Thu") => Some(4),
+        Some("Fri") => Some(5),
+        Some("Sat") => Some(6),
+        Some("Sun") => Some(7),
+        Some(_) => {
+            return Err(St3Error::new(
+                "invalid-schedule-calendar",
+                "calendar `at` must be HH:MM or Mon HH:MM (Mon–Sun)",
+            ));
+        }
+    };
+    let (hours, minutes) = clock.split_once(':').ok_or_else(|| {
+        St3Error::new(
+            "invalid-schedule-calendar",
+            "calendar `at` must be HH:MM or Mon HH:MM (Mon–Sun)",
+        )
+    })?;
+    if hours.len() != 2
+        || minutes.len() != 2
+        || !hours
+            .bytes()
+            .chain(minutes.bytes())
+            .all(|byte| byte.is_ascii_digit())
+    {
+        return Err(St3Error::new(
+            "invalid-schedule-calendar",
+            "calendar `at` must use 24-hour HH:MM",
+        ));
+    }
+    let hour: u16 = hours
+        .parse()
+        .map_err(|_| St3Error::new("invalid-schedule-calendar", "invalid hour"))?;
+    let minute: u16 = minutes
+        .parse()
+        .map_err(|_| St3Error::new("invalid-schedule-calendar", "invalid minute"))?;
+    if hour >= 24 || minute >= 60 {
+        return Err(St3Error::new(
+            "invalid-schedule-calendar",
+            "calendar `at` must be a valid local time",
+        ));
+    }
+    Ok((weekday, hour * 60 + minute))
+}
+
+
 pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> {
     let children = value.get("children")?.as_array()?;
     if children.len() == 1 && children[0].get("name").and_then(Value::as_str) == Some("stop") {
@@ -3700,6 +3785,7 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
             at_unix_ms: None,
             every_ms: None,
             anchor_unix_ms: None,
+            calendar: None,
             catch_up: "latest".into(),
             max_catch_up: None,
             work: None,
@@ -3719,6 +3805,18 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
     let anchor_unix_ms = canonical_child_value(value, "anchor")
         .and_then(Value::as_str)
         .and_then(|value| parse_utc_time(value).ok());
+    let calendar = children
+        .iter()
+        .find(|child| child.get("name").and_then(Value::as_str) == Some("calendar"))
+        .and_then(|node| {
+            let (weekday, at_minute) =
+                parse_calendar_time(canonical_child_value(node, "at")?.as_str()?).ok()?;
+            Some(crate::model::CalendarSchedule {
+                weekday,
+                at_minute,
+                timezone: canonical_child_value(node, "timezone")?.as_str()?.to_owned(),
+            })
+        });
     let catch_up = canonical_child_value(value, "catch-up")
         .and_then(Value::as_str)
         .unwrap_or("latest")
@@ -3731,7 +3829,10 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
         .find(|child| child.get("name").and_then(Value::as_str) == Some("work"))?;
     let reference = canonical_child_value(work_node, "mission")?.as_str()?;
     let reference = reference.strip_prefix("mission/").unwrap_or(reference);
-    let (mission, revision) = reference.rsplit_once('@')?;
+    let (mission, revision) = match reference.rsplit_once('@') {
+        Some((mission, revision)) => (mission, Some(revision.to_owned())),
+        None => (reference, None),
+    };
     let mut inputs = BTreeMap::new();
     for input in work_node
         .get("children")?
@@ -3751,11 +3852,12 @@ pub fn schedule_spec(value: &Value, default_host: &str) -> Option<ScheduleSpec> 
         at_unix_ms,
         every_ms,
         anchor_unix_ms,
+        calendar,
         catch_up,
         max_catch_up,
         work: Some(crate::model::ScheduledWork {
             mission: mission.to_owned(),
-            revision: revision.to_owned(),
+            revision,
             workspace: canonical_child_value(work_node, "workspace")?
                 .as_str()?
                 .to_owned(),
@@ -4728,15 +4830,15 @@ mod tests {
     #[test]
     fn accepts_a_durable_agent_seat_but_rejects_unowned_tasks() {
         let intent = parse_intent(
-            "version 2\nagent \"fleet/cos/standing/cos\" { command \"true\" }",
+            "version 2\nagent \"example/cos/standing/cos\" { command \"true\" }",
             "host",
         )
         .expect("a durable seat is valid desired state");
-        let seat = &intent.subjects["agent/fleet/cos/standing/cos"];
+        let seat = &intent.subjects["agent/example/cos/standing/cos"];
         assert!(seat.owner_run.is_none());
         assert_eq!(
             seat.member.as_ref().unwrap().runtime_id,
-            "fleet.cos.standing.cos"
+            "example.cos.standing.cos"
         );
 
         let error = parse_intent("version 2\npty \"worker\" { command \"true\" }", "host")
@@ -5492,6 +5594,35 @@ observer "github" {
         let error = parse_test_intent(&source.replace("5m", "0s"), "node").unwrap_err();
         assert_eq!(error.code, "invalid-duration");
     }
+    #[test]
+    fn daily_calendar_is_exclusive_and_requires_valid_local_time_and_zone() {
+        let source = r#"version 2
+schedule "daily" {
+    calendar { at "08:00"; timezone "Europe/Berlin" }
+    catch-up "latest"
+    work { mission "work@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"; workspace "/tmp/work" }
+}"#;
+        let intent = parse_test_intent(source, "node").unwrap();
+        let spec = schedule_spec(&intent.subjects["schedule/daily"].desired, "node").unwrap();
+        assert_eq!(spec.calendar.as_ref().unwrap().at_minute, 480);
+        assert_eq!(spec.calendar.as_ref().unwrap().weekday, None);
+        assert_eq!(spec.calendar.as_ref().unwrap().timezone, "Europe/Berlin");
+        assert!(spec.at_unix_ms.is_none());
+        assert!(spec.every_ms.is_none());
+        let weekly = parse_test_intent(&source.replace("08:00", "Mon 09:00"), "node").unwrap();
+        let weekly = schedule_spec(&weekly.subjects["schedule/daily"].desired, "node").unwrap();
+        assert_eq!(weekly.calendar.as_ref().unwrap().weekday, Some(1));
+        assert_eq!(weekly.calendar.as_ref().unwrap().at_minute, 540);
+        for (changed, code) in [
+            (source.replace("08:00", "24:00"), "invalid-schedule-calendar"),
+            (source.replace("Europe/Berlin", "Europe/NotAZone"), "invalid-schedule-timezone"),
+            (source.replace("08:00", "Funday 08:00"), "invalid-schedule-calendar"),
+            (source.replace("calendar {", "every \"1d\"; anchor \"2026-01-01T00:00:00Z\"; calendar {"), "invalid-schedule-time"),
+        ] {
+            assert_eq!(parse_test_intent(&changed, "node").unwrap_err().code, code);
+        }
+    }
+
 
     #[test]
     fn strict_grammar_rejects_unknown_children_and_properties() {
@@ -5623,7 +5754,7 @@ subscription "reviews" {{
       mission "review@{revision}"
       resource "pull-request"
       workspace "/work/reviews"
-      requester "agent/fleet/repository/standing/owner"
+      requester "agent/example/repository/standing/owner"
     }}
 }}"#
         );
@@ -5640,7 +5771,7 @@ subscription "reviews" {{
         assert_eq!(spec.resource_input.as_deref(), Some("pull-request"));
         assert_eq!(
             spec.requester.as_deref(),
-            Some("agent/fleet/repository/standing/owner")
+            Some("agent/example/repository/standing/owner")
         );
     }
 
@@ -5672,7 +5803,7 @@ resource "pull" { kind "vcs.pull-request" }
 observer "pull" { resource "resource/pull"; provider "github.pull-request"; locator "owner/repo#1"; field "checks" }
 subscription "green" {
   observer "observer/pull"
-  to "agent/fleet/cos/standing/cos"
+  to "agent/example/cos/standing/cos"
   on "checks"
   when {
     every "checks" {
@@ -5712,6 +5843,44 @@ subscription "green" {
         assert_eq!(
             parse_test_intent(&invalid, "node").unwrap_err().code,
             "unknown-subscription-condition"
+        );
+    }
+    #[test]
+    fn only_scheduled_work_accepts_an_unpinned_mission() {
+        for anchor in ["2026-10-25T01:00:00Z", "2027-03-28T01:00:00Z"] {
+            let source = format!(r#"version 2
+schedule "cycle" {{
+  host "local"
+  every "1h"
+  anchor "{anchor}"
+  work {{ mission "mission/fabric/cycle"; workspace "/tmp/cycles" }}
+}}"#);
+            let intent = parse_test_intent(&source, "node").unwrap();
+            let schedule = intent.subjects.values().find(|item| item.kind == "schedule").unwrap();
+            let spec = schedule_spec(&schedule.desired, "node").unwrap();
+            assert_eq!(spec.anchor_unix_ms, Some(parse_utc_time(anchor).unwrap()));
+            let work = spec.work.unwrap();
+            assert_eq!(work.mission, "fabric/cycle");
+            assert_eq!(work.revision, None);
+            let pinned = source.replace(
+                "mission/fabric/cycle\"",
+                &format!("mission/fabric/cycle@{}\"", "a".repeat(64)),
+            );
+            let intent = parse_test_intent(&pinned, "node").unwrap();
+            let schedule = intent.subjects.values().find(|item| item.kind == "schedule").unwrap();
+            assert_eq!(
+                schedule_spec(&schedule.desired, "node").unwrap().work.unwrap().revision,
+                Some("a".repeat(64)),
+            );
+        }
+        assert_eq!(
+            parse_test_intent(
+                "version 2\nmission-run \"cycle\" { mission \"fabric/cycle\"; workspace \"/tmp/cycles\"; requester \"person/operator\" }",
+                "node",
+            )
+            .unwrap_err()
+            .code,
+            "unpinned-mission-run",
         );
     }
 }
