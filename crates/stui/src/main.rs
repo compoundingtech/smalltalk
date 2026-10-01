@@ -24,9 +24,9 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Tabs, Wrap},
 };
 use st3_client::{
-    AttentionResolveParameters, Client, ClientError, ErrorCode, Fence, LaunchCreateParameters,
-    LaunchTarget, LaunchVariantParameters, MessageSendParameters, Resource, TargetParameters,
-    TerminalInputMode, TerminalInputParameters, TerminalScreen,
+    Client, ClientError, ErrorCode, Fence, LaunchCreateParameters, LaunchTarget,
+    LaunchVariantParameters, MessageSendParameters, PersonStepParameters, Resource,
+    TargetParameters, TerminalInputMode, TerminalInputParameters, TerminalScreen,
 };
 use std::{
     cell::Cell,
@@ -1313,7 +1313,7 @@ fn mission_display_label(mission: &st3_client::Mission) -> String {
 }
 fn action_label(action: &str) -> String {
     match action {
-        "attention.resolve" => "Resolve [r]".into(),
+        "work.done" => "Complete step [c]".into(),
         "review.approve" | "launch.approve" => "Approve [a]".into(),
         "review.reject" => "Reject [j]".into(),
         "launch.cancel" => "Cancel [d]".into(),
@@ -1325,7 +1325,7 @@ fn action_label(action: &str) -> String {
 }
 fn action_key(action: &str) -> Option<char> {
     match action {
-        "attention.resolve" => Some('r'),
+        "work.done" => Some('c'),
         "review.approve" | "launch.approve" => Some('a'),
         "review.reject" => Some('j'),
         "launch.cancel" => Some('d'),
@@ -1981,16 +1981,20 @@ async fn attention_action(
     }
     let (id, idem) = action_pair();
     let result = match action {
-        "attention.resolve" => {
+        "work.done" => {
+            let summary = reason
+                .filter(|summary| !summary.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("a person step needs a response"))?;
             client
-                .attention_resolve(
+                .work_done(
                     id,
                     idem,
                     fence,
-                    AttentionResolveParameters {
-                        attention_id: attention.header.id.clone(),
-                        outcome: "resolved".into(),
-                        reason: None,
+                    PersonStepParameters {
+                        target_id: source,
+                        episode: attention.episode.clone(),
+                        summary,
+                        evidence: vec![],
                     },
                 )
                 .await?
@@ -2298,8 +2302,7 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
                 match app.mode {
                     Mode::ActionReason => {
                         if value.trim().is_empty() {
-                            app.action_result =
-                                Some("Enter a reason for this review decision".into());
+                            app.action_result = Some("Enter a response or decision reason".into());
                         } else {
                             app.action_result = None;
                             app.pending_reason = Some(value);
@@ -2450,7 +2453,7 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
         KeyCode::Char('o') if app.tab == 1 && app.history_open && app.model.timeline_truncated => {
             load_older_history(app);
         }
-        KeyCode::Char(c) if app.tab == 0 && "arjdm".contains(c) => {
+        KeyCode::Char(c) if app.tab == 0 && "arjdmc".contains(c) => {
             if let Some(attention) = app.model.attention().nth(app.selected[0]) {
                 if let Some(action) = attention
                     .actions
@@ -2459,7 +2462,7 @@ async fn handle_key(app: &mut App, client: &Client, key: KeyEvent) -> Result<boo
                 {
                     app.pending_action = Some((attention.header.id.clone(), action.clone()));
                     app.pending_reason = None;
-                    app.mode = if action.starts_with("review.") {
+                    app.mode = if action.starts_with("review.") || action == "work.done" {
                         Mode::ActionReason
                     } else {
                         Mode::Confirm
@@ -3221,7 +3224,7 @@ mod tests {
 
     #[test]
     fn regression_now_action_has_a_useful_label_and_key() {
-        assert_eq!(action_label("attention.resolve"), "Resolve [r]");
+        assert_eq!(action_label("work.done"), "Complete step [c]");
     }
 
     #[test]

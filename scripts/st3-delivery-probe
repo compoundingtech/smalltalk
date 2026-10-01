@@ -39,6 +39,12 @@ def save(path, value):
         os.close(descriptor)
 
 
+class ApiError(RuntimeError):
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
+
+
 class Api:
     def __init__(self, socket):
         self.socket = socket
@@ -54,7 +60,8 @@ class Api:
                 response = await reader.read()
                 headers, content = response.split(b"\r\n\r\n", 1)
                 if headers.split(b" ", 2)[1] != b"200":
-                    raise RuntimeError(response.decode(errors="replace")[:1000])
+                    error = json.loads(content)
+                    raise ApiError(error.get("code", "http-error"), error.get("message", "probe request failed"))
                 payload = json.loads(content)
                 return payload.get("value", payload) if isinstance(payload, dict) else payload
             finally:
@@ -199,6 +206,9 @@ class Probe:
 
     async def route(self, target):
         route = self.state["routes"].get(target)
+        if route and route.get("attention", "").startswith("attention/"):
+            route.pop("attention")
+            self.persist()
         presence = await self.api.get("/v1/replication/status")
         direct = next((peer for peer in presence["peers"] if peer["peer"] == self.peers[target]), {})
         # A grant refusal says nothing about end-to-end reachability through a hub.
@@ -210,12 +220,7 @@ class Probe:
                 route = {"target": self.peers[target], "to": target, "status": "unstarted"}
                 self.state["routes"][target] = route
             if not route.get("waiting_for_member"):
-                if route.get("attention"):
-                    await self.api.post("/v1/attention/withdraw/" + route["attention"], {
-                        "actor": self.actor, "reason": "Member is last seen; delivery waits for a new exchange.",
-                        "idempotency_key": "delivery-probe-absent:" + route["attention"],
-                    })
-                    route.pop("attention", None)
+                await self.cancel_ask(route, "Member is last seen; delivery waits for a new exchange.", "absent")
                 route["waiting_for_member"] = True
                 self.measuring.pop(target, None)
                 self.persist()
@@ -287,25 +292,36 @@ class Probe:
                 route["status"] = "overdue"
                 self.persist()
             if not route.get("attention"):
-                attention = await self.api.post("/v1/attention", {
-                    "actor": self.actor, "reviewer": self.config["reviewer"], "severity": "error",
+                attention = await self.api.post("/v1/work/ask", {
+                    "actor": self.actor, "person": self.config["reviewer"],
+                    "new_run": f"delivery-probe-{route['nonce']}",
                     "title": f"Delivery probe {self.source} → {self.peers[target]} has no read receipt",
-                    "reason": f"{route['message']} was not read within {self.deadline // 1000}s. The native probe keeps watching; its recipient closes the message after a real read, which clears this item. Inspect the node's probe seat, replication and daemon.",
-                    "targets": [route["message"]],
+                    "reason": f"{route['message']} was not read within {self.deadline // 1000}s. The native probe keeps watching; a real read cancels this person step automatically. Inspect the node's probe seat, replication and daemon.",
                     "idempotency_key": f"delivery-probe-overdue:{route['message']}:{route['started_at_unix_ms']}",
                 })
                 route["attention"] = attention["subject"]
                 self.persist()
                 self.event("attention", message=route["message"], attention=route["attention"])
 
-    async def withdraw(self, route):
+    async def cancel_ask(self, route, summary, key):
         if route.get("attention"):
-            await self.api.post("/v1/attention/withdraw/" + route["attention"], {
-                "actor": self.actor, "reason": f"The recipient read {route['message']}; observed latency {route['latency_ms']}ms.",
-                "idempotency_key": f"delivery-probe-recovered:{route['message']}",
-            })
+            subject = route["attention"]
+            # Old versions stored legacy attention IDs. Those are historical audit data now.
+            if subject.startswith("step-run/"):
+                try:
+                    await self.api.post("/v1/work/cancel-ask", {
+                        "subject": subject, "actor": self.actor, "summary": summary,
+                        "idempotency_key": f"delivery-probe-{key}:{subject}",
+                    })
+                except ApiError as error:
+                    if error.code not in ("stale-fence", "missing-step-run"):
+                        raise
             route.pop("attention", None)
             self.persist()
+
+    async def withdraw(self, route):
+        await self.cancel_ask(route,
+            f"The recipient read {route['message']}; observed latency {route['latency_ms']}ms.", "recovered")
 
     def report(self):
         return {"format": FORMAT, "source": self.source, "agent": self.actor,

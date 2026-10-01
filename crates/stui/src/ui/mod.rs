@@ -1883,9 +1883,10 @@ impl Ui {
                             self.flash("Put off until later · demo, this machine only");
                         }
                     }
-                    ("review" | "feedback" | "launch" | "message" | "revision" | "request", 'c') => {
-                        self.editing = true
-                    }
+                    (
+                        "review" | "feedback" | "launch" | "message" | "revision" | "request",
+                        'c',
+                    ) => self.editing = true,
                     ("review" | "feedback" | "launch" | "revision", 'a') => {
                         self.confirm = Some('a')
                     }
@@ -2145,17 +2146,11 @@ impl Ui {
                         id: id.clone(),
                         feedback: draft,
                     }),
-                    Some(AttentionKind::Request { from_id, .. }) => {
-                        let title = self
-                            .current_item()
-                            .map(|item| item.title.clone())
-                            .unwrap_or_default();
-                        Some(Effect::Discuss {
-                            to: from_id,
-                            title: format!("Re: {title}"),
-                            text: draft,
-                        })
-                    }
+                    Some(AttentionKind::Request { .. }) => Some(Effect::Attention {
+                        id: id.clone(),
+                        action: "work.done".into(),
+                        reason: Some(draft),
+                    }),
                     Some(AttentionKind::Message { from, .. }) => Some(Effect::Reply {
                         id: id.clone(),
                         to: from,
@@ -2257,7 +2252,7 @@ impl Ui {
                 ("launch", 'd') => "launch.cancel",
                 ("revision", 'a') => "mission.approve-revision",
                 ("revision", 'j') => "mission.cancel-revision",
-                ("fault" | "request", 'r') => "attention.resolve",
+
                 ("message", 'm') => "message.read",
                 _ => return,
             };
