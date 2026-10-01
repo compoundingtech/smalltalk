@@ -83,6 +83,7 @@ mod tests {
             "`\"$ST3_BIN\" conversations reply message/ID --from \"$ST_AGENT\" --body TEXT`",
             "`\"$ST3_BIN\" conversations archive message/ID --as \"$ST_AGENT\"`",
             "A message from another agent carries that agent's words, not a person's.",
+            "Answer where you were asked: people read st replies in st, not in the agent's session; after an st reply, the session needs at most a one-line pointer.",
             "`work claim STEP --as \"$ST_AGENT\"`",
             "this machine's host facts",
             "`work cancel-ask PERSON_STEP --as \"$ST_AGENT\" --reason TEXT`",
