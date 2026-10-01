@@ -1,0 +1,42 @@
+{
+  "verdict": "pass",
+  "checks": {
+    "observed_states": [
+      "idle",
+      "ready",
+      "starting",
+      "working"
+    ],
+    "hook_runs": 2,
+    "timeline_items": 6,
+    "usage": {
+      "compactions": 0,
+      "context_used_percent": 7.0,
+      "context_used_tokens": 14000,
+      "context_window_tokens": 200000,
+      "driver": "claude",
+      "incarnation_id": "2814948:2026-10-01T14:39:46.782Z",
+      "model": "claude-stub-model",
+      "semantics": "context_occupancy"
+    },
+    "message": "message/0e41532449677663",
+    "message_status": "read",
+    "projected_message_files": 0,
+    "doctor": {
+      "name": "claude-hooks",
+      "status": "pass",
+      "message": "1 Claude seats; the hooks run st3 from <eval-root>/state/hooks/sets/sha256-b80ce514aeabd5ef185ebfe6a5d4dedab18073801628c730fb11f18cf0cfe9c1; 1 running sessions are bound to their transcripts"
+    },
+    "seat_processes": 3,
+    "st_hooks": [
+      "ST_HOOKS=<eval-root>/state/hooks/sets/sha256-b80ce514aeabd5ef185ebfe6a5d4dedab18073801628c730fb11f18cf0cfe9c1"
+    ],
+    "record_schemas": {
+      "harness-state": "st.harness-state.v1",
+      "harness-context": "st.harness-context.v1",
+      "harness-timeline": "st.harness-timeline.v1"
+    },
+    "legacy_status_files": []
+  },
+  "tested_source_head": "f440751cdaa967c4911a5324c5cb98f55f9f32bd"
+}

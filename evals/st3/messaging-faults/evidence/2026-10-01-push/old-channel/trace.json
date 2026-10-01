@@ -1,0 +1,106 @@
+[
+  {
+    "id": "2758380c1028b735ad197237ee4a5709f4a7ee5822c9eb93ea4a990e01219dab",
+    "store_index": 20,
+    "batch_id": "batch/amber/6/e48b8fac02dd013924f8218fbc0aa4adb5147732c022fe99c5048e2149006cdf",
+    "subject": "message/909ae36e5f5f041f",
+    "kind": "message.sent",
+    "origin": "amber",
+    "actor": "person/eval",
+    "operation_id": "op/bb798ba5f46cd9db59163965dd6b0a0e61cdecd9d355bc210cbe16a4751632dc",
+    "request_digest": "af2decc4edd04bf3360b295e7a4ad9b652df9a4a84f7cc73e8d54e2817872aa3",
+    "body": {
+      "_operation": {
+        "id": "op/bb798ba5f46cd9db59163965dd6b0a0e61cdecd9d355bc210cbe16a4751632dc",
+        "request_digest": "af2decc4edd04bf3360b295e7a4ad9b652df9a4a84f7cc73e8d54e2817872aa3"
+      },
+      "evidence": [],
+      "fields": {
+        "content": "receipt-token:old-channel",
+        "from": "person/eval",
+        "in_reply_to": null,
+        "status": "sent",
+        "tags": [],
+        "title": "Fault probe: old-channel",
+        "to": "agent/eval/fault-probe"
+      }
+    },
+    "predecessors": [],
+    "accepted_at_unix_ms": 1790866555403
+  },
+  {
+    "id": "f6fa55e930077f7f5ef45ad03330a187183ad9de2091e1c7bc176b4fbab89f55",
+    "store_index": 21,
+    "batch_id": "batch/cobalt/15/93b660fc2c02e3db9ba8a5e4cff94280696122353004edc29dcf850547df9253",
+    "subject": "message/909ae36e5f5f041f",
+    "kind": "message.delivered",
+    "origin": "cobalt",
+    "actor": "agent/eval/fault-probe",
+    "operation_id": "op/13fe220d6c9b77143392fae7fc549334d4c0288141ac48102db179fd290bcca5",
+    "request_digest": "95e8c583b309f83cd7b3734342688e234c33a12f353dd47786e93274af00d97d",
+    "body": {
+      "_operation": {
+        "id": "op/13fe220d6c9b77143392fae7fc549334d4c0288141ac48102db179fd290bcca5",
+        "request_digest": "95e8c583b309f83cd7b3734342688e234c33a12f353dd47786e93274af00d97d"
+      },
+      "evidence": [],
+      "fields": {
+        "status": "delivered"
+      }
+    },
+    "predecessors": [
+      "2758380c1028b735ad197237ee4a5709f4a7ee5822c9eb93ea4a990e01219dab"
+    ],
+    "accepted_at_unix_ms": 1790866560786
+  },
+  {
+    "id": "8aa8c701968868a7d6434371bb3c3f4c2fc86119cdfeea1a464f35d11d64c7b1",
+    "store_index": 22,
+    "batch_id": "batch/cobalt/16/61aa1b446d33a8e64d8e10be4c8df65dca7bcf40c775be6dce8db699dc8fed7b",
+    "subject": "message/909ae36e5f5f041f",
+    "kind": "message.read",
+    "origin": "cobalt",
+    "actor": "agent/eval/fault-probe",
+    "operation_id": "op/aa66b020c8b8a1bd0a082b7695814c1159fae2fec33931133c5d76e7d8090aae",
+    "request_digest": "f6f8c4becb0792f59924d8fcaff522096b4c8829fe5bf38ebb0709589b9176bc",
+    "body": {
+      "_operation": {
+        "id": "op/aa66b020c8b8a1bd0a082b7695814c1159fae2fec33931133c5d76e7d8090aae",
+        "request_digest": "f6f8c4becb0792f59924d8fcaff522096b4c8829fe5bf38ebb0709589b9176bc"
+      },
+      "evidence": [],
+      "fields": {
+        "status": "read"
+      }
+    },
+    "predecessors": [
+      "f6fa55e930077f7f5ef45ad03330a187183ad9de2091e1c7bc176b4fbab89f55"
+    ],
+    "accepted_at_unix_ms": 1790866560813
+  },
+  {
+    "id": "54024154e5b5c62a11708118f3a01e62a244fab2df7e484f9fd97a1169bdc83c",
+    "store_index": 23,
+    "batch_id": "batch/cobalt/17/8a5a2d4c39c32c20abe48265061236d2ef56185ebede18a1281f6e3b783273d5",
+    "subject": "message/909ae36e5f5f041f",
+    "kind": "message.closed",
+    "origin": "cobalt",
+    "actor": "agent/eval/fault-probe",
+    "operation_id": "op/bc904f90b7d8b7e84c4e73a0892bf533ade860ce6f843754f2833010e087d181",
+    "request_digest": "51e12c9c0926779989a8282e889529a2e4802e5d85480df81b39361937b688c1",
+    "body": {
+      "_operation": {
+        "id": "op/bc904f90b7d8b7e84c4e73a0892bf533ade860ce6f843754f2833010e087d181",
+        "request_digest": "51e12c9c0926779989a8282e889529a2e4802e5d85480df81b39361937b688c1"
+      },
+      "evidence": [],
+      "fields": {
+        "status": "closed"
+      }
+    },
+    "predecessors": [
+      "8aa8c701968868a7d6434371bb3c3f4c2fc86119cdfeea1a464f35d11d64c7b1"
+    ],
+    "accepted_at_unix_ms": 1790866560836
+  }
+]

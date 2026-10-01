@@ -6,7 +6,7 @@ import childProcess from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 
 if (process.argv.includes('--version')) {
-  console.log('omp v18.0.9');
+  console.log('omp v18.4.4');
   process.exit(0);
 }
 const directory = process.cwd();
@@ -73,6 +73,7 @@ let acknowledgements = Promise.resolve();
 const api = {
   on: (event, callback) => events.set(event, callback),
   sendMessage: () => {},
+  setSessionName: (label) => record({ event: 'seat-title', label }),
   sendUserMessage: async (content) => {
     // Join consumed provider text to the real channel's immutable metadata.
     const matched = pendingFrames.filter(frame => content.includes(frame.content));

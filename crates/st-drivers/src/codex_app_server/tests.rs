@@ -6830,6 +6830,59 @@ fn an_error_with_no_optional_codex_error_info_reports_an_unclassified_failure() 
 }
 
 #[test]
+fn codex_native_push_delivery_reconciles_an_uncertain_handoff_without_files() {
+    let tmp = tempfile::tempdir().unwrap();
+    let config = delivery_config(tmp.path());
+    std::fs::create_dir_all(&config.agent_dir).unwrap();
+    crate::push_mailbox::register(&config.agent_dir);
+    let key = "message/quartz-native";
+    let mut input = message::parse_message(key, "---\nfrom: person/eval\n---\nQUARTZ SIGNAL\n");
+    input.tags.push(format!("st3-message:{key}"));
+    crate::push_mailbox::replace(&config.agent_dir, vec![input.clone()]);
+    let idle = subscribed_state(CodexObservedState::Idle);
+    let mut delivery = inbox_delivery(tmp.path(), config.clone());
+    let request = delivery.maybe_request(&idle).unwrap().unwrap();
+    assert_eq!(request["method"], "turn/start");
+    assert!(
+        request["params"]["input"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("QUARTZ SIGNAL")
+    );
+    let client_id = request["params"]["clientUserMessageId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    drop(delivery);
+    crate::push_mailbox::replace_active(
+        &config.agent_dir,
+        Vec::new(),
+        BTreeSet::from([key.into()]),
+    );
+    let mut resumed = inbox_delivery(tmp.path(), config.clone());
+    assert_eq!(
+        resumed.maybe_request(&idle).unwrap(),
+        None,
+        "an uncertain handoff is held"
+    );
+    assert!(
+        resumed.ledger.entry(key).is_some(),
+        "an unavailable body cannot prune uncertainty"
+    );
+    crate::push_mailbox::replace(&config.agent_dir, vec![input]);
+    resumed.reconcile_resume(&json!({"id":CONTROL_SUBSCRIBE_REQUEST_ID,"result":{"thread":{
+        "id":"thread-main","turns":[{"id":"turn-native","items":[{"type":"userMessage","id":"item-native",
+            "clientId":client_id,"content":[]}]}]}}}), &idle).unwrap();
+    assert_eq!(
+        resumed.ledger.entry(key).unwrap().phase,
+        delivery_ledger::Phase::Consumed
+    );
+    assert_eq!(resumed.maybe_request(&idle).unwrap(), None);
+    assert!(!config.inbox.exists());
+    assert!(!message::archive_dir(&config.agent_dir).exists());
+}
+
+#[test]
 fn adopted_codex_records_keep_their_schema_family() {
     let tmp = tempfile::tempdir().unwrap();
     let mut runtime =

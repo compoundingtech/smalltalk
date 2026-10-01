@@ -28,7 +28,10 @@ and refuses new traffic. Cleanup stops reconciliation before closing the private
 PTY registry. Shared daemons and seats are never stopped or changed.
 
 Every case starts fresh nodes and proves a cross-node warmup before injecting the
-fault. The cases are:
+fault. Provider readiness and that warmup both use the setup deadline (60 seconds by
+default): a peer exchange can already be in its 30-second long poll when the warmup
+is sent. This does not change the ten-second recovery gate after a fault clears.
+Fixture errors record the phase that timed out. The cases are:
 
 | Case | Injection | Fault clears when |
 | --- | --- | --- |
@@ -40,7 +43,7 @@ fault. The cases are:
 | receiver-down | Receiving daemon and worker are down when the sender accepts the message | Restarted API answers and worker is started |
 | harness-restart | Kill the provider, queue a message, let the daemon restart its seat | New provider process exists |
 | channel-killed | Kill the live channel and send a message | Kill completes and sender accepts the message; recovery belongs to the real extension |
-| old-channel | Start a real historical channel under the candidate's driver and extension, then deploy the candidate while queueing remotely | New daemon answers and peer link opens |
+| old-channel | Start a real historical channel under the candidate's driver and extension, then deploy the candidate with a short API outage while queueing remotely | New daemon answers and peer link opens |
 | handoff-failed | Refuse native handoffs past the third failure; check agent, doctor and sender visibility | The provider API accepts handoffs again |
 
 Receiver-down models an unavailable receiving node's messaging services with its
@@ -49,7 +52,12 @@ permits the one injected provider replacement; every other case requires the sam
 provider PID and runtime incarnation. No case permits an additional provider start.
 The old binary must actually predate reexec; the runner records its hash, checks
 that it does not support `resume-probe`, and starts its actual channel process
-rather than simulating legacy requests. The candidate's driver and extension remain
+rather than simulating legacy requests. The old-channel case holds the receiving API down for
+at least three seconds so its one-second poll cannot race past the outage. The owned extension
+sends authority-free protocol-1 keepalives: an old channel whose API request failed can otherwise
+remain stuck in Tokio shutdown waiting for its stdin reader, never notifying the extension to
+reconnect. Replayed recipient receipts settle to existing later evidence without moving the
+message backward or creating another lifecycle claim. The candidate's driver and extension remain
 current, so the case isolates compatibility with an old channel. It does not prove
 an old driver's recovery or compatibility between arbitrary historical releases:
 failure of that case's warmup is a fixture error, not a fault verdict.
@@ -61,7 +69,8 @@ wire frames alone never count as consumption. It writes every native handoff bef
 an API outage using stable idempotency keys. The oracle requires exactly one native
 handoff, one authoritative graph read within ten seconds of clearing, convergence
 of the read receipt back to the sender, and no unexpected provider replacement.
-It observes a fixed 25-second tail after clearing, even when the first read is fast,
+The runner also counts message files below inbox/archive directories in the private receiver state;
+any projection fails the no-files gate. It observes a fixed 25-second tail after clearing, even when the first read is fast,
 to catch duplicates and to outlast the delivery report's 20-second startup grace.
 Duplicates after that bounded observation window are not covered.
 
@@ -104,3 +113,29 @@ Set `ST3_MESSAGING_COMPAT_BIN` to use an already built historical executable.
 `ST3_MESSAGING_FAULTS_EVIDENCE` can select a new evidence directory for a local run;
 on failure the default temporary evidence directory is retained. CI also retains
 successful normalized evidence under its checkout's `target/messaging-faults/run-*/evidence/`.
+
+The daemon push implementation's ten-case evidence is in
+[evidence/2026-10-01-push/result.json](evidence/2026-10-01-push/result.json).
+All cases passed with no projected inbox/archive messages on the final implementation and fixture build `ad7b6ae1`,
+including daemon-allocated binding epochs, transient-error reconnect behavior and a deterministic historical-channel outage. Native Codex/OpenCode ledger tests,
+Claude transcript/uncertainty tests, and both owned extension smoke tests cover the other no-files
+boundaries, current-session receipt fencing and replacement reconnects. The Unix stream test
+commits a native receipt then discards the HTTP acknowledgement; its retry returns the same claim.
+
+The real OMP 18.4.4 title bakeoff is reproducible without prompts, credentials or model calls:
+
+```sh
+python3 scripts/st3-omp-labels-eval/run /path/to/omp-18.4.4 \
+  crates/st3/hooks/omp-channel.ts /tmp/omp-labels-result.json
+```
+
+It uses an isolated profile and a loopback-only dummy model. The actual extension receives full
+seat-record frames from a fixture channel, while the real provider exercises new-session,
+in-process resume and cold resume. It also verifies a temporary native rename is replaced by the
+next authority update, including the seat's persona suffix. Results are in
+[evidence/2026-10-01-push/omp-18.4.4-labels.json](evidence/2026-10-01-push/omp-18.4.4-labels.json).
+
+The fresh Claude-only seat smoke proves managed hooks and transcript binding, native delivery/read,
+zero projected message files and zero legacy status files:
+[evidence/2026-10-01-push/claude-no-st2.json](evidence/2026-10-01-push/claude-no-st2.json).
+Each result records the tested source head; the smoke uses a provider stand-in without model calls.

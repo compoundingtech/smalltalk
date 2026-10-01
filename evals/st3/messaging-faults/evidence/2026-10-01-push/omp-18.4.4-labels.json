@@ -1,0 +1,14 @@
+{
+  "version": "18.4.4",
+  "agent_tokens": 0,
+  "model_calls": 0,
+  "cases": {
+    "initial": "Quartz [gen]",
+    "new": "Quartz [gen]",
+    "in_process_resume": "Quartz [gen]",
+    "cold_resume": "Quartz [gen]",
+    "authority_update": "Indigo [gen]"
+  },
+  "verdict": "pass",
+  "tested_source_head": "f440751cdaa967c4911a5324c5cb98f55f9f32bd"
+}

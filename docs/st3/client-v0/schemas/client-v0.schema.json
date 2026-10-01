@@ -10,9 +10,9 @@
     { "$ref": "#/$defs/PairingComplete" }
   ],
   "$defs": {
-    "GlassLayout": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["pane"], "properties": {"pane": {"type": "string", "minLength": 1}}}, {"type": "object", "additionalProperties": false, "required": ["split", "children"], "properties": {"split": {"enum": ["right", "below"]}, "children": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/GlassLayout"}}}}]},
-    "GlassTab": {"type": "object", "additionalProperties": false, "required": ["layout"], "properties": {"title": {"type": "string"}, "layout": {"$ref": "#/$defs/GlassLayout"}}},
-    "GlassBody": {"type": "object", "additionalProperties": false, "required": ["name", "tabs"], "properties": {"name": {"type": "string", "minLength": 1}, "tabs": {"type": "array", "minItems": 0, "maxItems": 1024, "items": {"$ref": "#/$defs/GlassTab"}}}},
+    "GlassLayout": {"oneOf": [{"type": "object", "additionalProperties": false, "required": ["tabs"], "properties": {"tabs": {"type": "array", "maxItems": 1024, "items": {"$ref": "#/$defs/GlassTab"}}}}, {"type": "object", "additionalProperties": false, "required": ["split", "children"], "properties": {"split": {"enum": ["right", "below"]}, "children": {"type": "array", "minItems": 2, "maxItems": 2, "items": {"$ref": "#/$defs/GlassLayout"}}}}]},
+    "GlassTab": {"type": "object", "additionalProperties": false, "required": ["pane"], "properties": {"title": {"type": "string"}, "pane": {"type": "string", "minLength": 1}}},
+    "GlassBody": {"type": "object", "additionalProperties": false, "required": ["name", "layout"], "properties": {"name": {"type": "string", "minLength": 1}, "layout": {"$ref": "#/$defs/GlassLayout"}}},
     "Glass": {"allOf": [{"$ref": "#/$defs/ResourceHeader"}, {"type": "object", "required": ["kind", "body", "deleted", "base_revision", "replaced_revision"], "properties": {"kind": {"const": "glass"}, "body": {"oneOf": [{"$ref": "#/$defs/GlassBody"}, {"type": "null"}]}, "deleted": {"type": "boolean"}, "base_revision": {"type": ["string", "null"]}, "replaced_revision": {"type": ["string", "null"]}}}]},
     "GlassPut": {"type": "object", "additionalProperties": false, "required": ["body", "base_revision"], "properties": {"body": {"$ref": "#/$defs/GlassBody"}, "base_revision": {"type": ["string", "null"]}}},
     "GlassDelete": {"type": "object", "additionalProperties": false, "required": ["base_revision"], "properties": {"base_revision": {"type": ["string", "null"]}}},
@@ -642,25 +642,11 @@
             "next_work": { "oneOf": [{ "$ref": "#/$defs/WorkLabel" }, { "type": "null" }] },
             "upcoming_work": { "type": "array", "items": { "$ref": "#/$defs/WorkLabel" } },
             "usage": { "oneOf": [{ "$ref": "#/$defs/UsageSummary" }, { "type": "null" }] },
-            "mission_authority": { "oneOf": [{ "$ref": "#/$defs/AgentMissionAuthority" }, { "type": "null" }] },
             "under": { "type": "array", "items": { "$ref": "#/$defs/AgentRelationship" } },
             "delivery": { "oneOf": [{ "$ref": "#/$defs/AgentDelivery" }, { "type": "null" }], "description": "Whether the process that carries this local seat's messages is live and runs this daemon's st binary. Present only for a local native seat whose harness can take work; a stale path makes the agent `waiting`." }
           }
         }
       ]
-    },
-    "AgentMissionAuthority": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["source"],
-      "description": "Missions the agent may publish, start, revise, and cancel. Patterns are exact mission IDs or terminal `/*` namespaces without `mission/`.",
-      "properties": {
-        "source": { "enum": ["declared", "default", "none"], "description": "`declared`: the declaration's `mission-authority`. `default`: a person-declared top-level seat `fleet/PROJECT/...` holds `fleet/PROJECT/*`. `none`: neither." },
-        "publish": { "type": "array", "items": { "type": "string" } },
-        "start": { "type": "array", "items": { "type": "string" } },
-        "revise": { "type": "array", "items": { "type": "string" } },
-        "cancel": { "type": "array", "items": { "type": "string" } }
-      }
     },
     "AgentDelivery": {
       "type": "object",

@@ -727,13 +727,16 @@ impl CodexInboxDelivery {
         runtime: CodexRuntime,
         safe_fallback_active: Arc<AtomicBool>,
     ) -> Result<Self> {
-        fs::create_dir_all(&config.inbox).with_context(|| {
-            format!(
-                "creating Codex native delivery inbox {}",
-                config.inbox.display()
-            )
-        })?;
+        if !crate::push_mailbox::managed(&config.agent_dir) {
+            fs::create_dir_all(&config.inbox).with_context(|| {
+                format!(
+                    "creating Codex native delivery inbox {}",
+                    config.inbox.display()
+                )
+            })?;
+        }
         let (wake_tx, wake) = mpsc::channel();
+        crate::push_mailbox::watch(&config.agent_dir, wake_tx.clone());
         // Scoped to inbox + status: this pump's own process group writes runtime records (presence
         // refreshes, harness-state transitions) into the same agent dir, and those must not wake it.
         let watcher = crate::watch::watch_delivery_inputs_with_status(
@@ -1209,7 +1212,7 @@ impl CodexInboxDelivery {
     /// releases ownership, and this pump never moves a file.
     fn reconcile_inbox(&mut self, unread: &[message::Message]) -> Result<()> {
         self.ledger
-            .prune(|filename| unread.iter().any(|message| message.filename == filename))
+            .prune(|filename| crate::push_mailbox::is_unread(&self.config.agent_dir, filename, unread))
     }
 
     fn refresh_if_due(&mut self) -> Result<()> {
@@ -1238,7 +1241,7 @@ impl CodexInboxDelivery {
         if !due {
             return Ok(());
         }
-        let unread = message::list_inbox(&self.config.inbox)?;
+        let unread = crate::push_mailbox::messages(&self.config.agent_dir, &self.config.inbox)?;
         self.reconcile_inbox(&unread)?;
         if self.rejected.as_ref().is_some_and(|rejected| {
             unread
@@ -1780,7 +1783,12 @@ fn should_track_timeline_usage(message: &Value, active_turn_id: Option<&str>) ->
 
 fn stable_client_user_message_id(recipient: &str, thread_id: &str, filename: &str) -> String {
     let mut hash = Sha256::new();
-    hash.update(b"st2.codex-client-user-message.v1");
+    let graph_message = filename.starts_with("message/");
+    hash.update(if graph_message {
+        b"st.codex-client-user-message.v1".as_slice()
+    } else {
+        b"st2.codex-client-user-message.v1".as_slice()
+    });
     for value in [
         recipient.as_bytes(),
         thread_id.as_bytes(),
@@ -1789,9 +1797,11 @@ fn stable_client_user_message_id(recipient: &str, thread_id: &str, filename: &st
         hash.update((value.len() as u64).to_be_bytes());
         hash.update(value);
     }
-    // The complete identifier, including its historical namespace, is durable native identity.
-    // Renaming it would invalidate ledgers and replay already-delivered messages.
-    format!("st2:{:x}", hash.finalize())
+    format!(
+        "{}:{:x}",
+        if graph_message { "st" } else { "st2" },
+        hash.finalize()
+    )
 }
 
 /// Read the exact native inbox filenames whose Codex deliveries reached consumption.
@@ -2572,8 +2582,10 @@ pub fn run_controlled_paths(
     secure_dir(state_dir)?;
     secure_dir(agent_dir)?;
     let inbox = message::inbox_dir(agent_dir);
-    secure_dir(&inbox)?;
-    secure_dir(&message::archive_dir(agent_dir))?;
+    if !crate::push_mailbox::managed(agent_dir) {
+        secure_dir(&inbox)?;
+        secure_dir(&message::archive_dir(agent_dir))?;
+    }
     let delivery = CodexDeliveryConfig {
         control: crate::session_control::SessionControl::Graph(gate),
         catalog_root: driver_root.to_path_buf(),

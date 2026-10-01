@@ -4,14 +4,14 @@ import { useNavigation } from '@react-navigation/native';
 import type { NativeStackNavigationProp } from '@react-navigation/native-stack';
 import SegmentedControl from '@react-native-segmented-control/segmented-control';
 import { Banners, Empty, StatusLine, useListsOnFocus } from '../chrome';
-import { glassChoices, glassTabs, type GlassLists, type PaneTarget } from '../glassesView';
-import { navigationRef, type RootParams, type RootScreen } from '../navigation';
+import { glassChoices, glassGroups, type GlassLists, type PaneTarget } from '../glassesView';
+import { navigationRef, type RootParams } from '../navigation';
 import { useStore } from '../store';
 import { theme } from '../theme';
 import { ListRow, Note, Screen, SectionHeader, T } from '../ui';
 
 // Glasses on the phone (an experiment, on in Fleet): one thing at a time. The root lists the
-// chosen glass's tabs, Home first; a tab with one pane opens it, a split tab lists its panes.
+// chosen glass's tabs, Home first, split by split as stui shows them; a tab opens its pane.
 
 type Navigation = NativeStackNavigationProp<RootParams>;
 
@@ -48,7 +48,8 @@ export function GlassesScreen() {
   const [chosen, setChosen] = useState<string | null>(null);
   const shownId = choices.find(choice => choice.id === chosen)?.id ?? choices.find(choice => choice.name === 'main')?.id ?? choices[0]?.id;
   const shown = glasses.find(glass => glass.id === shownId);
-  const tabs = shown ? glassTabs(shown, lists) : [];
+  const splits = shown ? glassGroups(shown, lists) : [];
+  const many = splits.length > 1;
   return <Screen>
     <Banners />
     <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingBottom: 32 }}>
@@ -63,40 +64,24 @@ export function GlassesScreen() {
         />
       </View> : null}
       {shown ? <>
-        <SectionHeader title={shown.body?.name ?? 'glass'} count={tabs.length + 1} />
+        <SectionHeader title={shown.body?.name ?? 'glass'} count={splits.reduce((sum, split) => sum + split.tabs.length, 1)} />
         <ListRow glyph="⌂" glyphColor={theme.accent} title="Home" second="what needs you" onPress={() => navigationRef.navigate('Home', { screen: 'HomeRoot' })} />
-        {tabs.map(tab => {
-          const only = tab.panes.length === 1 ? tab.panes[0] : null;
-          const glyph = only ? paneGlyph(only) : { glyph: tab.needsYou ? '◆' : '▤', color: tab.needsYou ? theme.person : theme.subtext0 };
-          return <ListRow
-            key={tab.index}
-            glyph={glyph.glyph}
-            glyphColor={glyph.color}
-            title={tab.title}
-            second={only ? paneDetail(only) : `${tab.panes.length} panes`}
-            onPress={() => only ? openPane(navigation, only) : navigation.navigate('GlassTab', { glass: shown.id, index: tab.index })}
-          />;
-        })}
+        {splits.map(split => <View key={split.index}>
+          {many ? <SectionHeader title={`split ${split.index + 1} of ${splits.length}`} count={split.tabs.length} /> : null}
+          {split.tabs.map(tab => {
+            const glyph = paneGlyph(tab.pane);
+            return <ListRow
+              key={`${tab.group}-${tab.index}`}
+              glyph={glyph.glyph}
+              glyphColor={glyph.color}
+              title={tab.title}
+              second={paneDetail(tab.pane)}
+              onPress={tab.pane.gone ? undefined : () => openPane(navigation, tab.pane)}
+            />;
+          })}
+          {many && split.tabs.length === 0 ? <T dim style={{ paddingHorizontal: 12, paddingVertical: 6 }}>Empty on the computer too.</T> : null}
+        </View>)}
       </> : glassesGranted ? <Empty text="No glasses yet. Make one with stui --glasses on a computer." /> : null}
-    </ScrollView>
-  </Screen>;
-}
-
-export function GlassTabScreen({ route }: RootScreen<'GlassTab'>) {
-  const { glasses } = useStore();
-  const navigation = useNavigation<Navigation>();
-  const lists = useLists();
-  const glass = glasses.find(candidate => candidate.id === route.params.glass);
-  const tab = glass ? glassTabs(glass, lists)[route.params.index] : undefined;
-  if (!tab) return <Screen><Empty text="This tab is no longer in its glass." /></Screen>;
-  return <Screen>
-    <ScrollView contentInsetAdjustmentBehavior="automatic" contentContainerStyle={{ paddingBottom: 32 }}>
-      <SectionHeader title={tab.title} count={tab.panes.length} />
-      {tab.panes.map(pane => {
-        const glyph = paneGlyph(pane);
-        return <ListRow key={pane.key} glyph={glyph.glyph} glyphColor={glyph.color} title={pane.title} second={paneDetail(pane)} onPress={pane.gone ? undefined : () => openPane(navigation, pane)} />;
-      })}
-      <T dim style={{ paddingHorizontal: 12, paddingTop: 12 }}>On a computer these panes sit side by side; here they open one at a time.</T>
     </ScrollView>
   </Screen>;
 }

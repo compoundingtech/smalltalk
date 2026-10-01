@@ -88,35 +88,11 @@ anchor must be queued for the seat. After a move, the command prints the new que
 A person moves runs with `--as person/NAME` or `person` in the st config, like other client-v0
 mutations. With `--json`, it prints the action result.
 
-An agent moves runs with `--as agent/PATH` when a person has granted it that authority in its
-declaration, the way `mission-authority` grants named missions:
-
-```kdl
-agent "fleet/example/chief" {
-  workspace "."
-  harness "claude" {}
-  queue-authority {
-    move "fleet/example/worker"
-    move "fleet/review/*"
-  }
-}
-```
-
-Each `move` rule names an exact seat identity or a terminal `/*` namespace, without `agent/`. A
-seat has no authority over its own queue unless a rule names it. The daemon reads the grant from
-the agent's current desired declaration when the move arrives, and refuses a move outside it with
-`queue-authority-denied`, or `missing-agent-queue-authority` when the agent has no declaration.
-An agent can delegate queue authority only when it holds both `agent-authority { apply PATH }`
-over the target declaration and `queue-authority { move PATH }` over the same or a wider queue
-path. The same kind, verb, and path checks apply to every other authority block; see
-[agent declaration authority](kdl-lifecycle.md#agent-declaration-authority). Existing
-`seat-authority { declare "NAMESPACE/*"; stop "NAMESPACE/*" }` rules continue to authorize
-plain declarations and stops. A person-declared top-level seat named `fleet/PROJECT/...` also
-holds mission authority for `fleet/PROJECT/*` by default, and loses that default while an agent's
-declaration is current ([agent mission authority](kdl-lifecycle.md#agent-mission-authority)).
-The agent's queue move goes to `POST /v1/agent-queue-moves`; that route also accepts a person.
-Client-v0 agent mutations cover work and authorized mission cancellation, while queue moves
-through client-v0 still require a person. With `--json`, the route prints the move claim.
+An agent moves runs in any seat's queue, including its own, with `--as agent/PATH`; in
+[free mode](kdl-lifecycle.md#free-mode) it needs no grant, and a `queue-authority` block in its
+declaration is ignored. The move records the agent as its actor. The agent's queue move goes to
+`POST /v1/agent-queue-moves`; that route also accepts a person. An agent's local client-v0 session can also use the `agent.queue-move` action. With `--json`, the
+route prints the move claim.
 
 The typed client exposes the same surface:
 
@@ -194,24 +170,16 @@ others.
   - moves must name queued runs and valid anchors.
 - `client_v0_contract::agent_queue_read_and_person_move_share_one_seat_order`: the read, the
   person action, the agent-filtered work list order, validation errors, and an unknown agent.
-- `api::tests::an_agent_moves_a_seat_queue_only_with_queue_authority`: an agent granted the seat
-  moves a run and is recorded as the move's actor in the queue view and history. The seat itself,
-  an agent without a grant, an agent granted another seat, an undeclared agent, and a daemon actor
-  are refused, and the order does not change. An agent cannot publish a top-level declaration that
-  grants queue or mission authority to itself or another seat, and can still publish one without.
-  A person can use the same route. A replica rebuilds the same order and history from the agent's
-  and the person's moves.
-- `mission::tests::agent_queue_authority_uses_exact_and_terminal_seat_rules`: exact and namespace
-  rules, `${ST_MISSION_RUN}` in a rule, and refused empty, prefixed, wildcard, duplicate, and
-  unknown rules.
+- `mission::tests::queue_authority_still_parses_and_rejects_invalid_rules`: a `queue-authority`
+  block still parses, and empty, prefixed, wildcard, duplicate, and unknown rules are refused.
 - `client_v0_cli::agents_queue_cli_shows_seat_order_and_records_person_and_agent_moves`: human
-  and JSON output for person and agent moves, `--as`, the configured person fallback, a refused
-  seat, and a malformed actor, against a temporary daemon socket.
+  and JSON output for person and agent moves, `--as`, the configured person fallback, the seat
+  moving its own queue, and a malformed actor, against a temporary daemon socket.
 - `tests::agent_queue_view_lists_the_claim_then_runs_in_order_and_moves`: the exact human view.
 - `evals/st3/seat-queue`: a paid eval with one durable seat and three runs. The seat is Claude
   `claude-sonnet-5` by default; the runner can put Codex `gpt-6-luna` or omp
-  `openai-codex/gpt-5.6-luna` in it instead. A model-free chief agent with queue authority over the
-  seat makes the move, after the seat's own move is refused. Held-out judges replay graph history
+  `openai-codex/gpt-5.6-luna` in it instead. A model-free chief agent makes the move. Reports from
+  before free mode also record the seat's own move being refused. Held-out judges replay graph history
   at every claim. They require that a live agent took the first ready step in queue order each
   time, followed the chief's move, passed over a head run waiting on a gate and returned to it
   once ready, kept each held claim, and got no terminal input. Run reports are in
@@ -228,23 +196,16 @@ others.
   the wake and the agent's work list are not enough. A Claude seat that finished one step checked
   its list, then claimed a later run's step before the wake for the head run arrived. `work claim`
   now refuses that. Inside one run, the mission's dependencies still decide. `available-to` work
-  is not queued, so it is not refused. An agent that wants another run first needs a person, or
-  an agent with queue authority for the seat, to move it.
+  is not queued, so it is not refused. An agent that wants another run first moves it.
 - **`st work ls` without `--as` lists fleet work.** That list is in creation order, not seat
   order, and it includes steps the agent cannot claim. The claim check makes the seat order hold
   anyway, and the seat's next step also arrives as a message that names it.
-- **Agents move runs only with a declared grant.** A person grants `queue-authority` in the
-  agent's declaration, and the daemon checks it on each move, as it checks `mission-authority`.
-  As there, the local socket trusts the actor named by `--as`, so the grant keeps well-behaved
-  agents in bounds and is not a security boundary against local processes. Removing a grant stops
-  later moves and leaves earlier ones in place. Paired and typed clients have no agent path;
-  client-v0 actions stay person-only.
 - **An agent once re-declared its own seat.** In one live eval run an omp seat ran
   `st agents start` for its own identity, as itself. The daemon accepted the declaration, which
   replaced the eval's: it dropped the model and the audit environment and set `restart always`.
   Eval cleanup then no longer owned the seat and could not remove its terminal, so the run was
-  void although every judge passed. The later `seat-authority` check refuses this unless a person
-  grants the agent permission to declare that seat.
+  void although every judge passed. In free mode an agent may still do this; the declaration
+  records the agent as its writer.
 - **A reorder does not withdraw a wake that was already sent.** If the old head was woken and not
   yet claimed, the seat also receives a wake for the new head. Withdrawing the old wake would count
   as a closed attempt and could exhaust wakes when moves go back and forth.

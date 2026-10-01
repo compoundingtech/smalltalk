@@ -3242,6 +3242,9 @@ impl<R: RuntimeControl> Reconciler<R> {
             launch_member
                 .environment
                 .insert("ST_AGENT".into(), subject.subject.clone());
+            launch_member
+                .environment
+                .insert("ST3_MAILBOX_TRANSPORT".into(), "push".into());
         } else if let Some(owner) = member.tags.get("st3.agent") {
             launch_member
                 .environment

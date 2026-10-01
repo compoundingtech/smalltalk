@@ -76,3 +76,11 @@ assert.equal(shownToolLines({ ...tool, state: 'failed' }, false).hidden, 0);
   assert.equal(unreadableTranscript([mail, notice({ driver: 'omp' })]), 'This conversation could not be loaded: the transcript could not be read: line 12: expected value');
 }
 
+// A seat that has said nothing since it started shows its Small Talk and one quiet line.
+{
+  const notYet = { id: 'n', role: 'system', timestamp: '2026-10-01T10:00:01Z', type: 'error', body: { code: 'transcript-not-bound', message: 'transcript not bound: Claude session 0190 has no transcript file yet', retryable: true, details: { driver: 'claude', not_yet: true } } };
+  assert.equal(unreadableTranscript([notYet]), null);
+  const shown = conversationEntries([notYet], new Map());
+  assert.deepEqual(shown.map(entry => entry.body), [{ kind: 'event', tone: 'quiet', text: 'nothing in the harness yet since this seat started' }]);
+}
+

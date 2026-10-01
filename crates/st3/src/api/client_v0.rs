@@ -9,7 +9,7 @@ const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
 const COLLECTION_SUBPROTOCOL: &str = "st3.client.collections.v0";
 const TERMINAL_CAPABILITY_PROTOCOL_PREFIX: &str = "st3.cap.";
-const LOCAL_PERSON_HEADER: &str = "x-st3-person";
+pub(super) const LOCAL_PERSON_HEADER: &str = "x-st3-person";
 
 pub(super) async fn request_latency(
     Extension(session): Extension<ClientSession>,
@@ -320,9 +320,9 @@ fn conversation_owner_host(
     .filter(|origin| origin != state.store.origin())
     .map(|origin| client_host_id(&origin));
     if let Some(owner) = &remote {
-        if !session.authority_actor.starts_with("person/") {
+        if !acting_party(session) {
             return Err(forbidden(
-                "a remote conversation requires a concrete person",
+                "a remote conversation requires a concrete person or agent",
             ));
         }
         if state
@@ -986,18 +986,13 @@ impl ClientSession {
                     .collect(),
             });
         };
+        // Free mode: an agent's local session holds every scope a person's does. Its actions
+        // still record the agent as their actor.
         Ok(Self {
             actor: person.into(),
             authority_actor: person.into(),
             transport: "unix",
-            scopes: if person.starts_with("agent/") {
-                ["read.projections", "control.work", "control.missions"]
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect()
-            } else {
-                ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect()
-            },
+            scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
         })
     }
 
@@ -1013,6 +1008,14 @@ impl ClientSession {
     fn allows(&self, scope: &str) -> bool {
         self.scopes.contains(scope)
     }
+}
+
+/// Whether the session acts for a concrete person, or for a local agent seat. Within a fleet, an
+/// agent may do whatever the person who runs the fleet may do (free mode).
+pub(super) fn acting_party(session: &ClientSession) -> bool {
+    let actor = session.authority_actor.as_str();
+    actor.starts_with("person/") && actor.matches('/').count() == 1
+        || session.transport == "unix" && actor.starts_with("agent/")
 }
 
 fn session_claim_actor(session: &ClientSession) -> String {
@@ -1036,16 +1039,12 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
             })
         })
         .collect::<Vec<_>>();
-    capabilities.push(json!({"id":"glasses", "version":0, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
+    capabilities.push(json!({"id":"glasses", "version":1, "state":if glass_person(session, false).is_ok() && glass_person(session, true).is_ok() { "granted" } else { "ungranted" }}));
     capabilities.extend(ACTIONS.iter().map(|action| {
         let scope = action_scope(action).expect("registered client action has a scope");
         let state = if !AVAILABLE_ACTIONS.contains(action) {
             "unavailable"
-        } else if session.allows(scope)
-            && !(session.authority_actor.starts_with("agent/")
-                && scope == "control.missions"
-                && *action != "mission.cancel")
-        {
+        } else if session.allows(scope) {
             "granted"
         } else {
             "ungranted"
@@ -3306,7 +3305,39 @@ struct ManagedTranscript {
     /// placed beside it in the timeline, so it moves forward when the observation changes.
     anchor: ClaimRecord,
     /// The seat's exact native session, or why st3 could not bind one.
-    transcript: Result<crate::external_sessions::ExternalSession, String>,
+    transcript: Result<crate::external_sessions::ExternalSession, Missing>,
+}
+
+/// Why a seat's transcript is not shown. `not_yet` means the harness has not written one for
+/// this incarnation: the seat has said nothing since it started, which is not a failure.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Missing {
+    reason: String,
+    not_yet: bool,
+}
+
+impl Missing {
+    fn not_yet(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            not_yet: true,
+        }
+    }
+}
+
+impl From<String> for Missing {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            not_yet: false,
+        }
+    }
+}
+
+impl From<&str> for Missing {
+    fn from(reason: &str) -> Self {
+        reason.to_owned().into()
+    }
 }
 
 /// Bind a managed seat to its exact native transcript, when its harness keeps one st3 reads.
@@ -3334,7 +3365,9 @@ fn managed_transcript(
         return Ok(None);
     }
     let transcript = if fields["incarnation_id"] != incarnation {
-        Err("the harness has not reported on the seat's current incarnation yet".to_owned())
+        Err(Missing::not_yet(
+            "the harness has not reported on the seat's current incarnation yet",
+        ))
     } else {
         let evidence = fields["evidence_incarnation"].as_str();
         match driver.as_str() {
@@ -3356,8 +3389,13 @@ fn managed_transcript(
 fn transcript_notice(session_id: &str, managed: &ManagedTranscript, reason: &str) -> Value {
     let anchor = &managed.anchor;
     let mut details = json!({ "driver": managed.driver, "claim_id": anchor.id });
-    if let Ok(external) = &managed.transcript {
-        details["transcript"] = Value::String(external.transcript.display().to_string());
+    match &managed.transcript {
+        Ok(external) => {
+            details["transcript"] = Value::String(external.transcript.display().to_string());
+        }
+        // Nothing has gone wrong: the seat has said nothing since it started.
+        Err(missing) if missing.not_yet => details["not_yet"] = Value::Bool(true),
+        Err(_) => {}
     }
     let fields = anchor.body.get("fields").unwrap_or(&anchor.body);
     let digest = hex::encode(Sha256::digest(
@@ -3391,7 +3429,7 @@ fn managed_codex_transcript(
     state: &AppState,
     owner: &str,
     evidence: Option<&str>,
-) -> Result<crate::external_sessions::ExternalSession, String> {
+) -> Result<crate::external_sessions::ExternalSession, Missing> {
     let Some(home) = state.native_session_home.as_deref() else {
         return Err("this daemon has no home directory to read native sessions from".into());
     };
@@ -3446,14 +3484,16 @@ fn managed_codex_transcript(
                     && session.native_id == native_id
             }),
     };
-    bound.ok_or_else(|| format!("Codex thread {native_id} has no rollout file yet"))
+    bound.ok_or_else(|| {
+        Missing::not_yet(format!("Codex thread {native_id} has no rollout file yet"))
+    })
 }
 
 fn managed_claude_transcript(
     state: &AppState,
     owner: &str,
     evidence: Option<&str>,
-) -> Result<crate::external_sessions::ExternalSession, String> {
+) -> Result<crate::external_sessions::ExternalSession, Missing> {
     let Some(home) = state.native_session_home.as_deref() else {
         return Err("this daemon has no home directory to read native sessions from".into());
     };
@@ -3496,12 +3536,10 @@ fn managed_claude_transcript(
         &native_id,
     ) {
         Ok(Some(session)) => Ok(session),
-        Ok(None) => Err(format!(
+        Ok(None) => Err(Missing::not_yet(format!(
             "Claude session {native_id} has no transcript file yet"
-        )),
-        Err(error) => Err(format!(
-            "finding Claude session {native_id} failed: {error:#}"
-        )),
+        ))),
+        Err(error) => Err(format!("finding Claude session {native_id} failed: {error:#}").into()),
     }
 }
 
@@ -3509,7 +3547,7 @@ fn managed_omp_transcript(
     state: &AppState,
     owner: &str,
     incarnation: &str,
-) -> Result<crate::external_sessions::ExternalSession, String> {
+) -> Result<crate::external_sessions::ExternalSession, Missing> {
     let started_at = incarnation
         .split_once(':')
         .and_then(|(_, started_at)| chrono::DateTime::parse_from_rfc3339(started_at).ok())
@@ -3533,10 +3571,13 @@ fn managed_omp_transcript(
                 native_id,
             ) {
                 Ok(Some(session)) => Ok(session),
-                Ok(None) => Err(format!("the imported OMP session {native_id} is not readable")),
+                Ok(None) => {
+                    Err(format!("the imported OMP session {native_id} is not readable").into())
+                }
                 Err(error) => Err(format!(
                     "reading the imported OMP session {native_id} failed: {error:#}"
-                )),
+                )
+                .into()),
             };
         }
     }
@@ -3555,10 +3596,10 @@ fn managed_omp_transcript(
         (started_at.timestamp_millis().max(0) as u128).saturating_sub(2_000),
     ) {
         Ok(Some(session)) => Ok(session),
-        Ok(None) => Err("OMP has not saved a session for this incarnation yet".into()),
-        Err(error) => Err(format!(
-            "reading the OMP session directory failed: {error:#}"
+        Ok(None) => Err(Missing::not_yet(
+            "OMP has not saved a session for this incarnation yet",
         )),
+        Err(error) => Err(format!("reading the OMP session directory failed: {error:#}").into()),
     }
 }
 
@@ -3632,7 +3673,7 @@ pub(super) fn timeline_value(
         let read = managed
             .transcript
             .as_ref()
-            .map_err(String::clone)
+            .map_err(|missing| missing.reason.clone())
             .and_then(|external| {
                 crate::external_sessions::normalized_timeline(external)
                     .map_err(|error| format!("the transcript could not be read: {error:#}"))
@@ -4419,9 +4460,9 @@ pub(super) async fn conversation_changes(
             .map_err(ApiError::internal)?
     {
         if origin != state.store.origin() {
-            if !session.authority_actor.starts_with("person/") {
+            if !acting_party(&session) {
                 return Err(forbidden(
-                    "remote conversation changes require a concrete person",
+                    "remote conversation changes require a concrete person or agent",
                 ));
             }
             let owner = client_host_id(&origin);
@@ -4487,9 +4528,9 @@ pub(super) async fn conversation_stream(
         .and_then(|(_, _, origin)| origin)
         .filter(|origin| origin != state.store.origin())
         .map(|origin| client_host_id(&origin));
-    if remote.is_some() && !session.authority_actor.starts_with("person/") {
+    if remote.is_some() && !acting_party(&session) {
         return Err(forbidden(
-            "remote conversation stream requires a concrete person",
+            "remote conversation stream requires a concrete person or agent",
         ));
     }
     if let Some(owner) = &remote {
@@ -5308,9 +5349,9 @@ pub(super) async fn terminal_screen(
                 .client_relay
                 .as_ref()
                 .ok_or_else(|| remote_unavailable(&host))?;
-            if !session.authority_actor.starts_with("person/") {
+            if !acting_party(&session) {
                 return Err(forbidden(
-                    "remote terminal screen requires a concrete person",
+                    "remote terminal screen requires a concrete person or agent",
                 ));
             }
             let terminal_id = client_detail_id("terminal", &id);
@@ -5448,11 +5489,9 @@ fn prepare_terminal_follow(
             "the requested runtime does not expose a terminal",
         ));
     }
-    if live.owner_host_id != client_host_id(&state.node)
-        && !session.authority_actor.starts_with("person/")
-    {
+    if live.owner_host_id != client_host_id(&state.node) && !acting_party(session) {
         return Err(forbidden(
-            "remote terminal stream requires a concrete person",
+            "remote terminal stream requires a concrete person or agent",
         ));
     }
     consume_terminal_attachment(
@@ -7050,7 +7089,6 @@ async fn dispatch_action(
             if request.fence.mission_generation.as_deref() != Some(current.generation.as_str()) {
                 return Err(stale("the mission generation fence is stale"));
             }
-            require_agent_mission_authority(state, authority_actor, "cancel", &current.mission)?;
             let reason = p
                 .get("reason")
                 .and_then(Value::as_str)
@@ -7407,16 +7445,9 @@ pub(super) async fn action(
         request.action_type.as_str(),
         "terminal.attach" | "terminal.detach"
     );
-    if !read_only_terminal_lifecycle
-        && !session.authority_actor.starts_with("person/")
-        && !(session.transport == "unix"
-            && session.authority_actor.starts_with("agent/")
-            && ((request.action_type.starts_with("work.")
-                && request.action_type != "work.done")
-                || request.action_type == "mission.cancel"))
-    {
+    if !read_only_terminal_lifecycle && !acting_party(&session) {
         return Err(forbidden(
-            "client mutations require explicit concrete person authority",
+            "client mutations require a concrete person or a local agent",
         ));
     }
     let encoded = serde_json::to_vec(&request).map_err(ApiError::internal)?;
@@ -7535,9 +7566,9 @@ pub(super) async fn action(
             .ok_or_else(|| validation("terminal attach requires an incarnation fence"))?;
         let live = remote_terminal_live_session(&state, &terminal_subject(&target), incarnation)?;
         if live.owner_host_id != client_host_id(&state.node) && reconciled_attachment.is_none() {
-            if !session.authority_actor.starts_with("person/") {
+            if !acting_party(&session) {
                 return Err(forbidden(
-                    "remote terminal attach requires a concrete person",
+                    "remote terminal attach requires a concrete person or agent",
                 ));
             }
             let relay = state
@@ -10478,6 +10509,31 @@ mission "example/zero-run" state="ready" {
             }
             std::fs::set_permissions(&transcript, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
+        // A thread that has not written its rollout yet is not a failure: the seat has said
+        // nothing since it started, and the notice says so.
+        std::fs::write(
+            directory.join("binding.json"),
+            serde_json::to_vec(&json!({"agent":"managed-codex","runtimeIncarnation":provider_incarnation,"threadId":"native-managed-codex-unwritten"})).unwrap(),
+        )
+        .unwrap();
+        let quiet = timeline_value(
+            &state,
+            &new_client_snapshot(&state),
+            &session,
+            &session_id,
+            &ClientListQuery::default(),
+        )
+        .unwrap()
+        .0;
+        let notice = quiet["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|item| item["body"]["code"] == "transcript-not-bound")
+            .cloned()
+            .expect("a seat with no rollout yet says so");
+        assert_eq!(notice["body"]["details"]["not_yet"], true, "{notice:#}");
+        assert!(notice["body"]["details"].get("transcript").is_none());
         std::fs::write(
             directory.join("binding.json"),
             serde_json::to_vec(
@@ -10491,7 +10547,7 @@ mission "example/zero-run" state="ready" {
             .unwrap();
         assert_eq!(
             stale.transcript.unwrap_err(),
-            "the Codex binding belongs to a different runtime"
+            Missing::from("the Codex binding belongs to a different runtime")
         );
         let unbound = timeline_value(
             &state,
@@ -10595,7 +10651,10 @@ mission "example/zero-run" state="ready" {
             .unwrap()
             .transcript
             .unwrap_err();
-        assert!(stale.contains("does not name a driver process"), "{stale}");
+        assert!(
+            stale.reason.contains("does not name a driver process") && !stale.not_yet,
+            "{stale:?}"
+        );
     }
 
     #[test]

@@ -93,7 +93,7 @@ fn value(output: &Output) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_granted_seat_bootstraps_and_cancels_with_its_own_cli_identity() {
+async fn a_seat_bootstraps_cancels_and_stops_with_its_own_cli_identity() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");
     let state = test_state(root.path());
@@ -116,8 +116,6 @@ async fn a_granted_seat_bootstraps_and_cancels_with_its_own_cli_identity() {
 agent "example/operations/coordinator" {
   workspace "."
   command "true"
-  agent-authority { apply "example/operations/*" }
-  mission-authority { publish "example/jobs/*"; start "example/jobs/*"; cancel "example/jobs/*" }
 }
 "#,
     )
@@ -148,13 +146,21 @@ agent "example/operations/deputy" {
 "#,
     )
     .unwrap();
-    value(
-        &run_cli_with_agent_env(
-            &socket,
-            actor,
-            &["agents", "apply", deputy.to_str().unwrap(), "--as", actor],
-        )
-        .await,
+    // Free mode: the seat declares another seat with no grant, and st says it ignores the
+    // deputy's authority block.
+    let applied = run_cli_with_agent_env(
+        &socket,
+        actor,
+        &["agents", "apply", deputy.to_str().unwrap(), "--as", actor],
+    )
+    .await;
+    value(&applied);
+    assert!(
+        String::from_utf8_lossy(&applied.stderr).contains(
+            "`agent/example/operations/deputy` declares `mission-authority`, which st ignores"
+        ),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
     );
     let mission = root.path().join("mission.kdl");
     std::fs::write(&mission, "version 2\nmission \"example/jobs/docs/one\" state=\"ready\" { goal \"Do the assigned work.\"; step \"wait\" { agentless } }\n").unwrap();
@@ -215,20 +221,11 @@ agent "example/operations/deputy" {
             .phase,
         "cleanup-cancelled"
     );
-    let escalate = root.path().join("escalate.kdl");
-    std::fs::write(&escalate, "version 2\nagent \"example/operations/deputy\" { workspace \".\"; command \"true\"; mission-authority { publish \"example/*\" } }\n").unwrap();
-    let denied = run_cli_with_agent_env(
-        &socket,
-        actor,
-        &["agents", "apply", escalate.to_str().unwrap(), "--as", actor],
-    )
-    .await;
-    assert!(!denied.status.success());
-    assert!(
-        String::from_utf8_lossy(&denied.stderr).contains("agent-authority-grant-denied"),
-        "{}",
-        String::from_utf8_lossy(&denied.stderr)
-    );
+    let run = store
+        .mission_run("example/jobs/docs/one/run")
+        .unwrap()
+        .unwrap();
+    assert_eq!(run.requester, actor, "the agent started the run as itself");
     value(
         &run_cli_with_agent_env(
             &socket,
@@ -237,6 +234,17 @@ agent "example/operations/deputy" {
         )
         .await,
     );
+    // A seat stops itself.
+    value(&run_cli_with_agent_env(&socket, actor, &["agents", "stop", actor, "--as", actor]).await);
+    let stopped = store
+        .desired_subjects()
+        .unwrap()
+        .into_iter()
+        .filter(|desired| desired.kind == "stop")
+        .map(|desired| desired.subject)
+        .collect::<Vec<_>>();
+    assert!(stopped.contains(&actor.to_owned()), "{stopped:?}");
+    assert!(stopped.contains(&deputy_actor.to_owned()), "{stopped:?}");
     server.abort();
 }
 
@@ -1411,7 +1419,7 @@ mission "queued-work" state="ready" {
     assert_eq!(queue["value"]["moves"][0]["placement"], "after");
     assert_eq!(queue["value"]["moves"][0]["anchor_run_id"], run(1));
 
-    // An agent with queue authority for the seat moves runs as itself.
+    // Another agent moves the seat's runs as itself.
     let chief = "agent/client-v0-cli.queue-chief";
     let moved = run_queue_cli(
         &socket,
@@ -1477,29 +1485,26 @@ mission "queued-work" state="ready" {
     assert_eq!(queue["value"]["moves"][0]["actor_id"], chief);
     assert_eq!(queue["value"]["move_count"], 4);
 
-    // The seat has no grant over its own queue.
-    let refused = run_queue_cli(
-        &socket,
-        &config_home,
-        false,
-        &[
-            "agents",
-            "queue",
-            "move",
-            &seat,
-            run(2),
-            "--top",
-            "--as",
-            &seat,
-        ],
-    )
-    .await;
-    assert!(!refused.status.success());
-    assert!(
-        String::from_utf8_lossy(&refused.stderr).contains("queue-authority-denied"),
-        "{}",
-        String::from_utf8_lossy(&refused.stderr)
+    // Free mode: the seat moves its own queue without a grant.
+    let claim = value(
+        &run_queue_cli(
+            &socket,
+            &config_home,
+            true,
+            &[
+                "agents",
+                "queue",
+                "move",
+                &seat,
+                run(2),
+                "--top",
+                "--as",
+                &seat,
+            ],
+        )
+        .await,
     );
+    assert_eq!(claim["actor"], seat);
     let refused = run_queue_cli(
         &socket,
         &config_home,
