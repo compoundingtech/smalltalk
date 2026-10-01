@@ -3,6 +3,29 @@ use serde_json::Value;
 use st3_client::{TimelineBody, TimelineEntry, TimelineRole, TimelineToolStatus};
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Why a conversation cannot be shown whole, when st could not read the harness's transcript.
+/// st then sends only the Small Talk around it, which reads as a conversation with the agent's
+/// side missing; Nathan's rule (2026-10-01) is to show neither half then, and say why, with the
+/// transcript's path so it can be reported.
+pub fn unreadable_transcript(timeline: &[TimelineEntry]) -> Option<String> {
+    let error = timeline.iter().rev().find_map(|entry| match &entry.body {
+        TimelineBody::Error(error) if error.code == "transcript-not-bound" => Some(error),
+        _ => None,
+    })?;
+    let reason = error
+        .message
+        .strip_prefix("transcript not bound: ")
+        .unwrap_or(&error.message);
+    Some(
+        match error.details.get("transcript").and_then(Value::as_str) {
+            Some(path) => {
+                format!("This conversation could not be loaded: {reason} (transcript {path})")
+            }
+            None => format!("This conversation could not be loaded: {reason}"),
+        },
+    )
+}
+
 /// One conversation: the harness transcript and Small Talk messages, in time order.
 /// Draw one conversation as st joined it: the harness's turns and the agent's Small Talk, in
 /// the order st sent them.

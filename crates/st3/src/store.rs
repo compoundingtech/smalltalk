@@ -9057,6 +9057,14 @@ impl Store {
                 if let Some((operation_id, request_digest)) = &operation {
                     checkpointed_operation_outcome(transaction, operation_id, request_digest)?;
                 }
+                // A native adoption may import old DND only before any explicit graph decision.
+                // Check inside the writer transaction so a concurrent release always wins.
+                if input.kind == "delivery.hold"
+                    && input.fields.get("legacy_adoption") == Some(&Value::Bool(true))
+                    && let Some(existing) = latest_claim_of_kind_tx(transaction, &input.subject, "delivery.hold")?
+                {
+                    return Ok((existing, false));
+                }
                 for evidence in &input.evidence {
                     // Evidence may cite a claim that a checkpoint has since dropped.
                     let exists = checkpoint::claim_or_tombstone_exists(transaction, evidence)
@@ -25600,31 +25608,32 @@ fn batches_accepted_in_one_millisecond_extend_the_projection_without_a_replay() 
     put(0);
     sync();
 
-    // Write document bindings, each its own batch, until two share an accepted millisecond.
-    let bindings = |source: &Store| {
-        source
-            .claims_page(None, None, 0, None, false, 10_000)
-            .unwrap()
-            .claims
-            .into_iter()
-            .filter(|claim| claim.kind == "doc.bound")
-            .collect::<Vec<_>>()
+    // Pin two different batches to the same millisecond: relying on the wall clock
+    // can never force a collision on a slower machine.
+    let accepted_at = source
+        .claims_page(None, None, 0, None, false, 10)
+        .unwrap()
+        .claims
+        .last()
+        .unwrap()
+        .accepted_at_unix_ms
+        + 1;
+    source.set_write_clock_at(accepted_at).unwrap();
+    put(1);
+    put(2);
+    let written = source
+        .claims_page(None, None, 0, None, false, 10)
+        .unwrap()
+        .claims
+        .into_iter()
+        .filter(|claim| claim.kind == "doc.bound")
+        .collect::<Vec<_>>();
+    let [.., previous, last] = written.as_slice() else {
+        panic!("the two document bindings are missing");
     };
-    source.set_write_clock_at(now_ms()).unwrap();
-    let mut index = 1;
-    loop {
-        put(index);
-        index += 1;
-        let written = bindings(&source);
-        let [.., previous, last] = written.as_slice() else {
-            continue;
-        };
-        if previous.accepted_at_unix_ms == last.accepted_at_unix_ms {
-            assert_ne!(previous.batch_id, last.batch_id);
-            break;
-        }
-        assert!(index < 5_000, "no two bindings shared a millisecond");
-    }
+    assert_eq!(previous.accepted_at_unix_ms, accepted_at);
+    assert_eq!(last.accepted_at_unix_ms, accepted_at);
+    assert_ne!(previous.batch_id, last.batch_id);
     FULL_REPLAYS.with(|replays| replays.set(0));
     sync();
     assert_eq!(FULL_REPLAYS.with(std::cell::Cell::get), 0);

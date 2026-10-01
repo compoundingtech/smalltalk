@@ -32,6 +32,31 @@
         "created_at": { "$ref": "#/$defs/Timestamp" }
       }
     },
+    "CanonicalNode": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string" },
+        "arguments": { "type": "array", "items": { "type": ["string", "number", "boolean", "null"] } },
+        "properties": { "type": "object", "additionalProperties": { "type": ["string", "number", "boolean", "null"] } },
+        "children": { "type": "array", "items": { "$ref": "#/$defs/CanonicalNode" } }
+      }
+    },
+    "SubjectDefinition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "subject", "desired", "kdl", "desired_revision", "desired_token", "conflicts"],
+      "properties": {
+        "kind": { "const": "subject-definition" },
+        "subject": { "type": "string", "pattern": "^agent/[^\\s]+$" },
+        "desired": { "$ref": "#/$defs/CanonicalNode" },
+        "kdl": { "type": "string" },
+        "desired_revision": { "$ref": "#/$defs/Revision" },
+        "desired_token": { "type": "string", "minLength": 1 },
+        "conflicts": { "type": "array", "items": { "type": "string" } }
+      }
+    },
     "PageInfo": {
       "type": "object",
       "additionalProperties": false,
@@ -55,6 +80,7 @@
           "oneOf": [
             { "$ref": "#/$defs/Capabilities" },
             { "$ref": "#/$defs/DocumentContent" },
+            { "$ref": "#/$defs/SubjectDefinition" },
             { "$ref": "#/$defs/Page" },
             { "$ref": "#/$defs/Resource" },
             { "$ref": "#/$defs/TimelinePage" },
@@ -598,6 +624,9 @@
             "owner_run_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "driver": { "type": ["string", "null"] },
             "harness_state": { "type": ["string", "null"] },
+            "blocked_on": { "type": ["string", "null"], "description": "Current incarnation's harness blocking axis; human means a person must answer before it continues." },
+            "ask": { "type": ["string", "null"], "description": "Structured human ask kind (question, permission, or review); meaningful only while blocked_on is human." },
+            "reason": { "type": ["string", "null"], "description": "Diagnostic harness reason, not a machine-readable verdict." },
             "host_id": { "oneOf": [{ "$ref": "#/$defs/Id" }, { "type": "null" }] },
             "last_activity_at": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
             "silent_since": { "oneOf": [{ "$ref": "#/$defs/Timestamp" }, { "type": "null" }] },
