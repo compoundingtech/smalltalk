@@ -190,7 +190,7 @@ nix build --print-build-logs --out-link "$RUNNER_TEMP/vm-driver" .#legacyPackage
 printf '| VM driver build | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"`,
         },
         {
-          name: 'Run the exec and pty cascade tests in the VM',
+          name: 'Run all three systemd-scope tests in the VM',
           env: {
             ST_ISOLATION_ARCHIVE: '${{ runner.temp }}/isolation.tar.zst',
             ST_ISOLATION_WORKSPACE: '${{ github.workspace }}',
@@ -199,7 +199,7 @@ printf '| VM driver build | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SU
           run: `start=$SECONDS
 mkdir -p "$RUNNER_TEMP/vm-out"
 "$RUNNER_TEMP/vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/vm-out"
-jq -r '"| VM boot | \\(.boot_seconds)s |\\n| cascade tests in VM (extract and run) | \\(.test_seconds)s |"' "$ST_ISOLATION_TIMINGS" >> "$GITHUB_STEP_SUMMARY"
+jq -r '"| VM boot | \\(.boot_seconds)s |\\n| systemd-scope tests in VM (extract and run) | \\(.test_seconds)s |"' "$ST_ISOLATION_TIMINGS" >> "$GITHUB_STEP_SUMMARY"
 printf '| VM test driver total | %ss |\\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"`,
         },
       ],

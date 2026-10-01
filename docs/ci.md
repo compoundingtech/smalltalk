@@ -41,9 +41,11 @@ backend) holding Cargo's registry and the workspace `target/` directory, keyed o
 `flake.lock`. Namespace cache volumes are not used: they are per node and replicate in the
 background, so a job landing on another node starts empty.
 
-For the trial, `linux-tests` skips the messaging fault matrix exactly as `st/ci` does this week
-(`scripts/ci-linux`), because it timed out in fixture startup on Namespace and its retries kept the
-job running for tens of minutes. Remove that skip when the matrix returns as parallel tests.
+The messaging fault matrix runs as eleven independent `messaging_faults::*` tests in
+`linux-tests`. Nextest schedules the cases in parallel and retries each failing case separately.
+Each case keeps its own evidence directory under `target/messaging-faults/`. The fixture uses
+a systemd user runtime only when its bus exists, so runners without a user manager use the
+existing detached process path instead of trying to create scopes through a synthetic runtime.
 
 `.config/nextest.toml` gives the messaging fault matrix and the fleet reconnect test, both with
 real multi-minute outages, first priority so their retries fit the CI test window. Failed tests
@@ -76,9 +78,11 @@ workspace. List the selection with `cargo nextest list --workspace --profile ci`
 ### Isolation VM
 
 `tests/transport_isolation.rs` proves that a task st2 starts in its own systemd user scope
-survives a SIGKILL of its supervisor's cgroup, for both exec and pty tasks. It needs a real
-systemd user manager, which Namespace's runner image does not boot, so `linux-gate` leaves it
-out and the `isolation-vm` job runs it in a NixOS VM (`nix/transport-isolation-vm.nix`):
+survives a SIGKILL of its supervisor's cgroup, for both exec and pty tasks. The managed-agent
+color contract also checks environment propagation through a real user scope, including a
+PTY restart. These three tests need a real systemd user manager, which Namespace's runner
+image does not boot. They run in a NixOS VM (`nix/transport-isolation-vm.nix`) in the required
+`isolation-vm` job:
 
 1. Probe `/dev/kvm`: the job fails unless KVM can create a VM. Namespace offers nested
    virtualization on `linux/amd64`. QEMU is configured with `forceAccel`, and the test checks
@@ -86,10 +90,12 @@ out and the `isolation-vm` job runs it in a NixOS VM (`nix/transport-isolation-v
 2. `cargo nextest archive -p st2 --test integration` builds the integration test binary and st2.
 3. The job builds the VM test driver from the flake and runs it on the runner. The VM boots
    NixOS with a lingering user, copies in the archive, extracts it at the checkout's path (the
-   test binary has st2's path compiled in) and runs both cascade tests with nextest as a
+   test binary has st2's path compiled in) and runs both cascade tests and
+   `nomad_survival::managed_agent_color_contract_crosses_systemd_scope` with nextest as a
    transient service of that user's systemd manager. The VM compiles nothing.
 
-The job summary records the KVM probe and each phase's elapsed time.
+The VM requires all three tests to run and pass, with no isolation opt-out. The job summary
+records the KVM probe and each phase's elapsed time.
 
 ### macOS
 
