@@ -9,8 +9,7 @@
 
 use st3_client::{
     CapabilityState, Client, ClientError, CollectionEvent, CollectionStream, ErrorCode, Fence,
-    Resource, Snapshot,
-    TargetParameters, TerminalScreen, TimelineEntry,
+    Resource, Snapshot, TargetParameters, TerminalScreen, TimelineEntry,
 };
 use std::collections::BTreeMap;
 use std::sync::mpsc;
@@ -71,6 +70,9 @@ impl Window {
         }
     }
 }
+
+/// The glasses capability version whose glasses are splits of tab groups.
+const GLASSES_VERSION: u32 = 1;
 
 /// The most glasses st keeps live for one person.
 const GLASSES: usize = 100;
@@ -302,14 +304,21 @@ async fn connected(
     // detects that case even when the graph is idle; it never resends a mutation.
     let mut probe = tokio::time::interval(Duration::from_secs(15));
     probe.tick().await;
-    // Glasses are followed only where st grants them; elsewhere stui keeps them on the device.
+    // Glasses are followed only where st grants them in the shape this stui reads (splits of
+    // tab groups, version 1); elsewhere stui keeps them on the device. A member still on the
+    // earlier shape would send glasses this stui cannot decode, and that drops the connection.
     let granted = glasses
         && client.capabilities().await.is_ok_and(|capabilities| {
             capabilities.value.capabilities.iter().any(|capability| {
-                capability.id == "glasses" && capability.state == CapabilityState::Granted
+                capability.id == "glasses"
+                    && capability.version >= GLASSES_VERSION
+                    && capability.state == CapabilityState::Granted
             })
         });
-    for window in Window::ALL.into_iter().chain(granted.then_some(Window::Glasses)) {
+    for window in Window::ALL
+        .into_iter()
+        .chain(granted.then_some(Window::Glasses))
+    {
         if let Err(error) = stream
             .subscribe(window.id(), window.id(), window.limit(), None, None)
             .await

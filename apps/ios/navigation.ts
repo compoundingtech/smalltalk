@@ -12,8 +12,6 @@ export type StackParams = {
   FleetRoot: undefined;
   /** Glasses, an experiment: the chosen glass's tabs. */
   GlassesRoot: undefined;
-  /** One glass tab's panes, by glass id and tab index. */
-  GlassTab: { glass: string; index: number };
   Conversation: { target: string; sessionId?: string; title?: string };
   Terminal: { terminalId: string; title?: string };
   Mission: { id: string; title?: string };

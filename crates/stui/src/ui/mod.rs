@@ -2440,9 +2440,12 @@ impl Ui {
 
     fn click(&mut self, hit: Hit) {
         match hit {
-            Hit::Palette => self.open_palette(None, glass::Open::Here),
             Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
-            Hit::GlassTab(index) => self.show_tab(index),
+            Hit::GlassTab(group, tab) => self.show_in(group, tab),
+            Hit::GlassAdd(group) => {
+                self.focus_group(group);
+                self.open_palette(None, glass::Open::Tab);
+            }
             Hit::PaletteChoice(index) => self.open_choice(Some(index), glass::Open::Here),
             Hit::Tab(tab) => self.switch_tab(tab),
             Hit::Row(index) => self.select(index),
