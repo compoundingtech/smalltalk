@@ -131,7 +131,7 @@ agent "worker" {
     .unwrap();
 
     let receipt = parsed(&diff(&catalog, &prepared, &root));
-    assert_eq!(receipt["schema"], "st2.catalog-diff.v1");
+    assert_eq!(receipt["schema"], "st.catalog-diff.v1");
     assert!(receipt["agents"].as_array().unwrap().is_empty());
     assert_eq!(receipt["paths"].as_array().unwrap().len(), 1);
     assert_eq!(receipt["paths"][0]["path"], "agents/host/worker/agent.kdl");

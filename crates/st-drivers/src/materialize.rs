@@ -1020,7 +1020,7 @@ pub fn materialize_agent(root: &Path, spec: &AgentSpec, this_host: &str) -> Resu
     // Creating the seat is the moment the operator can still act on it. Expansion itself stays
     // pure and silent so `st2 driver expand`, reconcile, and ownership checks read the same.
     for advisory in crate::driver::claude_channel_advisories(spec) {
-        tracing::warn!("st2 materialize: agent '{}': {advisory}", spec.identity);
+        tracing::warn!("st materialize: agent '{}': {advisory}", spec.identity);
     }
     if plan.references_variable("ST_HOOKS") {
         crate::hooks::verify_required_set().with_context(|| {

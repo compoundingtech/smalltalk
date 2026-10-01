@@ -94,7 +94,7 @@ impl Telemetry {
     /// than to build it and hope the flush is quick.
     ///
     /// This is deliberately NOT "hook-class subcommands skip telemetry". `06-observability`'s
-    /// spec instruments `st2 driver claude-observe` by name as `st2-hook` and records that other
+    /// spec instruments `st2 driver claude-observe` by name as `st-hook` and records that other
     /// hook surfaces are not instrumented yet, so a blanket rule would drop an instrumented
     /// surface. The rule is about cadence, not about being a hook.
     pub fn local_only() -> Self {
@@ -107,7 +107,7 @@ impl Telemetry {
     }
 
     /// Initialize telemetry for one process unit (`supervisor`, `cli`, ...). The service name
-    /// follows the central observability contract's process-unit boundary: `st2-<unit>`.
+    /// follows the central observability contract's process-unit boundary: `st-<unit>`.
     pub fn init(unit: &str) -> Self {
         // The stderr fmt layer is installed unconditionally — with or without an endpoint (see
         // `install_subscriber`). Migrated `tracing` diagnostics must stay visible exactly when
@@ -126,13 +126,13 @@ impl Telemetry {
             Ok(exporter) => exporter,
             // Export setup must never take the runner down: telemetry is best-effort.
             Err(err) => {
-                eprintln!("st2: otel exporter unavailable, continuing without telemetry: {err}");
+                eprintln!("st: otel exporter unavailable, continuing without telemetry: {err}");
                 return Self::local_only();
             }
         };
 
         let resource = opentelemetry_sdk::Resource::builder()
-            .with_service_name(format!("st2-{unit}"))
+            .with_service_name(format!("st-{unit}"))
             .with_attribute(KeyValue::new(
                 "service.version",
                 crate::version::machine_version(),
@@ -145,7 +145,7 @@ impl Telemetry {
             .with_resource(resource.clone())
             .build();
         opentelemetry::global::set_tracer_provider(tracer_provider.clone());
-        let otel_span_layer = OpenTelemetryLayer::new(tracer_provider.tracer("st2"));
+        let otel_span_layer = OpenTelemetryLayer::new(tracer_provider.tracer("st"));
 
         // Metrics share endpoint, protocol, and resource with traces. Metric setup is
         // best-effort: if its exporter fails to build (e.g. malformed
@@ -166,7 +166,7 @@ impl Telemetry {
                 Some(meter_provider)
             }
             Err(err) => {
-                eprintln!("st2: otel metric exporter unavailable, metrics disabled: {err}");
+                eprintln!("st: otel metric exporter unavailable, metrics disabled: {err}");
                 None
             }
         };
@@ -181,7 +181,7 @@ impl Telemetry {
                     .build(),
             ),
             Err(err) => {
-                eprintln!("st2: otel log exporter unavailable, logs disabled: {err}");
+                eprintln!("st: otel log exporter unavailable, logs disabled: {err}");
                 None
             }
         };

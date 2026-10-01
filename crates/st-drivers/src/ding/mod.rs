@@ -666,7 +666,7 @@ fn output_with_timeout(command: &mut Command, timeout: Duration) -> anyhow::Resu
     for (stream, name) in [(&stdout_stream, "stdout"), (&stderr_stream, "stderr")] {
         if stream.truncated() {
             eprintln!(
-                "st2: truncated {name} capture of `{program}`: keeping last {} of {} bytes (cap {CAPTURE_CAP_BYTES})",
+                "st: truncated {name} capture of `{program}`: keeping last {} of {} bytes (cap {CAPTURE_CAP_BYTES})",
                 stream.bytes.len(),
                 stream.total,
             );
@@ -705,7 +705,7 @@ fn transport_and_observe_with_window(
     // observation failure is ambiguous: the paste may have landed even if Return did not.
     if let Err(error) = transport() {
         tracing::warn!(
-            "st2 ping: PING transport became ambiguous; retaining staged ownership: {error}"
+            "st ping: PING transport became ambiguous; retaining staged ownership: {error}"
         );
         return Ok(PokeOutcome::Staged);
     }
@@ -727,7 +727,7 @@ fn observe_receipt_with_window(
             Ok(screen) => screen,
             Err(error) => {
                 tracing::warn!(
-                    "st2 ping: post-submit receipt observation failed; retaining staged ownership: {error}"
+                    "st ping: post-submit receipt observation failed; retaining staged ownership: {error}"
                 );
                 return Ok(PokeOutcome::Staged);
             }
@@ -756,7 +756,7 @@ fn retry_staged_with_window(
         Ok(screen) => screen,
         Err(error) => {
             tracing::warn!(
-                "st2 ping: staged retry observation failed; retaining ownership: {error}"
+                "st ping: staged retry observation failed; retaining ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
         }
@@ -788,7 +788,7 @@ fn submit_retained_after_final_observation(
         Ok(screen) => screen,
         Err(error) => {
             tracing::warn!(
-                "st2 ping: final retained-composer observation failed; retaining ownership: {error}"
+                "st ping: final retained-composer observation failed; retaining ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
         }
@@ -806,14 +806,14 @@ fn submit_retained_after_final_observation(
         Ok(None) => {}
         Err(error) => {
             tracing::warn!(
-                "st2 ping: pre-submit receipt failed; retaining staged ownership: {error}"
+                "st ping: pre-submit receipt failed; retaining staged ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
         }
     }
     if let Err(error) = submit() {
         tracing::warn!(
-            "st2 ping: Return command became ambiguous; retaining staged ownership: {error}"
+            "st ping: Return command became ambiguous; retaining staged ownership: {error}"
         );
         return Ok(PokeOutcome::Staged);
     }
@@ -864,7 +864,7 @@ fn observed_poke_with_window(
     // have reached the TUI. Preserve ownership and let retry_staged inspect instead of re-pasting.
     if let Err(error) = stage() {
         tracing::warn!(
-            "st2 ping: paste command became ambiguous; retaining staged ownership: {error}"
+            "st ping: paste command became ambiguous; retaining staged ownership: {error}"
         );
         return Ok(PokeOutcome::Staged);
     }
@@ -875,7 +875,7 @@ fn observed_poke_with_window(
             Ok(screen) => screen,
             Err(error) => {
                 tracing::warn!(
-                    "st2 ping: post-paste observation failed; retaining staged ownership: {error}"
+                    "st ping: post-paste observation failed; retaining staged ownership: {error}"
                 );
                 return Ok(PokeOutcome::Staged);
             }
@@ -916,7 +916,7 @@ fn submit_after_final_observation(
         Ok(screen) => screen,
         Err(error) => {
             tracing::warn!(
-                "st2 ping: final composer observation failed; retaining staged ownership: {error}"
+                "st ping: final composer observation failed; retaining staged ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
         }
@@ -935,14 +935,14 @@ fn submit_after_final_observation(
         Ok(None) => {}
         Err(error) => {
             tracing::warn!(
-                "st2 ping: pre-submit receipt failed; retaining staged ownership: {error}"
+                "st ping: pre-submit receipt failed; retaining staged ownership: {error}"
             );
             return Ok(PokeOutcome::Staged);
         }
     }
     if let Err(error) = submit() {
         tracing::warn!(
-            "st2 ping: Return command became ambiguous; retaining staged ownership: {error}"
+            "st ping: Return command became ambiguous; retaining staged ownership: {error}"
         );
         return Ok(PokeOutcome::Staged);
     }
@@ -1262,7 +1262,7 @@ pub fn run_ding(
         });
     }
     eprintln!(
-        "st2 ping: ready — found {} existing unread message(s){}; watching for new arrivals.",
+        "st ping: ready — found {} existing unread message(s){}; watching for new arrivals.",
         backlog.len(),
         if backlog.is_empty() {
             ""
@@ -1284,7 +1284,7 @@ pub fn run_ding(
 
         let alive = poker.session_alive();
         if watch.step(alive) == WatchStep::Gone {
-            eprintln!("st2 ping: target pty session is gone — exiting.");
+            eprintln!("st ping: target pty session is gone — exiting.");
             break;
         }
 
@@ -1346,7 +1346,7 @@ pub fn run_ding(
                             Ok(None) => startup_adoption_pending = false,
                             Err(error) => {
                                 tracing::warn!(
-                                    "st2 ping: startup staged-notice adoption failed: {error}"
+                                    "st ping: startup staged-notice adoption failed: {error}"
                                 )
                             }
                         }
@@ -1359,7 +1359,7 @@ pub fn run_ding(
                     && let Some(reason) = report.deferred
                 {
                     tracing::warn!(
-                        "st2 ping: delivery deferred for '{}', no input performed: {reason}",
+                        "st ping: delivery deferred for '{}', no input performed: {reason}",
                         context.recipient
                     );
                 }
@@ -1368,7 +1368,7 @@ pub fn run_ding(
             }
         } else if !watch.seen_alive && !logged_waiting {
             eprintln!(
-                "st2 ping: target pty session not yet registered; waiting before enabling exit-when-gone."
+                "st ping: target pty session not yet registered; waiting before enabling exit-when-gone."
             );
             logged_waiting = true;
         }
@@ -1492,7 +1492,7 @@ fn flush_pending_inbox(
                 break;
             }
             Err(error) => {
-                tracing::warn!("st2 ping: {error}");
+                tracing::warn!("st ping: {error}");
                 break;
             }
         }

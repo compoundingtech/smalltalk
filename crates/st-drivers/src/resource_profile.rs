@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde::{Deserialize, Serialize};
 
-pub use st2_resource_protocol::{
+pub use st_resource_protocol::{
     BindingId, FactError, FactValue, HostMessage, MAX_FACT_KEY_BYTES, MAX_FACT_VALUE_BYTES,
     MAX_FACTS, MAX_HEALTH_DETAIL_BYTES, MAX_OBSERVATION_DIAGNOSTIC_BYTES, MAX_PROTOCOL_LINE_BYTES,
     MAX_SELECTOR_BYTES, MAX_SNAPSHOT_BYTES, ObservationResult, OpaqueIdError, OwnerClaim,

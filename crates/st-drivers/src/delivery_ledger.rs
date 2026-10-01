@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::message;
 
-pub(crate) const LEDGER_SCHEMA: &str = "st2.delivery-ledger.v1";
+pub(crate) const LEDGER_SCHEMA: &str = "st.delivery-ledger.v1";
 pub(crate) const LEDGER_FILE: &str = "delivery-ledger.json";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -295,11 +295,17 @@ impl Ledger {
         ledger
     }
 
+    /// Retain the schema family when a replacement control process adopts a live old runtime.
+    pub(crate) fn with_owner_schema(mut self, owner: &str) -> Self {
+        self.record.schema = crate::contracts::schema_for_owner(owner, LEDGER_SCHEMA);
+        self
+    }
+
     fn load(&mut self, bytes: &[u8], correlate: &impl Fn(&str, &str) -> String) -> Result<()> {
         let mut record: Record = serde_json::from_slice(bytes)
             .with_context(|| format!("reading delivery ledger {}", self.path.display()))?;
         anyhow::ensure!(
-            record.schema == LEDGER_SCHEMA,
+            crate::contracts::schema_matches(&record.schema, LEDGER_SCHEMA),
             "delivery ledger has unsupported schema '{}'",
             record.schema
         );
@@ -314,6 +320,7 @@ impl Ledger {
         );
         self.accept(&record.entries, correlate)?;
         record.runtime_id.clone_from(&self.record.runtime_id);
+        record.schema = LEDGER_SCHEMA.to_owned();
         self.record = record;
         Ok(())
     }

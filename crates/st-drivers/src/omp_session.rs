@@ -24,25 +24,25 @@ use crate::pi_family_session::{self, HarnessKind};
 const EXTENSION: &str = "omp-channel.ts";
 
 /// The exact st2 executable the omp extension must spawn for its channel.
-pub const CHANNEL_BIN: &str = "ST2_OMP_CHANNEL_BIN";
+pub const CHANNEL_BIN: &str = "ST_OMP_CHANNEL_BIN";
 /// The catalog root that executable must be pointed at.
-pub const CHANNEL_CATALOG: &str = "ST2_OMP_CHANNEL_CATALOG";
+pub const CHANNEL_CATALOG: &str = "ST_OMP_CHANNEL_CATALOG";
 /// The host-qualified bus identity the channel binds.
-pub const CHANNEL_IDENTITY: &str = "ST2_OMP_CHANNEL_IDENTITY";
+pub const CHANNEL_IDENTITY: &str = "ST_OMP_CHANNEL_IDENTITY";
 /// The wrapper's runtime/task ID — the pty session whose liveness vouches for observed state.
-pub const CHANNEL_RUNTIME_ID: &str = "ST2_OMP_CHANNEL_RUNTIME_ID";
+pub const CHANNEL_RUNTIME_ID: &str = "ST_OMP_CHANNEL_RUNTIME_ID";
 /// The session incarnation token the wrapper mints. The channel adopts it so the wrapper's
 /// terminal record owns — and thereby fences — the live records the channel writes.
-pub const CHANNEL_SESSION: &str = "ST2_OMP_CHANNEL_SESSION";
+pub const CHANNEL_SESSION: &str = "ST_OMP_CHANNEL_SESSION";
 /// The ownership sequence the wrapper claimed at startup.
-pub const CHANNEL_SEQ: &str = "ST2_OMP_CHANNEL_SEQ";
+pub const CHANNEL_SEQ: &str = "ST_OMP_CHANNEL_SEQ";
 /// The exact native session that a cold residency launch must resume.
-pub const CHANNEL_EXPECTED_NATIVE_SESSION: &str = "ST2_OMP_CHANNEL_EXPECTED_NATIVE_SESSION";
+pub const CHANNEL_EXPECTED_NATIVE_SESSION: &str = "ST_OMP_CHANNEL_EXPECTED_NATIVE_SESSION";
 /// The cold residency generation whose exact native session the channel must prove.
-pub const CHANNEL_RESUME_GENERATION: &str = "ST2_OMP_CHANNEL_RESUME_GENERATION";
+pub const CHANNEL_RESUME_GENERATION: &str = "ST_OMP_CHANNEL_RESUME_GENERATION";
 
-const BINDING_SCHEMA: &str = "st2.omp-session-binding.v1";
-const CHECKPOINT_SCHEMA: &str = "st2.omp-residency-checkpoint.v1";
+const BINDING_SCHEMA: &str = "st.omp-session-binding.v1";
+const CHECKPOINT_SCHEMA: &str = "st.omp-residency-checkpoint.v1";
 const BINDING_FILE: &str = "binding.json";
 const PENDING_BINDING_FILE: &str = "binding.pending.json";
 const CHECKPOINT_FILE: &str = "residency-checkpoint.json";
@@ -156,8 +156,11 @@ pub fn record_channel_binding(
             "OMP native session {native_session_id:?} does not match required resume {expected:?}"
         );
     }
+    let schema = load_binding(state_dir, agent, runtime_id)?
+        .filter(|binding| binding.runtime_incarnation == runtime_incarnation)
+        .map_or_else(|| BINDING_SCHEMA.to_owned(), |binding| binding.schema);
     let binding = OmpSessionBinding {
-        schema: BINDING_SCHEMA.into(),
+        schema,
         agent: agent.into(),
         runtime_id: runtime_id.into(),
         runtime_incarnation: runtime_incarnation.into(),
@@ -221,7 +224,7 @@ pub fn checkpoint_residency(
         "OMP runtime native session binding is not ready"
     );
     let checkpoint = OmpResidencyCheckpoint {
-        schema: CHECKPOINT_SCHEMA.into(),
+        schema: crate::contracts::schema_for_owner(&binding.schema, CHECKPOINT_SCHEMA),
         source_generation,
         resume_generation,
         binding,
@@ -304,7 +307,7 @@ fn load_binding_file(
     };
     let binding: OmpSessionBinding = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(
-        binding.schema == BINDING_SCHEMA,
+        crate::contracts::schema_matches(&binding.schema, BINDING_SCHEMA),
         "unsupported OMP native session binding schema"
     );
     anyhow::ensure!(
@@ -329,7 +332,7 @@ fn load_checkpoint(
         .with_context(|| format!("reading OMP residency checkpoint {}", path.display()))?;
     let checkpoint: OmpResidencyCheckpoint = serde_json::from_slice(&bytes)?;
     anyhow::ensure!(
-        checkpoint.schema == CHECKPOINT_SCHEMA,
+        crate::contracts::schema_matches(&checkpoint.schema, CHECKPOINT_SCHEMA),
         "unsupported OMP residency checkpoint schema"
     );
     anyhow::ensure!(
@@ -342,7 +345,7 @@ fn load_checkpoint(
         "OMP residency checkpoint belongs to a different agent runtime"
     );
     anyhow::ensure!(
-        checkpoint.binding.schema == BINDING_SCHEMA
+        crate::contracts::schema_matches(&checkpoint.binding.schema, BINDING_SCHEMA)
             && checkpoint.binding.ready
             && !checkpoint.binding.runtime_incarnation.is_empty(),
         "OMP residency checkpoint has an invalid native session binding"
@@ -523,7 +526,7 @@ mod tests {
     impl FakeExecutable {
         fn new(body: &str) -> Self {
             let directory = tempfile::Builder::new()
-                .prefix("st2-omp-version-")
+                .prefix("st-omp-version-")
                 .tempdir()
                 .unwrap();
             let source = directory.path().join("omp.source");
@@ -782,8 +785,8 @@ mod tests {
         let fake = FakeExecutable::new(&format!(
             "#!/bin/sh\n\
              if [ \"$1\" = \"--version\" ]; then printf 'omp v18.1.7\\n'; exit 0; fi\n\
-             printf '%s|%s\\n' \"${{ST2_OMP_CHANNEL_EXPECTED_NATIVE_SESSION-unset}}\" \
-             \"${{ST2_OMP_CHANNEL_RESUME_GENERATION-unset}}\" > '{}'\n",
+             printf '%s|%s\\n' \"${{ST_OMP_CHANNEL_EXPECTED_NATIVE_SESSION-unset}}\" \
+             \"${{ST_OMP_CHANNEL_RESUME_GENERATION-unset}}\" > '{}'\n",
             marker.display()
         ));
         let hooks = temp.path().join("hooks");

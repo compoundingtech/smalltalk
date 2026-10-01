@@ -3,7 +3,7 @@
 //! Every script in st3's hook set execs this, hidden from `--help`, with the harness's payload on
 //! stdin. The arguments and environment are the ones the seat's driver exports: the event name in
 //! the first argument, `CATALOG` (else `ST_ROOT`) for the driver's private catalog,
-//! `ST2_CLAUDE_IDENTITY` (else `ST_AGENT`), and the `ST2_CLAUDE_*` wrapper-session variables.
+//! `ST_CLAUDE_IDENTITY` (else `ST_AGENT`), and the `ST_CLAUDE_*` wrapper-session variables.
 //! Behaviour comes from the same library functions st2's CLI used, so no `st2` program runs.
 //!
 //! Observation fails open, since a hook the harness waits on must not stop it. One case is loud:
@@ -40,21 +40,34 @@ pub struct Diagnostic {
 /// What a hook sees of its process environment.
 pub trait HookEnv {
     fn var(&self, name: &str) -> Option<String>;
+    fn raw_var(&self, name: &str) -> Option<String> {
+        self.var(name)
+    }
 }
 
 /// The real process environment. Empty values count as unset, as the scripts treated them.
 pub struct ProcessEnv;
 
 impl HookEnv for ProcessEnv {
+    fn raw_var(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
     fn var(&self, name: &str) -> Option<String> {
         std::env::var(name).ok().filter(|value| !value.is_empty())
     }
 }
 
 impl HookEnv for BTreeMap<String, String> {
+    fn raw_var(&self, name: &str) -> Option<String> {
+        self.get(name).cloned()
+    }
     fn var(&self, name: &str) -> Option<String> {
         self.get(name).filter(|value| !value.is_empty()).cloned()
     }
+}
+
+fn hook_var(env: &dyn HookEnv, name: &str) -> Option<String> {
+    st_drivers::contracts::env_with(name, &|key| env.raw_var(key))
 }
 
 /// Run hook `name` and return the process exit code.
@@ -72,9 +85,7 @@ pub fn run(
     match name {
         "claude-observe" => claude_observe(args, env, stdin, report),
         "claude-statusline" => {
-            let identity = env
-                .var("ST2_CLAUDE_IDENTITY")
-                .or_else(|| env.var("ST_AGENT"));
+            let identity = hook_var(env, "ST_CLAUDE_IDENTITY").or_else(|| env.var("ST_AGENT"));
             let root = env.var("CATALOG").or_else(|| env.var("ST_ROOT"));
             let (Some(identity), Some(root)) = (identity, root) else {
                 // Claude writes the payload to this process; drain it so Claude never sees EPIPE.
@@ -131,15 +142,9 @@ fn claude_observe(
     let event = args.first().map(String::as_str).unwrap_or_default();
     let session_start = event == "SessionStart";
     let mandatory = session_start
-        && (env
-            .var(st_drivers::claude_session::RESUME_GENERATION_ENV)
-            .is_some()
-            || env
-                .var(st_drivers::claude_session::EXPECTED_NATIVE_SESSION_ENV)
-                .is_some());
-    let identity = env
-        .var("ST2_CLAUDE_IDENTITY")
-        .or_else(|| env.var("ST_AGENT"));
+        && (hook_var(env, st_drivers::claude_session::RESUME_GENERATION_ENV).is_some()
+            || hook_var(env, st_drivers::claude_session::EXPECTED_NATIVE_SESSION_ENV).is_some());
+    let identity = hook_var(env, "ST_CLAUDE_IDENTITY").or_else(|| env.var("ST_AGENT"));
     // CATALOG first: it names the catalog that declares the agent, while ST_ROOT can be a bus root.
     let root = env.var("CATALOG").or_else(|| env.var("ST_ROOT"));
     let (Some(identity), Some(root)) = (identity, root) else {
@@ -158,8 +163,7 @@ fn claude_observe(
     }
     let root = PathBuf::from(&root);
     let root = root.canonicalize().unwrap_or(root);
-    let runtime_id = env
-        .var(st_drivers::claude_session::RUNTIME_ID_ENV)
+    let runtime_id = hook_var(env, st_drivers::claude_session::RUNTIME_ID_ENV)
         .unwrap_or_else(|| identity.clone());
     if let Err(error) = st_drivers::claude_session::run_observe_payload(
         &root,
@@ -167,7 +171,7 @@ fn claude_observe(
         Some(&runtime_id),
         event,
         &raw,
-        &|name| env.var(name),
+        &|name| env.raw_var(name),
     ) {
         if mandatory {
             eprintln!("st: the mandatory Claude SessionStart binding failed: {error:#}");
@@ -191,9 +195,8 @@ fn session_start_binding(
     env: &dyn HookEnv,
     raw: &str,
 ) -> std::result::Result<(), String> {
-    let wrapper = env
-        .var(st_drivers::claude_session::SESSION_ENV)
-        .ok_or("the SessionStart hook has no wrapper session (ST2_CLAUDE_SESSION)")?;
+    let wrapper = hook_var(env, st_drivers::claude_session::SESSION_ENV)
+        .ok_or("the SessionStart hook has no wrapper session (ST_CLAUDE_SESSION)")?;
     let payload: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
     let native = payload["session_id"]
         .as_str()
@@ -227,8 +230,7 @@ fn unbound(env: &dyn HookEnv, report: &mut dyn FnMut(Diagnostic), reason: &str) 
         .or_else(|| env.var("ST_AGENT"))
         .filter(|subject| subject.starts_with("agent/"))
     {
-        let session = env
-            .var(st_drivers::claude_session::SESSION_ENV)
+        let session = hook_var(env, st_drivers::claude_session::SESSION_ENV)
             .unwrap_or_else(|| "unknown".into());
         report(Diagnostic {
             idempotency_key: format!("{UNBOUND_CODE}-hook:{subject}:{session}"),
@@ -300,10 +302,10 @@ mod tests {
         .unwrap();
         let env = BTreeMap::from([
             ("CATALOG".to_owned(), catalog.display().to_string()),
-            ("ST2_CLAUDE_IDENTITY".to_owned(), "example/seat".to_owned()),
-            ("ST2_CLAUDE_RUNTIME_ID".to_owned(), "example/seat".to_owned()),
-            ("ST2_CLAUDE_SESSION".to_owned(), "wrapper-1".to_owned()),
-            ("ST2_CLAUDE_SESSION_SEQ".to_owned(), "1".to_owned()),
+            ("ST_CLAUDE_IDENTITY".to_owned(), "example/seat".to_owned()),
+            ("ST_CLAUDE_RUNTIME_ID".to_owned(), "example/seat".to_owned()),
+            ("ST_CLAUDE_SESSION".to_owned(), "wrapper-1".to_owned()),
+            ("ST_CLAUDE_SESSION_SEQ".to_owned(), "1".to_owned()),
             ("ST3_SUBJECT".to_owned(), "agent/example/seat".to_owned()),
             (
                 "ST3_DRIVER_STATE_DIR".to_owned(),
@@ -369,7 +371,7 @@ mod tests {
         assert!(reported[0].reason.contains("session_id"), "{reported:?}");
 
         // A seat whose driver exported no wrapper session cannot bind either.
-        env.remove("ST2_CLAUDE_SESSION");
+        env.remove("ST_CLAUDE_SESSION");
         let (code, reported) = hook(
             "claude-observe",
             &["SessionStart"],
@@ -377,7 +379,7 @@ mod tests {
             r#"{"session_id":"native-1"}"#,
         );
         assert_eq!(code, 1);
-        assert!(reported[0].reason.contains("ST2_CLAUDE_SESSION"));
+        assert!(reported[0].reason.contains("ST_CLAUDE_SESSION"));
 
         // A hook with no catalog at all is loud at SessionStart, quiet otherwise.
         env.remove("CATALOG");
@@ -464,5 +466,49 @@ mod tests {
             let text = std::str::from_utf8(bytes).unwrap();
             assert!(text.contains(&format!("exec \"$ST3_BIN\" {SUBCOMMAND} {name}")));
         }
+    }
+    #[test]
+    fn legacy_hook_environment_survives_upgrade_and_current_values_win() {
+        let root = tempfile::tempdir().unwrap();
+        let (agent_dir, env) = seat(root.path());
+        let mut env = env
+            .into_iter()
+            .map(|(key, value)| {
+                (
+                    if key.starts_with("ST_CLAUDE_") {
+                        key.replacen("ST_", "ST2_", 1)
+                    } else {
+                        key
+                    },
+                    value,
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let payload =
+            r#"{"session_id":"native-1","transcript_path":"/nowhere.jsonl","source":"startup"}"#;
+        assert_eq!(
+            hook("claude-observe", &["SessionStart"], &env, payload).0,
+            0
+        );
+        assert_eq!(
+            crate::hooks::claude_binding(&agent_dir, "wrapper-1").as_deref(),
+            Some("native-1")
+        );
+        env.insert("ST_CLAUDE_SESSION".into(), "wrapper-2".into());
+        env.insert(
+            "ST2_CLAUDE_RESUME_GENERATION".into(),
+            "invalid-old-fence".into(),
+        );
+        env.insert("ST_CLAUDE_RESUME_GENERATION".into(), String::new());
+        assert_eq!(
+            hook("claude-observe", &["SessionStart"], &env, payload).0,
+            0
+        );
+        assert_eq!(
+            crate::hooks::claude_binding(&agent_dir, "wrapper-2").as_deref(),
+            Some("native-1")
+        );
+        env.insert("ST_CLAUDE_SESSION".into(), String::new());
+        assert_eq!(hook_var(&env, "ST_CLAUDE_SESSION"), None);
     }
 }

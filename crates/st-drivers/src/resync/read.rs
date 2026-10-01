@@ -21,7 +21,7 @@ pub(super) fn read_state(
 
 pub(super) fn diagnose_read_error(path: &Path, error: &std::io::Error) {
     eprintln!(
-        "st2: resync read for '{}' failed transiently; retrying: {error}",
+        "st: resync read for '{}' failed transiently; retrying: {error}",
         path.display()
     );
 }

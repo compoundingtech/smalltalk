@@ -647,10 +647,27 @@ fn apply_provider_environment(
     env: &[(String, String)],
     removed_env: &[&str],
 ) {
+    // A fresh provider owns a new wrapper environment, even when launched below an old seat.
+    // Never hand it another harness's legacy ownership or mandatory-resume fields.
+    for (key, _) in std::env::vars_os() {
+        if key.to_str().is_some_and(|key| {
+            key.starts_with("ST2_CLAUDE_")
+                || key.starts_with("ST2_PI_CHANNEL_")
+                || key.starts_with("ST2_OMP_CHANNEL_")
+        }) {
+            command.env_remove(key);
+        }
+    }
     for key in removed_env {
         command.env_remove(key);
+        if let Some(legacy) = crate::contracts::legacy_env_name(key) {
+            command.env_remove(legacy);
+        }
     }
     for (key, value) in env {
+        if let Some(legacy) = crate::contracts::legacy_env_name(key) {
+            command.env_remove(legacy);
+        }
         command.env(key, value);
     }
 }
@@ -948,5 +965,36 @@ mod tests {
             value_for(&required),
             Some(Some(std::ffi::OsString::from("required")))
         );
+    }
+    #[test]
+    fn fresh_provider_exports_current_names_and_removes_both_resume_fences() {
+        let mut command = Command::new("true");
+        apply_provider_environment(
+            &mut command,
+            &[("ST_CLAUDE_SESSION".into(), "fresh".into())],
+            &[
+                "ST_CLAUDE_EXPECTED_NATIVE_SESSION",
+                "ST_CLAUDE_RESUME_GENERATION",
+            ],
+        );
+        let vars = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.map(|value| value.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(vars["ST_CLAUDE_SESSION"].as_deref(), Some("fresh"));
+        for key in [
+            "ST2_CLAUDE_SESSION",
+            "ST_CLAUDE_EXPECTED_NATIVE_SESSION",
+            "ST2_CLAUDE_EXPECTED_NATIVE_SESSION",
+            "ST_CLAUDE_RESUME_GENERATION",
+            "ST2_CLAUDE_RESUME_GENERATION",
+        ] {
+            assert_eq!(vars[key], None, "{key} must not reach a fresh provider");
+        }
     }
 }

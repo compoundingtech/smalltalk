@@ -15,7 +15,7 @@ use sha2::{Digest as _, Sha256};
 use crate::Discovered;
 use crate::park::{ParkObserver, ParkState};
 
-pub const TASK_INVENTORY_SCHEMA: &str = "st2.task-inventory.v3";
+pub const TASK_INVENTORY_SCHEMA: &str = "st.task-inventory.v3";
 
 /// Opaque identity over one backend's stable process-generation evidence.
 pub(crate) fn generation_id(
@@ -1016,7 +1016,7 @@ mod tests {
                 errors: vec![],
             },
         );
-        assert_eq!(value["schema"], "st2.task-inventory.v3");
+        assert_eq!(value["schema"], TASK_INVENTORY_SCHEMA);
         assert_eq!(value["tasks"][0]["residencyPolicy"], "on-demand");
         assert_eq!(
             value["tasks"][0]["runtimeResidency"],
@@ -1227,8 +1227,8 @@ mod tests {
         assert_eq!(value["tasks"][1]["runtimeId"], "h.healthy");
         assert_eq!(value["tasks"][1]["parked"], Value::Null);
 
-        // A park is a KNOWN fault. Making it incomplete would conflate "st2 decided to stop
-        // restarting this" with "st2 could not tell what is going on", and would make `st2 tasks`
+        // A park is a KNOWN fault. Making it incomplete would conflate "st decided to stop
+        // restarting this" with "st could not tell what is going on", and would make `st2 tasks`
         // exit non-zero for the entire time a crash-looper sits parked.
         assert_eq!(value["complete"], true);
         assert_eq!(value["errors"], Value::Array(vec![]));

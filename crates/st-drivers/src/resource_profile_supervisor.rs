@@ -24,7 +24,7 @@ use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 #[cfg(feature = "wasip2-provider-runtime")]
-use st2_resource_protocol::ProposalFence;
+use st_resource_protocol::ProposalFence;
 #[cfg(feature = "wasip2-provider-runtime")]
 use st2_resource_providers::{
     GitHubIssueConfig, GitHubIssueModule, GitHubPrConfig, GitHubPrModule, PtyStatsConfig,
@@ -99,7 +99,7 @@ impl ResourceProfileSupervisor {
         let worker_host = this_host.clone();
         let completion_tx = tx.clone();
         let worker = thread::Builder::new()
-            .name("st2-resource-profile".to_owned())
+            .name("st-resource-profile".to_owned())
             .spawn(move || {
                 Worker::new(
                     worker_root,
@@ -113,7 +113,7 @@ impl ResourceProfileSupervisor {
             .context("spawn Resource Profile supervisor")?;
         let bridge_tx = tx.clone();
         let observe_bridge = thread::Builder::new()
-            .name("st2-resource-observe-watch".to_owned())
+            .name("st-resource-observe-watch".to_owned())
             .spawn(move || {
                 while watch_rx.recv().is_ok() {
                     if bridge_tx.send(Msg::ObserveRequests).is_err() {
@@ -246,7 +246,7 @@ struct ObservationCompletion {
     authority: ObservationAuthority,
     watermark: u64,
     fence: ProposalFence,
-    result: Result<st2_resource_protocol::ObservationResult, String>,
+    result: Result<st_resource_protocol::ObservationResult, String>,
 }
 
 #[cfg(feature = "wasip2-provider-runtime")]
@@ -286,10 +286,10 @@ impl ObservationCancellation {
 #[cfg(feature = "wasip2-provider-runtime")]
 fn catch_observation(
     observe: impl FnOnce() -> Result<
-        st2_resource_protocol::ObservationResult,
+        st_resource_protocol::ObservationResult,
         st2_resource_wasip2::ObserveError,
     >,
-) -> Result<st2_resource_protocol::ObservationResult, String> {
+) -> Result<st_resource_protocol::ObservationResult, String> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(observe))
         .map_err(|_| "provider observation panicked".to_owned())?
         .map_err(|error| error.to_string())
@@ -771,7 +771,7 @@ impl Worker {
                     (launches, errors, runtime.scheme.clone())
                 };
                 for error in errors {
-                    eprintln!("st2: Resource Profile '{scheme}': {error}");
+                    eprintln!("st: Resource Profile '{scheme}': {error}");
                 }
                 for launch in launches {
                     self.spawn_observation(launch);
@@ -781,7 +781,7 @@ impl Worker {
         #[cfg(not(feature = "wasip2-provider-runtime"))]
         for runtime in self.runtimes.values_mut() {
             for error in runtime.retry_observe_dispatches() {
-                eprintln!("st2: Resource Profile '{}': {error}", runtime.scheme);
+                eprintln!("st: Resource Profile '{}': {error}", runtime.scheme);
             }
         }
     }
@@ -806,7 +806,7 @@ impl Worker {
         let thread_cancellation = cancellation.clone();
         let thread_fence = fence;
         let spawn = thread::Builder::new()
-            .name(format!("st2-resource-observe-{job_id}"))
+            .name(format!("st-resource-observe-{job_id}"))
             .spawn(move || {
                 let result = catch_observation(|| provider.observe(&request, &thread_cancellation));
                 let _ = completion_tx.send(Msg::ObservationCompleted(ObservationCompletion {
@@ -886,7 +886,7 @@ impl Worker {
         match completion.result {
             Ok(result) => {
                 let failure_detail = match &result {
-                    st2_resource_protocol::ObservationResult::Failed { diagnostic } => Some(
+                    st_resource_protocol::ObservationResult::Failed { diagnostic } => Some(
                         diagnostic
                             .clone()
                             .unwrap_or_else(|| "provider returned a failed observation".to_owned()),
@@ -1004,7 +1004,7 @@ impl Worker {
         .entered();
         let (records, errors) = scan_requests(&self.request_dir);
         for error in errors {
-            eprintln!("st2: {error}");
+            eprintln!("st: {error}");
         }
         for record in records {
             match read_receipt(&self.receipt_dir, &record.request.request_id) {
@@ -1015,7 +1015,7 @@ impl Worker {
                 Ok(_) => {}
                 Err(error) => {
                     eprintln!(
-                        "st2: reading observe receipt for {:?}: {error:#}",
+                        "st: reading observe receipt for {:?}: {error:#}",
                         record.request.request_id
                     );
                     continue;
@@ -1116,7 +1116,7 @@ impl Worker {
             }
         }
         for error in prune_terminal_receipts(&self.receipt_dir) {
-            eprintln!("st2: {error}");
+            eprintln!("st: {error}");
         }
     }
 
@@ -1139,13 +1139,13 @@ impl Worker {
                 crate::metrics::record_resource_observe_request(status.wire_str());
                 if let Err(error) = remove_request(&record.path) {
                     eprintln!(
-                        "st2: consuming observe request {}: {error:#}",
+                        "st: consuming observe request {}: {error:#}",
                         record.path.display()
                     );
                 }
             }
             Err(error) => eprintln!(
-                "st2: writing observe receipt for {:?}: {error:#}",
+                "st: writing observe receipt for {:?}: {error:#}",
                 record.request.request_id
             ),
         }
@@ -1241,7 +1241,7 @@ impl ProviderRuntime {
         &self,
         request: &Wasip2ObservationRequest,
         cancellation: &ObservationCancellation,
-    ) -> Result<st2_resource_protocol::ObservationResult, st2_resource_wasip2::ObserveError> {
+    ) -> Result<st_resource_protocol::ObservationResult, st2_resource_wasip2::ObserveError> {
         match self {
             Self::GitHubIssue {
                 executor,
@@ -1895,7 +1895,7 @@ impl RuntimeProcess {
                 )?;
                 if let Some(error) = delivery_error {
                     eprintln!(
-                        "st2: Resource Profile '{}': demanded publication delivery failed: {error:#}",
+                        "st: Resource Profile '{}': demanded publication delivery failed: {error:#}",
                         self.scheme
                     );
                 }
@@ -2078,7 +2078,7 @@ fn settle_active_demand(
         diagnostic,
     });
     for error in retry_settled_demand(request_dir, receipt_dir, &authority, active) {
-        eprintln!("st2: Resource Profile '{}': {error}", active.desired.scheme);
+        eprintln!("st: Resource Profile '{}': {error}", active.desired.scheme);
     }
     tracing::info!(
         recipient = %active.desired.recipient,
@@ -2104,7 +2104,7 @@ fn finalize_active_demand(
         registration: active.registration.clone(),
     };
     for error in retry_settled_demand(request_dir, receipt_dir, &authority, active) {
-        eprintln!("st2: Resource Profile '{}': {error}", active.desired.scheme);
+        eprintln!("st: Resource Profile '{}': {error}", active.desired.scheme);
     }
     for mut batch in active
         .demand
@@ -2122,7 +2122,7 @@ fn finalize_active_demand(
             None,
             diagnostic.clone(),
         ) {
-            eprintln!("st2: Resource Profile '{}': {error}", active.desired.scheme);
+            eprintln!("st: Resource Profile '{}': {error}", active.desired.scheme);
         }
     }
 }
