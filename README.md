@@ -295,7 +295,10 @@ answer within a second, st attaches to the seat's newest PTY session on that hos
 says so.
 
 A running seat keeps its current process when you apply a changed declaration; launch changes
-take effect the next time it starts. To use those now, stop the seat and apply again. `st agents stop
+take effect the next time it starts. Use `st agents restart agent/example/worker --as person/ada`
+to apply those changes now. Restart preserves the declaration, works for top-level and mission
+seats, and waits for a new running incarnation. `--timeout 2m` changes the default ten-minute
+wait; a failure or timeout explains why the seat is not running again. `st agents stop
 agent/example/worker --as person/ada` stops a seat until you apply its file again.
 
 Human labels are presentation, not launch configuration:

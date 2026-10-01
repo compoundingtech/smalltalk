@@ -43,6 +43,14 @@ seat has no claimed work. The ask ends with its requester, originating attempt o
 `work cancel-ask PERSON_STEP --as "$ST_AGENT" --reason TEXT` cancels the requester's ask.
 `st now` and `attention ls/show` display current source work; attention has no separate close action.
 
+## Restart a seat
+
+`"$ST3_BIN" agents restart AGENT --as "$ST_AGENT"` restarts a top-level or mission seat,
+keeping its declaration, and returns when a new incarnation is running. It uses the same
+person or agent authority as stopping and starting a seat. `--timeout 2m` changes the default
+ten-minute wait. If the seat cannot restart, the command explains why; `agents show AGENT`
+and `terminals attach AGENT` help inspect it. Use `agents restart` to replace a seat's process.
+
 ## Other agents' terminals
 
 st reaches every seat through its harness's own channel. Keys typed into another agent's terminal
