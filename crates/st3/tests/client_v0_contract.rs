@@ -1813,6 +1813,25 @@ mission "example/other/one" state="ready" { goal "Stay outside the cancel grant.
     let granted = start("example/jobs/one", "cancel-granted-run");
     let outside = start("example/other/one", "cancel-outside-run");
     let app = st3::api::router(state.clone());
+    let (_, capabilities) = client_json_person(
+        app.clone(),
+        "/v1/client/capabilities",
+        "agent/example/operator",
+    )
+    .await;
+    let capability_state = |id: &str| {
+        capabilities["value"]["capabilities"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|capability| capability["id"] == id)
+            .unwrap()["state"]
+            .as_str()
+            .unwrap()
+    };
+    assert_eq!(capability_state("mission.cancel"), "granted");
+    assert_eq!(capability_state("mission.start"), "ungranted");
+    assert_eq!(capability_state("mission.approve-revision"), "ungranted");
     let cancel = |run: &st3::model::MissionRunView,
                   generation: &str,
                   snapshot: &Value,

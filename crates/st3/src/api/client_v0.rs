@@ -964,7 +964,11 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         let scope = action_scope(action).expect("registered client action has a scope");
         let state = if !AVAILABLE_ACTIONS.contains(action) {
             "unavailable"
-        } else if session.allows(scope) {
+        } else if session.allows(scope)
+            && !(session.authority_actor.starts_with("agent/")
+                && scope == "control.missions"
+                && *action != "mission.cancel")
+        {
             "granted"
         } else {
             "ungranted"
