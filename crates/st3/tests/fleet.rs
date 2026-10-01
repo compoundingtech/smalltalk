@@ -2247,9 +2247,20 @@ async fn outbound_only_member_returns_after_minutes_and_aged_hours_without_alert
                 .unwrap();
             assert_eq!(machine["state"], "last-seen", "{machines}");
         }
+        let absent_attempts = attempts.load(Ordering::Relaxed) - before;
+        eprintln!("{absent_attempts} connection attempts during {label} absence");
+        if absent_attempts > 20 {
+            for node in [&a, &b] {
+                eprintln!(
+                    "{} after {label}: {}",
+                    node.name,
+                    node.st_json(&["replication", "status"])
+                );
+            }
+        }
         assert!(
-            attempts.load(Ordering::Relaxed) - before <= 20,
-            "absence did not back off"
+            absent_attempts <= 20,
+            "absence did not back off: {absent_attempts} attempts during {label}"
         );
         let always_on_notes = expected
             .iter()
