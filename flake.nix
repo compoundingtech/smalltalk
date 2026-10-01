@@ -12,12 +12,10 @@
     # controls them through (Cargo.lock).
     pty.url = "github:compoundingtech/pty-rust/06c303f708a49a8110a5eb640194deab0561fa3a";
     pty.inputs.nixpkgs.follows = "nixpkgs";
-    # Shared tooling packages from overengineering: provides the `otelite`
-    # OTLP collector binary that `checks.release-integration` drives to prove
-    # real span export end-to-end. Pinned to a full rev (like `pty`)
-    # so CI is reproducible; bump deliberately via `nix flake lock`.
+    # Shared CI generators and the `otelite` collector used by release-integration.
+    # Re-pin to effect-utils main once the Rust helpers and repo-settings PRs merge.
     effect-utils.url =
-      "github:overengineeringstudio/effect-utils/911e2ce0f4ac39d2b54f9ebd6df035234982f721";
+      "github:overengineeringstudio/effect-utils/3089f7e1faa82d7a4cb4de0e8d485164f837708b";
   };
 
   outputs =
@@ -1049,11 +1047,29 @@
             # (`cargo test --test integration otel_export::`) need the same collector the
             # Nix check pins; `ST2_OTELITE_BIN` points at it.
             effect-utils.packages.${system}.otelite
+            # st3's messaging fault matrix runs the omp channel hook (TypeScript) under the
+            # provider stand-in with Node's built-in type stripping, which Node 24 enables.
+            pkgs.nodejs
           ];
           # Same collector the Nix gate pins, so a bare
           # `cargo test --test integration otel_export::` in this shell runs against it.
           ST2_OTELITE_BIN = "${effect-utils.packages.${system}.otelite}/bin/otelite";
           RUSTC_WRAPPER = "${pkgs.sccache}/bin/sccache";
+        };
+        # Configuration generation must not realize the Rust/PTY/collector shell.
+        devShells.genie = pkgs.mkShell {
+          packages = [ effect-utils.packages.${system}.genie ];
+          shellHook = ''
+            mkdir -p repos
+            ln -sfn ${effect-utils} repos/effect-utils
+          '';
+        };
+        # The isolation-vm CI job's NixOS VM; see the file for how it runs.
+        legacyPackages = pkgs.lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+          transport-isolation-vm = import ./nix/transport-isolation-vm.nix {
+            inherit pkgs;
+            pty = ptyPackage;
+          };
         };
       }
     ) // {
