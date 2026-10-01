@@ -9,7 +9,7 @@ const TERMINAL_SUBPROTOCOL: &str = "st3.client.terminal.v0";
 const CONVERSATION_SUBPROTOCOL: &str = "st3.client.conversation.v0";
 const COLLECTION_SUBPROTOCOL: &str = "st3.client.collections.v0";
 const TERMINAL_CAPABILITY_PROTOCOL_PREFIX: &str = "st3.cap.";
-const LOCAL_PERSON_HEADER: &str = "x-st3-person";
+pub(super) const LOCAL_PERSON_HEADER: &str = "x-st3-person";
 
 pub(super) async fn request_latency(
     Extension(session): Extension<ClientSession>,
@@ -320,9 +320,9 @@ fn conversation_owner_host(
     .filter(|origin| origin != state.store.origin())
     .map(|origin| client_host_id(&origin));
     if let Some(owner) = &remote {
-        if !session.authority_actor.starts_with("person/") {
+        if !acting_party(session) {
             return Err(forbidden(
-                "a remote conversation requires a concrete person",
+                "a remote conversation requires a concrete person or agent",
             ));
         }
         if state
@@ -986,18 +986,13 @@ impl ClientSession {
                     .collect(),
             });
         };
+        // Free mode: an agent's local session holds every scope a person's does. Its actions
+        // still record the agent as their actor.
         Ok(Self {
             actor: person.into(),
             authority_actor: person.into(),
             transport: "unix",
-            scopes: if person.starts_with("agent/") {
-                ["read.projections", "control.work", "control.missions"]
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect()
-            } else {
-                ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect()
-            },
+            scopes: ALL_SCOPES.iter().map(|scope| (*scope).to_owned()).collect(),
         })
     }
 
@@ -1013,6 +1008,14 @@ impl ClientSession {
     fn allows(&self, scope: &str) -> bool {
         self.scopes.contains(scope)
     }
+}
+
+/// Whether the session acts for a concrete person, or for a local agent seat. Within a fleet, an
+/// agent may do whatever the person who runs the fleet may do (free mode).
+pub(super) fn acting_party(session: &ClientSession) -> bool {
+    let actor = session.authority_actor.as_str();
+    actor.starts_with("person/") && actor.matches('/').count() == 1
+        || session.transport == "unix" && actor.starts_with("agent/")
 }
 
 fn session_claim_actor(session: &ClientSession) -> String {
@@ -1041,11 +1044,7 @@ pub(super) fn capabilities(session: &ClientSession) -> Vec<Value> {
         let scope = action_scope(action).expect("registered client action has a scope");
         let state = if !AVAILABLE_ACTIONS.contains(action) {
             "unavailable"
-        } else if session.allows(scope)
-            && !(session.authority_actor.starts_with("agent/")
-                && scope == "control.missions"
-                && *action != "mission.cancel")
-        {
+        } else if session.allows(scope) {
             "granted"
         } else {
             "ungranted"
@@ -4461,9 +4460,9 @@ pub(super) async fn conversation_changes(
             .map_err(ApiError::internal)?
     {
         if origin != state.store.origin() {
-            if !session.authority_actor.starts_with("person/") {
+            if !acting_party(&session) {
                 return Err(forbidden(
-                    "remote conversation changes require a concrete person",
+                    "remote conversation changes require a concrete person or agent",
                 ));
             }
             let owner = client_host_id(&origin);
@@ -4529,9 +4528,9 @@ pub(super) async fn conversation_stream(
         .and_then(|(_, _, origin)| origin)
         .filter(|origin| origin != state.store.origin())
         .map(|origin| client_host_id(&origin));
-    if remote.is_some() && !session.authority_actor.starts_with("person/") {
+    if remote.is_some() && !acting_party(&session) {
         return Err(forbidden(
-            "remote conversation stream requires a concrete person",
+            "remote conversation stream requires a concrete person or agent",
         ));
     }
     if let Some(owner) = &remote {
@@ -5350,9 +5349,9 @@ pub(super) async fn terminal_screen(
                 .client_relay
                 .as_ref()
                 .ok_or_else(|| remote_unavailable(&host))?;
-            if !session.authority_actor.starts_with("person/") {
+            if !acting_party(&session) {
                 return Err(forbidden(
-                    "remote terminal screen requires a concrete person",
+                    "remote terminal screen requires a concrete person or agent",
                 ));
             }
             let terminal_id = client_detail_id("terminal", &id);
@@ -5490,11 +5489,9 @@ fn prepare_terminal_follow(
             "the requested runtime does not expose a terminal",
         ));
     }
-    if live.owner_host_id != client_host_id(&state.node)
-        && !session.authority_actor.starts_with("person/")
-    {
+    if live.owner_host_id != client_host_id(&state.node) && !acting_party(session) {
         return Err(forbidden(
-            "remote terminal stream requires a concrete person",
+            "remote terminal stream requires a concrete person or agent",
         ));
     }
     consume_terminal_attachment(
@@ -7092,7 +7089,6 @@ async fn dispatch_action(
             if request.fence.mission_generation.as_deref() != Some(current.generation.as_str()) {
                 return Err(stale("the mission generation fence is stale"));
             }
-            require_agent_mission_authority(state, authority_actor, "cancel", &current.mission)?;
             let reason = p
                 .get("reason")
                 .and_then(Value::as_str)
@@ -7449,16 +7445,9 @@ pub(super) async fn action(
         request.action_type.as_str(),
         "terminal.attach" | "terminal.detach"
     );
-    if !read_only_terminal_lifecycle
-        && !session.authority_actor.starts_with("person/")
-        && !(session.transport == "unix"
-            && session.authority_actor.starts_with("agent/")
-            && ((request.action_type.starts_with("work.")
-                && request.action_type != "work.done")
-                || request.action_type == "mission.cancel"))
-    {
+    if !read_only_terminal_lifecycle && !acting_party(&session) {
         return Err(forbidden(
-            "client mutations require explicit concrete person authority",
+            "client mutations require a concrete person or a local agent",
         ));
     }
     let encoded = serde_json::to_vec(&request).map_err(ApiError::internal)?;
@@ -7577,9 +7566,9 @@ pub(super) async fn action(
             .ok_or_else(|| validation("terminal attach requires an incarnation fence"))?;
         let live = remote_terminal_live_session(&state, &terminal_subject(&target), incarnation)?;
         if live.owner_host_id != client_host_id(&state.node) && reconciled_attachment.is_none() {
-            if !session.authority_actor.starts_with("person/") {
+            if !acting_party(&session) {
                 return Err(forbidden(
-                    "remote terminal attach requires a concrete person",
+                    "remote terminal attach requires a concrete person or agent",
                 ));
             }
             let relay = state

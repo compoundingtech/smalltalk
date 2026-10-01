@@ -277,14 +277,10 @@ at most five items each. Ready work follows the agent's seat queue: mission runs
 then step creation time and subject ID inside one run. These fields describe the queue and do not
 imply that an active claim is making progress.
 
-`mission_authority` lists the missions the agent may publish, start, revise, and cancel, as exact mission
-IDs or terminal `/*` namespaces. Its `source` is `declared` when the declaration carries
-`mission-authority`, `default` for a person-declared top-level seat `fleet/PROJECT/...` (which
-holds `fleet/PROJECT/*`), and `none` otherwise. It is `null` for an agent with no current
-declaration. Cancellation requires an explicit `cancel` rule and is excluded from the default.
-Trusted local agent sessions may invoke `mission.cancel` with the current generation fence;
-the daemon checks the mission path against their current declaration. Other mission actions
-on client-v0 retain their person requirement.
+A trusted local agent session (`--as agent/PATH` on the local Unix API) holds every scope a person's
+local session holds and may invoke every action, recorded with the agent as its actor; see
+[free mode](../kdl-lifecycle.md#free-mode). Glasses stay a person's own: an agent session reads and
+writes none. Each action keeps its own fences, and a review still needs its named reviewer.
 
 `GET /v1/client/agent-queues/{agent_id}` returns one `AgentQueue` value for a seat: its
 `current_work_ids`, its `next_work_id`, each queued mission run in order with `position`, `state`

@@ -26,10 +26,6 @@ mission "eval/review-escalation/standing" state="ready" {
   agent "owner" {
     workspace "${ST_WORKSPACE}"
     command "sleep 1200"
-    mission-authority {
-      start "eval/review-escalation/work"
-      revise "eval/review-escalation/work"
-    }
     restart "never"
   }
 }
