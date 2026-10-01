@@ -183,6 +183,7 @@ jobs:
           ST_ISOLATION_TIMINGS: "${{ runner.temp }}/vm-timings.json"
         run: |
           start=$SECONDS
+          mkdir -p "$RUNNER_TEMP/vm-out"
           "$RUNNER_TEMP/vm-driver/bin/nixos-test-driver" --output_directory "$RUNNER_TEMP/vm-out"
           jq -r '"| VM boot | \(.boot_seconds)s |\n| cascade tests in VM (extract and run) | \(.test_seconds)s |"' "$ST_ISOLATION_TIMINGS" >> "$GITHUB_STEP_SUMMARY"
           printf '| VM test driver total | %ss |\n' "$((SECONDS - start))" >> "$GITHUB_STEP_SUMMARY"
