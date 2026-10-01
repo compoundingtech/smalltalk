@@ -1400,6 +1400,15 @@ fn claim_specs() -> BTreeMap<String, ClaimSpec> {
             &[],
         ),
         (
+            "delivery.hold",
+            &["agent"],
+            WritePolicy::AuthorizedRequester,
+            Cardinality::StateTransition,
+            Some("delivery-holds"),
+            false,
+            &[],
+        ),
+        (
             "agent.presence",
             &["agent"],
             WritePolicy::SameSubjectActor,
@@ -2516,6 +2525,12 @@ fn claim_fields(kind: &str) -> BTreeMap<String, FieldSpec> {
             ("incarnation_id", required_string()),
             ("deadline_unix_ms", required_string()),
             ("reason", required_string()),
+        ],
+        "delivery.hold" => &[
+            ("held", required_boolean()),
+            ("until_unix_ms", required_integer()),
+            ("reason", required_string()),
+            ("legacy_adoption", boolean()),
         ],
         "harness.observed" => &[
             (
