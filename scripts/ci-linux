@@ -32,7 +32,15 @@ run_stage() {
 
 # The nextest --no-run stage already compiled the test executables. Clippy gets
 # a separate target directory so its Cargo lock cannot serialize the four lanes.
-run_stage test cargo nextest run --workspace --locked --profile ci -E "$ST2_FILTER" &
+# TRIAL ONLY (Namespace trial copy of #849): tests the Namespace runner cannot run yet.
+# - The messaging fault matrix is skipped exactly as st/ci skips it this week; it returns as parallel tests.
+# - Three st2 gates need a real systemd user manager, which Namespace's default Linux image does not
+#   boot. The real fix is a Namespace runner image with systemd, not skipping them.
+# Remove each exclusion when its cause is fixed.
+trial_skips='test(/^messaging_faults::messages_recover_across_transport_and_process_faults$/)'
+trial_skips+=' | test(/^transport_isolation::(exec|pty)_task_survives_transport_cgroup_cascade$/)'
+trial_skips+=' | test(/^nomad_survival::managed_agent_color_contract_crosses_systemd_scope$/)'
+run_stage test cargo nextest run --workspace --locked --profile ci -E "($ST2_FILTER) and not ($trial_skips)" &
 test_pid=$!
 run_stage clippy env CARGO_TARGET_DIR="$RUNNER_TEMP/clippy-target" cargo clippy --workspace --all-targets --locked &
 clippy_pid=$!
