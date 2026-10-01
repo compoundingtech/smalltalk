@@ -6,7 +6,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 import type { TimelineEntry } from '../../../clients/typescript/st3-client';
 import { agentGlyph, agentName, agentState, agentWord, harnessColor, harnessName } from '../agentsView';
 import { Banners } from '../chrome';
-import { conversationEntries, shownToolLines, unreadableTranscript, type ConversationEntry } from '../conversationView';
+import { conversationEntries, entryMatches, shownToolLines, unreadableTranscript, type ConversationEntry } from '../conversationView';
 import { rememberBounded } from '../boundedCache';
 import type { RootScreen } from '../navigation';
 import { applyConversation, isUnresolved, type Conversation } from '../sessionView';
@@ -38,6 +38,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   const [issue, setIssue] = useState('');
   const [open, setOpen] = useState<ReadonlySet<string>>(new Set());
   const [pending, setPending] = useState<Pending[]>([]);
+  const [find, setFind] = useState('');
   const [draft, setDraft] = useState(() => draftCache.current.get(target) ?? '');
   const [away, setAway] = useState(false);
   const list = useRef<FlatList<Row>>(null);
@@ -56,6 +57,14 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     const runtime = agent && agent.runtime_ids.length && !['stopped', 'failed'].includes(agent.state) ? agent.runtime_ids[0] : undefined;
     navigation.setOptions({
       title,
+      // Finding in the conversation: only the entries that say it stay, newest first.
+      headerSearchBarOptions: {
+        placeholder: 'Find in this conversation',
+        hideWhenScrolling: true,
+        autoCapitalize: 'none',
+        onChangeText: event => setFind(event.nativeEvent.text),
+        onCancelButtonPress: () => setFind(''),
+      },
       // A native bar button: the agent's live terminal, while it has one.
       unstable_headerRightItems: () => runtime ? [{
         type: 'button', label: 'Terminal', icon: { type: 'sfSymbol', name: 'terminal' }, disabled: status !== 'online',
@@ -91,11 +100,13 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
   useEffect(() => {
     setPending(previous => previous.filter(item => item.failed || !entries.some(entry => entry.body.kind === 'mail' && entry.body.from === 'you' && entry.body.text.trim() === item.text.trim())));
   }, [entries]);
+  const finding = find.trim() !== '';
+  const found = useMemo(() => finding ? entries.filter(entry => entryMatches(entry, find)) : entries, [entries, find, finding]);
   const rows: Row[] = useMemo(() => [
-    ...[...pending].reverse().map(item => ({ kind: 'pending' as const, pending: item })),
-    ...[...entries].reverse().map(entry => ({ kind: 'entry' as const, entry })),
-    ...(timeline.hasOlder ? [{ kind: 'older' as const }] : []),
-  ], [entries, pending, timeline.hasOlder]);
+    ...(finding ? [] : [...pending].reverse().map(item => ({ kind: 'pending' as const, pending: item }))),
+    ...[...found].reverse().map(entry => ({ kind: 'entry' as const, entry })),
+    ...(timeline.hasOlder && !finding ? [{ kind: 'older' as const }] : []),
+  ], [found, pending, timeline.hasOlder, finding]);
 
   const canSend = !!agent && status === 'online';
   async function send() {
@@ -115,6 +126,7 @@ export function ConversationScreen({ route, navigation }: RootScreen<'Conversati
     <Banners />
     {agent ? <AgentStrip agent={agent} onMission={(id, missionTitle) => navigation.navigate('Mission', { id, title: missionTitle })} /> : session ? <View style={styles.strip}><T dim numberOfLines={1}>{session.driver ?? 'harness'} · {session.state} · {session.id}</T></View> : null}
     {issue ? <View style={styles.strip}><T color={theme.waiting}>{issue}</T></View> : null}
+    {finding ? <View style={styles.strip}><T color={theme.yellow}>{found.length === 0 ? `Nothing here says “${find.trim()}”` : `${found.length} ${found.length === 1 ? 'entry says' : 'entries say'} “${find.trim()}”`}</T></View> : null}
     <FlatList
       ref={list}
       inverted
@@ -182,11 +194,14 @@ const EntryView = memo(function EntryView({ entry, open, onToggle }: { entry: Co
       </View>;
     case 'assistant':
       return <View style={styles.entry}><Markdown text={body.text} /></View>;
-    case 'mail':
-      return <View style={[styles.entry, styles.barred, { borderLeftColor: theme.sapphire }]}>
-        <T><T bold color={theme.sapphire}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold>  {body.subject}</T> : null}<T dim>  {entry.at}</T></T>
-        <Markdown text={body.text} color={theme.subtext0} />
+    case 'mail': {
+      // Mail to the person stands out; their own says how far it got: ✓ st has it, ✓✓ the agent has it.
+      const toYou = body.to === 'you';
+      return <View style={[styles.entry, styles.barred, { borderLeftColor: theme.sapphire }, toYou ? { backgroundColor: theme.toolBg } : null]}>
+        <T><T bold color={theme.sapphire}>{body.to ? `${body.from} → ${body.to}` : body.from}</T>{body.subject ? <T bold>  {body.subject}</T> : null}<T dim>  {entry.at}</T>{body.from === 'you' ? (body.delivered ? <T color={theme.green}>  ✓✓ delivered</T> : <T dim>  ✓ sent</T>) : null}</T>
+        <Markdown text={body.text} color={toYou ? theme.text : theme.subtext0} />
       </View>;
+    }
     case 'event': {
       const color = body.tone === 'fault' ? theme.red : body.tone === 'warning' ? theme.yellow : theme.overlay0;
       return <View style={[styles.entry, { flexDirection: 'row' }]}>

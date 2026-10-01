@@ -2,3 +2,33 @@
 [[profile.default.overrides]]
 filter = 'package(st3) and test(/^messaging_faults::messages_recover_across_transport_and_process_faults$/)'
 priority = 100
+
+[profile.ci]
+test-threads = 8
+fail-fast = false
+retries = { count = 2, backoff = "fixed", delay = "30s", jitter = false }
+status-level = "fail"
+final-status-level = "flaky"
+# The gate covers st3, st-runtime, st-drivers and the other shared crates, and the st2 test
+# files. It leaves out st2-only code: st2's own unit tests (none of its remaining modules is
+# used by st3), its catalog, eval-run, resync, nomad-survival, event and resource-profile
+# supervisor tests, and st-drivers' catalog, resync and resource-profile supervisor modules.
+# `transport_isolation` needs real systemd user scopes; the isolation-vm job runs it in a
+# NixOS VM. See docs/ci.md.
+default-filter = '''
+not (
+  (package(=st2) and (
+    kind(lib) or kind(bin)
+    or binary(=event_e2e) or binary(=resource_profile_supervisor_e2e)
+    or test(/^(catalog_[^:]*|eval_run_e2e|nomad_survival|resync[^:]*|supervisor_auto_archive|transport_isolation)::/)
+  ))
+  or (package(=st-drivers) and kind(lib)
+    and test(/^(catalog[^:]*|resync|resource_profile_supervisor)::/))
+)
+'''
+
+# The fleet reconnect test also includes a real two-minute outage. The ci profile inherits the
+# default profile's messaging-fault priority above.
+[[profile.ci.overrides]]
+filter = 'package(st3) and test(/^fleet::outbound_only_member_returns_after_minutes_and_aged_hours_without_alerts$/)'
+priority = 100
