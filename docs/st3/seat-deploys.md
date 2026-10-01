@@ -1,9 +1,9 @@
 # Seats across deploys
 
-A deploy installs a new st binary at the same path and then restarts the daemon. The daemon adopts
-every running seat; it does not restart them. This document explains how each seat's message path
-follows the new binary without ending the provider session, and how st reports a seat whose message
-path did not.
+A deploy installs a new st binary and then restarts the daemon, either from the same path or from a
+new one such as a new Nix store path. The daemon adopts every running seat; it does not restart them.
+This document explains how each seat's message path follows the new binary without ending the
+provider session, and how st reports a seat whose message path did not.
 
 ## What runs in a seat
 
@@ -55,12 +55,15 @@ brought delivery back.
 
 ## Following a replaced binary
 
-The driver and both channels watch the installed binary: `ST3_BIN`, which the daemon sets to its own
-executable path, or else the path the process started from. Once a second the process compares that
-file's device, inode, size, and modification time with its own running image. A different file is a
-replacement. The process acts on it only after the file stays unchanged for a second and answers
+The driver and both channels watch the installed binary: `ST3_BIN`, or else the path the process
+started from. The daemon sets `ST3_BIN` to `STATE_DIR/current/st3`, a symbolic link that the daemon
+points at its own executable each time it starts, before it launches or adopts any seat. The file
+behind that link therefore changes both when a deploy replaces the daemon's executable in place and
+when the daemon restarts from a new path. Once a second the process compares that file's device,
+inode, size, and modification time with its own running image. A different file is a replacement.
+The process acts on it only after the file stays unchanged for a second and answers
 `st3 resume-probe` with the resume format the process writes. A replacement that cannot read that
-format, such as a rollback to a build from before this change, is refused, and the process keeps its
+format, such as a rollback to a build from before reexec, is refused, and the process keeps its
 current code and tries again 30 seconds later.
 
 To follow the replacement, the process writes its live state to a private file, blocks the stop
@@ -100,10 +103,11 @@ and delivery runs before every other publish on each tick, so no observation can
 
 ## Reporting a stale path
 
-Each push subscription renews a small report, and legacy mailbox polls carry the same report: the transport, the
-process's PID, its running image, and for Claude the channel's PID, image, and the age of its last
-presence write. The daemon keeps the latest report for each recipient in memory. It is not graph
-state; a restarted daemon learns every live path again within a second.
+Each push subscription renews a small report, and legacy mailbox polls carry the same report: the
+transport, the process's PID, its running image, the installed binary it follows, and for Claude the
+channel's PID, image, and the age of its last presence write. The daemon keeps the latest report for
+each recipient in memory. It is not graph state; a restarted daemon learns every live path again
+within a second.
 
 `st agents ls` and `st agents show` add a `delivery` object to each local native seat whose harness
 can take work:
@@ -111,13 +115,17 @@ can take work:
 - `current`: a report arrived in the last 45 seconds from a process running the daemon's own image,
   and for Claude the channel reported in the last ten seconds from that image too. Pi-family
   channels must also have received the provider's idle proof and have no rejected handoff waiting;
+- `outdated`: the same live, ready path, but the process or the Claude channel still runs a
+  replaced st binary. It delivers with its old code. The reason says whether it is switching, because
+  the file it follows now holds the daemon's image, or whether it follows another file and needs a
+  seat restart to run current code;
 - `legacy`: a recent metadata-free mailbox poll came from this seat's native delivery process.
   The daemon identifies the Unix peer PID, native driver command and inherited seat identity;
   ordinary mailbox reads do not count. This proves polling, while binary version and readiness
   remain unverified;
 - `unknown`: the daemon started less than 20 seconds ago and the seat has not reported yet;
-- `stale`, with the reason: no report since then, a report from a replaced or unidentified binary, or a
-  silent or replaced Claude channel.
+- `stale`, with the reason: no report since then, a report from an unidentified binary, a pi-family
+  channel without idle proof or with a rejected handoff, or a silent Claude channel.
 
 A stale seat shows as `waiting` instead of `running`, and `st agents show` prints the reason on its
 `DELIVERY` line. Remote seats carry no `delivery` object; only their own daemon can see their reports.
@@ -157,8 +165,10 @@ is proven to be that recipient's native outer driver. An ordinary CLI history re
 another recipient, or a channel process's history query does not count. Claude's MCP child
 watches inbox files; the outer `driver claude` process supplies the mailbox poll.
 
-The path must stay the same. A deploy that starts the daemon from a new path, such as a new store
-path, leaves every running seat on the old one, and st reports them as stale.
+A daemon started from a new path, such as a new Nix store path, moves its seats through the
+`STATE_DIR/current/st3` link. Seats launched before that link existed have `ST3_BIN` set to the
+executable path they started from. A Nix store path never changes, so those seats keep delivering
+with their old code and report `outdated`, naming the path they follow, until they are restarted.
 
 The Home Manager module installs a real executable at `services.smalltalk.stateDir/bin/st3`
 and provides `st` as a relative symlink there. Activation copies a changed build to a temporary
@@ -168,10 +178,6 @@ activation does not make seats re-exec. Both the daemon and declaration-apply se
 stable executable, and the service PATH puts its directory first; `pty` still comes from the
 configured package. A systemd restart trigger or a build reference in the launchd plist makes
 Home Manager restart the daemon when the package changes despite its stable executable path.
-
-Seats already running an old Nix store path before this migration still watch that immutable
-path. They stay stale until restarted; installing the stable executable cannot move an existing
-seat's watch to it.
 
 `scripts/st3-graceful-messaging-eval/run` proves this end to end for each harness; see
 [the eval](../../evals/st3/graceful-messaging/README.md).

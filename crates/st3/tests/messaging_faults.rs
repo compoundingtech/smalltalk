@@ -97,7 +97,7 @@ fn messages_recover_across_transport_and_process_faults() {
         result.get("ended").is_some(),
         "eval stopped early: {result}"
     );
-    assert_eq!(result["cases"].as_array().unwrap().len(), 10, "{result}");
+    assert_eq!(result["cases"].as_array().unwrap().len(), 11, "{result}");
     assert_eq!(
         result["verdict"],
         "pass",

@@ -485,6 +485,8 @@ pub struct Reconciler<R = NativeRuntime> {
     host: String,
     endpoint: String,
     driver_state_dir: PathBuf,
+    /// The `ST3_BIN` members get; see [`st_binary_link`]. Without one they get the executable.
+    st_binary: Option<PathBuf>,
     runtime_environment: BTreeMap<String, String>,
     notify: Arc<Notify>,
     event_notify: watch::Sender<u64>,
@@ -571,6 +573,7 @@ impl Reconciler<NativeRuntime> {
             host,
             endpoint,
             driver_state_dir: state_dir.join("drivers"),
+            st_binary: Some(publish_st_binary(state_dir)?),
             runtime_environment: BTreeMap::from([
                 (
                     "PTY_ROOT".into(),
@@ -624,6 +627,7 @@ impl<R: RuntimeControl> Reconciler<R> {
             host,
             endpoint: "unused-test-endpoint".into(),
             driver_state_dir: std::env::temp_dir().join("st3-test-drivers"),
+            st_binary: None,
             runtime_environment: BTreeMap::new(),
             notify,
             event_notify: watch::channel(0_u64).0,
@@ -3274,9 +3278,10 @@ impl<R: RuntimeControl> Reconciler<R> {
             launch_member.environment.remove("ST_AGENT");
         }
         let executable = launch_executable()?;
+        let st_binary = self.st_binary.as_ref().unwrap_or(&executable);
         launch_member
             .environment
-            .insert("ST3_BIN".into(), executable.to_string_lossy().into_owned());
+            .insert("ST3_BIN".into(), st_binary.to_string_lossy().into_owned());
         if let crate::model::LaunchSpec::Argv(argv) = &mut launch_member.launch
             && argv.first().map(String::as_str) == Some("st3")
         {
@@ -10919,6 +10924,44 @@ pub(crate) fn launch_executable() -> Result<PathBuf> {
 fn replaced_executable(current: &Path) -> Option<PathBuf> {
     let original = PathBuf::from(current.to_str()?.strip_suffix(" (deleted)")?);
     original.is_file().then_some(original)
+}
+
+/// The st binary every seat follows: a link beneath the state directory that names the
+/// executable the daemon runs. Seats get this path as `ST3_BIN`. Their drivers and channels
+/// re-execute once the file it names changes, so a deploy that starts the daemon from a new path,
+/// such as a new Nix store path, moves every seat with it, and so does a deploy that replaces the
+/// daemon's executable in place. A seat given the executable's own path would watch a file that
+/// never changes and keep running the old code.
+pub fn st_binary_link(state_dir: &Path) -> PathBuf {
+    state_dir.join("current").join("st3")
+}
+
+/// Point [`st_binary_link`] at the executable this daemon runs, replacing the link atomically.
+pub fn publish_st_binary(state_dir: &Path) -> Result<PathBuf> {
+    let link = st_binary_link(state_dir);
+    let executable = launch_executable()?;
+    // Resolve symbolic links, so a daemon started through this link cannot point it at itself.
+    let target = std::fs::canonicalize(&executable)
+        .with_context(|| format!("resolve the st executable {}", executable.display()))?;
+    match std::fs::read_link(&link) {
+        Ok(current) if current == target => return Ok(link),
+        // The daemon runs this very file; it stays as it is.
+        Err(_) if std::fs::canonicalize(&link).is_ok_and(|path| path == target) => {
+            return Ok(link);
+        }
+        _ => {}
+    }
+    let directory = link
+        .parent()
+        .context("the st binary link has no directory")?;
+    std::fs::create_dir_all(directory)
+        .with_context(|| format!("create {}", directory.display()))?;
+    let staged = directory.join(format!(".st3.{}.link", std::process::id()));
+    let _ = std::fs::remove_file(&staged);
+    std::os::unix::fs::symlink(&target, &staged)
+        .with_context(|| format!("link {} to {}", staged.display(), target.display()))?;
+    std::fs::rename(&staged, &link).with_context(|| format!("publish {}", link.display()))?;
+    Ok(link)
 }
 
 fn member_fields(
@@ -24061,6 +24104,23 @@ version 2
         std::fs::write(&installed, b"").unwrap();
         assert_eq!(replaced_executable(&deleted), Some(installed.clone()));
         assert_eq!(replaced_executable(&installed), None);
+    }
+
+    #[test]
+    fn a_starting_daemon_points_the_seat_binary_link_at_its_own_executable() {
+        let state = tempfile::tempdir().unwrap();
+        let link = st_binary_link(state.path());
+        // A predecessor started from another path, such as an older Nix store path.
+        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(state.path().join("old-store/bin/st3"), &link).unwrap();
+        assert_eq!(publish_st_binary(state.path()).unwrap(), link);
+        let running = std::fs::canonicalize(launch_executable().unwrap()).unwrap();
+        assert_eq!(std::fs::read_link(&link).unwrap(), running);
+        // A restart from the same executable leaves the link alone.
+        use std::os::unix::fs::MetadataExt as _;
+        let before = std::fs::symlink_metadata(&link).unwrap().ino();
+        publish_st_binary(state.path()).unwrap();
+        assert_eq!(std::fs::symlink_metadata(&link).unwrap().ino(), before);
     }
 
     #[test]

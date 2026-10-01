@@ -12489,6 +12489,7 @@ fn native_delivery_report(transport: &str, agent_dir: Option<&Path>) -> String {
         "transport": transport,
         "pid": std::process::id(),
         "image": st_drivers::reexec::running_identity().map(|identity| identity.token()),
+        "follows": st_drivers::reexec::installed_binary().map(|path| path.display().to_string()),
     });
     if let Some(agent_dir) = agent_dir {
         let channel = st_drivers::claude_mcp::read_presence(agent_dir);
