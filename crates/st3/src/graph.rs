@@ -145,6 +145,14 @@ pub(crate) fn runtime_proof_variables(
     variables
 }
 
+/// Authority kinds carried by one agent declaration.
+pub type AgentAuthorityGrants = (
+    crate::model::MissionAuthority,
+    crate::model::QueueAuthority,
+    crate::model::SeatAuthority,
+    crate::model::AgentAuthority,
+);
+
 /// The authority granted to agents declared inside a mission, in its own declarations, its
 /// steps' declarations, or any nested mission, keyed by the agent subject of a proof run. Only a
 /// person grants authority, so an agent may not publish or revise a mission whose grants exceed
@@ -152,28 +160,11 @@ pub(crate) fn runtime_proof_variables(
 pub fn mission_declared_authority_grants(
     mission: &crate::model::MissionSpec,
     default_host: &str,
-) -> Result<
-    BTreeMap<
-        String,
-        (
-            crate::model::MissionAuthority,
-            crate::model::QueueAuthority,
-            crate::model::SeatAuthority,
-        ),
-    >,
-    St3Error,
-> {
+) -> Result<BTreeMap<String, AgentAuthorityGrants>, St3Error> {
     fn visit(
         mission: &crate::model::MissionSpec,
         default_host: &str,
-        grants: &mut BTreeMap<
-            String,
-            (
-                crate::model::MissionAuthority,
-                crate::model::QueueAuthority,
-                crate::model::SeatAuthority,
-            ),
-        >,
+        grants: &mut BTreeMap<String, AgentAuthorityGrants>,
     ) -> Result<(), St3Error> {
         let variables = runtime_proof_variables(mission);
         let sources = mission.declarations_kdl.iter().chain(
@@ -193,6 +184,7 @@ pub fn mission_declared_authority_grants(
                             agent_mission_authority(&desired.desired),
                             agent_queue_authority(&desired.desired),
                             agent_seat_authority(&desired.desired),
+                            agent_declaration_authority(&desired.desired),
                         ),
                     );
                 }
@@ -2393,6 +2385,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "mission-authority",
         "queue-authority",
         "seat-authority",
+        "agent-authority",
         "pty",
         "exec",
     ];
@@ -2428,6 +2421,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
         "mission-authority",
         "queue-authority",
         "seat-authority",
+        "agent-authority",
     ] {
         unique_child(document, child)?;
     }
@@ -2438,7 +2432,7 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
             authority,
             AuthorityBlock {
                 name: "mission-authority",
-                verbs: &["publish", "start", "revise"],
+                verbs: &["publish", "start", "revise", "cancel"],
                 empty: "empty-mission-authority",
                 duplicate: "duplicate-mission-authority",
                 pattern: validate_mission_authority_pattern,
@@ -2468,6 +2462,19 @@ fn validate_agent_body(document: &KdlDocument, owner: &str) -> Result<(), St3Err
                 empty: "empty-seat-authority",
                 duplicate: "duplicate-seat-authority",
                 pattern: validate_queue_authority_pattern,
+            },
+            owner,
+        )?;
+    }
+    if let Some(authority) = unique_child(document, "agent-authority")? {
+        validate_authority_block(
+            authority,
+            AuthorityBlock {
+                name: "agent-authority",
+                verbs: &["apply"],
+                empty: "empty-agent-authority",
+                duplicate: "duplicate-agent-authority",
+                pattern: validate_agent_authority_pattern,
             },
             owner,
         )?;
@@ -2609,6 +2616,13 @@ fn validate_queue_authority_pattern(pattern: &str) -> Result<(), St3Error> {
     validate_name(seat, false).map_err(|_| invalid())
 }
 
+fn validate_agent_authority_pattern(pattern: &str) -> Result<(), St3Error> {
+    validate_queue_authority_pattern(pattern).map_err(|_| St3Error::new(
+        "invalid-agent-authority-pattern",
+        "agent authority needs an exact agent identity or a terminal `/*` namespace, without `agent/`",
+    ))
+}
+
 /// Whether `mission-authority "none"` withholds all mission authority, including the default
 /// of a top-level project seat. Any other value is refused; a block of rules is not a value.
 fn declares_no_mission_authority(authority: &KdlNode) -> Result<bool, St3Error> {
@@ -2673,7 +2687,7 @@ fn validate_authority_block(
 }
 
 /// The `VERB "PATTERN"` rules of one authority block in a desired agent declaration.
-fn authority_rules<'a>(desired: &'a Value, block: &str) -> Vec<(&'a str, &'a str)> {
+pub(crate) fn authority_rules<'a>(desired: &'a Value, block: &str) -> Vec<(&'a str, &'a str)> {
     let Some(children) = desired.get("children").and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -2702,7 +2716,12 @@ fn authority_rules<'a>(desired: &'a Value, block: &str) -> Vec<(&'a str, &'a str
 
 /// Whether a desired agent declaration grants authority.
 pub fn declares_authority(desired: &Value) -> bool {
-    ["mission-authority", "queue-authority", "seat-authority"]
+    [
+        "mission-authority",
+        "queue-authority",
+        "seat-authority",
+        "agent-authority",
+    ]
         .iter()
         .any(|block| !authority_rules(desired, block).is_empty())
 }
@@ -2714,6 +2733,7 @@ pub fn agent_mission_authority(desired: &Value) -> crate::model::MissionAuthorit
             "publish" => authority.publish.push(pattern.to_owned()),
             "start" => authority.start.push(pattern.to_owned()),
             "revise" => authority.revise.push(pattern.to_owned()),
+            "cancel" => authority.cancel.push(pattern.to_owned()),
             _ => {}
         }
     }
@@ -2768,6 +2788,7 @@ pub fn effective_agent_mission_authority(
                     publish: namespace.clone(),
                     start: namespace.clone(),
                     revise: namespace,
+                    cancel: Vec::new(),
                 },
             }
         }
@@ -2795,6 +2816,16 @@ pub fn agent_seat_authority(desired: &Value) -> crate::model::SeatAuthority {
         }
     }
     authority
+}
+
+pub fn agent_declaration_authority(desired: &Value) -> crate::model::AgentAuthority {
+    crate::model::AgentAuthority {
+        apply: authority_rules(desired, "agent-authority")
+            .into_iter()
+            .filter(|(verb, _)| *verb == "apply")
+            .map(|(_, pattern)| pattern.to_owned())
+            .collect(),
+    }
 }
 
 fn validate_task_body(

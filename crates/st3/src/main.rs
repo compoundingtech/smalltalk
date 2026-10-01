@@ -1624,8 +1624,8 @@ struct MissionCancelArgs {
     /// Why the run is no longer wanted.
     #[arg(long)]
     reason: String,
-    /// Concrete human authority carried over the trusted local Unix boundary.
-    #[arg(long = "as", value_parser = parse_person_subject)]
+    /// Person or authorized agent carried over the trusted local Unix boundary.
+    #[arg(long = "as", value_parser = parse_publication_actor)]
     actor: String,
 }
 
@@ -9612,6 +9612,7 @@ fn render_mission_authority(authority: &st3_client::AgentMissionAuthority) -> St
         ("publish", &authority.publish),
         ("start", &authority.start),
         ("revise", &authority.revise),
+        ("cancel", &authority.cancel),
     ] {
         for pattern in rules {
             match patterns.iter_mut().find(|(known, _)| known == pattern) {
@@ -15161,10 +15162,10 @@ mod tests {
         assert!(
             card(serde_json::json!({
                 "source": "declared",
-                "publish": ["fleet/website/docs/*"], "start": ["fleet/website/docs/*", "fleet/website/deploy"]
+                "publish": ["fleet/website/docs/*"], "start": ["fleet/website/docs/*", "fleet/website/deploy"], "cancel": ["fleet/website/deploy"]
             }))
             .contains(
-                "AUTHORITY    publish, start mission/fleet/website/docs/*; start mission/fleet/website/deploy (declared)"
+                "AUTHORITY    publish, start mission/fleet/website/docs/*; start, cancel mission/fleet/website/deploy (declared)"
             )
         );
         assert!(
@@ -16751,6 +16752,34 @@ mod tests {
 
     #[test]
     fn mission_cancel_requires_an_exact_actor_and_reason() {
+        for actor in ["agent/example/operator", "person/alex"] {
+            assert!(
+                Cli::try_parse_from([
+                    "st3",
+                    "missions",
+                    "cancel",
+                    "mission-run/example/one",
+                    "--reason",
+                    "superseded",
+                    "--as",
+                    actor
+                ])
+                .is_ok()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "st3",
+                "missions",
+                "cancel",
+                "mission-run/example/one",
+                "--reason",
+                "superseded",
+                "--as",
+                "operator"
+            ])
+            .is_err()
+        );
         let cli = Cli::try_parse_from([
             "st3",
             "missions",

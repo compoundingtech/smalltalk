@@ -93,6 +93,154 @@ fn value(output: &Output) -> Value {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_granted_seat_bootstraps_and_cancels_with_its_own_cli_identity() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let store = state.store.clone();
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    let parent = root.path().join("coordinator.kdl");
+    std::fs::write(
+        &parent,
+        r#"version 2
+agent "example/operations/coordinator" {
+  workspace "."
+  command "true"
+  agent-authority { apply "example/operations/*" }
+  mission-authority { publish "example/jobs/*"; start "example/jobs/*"; cancel "example/jobs/*" }
+}
+"#,
+    )
+    .unwrap();
+    value(
+        &run_cli(
+            &socket,
+            &[
+                "agents",
+                "apply",
+                parent.to_str().unwrap(),
+                "--as",
+                "person/operator",
+            ],
+        )
+        .await,
+    );
+    let actor = "agent/example/operations/coordinator";
+    let deputy = root.path().join("deputy.kdl");
+    std::fs::write(
+        &deputy,
+        r#"version 2
+agent "example/operations/deputy" {
+  workspace "."
+  command "true"
+  mission-authority { cancel "example/jobs/docs/*" }
+}
+"#,
+    )
+    .unwrap();
+    value(
+        &run_cli_with_agent_env(
+            &socket,
+            actor,
+            &["agents", "apply", deputy.to_str().unwrap(), "--as", actor],
+        )
+        .await,
+    );
+    let mission = root.path().join("mission.kdl");
+    std::fs::write(&mission, "version 2\nmission \"example/jobs/docs/one\" state=\"ready\" { goal \"Do the assigned work.\"; step \"wait\" { agentless } }\n").unwrap();
+    value(
+        &run_cli_with_agent_env(
+            &socket,
+            actor,
+            &[
+                "missions",
+                "publish",
+                mission.to_str().unwrap(),
+                "--as",
+                actor,
+            ],
+        )
+        .await,
+    );
+    value(
+        &run_cli_with_agent_env(
+            &socket,
+            actor,
+            &[
+                "missions",
+                "start",
+                "example/jobs/docs/one",
+                "--id",
+                "example/jobs/docs/one/run",
+                "--workspace",
+                root.path().to_str().unwrap(),
+                "--as",
+                actor,
+            ],
+        )
+        .await,
+    );
+    let deputy_actor = "agent/example/operations/deputy";
+    value(
+        &run_cli_with_agent_env(
+            &socket,
+            deputy_actor,
+            &[
+                "missions",
+                "cancel",
+                "mission-run/example/jobs/docs/one/run",
+                "--reason",
+                "The work was superseded.",
+                "--as",
+                deputy_actor,
+            ],
+        )
+        .await,
+    );
+    assert_eq!(
+        store
+            .mission_run("example/jobs/docs/one/run")
+            .unwrap()
+            .unwrap()
+            .phase,
+        "cleanup-cancelled"
+    );
+    let escalate = root.path().join("escalate.kdl");
+    std::fs::write(&escalate, "version 2\nagent \"example/operations/deputy\" { workspace \".\"; command \"true\"; mission-authority { publish \"example/*\" } }\n").unwrap();
+    let denied = run_cli_with_agent_env(
+        &socket,
+        actor,
+        &["agents", "apply", escalate.to_str().unwrap(), "--as", actor],
+    )
+    .await;
+    assert!(!denied.status.success());
+    assert!(
+        String::from_utf8_lossy(&denied.stderr).contains("agent-authority-grant-denied"),
+        "{}",
+        String::from_utf8_lossy(&denied.stderr)
+    );
+    value(
+        &run_cli_with_agent_env(
+            &socket,
+            actor,
+            &["agents", "stop", deputy_actor, "--as", actor],
+        )
+        .await,
+    );
+    server.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn operational_cli_lists_outcomes_summarizes_runs_and_reports_performance() {
     let root = tempfile::tempdir().unwrap();
     let socket = root.path().join("st3.sock");

@@ -967,9 +967,12 @@ fn client_error_code(code: Option<&str>) -> String {
         | "runtime-authority-indeterminate"
         | "remote-unavailable"
         | "internal" => code.unwrap_or("internal").to_owned(),
-        "launch-review-not-authorized" | "wrong-message-recipient" | "lane-approval-denied" | "glass-owner-forbidden" => {
-            "forbidden".into()
-        }
+        "launch-review-not-authorized"
+        | "wrong-message-recipient"
+        | "lane-approval-denied"
+        | "glass-owner-forbidden"
+        | "mission-authority-denied"
+        | "missing-agent-mission-authority" => "forbidden".into(),
         "lane-not-found" => "not-found".into(),
         "invalid-person-ask"
         | "invalid-person-response"
@@ -7712,21 +7715,10 @@ async fn apply(
         for mission in crate::mission::top_level_mission_ids(&intent.missions) {
             require_agent_mission_authority(&state, actor, "publish", &mission)?;
         }
-        // Only a person grants authority in a top-level seat declaration. Otherwise an agent
-        // could declare itself, or another seat, with authority nobody gave it.
-        if let Some(granted) = intent.subjects.values().find(|desired| {
+        for granted in intent.subjects.values().filter(|desired| {
             desired.kind == "agent" && crate::graph::declares_authority(&desired.desired)
         }) {
-            return Err(ApiError::bad(
-                St3Error::new(
-                    "agent-authority-grant-denied",
-                    format!(
-                        "`{actor}` cannot grant authority in the declaration of `{}`; only a person can",
-                        granted.subject
-                    ),
-                )
-                .with_detail("agent", granted.subject.clone()),
-            ));
+            require_non_escalating_agent_grant(&state, actor, &granted.subject, &granted.desired)?;
         }
         for desired in intent.subjects.values() {
             if desired.subject.starts_with("agent/")
@@ -7734,7 +7726,7 @@ async fn apply(
             {
                 require_agent_seat_authority(
                     &state,
-                    actor,
+                    &normalized_agent_actor(actor).expect("agent actor checked"),
                     if desired.kind == "stop" {
                         "stop"
                     } else {
@@ -10150,6 +10142,73 @@ fn refuse_agent_granted_mission_authority(
     Ok(())
 }
 
+/// An agent may delegate only rules of the same kind and verb within its current grants.
+/// Declaration permission and grants are read before the candidate is applied, even for self-apply.
+fn require_non_escalating_agent_grant(
+    state: &AppState,
+    actor: &str,
+    subject: &str,
+    proposed: &Value,
+) -> Result<(), ApiError> {
+    let actor = normalized_agent_actor(actor).expect("agent actor checked");
+    let held = state
+        .store
+        .desired_subject_with_writer(&actor)
+        .map_err(ApiError::internal)?
+        .filter(|(desired, _)| desired.kind == "agent");
+    let denied = |kind: &str, verb: &str, pattern: &str| {
+        ApiError::bad(St3Error::new(
+            "agent-authority-grant-denied",
+            format!("`{actor}` cannot grant {kind} `{verb} {pattern}` to `{subject}`; it must hold the same kind and verb over the same or a wider path and agent-authority apply over the declaration"),
+        ).with_detail("agent", subject.to_owned())
+         .with_detail("authority_kind", kind.to_owned())
+         .with_detail("verb", verb.to_owned())
+         .with_detail("pattern", pattern.to_owned()))
+    };
+    for kind in [
+        "mission-authority",
+        "queue-authority",
+        "seat-authority",
+        "agent-authority",
+    ] {
+        for (verb, pattern) in crate::graph::authority_rules(proposed, kind) {
+            let Some((held, writer)) = &held else {
+                return Err(denied(kind, verb, pattern));
+            };
+            if !crate::graph::agent_declaration_authority(&held.desired).allows_apply(subject) {
+                return Err(denied(kind, verb, pattern));
+            }
+            let mission = crate::graph::effective_agent_mission_authority(
+                held,
+                declared_by_agent(writer.as_deref()),
+            );
+            let mission_patterns = match verb {
+                "publish" => &mission.authority.publish,
+                "start" => &mission.authority.start,
+                "revise" => &mission.authority.revise,
+                "cancel" => &mission.authority.cancel,
+                _ => &Vec::new(),
+            };
+            let covers = if kind == "mission-authority" {
+                mission_patterns
+                    .iter()
+                    .any(|held| crate::model::authority_pattern_contains(held, pattern))
+            } else {
+                crate::graph::authority_rules(&held.desired, kind)
+                    .iter()
+                    .any(|(held_verb, held_pattern)| {
+                        *held_verb == verb
+                            && crate::model::authority_pattern_contains(held_pattern, pattern)
+                    })
+            };
+            if !covers {
+                return Err(denied(kind, verb, pattern));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// The actor's current desired agent declaration, which is where a person grants it authority.
 fn current_agent_declaration(
     state: &AppState,
@@ -10246,7 +10305,9 @@ fn require_agent_seat_authority(
     seat: &str,
 ) -> Result<(), ApiError> {
     let desired = current_agent_declaration(state, actor, "missing-agent-seat-authority")?;
-    if crate::graph::agent_seat_authority(&desired).allows(action, seat) {
+    if crate::graph::agent_declaration_authority(&desired).allows_apply(seat)
+        || crate::graph::agent_seat_authority(&desired).allows(action, seat)
+    {
         Ok(())
     } else {
         Err(ApiError::bad(
@@ -17126,6 +17187,233 @@ mission "queued" state="ready" {
     }
 
     #[tokio::test]
+    async fn agent_authority_applies_and_delegates_only_current_narrower_grants() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        let source = r#"version 2
+    agent "example/managed/coordinator" {
+      workspace "."
+      command "true"
+      agent-authority { apply "example/managed/*" }
+      mission-authority { publish "example/jobs/*"; start "example/jobs/*"; cancel "example/jobs/*" }
+      queue-authority { move "example/managed/*" }
+      seat-authority { declare "example/managed/*" }
+    }
+    "#;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                source,
+                "person/operator",
+                "grant-coordinator",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let actor = "agent/example/managed/coordinator";
+        // A bare actor follows the same normalization as mission publication.
+        let child = r#"version 2
+    agent "example/managed/deputy" {
+      workspace "."
+      command "true"
+      agent-authority { apply "example/managed/workers/*" }
+      mission-authority { publish "example/jobs/docs/*"; start "example/jobs/docs/one"; cancel "example/jobs/docs/*" }
+      queue-authority { move "example/managed/workers/*" }
+      seat-authority { declare "example/managed/workers/*" }
+    }
+    "#;
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                child,
+                "example/managed/coordinator",
+                "delegate-deputy",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            shown_mission_authority(&state, "agent/example/managed/deputy")["cancel"],
+            json!(["example/jobs/docs/*"])
+        );
+        // Delegation can continue down the path, and apply covers both start and stop.
+        for (source, key) in [
+            (
+                "version 2\nagent \"example/managed/workers/one\" { workspace \".\"; command \"true\"; mission-authority { publish \"example/jobs/docs/one\" } }\n",
+                "deputy-delegates-worker",
+            ),
+            (
+                "version 2\nstop \"agent/example/managed/workers/one\"\n",
+                "deputy-stops-worker",
+            ),
+        ] {
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/intent/apply",
+                serde_json::to_value(apply_request(
+                    &state,
+                    source,
+                    "agent/example/managed/deputy",
+                    key,
+                ))
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        for (key, grant) in [
+            ("wider-path", "mission-authority { publish \"example/*\" }"),
+            (
+                "extra-verb",
+                "mission-authority { revise \"example/jobs/docs/*\" }",
+            ),
+            (
+                "different-kind",
+                "seat-authority { stop \"example/managed/workers/*\" }",
+            ),
+            (
+                "wider-agent-path",
+                "agent-authority { apply \"example/*\" }",
+            ),
+            ("wider-queue-path", "queue-authority { move \"example/*\" }"),
+            (
+                "namespace-root",
+                "mission-authority { publish \"example/jobs\" }",
+            ),
+            (
+                "prefix-lookalike",
+                "mission-authority { cancel \"example/jobsmith/*\" }",
+            ),
+        ] {
+            let before = state.store.desired_subjects().unwrap();
+            let source = format!(
+                "version 2\nagent \"example/managed/deputy\" {{ workspace \".\"; command \"true\"; {grant} }}\n"
+            );
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/intent/apply",
+                serde_json::to_value(apply_request(&state, &source, actor, key)).unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{key}: {body}");
+            assert_eq!(
+                body["code"], "agent-authority-grant-denied",
+                "{key}: {body}"
+            );
+            assert_eq!(
+                serde_json::to_value(state.store.desired_subjects().unwrap()).unwrap(),
+                serde_json::to_value(before).unwrap()
+            );
+        }
+        // The candidate cannot supply its own missing verb, even when self-apply is granted.
+        let self_grant = source.replace("cancel \"example/jobs/*\"", "revise \"example/jobs/*\"");
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(&state, &self_grant, actor, "self-extra-verb")).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "agent-authority-grant-denied");
+        // A held grant does not authorize writing an unrelated declaration.
+        let outside = child.replace("example/managed/deputy", "example/other/deputy");
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                &outside,
+                actor,
+                "outside-declaration",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "agent-authority-grant-denied");
+        // Removing apply authority takes effect on the next request.
+        let revoked = source.replace("agent-authority { apply \"example/managed/*\" }", "");
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                &revoked,
+                "person/operator",
+                "revoke-coordinator",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let (status, body) = json_request(
+            app,
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(&state, child, actor, "revoked-delegation")).unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "agent-authority-grant-denied");
+    }
+
+    #[tokio::test]
+    async fn default_mission_authority_can_be_delegated_without_adding_cancel() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        let parent = "version 2\nagent \"fleet/fixture-grants/coordinator\" { workspace \".\"; command \"true\"; agent-authority { apply \"fleet/fixture-grants/workers/*\" } }\n";
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                parent,
+                "person/operator",
+                "default-parent",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        for (verb, allowed) in [("publish", true), ("cancel", false)] {
+            let child = format!(
+                "version 2\nagent \"fleet/fixture-grants/workers/one\" {{ workspace \".\"; command \"true\"; mission-authority {{ {verb} \"fleet/fixture-grants/docs/*\" }} }}\n"
+            );
+            let (status, body) = json_request(
+                app.clone(),
+                "/v1/intent/apply",
+                serde_json::to_value(apply_request(
+                    &state,
+                    &child,
+                    "agent/fleet/fixture-grants/coordinator",
+                    &format!("default-delegate-{verb}"),
+                ))
+                .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                if allowed {
+                    StatusCode::OK
+                } else {
+                    StatusCode::UNPROCESSABLE_ENTITY
+                },
+                "{body}"
+            );
+            if !allowed {
+                assert_eq!(body["code"], "agent-authority-grant-denied");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn agent_with_seat_authority_can_declare_and_stop_only_granted_seats() {
         let root = tempfile::tempdir().unwrap();
         let state = state(root.path());
@@ -17593,6 +17881,49 @@ mission "gen/escalate" state="ready" {
             "an agent publication must not grant authority: {body}"
         );
         assert_eq!(body["code"], "agent-authority-grant-denied", "{body}");
+    }
+
+    #[tokio::test]
+    async fn mission_publication_cannot_smuggle_agent_declaration_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let state = state(root.path());
+        let app = router(state.clone());
+        let parent = "version 2\nagent \"example/publisher\" { workspace \".\"; command \"true\"; mission-authority { publish \"example/jobs/*\" } }\n";
+        let (status, body) = json_request(
+            app.clone(),
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                parent,
+                "person/operator",
+                "smuggle-parent",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let proposed = "version 2\nmission \"example/jobs/escalate\" state=\"ready\" { goal \"Refuse the smuggled grant.\"; agent \"boss\" { workspace \".\"; command \"true\"; agent-authority { apply \"example/*\" } } }\n";
+        let (status, body) = json_request(
+            app,
+            "/v1/intent/apply",
+            serde_json::to_value(apply_request(
+                &state,
+                proposed,
+                "agent/example/publisher",
+                "smuggle-apply",
+            ))
+            .unwrap(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+        assert_eq!(body["code"], "agent-authority-grant-denied");
+        assert!(
+            state
+                .store
+                .mission_spec("example/jobs/escalate", None)
+                .unwrap()
+                .is_none()
+        );
     }
 
     /// Review 2026-09-27 area 1: the consequence of the accepted publication above. The

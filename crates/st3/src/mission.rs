@@ -3841,6 +3841,27 @@ mission "bad" state="ready" { goal "Reject a duplicate rule."; agent "bad" { wor
     }
 
     #[test]
+    fn agent_authority_and_mission_cancel_reject_invalid_rules() {
+        for block in [
+            "agent-authority { }",
+            "agent-authority { start \"example/*\" }",
+            "agent-authority { apply \"agent/example/*\" }",
+            "agent-authority { apply \"example/*/bad\" }",
+            "agent-authority { apply \"example/*\"; apply \"example/*\" }",
+            "mission-authority { cancel \"mission/example/*\" }",
+            "mission-authority { cancel \"example/*\"; cancel \"example/*\" }",
+        ] {
+            let source = format!(
+                "version 2\nagent \"example/operator\" {{ workspace \".\"; command \"true\"; {block} }}\n"
+            );
+            assert!(
+                crate::graph::parse_intent(&source, "node").is_err(),
+                "{block}"
+            );
+        }
+    }
+
+    #[test]
     fn a_top_level_project_seat_holds_its_namespace_unless_its_declaration_says_otherwise() {
         use crate::model::MissionAuthoritySource::{Declared, Default, None};
 
