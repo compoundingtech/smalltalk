@@ -35,7 +35,10 @@ export default githubWorkflow({
       "strategy": {
         "fail-fast": false,
         "matrix": {
-          "runner": ["namespace-profile-linux-x86-64", "namespace-profile-macos-arm64"]
+          "runner": [
+            "namespace-profile-linux-x86-64",
+            "namespace-profile-macos-arm64"
+          ]
         }
       },
       "runs-on": [
@@ -119,7 +122,10 @@ export default githubWorkflow({
     },
     "assemble": {
       "name": "release-assemble",
-      "needs": ["build", "installer"],
+      "needs": [
+        "build",
+        "installer"
+      ],
       "runs-on": "namespace-profile-linux-x86-64",
       "steps": [
         {
