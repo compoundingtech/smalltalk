@@ -7,12 +7,12 @@
 
 pub mod adapt;
 mod attach;
-mod edit;
 #[cfg(test)]
 mod contract;
 pub mod conversation;
 pub mod demo;
 pub mod doc;
+mod edit;
 mod glass;
 mod glass_store;
 pub mod layout;
@@ -556,12 +556,21 @@ impl Ui {
             return;
         }
         if let Some((fields, focus)) = self.new_mission.as_mut() {
-            edit::insert(&mut fields[*focus], &self.cursor, &format!("mission:{focus}"), &text);
+            edit::insert(
+                &mut fields[*focus],
+                &self.cursor,
+                &format!("mission:{focus}"),
+                &text,
+            );
             return;
         }
         if let Some(chat) = self.chat.clone().filter(|chat| chat.editing) {
             let input = format!("chat:{}", chat.item);
-            let draft = self.conversation_state.drafts.entry(input.clone()).or_default();
+            let draft = self
+                .conversation_state
+                .drafts
+                .entry(input.clone())
+                .or_default();
             edit::insert(draft, &self.cursor, &input, &text);
             return;
         }
@@ -580,7 +589,11 @@ impl Ui {
             self.attachments.entry(key).or_default().push(attachment);
             return;
         }
-        let draft = self.conversation_state.drafts.entry(key.clone()).or_default();
+        let draft = self
+            .conversation_state
+            .drafts
+            .entry(key.clone())
+            .or_default();
         edit::insert(draft, &self.cursor, &key, &text);
     }
 
@@ -1346,7 +1359,12 @@ impl Ui {
             Pane::NewMission => {
                 let empty = Default::default();
                 let (fields, focus) = self.new_mission.as_ref().unwrap_or(&empty);
-                screens::new_mission_form(fields, *focus, self.cursor.at(&format!("mission:{focus}"), &fields[*focus]), width)
+                screens::new_mission_form(
+                    fields,
+                    *focus,
+                    self.cursor.at(&format!("mission:{focus}"), &fields[*focus]),
+                    width,
+                )
             }
             Pane::NewAgent => {
                 let empty = Default::default();
@@ -1354,7 +1372,10 @@ impl Ui {
                 screens::new_agent_form(
                     form,
                     &self.other_hosts(),
-                    [self.cursor.at("agent:task", &form.task), self.cursor.at("agent:name", &form.name)],
+                    [
+                        self.cursor.at("agent:task", &form.task),
+                        self.cursor.at("agent:name", &form.name),
+                    ],
                     width,
                 )
             }
@@ -2318,12 +2339,22 @@ impl Ui {
                         .modifiers
                         .intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) =>
                 {
-                    edit::insert(&mut fields[focus_now], &self.cursor, &format!("mission:{focus_now}"), "\n")
+                    edit::insert(
+                        &mut fields[focus_now],
+                        &self.cursor,
+                        &format!("mission:{focus_now}"),
+                        "\n",
+                    )
                 }
                 KeyCode::Enter if focus_now < 3 => *focus = focus_now + 1,
                 KeyCode::Enter => self.create_launch(),
                 _ => {
-                    edit::edit(&mut fields[focus_now], &self.cursor, &format!("mission:{focus_now}"), key);
+                    edit::edit(
+                        &mut fields[focus_now],
+                        &self.cursor,
+                        &format!("mission:{focus_now}"),
+                        key,
+                    );
                 }
             }
             return;
@@ -2338,7 +2369,11 @@ impl Ui {
                 }
                 KeyCode::Enter => self.submit_chat(),
                 _ => {
-                    let draft = self.conversation_state.drafts.entry(key_id.clone()).or_default();
+                    let draft = self
+                        .conversation_state
+                        .drafts
+                        .entry(key_id.clone())
+                        .or_default();
                     edit::edit(draft, &self.cursor, &key_id, key);
                 }
             }
@@ -2365,7 +2400,11 @@ impl Ui {
                 || (key.code == KeyCode::Char('j')
                     && key.modifiers.contains(KeyModifiers::CONTROL));
             if newline {
-                let draft = self.conversation_state.drafts.entry(key_id.clone()).or_default();
+                let draft = self
+                    .conversation_state
+                    .drafts
+                    .entry(key_id.clone())
+                    .or_default();
                 edit::insert(draft, &self.cursor, &key_id, "\n");
                 return;
             }
@@ -2393,7 +2432,11 @@ impl Ui {
                     }
                 }
                 _ => {
-                    let draft = self.conversation_state.drafts.entry(key_id.clone()).or_default();
+                    let draft = self
+                        .conversation_state
+                        .drafts
+                        .entry(key_id.clone())
+                        .or_default();
                     edit::edit(draft, &self.cursor, &key_id, key);
                 }
             }
