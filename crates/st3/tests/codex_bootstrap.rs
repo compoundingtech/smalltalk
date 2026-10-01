@@ -60,6 +60,15 @@ async fn until(mut predicate: impl FnMut() -> bool, description: &str) {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_fresh_codex_driver_waits_for_reconciliation_before_binding_its_mailbox() {
+    bootstrap_waits_for_reconciliation("starting", None).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_replacement_driver_waits_while_the_previous_runtime_is_vanished() {
+    bootstrap_waits_for_reconciliation("vanished", Some("previous-incarnation")).await;
+}
+
+async fn bootstrap_waits_for_reconciliation(status: &str, previous: Option<&str>) {
     let path = std::env::var_os("PATH").unwrap_or_default();
     let pty = std::env::split_paths(&path)
         .map(|dir| dir.join("pty"))
@@ -76,7 +85,7 @@ async fn a_fresh_codex_driver_waits_for_reconciliation_before_binding_its_mailbo
     let runtime = PtyRuntime::new(pty_root.clone()).with_binary(pty.to_string_lossy());
     let _cleanup = Cleanup(runtime.clone());
     let store = Arc::new(Store::open_memory("bootstrap").unwrap());
-    runtime_claim(&store, "starting", None);
+    runtime_claim(&store, status, previous);
     let pending = Arc::new(AtomicUsize::new(0));
     let bound = Arc::new(AtomicUsize::new(0));
     let state = AppState {
