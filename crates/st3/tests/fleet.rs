@@ -1693,7 +1693,10 @@ async fn an_old_build_config_peer_replicates_with_new_members() {
 fn fleet_workflows_have_no_path_filter() {
     let workflows = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.github/workflows");
     let compat = fs::read_to_string(workflows.join("fleet.yml")).unwrap();
-    assert!(compat.contains("fleet-compat"));
+    // The Linux gate runs the fleet compatibility stage from this script.
+    let stages = fs::read_to_string(workflows.join("../../scripts/ci-linux")).unwrap();
+    assert!(compat.contains("bash scripts/ci-linux"));
+    assert!(stages.contains("fleet-compat"));
     assert!(compat.contains("pull_request:"));
     for filter in ["paths:", "paths-ignore:", "branches-ignore:"] {
         assert!(
@@ -1701,11 +1704,11 @@ fn fleet_workflows_have_no_path_filter() {
             "fleet.yml filters its runs with {filter}"
         );
     }
-    assert!(compat.contains("an_old_build_config_peer_replicates_with_new_members"));
-    // macOS checks never run on GitHub (#632).
+    assert!(stages.contains("an_old_build_config_peer_replicates_with_new_members"));
+    // The optional macOS job lives in macos.yml so label events cannot restart this gate.
     assert!(
         !compat.to_ascii_lowercase().contains("macos-"),
-        "fleet.yml runs on a GitHub macOS runner"
+        "fleet.yml runs a macOS job"
     );
     let baseline: Value = serde_json::from_str(
         &fs::read_to_string(workflows.join("../fleet-compat-baseline.json")).unwrap(),

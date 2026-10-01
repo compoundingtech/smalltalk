@@ -49,8 +49,8 @@ use screens::{Drafts, Item, ListState, Listing, TABS};
 use st3_conversation_ui::pane::order;
 use st3_conversation_ui::{PaneIntent, PaneState, Selection};
 use std::{
-    cell::RefCell,
-    collections::HashSet,
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
     io::{self, Write},
     rc::Rc,
     time::{Duration, Instant},
@@ -74,8 +74,13 @@ struct FrameInfo {
     sidebar: Rect,
     sidebar_lines: usize,
     sidebar_height: usize,
-    /// Glasses: where each pane of the shown tab was drawn, in leaf order.
+    /// Glasses: where each group's content was drawn, in group order.
     glass_leaves: Vec<Rect>,
+    read_messages: HashSet<String>,
+    /// The focused agent's pane was too narrow for details beside its conversation.
+    agent_narrow: bool,
+    /// The first palette row drawn.
+    palette_top: usize,
 }
 
 struct Demo {
@@ -136,6 +141,14 @@ pub enum Effect {
     },
     /// Keep a glass in st, or delete it there.
     SaveGlass(glass::GlassWrite),
+    /// Send a failed or unconfirmed message again, as the same request.
+    Resend {
+        entry: String,
+    },
+    /// Drop a failed or unconfirmed message from the conversation.
+    Forget {
+        entry: String,
+    },
 }
 
 /// An agent's live terminal screen, drawn in place of its conversation.
@@ -151,6 +164,19 @@ pub(crate) struct TerminalView {
     /// Why the screen shown is not current: still connecting, or reconnecting after a drop.
     pub(crate) stale: Option<String>,
     pub(crate) ended: Option<String>,
+}
+
+/// `/` in a conversation: what to find there, and which match is current.
+struct Find {
+    /// The agent whose conversation is searched.
+    agent: String,
+    query: String,
+    /// The current match, counted from the newest: 0 is the latest one.
+    current: usize,
+    /// How many matches the last draw found.
+    count: Cell<usize>,
+    /// Scroll to the current match on the next draw.
+    jump: Cell<bool>,
 }
 
 /// An open "chat about this" on a Home item.
@@ -207,9 +233,33 @@ pub struct Ui {
     /// `stui --glasses`: named glasses of tabs and split panes, and a palette, in place of the
     /// sidebar layout.
     pub(crate) glasses: Option<glass::Glasses>,
+    /// The footer names this build (version, revision, age); off in tests, whose screens must
+    /// not change with every commit.
+    pub(crate) build: bool,
+    /// A pane too narrow for details beside the conversation shows them instead of it.
+    details_here: bool,
+    /// Finding text in a conversation.
+    find: Option<Find>,
+    /// When st last sent each conversation something, shown above its message box.
+    updated: HashMap<String, Instant>,
+    /// Why a conversation could not be brought up to date, until st sends it again.
+    stalled: HashMap<String, String>,
 }
 
 impl Ui {
+    /// Call only after the terminal successfully presented this frame.
+    pub(crate) fn visible_messages(&self) -> HashSet<String> {
+        if self.help
+            || self.popover.is_some()
+            || self
+                .glasses
+                .as_ref()
+                .is_some_and(|glasses| glasses.palette_open())
+        {
+            return HashSet::new();
+        }
+        self.frame.borrow().read_messages.clone()
+    }
     pub fn new(world: World) -> Self {
         Self {
             world,
@@ -243,6 +293,11 @@ impl Ui {
             revoke: None,
             snoozed: HashSet::new(),
             glasses: None,
+            build: false,
+            details_here: false,
+            find: None,
+            updated: HashMap::new(),
+            stalled: HashMap::new(),
         }
     }
 
@@ -264,6 +319,106 @@ impl Ui {
             }
         }
         self.tab = tab;
+        if self.glasses.is_some() {
+            self.resync_focus();
+        }
+    }
+
+    /// The conversations to keep live, the focused one first: the selected agent's in the
+    /// sidebar layout; in a glass, every agent pane on screen, as many as st follows at once.
+    pub(crate) fn live_conversations(&self) -> Vec<String> {
+        let mut targets = Vec::new();
+        if self.tab == 1
+            && let Some(id) = self.selected_id()
+        {
+            targets.push(id);
+        }
+        if let Some(glasses) = &self.glasses {
+            for id in glasses.shown_agents() {
+                if !targets.contains(&id) {
+                    targets.push(id);
+                }
+            }
+        }
+        targets.truncate(crate::feed::MAX_CONVERSATIONS);
+        targets
+    }
+
+    /// Details beside the conversation, or in its place when the pane is too narrow for both.
+    fn toggle_details(&mut self) {
+        if self.frame.borrow().agent_narrow {
+            self.details_here = !self.details_here;
+        } else {
+            self.details = !self.details;
+        }
+    }
+
+    pub(crate) fn conversation_updated(&mut self, target: &str) {
+        self.updated.insert(target.to_owned(), Instant::now());
+        self.stalled.remove(target);
+    }
+
+    pub(crate) fn conversation_failed(&mut self, target: &str, error: &str) {
+        self.stalled.insert(target.to_owned(), error.to_owned());
+    }
+
+    /// The agent whose message box has the keyboard: the selected agent while the Agents tab
+    /// is the focused one.
+    fn composing(&self, agent: &str) -> bool {
+        self.tab == 1 && self.selected_id().as_deref() == Some(agent)
+    }
+
+    /// ` ● live · updated 12s ago `, or paused when st is not following it.
+    fn freshness(&self, agent: &str) -> Span<'static> {
+        let age = self.updated.get(agent).map(|at| {
+            let seconds = at.elapsed().as_secs();
+            match seconds {
+                0..60 => format!("{seconds}s ago"),
+                60..3600 => format!("{}m ago", seconds / 60),
+                _ => format!("{}h ago", seconds / 3600),
+            }
+        });
+        let live = self.live_conversations().iter().any(|id| id == agent);
+        if live && let Some(error) = self.stalled.get(agent) {
+            let age = age
+                .map(|age| format!(" · updated {age}"))
+                .unwrap_or_default();
+            return Span::styled(
+                format!(" ⚠ retrying{age} · {} ", text::truncate(error, 60)),
+                theme::fg(theme::YELLOW),
+            );
+        }
+        let (text, color) = match (live, age) {
+            (true, Some(age)) => (format!(" ● live · updated {age} "), theme::OVERLAY1),
+            (true, None) => (" ● live · waiting for st ".to_owned(), theme::OVERLAY1),
+            (false, Some(age)) => (
+                format!(" ○ paused · updated {age} · focus to follow "),
+                theme::YELLOW,
+            ),
+            (false, None) => (" ○ paused · focus to follow ".to_owned(), theme::YELLOW),
+        };
+        Span::styled(text, theme::fg(color))
+    }
+
+    /// The selected agent's newest message that failed or went unconfirmed, by entry id.
+    fn undelivered(&self) -> Option<String> {
+        let agent = self.selected_id()?;
+        let Some(Load::Ready(entries)) = self.world.conversations.get(&agent) else {
+            return None;
+        };
+        entries
+            .iter()
+            .rev()
+            .find(|entry| {
+                matches!(
+                    &entry.body,
+                    Body::Pending {
+                        failed: Some(_),
+                        ..
+                    }
+                )
+            })
+            .map(|entry| entry.id.clone())
     }
 
     /// The tab and the id selected in it.
@@ -566,17 +721,25 @@ impl Ui {
                 ("esc", "cancel"),
             ]
         } else if self.editing {
-            vec![("enter", "send"), ("esc", "stop editing"), ("⌫", "delete")]
+            vec![
+                ("enter", "send"),
+                ("esc", "stop editing"),
+                ("ctrl+w", "delete word"),
+                ("ctrl+u", "clear"),
+            ]
         } else if self.confirm.is_some() {
             vec![("y", "confirm"), ("esc", "cancel")]
         } else {
             let mut hints = match &self.glasses {
                 Some(_) if self.split_shown() => vec![
                     ("ctrl+k", "open"),
-                    ("alt+←→↑↓", "panes"),
+                    ("[ ]", "tabs"),
+                    ("alt+←→↑↓", "splits"),
                     ("ctrl+w", "close"),
                 ],
-                Some(_) if !self.on_home() => vec![("ctrl+k", "open"), ("ctrl+w", "close")],
+                Some(_) if !self.on_home() => {
+                    vec![("ctrl+k", "open"), ("[ ]", "tabs"), ("ctrl+w", "close")]
+                }
                 Some(_) => vec![("ctrl+k", "open"), ("↑↓", "select")],
                 None => vec![("1-4", "tabs"), ("↑↓", "select")],
             };
@@ -595,11 +758,19 @@ impl Ui {
             hints.extend([("?", "help"), ("q", "quit")]);
             hints
         };
+        // The build, always at the right edge; the hints give way to it.
+        let build = self
+            .build
+            .then(|| format!(" {} ", crate::version::short(crate::version::now())));
+        let reserved = build
+            .as_deref()
+            .map_or(0, |build| text::width(build) as u16 + 1);
         let mut x = area.x + 1;
         for (key, label) in hints {
             let key_text = format!("{key} ");
             let label_text = format!("{label}   ");
-            if x + (text::width(&key_text) + text::width(&label_text)) as u16 > area.x + area.width
+            if x + (text::width(&key_text) + text::width(&label_text)) as u16 + reserved
+                > area.x + area.width
             {
                 break;
             }
@@ -619,6 +790,17 @@ impl Ui {
                 Style::default().fg(theme::OVERLAY1).bg(theme::CRUST),
             );
             x += text::width(&label_text) as u16;
+        }
+        if let Some(build) = &build
+            && x + reserved <= area.x + area.width
+        {
+            buf.set_stringn(
+                area.x + area.width - reserved,
+                area.y,
+                build,
+                reserved as usize,
+                Style::default().fg(theme::OVERLAY0).bg(theme::CRUST),
+            );
         }
         if let Some((message, _)) = &self.flash {
             let message = format!(" {message} ");
@@ -1005,7 +1187,39 @@ impl Ui {
             buf.set_stringn(area.x, area.y + 1, message, width, theme::dim());
             return;
         };
-        let full = area;
+        let narrow = area.width < 90;
+        if self.composing(&agent.id) {
+            self.frame.borrow_mut().agent_narrow = narrow;
+        }
+        // Too narrow for details beside the conversation: `i` shows them in its place.
+        if narrow && self.details_here && !agent.unmanaged && self.composing(&agent.id) {
+            buf.set_stringn(
+                area.x,
+                area.y,
+                " i back to the conversation ",
+                area.width as usize,
+                theme::fg(theme::OVERLAY1),
+            );
+            self.hit(Rect { height: 1, ..area }, Hit::Key('i'));
+            let doc = screens::agent_details(
+                &self.world,
+                agent,
+                (area.width as usize).saturating_sub(3),
+                self.spinner(),
+            );
+            self.pane(
+                buf,
+                &format!("details:{}", agent.id),
+                Rect {
+                    y: area.y + 1,
+                    height: area.height.saturating_sub(1),
+                    ..area
+                },
+                doc,
+                false,
+            );
+            return;
+        }
         let area = if self.details && !agent.unmanaged && area.width >= 90 {
             let side = (area.width / 3).clamp(30, 44);
             let pane = Rect {
@@ -1058,8 +1272,10 @@ impl Ui {
             area.width as usize,
             theme::fg(theme::SURFACE0),
         );
-        if !agent.unmanaged && full.width >= 90 {
-            let label = if self.details {
+        if !agent.unmanaged && (!narrow || self.composing(&agent.id)) {
+            let label = if narrow {
+                " i details "
+            } else if self.details {
                 " i hide details ▸ "
             } else {
                 " ◂ i details "
@@ -1077,22 +1293,8 @@ impl Ui {
                 Hit::Key('i'),
             );
         }
-        // The composer grows with the draft (up to eight lines) and keeps the cursor in view.
-        let composer = if agent.unmanaged {
-            Vec::new()
-        } else {
-            self.composer_lines(agent, width)
-        };
-        let composer_height = if agent.unmanaged {
-            0
-        } else {
-            composer.len() as u16 + 2
-        };
-        let body = Rect {
-            y: area.y + header_height,
-            height: area.height.saturating_sub(header_height + composer_height),
-            ..area
-        };
+        // While finding, the find bar takes the message box's place.
+        let find = self.find.as_ref().filter(|find| find.agent == agent.id);
         let doc = match self.world.conversations.get(&agent.id) {
             None | Some(Load::Loading) => {
                 let mut doc = Doc::new();
@@ -1125,22 +1327,105 @@ impl Ui {
                 doc
             }
             Some(Load::Ready(entries)) => {
+                // Folded tool output with a match inside opens while finding.
+                let query = find
+                    .map(|find| find.query.to_lowercase())
+                    .unwrap_or_default();
+                let mut expanded = self.conversation_state.expanded.clone();
+                if !query.is_empty() {
+                    expanded.extend(entries.iter().filter_map(|entry| {
+                        match &entry.body {
+                            Body::Tool { output, .. }
+                                if output
+                                    .iter()
+                                    .any(|line| line.to_lowercase().contains(&query)) =>
+                            {
+                                Some(entry.id.clone())
+                            }
+                            _ => None,
+                        }
+                    }));
+                }
                 let mut doc = Doc::new();
                 doc.blank();
                 doc.append(
-                    self.cache.render(
-                        entries,
-                        width,
-                        &self.conversation_state.expanded,
-                        self.spinner(),
-                    ),
+                    self.cache.render(entries, width, &expanded, self.spinner()),
                     0,
                 );
                 doc.blank();
                 doc
             }
         };
-        self.pane(buf, &format!("chat:{}", agent.id), body, doc, true);
+        let key = format!("chat:{}", agent.id);
+        let matches = find
+            .map(|find| find_matches(&doc, &find.query))
+            .unwrap_or_default();
+        if let Some(find) = find {
+            find.count.set(matches.len());
+        }
+        // The composer grows with the draft (up to eight lines) and keeps the cursor in view.
+        let composer = if let Some(find) = find {
+            vec![self.find_bar(find)]
+        } else if agent.unmanaged {
+            Vec::new()
+        } else {
+            self.composer_lines(agent, width)
+        };
+        let composer_height = if composer.is_empty() {
+            0
+        } else {
+            composer.len() as u16 + 2
+        };
+        let body = Rect {
+            y: area.y + header_height,
+            height: area.height.saturating_sub(header_height + composer_height),
+            ..area
+        };
+        if let Some(find) = find {
+            let current = matches
+                .len()
+                .checked_sub(1 + find.current.min(matches.len().saturating_sub(1)))
+                .and_then(|index| matches.get(index));
+            if find.jump.replace(false)
+                && let Some((line, _, _)) = current
+            {
+                let mut panes = self.conversation_state.panes.borrow_mut();
+                let state = panes.entry(key.clone()).or_default();
+                state.top = line.saturating_sub(body.height as usize / 3);
+                state.follow = false;
+            }
+        }
+        self.pane(buf, &key, body, doc, true);
+        // Every match on screen is marked; the current one stands out.
+        if let Some(find) = find {
+            let top = self
+                .conversation_state
+                .panes
+                .borrow()
+                .get(&key)
+                .map_or(0, |state| state.top);
+            let current = matches
+                .len()
+                .saturating_sub(1 + find.current.min(matches.len().saturating_sub(1)));
+            for (index, (line, column, width)) in matches.iter().enumerate() {
+                if *line < top || *line >= top + body.height as usize {
+                    continue;
+                }
+                let y = body.y + (line - top) as u16;
+                let style = if index == current {
+                    Style::default().fg(theme::CRUST).bg(theme::YELLOW)
+                } else {
+                    Style::default().fg(theme::TEXT).bg(theme::SURFACE2)
+                };
+                for x in *column..column + width {
+                    if let Some(cell) = buf.cell_mut((body.x + x as u16, y))
+                        && x < body.width as usize
+                    {
+                        cell.set_style(style);
+                    }
+                }
+            }
+        }
         if composer_height > 0 {
             let y = body.y + body.height;
             buf.set_stringn(
@@ -1148,12 +1433,26 @@ impl Ui {
                 y,
                 "─".repeat(area.width as usize),
                 area.width as usize,
-                theme::fg(if self.editing {
+                theme::fg(if self.editing && self.composing(&agent.id) {
                     theme::ACCENT
                 } else {
                     theme::SURFACE0
                 }),
             );
+            // How fresh the conversation is, on the rule above the box: st pushes changes to
+            // the conversations on screen, and one that is not followed says so.
+            if self.live {
+                let label = self.freshness(&agent.id);
+                let width = text::width(&label.content) as u16;
+                if width + 4 < area.width {
+                    buf.set_line(
+                        area.x + area.width - width - 2,
+                        y,
+                        &Line::from(vec![label]),
+                        width,
+                    );
+                }
+            }
             for (offset, line) in composer.iter().enumerate() {
                 buf.set_line(area.x, y + 1 + offset as u16, line, area.width);
             }
@@ -1184,6 +1483,14 @@ impl Ui {
             *state
         };
         let top = state.top;
+        if area.width > 1 && height > 0 {
+            self.frame.borrow_mut().read_messages.extend(
+                doc.messages
+                    .iter()
+                    .filter(|(_, range)| range.start < top + height && range.end > top)
+                    .map(|(id, _)| id.clone()),
+            );
+        }
         let lines = Rc::new(doc.lines);
         for (offset, line) in lines.iter().skip(top).take(height).enumerate() {
             buf.set_line(
@@ -1365,6 +1672,26 @@ impl Ui {
         }
     }
 
+    /// The find bar: what is sought, where the current match is, and the keys.
+    fn find_bar(&self, find: &Find) -> Line<'static> {
+        let count = find.count.get();
+        let place = match count {
+            0 if find.query.is_empty() => String::new(),
+            0 => "  no matches".to_owned(),
+            count => format!("  {} of {count}", find.current.min(count - 1) + 1),
+        };
+        Line::from(vec![
+            Span::styled("/ ", theme::strong(theme::ACCENT)),
+            Span::styled(find.query.clone(), theme::text()),
+            Span::styled("█", theme::fg(theme::ACCENT)),
+            Span::styled(place, theme::fg(theme::YELLOW)),
+            Span::styled(
+                "  · enter older · shift+enter newer · esc close",
+                theme::dim(),
+            ),
+        ])
+    }
+
     /// The message box under a conversation, wrapped, newest lines last.
     fn composer_lines(&self, agent: &Agent, width: usize) -> Vec<Line<'static>> {
         let draft = self
@@ -1373,13 +1700,21 @@ impl Ui {
             .get(&agent.id)
             .cloned()
             .unwrap_or_default();
-        if draft.is_empty() && !self.editing {
+        // Only the focused pane's box takes keys; the others show their draft, and how to reach
+        // them by click.
+        let editing = self.editing && self.composing(&agent.id);
+        if draft.is_empty() && !editing {
+            let hint = if self.composing(&agent.id) {
+                format!("Message {} · c or click", agent.name)
+            } else {
+                format!("Message {} · click", agent.name)
+            };
             return vec![Line::from(vec![
                 Span::styled("› ", theme::dim()),
-                Span::styled(format!("Message {} · c or click", agent.name), theme::dim()),
+                Span::styled(hint, theme::dim()),
             ])];
         }
-        let style = if self.editing {
+        let style = if editing {
             theme::text()
         } else {
             theme::soft()
@@ -1388,13 +1723,13 @@ impl Ui {
         let paragraphs = draft.split('\n').collect::<Vec<_>>();
         for (index, paragraph) in paragraphs.iter().enumerate() {
             let mut runs = vec![text::run(paragraph.to_string(), style)];
-            if self.editing && index == paragraphs.len() - 1 {
+            if editing && index == paragraphs.len() - 1 {
                 runs.push(text::run("█", theme::fg(theme::ACCENT)));
             }
             let first = if index == 0 {
                 text::run(
                     "› ",
-                    if self.editing {
+                    if editing {
                         theme::strong(theme::ACCENT)
                     } else {
                         theme::dim()
@@ -1622,6 +1957,29 @@ impl Ui {
             self.help = false;
             return;
         }
+        if let Some(find) = self.find.as_mut() {
+            let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+            let count = find.count.get().max(1);
+            match key.code {
+                KeyCode::Esc => self.find = None,
+                // Enter goes back in time, to the next older match; Shift+Enter forward.
+                KeyCode::Enter | KeyCode::Up if !shift => {
+                    find.current = (find.current + 1) % count;
+                    find.jump.set(true);
+                }
+                KeyCode::Enter | KeyCode::Down => {
+                    find.current = (find.current + count - 1) % count;
+                    find.jump.set(true);
+                }
+                _ => {
+                    if edit_text(&mut find.query, key) {
+                        find.current = 0;
+                        find.jump.set(true);
+                    }
+                }
+            }
+            return;
+        }
         if let Some((fields, focus)) = self.new_mission.as_mut() {
             let focus_now = *focus;
             match key.code {
@@ -1637,16 +1995,9 @@ impl Ui {
                 }
                 KeyCode::Enter if focus_now < 3 => *focus = focus_now + 1,
                 KeyCode::Enter => self.create_launch(),
-                KeyCode::Backspace => {
-                    fields[focus_now].pop();
+                _ => {
+                    edit_text(&mut fields[focus_now], key);
                 }
-                KeyCode::Char(character) => {
-                    fields[focus_now].push(character);
-                    if focus_now == 0 && fields[2].is_empty() {
-                        // Suggest a mission id from the title as it is typed.
-                    }
-                }
-                _ => {}
             }
             return;
         }
@@ -1659,20 +2010,12 @@ impl Ui {
                     }
                 }
                 KeyCode::Enter => self.submit_chat(),
-                KeyCode::Backspace => {
-                    self.conversation_state
-                        .drafts
-                        .entry(key_id)
-                        .or_default()
-                        .pop();
+                _ => {
+                    edit_text(
+                        self.conversation_state.drafts.entry(key_id).or_default(),
+                        key,
+                    );
                 }
-                KeyCode::Char(character) => self
-                    .conversation_state
-                    .drafts
-                    .entry(key_id)
-                    .or_default()
-                    .push(character),
-                _ => {}
             }
             return;
         }
@@ -1707,20 +2050,12 @@ impl Ui {
             match key.code {
                 KeyCode::Esc => self.editing = false,
                 KeyCode::Enter => self.submit(),
-                KeyCode::Backspace => {
-                    self.conversation_state
-                        .drafts
-                        .entry(key_id)
-                        .or_default()
-                        .pop();
+                _ => {
+                    edit_text(
+                        self.conversation_state.drafts.entry(key_id).or_default(),
+                        key,
+                    );
                 }
-                KeyCode::Char(character) => self
-                    .conversation_state
-                    .drafts
-                    .entry(key_id)
-                    .or_default()
-                    .push(character),
-                _ => {}
             }
             return;
         }
@@ -1759,7 +2094,25 @@ impl Ui {
             KeyCode::Char('s') => self.sidebar = !self.sidebar,
             KeyCode::Char('x') if self.tab == 2 => self.system = !self.system,
             KeyCode::Char('o') if self.tab == 1 => self.toggle_all_tools(),
-            KeyCode::Char('i') if self.tab == 1 => self.details = !self.details,
+            KeyCode::Char('/') if self.tab == 1 => {
+                if let Some(agent) = self.selected_id() {
+                    self.find = Some(Find {
+                        agent,
+                        query: String::new(),
+                        current: 0,
+                        count: Cell::new(0),
+                        jump: Cell::new(false),
+                    });
+                }
+            }
+            KeyCode::Char(letter @ ('r' | 'x')) if self.tab == 1 && self.live => {
+                match self.undelivered() {
+                    Some(entry) if letter == 'r' => self.effects.push(Effect::Resend { entry }),
+                    Some(entry) => self.effects.push(Effect::Forget { entry }),
+                    None => {}
+                }
+            }
+            KeyCode::Char('i') if self.tab == 1 => self.toggle_details(),
             KeyCode::Char('t') if matches!(self.tab, 1 | 2) => {
                 let id = self.selected_id();
                 self.tree = !self.tree;
@@ -1899,11 +2252,12 @@ impl Ui {
                     ("launch", 'd') | ("revision", 'j') | ("fault" | "request", 'r') => {
                         self.confirm = Some(key)
                     }
+                    ("request", 'y' | 'n') => self.confirm = Some(key),
                     ("message", 'm') => self.act('m'),
                     _ => {}
                 }
             }
-            1 if key == 'i' => self.details = !self.details,
+            1 if key == 'i' => self.toggle_details(),
             1 if key == 'c'
                 && self.world.agents.items().iter().any(|agent| {
                     Some(&agent.id) == self.selected_id().as_ref() && !agent.unmanaged
@@ -2083,9 +2437,6 @@ impl Ui {
         };
         let title = format!("About: {}", item.title);
         self.conversation_state.drafts.remove(&key);
-        if let Some(state) = &mut self.chat {
-            state.editing = false;
-        }
         if self.live {
             let mut context = format!("{text}\n\n---\nThis is about {} ({}", item.title, item.id);
             if let Some(mission) = &item.mission {
@@ -2110,6 +2461,7 @@ impl Ui {
                     to: chat.to_name.clone(),
                     subject: title.clone(),
                     body: text,
+                    delivered: false,
                 },
             });
             entries.push(Entry {
@@ -2120,6 +2472,7 @@ impl Ui {
                     to: "you".into(),
                     subject: title,
                     body: "Good question. Here is what I know, and what I would need from you to go on. (demo reply)".into(),
+                    delivered: false,
                 },
             });
         }
@@ -2132,7 +2485,7 @@ impl Ui {
             self.flash("Write something first");
             return;
         };
-        self.editing = false;
+        // The input stays focused after a send; Esc leaves it.
         if self.live {
             let effect = match self.tab {
                 1 => Some(Effect::Send {
@@ -2210,6 +2563,7 @@ impl Ui {
                             to: name,
                             subject: String::new(),
                             body: draft,
+                            delivered: false,
                         },
                     });
                 }
@@ -2254,6 +2608,20 @@ impl Ui {
         let Some(id) = self.attention_focus() else {
             return;
         };
+        if matches!(action, 'y' | 'n') && self.current_kind() == Some("request") {
+            let answer = if action == 'y' { "Yes" } else { "No" };
+            if self.live {
+                self.effects.push(Effect::Attention {
+                    id,
+                    action: "work.done".into(),
+                    reason: Some(answer.into()),
+                });
+                self.flash(format!("Answering “{answer}”…"));
+            } else {
+                self.flash(format!("Answered “{answer}” · demo: nothing was sent"));
+            }
+            return;
+        }
         if self.live {
             let kind = self.current_kind().unwrap_or("");
             let name = match (kind, action) {
@@ -2405,6 +2773,10 @@ impl Ui {
                     }
                 }
             }
+            // The palette, while open, takes the wheel: nothing behind it moves.
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if self.palette_open() => {
+                self.scroll_palette(matches!(mouse.kind, MouseEventKind::ScrollUp));
+            }
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
                 let delta = if matches!(mouse.kind, MouseEventKind::ScrollUp) {
                     -3
@@ -2441,6 +2813,7 @@ impl Ui {
     fn click(&mut self, hit: Hit) {
         match hit {
             Hit::GlassMenu => self.open_palette(Some(4), glass::Open::Here),
+            Hit::PaletteSection(section) => self.open_palette(Some(section), glass::Open::Here),
             Hit::GlassTab(group, tab) => self.show_in(group, tab),
             Hit::GlassAdd(group) => {
                 self.focus_group(group);
@@ -2676,11 +3049,82 @@ impl Ui {
         }
         if cos > 8.0 && !demo.mail {
             demo.mail = true;
-            if let Some(Load::Ready(entries)) = self.world.conversations.get_mut("agent/example/cos")
+            if let Some(Load::Ready(entries)) =
+                self.world.conversations.get_mut("agent/example/cos")
             {
                 entries.push(demo::late_mail());
             }
         }
+    }
+}
+
+/// Terminal text editing on a draft, which is edited at its end: typing, Backspace, and the
+/// readline keys people expect (Ctrl+W and Alt+Backspace delete a word, Ctrl+U the line).
+/// Returns whether the key belonged to the text; a typing key never reaches anything else.
+fn edit_text(text: &mut String, key: KeyEvent) -> bool {
+    let control = key.modifiers.contains(KeyModifiers::CONTROL);
+    let alt = key.modifiers.contains(KeyModifiers::ALT);
+    match key.code {
+        KeyCode::Backspace if control || alt => delete_word(text),
+        KeyCode::Backspace | KeyCode::Char('h') if key.code == KeyCode::Backspace || control => {
+            text.pop();
+        }
+        KeyCode::Char('w') if control && !alt => delete_word(text),
+        KeyCode::Char('u') if control && !alt => {
+            let start = text.rfind('\n').map_or(0, |index| index + 1);
+            text.truncate(start);
+        }
+        // Cursor keys have nowhere to go at the end of the draft; they still belong to it.
+        KeyCode::Char('a' | 'e' | 'k' | 'b' | 'f' | 'd') if control && !alt => {}
+        // AltGr arrives as Ctrl+Alt on some terminals: that is typing too.
+        KeyCode::Char(character) if control == alt => text.push(character),
+        _ => return false,
+    }
+    true
+}
+
+/// Where `query` shows in a drawn document, case aside: (line, display column, display width).
+fn find_matches(doc: &Doc, query: &str) -> Vec<(usize, usize, usize)> {
+    let query = query.to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut found = Vec::new();
+    for (index, line) in doc.lines.iter().enumerate() {
+        let plain = st3_conversation_ui::text::plain(line);
+        let lower = plain.to_lowercase();
+        // Lowercasing keeps byte offsets only for ASCII; elsewhere match the line as written.
+        let haystack = if lower.len() == plain.len() {
+            &lower
+        } else {
+            &plain
+        };
+        let mut from = 0;
+        while let Some(offset) = haystack[from..].find(&query) {
+            let start = from + offset;
+            let end = start + query.len();
+            found.push((
+                index,
+                text::width(&plain[..start]),
+                text::width(&plain[start..end]),
+            ));
+            from = end;
+        }
+    }
+    found
+}
+
+/// Readline's word delete: the blanks before the end, then the word before them.
+fn delete_word(text: &mut String) {
+    let before = text.len();
+    while text.ends_with([' ', '\t']) {
+        text.pop();
+    }
+    while text.ends_with(|character: char| !character.is_whitespace()) {
+        text.pop();
+    }
+    if text.len() == before && text.ends_with('\n') {
+        text.pop();
     }
 }
 
@@ -2995,6 +3439,29 @@ fn dump(args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn drafts_take_the_terminal_editing_keys() {
+        let key = |code, modifiers| KeyEvent::new(code, modifiers);
+        let mut text = "look at the  ".to_owned();
+        assert!(edit_text(
+            &mut text,
+            key(KeyCode::Char('w'), KeyModifiers::CONTROL)
+        ));
+        assert_eq!(text, "look at ");
+        edit_text(&mut text, key(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(text, "look ");
+        edit_text(&mut text, key(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        assert_eq!(text, "look ", "a control key never types its letter");
+        edit_text(&mut text, key(KeyCode::Char('X'), KeyModifiers::SHIFT));
+        assert_eq!(text, "look X");
+        let mut lines = "first\nsecond line".to_owned();
+        edit_text(&mut lines, key(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(lines, "first\n");
+        edit_text(&mut lines, key(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(lines, "first");
+        assert!(!edit_text(&mut lines, key(KeyCode::Up, KeyModifiers::NONE)));
+    }
 
     fn frame(ui: &Ui, width: u16, height: u16) -> Vec<String> {
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();

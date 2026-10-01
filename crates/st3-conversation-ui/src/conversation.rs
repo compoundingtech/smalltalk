@@ -19,7 +19,8 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-const COLLAPSED_TOOL_LINES: usize = 5;
+/// The most rows a tool call's output takes until it is expanded, wrapped lines counted.
+const COLLAPSED_TOOL_LINES: usize = 6;
 
 #[derive(Default)]
 pub struct Cache {
@@ -128,13 +129,23 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             state,
             output,
         } => {
-            let (bg, glyph, color) = match state {
-                ToolState::Running => (theme.tool_bg, spinner, theme.working),
-                ToolState::Ok => (theme.tool_ok_bg, "✓", theme.green),
-                ToolState::Failed => (theme.tool_err_bg, "✕", theme.red),
+            // Quiet until opened: an edge in the outcome's colour, dim text, no fill. Opened,
+            // it reads at full brightness.
+            let (glyph, color) = match state {
+                ToolState::Running => (spinner, theme.working),
+                ToolState::Ok => ("✓", theme.green),
+                ToolState::Failed => ("✕", theme.red),
+            };
+            let edge = || run("▎ ", theme::fg(color));
+            let (title_style, row_style) = if open {
+                (theme.bold(), Style::default().fg(theme.subtext0))
+            } else {
+                (
+                    Style::default().fg(theme.overlay1),
+                    Style::default().fg(theme.overlay0),
+                )
             };
             let title = text::truncate(&text::sanitize(title), width.saturating_sub(6));
-            let used = 3 + text::width(&title) + 2;
             doc.targets.push(Target {
                 line: 0,
                 column: 0,
@@ -142,84 +153,65 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                 hit: PaneIntent::Expand(entry.id.clone()),
             });
             doc.line(Line::from(vec![
-                Span::styled(
-                    format!(" {glyph} "),
-                    Style::default()
-                        .fg(color)
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    title,
-                    Style::default()
-                        .fg(theme.text)
-                        .bg(bg)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    " ".repeat(width.saturating_sub(used) + 2),
-                    Style::default().bg(bg),
-                ),
+                Span::styled(edge().text, edge().style),
+                Span::styled(format!("{glyph} "), theme::fg(color)),
+                Span::styled(title, title_style),
             ]));
-            let shell =
-                matches!(state, ToolState::Failed) || output.len() <= COLLAPSED_TOOL_LINES || open;
-            let shown: Vec<&String> = if shell {
-                output.iter().collect()
-            } else {
-                output
-                    .iter()
-                    .skip(output.len() - COLLAPSED_TOOL_LINES)
-                    .collect()
-            };
-            let hidden = output.len() - shown.len();
-            if hidden > 0 {
-                doc.targets.push(Target {
-                    line: doc.lines.len(),
-                    column: 0,
-                    width: width as u16,
-                    hit: PaneIntent::Expand(entry.id.clone()),
-                });
-                doc.line(pad(
-                    Line::from(Span::styled(
-                        format!("   … {hidden} earlier lines · o or click to expand"),
-                        Style::default().fg(theme.overlay0).bg(bg),
-                    )),
-                    width,
-                    bg,
-                ));
-            }
-            for line in shown {
+            // Every row the output takes once wrapped; collapsed, a call shows its last few.
+            let mut rows = Vec::new();
+            for line in output {
                 let line = text::sanitize(line);
                 let style = if line.starts_with('+') {
                     Style::default().fg(theme.green)
                 } else if line.starts_with('-') || line.contains("error") {
                     Style::default().fg(theme.red)
                 } else {
-                    Style::default().fg(theme.subtext0)
+                    row_style
                 };
-                doc.lines(text::wrap(
+                let style = if open {
+                    style
+                } else {
+                    style.add_modifier(Modifier::DIM)
+                };
+                rows.extend(text::wrap(
                     &[run(line, style)],
                     width,
-                    &[run("   ", style)],
-                    &[run("   ", style)],
-                    Some(bg),
+                    &[edge(), run("  ", style)],
+                    &[edge(), run("  ", style)],
+                    None,
                 ));
             }
-            if open && output.len() > COLLAPSED_TOOL_LINES {
+            let total = rows.len();
+            let hidden = if open {
+                0
+            } else {
+                total.saturating_sub(COLLAPSED_TOOL_LINES)
+            };
+            let control = |doc: &mut Doc, label: String| {
                 doc.targets.push(Target {
                     line: doc.lines.len(),
                     column: 0,
                     width: width as u16,
                     hit: PaneIntent::Expand(entry.id.clone()),
                 });
-                doc.line(pad(
-                    Line::from(Span::styled(
-                        "   collapse",
-                        Style::default().fg(theme.overlay0).bg(bg),
-                    )),
-                    width,
-                    bg,
-                ));
+                doc.line(Line::from(vec![
+                    Span::styled(edge().text, edge().style),
+                    Span::styled(format!("  {label}"), Style::default().fg(theme.overlay0)),
+                ]));
+            };
+            if hidden > 0 {
+                control(
+                    &mut doc,
+                    format!("… {hidden} more lines · o or click to show"),
+                );
+            }
+            // An open long call folds from the same place it opened, as well as from its end.
+            if open && total > COLLAPSED_TOOL_LINES {
+                control(&mut doc, "▴ collapse".into());
+            }
+            doc.lines(rows.into_iter().skip(hidden));
+            if open && total > COLLAPSED_TOOL_LINES {
+                control(&mut doc, "▴ collapse".into());
             }
         }
         Body::Mail {
@@ -227,8 +219,25 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
             to,
             subject,
             body,
+            delivered,
         } => {
             let bar = run("▎ ", theme::fg(theme.sapphire));
+            // The person's own mail says how far it got: ✓ st has it, ✓✓ the agent's harness
+            // has it.
+            let progress = match (from == "you", delivered) {
+                (false, _) => run(String::new(), theme.dim()),
+                (true, false) => run("  ✓ sent", theme.dim()),
+                (true, true) => run("  ✓✓ delivered", theme::fg(theme.green)),
+            };
+            // Mail to the person stands out: full brightness on a tinted block, like their own
+            // messages. Mail between others stays quieter.
+            let to_you = to == "you";
+            let tint = to_you.then_some(theme.tool_bg);
+            let on = |style: Style| match tint {
+                Some(bg) => style.bg(bg),
+                None => style,
+            };
+            let bar = run(bar.text, on(bar.style));
             doc.lines(text::wrap(
                 &[
                     run(
@@ -237,29 +246,54 @@ fn render_entry(entry: &Entry, width: usize, open: bool, spinner: &str, theme: &
                         } else {
                             format!("{from} → {to}")
                         },
-                        theme::strong(theme.sapphire),
+                        on(theme::strong(theme.sapphire)),
                     ),
-                    run(format!("  {}", text::sanitize(subject)), theme.bold()),
-                    run(format!("  {}", entry.at), theme.dim()),
+                    run(format!("  {}", text::sanitize(subject)), on(theme.bold())),
+                    run(format!("  {}", entry.at), on(theme.dim())),
+                    run(progress.text, on(progress.style)),
                 ],
                 inner,
                 std::slice::from_ref(&bar),
                 std::slice::from_ref(&bar),
-                None,
+                tint,
             ));
-            for line in text::markdown(body, inner.saturating_sub(2), theme.soft(), theme) {
+            let start = doc.lines.len();
+            let style = if to_you { theme.text() } else { theme.soft() };
+            for line in text::markdown(body, inner.saturating_sub(2), on(style), theme) {
                 let mut spans = vec![Span::styled(bar.text.clone(), bar.style)];
-                spans.extend(line.spans);
-                doc.line(Line::from(spans));
+                spans.extend(line.spans.into_iter().map(|span| {
+                    let style = on(span.style);
+                    span.style(style)
+                }));
+                let line = Line::from(spans);
+                doc.line(match tint {
+                    Some(bg) => pad(line, inner, bg),
+                    None => line,
+                });
+            }
+            if entry.id.starts_with("message/") && doc.lines.len() > start {
+                doc.messages
+                    .push((entry.id.clone(), start..doc.lines.len()));
             }
         }
-        Body::Pending { text: body, failed } => {
-            // Dim until st has it; red if it never got there.
-            let (bar, label, style) = match failed {
-                None => (theme.surface2, "you · sending…".to_owned(), theme.dim()),
-                Some(error) => (
+        Body::Pending {
+            text: body,
+            failed,
+            unconfirmed,
+        } => {
+            // Dim until st has it; red if it never got there, peach if st never said.
+            let (bar, label, style) = match (failed, unconfirmed) {
+                (None, _) => (theme.surface2, "you · sending…".to_owned(), theme.dim()),
+                (Some(error), true) => (
+                    theme.peach,
+                    format!(
+                        "you · unconfirmed, st did not answer ({error}) · r send again · x clear"
+                    ),
+                    theme::fg(theme.peach),
+                ),
+                (Some(error), false) => (
                     theme.red,
-                    format!("you · not sent: {error}"),
+                    format!("you · not sent: {error} · r retry · x clear"),
                     theme::fg(theme.red),
                 ),
             };
@@ -354,8 +388,22 @@ mod tests {
         )];
         let doc = cache.render(&entries, 40, &HashSet::new(), "⠋", &crate::tests::theme());
         let text = doc.lines.iter().map(text::plain).collect::<Vec<_>>();
-        assert!(text[1].contains("15 earlier lines"));
+        assert!(text[1].contains("14 more lines"));
+        assert_eq!(text.len(), 2 + 6, "a title, the more line, six rows");
         assert!(text.last().unwrap().contains("line 19"));
+        // Rows count once wrapped, and a failed call collapses too.
+        let wide = vec![entry(
+            "w",
+            Body::Tool {
+                title: "$ test".into(),
+                state: ToolState::Failed,
+                output: vec!["word ".repeat(80)],
+            },
+        )];
+        let doc = cache.render(&wide, 40, &HashSet::new(), "⠋", &crate::tests::theme());
+        let text = doc.lines.iter().map(text::plain).collect::<Vec<_>>();
+        assert!(text[1].contains("more lines"), "{text:?}");
+        assert_eq!(text.len(), 2 + 6);
         let mut open = HashSet::new();
         open.insert("t".to_owned());
         assert!(

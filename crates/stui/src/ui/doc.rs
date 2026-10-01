@@ -32,6 +32,8 @@ pub enum Hit {
     Detach,
     /// Glasses: open the palette at the glasses section.
     GlassMenu,
+    /// Glasses: open the palette at one section.
+    PaletteSection(usize),
     /// Glasses: show a group's tab (group 0's tab 0 is Home).
     GlassTab(usize, usize),
     /// Glasses: open the palette for a new tab in a group.
@@ -141,6 +143,12 @@ impl DocExt for Doc {
                 ..target
             });
         }
+        self.messages.extend(
+            inner
+                .messages
+                .into_iter()
+                .map(|(id, range)| (id, range.start + base..range.end + base)),
+        );
         for line in inner.lines {
             let used = line.width();
             let mut spans = vec![Span::styled(format!("{v} "), border)];

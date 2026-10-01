@@ -42,6 +42,13 @@ use crate::model::{
 use crate::model::{ReplicaRange, ReplicationBatch, ReplicationResponse};
 use crate::model::{SeatQueueMoveRequest, SeatQueueMoveView, SeatQueueRunView, SeatQueueView};
 use crate::seat_queue::{self, Placement, QueueJoin, QueueMove, SeatStep};
+use smallclaims::claim::ReplicaEnvelopePayload;
+use smallclaims::error::internal;
+use smallclaims::hash::{
+    batch_header_hash, canonical_hash, canonical_json_text, canonical_json_value,
+    canonical_serialized_json_text, claim_hash, claim_id_is_content_hash, replica_envelope_hash,
+    replica_record_ref, verify_replica_batch_header,
+};
 
 mod attention_snapshot;
 mod canonical;
@@ -125,6 +132,8 @@ CREATE TABLE IF NOT EXISTS claims (
     accepted_at_unix_ms TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS claims_subject_index ON claims(subject, store_index);
+CREATE INDEX IF NOT EXISTS claims_subject_accepted_index
+ON claims(subject, length(accepted_at_unix_ms), accepted_at_unix_ms);
 CREATE INDEX IF NOT EXISTS claims_kind_index ON claims(kind, store_index);
 CREATE INDEX IF NOT EXISTS claims_terminal_history_index ON claims(store_index)
 WHERE kind IN ('mission-run.state','step-run.state','work.failed')
@@ -269,6 +278,13 @@ CREATE INDEX IF NOT EXISTS claims_generation_revision_index ON claims(json_extra
 WHERE kind='run-generation.created';
 CREATE INDEX IF NOT EXISTS claims_proposal_revision_index ON claims(json_extract(body, '$.fields.candidate_revision'))
 WHERE kind='revision-proposal.created';
+-- A standalone person ask creates its run and generation in the asking claim itself.
+CREATE INDEX IF NOT EXISTS claims_person_ask_generation_index ON claims(json_extract(body, '$.fields.generation'))
+WHERE kind='work.person-asked';
+CREATE INDEX IF NOT EXISTS claims_person_ask_run_index ON claims(json_extract(body, '$.fields.run'))
+WHERE kind='work.person-asked';
+CREATE INDEX IF NOT EXISTS claims_person_ask_owner_index ON claims(json_extract(body, '$.fields.owner_run'))
+WHERE kind='work.person-asked';
 
 CREATE TABLE IF NOT EXISTS idempotency (
     operation_id TEXT PRIMARY KEY,
@@ -2209,12 +2225,6 @@ impl CompactReplicationInventory {
             .map(|range| self.bucket(range))
             .collect()
     }
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-struct ReplicaEnvelopePayload {
-    batch: ReplicaBatch,
-    blobs: BTreeMap<String, Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -19306,10 +19316,40 @@ fn validate_message_transition(
             | (Some("delivered"), "read")
             | (Some("read"), "closed")
     );
+    // A person's displayed message has no native harness handoff. Its explicit read receipt
+    // is also delivery evidence; only the actual person recipient may skip that boundary.
+    let person_read = if requested == "read"
+        && matches!(current, Some("sent" | "staged"))
+        && input
+            .actor
+            .as_deref()
+            .is_some_and(|actor| actor.starts_with("person/"))
+    {
+        let index: Option<u64> = transaction
+            .query_row(
+                "SELECT created_index FROM message_index WHERE subject=?1",
+                [&input.subject],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(internal)?;
+        match index {
+            Some(index) => {
+                message_view_tx(transaction, &input.subject, index)
+                    .map_err(internal)?
+                    .to
+                    .as_str()
+                    == input.actor.as_deref().unwrap()
+            }
+            None => false,
+        }
+    } else {
+        false
+    };
     let daemon_withdrawal = matches!(current, Some("sent" | "staged"))
         && requested == "closed"
         && input.actor.as_deref() == Some("daemon/runtime");
-    if !valid && !daemon_withdrawal {
+    if !valid && !person_read && !daemon_withdrawal {
         return Err(St3Error::new(
             "invalid-message-transition",
             format!(
@@ -19607,12 +19647,14 @@ fn previous_batch_hash(transaction: &Transaction<'_>, origin: &str) -> Result<Op
         .map_err(Into::into)
 }
 
+// Seek the newest time block before evaluating canonical writer/sequence/position ties.
+const LATEST_CLAIM_QUERY: &str = "SELECT id FROM claims INDEXED BY claims_subject_accepted_index
+    WHERE subject=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1";
+
 fn latest_claim_id_tx(transaction: &Transaction<'_>, subject: &str) -> Result<Option<String>> {
     transaction
         .query_row(
-            &canonical_sql(
-                "SELECT id FROM claims WHERE subject=?1 ORDER BY CANONICAL_DESC(claims) LIMIT 1",
-            ),
+            &canonical_sql(LATEST_CLAIM_QUERY),
             [subject],
             |row| row.get(0),
         )
@@ -22101,95 +22143,6 @@ fn operational_annotation(
     })
 }
 
-fn canonical_hash(value: &impl Serialize) -> Result<String> {
-    let mut bytes = Vec::new();
-    ciborium::into_writer(value, &mut bytes)?;
-    Ok(hex::encode(Sha256::digest(bytes)))
-}
-
-fn batch_header_hash(
-    origin: &str,
-    sequence: u64,
-    previous_hash: Option<&str>,
-    accepted_at_unix_ms: u128,
-) -> Result<String> {
-    canonical_hash(&(
-        "st3.replica-batch.v1",
-        origin,
-        sequence,
-        previous_hash,
-        accepted_at_unix_ms.to_string(),
-    ))
-}
-
-fn claim_hash(
-    batch_id: &str,
-    subject: &str,
-    kind: &str,
-    origin: &str,
-    actor: Option<&str>,
-    body: &Value,
-    predecessors: &[String],
-) -> Result<String> {
-    let body = canonical_json_value(body);
-    canonical_hash(&(batch_id, subject, kind, origin, actor, body, predecessors))
-}
-
-/// Whether a replicated claim's ID is the hash of its content. On 2026-09-16, builds between
-/// eaec66a and 2537978d hashed each body in field insertion order: a new dependency switched
-/// serde_json to `preserve_order` before claim hashes sorted object keys. Those claims are
-/// genuine, so a node that verifies them later accepts that hash too. Bodies still decode with
-/// `preserve_order`, so the writer's field order survives to reproduce it.
-fn claim_id_is_content_hash(claim: &ClaimRecord) -> Result<bool> {
-    let canonical = claim_hash(
-        &claim.batch_id,
-        &claim.subject,
-        &claim.kind,
-        &claim.origin,
-        claim.actor.as_deref(),
-        &claim.body,
-        &claim.predecessors,
-    )?;
-    if canonical == claim.id {
-        return Ok(true);
-    }
-    let insertion_order = canonical_hash(&(
-        &claim.batch_id,
-        &claim.subject,
-        &claim.kind,
-        &claim.origin,
-        claim.actor.as_deref(),
-        &claim.body,
-        &claim.predecessors,
-    ))?;
-    Ok(insertion_order == claim.id)
-}
-
-fn canonical_json_value(value: &Value) -> Value {
-    match value {
-        Value::Array(values) => Value::Array(values.iter().map(canonical_json_value).collect()),
-        Value::Object(fields) => {
-            let mut fields = fields.iter().collect::<Vec<_>>();
-            fields.sort_unstable_by_key(|(left, _)| *left);
-            Value::Object(
-                fields
-                    .into_iter()
-                    .map(|(key, value)| (key.clone(), canonical_json_value(value)))
-                    .collect(),
-            )
-        }
-        _ => value.clone(),
-    }
-}
-
-fn canonical_json_text(value: &Value) -> Result<String> {
-    Ok(serde_json::to_string(&canonical_json_value(value))?)
-}
-
-fn canonical_serialized_json_text(value: &impl Serialize) -> Result<String> {
-    canonical_json_text(&serde_json::to_value(value)?)
-}
-
 /// How long a mission whose run failed or was cancelled stays in the current missions view.
 pub(crate) const RECENTLY_ENDED_MS: u128 = 24 * 60 * 60 * 1000;
 
@@ -22245,10 +22198,6 @@ fn validate_mission_run_timeout(mission: &MissionSpec, mode: &str) -> Result<(),
         ));
     }
     Ok(())
-}
-
-fn internal(error: impl std::fmt::Display) -> St3Error {
-    St3Error::new("internal", error.to_string())
 }
 
 fn claim_append_error(error: anyhow::Error) -> St3Error {
@@ -24555,36 +24504,6 @@ fn seed_replica_envelopes_tx(
     Ok(())
 }
 
-fn replica_envelope_hash(
-    writer: &str,
-    sequence: u64,
-    previous_hash: Option<&str>,
-    accepted_at_unix_ms: u128,
-    payload: &[u8],
-) -> String {
-    let mut digest = Sha256::new();
-    digest.update(b"st3-replica-envelope-v1\0");
-    for field in [
-        writer.to_owned(),
-        sequence.to_string(),
-        previous_hash.unwrap_or_default().to_owned(),
-        accepted_at_unix_ms.to_string(),
-        hex::encode(Sha256::digest(payload)),
-    ] {
-        digest.update((field.len() as u64).to_be_bytes());
-        digest.update(field.as_bytes());
-    }
-    hex::encode(digest.finalize())
-}
-
-fn replica_record_ref(writer: &str, sequence: u64, envelope_hash: &str, position: u64) -> String {
-    let digest = Sha256::digest(
-        format!("st3-replica-record-v1\0{writer}\0{sequence}\0{envelope_hash}\0{position}")
-            .as_bytes(),
-    );
-    format!("record/{}", hex::encode(digest))
-}
-
 #[cfg(test)]
 fn full_replication_inventory_rows(
     connection: &Connection,
@@ -26552,29 +26471,6 @@ fn validate_and_admit_envelope_tx(
     Ok(())
 }
 
-fn verify_replica_batch_header(batch: &ReplicaBatch) -> Result<(), St3Error> {
-    let expected_batch = batch_header_hash(
-        &batch.origin,
-        batch.replica_sequence,
-        batch.previous_hash.as_deref(),
-        batch.accepted_at_unix_ms,
-    )
-    .map_err(internal)?;
-    if expected_batch != batch.hash
-        || batch.id
-            != format!(
-                "batch/{}/{}/{}",
-                batch.origin, batch.replica_sequence, batch.hash
-            )
-    {
-        return Err(St3Error::new(
-            "batch-hash-mismatch",
-            format!("replicated batch `{}` failed verification", batch.id),
-        ));
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 fn validate_replicated_claim(
     transaction: &Connection,
@@ -26788,6 +26684,20 @@ fn generation_run_tx(
     if let Some(run) = created {
         return Ok(Some(run.trim_start_matches("mission-run/").to_owned()));
     }
+    let asked = transaction
+        .query_row(
+            &canonical_sql("SELECT json_extract(body, '$.fields.run') FROM claims
+             WHERE kind='work.person-asked' AND json_extract(body, '$.fields.generation')=?1
+             ORDER BY CANONICAL_ASC(claims) LIMIT 1"),
+            [&subject],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .map_err(internal)?
+        .flatten();
+    if let Some(run) = asked {
+        return Ok(Some(run.trim_start_matches("mission-run/").to_owned()));
+    }
     // A run's first generation is named by the claim that creates the run.
     Ok(transaction
         .query_row(
@@ -26869,6 +26779,20 @@ fn run_tree_of_tx(
         .optional()
         .map_err(internal)?
         .flatten();
+    let root = match root {
+        Some(root) => Some(root),
+        None => transaction
+            .query_row(
+                &canonical_sql("SELECT json_extract(body, '$.fields.owner_run') FROM claims
+                 WHERE kind='work.person-asked' AND json_extract(body, '$.fields.run')=?1
+                 ORDER BY CANONICAL_ASC(claims) LIMIT 1"),
+                [format!("mission-run/{run}")],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(internal)?
+            .flatten(),
+    };
     Ok(Some(
         root.map(|root| root.trim_start_matches("mission-run/").to_owned())
             .unwrap_or(run),
@@ -26969,6 +26893,15 @@ fn rebuild_run_tree_tx(transaction: &Transaction<'_>, root: &str) -> Result<(), 
         .into_iter()
         .map(|run| run.trim_start_matches("mission-run/").to_owned()),
     );
+    runs.extend(
+        strings(
+            "SELECT json_extract(body, '$.fields.run') FROM claims
+             WHERE kind='work.person-asked' AND json_extract(body, '$.fields.owner_run')=?1",
+            &format!("mission-run/{root}"),
+        )?
+        .into_iter()
+        .map(|run| run.trim_start_matches("mission-run/").to_owned()),
+    );
     let mut generations = BTreeSet::new();
     let mut proposals = BTreeSet::new();
     for run in &runs {
@@ -26986,6 +26919,11 @@ fn rebuild_run_tree_tx(transaction: &Transaction<'_>, root: &str) -> Result<(), 
         .chain(strings(
             "SELECT json_extract(body, '$.fields.current_generation') FROM claims
              WHERE subject=?1 AND kind='mission-run.created'",
+            &subject,
+        )?)
+        .chain(strings(
+            "SELECT json_extract(body, '$.fields.generation') FROM claims
+             WHERE kind='work.person-asked' AND json_extract(body, '$.fields.run')=?1",
             &subject,
         )?) {
             generations.insert(generation.trim_start_matches("run-generation/").to_owned());
@@ -27224,6 +27162,9 @@ fn try_project_simple_replication_tx(
             && !matches!(
                 claim.kind.as_str(),
                 "intent.desired"
+                    | "work.person-asked"
+                    | "work.person-done"
+                    | "work.person-cancelled"
                     | "doc.bound"
                     | "mission.published"
                     | "mission-run.created"
@@ -27255,6 +27196,16 @@ fn try_project_simple_replication_tx(
                 "{reason}: {} from {}",
                 claim.kind, claim.origin
             )));
+        }
+        // Person asks add steps (and sometimes a whole run) in their own claim. Their response
+        // also resumes an originating step. Rebuild the affected tree so a response received
+        // before its ask, or a later local update, has the same result as canonical replay.
+        if matches!(
+            claim.kind.as_str(),
+            "work.person-asked" | "work.person-done" | "work.person-cancelled"
+        ) && let Some(aggregate) = aggregate_of_tx(transaction, claim)?
+        {
+            dirty.insert(aggregate);
         }
         if !Store::simple_replication_kind(&claim.kind) {
             let key = canonical::claim_key(transaction, &claim.id).map_err(internal)?;
@@ -33643,46 +33594,6 @@ mod tests {
     }
 
     #[test]
-    fn claim_hash_does_not_depend_on_json_object_insertion_order() {
-        let mut left_fields = serde_json::Map::new();
-        left_fields.insert("status".into(), Value::String("running".into()));
-        left_fields.insert("pid".into(), Value::Number(42.into()));
-        let mut left = serde_json::Map::new();
-        left.insert("fields".into(), Value::Object(left_fields));
-        left.insert("evidence".into(), Value::Array(Vec::new()));
-
-        let mut right_fields = serde_json::Map::new();
-        right_fields.insert("pid".into(), Value::Number(42.into()));
-        right_fields.insert("status".into(), Value::String("running".into()));
-        let mut right = serde_json::Map::new();
-        right.insert("evidence".into(), Value::Array(Vec::new()));
-        right.insert("fields".into(), Value::Object(right_fields));
-
-        let left = claim_hash(
-            "batch/node/1/hash",
-            "daemon/node",
-            "daemon.started",
-            "node",
-            None,
-            &Value::Object(left),
-            &[],
-        )
-        .expect("left claim hash");
-        let right = claim_hash(
-            "batch/node/1/hash",
-            "daemon/node",
-            "daemon.started",
-            "node",
-            None,
-            &Value::Object(right),
-            &[],
-        )
-        .expect("right claim hash");
-
-        assert_eq!(left, right);
-    }
-
-    #[test]
     fn desired_revision_does_not_depend_on_json_object_insertion_order() {
         let mut left_value = serde_json::Map::new();
         left_value.insert("workspace".into(), Value::String("/workspace".into()));
@@ -39818,6 +39729,64 @@ mission "proposal-replay" state="ready" revisions="human-only" revision-reviewer
     }
 
     #[test]
+    fn only_the_person_recipient_can_read_before_native_delivery() {
+        let store = Store::open_memory("person-read").unwrap();
+        for (id, to) in [
+            ("sent", "person/avery"),
+            ("staged", "person/avery"),
+            ("native", "agent/example/keeper"),
+        ] {
+            let subject = format!("message/{id}");
+            store
+                .append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: "message.sent".into(),
+                    actor: Some("agent/example/sender".into()),
+                    fields: BTreeMap::from([
+                        ("status".into(), Value::String("sent".into())),
+                        ("from".into(), Value::String("agent/example/sender".into())),
+                        ("to".into(), Value::String(to.into())),
+                    ]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+                .unwrap();
+            let receipt = |actor: &str, status: &str| {
+                store.append_claim(&ClaimInput {
+                    subject: subject.clone(),
+                    kind: format!("message.{status}"),
+                    actor: Some(actor.into()),
+                    fields: BTreeMap::from([("status".into(), Value::String(status.into()))]),
+                    evidence: vec![],
+                    expected_subject: None,
+                    idempotency_key: None,
+                })
+            };
+            for actor in ["person/other", "agent/example/sender"] {
+                assert_eq!(
+                    receipt(actor, "read").unwrap_err().code,
+                    "invalid-message-transition"
+                );
+                assert_eq!(store.message(&subject).unwrap().unwrap().status, "sent");
+            }
+            if id == "native" {
+                assert_eq!(
+                    receipt(to, "read").unwrap_err().code,
+                    "invalid-message-transition"
+                );
+                continue;
+            }
+            if id == "staged" {
+                receipt(to, "staged").unwrap();
+            }
+            let first = receipt(to, "read").unwrap();
+            assert_eq!(receipt(to, "read").unwrap().id, first.id);
+            assert_eq!(store.message(&subject).unwrap().unwrap().status, "read");
+        }
+    }
+
+    #[test]
     fn native_mailbox_pages_use_exact_recipient_and_stable_created_cursors() {
         let store = Store::open_memory("node").unwrap();
         for (id, to) in [
@@ -40282,6 +40251,62 @@ version 2
         assert!(
             plan.contains("replica_records_claim"),
             "the projection query must use the claim position index:\n{plan}"
+        );
+    }
+
+    #[test]
+    fn latest_predecessor_seeks_the_newest_time_block_and_preserves_ties() {
+        let store = Store::open_memory("alder").unwrap();
+        let mut connection = store.connection.write();
+        let transaction = connection.transaction().unwrap();
+        let mut expected = Vec::new();
+        // Arrival order and claim ID deliberately disagree with canonical time and position.
+        for (id, time, writer, sequence, batch) in [
+            ("old", "99", "z", 9, "old-batch"),
+            ("z-first", "100", "a", 1, "a-batch"),
+            ("a-second", "100", "a", 1, "a-batch"),
+            ("sequence", "100", "a", 2, "a-later"),
+            ("writer", "100", "b", 1, "b-batch"),
+            ("batch", "100", "b", 1, "z-batch"),
+            ("late-arrival-old-time", "99", "z", 10, "older-time"),
+        ] {
+            transaction.execute(
+                "INSERT OR IGNORE INTO batches(id,origin,replica_sequence,hash,accepted_at_unix_ms)
+                 VALUES(?1,?2,?3,?1,?4)", params![batch, writer, sequence, time],
+            ).unwrap();
+            transaction.execute(
+                "INSERT INTO claims(id,batch_id,subject,kind,origin,body,predecessors,accepted_at_unix_ms)
+                 VALUES(?1,?2,'daemon/alder','daemon.diagnostic',?3,'{}','[]',?4)",
+                params![id, batch, writer, time],
+            ).unwrap();
+            expected.push(canonical::claim_key(&transaction, id).unwrap());
+            assert_eq!(
+                latest_claim_id_tx(&transaction, "daemon/alder").unwrap(),
+                expected.iter().max().map(|key| key.5.clone())
+            );
+        }
+        assert_eq!(
+            latest_claim_id_tx(&transaction, "daemon/missing").unwrap(),
+            None
+        );
+        let plan = transaction
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {}",
+                canonical_sql(LATEST_CLAIM_QUERY)
+            ))
+            .unwrap()
+            .query_map(["daemon/alder"], |row| row.get::<_, String>(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+            .join("\n");
+        assert!(
+            plan.contains("claims_subject_accepted_index (subject=?)"),
+            "{plan}"
+        );
+        assert!(
+            !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "history must not be sorted: {plan}"
         );
     }
 
