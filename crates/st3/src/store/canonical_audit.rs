@@ -48,7 +48,7 @@ fn every_persistent_table_has_a_projection_scope() {
         "local_observations",
         "local_blobs",
         "local_subscription_mission_deferrals",
-        "local_usage_totals",
+        "local_usage_spend",
         "local_usage_seen",
         "local_latest_slots",
         "graph_generation",

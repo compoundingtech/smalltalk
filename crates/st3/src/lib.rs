@@ -24,6 +24,7 @@ pub mod mission;
 pub mod model;
 pub mod otlp;
 pub mod peer;
+pub mod pricing;
 pub use smallclaims::{performance, profile};
 pub mod projection;
 pub mod reconcile;

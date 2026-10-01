@@ -2020,8 +2020,40 @@ struct NowArgs {
 enum UsageBy {
     Agent,
     Mission,
+    Step,
     Model,
+    Account,
     Host,
+}
+
+impl UsageBy {
+    const ALL: [Self; 6] = [
+        Self::Agent,
+        Self::Mission,
+        Self::Step,
+        Self::Model,
+        Self::Account,
+        Self::Host,
+    ];
+
+    /// The report row field this grouping reads.
+    fn field(self) -> &'static str {
+        match self {
+            Self::Agent => "agent",
+            Self::Mission => "mission_run",
+            Self::Step => "step",
+            Self::Model => "model",
+            Self::Account => "account",
+            Self::Host => "host",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Mission => "mission",
+            other => other.field(),
+        }
+    }
 }
 
 #[derive(Args)]
@@ -2029,7 +2061,7 @@ struct UsageArgs {
     /// Length of the period ending now.
     #[arg(long, default_value_t = 24)]
     hours: u64,
-    /// Show only this grouping; the default shows all four.
+    /// Show only this grouping; the default shows them all.
     #[arg(long, value_enum)]
     by: Option<UsageBy>,
 }
@@ -6609,67 +6641,88 @@ async fn run_usage(client: &Client, args: UsageArgs, json_output: bool) -> Resul
 fn render_usage_report(report: &Value, hours: u64, only: Option<UsageBy>) -> String {
     use std::fmt::Write as _;
 
+    const COLUMNS: [&str; 7] = [
+        "cost_microusd",
+        "total_tokens",
+        "input_tokens",
+        "output_tokens",
+        "cache_write_tokens",
+        "cached_tokens",
+        "unpriced_tokens",
+    ];
+    let rows = report["rows"].as_array().map(Vec::as_slice).unwrap_or(&[]);
+    let sum = |rows: &mut dyn Iterator<Item = &Value>| {
+        let mut values = [0_u64; COLUMNS.len()];
+        for row in rows {
+            for (value, field) in values.iter_mut().zip(COLUMNS) {
+                *value = value.saturating_add(row[field].as_u64().unwrap_or(0));
+            }
+        }
+        values
+    };
+    // Cost is API-equivalent: what the tokens would cost at list price. A trailing `+` marks a
+    // figure that leaves out tokens on models without a price.
+    let dollars = |values: &[u64; COLUMNS.len()]| {
+        format!(
+            "${:.2}{}",
+            values[0] as f64 / 1_000_000.0,
+            if values[6] > 0 { "+" } else { "" }
+        )
+    };
     let mut output = String::new();
-    let groups = only.map(|by| vec![by]).unwrap_or_else(|| {
-        vec![
-            UsageBy::Agent,
-            UsageBy::Mission,
-            UsageBy::Model,
-            UsageBy::Host,
-        ]
-    });
+    let total = sum(&mut rows.iter());
+    let _ = writeln!(
+        output,
+        "SPEND  {} · {} tokens · {hours}h · API-equivalent",
+        dollars(&total),
+        total[1]
+    );
+    if total[6] > 0 {
+        let _ = writeln!(
+            output,
+            "UNPRICED  {} tokens on models without a price",
+            total[6]
+        );
+    }
+    let groups = only
+        .map(|by| vec![by])
+        .unwrap_or_else(|| UsageBy::ALL.to_vec());
     for by in groups {
-        let mut totals = BTreeMap::<String, [u64; 5]>::new();
-        for row in report["rows"].as_array().into_iter().flatten() {
-            let dimension = match by {
-                UsageBy::Agent => "agent",
-                UsageBy::Mission => "mission_run",
-                UsageBy::Model => "model",
-                UsageBy::Host => "host",
-            };
-            let label = row[dimension]
+        let mut totals = BTreeMap::<String, Vec<&Value>>::new();
+        for row in rows {
+            let label = row[by.field()]
                 .as_str()
                 .filter(|value| !value.is_empty())
                 .unwrap_or("unknown");
-            let entry = totals.entry(label.to_owned()).or_default();
-            for (index, field) in [
-                "total_tokens",
-                "input_tokens",
-                "output_tokens",
-                "cache_write_tokens",
-                "cached_tokens",
-            ]
-            .iter()
-            .enumerate()
-            {
-                entry[index] = entry[index].saturating_add(row[*field].as_u64().unwrap_or(0));
-            }
+            totals.entry(label.to_owned()).or_default().push(row);
         }
-        let mut totals = totals.into_iter().collect::<Vec<_>>();
+        let mut totals = totals
+            .into_iter()
+            .map(|(name, rows)| (name, sum(&mut rows.into_iter())))
+            .collect::<Vec<_>>();
         totals.sort_by(|left, right| {
             right.1[0]
                 .cmp(&left.1[0])
+                .then_with(|| right.1[1].cmp(&left.1[1]))
                 .then_with(|| left.0.cmp(&right.0))
         });
-        let by = match by {
-            UsageBy::Agent => "agent",
-            UsageBy::Mission => "mission",
-            UsageBy::Model => "model",
-            UsageBy::Host => "host",
-        };
-        if !output.is_empty() {
-            output.push('\n');
-        }
+        let by = by.label();
+        output.push('\n');
         let _ = writeln!(output, "USAGE  {} · {}h · by {by}", totals.len(), hours);
         let _ = writeln!(
             output,
-            "TOTAL  INPUT  OUTPUT  CACHE WRITE  CACHE READ  {by}"
+            "COST  TOTAL  INPUT  OUTPUT  CACHE WRITE  CACHE READ  {by}"
         );
         for (name, values) in totals {
             let _ = writeln!(
                 output,
-                "{}  {}  {}  {}  {}  {name}",
-                values[0], values[1], values[2], values[3], values[4]
+                "{}  {}  {}  {}  {}  {}  {name}",
+                dollars(&values),
+                values[1],
+                values[2],
+                values[3],
+                values[4],
+                values[5]
             );
         }
     }
@@ -14504,12 +14557,19 @@ async fn drive_codex_native(
                         &mut last_usage_fingerprint,
                     )
                     .await?;
+                    // The Codex runtime stamps its timeline with its own incarnation, which
+                    // outlives st's runtime incarnation when a resident Codex is adopted.
+                    let codex_incarnation = st_drivers::codex_app_server::current_runtime_incarnation(
+                        &state_dir,
+                        &identity,
+                        &runtime_id,
+                    );
                     publish_harness_timeline(
                         client,
                         subject,
                         "codex",
                         &incarnation,
-                        Some(&incarnation),
+                        codex_incarnation.as_deref(),
                         &agent_dir,
                         &mut loop_state.published_timeline,
                     )
@@ -15982,21 +16042,34 @@ mod tests {
     }
 
     #[test]
-    fn usage_report_ranks_each_fleet_group_by_spend() {
+    fn usage_report_ranks_each_group_by_cost_and_marks_unpriced_tokens() {
         let report = json!({"rows": [
-            {"agent":"agent/small","mission_run":"mission-run/one","model":"model-a","host":"host/a","total_tokens":9,"input_tokens":2,"output_tokens":1,"cache_write_tokens":0,"cached_tokens":6},
-            {"agent":"agent/large","mission_run":"mission-run/two","model":"model-b","host":"host/b","total_tokens":30,"input_tokens":5,"output_tokens":2,"cache_write_tokens":3,"cached_tokens":20},
-            {"agent":"agent/large","mission_run":"mission-run/two","model":"model-b","host":"host/b","total_tokens":10,"input_tokens":2,"output_tokens":1,"cache_write_tokens":1,"cached_tokens":6},
+            {"agent":"agent/cheap","mission_run":"mission-run/one","step":"step-run/one/build","model":"model-a","account":"claude/aaaa","host":"host/a","cost_microusd":250000,"total_tokens":900,"input_tokens":200,"output_tokens":100,"cache_write_tokens":0,"cached_tokens":600,"unpriced_tokens":0},
+            {"agent":"agent/dear","mission_run":"mission-run/two","step":"step-run/two/review","model":"model-b","account":"claude/bbbb","host":"host/b","cost_microusd":3000000,"total_tokens":30,"input_tokens":5,"output_tokens":2,"cache_write_tokens":3,"cached_tokens":20,"unpriced_tokens":0},
+            {"agent":"agent/dear","mission_run":"mission-run/two","step":"step-run/two/review","model":"model-b","account":"claude/bbbb","host":"host/b","cost_microusd":1000000,"total_tokens":10,"input_tokens":2,"output_tokens":1,"cache_write_tokens":1,"cached_tokens":6,"unpriced_tokens":0},
+            {"agent":"agent/local","mission_run":"","step":"","model":"model-local","account":"","host":"host/a","cost_microusd":0,"total_tokens":50,"input_tokens":50,"output_tokens":0,"cache_write_tokens":0,"cached_tokens":0,"unpriced_tokens":50},
         ]});
         let output = render_usage_report(&report, 24, None);
-        assert_eq!(output.matches("USAGE  ").count(), 4);
+        assert_eq!(output.matches("USAGE  ").count(), 6);
         assert!(
-            output.find("40  7  3  4  26  agent/large").unwrap()
-                < output.find("9  2  1  0  6  agent/small").unwrap()
+            output.starts_with("SPEND  $4.25+ · 990 tokens · 24h · API-equivalent\n"),
+            "{output}"
         );
-        assert!(output.contains("40  7  3  4  26  mission-run/two"));
-        assert!(output.contains("40  7  3  4  26  model-b"));
-        assert!(output.contains("40  7  3  4  26  host/b"));
+        assert!(output.contains("UNPRICED  50 tokens on models without a price"));
+        // Cost ranks, not tokens: the dear agent spent fewer tokens on a pricier model.
+        assert!(
+            output.find("$4.00  40  7  3  4  26  agent/dear").unwrap()
+                < output
+                    .find("$0.25  900  200  100  0  600  agent/cheap")
+                    .unwrap()
+        );
+        assert!(output.contains("$0.00+  50  50  0  0  0  agent/local"));
+        assert!(output.contains("$4.00  40  7  3  4  26  step-run/two/review"));
+        assert!(output.contains("$4.00  40  7  3  4  26  claude/bbbb"));
+        assert!(output.contains("$0.00+  50  50  0  0  0  unknown"));
+        let by_step = render_usage_report(&report, 24, Some(UsageBy::Step));
+        assert_eq!(by_step.matches("USAGE  ").count(), 1);
+        assert!(by_step.contains("by step"));
     }
 
     #[test]
