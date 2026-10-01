@@ -2059,9 +2059,20 @@ struct DevicesArgs {
 #[derive(Subcommand)]
 enum SubjectCommand {
     /// Show one typed subject card.
-    Show(InspectArgs),
+    Show(SubjectShowArgs),
     /// Show bounded immutable history for one subject.
     History(TraceArgs),
+}
+
+#[derive(Args)]
+struct SubjectShowArgs {
+    subject: String,
+    /// Print the current managed agent declaration as canonical KDL v2.
+    #[arg(long)]
+    kdl: bool,
+    /// Include literal environment values in the KDL output.
+    #[arg(long, requires = "kdl")]
+    show_env_values: bool,
 }
 
 #[derive(Subcommand)]
@@ -6629,7 +6640,36 @@ async fn follow_conversation(
 
 async fn run_subject(client: &Client, command: SubjectCommand, json_output: bool) -> Result<()> {
     match command {
-        SubjectCommand::Show(args) => run_inspect(client, args, json_output).await,
+        SubjectCommand::Show(args) => {
+            if args.kdl {
+                anyhow::ensure!(
+                    args.subject.starts_with("agent/"),
+                    "--kdl is supported for managed agents only"
+                );
+                let status = status_for(client, &args.subject).await?;
+                let mut desired = status
+                    .subjects
+                    .iter()
+                    .find(|subject| subject.subject == args.subject)
+                    .and_then(|subject| subject.desired.as_ref())
+                    .cloned()
+                    .context("No managed declaration")?;
+                if !args.show_env_values {
+                    st3::graph::redact_agent_env_values(&mut desired);
+                }
+                print!("{}", st3::graph::render_agent_desired_kdl(&desired)?);
+                Ok(())
+            } else {
+                run_inspect(
+                    client,
+                    InspectArgs {
+                        subject: args.subject,
+                    },
+                    json_output,
+                )
+                .await
+            }
+        }
         SubjectCommand::History(args) => run_trace(client, args, json_output).await,
     }
 }

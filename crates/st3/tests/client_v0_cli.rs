@@ -92,6 +92,76 @@ fn value(output: &Output) -> Value {
     })
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_declaration_cli_redacts_environment_unless_explicitly_requested() {
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("st3.sock");
+    let state = test_state(root.path());
+    let source = "version 2\nagent \"read/test\" { workspace \"/tmp\"; command \"true\"; env { API_TOKEN \"private-value\" } }";
+    let intent = st3::graph::parse_intent(source, "client-v0-cli").unwrap();
+    let planned = state
+        .store
+        .mission(
+            &intent,
+            IntentInput {
+                kdl: source.into(),
+                source_name: None,
+            },
+        )
+        .unwrap();
+    assert!(planned.blockers.is_empty(), "{:?}", planned.blockers);
+    state
+        .store
+        .apply(&intent, &planned.subject_tokens, source)
+        .unwrap();
+    let server_socket = socket.clone();
+    let server =
+        tokio::spawn(
+            async move { st3::api::serve_unix(&server_socket, st3::api::router(state)).await },
+        );
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    }
+    assert!(socket.exists());
+    for show_values in [false, true] {
+        let mut args = vec!["subject", "show", "agent/read/test", "--kdl"];
+        if show_values {
+            args.push("--show-env-values");
+        }
+        let output = run_cli_human(&socket, &args).await;
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let kdl = String::from_utf8(output.stdout).unwrap();
+        let parsed = st3::graph::parse_intent(&kdl, "client-v0-cli").unwrap();
+        let desired = &parsed.subjects["agent/read/test"].desired;
+        let env = desired["children"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|node| node["name"] == "env")
+            .unwrap();
+        assert_eq!(env["children"][0]["name"], "API_TOKEN");
+        assert_eq!(
+            env["children"][0]["arguments"][0],
+            if show_values {
+                "private-value"
+            } else {
+                "<redacted>"
+            }
+        );
+        if !show_values {
+            assert!(!kdl.contains("private-value"), "{kdl}");
+        }
+    }
+    server.abort();
+}
+
 #[test]
 fn service_permissions_honors_global_json_flag() {
     let output = std::process::Command::new(assert_cmd::cargo::cargo_bin!("st3"))
