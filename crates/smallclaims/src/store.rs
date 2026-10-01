@@ -3856,7 +3856,13 @@ impl Store {
 
     /// Append a claim this node writes, through the runtime that knows its kind.
     pub fn append_claim(&self, input: &ClaimInput) -> Result<ClaimRecord, St3Error> {
-        self.runtime.append_claim(self, input).map(|(claim, _)| claim)
+        self.append_claim_outcome(input).map(|(claim, _)| claim)
+    }
+
+    /// Append a claim this node writes, and say whether it is new rather than an idempotent
+    /// repeat. Every local write from a client's input comes through here.
+    pub fn append_claim_outcome(&self, input: &ClaimInput) -> Result<(ClaimRecord, bool), St3Error> {
+        self.runtime.append_claim(self, input)
     }
 
     pub fn read_snapshot<T>(&self, read: impl FnOnce(u64) -> Result<T>) -> Result<T> {

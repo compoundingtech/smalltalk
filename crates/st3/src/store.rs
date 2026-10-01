@@ -7509,7 +7509,7 @@ impl Store {
         &self,
         input: &ClaimInput,
     ) -> Result<(ClaimRecord, bool), St3Error> {
-        self.append_claim_fenced_outcome(input, None)
+        self.graph.append_claim_outcome(input)
     }
 
     pub(crate) fn append_mailbox_receipt(
