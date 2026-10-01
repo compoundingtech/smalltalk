@@ -24,6 +24,18 @@ its own digest so a mismatch names the source. Local receipt metadata, physical 
 lease overlays and live reachability are excluded explicitly. Retained history and checkpoint
 tombstones represent the same logical source identity.
 
+Uploaded bytes in `local_blobs` are staged locally until a durable claim references them.
+Claim admission promotes those bytes into `blobs` in the claim's transaction; every column of
+`blobs` remains in the shared digest. Unreferenced uploads never enter envelopes and cannot be
+compared as shared authority. On upgrade, retained claim references, document bindings and valid
+received blob records identify existing shared bytes. Other bytes move to local staging without
+being deleted. If checkpoint tombstones already removed historical references, the upgrade
+conservatively keeps all existing shared blobs.
+
+A keyed worker signs batches beyond its last processed batch, including envelopes another
+unkeyed process already sealed at startup. Signature requests recover missing signatures after
+an upgrade. Equal envelope inventories alone cannot prove equal claim admission.
+
 `store::tests::canonical_audit::every_shared_projection_agrees_after_shuffle_restart_and_checkpoint`
 checks both invariants by comparing shared rows, selected readers and per-table digest oracles
 across isolated stores. `shared_folds_never_order_by_local_arrival` rejects raw shared arrival
@@ -61,6 +73,14 @@ payloads and ordering metadata. This covers the sources of on-demand views such 
 subscriptions, fleet membership, usage, observer/fault episodes, and attention. A timed view's
 answer must still be tested at the same explicit time and recipients. Host-local liveness,
 leases, receipts, cursors, secrets and notification bookkeeping stay outside shared digests.
+
+A repaired original is no longer an admitted projection source. One member may retain its
+old claim row while another rejected it before admission; both exclude it from claim-source
+and operation projections. The original wire bytes remain committed by authenticated envelope
+inventory, and the repair and replacement remain shared claim sources. A local
+`projection_digest_repaired_claims` cache retains the exclusion after receipt cleanup; repair
+record updates and cached source digests commit or roll back together. Registry version 5
+backfills existing repairs once, and operation rules version 2 rebuilds older operation rows.
 
 Operations are logical rows over the hot operation table and operation facts retained in
 checkpoint tombstones. Trimming a claim changes its storage representation, preserving its
