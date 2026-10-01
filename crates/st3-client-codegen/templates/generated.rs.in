@@ -1949,16 +1949,16 @@ pub struct TerminalScreen {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum GlassLayout {
-    Pane { pane: String },
+    Group { tabs: Vec<GlassTab> },
     Split { split: GlassSplit, children: [Box<GlassLayout>; 2] },
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(rename_all="lowercase")]
 pub enum GlassSplit { Right, Below }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct GlassTab { #[serde(skip_serializing_if="Option::is_none")] pub title: Option<String>, pub layout: GlassLayout }
+pub struct GlassTab { #[serde(skip_serializing_if="Option::is_none")] pub title: Option<String>, pub pane: String }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct GlassBody { pub name: String, pub tabs: Vec<GlassTab> }
+pub struct GlassBody { pub name: String, pub layout: GlassLayout }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Glass {
     #[serde(flatten)] pub header: ResourceHeader,

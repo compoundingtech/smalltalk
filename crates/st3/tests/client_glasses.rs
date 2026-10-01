@@ -65,7 +65,7 @@ async fn glasses_routes_enforce_owner_and_mutation_contract_and_hide_raw_history
     let app = st3::api::router(state.clone());
     let id = "019a0000-0000-7000-8000-000000000001";
     let path = format!("/v1/client/glasses/{id}");
-    let body = json!({"name":"Main workspace", "tabs":[{"title":"Home","layout":{"pane":"home:"}},{"layout":{"split":"right","children":[{"pane":"agent:opaque"},{"pane":"mission:opaque"}]}}]});
+    let body = json!({"name":"Main workspace", "layout":{"split":"right","children":[{"tabs":[{"title":"Work","pane":"agent:opaque"},{"pane":"mission:opaque"}]},{"tabs":[]}]}});
     for person in [None, Some("agent/worker")] {
         assert_eq!(
             request(
@@ -128,7 +128,7 @@ async fn glasses_routes_enforce_owner_and_mutation_contract_and_hide_raw_history
     )
     .await;
     assert_eq!(retry["value"]["revision"], revision);
-    let (conflict_status,conflict)=request(app.clone(),"PUT",&path,Some("person/ada"),Some("create"),json!({"body":{"name":"Changed retry","tabs":[{"layout":{"pane":"home:"}}]},"base_revision":null})).await;
+    let (conflict_status,conflict)=request(app.clone(),"PUT",&path,Some("person/ada"),Some("create"),json!({"body":{"name":"Changed retry","layout":{"tabs":[{"pane":"home:"}]}},"base_revision":null})).await;
     assert_eq!(conflict_status, StatusCode::CONFLICT);
     assert_eq!(conflict["code"], "idempotency-conflict");
     assert_eq!(
@@ -219,7 +219,7 @@ async fn glasses_routes_enforce_owner_and_mutation_contract_and_hide_raw_history
             .iter()
             .any(|c| c["id"] == "glasses" && c["state"] == "granted")
     );
-    let empty_body = json!({"name":"Home only","tabs":[]});
+    let empty_body = json!({"name":"Home only","layout":{"tabs":[]}});
     let (empty_status, empty) = request(
         app.clone(),
         "PUT",
@@ -317,12 +317,12 @@ async fn glasses_rust_client_and_collection_stream_deliver_upserts_and_removes()
     let id = "019a0000-0000-7000-8000-000000000002";
     let body = GlassBody {
         name: "Main".into(),
-        tabs: vec![GlassTab {
-            title: None,
-            layout: GlassLayout::Pane {
-                pane: "home:".into(),
-            },
-        }],
+        layout: GlassLayout::Group {
+            tabs: vec![GlassTab {
+                title: None,
+                pane: "opaque:first".into(),
+            }],
+        },
     };
     let created = client
         .put_glass(
@@ -408,7 +408,7 @@ async fn glasses_rust_client_and_collection_stream_deliver_upserts_and_removes()
     let id = "019a0000-0000-7000-8000-000000000003";
     let body = GlassBody {
         name: "Phone workspace".into(),
-        tabs: vec![],
+        layout: GlassLayout::Group { tabs: vec![] },
     };
     phone
         .put_glass(

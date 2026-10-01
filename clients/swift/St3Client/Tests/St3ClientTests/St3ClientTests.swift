@@ -8,11 +8,21 @@ final class St3ClientTests: XCTestCase {
         let data = try Data(contentsOf: root.appendingPathComponent("docs/st3/client-v0/fixtures/glasses.json"))
         let glass = try JSONDecoder().decode(Envelope<Glass>.self, from: data).value
         XCTAssertEqual(glass.body?.name, "Main workspace")
-        XCTAssertEqual(glass.body?.tabs.count, 2)
+        guard case .split(.right, let groups) = try XCTUnwrap(glass.body).layout,
+              case .group(let tabs) = groups[0],
+              case .split(.below, let nested) = groups[1],
+              case .group(let empty) = nested[1] else { return XCTFail("Expected nested groups") }
+        XCTAssertEqual(tabs.count, 2)
+        XCTAssertEqual(tabs[0].pane, "agent:agent/example/worker")
+        XCTAssertEqual(tabs[0].title, "Work")
+        XCTAssertTrue(empty.isEmpty)
         XCTAssertNil(glass.baseRevision)
         let encoded = try JSONEncoder().encode(GlassPut(body: try XCTUnwrap(glass.body), baseRevision: nil))
         let object = try XCTUnwrap(JSONSerialization.jsonObject(with: encoded) as? [String: Any])
         XCTAssertTrue(object["base_revision"] is NSNull)
+        let fixture = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        let value = try XCTUnwrap(fixture["value"] as? [String: Any])
+        XCTAssertEqual(object["body"] as? NSDictionary, value["body"] as? NSDictionary)
         _ = try JSONDecoder().decode(Resource.self, from: JSONEncoder().encode(glass))
     }
 

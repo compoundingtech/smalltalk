@@ -2579,8 +2579,8 @@ pub struct TerminalScreen {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(untagged)]
 pub enum GlassLayout {
-    Pane {
-        pane: String,
+    Group {
+        tabs: Vec<GlassTab>,
     },
     Split {
         split: GlassSplit,
@@ -2597,12 +2597,12 @@ pub enum GlassSplit {
 pub struct GlassTab {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
-    pub layout: GlassLayout,
+    pub pane: String,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct GlassBody {
     pub name: String,
-    pub tabs: Vec<GlassTab>,
+    pub layout: GlassLayout,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct Glass {

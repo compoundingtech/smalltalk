@@ -681,13 +681,19 @@ client's basis; `replaced_revision` records the head this member observed under 
 transaction. Both are null on a first creation. A deletion response has a null body and
 `deleted: true`; lists and detail reads show only current live glasses.
 
-The structure is `{name, tabs:[{title?, layout}]}`. A layout is `{pane: "opaque key"}` or
-`{split: "right" | "below", children: [layout, layout]}`. Pane keys convey no authority. No
-focus, scroll, selection, ratios, or last-used glass is stored. Empty `tabs: []` is valid:
-clients supply their implicit Home locally. Names and pane keys must be nonempty; splits have
-exactly two children, and no unknown structure fields are accepted.
-The daemon advertises limits: 65,536 bytes of compact UTF-8 JSON per body, 32 layout levels,
-1,024 layout nodes across all tabs, and 100 live glasses per person. The response ceiling is
+The structure is `{name, layout}`. A layout is a leaf group
+`{tabs:[{title?, pane: "opaque key"}]}` or a binary split
+`{split: "right" | "below", children: [layout, layout]}`. Each group has its own tab strip.
+Pane keys convey no authority. Focus, the selected tab in each group, scroll, ratios, and
+last-used glass stay local. Empty groups `{tabs: []}` are valid; clients supply their implicit
+Home locally in the first group. Names and pane keys must be nonempty; splits have exactly
+two children, and no unknown structure fields are accepted.
+The daemon advertises limits: 65,536 bytes of compact UTF-8 JSON per body, 32 layout levels
+(the root is level 1), 1,024 tabs and split nodes combined across the whole tree, and 100 live
+glasses per person. Leaf group containers do not add nodes; tabs do not add layout depth.
+The previous `{name, tabs}` body is rejected. This contract changes before the glasses API's
+first deployment; no deployed-store migration is required.
+The response ceiling is
 8 MiB, allowing a complete 100-glass subscription window at these bounds.
 
 Local creation is refused when the member already sees 100 live glasses. Concurrent creates

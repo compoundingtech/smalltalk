@@ -27,3 +27,17 @@ const glassName: string | undefined = glass.body?.name;
 const machine = null as unknown as Machine;
 const machineHost: string = machine.host_id;
 void glassName; void machineHost;
+
+import type { GlassBody, GlassLayout } from './Models.generated';
+const groupedBody: GlassBody = { name: 'Main', layout: { split: 'right', children: [
+    { tabs: [{ title: 'Work', pane: 'opaque:key' }] }, { tabs: [] },
+] } };
+function tabPanes(layout: GlassLayout): string[] {
+    return 'tabs' in layout ? layout.tabs.map(tab => tab.pane) : layout.children.flatMap(tabPanes);
+}
+void tabPanes(groupedBody.layout);
+// @ts-expect-error the pre-deployment body with tabs at the root is no longer valid
+const legacyBody: GlassBody = { name: 'Old', tabs: [] };
+// @ts-expect-error panes belong to tabs, not layout leaves
+const legacyLayout: GlassLayout = { pane: 'opaque:key' };
+void legacyBody; void legacyLayout;
