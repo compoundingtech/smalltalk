@@ -52,3 +52,11 @@ const createTerminal: ActionOf<'terminal.create'> = {
 };
 void createAgent.parameters.message;
 void createTerminal.parameters.cwd;
+
+const attachTerminal: ActionOf<'terminal.attach'> = {
+    api_version: 'st3.client.v0', id: 'action/attach', type: 'terminal.attach',
+    idempotency_key: 'terminal-attach-key',
+    fence: { snapshot_id: 'snapshot/test', subject_revisions: {}, runtime_incarnation: 'runtime:one' },
+    parameters: { target_id: 'terminal/agent/example' },
+};
+void attachTerminal;
