@@ -16,7 +16,9 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest as _;
 
 #[cfg(test)]
 use crate::model::ApiResponse;
-use crate::model::{ApiErrorResponse, AttachRequest, Attachment, LocalTerminal};
+use crate::model::{
+    ApiErrorResponse, AttachRequest, Attachment, LocalTerminal, MessageSendRequest, MessageView,
+};
 
 #[derive(Clone, Debug)]
 pub enum Endpoint {
@@ -246,6 +248,32 @@ impl Client {
 
     pub async fn post<I: Serialize, O: DeserializeOwned>(&self, path: &str, body: &I) -> Result<O> {
         self.request("POST", path, Some(body)).await
+    }
+
+    /// Send a message, retrying one unanswered request with the same idempotency key
+    /// and body. Keep this request for later retries if both attempts go unconfirmed.
+    pub async fn send_message(&self, request: &MessageSendRequest) -> Result<MessageView> {
+        anyhow::ensure!(
+            !request.idempotency_key.trim().is_empty(),
+            "a message send needs a nonempty idempotency key"
+        );
+        for attempt in 0..2 {
+            match self.post("/v1/messages", request).await {
+                Ok(message) => return Ok(message),
+                Err(error) if daemon_did_not_answer(&error) => {
+                    if attempt == 0 {
+                        continue;
+                    }
+                    anyhow::bail!(
+                        "st did not answer; the message may have been sent. Retry with the same recipient, sender, body and options, and --idempotency-key {:?}. Delivery is unconfirmed: {}",
+                        request.idempotency_key,
+                        error
+                    );
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("the bounded message retry loop always returns")
     }
 
     pub async fn request<I: Serialize, O: DeserializeOwned>(
@@ -1248,6 +1276,126 @@ mod tests {
             request_deadline("/v1/internal/replication/export", deadlines),
             Duration::from_secs(120)
         );
+    }
+
+    #[tokio::test]
+    async fn message_retry_after_an_accepted_but_unanswered_send_creates_one_message() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        let store = Arc::new(crate::store::Store::open_memory("message-retry").unwrap());
+        let state = crate::api::AppState {
+            store: store.clone(),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            event_notify: tokio::sync::watch::channel(0).0,
+            node: "message-retry".into(),
+            state_dir: directory.path().into(),
+            pty_root: directory.path().join("pty"),
+            pty_binary: "pty".into(),
+            fleet_id: None,
+            configured_peers: vec![],
+            client_relay: None,
+            native_session_home: None,
+            planner_default: Default::default(),
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = crate::api::router(state).layer(axum::middleware::from_fn(
+            move |request: axum::extract::Request, next: axum::middleware::Next| {
+                let count = count.clone();
+                async move {
+                    let response = next.run(request).await;
+                    // Acceptance has committed. Lose only the first reply, as under load.
+                    if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    response
+                }
+            },
+        ));
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            crate::api::serve_unix(&server_socket, app).await.unwrap();
+        });
+        while !socket.exists() {
+            tokio::task::yield_now().await;
+        }
+        let request = MessageSendRequest {
+            idempotency_key: "message-retry-accepted-001".into(),
+            from: "person/ada".into(),
+            to: "agent/example/worker".into(),
+            content: "Hello once".into(),
+            title: Some("A greeting".into()),
+            in_reply_to: None,
+            tags: vec!["example".into()],
+        };
+        let mut client = fast_client(Endpoint::Unix(socket));
+        client.deadlines.request = Duration::from_millis(200);
+        let message = client.send_message(&request).await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        let stored = store.messages(Some("agent/example/worker"), true).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(message.subject, stored[0].subject);
+        assert_eq!(message.created_index, stored[0].created_index);
+        // A later command retaining the key receives the same durable result as well.
+        let replay = client.send_message(&request).await.unwrap();
+        assert_eq!(replay.subject, message.subject);
+        assert_eq!(replay.created_index, message.created_index);
+        assert_eq!(store.messages(None, true).unwrap().len(), 1);
+        // A reused key never silently changes the original message.
+        let mut changed = request;
+        changed.content = "A different message".into();
+        let before = calls.load(Ordering::SeqCst);
+        assert!(client.send_message(&changed).await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), before + 1);
+        assert_eq!(store.messages(None, true).unwrap().len(), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn unanswered_message_retries_are_bounded_and_report_the_reusable_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("st3.sock");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = calls.clone();
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let count = count.clone();
+                async move {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    Json(test_envelope(Value::Null))
+                }
+            }),
+        );
+        let server_socket = socket.clone();
+        let server = tokio::spawn(async move {
+            crate::api::serve_unix(&server_socket, app).await.unwrap();
+        });
+        while !socket.exists() {
+            tokio::task::yield_now().await;
+        }
+        let error = fast_client(Endpoint::Unix(socket))
+            .send_message(&MessageSendRequest {
+                idempotency_key: "retry-this-key".into(),
+                from: "person/ada".into(),
+                to: "agent/example/worker".into(),
+                content: "Hello".into(),
+                title: None,
+                in_reply_to: None,
+                tags: vec![],
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert!(error.contains("may have been sent"), "{error}");
+        assert!(
+            error.contains("--idempotency-key \"retry-this-key\""),
+            "{error}"
+        );
+        assert!(error.contains("unconfirmed"), "{error}");
+        server.abort();
     }
 
     #[tokio::test]

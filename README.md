@@ -361,6 +361,11 @@ st conversations thread MESSAGE
 st conversations archive MESSAGE --as person/ada
 ```
 
+If a send or reply goes unanswered, st retries once with the same message and idempotency
+key. If delivery remains unconfirmed, the error prints the key: rerun the same command with
+`--idempotency-key KEY` to recover its result without sending a second message. Use a new key
+for a new message.
+
 `st conversations sessions` lists harness sessions and `st conversations timeline SESSION`
 shows one session's messages and tool calls.
 
