@@ -8,6 +8,9 @@ pub mod claim;
 pub mod error;
 pub mod fleet;
 pub mod hash;
+pub mod performance;
+/// Opt-in accounting of where the daemon's time goes, turned on by `ST3_PROFILE_DIR`.
+pub mod profile;
 pub mod replication;
 
 pub use claim::{

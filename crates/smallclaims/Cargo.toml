@@ -12,6 +12,7 @@ ciborium = "0.2"
 data-encoding = "2"
 hex = "0.4"
 hmac = "0.12"
+libc = "0.2"
 ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 # Claim bodies keep the writer's field order when they decode, so a claim hashed in insertion
@@ -19,6 +20,7 @@ serde = { version = "1", features = ["derive"] }
 # another dependency turns this on; the crate asks for it so it behaves the same built alone.
 serde_json = { version = "1", features = ["preserve_order"] }
 sha2 = "0.10"
+tokio = { version = "1", features = ["time"] }
 uuid = { version = "1", features = ["v7"] }
 
 [dev-dependencies]
