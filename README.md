@@ -117,6 +117,11 @@ Seat drivers wait as long as the restart takes, keep their notes out of the seat
 `~/.local/state/st3/driver-api-warnings.log`, and resume from the graph. To run the daemon in the
 foreground instead, use `st up`.
 
+On Linux, the daemon normally listens in `XDG_RUNTIME_DIR`; it also publishes
+`STATE/run/st3.sock` as a link to that socket, so commands without the daemon's
+runtime environment can reach it. On macOS the socket already lives at that state path.
+An explicit `--endpoint` or `ST3_ENDPOINT` still takes precedence.
+
 st records every `git` and `gh` call it starts, including its own, in
 `~/.local/state/st3/recorder/commands.jsonl`, then runs the real program unchanged. A call by
 absolute path is not recorded. The [command recorder](docs/st3/command-recorder.md) describes the

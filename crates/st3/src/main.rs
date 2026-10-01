@@ -3223,7 +3223,7 @@ async fn run(cli: Cli) -> Result<()> {
         .or_else(|| std::env::var("ST3_ENDPOINT").ok())
         .as_deref()
         .map(Endpoint::parse)
-        .unwrap_or_else(|| Endpoint::Unix(config.socket.clone()));
+        .unwrap_or_else(|| Endpoint::Unix(config.client_socket()));
     let _ = DAEMON_WAIT.set(Duration::from_secs(cli.daemon_wait));
     let client = cli_client(&endpoint);
     // Drivers outlive daemon restarts and handle an outage in their own loops; doctor reports one.
@@ -3771,13 +3771,14 @@ async fn run_up(args: UpArgs) -> Result<()> {
         config.client_gateway_socket.display()
     );
     let local_socket = config.socket.clone();
+    let state_socket = config.state_dir.join("run/st3.sock");
     let client_gateway_socket = config.client_gateway_socket.clone();
     // The first diagnostic report reads the whole claim log; no read waits for it.
     st3::api::start_operation_report(&state);
     // Nor does the first session list wait to read every native transcript's header.
     st3::api::start_native_session_discovery(&state);
     tokio::try_join!(
-        st3::api::serve_unix_bound(&local_socket, router(state.clone())),
+        st3::api::serve_unix_bound(&local_socket, &state_socket, router(state.clone())),
         serve_unix(&client_gateway_socket, fabric_router(state)),
     )?;
     Ok(())
