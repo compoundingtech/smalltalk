@@ -362,6 +362,17 @@ Admission commits once per pass over the pending envelopes, so one disk flush co
 
 A node catching up with a peer, one more than one exchange behind it, projects at most every 30 seconds and again as soon as it has caught up. History arrives older than the node's own claims, so the node cannot extend its projection incrementally; projecting after every exchange would replay the whole graph each time. Meanwhile `st now`, `st missions ls` and stui say the node is syncing.
 
+Person-work asks, completions and cancellations rebuild only their owning mission run tree.
+Standalone asks embed their run and generation in the asking claim; indexed lookups recover
+that ownership even before the ask is projected. A response received before its ask is replayed
+with the ask in canonical order once both arrive. These updates preserve unrelated runs and
+avoid holding the single writer for a full retained-graph replay. New claims find their canonical
+predecessor by seeking the newest time block of their subject, then resolving writer, sequence
+and position ties within that block. They do not sort the subject's whole retained history.
+Regression tests compare all
+17 shared maps with full replay and the digest scan after reopen, and exercise receipt and
+admission while normal claims and worker renewals write to a populated WAL database.
+
 An unknown claim kind or field can become valid after a schema upgrade. Admission retries unknown records on each wake and startup. Records that older builds classified as invalid solely because of an unknown field are also reconsidered, preserving and admitting the original signed claim when the upgraded schema recognizes it.
 
 A projection fault keeps the last good projection. The daemon continues to serve status and repair commands.
