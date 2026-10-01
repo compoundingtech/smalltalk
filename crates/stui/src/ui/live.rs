@@ -216,6 +216,15 @@ pub fn run(context: Context) -> Result<()> {
     ui.show_focused();
 
     let _guard = Guard::enter(ui.glasses.is_some())?;
+    // How images are drawn: asked of a terminal known to draw them, once, inside the
+    // alternate screen and before any event is read. A terminal that never answers would
+    // leave the query reading stdin and swallow keys, so others get half blocks unasked.
+    ui.picker = Some(if super::attach::graphics_terminal() {
+        ratatui_image::picker::Picker::from_query_stdio()
+            .unwrap_or_else(|_| ratatui_image::picker::Picker::halfblocks())
+    } else {
+        ratatui_image::picker::Picker::halfblocks()
+    });
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     terminal.hide_cursor()?;
     let started = Instant::now();
@@ -783,6 +792,7 @@ pub fn run(context: Context) -> Result<()> {
                         let _ = commands.send(Command::Reconnect);
                     }
                     Event::Key(key) => ui.key(key),
+                    Event::Paste(text) => ui.paste(text),
                     Event::Mouse(mouse) => ui.mouse(mouse),
                     _ => {}
                 }

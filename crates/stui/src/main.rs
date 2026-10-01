@@ -2582,7 +2582,7 @@ fn main() -> Result<()> {
         .iter()
         .any(|arg| matches!(arg.as_str(), "--version" | "-V"))
     {
-        println!("stui {}", version::display(version::now()));
+        println!("stui {}", version::display_version());
         return Ok(());
     }
     if args
