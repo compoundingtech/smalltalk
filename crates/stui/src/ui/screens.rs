@@ -311,6 +311,76 @@ fn text_box(doc: &mut Doc, title: &str, drafts: &Drafts<'_>, placeholder: &str, 
     }
 }
 
+/// A request whose text is (or ends in) a JSON report: the words before it, then the fields that
+/// say what happened, then the rest folded to a few. `None` when there is no JSON object.
+fn report(text: &str, width: usize) -> Option<Vec<Line<'static>>> {
+    const TELLING: [&str; 14] = [
+        "status", "state", "outcome", "result", "error", "reason", "message", "summary", "commit",
+        "sha", "version", "host", "run", "url",
+    ];
+    const OTHERS: usize = 4;
+    let start = text.find('{')?;
+    let end = text.rfind('}')?;
+    let serde_json::Value::Object(fields) =
+        serde_json::from_str::<serde_json::Value>(text.get(start..=end)?).ok()?
+    else {
+        return None;
+    };
+    let mut lines = Vec::new();
+    let before = text[..start].trim();
+    if !before.is_empty() {
+        lines.extend(text::markdown(before, width, theme::text()));
+        lines.push(Line::default());
+    }
+    let shown = |value: &serde_json::Value| match value {
+        serde_json::Value::String(text) => text.lines().next().unwrap_or_default().to_owned(),
+        other => other.to_string(),
+    };
+    let key_width = fields
+        .keys()
+        .map(|key| text::width(key))
+        .max()
+        .unwrap_or(0)
+        .min(14);
+    let row = |key: &str, value: &serde_json::Value, style: Style| {
+        let value = text::truncate(&shown(value), width.saturating_sub(key_width + 2));
+        Line::from(vec![
+            span(format!("{key:<key_width$}  "), theme::dim()),
+            span(value, style),
+        ])
+    };
+    let mut telling = TELLING
+        .iter()
+        .filter_map(|key| fields.get_key_value(*key))
+        .collect::<Vec<_>>();
+    if telling.is_empty() {
+        telling = fields.iter().take(OTHERS).collect();
+    }
+    for (key, value) in &telling {
+        let style = if key.as_str() == "error" || matches!(value.as_str(), Some("failed" | "error"))
+        {
+            theme::fg(theme::RED)
+        } else {
+            theme::text()
+        };
+        lines.push(row(key, value, style));
+    }
+    let rest = fields
+        .iter()
+        .filter(|(key, _)| !telling.iter().any(|(shown, _)| shown == key))
+        .collect::<Vec<_>>();
+    for (key, value) in rest.iter().take(OTHERS) {
+        lines.push(row(key, value, theme::soft()));
+    }
+    if rest.len() > OTHERS {
+        lines.push(Line::from(span(
+            format!("… {} more fields", rest.len() - OTHERS),
+            theme::dim(),
+        )));
+    }
+    Some(lines)
+}
+
 fn confirm_row(doc: &mut Doc, drafts: &Drafts<'_>, label: &str) -> bool {
     if drafts.confirm.is_some() {
         doc.line(Line::from(vec![span(
@@ -738,7 +808,11 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 span(from.clone(), theme::strong(theme::PERSON)),
             ]));
             card.blank();
-            card.lines(text::markdown(question, inner, theme::text()));
+            // A report pasted in as JSON shows its telling fields, not a wall of braces.
+            match report(question, inner) {
+                Some(lines) => card.lines(lines),
+                None => card.lines(text::markdown(question, inner, theme::text())),
+            }
             card.blank();
             // The answer goes back to the agent that asked, and its waiting step continues.
             if drafts.editing || drafts.text.is_some_and(|text| !text.is_empty()) {
@@ -751,7 +825,7 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                 let label = match drafts.confirm {
                     Some('y') => format!("Answer {from} “Yes”"),
                     Some('n') => format!("Answer {from} “No”"),
-                    _ => "Mark this request answered".to_owned(),
+                    _ => format!("Close this: tell {from} there is nothing for you to do"),
                 };
                 if !confirm_row(&mut card, drafts, &label) {
                     // A yes-or-no question can be answered in one key.
@@ -760,15 +834,21 @@ pub fn home_detail(world: &World, id: Option<&str>, width: usize, drafts: &Draft
                             ("y", "Yes", Hit::Key('y'), theme::GREEN),
                             ("n", "No", Hit::Key('n'), theme::RED),
                             ("c", "Answer in words", Hit::Key('c'), theme::ACCENT),
+                            ("r", "Nothing to do", Hit::Key('r'), theme::OVERLAY1),
                         ]);
                     } else {
-                        card.buttons(&[("c", "Answer", Hit::Key('c'), theme::ACCENT)]);
+                        card.buttons(&[
+                            ("c", "Answer", Hit::Key('c'), theme::ACCENT),
+                            ("r", "Nothing to do", Hit::Key('r'), theme::OVERLAY1),
+                        ]);
                     }
                 }
             }
             card.wrap(
                 &text::inline(
-                    &format!("Your answer goes back to {from} and the step it waits on continues."),
+                    &format!(
+                        "{from} is waiting on you: answer it, or r if there is nothing for you to do. Either way the step it waits on continues."
+                    ),
                     theme::dim(),
                 ),
                 inner,
@@ -2319,6 +2399,31 @@ pub fn missions_tree(world: &World, spinner: &'static str, system: bool) -> List
 #[cfg(test)]
 mod tree_tests {
     use super::*;
+
+    #[test]
+    fn a_request_holding_a_json_report_shows_what_happened_and_folds_the_rest() {
+        let text = r#"The deploy finished: {"status":"failed","error":"unit st3.service did not start","commit":"8821eced","host":"willow","attempt":2,"log":"/var/log/x","duration_ms":1234,"members":["maple","cedar"],"plan":{"a":1},"notes":"long\nnotes"}"#;
+        let shown = report(text, 60)
+            .unwrap()
+            .iter()
+            .map(text::plain)
+            .collect::<Vec<_>>();
+        assert_eq!(shown[0], "The deploy finished:");
+        let joined = shown.join("\n");
+        for wanted in [
+            "status",
+            "failed",
+            "error",
+            "unit st3.service did not start",
+            "commit",
+            "8821eced",
+        ] {
+            assert!(joined.contains(wanted), "{joined}");
+        }
+        assert!(shown.last().unwrap().contains("more fields"), "{joined}");
+        assert!(!joined.contains('{'), "no braces: {joined}");
+        assert!(report("Can you look at the deploy?", 60).is_none());
+    }
 
     #[test]
     fn a_folder_holding_only_a_folder_joins_it_on_one_line() {
