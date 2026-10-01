@@ -168,6 +168,11 @@ pub struct Config {
     pub socket: PathBuf,
     pub client_gateway_socket: PathBuf,
     pub peer_listen: Option<String>,
+    /// Lets `peer_listen` bind an address other than loopback or Tailscale, such as
+    /// `0.0.0.0` or a LAN IP. st cannot tell whether such a path is encrypted, and the
+    /// listener carries plain HTTP: replication, terminal input and attach grants.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub peer_listen_allow_plain_http: bool,
     pub peers: Vec<PeerConfig>,
     /// Default harness configuration for new planning sessions only.
     pub planner: PlannerSpec,
@@ -269,6 +274,7 @@ impl Default for Config {
             socket,
             client_gateway_socket,
             peer_listen: None,
+            peer_listen_allow_plain_http: false,
             peers: Vec::new(),
             planner: PlannerSpec::default(),
             observations: ObservationsConfig::default(),
@@ -468,8 +474,10 @@ impl Config {
                 .parse::<SocketAddr>()
                 .with_context(|| format!("parse peer listener `{address}`"))?;
             anyhow::ensure!(
-                is_permitted_route_address(&address.ip()),
-                "the peer listener must bind to a loopback or Tailscale address"
+                self.peer_listen_allow_plain_http || is_permitted_route_address(&address.ip()),
+                "the peer listener must bind to a loopback or Tailscale address; set \
+                 peer_listen_allow_plain_http = true (or --peer-listen-allow-plain-http) to \
+                 serve unencrypted HTTP on {address}"
             );
         }
         anyhow::ensure!(
@@ -670,7 +678,7 @@ mod tests {
     }
 
     #[test]
-    fn a_peer_listener_accepts_only_loopback_or_tailnet_addresses() {
+    fn a_peer_listener_needs_the_plain_http_opt_in_beyond_loopback_or_tailnet() {
         let mut config = Config {
             peer_listen: Some("127.0.0.1:31313".into()),
             fleet_id: Some("1f91ca65-7793-48cc-866e-ac15690130e1".into()),
@@ -700,14 +708,17 @@ mod tests {
             "[fd7a:115c:a1e1::1]:31313",
         ] {
             config.peer_listen = Some(address.into());
+            config.peer_listen_allow_plain_http = false;
             assert!(
                 config
                     .validate()
                     .unwrap_err()
                     .to_string()
-                    .contains("loopback or Tailscale"),
+                    .contains("peer_listen_allow_plain_http"),
                 "{address}"
             );
+            config.peer_listen_allow_plain_http = true;
+            config.validate().unwrap();
         }
     }
 

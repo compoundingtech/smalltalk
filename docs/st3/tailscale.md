@@ -1,10 +1,12 @@
 # Tailscale setup for fleet replication
 
 The replication protocol uses plain HTTP with fleet-secret authentication and member
-signatures. Tailscale encrypts traffic between machines; do not expose the listener on
-`0.0.0.0`, a LAN address, or the public Internet. The allowed listener and peer IP ranges
-are `100.64.0.0/10` and `fd7a:115c:a1e0::/48`, plus loopback for local tunnels. Grant the
-chosen TCP port (default 31313) between fleet members in your Tailscale ACL.
+signatures. Tailscale encrypts traffic between machines. The listener binds
+`100.64.0.0/10`, `fd7a:115c:a1e0::/48`, or loopback for local tunnels; `0.0.0.0`, a LAN
+address, or a public address is refused unless you opt into unencrypted traffic with
+`peer_listen_allow_plain_http = true` (or `--peer-listen-allow-plain-http`). Peer URLs
+accept only those ranges. Grant the chosen TCP port (default 31313) between fleet
+members in your Tailscale ACL.
 
 ## Join two machines
 

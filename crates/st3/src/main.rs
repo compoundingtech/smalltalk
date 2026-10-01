@@ -232,6 +232,9 @@ struct ReplicationWorkerArgs {
     socket: Option<PathBuf>,
     #[arg(long)]
     peer_listen: Option<String>,
+    /// Let --peer-listen bind a non-loopback, non-Tailscale address; traffic is plain HTTP.
+    #[arg(long)]
+    peer_listen_allow_plain_http: bool,
     #[arg(long)]
     fleet_id: Option<String>,
     #[arg(long)]
@@ -1466,6 +1469,9 @@ struct UpArgs {
     client_gateway_socket: Option<PathBuf>,
     #[arg(long)]
     peer_listen: Option<String>,
+    /// Let --peer-listen bind a non-loopback, non-Tailscale address; traffic is plain HTTP.
+    #[arg(long)]
+    peer_listen_allow_plain_http: bool,
     #[arg(long)]
     fleet_id: Option<String>,
     #[arg(long)]
@@ -3257,6 +3263,9 @@ async fn run(cli: Cli) -> Result<()> {
         if let Some(value) = args.peer_listen {
             config.peer_listen = Some(value);
         }
+        if args.peer_listen_allow_plain_http {
+            config.peer_listen_allow_plain_http = true;
+        }
         if let Some(value) = args.fleet_id {
             config.fleet_id = Some(value);
         }
@@ -3641,6 +3650,9 @@ async fn run_up(args: UpArgs) -> Result<()> {
     }
     if let Some(peer_listen) = args.peer_listen {
         config.peer_listen = Some(peer_listen);
+    }
+    if args.peer_listen_allow_plain_http {
+        config.peer_listen_allow_plain_http = true;
     }
     if let Some(fleet_id) = args.fleet_id {
         config.fleet_id = Some(fleet_id);

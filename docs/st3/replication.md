@@ -201,7 +201,10 @@ to a Tailscale IP is advertised as this member's Tailscale endpoint.
 Explicit peer routes accept loopback or tailnet HTTP and `fabric://NODE_ID/PROTOCOL`.
 Fabric routes name the lasting remote endpoint: the worker creates or reacquires the local
 tunnel itself. Several peer entries may name the same member with distinct routes.
-Wildcard listeners, arbitrary DNS names, and LAN/public HTTP addresses remain rejected.
+Arbitrary DNS names and LAN/public HTTP peer URLs remain rejected. The listener refuses a
+wildcard, LAN or public address unless `peer_listen_allow_plain_http = true` (or
+`--peer-listen-allow-plain-http`) is set: st cannot tell whether such a path is encrypted,
+and the listener carries terminal input and attach grants as well as replication.
 Replication is plain HTTP, encrypted between hosts by Tailscale or a Fabric tunnel;
 the fleet secret and joined members' signatures still authenticate the exchange.
 See [Tailscale setup](tailscale.md) for direct-host setup and
